@@ -733,7 +733,7 @@ function CanvasView({
       session.edges.map((edge) => ({
         ...edge,
         animated: session.nodes.some((node) => node.id === edge.target && node.status === "running"),
-        style: { stroke: "#7f8b8d", strokeWidth: 1.4 },
+        style: { stroke: "#8d99ae", strokeWidth: 1.6 },
       })),
     [session.edges, session.nodes],
   );
@@ -749,7 +749,7 @@ function CanvasView({
         maxZoom={1.35}
         proOptions={{ hideAttribution: true }}
       >
-        <Background color="#c9cfca" gap={24} />
+        <Background color="#d3dce9" gap={14} size={2} />
         <Controls showInteractive={false} />
       </ReactFlow>
     </section>

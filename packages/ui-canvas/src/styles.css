@@ -670,3 +670,578 @@ h2 {
     grid-template-columns: 1fr;
   }
 }
+
+/* Modern workflow-app surface refresh: neutral, compact, and operational. */
+:root {
+  --sk-accent: #0ea5e9;
+  --sk-accent-strong: #0284c7;
+  --sk-accent-soft: #e0f2fe;
+  --sk-bg: #fbfbfc;
+  --sk-surface: #ffffff;
+  --sk-surface-muted: #f7f7f8;
+  --sk-surface-subtle: #f3f4f6;
+  --sk-border: #e5e7eb;
+  --sk-border-strong: #d1d5db;
+  --sk-text: #1f2937;
+  --sk-text-strong: #111827;
+  --sk-muted: #6b7280;
+  --sk-muted-strong: #4b5563;
+  --sk-success: #3f7f5f;
+  --sk-danger: #b4534a;
+  --sk-warning: #a16207;
+  --sk-info: #3b6ea8;
+  --sk-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  color: var(--sk-text);
+  background: var(--sk-bg);
+  font-family:
+    Inter,
+    Geist,
+    "SF Pro Text",
+    "Segoe UI",
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    sans-serif;
+}
+
+* {
+  scrollbar-color: rgba(107, 114, 128, 0.32) transparent;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(107, 114, 128, 0.3);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(107, 114, 128, 0.48);
+  background-clip: padding-box;
+}
+
+body {
+  background: var(--sk-bg);
+}
+
+button,
+input,
+textarea {
+  line-height: 1.45;
+}
+
+button {
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    color 140ms ease;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid rgba(14, 165, 233, 0.36);
+  outline-offset: 2px;
+}
+
+.home {
+  place-items: start center;
+  padding: 48px 24px;
+  background: var(--sk-bg);
+  background-image: radial-gradient(circle at 1px 1px, #e6e8eb 1px, transparent 0);
+  background-size: 16px 16px;
+}
+
+.home-panel,
+.node-modal {
+  border: 1px solid var(--sk-border);
+  border-radius: 8px;
+  background: var(--sk-surface);
+  box-shadow: var(--sk-shadow-sm);
+  backdrop-filter: none;
+}
+
+.home-panel {
+  width: min(680px, 100%);
+  padding: 20px;
+}
+
+.brand-row,
+.plan-header,
+.modal-header {
+  gap: 16px;
+}
+
+.eyebrow,
+.node-meta,
+.sidebar h2,
+.agent-row small,
+.diff-stat small,
+.context-grid dt {
+  color: var(--sk-muted);
+}
+
+.eyebrow,
+.sidebar h2,
+.session-tab small,
+.node-meta,
+.diff-stat small {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+h1,
+h2,
+.project-chip,
+.task-node,
+.agent-row,
+.diff-stat {
+  color: var(--sk-text-strong);
+}
+
+h1 {
+  font-size: 20px;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.home-input,
+.new-task input,
+.bottom-bar input {
+  border: 1px solid var(--sk-border);
+  border-radius: 6px;
+  background: var(--sk-surface);
+  color: var(--sk-text);
+  outline: none;
+  caret-color: var(--sk-accent);
+  box-shadow: none;
+  font-size: 13px;
+}
+
+.home-input {
+  min-height: 104px;
+  margin: 16px 0 12px;
+  resize: none;
+  scrollbar-width: none;
+}
+
+.home-input::-webkit-scrollbar {
+  display: none;
+}
+
+.home-input::placeholder,
+.new-task input::placeholder,
+.bottom-bar input::placeholder {
+  color: #9ca3af;
+}
+
+.home-input:focus,
+.bottom-bar input:focus,
+.new-task input:focus {
+  border-color: var(--sk-accent);
+  box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.14);
+}
+
+.mode-switch {
+  min-width: 148px;
+  border-color: var(--sk-border);
+  border-radius: 6px;
+  background: var(--sk-surface-subtle);
+  padding: 2px;
+}
+
+.mode-switch.compact {
+  min-width: 120px;
+}
+
+.mode-switch button {
+  min-height: 28px;
+  border-radius: 4px;
+  color: var(--sk-muted-strong);
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.mode-switch button.active {
+  background: var(--sk-surface);
+  color: var(--sk-accent-strong);
+  box-shadow: var(--sk-shadow-sm);
+}
+
+.primary-action,
+.icon-button,
+.modal-actions button,
+.session-tab,
+.new-tab-button,
+.sidebar-row {
+  border-color: var(--sk-border);
+  border-radius: 6px;
+  color: var(--sk-text);
+  background: var(--sk-surface);
+  min-height: 34px;
+  font-size: 13px;
+}
+
+.primary-action,
+.icon-button.solid {
+  border-color: var(--sk-accent-strong);
+  background: var(--sk-accent);
+  color: #ffffff;
+}
+
+.primary-action:hover:not(:disabled),
+.icon-button.solid:hover:not(:disabled) {
+  border-color: var(--sk-accent-strong);
+  background: var(--sk-accent-strong);
+}
+
+.icon-button:hover:not(:disabled),
+.modal-actions button:hover:not(:disabled),
+.session-tab:hover:not(:disabled),
+.new-tab-button:hover:not(:disabled),
+.sidebar-row:hover:not(:disabled) {
+  border-color: var(--sk-border-strong);
+  background: var(--sk-surface-muted);
+  box-shadow: none;
+}
+
+.app-shell {
+  grid-template-rows: 52px 1fr 56px;
+  background: var(--sk-bg);
+}
+
+.topbar,
+.bottom-bar {
+  border-color: var(--sk-border);
+  background: var(--sk-surface);
+  backdrop-filter: none;
+}
+
+.topbar {
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.project-chip {
+  min-width: 152px;
+  max-width: 220px;
+  font-size: 13px;
+}
+
+.session-tabs,
+.sidebar-inner,
+.modal-actions {
+  scrollbar-width: none;
+}
+
+.session-tabs::-webkit-scrollbar,
+.sidebar-inner::-webkit-scrollbar,
+.modal-actions::-webkit-scrollbar {
+  display: none;
+}
+
+.session-tab {
+  flex-basis: 136px;
+  justify-content: space-between;
+  padding: 0 10px;
+}
+
+.session-tab small {
+  color: var(--sk-muted);
+  font-weight: 600;
+}
+
+.session-tab.active,
+.sidebar-row.active {
+  border-color: var(--sk-accent);
+  background: var(--sk-accent-soft);
+  color: var(--sk-accent-strong);
+}
+
+.new-tab-button {
+  padding: 0 10px;
+}
+
+.new-task input,
+.bottom-bar input {
+  height: 36px;
+  padding: 0 10px;
+}
+
+.sidebar {
+  width: 244px;
+  border-color: var(--sk-border);
+  background: var(--sk-surface);
+  backdrop-filter: none;
+}
+
+.sidebar.collapsed {
+  width: 44px;
+}
+
+.sidebar-toggle {
+  top: 8px;
+  right: 5px;
+}
+
+.sidebar-inner {
+  gap: 18px;
+  max-height: 100%;
+  overflow: auto;
+  padding: 52px 12px 12px;
+}
+
+.sidebar-row {
+  min-height: 32px;
+  margin-bottom: 4px;
+  padding: 0 9px;
+}
+
+.status-row {
+  min-height: 24px;
+  color: var(--sk-muted-strong);
+  font-size: 13px;
+}
+
+.agent-row {
+  margin-bottom: 8px;
+  color: var(--sk-text);
+  font-size: 13px;
+}
+
+.agent-row.muted {
+  color: var(--sk-muted);
+}
+
+.canvas-stage {
+  position: relative;
+  overflow: hidden;
+  background: var(--sk-bg);
+}
+
+.canvas-stage .react-flow {
+  background: transparent;
+}
+
+.canvas-stage .react-flow__pane {
+  cursor: grab;
+}
+
+.canvas-stage .react-flow__pane:active {
+  cursor: grabbing;
+}
+
+.react-flow__controls {
+  border: 1px solid var(--sk-border);
+  border-radius: 8px;
+  background: var(--sk-surface);
+  box-shadow: var(--sk-shadow-sm);
+  backdrop-filter: none;
+}
+
+.react-flow__controls-button {
+  border-bottom-color: var(--sk-border) !important;
+  background: transparent !important;
+  color: var(--sk-muted-strong) !important;
+}
+
+.react-flow__controls-button:hover {
+  background: var(--sk-surface-muted) !important;
+  color: var(--sk-accent-strong) !important;
+}
+
+.react-flow__handle {
+  width: 8px;
+  height: 8px;
+  border: 1px solid var(--sk-surface);
+  background: var(--sk-accent);
+}
+
+.task-node {
+  width: 208px;
+  min-height: 96px;
+  gap: 8px;
+  border-color: var(--sk-border);
+  border-radius: 8px;
+  background: var(--sk-surface);
+  box-shadow: var(--sk-shadow-sm);
+}
+
+.task-node:hover {
+  border-color: var(--sk-border-strong);
+  background: #fcfcfd;
+  box-shadow: var(--sk-shadow-sm);
+}
+
+.task-node.completed {
+  border-color: rgba(63, 127, 95, 0.42);
+}
+
+.task-node.failed {
+  border-color: rgba(180, 83, 74, 0.42);
+}
+
+.task-node.retrying {
+  border-color: rgba(161, 98, 7, 0.42);
+}
+
+.task-node.running {
+  border-color: var(--sk-accent);
+  background: #f0f9ff;
+  box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.16);
+}
+
+.node-heading {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.node-meta {
+  color: var(--sk-muted);
+}
+
+.task-node p,
+.status-row {
+  color: var(--sk-muted-strong);
+}
+
+.status-light {
+  width: 9px;
+  height: 9px;
+  background: #9ca3af;
+}
+
+.status-light.completed {
+  background: var(--sk-success);
+}
+
+.status-light.failed {
+  background: var(--sk-danger);
+}
+
+.status-light.retrying {
+  background: var(--sk-warning);
+}
+
+.status-light.pending {
+  background: #9ca3af;
+}
+
+@keyframes running-light {
+  0% {
+    background: var(--sk-success);
+  }
+  33% {
+    background: var(--sk-warning);
+  }
+  66%,
+  100% {
+    background: var(--sk-info);
+  }
+}
+
+.plan-view {
+  gap: 12px;
+  padding: 16px;
+}
+
+.markdown-grid {
+  gap: 12px;
+}
+
+.markdown-grid article {
+  border-color: var(--sk-border);
+  border-radius: 8px;
+  background: var(--sk-surface);
+  padding: 14px;
+}
+
+.bottom-bar {
+  grid-template-columns: 36px minmax(0, 1fr) 36px;
+  gap: 10px;
+  padding: 10px 12px;
+}
+
+.modal-backdrop {
+  background: rgba(17, 24, 39, 0.28);
+}
+
+.node-modal {
+  border-radius: 8px;
+  background: var(--sk-surface);
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
+  overflow: hidden;
+}
+
+.modal-header,
+.modal-actions,
+.modal-tabs {
+  border-color: var(--sk-border);
+}
+
+.modal-header,
+.modal-actions,
+.modal-tabs,
+.modal-body {
+  padding: 12px 14px;
+}
+
+.modal-actions button {
+  padding: 0 9px;
+}
+
+.modal-tabs button {
+  min-width: 84px;
+  border-radius: 6px;
+  color: var(--sk-muted-strong);
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
+.modal-tabs button.active {
+  background: var(--sk-accent-soft);
+  color: var(--sk-accent-strong);
+}
+
+.output-lines p {
+  border-left-color: var(--sk-accent);
+  border-radius: 6px;
+  background: #f8fafc;
+  color: var(--sk-text);
+}
+
+.changes-view pre {
+  border-color: #1f2937;
+  border-radius: 8px;
+  background: #111827;
+  color: #e5e7eb;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
