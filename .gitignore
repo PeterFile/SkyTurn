@@ -1,0 +1,8 @@
+node_modules/
+dist/
+dist-electron/
+.turbo/
+.playwright-cli/
+output/
+*.tsbuildinfo
+.DS_Store

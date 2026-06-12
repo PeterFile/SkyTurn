@@ -1,0 +1,15 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/project-core" },
+    { "path": "./packages/planner" },
+    { "path": "./packages/orchestrator" },
+    { "path": "./packages/agent-runtime" },
+    { "path": "./packages/git-worktree" },
+    { "path": "./packages/project-memory" },
+    { "path": "./packages/persistence" },
+    { "path": "./packages/ui-canvas" },
+    { "path": "./apps/desktop/tsconfig.app.json" },
+    { "path": "./apps/desktop/tsconfig.electron.json" }
+  ]
+}
