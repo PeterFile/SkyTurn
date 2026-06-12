@@ -17,7 +17,8 @@
 - `packages/project-core`: shared domain contracts.
 - `packages/planner`: Fast and Plan session creation.
 - `packages/orchestrator`: Hermes orchestration contracts and DAG scheduling.
-- `packages/agent-runtime`: agent adapter contracts and MVP mocks.
+- `packages/agent-runtime`: contract-only Agent adapter interfaces and support metadata.
+- `packages/agent-bridge`: local Agent discovery, connection, run lifecycle, event stream, and run evidence persistence.
 - `packages/git-worktree`: git/worktree/changeset/editor contracts and MVP mocks.
 - `packages/project-memory`: `.devflow` directory/file helpers.
 - `packages/persistence`: workspace state and renderer host adapters.
@@ -30,7 +31,7 @@ Electron main process owns:
 - `.devflow` filesystem creation
 - future git commands
 - future worktree commands
-- future process execution
+- Agent bridge IPC, local process execution, and run event persistence
 - future editor launching
 
 Renderer owns:
@@ -44,6 +45,8 @@ Renderer owns:
 - local interaction state
 
 Renderer does not directly run shell commands.
+
+`agent-bridge` does not schedule DAGs, confirm Hermes plans, consolidate shared memory, or decide UI policy. It only connects SkyTurn to local Agents and records run events/evidence.
 
 ## Persistence
 
@@ -64,3 +67,5 @@ Electron uses a preload API and keeps renderer Node access disabled:
 - IPC methods expose specific operations only.
 
 Folder writes are limited to the user-selected project root and `.devflow` helper files.
+
+Agent run events are durable data under `.devflow/runs/<runId>/events.ndjson`. Renderer streams can update UI, but reloads must recover Output from the persisted event log.

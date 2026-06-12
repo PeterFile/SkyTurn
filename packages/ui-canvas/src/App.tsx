@@ -23,10 +23,9 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 
-import { mockHermesAdapter } from "@skyturn/agent-runtime";
 import {
   createMockChangeset,
   mockChangesetService,
@@ -40,8 +39,11 @@ import {
   type OpenProjectResult,
   type WorkspaceState,
 } from "@skyturn/persistence";
+import { convertPlanToCanvas, createFastCanvasSession, createPlanSession } from "@skyturn/planner";
 import {
   NODE_MODAL_TABS,
+  RUN_EVENT_PROTOCOL_VERSION,
+  deriveNodeStatusFromEvidence,
   type AgentKind,
   type CanvasNode,
   type CanvasSession,
@@ -51,6 +53,9 @@ import {
   type NodeModalTab,
   type NodeStatus,
   type PlanSession,
+  type AgentRun,
+  type RunEvent,
+  type RunEvidence,
   type WorkflowMode,
 } from "@skyturn/project-core";
 
@@ -76,6 +81,7 @@ export default function App() {
   const [bottomGoal, setBottomGoal] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
+  const startedBridgeRuns = useRef(new Set<string>());
 
   const activeProject = workspace.projects.find((project) => project.id === workspace.activeProjectId) ?? null;
   const activeSession = workspace.sessions.find((session) => session.id === workspace.activeSessionId) ?? null;
@@ -101,6 +107,7 @@ export default function App() {
   }, [workspace, workspaceLoaded]);
 
   useEffect(() => {
+    if (window.devflow) return;
     const timer = window.setInterval(() => {
       setWorkspace((current) => ({
         ...current,
@@ -114,6 +121,50 @@ export default function App() {
 
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (!window.devflow || !activeProject) return;
+    let active = true;
+    void window.devflow.discoverAgents().then((result) => {
+      if (!active) return;
+      setWorkspace((current) => ({ ...current, agents: result.agents }));
+    });
+    return () => {
+      active = false;
+    };
+  }, [activeProject?.id]);
+
+  useEffect(() => {
+    if (!window.devflow) return;
+    return window.devflow.onRunEvent((event) => {
+      setWorkspace((current) => applyRunEventToWorkspace(current, event));
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
+    for (const node of activeSession.nodes) {
+      if (node.status !== "running" && node.status !== "retrying") continue;
+      if (startedBridgeRuns.current.has(node.runId)) continue;
+      startedBridgeRuns.current.add(node.runId);
+      void startBridgeRun(activeProject, activeSession, node).then((result) => {
+        if (!result) return;
+        setWorkspace((current) => applyBridgeRunResult(current, result));
+      });
+    }
+  }, [activeProject, activeSession]);
+
+  useEffect(() => {
+    if (!window.devflow || !activeProject || !selectedNode) return;
+    let active = true;
+    void window.devflow.getRunEvents(activeProject.rootPath, selectedNode.runId).then((result) => {
+      if (!active || result.events.length === 0) return;
+      setWorkspace((current) => mergeRunEventsIntoWorkspace(current, selectedNode.runId, result.events));
+    });
+    return () => {
+      active = false;
+    };
+  }, [activeProject, selectedNode?.runId]);
 
   const openSelectedNode = useCallback((nodeId: string) => {
     setSelectedNodeId(nodeId);
@@ -159,7 +210,7 @@ export default function App() {
   }
 
   function confirmPlan(session: PlanSession) {
-    const canvas = mockHermesAdapter.confirmPlan(session);
+    const canvas = convertPlanToCanvas(session);
     setWorkspace((current) => ({
       ...current,
       sessions: current.sessions.map((item) => (item.id === session.id ? canvas : item)),
@@ -192,11 +243,36 @@ export default function App() {
     if (!activeSession || activeSession.kind !== "canvas") return;
     const running = activeSession.nodes.find((node) => node.status === "running" || node.status === "retrying");
     if (!running) return;
+    if (window.devflow) {
+      void window.devflow.cancelAgentRun(running.runId, "Stopped from workspace controls").then((result) => {
+        setWorkspace((current) => ({
+          ...current,
+          runEvidence: { ...current.runEvidence, [running.runId]: result.evidence },
+        }));
+      });
+    }
     updateNode(running.id, (node) => ({
       ...node,
       status: "failed",
       progress: "Stopped; output persisted",
       output: [...node.output, "Run cancelled. Current output and status were persisted."],
+    }));
+  }
+
+  function stopNodeRun(target: CanvasNode) {
+    if (window.devflow) {
+      void window.devflow.cancelAgentRun(target.runId, "Stopped from node modal").then((result) => {
+        setWorkspace((current) => ({
+          ...current,
+          runEvidence: { ...current.runEvidence, [target.runId]: result.evidence },
+        }));
+      });
+    }
+    updateNode(target.id, (node) => ({
+      ...node,
+      status: "failed",
+      progress: "Stopped; output persisted",
+      output: [...node.output, "Run cancelled from node modal."],
     }));
   }
 
@@ -253,7 +329,7 @@ export default function App() {
   }
 
   function reassignNode(nodeId: string) {
-    const order: AgentKind[] = ["hermes", "codex", "gemini", "claude-code"];
+    const order: AgentKind[] = ["hermes", "codex", "gemini", "claude-code", "openclaw"];
     updateNode(nodeId, (node) => {
       const nextAgent = order[(order.indexOf(node.agent) + 1) % order.length];
       return {
@@ -366,10 +442,11 @@ export default function App() {
             {workspace.sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
           </button>
           {!workspace.sidebarCollapsed && (
-            <Sidebar
-              projects={workspace.projects}
-              sessions={workspace.sessions.filter((session) => session.projectId === activeProject.id)}
-              activeProjectId={activeProject.id}
+	        <Sidebar
+	          projects={workspace.projects}
+	          sessions={workspace.sessions.filter((session) => session.projectId === activeProject.id)}
+	          agents={workspace.agents}
+	          activeProjectId={activeProject.id}
               activeSessionId={workspace.activeSessionId}
               onSelectProject={(projectId) =>
                 setWorkspace((current) => ({ ...current, activeProjectId: projectId }))
@@ -404,14 +481,9 @@ export default function App() {
           tab={modalTab}
           onTab={setModalTab}
           onClose={() => setSelectedNodeId(null)}
-          onStop={() =>
-            updateNode(selectedNode.id, (node) => ({
-              ...node,
-              status: "failed",
-              progress: "Stopped; output persisted",
-              output: [...node.output, "Run cancelled from node modal."],
-            }))
-          }
+	          onStop={() =>
+	            stopNodeRun(selectedNode)
+	          }
           onRetry={() => retryNode(selectedNode.id)}
           onReassign={() => reassignNode(selectedNode.id)}
           onInsertBefore={() => insertBefore(selectedNode.id)}
@@ -535,6 +607,7 @@ function TopBar({
 function Sidebar({
   projects,
   sessions,
+  agents,
   activeProjectId,
   activeSessionId,
   onSelectProject,
@@ -542,6 +615,7 @@ function Sidebar({
 }: {
   projects: ImportedProject[];
   sessions: CanvasSessionTab[];
+  agents: WorkspaceState["agents"];
   activeProjectId: string;
   activeSessionId: string | null;
   onSelectProject: (projectId: string) => void;
@@ -583,6 +657,16 @@ function Sidebar({
             <span>{status}</span>
           </div>
         ))}
+      </section>
+      <section>
+        <h2>Agents</h2>
+        {agents.map((agent) => (
+          <div className="agent-row" key={agent.kind}>
+            <span>{agent.label}</span>
+            <small>{`${agent.status} / ${agent.supportLevel}`}</small>
+          </div>
+        ))}
+        {agents.length === 0 && <div className="agent-row muted">No agents discovered</div>}
       </section>
     </div>
   );
@@ -911,8 +995,8 @@ function StatusLight({ status }: { status: NodeStatus }) {
 function createSession(projectId: string, goal: string, mode: WorkflowMode): CanvasSessionTab {
   const createdAt = new Date().toISOString();
   return mode === "fast"
-    ? mockHermesAdapter.createFastSession({ projectId, goal, createdAt })
-    : mockHermesAdapter.createPlanSession({ projectId, goal, createdAt });
+    ? createFastCanvasSession({ projectId, goal, createdAt })
+    : createPlanSession({ projectId, goal, createdAt });
 }
 
 function changesetsForSession(session: CanvasSessionTab): WorkspaceState["changesets"] {
@@ -928,13 +1012,36 @@ function advanceMockRun(session: CanvasSession): CanvasSession {
 
   const nodes = [...session.nodes];
   const node = nodes[activeIndex];
-  const nextLine = mockHermesAdapter.nextOutputLine(node, node.output.length);
+  const nextLine = nextMockOutputLine(node, node.output.length);
   const output = [...node.output, nextLine];
 
   if (output.length >= 5) {
+    const run = {
+      id: node.runId,
+      nodeId: node.id,
+      sessionId: session.id,
+      projectRoot: session.projectId,
+      worktreePath: node.worktree.path,
+      agentKind: node.agent,
+      status: "succeeded" as const,
+      startedAt: session.createdAt,
+      endedAt: new Date().toISOString(),
+    };
+    const evidence = {
+      runId: node.runId,
+      status: "succeeded" as const,
+      exitCode: 0,
+      changesetId: node.changesetId,
+      checks: [{ kind: "run-exit" as const, name: "Browser mock run", status: "passed" as const }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: run.endedAt,
+    };
     nodes[activeIndex] = {
       ...node,
-      status: "completed",
+      status: deriveNodeStatusFromEvidence(run, evidence),
       progress: "Evidence ready",
       output,
     };
@@ -967,6 +1074,116 @@ function advanceMockRun(session: CanvasSession): CanvasSession {
     nodes,
     updatedAt: new Date().toISOString(),
   };
+}
+
+function nextMockOutputLine(node: CanvasNode, lineIndex: number): string {
+  const lines = [
+    `${node.agent} accepted run ${node.runId}.`,
+    `${node.agent} is writing task-local output under .devflow/tasks/${node.id}.`,
+    `${node.agent} recorded changeset evidence ${node.changesetId}.`,
+    `${node.agent} text may say completed, but RunEvidence decides status.`,
+  ];
+  return lines[lineIndex] ?? `${node.agent} is waiting for the next checkpoint.`;
+}
+
+interface BridgeRunResult {
+  run: AgentRun;
+  events: RunEvent[];
+  evidence: RunEvidence;
+}
+
+async function startBridgeRun(
+  project: ImportedProject,
+  session: CanvasSession,
+  node: CanvasNode,
+): Promise<BridgeRunResult | null> {
+  const result = await window.devflow?.startAgentRun({
+    protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+    runId: node.runId,
+    nodeId: node.id,
+    sessionId: session.id,
+    projectRoot: project.rootPath,
+    worktreePath: node.worktree.path,
+    agentKind: node.agent,
+    prompt: node.context.brief,
+  });
+  if (!result || !window.devflow) return null;
+  const [eventsResult, evidenceResult] = await Promise.all([
+    window.devflow.getRunEvents(project.rootPath, node.runId),
+    window.devflow.getRunEvidence(project.rootPath, node.runId),
+  ]);
+  return { run: result.run, events: eventsResult.events, evidence: evidenceResult.evidence };
+}
+
+function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRunResult): WorkspaceState {
+  const withEvents = mergeRunEventsIntoWorkspace(workspace, result.run.id, result.events);
+  const status = deriveNodeStatusFromEvidence(result.run, result.evidence);
+  return {
+    ...withEvents,
+    runs: { ...withEvents.runs, [result.run.id]: result.run },
+    runEvidence: { ...withEvents.runEvidence, [result.run.id]: result.evidence },
+    sessions: withEvents.sessions.map((session) =>
+      session.kind === "canvas"
+        ? {
+            ...session,
+            nodes: session.nodes.map((node) =>
+              node.runId === result.run.id
+                ? {
+                    ...node,
+                    status,
+                    progress: status === "completed" ? "Evidence ready" : "Run evidence incomplete",
+                  }
+                : node,
+            ),
+          }
+        : session,
+    ),
+  };
+}
+
+function applyRunEventToWorkspace(workspace: WorkspaceState, event: RunEvent): WorkspaceState {
+  return mergeRunEventsIntoWorkspace(workspace, event.runId, [...(workspace.runEvents[event.runId] ?? []), event]);
+}
+
+function mergeRunEventsIntoWorkspace(
+  workspace: WorkspaceState,
+  runId: string,
+  events: RunEvent[],
+): WorkspaceState {
+  const deduped = dedupeRunEvents(events);
+  return {
+    ...workspace,
+    runEvents: { ...workspace.runEvents, [runId]: deduped },
+    sessions: workspace.sessions.map((session) =>
+      session.kind === "canvas"
+        ? {
+            ...session,
+            nodes: session.nodes.map((node) => (node.runId === runId ? applyRunEventsToNode(node, deduped) : node)),
+          }
+        : session,
+    ),
+  };
+}
+
+function applyRunEventsToNode(node: CanvasNode, events: RunEvent[]): CanvasNode {
+  const output = outputFromEvents(events);
+  if (output.length === 0) return node;
+  return {
+    ...node,
+    output,
+    progress: node.status === "running" ? "Streaming persisted output" : node.progress,
+  };
+}
+
+function outputFromEvents(events: RunEvent[]): string[] {
+  return events
+    .filter((event) => event.kind === "output")
+    .map((event) => (typeof event.payload.text === "string" ? event.payload.text : ""))
+    .filter(Boolean);
+}
+
+function dedupeRunEvents(events: RunEvent[]): RunEvent[] {
+  return [...new Map(events.map((event) => [event.seq, event])).values()].sort((left, right) => left.seq - right.seq);
 }
 
 function makeProject(project: { name: string; rootPath: string; devflowPath: string }): ImportedProject {

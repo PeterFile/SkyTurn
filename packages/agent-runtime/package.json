@@ -19,7 +19,6 @@
     "test": "vitest run src"
   },
   "dependencies": {
-    "@skyturn/planner": "workspace:*",
     "@skyturn/project-core": "workspace:*"
   },
   "devDependencies": {

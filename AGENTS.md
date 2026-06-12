@@ -30,7 +30,10 @@
 ## Orchestration And Agents
 
 - Hermes-agent is the primary orchestrator.
-- Codex, Gemini, ClaudeCode, and Hermes must be integrated through adapter interfaces.
+- Codex, Gemini, ClaudeCode, OpenClaw, and Hermes must be integrated through adapter interfaces.
+- `agent-runtime` is contract-only: no process execution, discovery implementation, Electron, filesystem execution, or UI logic.
+- `agent-bridge` owns local Agent discovery, connection, run lifecycle, event stream, and run persistence; it must not do DAG orchestration.
+- Codex CLI real execution must stay in `agent-bridge` adapters: use `codex exec --json` inside a git repository, default to read-only sandbox, do not use `--yolo`, and derive completion from process exit `RunEvidence`.
 - Do not deeply couple the app to any single agent CLI internals.
 - Use mock adapters first when local CLIs or Hermes APIs are unavailable.
 - Each coding agent must load its own native config, skills, MCP, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, or equivalent files without polluting other agents.
@@ -47,6 +50,7 @@
 - Git, worktree, and change detection are part of completion evidence.
 - Do not mark a task or node complete only because an agent says it is done.
 - Completion must be tied to run status, git changes, tests, or concrete verification evidence.
+- Node status must be derived from `RunEvidence`; Agent text claiming success is only output.
 - Do not mark tasks complete without concrete verification.
 
 ## Engineering Rules

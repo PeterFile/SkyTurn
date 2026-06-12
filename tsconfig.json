@@ -5,6 +5,7 @@
     { "path": "./packages/planner" },
     { "path": "./packages/orchestrator" },
     { "path": "./packages/agent-runtime" },
+    { "path": "./packages/agent-bridge" },
     { "path": "./packages/git-worktree" },
     { "path": "./packages/project-memory" },
     { "path": "./packages/persistence" },

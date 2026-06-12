@@ -22,6 +22,7 @@
     "@skyturn/agent-runtime": "workspace:*",
     "@skyturn/git-worktree": "workspace:*",
     "@skyturn/persistence": "workspace:*",
+    "@skyturn/planner": "workspace:*",
     "@skyturn/project-core": "workspace:*",
     "@xyflow/react": "^12.11.0",
     "lucide-react": "^1.17.0",

@@ -1,10 +1,102 @@
 export type WorkflowMode = "fast" | "plan";
 export type SessionKind = "plan" | "canvas";
-export type AgentKind = "hermes" | "codex" | "gemini" | "claude-code";
+export type AgentKind = "hermes" | "codex" | "gemini" | "claude-code" | "openclaw";
 export type NodeStatus = "pending" | "running" | "retrying" | "completed" | "failed";
 export type NodeModalTab = "Output" | "Changes" | "Context";
+export type AgentAvailabilityStatus = "available" | "missing" | "needs-auth" | "unhealthy";
+export type AgentSupportLevel = "mock-only" | "detected-only" | "experimental-run" | "supported-run";
+export type AgentCapability =
+  | "chat"
+  | "file-read"
+  | "file-write"
+  | "shell"
+  | "software-control"
+  | "mcp"
+  | "worktree"
+  | "resume";
+export type AgentRunStatus =
+  | "queued"
+  | "running"
+  | "waiting-input"
+  | "requires-approval"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "timed-out";
+export type RunEventKind = "output" | "status" | "error" | "approval" | "progress" | "evidence";
+export type EvidenceCheckStatus = "passed" | "failed" | "skipped";
 
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
+export const RUN_EVENT_PROTOCOL_VERSION = 1;
+export const AGENT_SUPPORT_LEVELS: AgentSupportLevel[] = [
+  "mock-only",
+  "detected-only",
+  "experimental-run",
+  "supported-run",
+];
+
+export interface AgentDescriptor {
+  kind: AgentKind;
+  label: string;
+  executablePath: string | null;
+  version: string | null;
+  status: AgentAvailabilityStatus;
+  supportLevel: AgentSupportLevel;
+  capabilities: AgentCapability[];
+  configFiles: string[];
+}
+
+export interface AgentRun {
+  id: string;
+  nodeId: string;
+  sessionId: string;
+  projectRoot: string;
+  worktreePath: string;
+  agentKind: AgentKind;
+  status: AgentRunStatus;
+  startedAt: string;
+  endedAt?: string;
+}
+
+export interface StartAgentRunInput {
+  protocolVersion: typeof RUN_EVENT_PROTOCOL_VERSION;
+  runId?: string;
+  nodeId: string;
+  sessionId: string;
+  projectRoot: string;
+  worktreePath: string;
+  agentKind: AgentKind;
+  prompt: string;
+}
+
+export interface RunEvent {
+  protocolVersion: typeof RUN_EVENT_PROTOCOL_VERSION;
+  runId: string;
+  seq: number;
+  timestamp: string;
+  kind: RunEventKind;
+  payload: Record<string, unknown>;
+}
+
+export interface EvidenceCheck {
+  kind: "run-exit" | "git" | "test" | "typecheck" | "build" | "review";
+  name: string;
+  status: EvidenceCheckStatus;
+  detail?: string;
+}
+
+export interface RunEvidence {
+  runId: string;
+  status: AgentRunStatus;
+  exitCode: number | null;
+  changesetId: string | null;
+  checks: EvidenceCheck[];
+  artifacts: string[];
+  review: EvidenceCheck | null;
+  errorReason: string | null;
+  cancelReason: string | null;
+  completedAt: string | null;
+}
 
 export interface ImportedProject {
   id: string;
@@ -97,4 +189,28 @@ export interface Changeset {
   };
   patchPreview: string;
   source: "mock" | "git";
+}
+
+export function hasConcreteRunEvidence(evidence: RunEvidence | null | undefined): boolean {
+  if (!evidence) return false;
+  if (evidence.exitCode === 0) return true;
+  if (evidence.changesetId) return true;
+  if (evidence.artifacts.length > 0) return true;
+  if (evidence.review?.status === "passed") return true;
+  return evidence.checks.some((check) => check.status === "passed");
+}
+
+export function deriveNodeStatusFromEvidence(
+  run: AgentRun | null | undefined,
+  evidence: RunEvidence | null | undefined,
+): NodeStatus {
+  if (!run) return "pending";
+  if (run.status === "queued") return "pending";
+  if (run.status === "running" || run.status === "waiting-input" || run.status === "requires-approval") {
+    return "running";
+  }
+  if (run.status === "succeeded") {
+    return hasConcreteRunEvidence(evidence) ? "completed" : "failed";
+  }
+  return "failed";
 }

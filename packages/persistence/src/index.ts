@@ -1,5 +1,14 @@
 import type { EditorAdapter, EditorKind } from "@skyturn/git-worktree";
-import type { CanvasSessionTab, Changeset, ImportedProject } from "@skyturn/project-core";
+import type {
+  AgentDescriptor,
+  AgentRun,
+  CanvasSessionTab,
+  Changeset,
+  ImportedProject,
+  RunEvent,
+  RunEvidence,
+  StartAgentRunInput,
+} from "@skyturn/project-core";
 
 export interface OpenProjectResult {
   canceled: boolean;
@@ -16,6 +25,15 @@ export interface DevflowApi {
   loadWorkspace: () => Promise<unknown | null>;
   saveWorkspace: (state: unknown) => Promise<{ ok: boolean }>;
   openEditor: (editor: EditorKind, worktreePath: string) => Promise<{ ok: boolean; message: string }>;
+  discoverAgents: () => Promise<{ protocolVersion: number; agents: AgentDescriptor[] }>;
+  getAgentHealth: () => Promise<{ protocolVersion: number; agents: AgentDescriptor[] }>;
+  startAgentRun: (input: StartAgentRunInput) => Promise<{ protocolVersion: number; run: AgentRun }>;
+  sendRunMessage: (runId: string, message: string) => Promise<{ protocolVersion: number; ok: boolean }>;
+  cancelAgentRun: (runId: string, reason: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;
+  getRunEvents: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; events: RunEvent[] }>;
+  listAgentRuns: () => Promise<{ protocolVersion: number; runs: AgentRun[] }>;
+  getRunEvidence: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;
+  onRunEvent: (listener: (event: RunEvent) => void) => () => void;
 }
 
 declare global {
@@ -28,6 +46,10 @@ export interface WorkspaceState {
   projects: ImportedProject[];
   sessions: CanvasSessionTab[];
   changesets: Record<string, Changeset>;
+  agents: AgentDescriptor[];
+  runs: Record<string, AgentRun>;
+  runEvents: Record<string, RunEvent[]>;
+  runEvidence: Record<string, RunEvidence>;
   activeProjectId: string | null;
   activeSessionId: string | null;
   sidebarCollapsed: boolean;
@@ -45,6 +67,10 @@ export function emptyWorkspace(): WorkspaceState {
     projects: [],
     sessions: [],
     changesets: {},
+    agents: [],
+    runs: {},
+    runEvents: {},
+    runEvidence: {},
     activeProjectId: null,
     activeSessionId: null,
     sidebarCollapsed: false,
@@ -105,5 +131,9 @@ function normalizeWorkspace(value: Partial<WorkspaceState> | null): WorkspaceSta
     projects: value?.projects ?? [],
     sessions: value?.sessions ?? [],
     changesets: value?.changesets ?? {},
+    agents: value?.agents ?? [],
+    runs: value?.runs ?? {},
+    runEvents: value?.runEvents ?? {},
+    runEvidence: value?.runEvidence ?? {},
   };
 }

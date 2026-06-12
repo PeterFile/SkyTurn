@@ -14,6 +14,9 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@skyturn/agent-bridge':
+        specifier: workspace:*
+        version: link:../../packages/agent-bridge
       '@skyturn/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
@@ -23,6 +26,9 @@ importers:
       '@skyturn/ui-canvas':
         specifier: workspace:*
         version: link:../../packages/ui-canvas
+      '@xyflow/react':
+        specifier: ^12.11.0
+        version: 12.11.0(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
       react:
         specifier: ^19.2.7
         version: 19.2.7
@@ -52,11 +58,27 @@ importers:
         specifier: ^8.0.16
         version: 8.0.16(@types/node@25.9.3)
 
+  packages/agent-bridge:
+    dependencies:
+      '@skyturn/agent-runtime':
+        specifier: workspace:*
+        version: link:../agent-runtime
+      '@skyturn/project-core':
+        specifier: workspace:*
+        version: link:../project-core
+    devDependencies:
+      '@types/node':
+        specifier: ^25.0.0
+        version: 25.9.3
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.8
+        version: 4.1.8(@types/node@25.9.3)(vite@8.0.16(@types/node@25.9.3))
+
   packages/agent-runtime:
     dependencies:
-      '@skyturn/planner':
-        specifier: workspace:*
-        version: link:../planner
       '@skyturn/project-core':
         specifier: workspace:*
         version: link:../project-core
@@ -128,6 +150,9 @@ importers:
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
+      vitest:
+        specifier: ^4.1.8
+        version: 4.1.8(@types/node@25.9.3)(vite@8.0.16(@types/node@25.9.3))
 
   packages/project-memory:
     devDependencies:
@@ -149,6 +174,9 @@ importers:
       '@skyturn/persistence':
         specifier: workspace:*
         version: link:../persistence
+      '@skyturn/planner':
+        specifier: workspace:*
+        version: link:../planner
       '@skyturn/project-core':
         specifier: workspace:*
         version: link:../project-core

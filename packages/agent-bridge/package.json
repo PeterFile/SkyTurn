@@ -1,5 +1,5 @@
 {
-  "name": "@skyturn/project-core",
+  "name": "@skyturn/agent-bridge",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -16,9 +16,14 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "vitest run src"
+    "test": "pnpm --filter @skyturn/project-core build && pnpm --filter @skyturn/agent-runtime build && vitest run src"
+  },
+  "dependencies": {
+    "@skyturn/agent-runtime": "workspace:*",
+    "@skyturn/project-core": "workspace:*"
   },
   "devDependencies": {
+    "@types/node": "^25.0.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
   }

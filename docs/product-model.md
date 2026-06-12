@@ -8,12 +8,20 @@ The product model is:
 Project -> Canvas Session Tab -> Canvas -> Node -> Node Modal
 ```
 
+Executable work follows:
+
+```text
+Node -> Run -> RunEvidence -> Changeset / Artifact / Test
+```
+
 ## Objects
 
 - `Project`: one imported local folder.
 - `Canvas Session Tab`: one task canvas session. These are not file tabs.
 - `Canvas`: the visual task graph for one session.
 - `Node`: one executable agent task bound to a run and preferably a worktree.
+- `Run`: one local Agent execution managed by `agent-bridge`.
+- `RunEvidence`: concrete completion evidence derived from run events, changesets, checks, artifacts, or review.
 - `Node Modal`: the detail surface for one node.
 
 ## Required Modal Constraint
@@ -34,3 +42,4 @@ Actions such as Stop, Retry, Reassign, Insert Before, and editor launch buttons 
 - No file tabs.
 - No global Agent Console.
 - No inline code editor.
+- Node completion is not derived from Agent text. It must come from `RunEvidence`.

@@ -13,9 +13,11 @@
     "lint": "pnpm run typecheck"
   },
   "dependencies": {
+    "@skyturn/agent-bridge": "workspace:*",
     "@skyturn/persistence": "workspace:*",
     "@skyturn/project-memory": "workspace:*",
     "@skyturn/ui-canvas": "workspace:*",
+    "@xyflow/react": "^12.11.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },

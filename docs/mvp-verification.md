@@ -23,7 +23,8 @@
    - Keep modal tabs constrained to `Output`, `Changes`, and `Context`.
 
 4. Service boundaries
-   - Add adapter interfaces for Hermes, Codex, Gemini, ClaudeCode, git, worktrees, changesets, editors, and persistence.
+   - Add adapter interfaces for Hermes, Codex, Gemini, ClaudeCode, OpenClaw, git, worktrees, changesets, editors, and persistence.
+   - Keep `agent-runtime` contract-only and put discovery/run/event persistence in `agent-bridge`.
    - Use deterministic mock implementations for MVP.
 
 5. Home flow
@@ -65,7 +66,15 @@
     - Provide code-level helpers to create/document the required `.devflow` structure in an imported project.
     - Individual task outputs stay task-local; shared memory consolidation belongs to Hermes/orchestrator.
 
-12. Verification
+12. Agent bridge
+    - Discover local Agents with explicit `supportLevel`.
+    - Stream mock run output through versioned run events.
+    - Run Codex CLI only through the explicit `experimental-run` adapter.
+    - Persist run events to `.devflow/runs/<runId>/events.ndjson`.
+    - Persist readable node output to `.devflow/tasks/<nodeId>/output.md`.
+    - Derive node status from `RunEvidence`, not Agent prose.
+
+13. Verification
     - Run install.
     - Run tests.
     - Run TypeScript typecheck.
@@ -86,6 +95,11 @@
 | Node status lights render | CSS/source and visible sidebar/node status lights | Done |
 | Node modal has exactly Output/Changes/Context | Playwright node modal snapshot | Done |
 | Mock agent execution streams output | Playwright Output tab snapshot | Done |
+| Agent discovery reports `supportLevel` | `packages/agent-bridge/src/index.test.ts` and UI sidebar | Done |
+| Codex CLI adapter is explicit experimental run support | `packages/agent-bridge/src/index.test.ts` | Done |
+| Run events use NDJSON-compatible schema | `packages/project-core/src/index.test.ts`, `packages/agent-bridge/src/index.test.ts` | Done |
+| Run output is persisted under `.devflow` | `packages/agent-bridge/src/index.test.ts` | Done |
+| Node completion uses `RunEvidence` | `packages/project-core/src/index.test.ts`, UI status mapping | Done |
 | Changes tab uses `ChangesetService` | `packages/git-worktree/src/index.ts` and Playwright Changes tab snapshot | Done |
 | Context tab has node/session/worktree metadata | Playwright Context tab snapshot | Done |
 | `.devflow` structure helper exists | `packages/project-memory/src/index.ts`, `apps/desktop/electron/main.ts`, unit tests | Done |
@@ -95,7 +109,7 @@
 ## Verification Evidence
 
 - `pnpm install`: expected after monorepo migration.
-- `pnpm test`: package tests across planner, project-memory, agent-runtime, git-worktree, and orchestrator.
+- `pnpm test`: package tests across project-core, planner, project-memory, agent-runtime, agent-bridge, git-worktree, and orchestrator.
 - `pnpm typecheck`: package and desktop TypeScript checks.
 - `pnpm build`: package builds, Vite renderer build, and Electron build.
 - `pnpm --filter @skyturn/desktop dev:renderer`: starts Vite at `http://127.0.0.1:5173/`.
@@ -117,5 +131,6 @@
 
 ## Known Risk
 
-- Real Hermes-agent, Codex, Gemini, and ClaudeCode CLI integrations are intentionally mocked until their local APIs are verified.
+- Real Hermes-agent, Gemini, ClaudeCode, and OpenClaw CLI integrations are `detected-only` until their local APIs are verified.
+- Codex CLI has an explicit `experimental-run` adapter, but it is not wired as the default desktop run path.
 - Real git worktree creation is modeled behind interfaces first; destructive operations are not part of the MVP shell.

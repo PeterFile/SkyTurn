@@ -1,40 +1,84 @@
-import { convertPlanToCanvas, createFastCanvasSession, createPlanSession } from "@skyturn/planner";
-import type { AgentKind, CanvasNode, CanvasSession, PlanSession } from "@skyturn/project-core";
+import type {
+  AgentCapability,
+  AgentDescriptor,
+  AgentKind,
+  AgentSupportLevel,
+  CanvasSession,
+  PlanSession,
+  RunEvent,
+  StartAgentRunInput,
+} from "@skyturn/project-core";
 
-export interface AgentAdapter {
+export interface AgentAdapterContract {
   kind: AgentKind;
   label: string;
   nativeConfigFiles: string[];
+  supportLevel: AgentSupportLevel;
+  capabilities: AgentCapability[];
 }
 
-export interface HermesOrchestratorAdapter extends AgentAdapter {
+export interface RunEventDraft {
+  kind: RunEvent["kind"];
+  payload: Record<string, unknown>;
+  timestamp?: string;
+}
+
+export interface RunEventSink {
+  emit(event: RunEventDraft): Promise<RunEvent>;
+}
+
+export interface AgentRunHandle {
+  cancel(reason: string): Promise<void>;
+}
+
+export interface LocalAgentAdapterContract extends AgentAdapterContract {
+  detect(): Promise<AgentDescriptor>;
+  startRun(input: StartAgentRunInput, sink: RunEventSink): Promise<AgentRunHandle>;
+  send?(runId: string, message: string): Promise<void>;
+}
+
+export interface HermesOrchestratorAdapter extends AgentAdapterContract {
   createFastSession(input: { projectId: string; goal: string; createdAt: string }): CanvasSession;
   createPlanSession(input: { projectId: string; goal: string; createdAt: string }): PlanSession;
   confirmPlan(session: PlanSession): CanvasSession;
-  nextOutputLine(node: CanvasNode, lineIndex: number): string;
 }
 
-export const agentAdapters: AgentAdapter[] = [
-  { kind: "hermes", label: "Hermes", nativeConfigFiles: ["AGENTS.md"] },
-  { kind: "codex", label: "Codex", nativeConfigFiles: ["AGENTS.md", "skills"] },
-  { kind: "gemini", label: "Gemini", nativeConfigFiles: ["GEMINI.md"] },
-  { kind: "claude-code", label: "ClaudeCode", nativeConfigFiles: ["CLAUDE.md"] },
+export const agentAdapterContracts: AgentAdapterContract[] = [
+  {
+    kind: "hermes",
+    label: "Hermes",
+    nativeConfigFiles: ["AGENTS.md"],
+    supportLevel: "detected-only",
+    capabilities: ["chat", "file-read", "file-write", "shell", "worktree"],
+  },
+  {
+    kind: "codex",
+    label: "Codex CLI",
+    nativeConfigFiles: ["AGENTS.md", "skills"],
+    supportLevel: "detected-only",
+    capabilities: ["chat", "file-read", "file-write", "shell", "mcp", "worktree"],
+  },
+  {
+    kind: "gemini",
+    label: "Gemini",
+    nativeConfigFiles: ["GEMINI.md"],
+    supportLevel: "detected-only",
+    capabilities: ["chat", "file-read", "file-write", "shell"],
+  },
+  {
+    kind: "claude-code",
+    label: "Claude Code",
+    nativeConfigFiles: ["CLAUDE.md"],
+    supportLevel: "detected-only",
+    capabilities: ["chat", "file-read", "file-write", "shell", "mcp", "worktree"],
+  },
+  {
+    kind: "openclaw",
+    label: "OpenClaw",
+    nativeConfigFiles: ["OPENCLAW.md"],
+    supportLevel: "detected-only",
+    capabilities: ["chat", "file-read", "file-write", "shell"],
+  },
 ];
 
-export const mockHermesAdapter: HermesOrchestratorAdapter = {
-  kind: "hermes",
-  label: "Hermes",
-  nativeConfigFiles: ["AGENTS.md"],
-  createFastSession: createFastCanvasSession,
-  createPlanSession,
-  confirmPlan: convertPlanToCanvas,
-  nextOutputLine(node, lineIndex) {
-    const lines = [
-      `${node.agent} accepted run ${node.runId}.`,
-      `${node.agent} is writing task-local output under .devflow/tasks/${node.id}.`,
-      `${node.agent} recorded changeset evidence ${node.changesetId}.`,
-      `${node.agent} checkpoint complete; verification is still required.`,
-    ];
-    return lines[lineIndex] ?? `${node.agent} is waiting for the next checkpoint.`;
-  },
-};
+export const agentAdapters = agentAdapterContracts;
