@@ -98,7 +98,12 @@ import {
   type CanvasNodePositionUpdate,
 } from "./canvasState.js";
 import DecryptedText from "./DecryptedText.js";
-import { renameSessionTitle } from "./sessionState.js";
+import {
+  chooseActiveSessionIdForProject,
+  renameSessionTitle,
+  resolveSessionProjectId,
+  toggleCollapsedProjectId,
+} from "./sessionState.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
 
 gsap.registerPlugin(useGSAP);
@@ -138,6 +143,7 @@ export default function App() {
   const [newTaskOpen, setNewTaskOpen] = useState(false);
   const [newTaskGoal, setNewTaskGoal] = useState("");
   const [newTaskMode, setNewTaskMode] = useState<WorkflowMode>("fast");
+  const [newTaskProjectId, setNewTaskProjectId] = useState<string | null>(null);
   const [bottomGoal, setBottomGoal] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
@@ -152,6 +158,11 @@ export default function App() {
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
       : null;
+  const resolvedNewTaskProjectId = resolveSessionProjectId(
+    workspace.projects,
+    newTaskProjectId,
+    workspace.activeProjectId,
+  );
 
   useEffect(() => {
     let active = true;
@@ -252,7 +263,7 @@ export default function App() {
     [activeCanvasSessionId],
   );
 
-  async function openProject() {
+  async function importProject(initialGoal = "", initialMode: WorkflowMode = "fast") {
     const result = window.devflow ? await window.devflow.openProject() : await openMockProject();
     if (result.canceled || !result.project) return;
 
@@ -261,29 +272,51 @@ export default function App() {
     }
 
     const project = makeProject(result.project);
-    const initialSession = homeGoal.trim()
-      ? createSession(project.id, homeGoal.trim(), homeMode)
+    const goal = initialGoal.trim();
+    const initialSession = goal
+      ? createSession(project.id, goal, initialMode)
       : null;
 
-    setWorkspace((current) => ({
-      ...current,
-      projects: upsertProject(current.projects, project),
-      sessions: initialSession ? [...current.sessions, initialSession] : current.sessions,
-      changesets: initialSession
-        ? { ...current.changesets, ...changesetsForSession(initialSession) }
-        : current.changesets,
-      activeProjectId: project.id,
-      activeSessionId: initialSession?.id ?? current.activeSessionId,
-    }));
+    setWorkspace((current) => {
+      const sessions = initialSession ? [...current.sessions, initialSession] : current.sessions;
+      return {
+        ...current,
+        projects: upsertProject(current.projects, project),
+        sessions,
+        changesets: initialSession
+          ? { ...current.changesets, ...changesetsForSession(initialSession) }
+          : current.changesets,
+        activeProjectId: project.id,
+        activeSessionId:
+          initialSession?.id ?? chooseActiveSessionIdForProject(sessions, current.activeSessionId, project.id),
+      };
+    });
+  }
+
+  function openNewSessionPanel(projectId = workspace.activeProjectId) {
+    setNewTaskProjectId(resolveSessionProjectId(workspace.projects, projectId, workspace.activeProjectId));
+    setNewTaskOpen(true);
+  }
+
+  function toggleNewSessionPanel() {
+    if (!newTaskOpen) {
+      setNewTaskProjectId(
+        resolveSessionProjectId(workspace.projects, workspace.activeProjectId, workspace.activeProjectId),
+      );
+    }
+    setNewTaskOpen((open) => !open);
   }
 
   function addSessionFromComposer() {
-    if (!activeProject || !newTaskGoal.trim()) return;
-    const session = createSession(activeProject.id, newTaskGoal.trim(), newTaskMode);
+    const goal = newTaskGoal.trim();
+    if (!resolvedNewTaskProjectId || !goal) return;
+    const projectId = resolvedNewTaskProjectId;
+    const session = createSession(projectId, goal, newTaskMode);
     setWorkspace((current) => ({
       ...current,
       sessions: [...current.sessions, session],
       changesets: { ...current.changesets, ...changesetsForSession(session) },
+      activeProjectId: projectId,
       activeSessionId: session.id,
     }));
     setNewTaskGoal("");
@@ -490,7 +523,7 @@ export default function App() {
         mode={homeMode}
         onGoalChange={setHomeGoal}
         onModeChange={setHomeMode}
-        onOpenProject={openProject}
+        onOpenProject={() => void importProject(homeGoal, homeMode)}
       />
     );
   }
@@ -514,21 +547,27 @@ export default function App() {
             sessions={workspace.sessions}
             activeProjectId={activeProject.id}
             activeSessionId={workspace.activeSessionId}
-            onNewSession={() => setNewTaskOpen(true)}
+            collapsedProjectIds={workspace.collapsedProjectIds}
+            onNewSession={() => openNewSessionPanel()}
+            onOpenProject={() => void importProject()}
             onSelectProject={(projectId) =>
               setWorkspace((current) => {
-                const keepsActiveSession = current.sessions.some(
-                  (session) => session.id === current.activeSessionId && session.projectId === projectId,
+                const activeSessionId = chooseActiveSessionIdForProject(
+                  current.sessions,
+                  current.activeSessionId,
+                  projectId,
                 );
-                const activeSessionId = keepsActiveSession
-                  ? current.activeSessionId
-                  : current.sessions.find((session) => session.projectId === projectId)?.id ?? null;
-
                 return { ...current, activeProjectId: projectId, activeSessionId };
               })
             }
             onSelectSession={(sessionId, projectId) =>
               setWorkspace((current) => ({ ...current, activeProjectId: projectId, activeSessionId: sessionId }))
+            }
+            onToggleProjectSessions={(projectId) =>
+              setWorkspace((current) => ({
+                ...current,
+                collapsedProjectIds: toggleCollapsedProjectId(current.collapsedProjectIds, projectId),
+              }))
             }
           />
         )}
@@ -542,7 +581,7 @@ export default function App() {
               sessions: renameSessionTitle(current.sessions, sessionId, title, new Date().toISOString()),
             }))
           }
-          onToggleNewTask={() => setNewTaskOpen((open) => !open)}
+          onToggleNewTask={toggleNewSessionPanel}
         />
 
         <main className="stage">
@@ -559,7 +598,7 @@ export default function App() {
               onOpenNode={openSelectedNode}
             />
           )}
-          {!activeSession && <EmptyWorkspace onNewTask={() => setNewTaskOpen(true)} />}
+          {!activeSession && <EmptyWorkspace onNewTask={() => openNewSessionPanel()} />}
         </main>
       </div>
 
@@ -582,8 +621,11 @@ export default function App() {
         <NewSessionPanel
           goal={newTaskGoal}
           mode={newTaskMode}
+          projects={workspace.projects}
+          selectedProjectId={resolvedNewTaskProjectId}
           onGoalChange={setNewTaskGoal}
           onModeChange={setNewTaskMode}
+          onProjectChange={setNewTaskProjectId}
           onClose={() => setNewTaskOpen(false)}
           onCreate={addSessionFromComposer}
         />
@@ -715,18 +757,26 @@ function Sidebar({
   sessions,
   activeProjectId,
   activeSessionId,
+  collapsedProjectIds,
   onNewSession,
+  onOpenProject,
   onSelectProject,
   onSelectSession,
+  onToggleProjectSessions,
 }: {
   projects: ImportedProject[];
   sessions: CanvasSessionTab[];
   activeProjectId: string;
   activeSessionId: string | null;
+  collapsedProjectIds: string[];
   onNewSession: () => void;
+  onOpenProject: () => void;
   onSelectProject: (projectId: string) => void;
   onSelectSession: (sessionId: string, projectId: string) => void;
+  onToggleProjectSessions: (projectId: string) => void;
 }) {
+  const collapsedProjects = useMemo(() => new Set(collapsedProjectIds), [collapsedProjectIds]);
+
   return (
     <div className="sidebar-inner">
       <div className="sidebar-scroll">
@@ -735,35 +785,64 @@ function Sidebar({
           <span>New tab</span>
           <ChevronRight size={14} />
         </button>
-        <h2>Projects</h2>
-        {projects.map((project) => (
-          <section className="sidebar-project-group" key={project.id}>
-            <button
-              className={project.id === activeProjectId ? "sidebar-project-row active" : "sidebar-project-row"}
-              onClick={() => onSelectProject(project.id)}
-            >
-              <FolderOpen size={15} />
-              <span>{project.name}</span>
-            </button>
-            <div className="sidebar-session-list">
-              {sessions
-                .filter((session) => session.projectId === project.id)
-                .map((session) => (
-                  <button
-                    key={session.id}
-                    className={session.id === activeSessionId ? "sidebar-session-row active" : "sidebar-session-row"}
-                    onClick={() => onSelectSession(session.id, project.id)}
-                  >
-                    <span className="sidebar-session-title">{session.title}</span>
-                    <small>{formatRelativeTime(session.updatedAt)}</small>
-                  </button>
-                ))}
-              {sessions.every((session) => session.projectId !== project.id) && (
-                <div className="sidebar-empty">No sessions</div>
+        <div className="sidebar-section-heading">
+          <h2>Projects</h2>
+          <button
+            className="sidebar-hover-action"
+            type="button"
+            title="Add project"
+            aria-label="Add project"
+            onClick={onOpenProject}
+          >
+            <FolderOpen size={14} />
+          </button>
+        </div>
+        {projects.map((project) => {
+          const projectSessions = sessions.filter((session) => session.projectId === project.id);
+          const collapsed = collapsedProjects.has(project.id);
+          const collapseButtonClassName = collapsed
+            ? "sidebar-hover-action project-collapse collapsed"
+            : "sidebar-hover-action project-collapse";
+
+          return (
+            <section className="sidebar-project-group" key={project.id}>
+              <div className="sidebar-project-line">
+                <button
+                  className={project.id === activeProjectId ? "sidebar-project-row active" : "sidebar-project-row"}
+                  onClick={() => onSelectProject(project.id)}
+                >
+                  <FolderOpen size={15} />
+                  <span>{project.name}</span>
+                </button>
+                <button
+                  className={collapseButtonClassName}
+                  type="button"
+                  title={collapsed ? "Expand sessions" : "Collapse sessions"}
+                  aria-label={collapsed ? "Expand project sessions" : "Collapse project sessions"}
+                  aria-expanded={!collapsed}
+                  onClick={() => onToggleProjectSessions(project.id)}
+                >
+                  <ChevronRight size={14} />
+                </button>
+              </div>
+              {!collapsed && (
+                <div className="sidebar-session-list">
+                  {projectSessions.map((session) => (
+                    <button
+                      key={session.id}
+                      className={session.id === activeSessionId ? "sidebar-session-row active" : "sidebar-session-row"}
+                      onClick={() => onSelectSession(session.id, project.id)}
+                    >
+                      <span className="sidebar-session-title">{session.title}</span>
+                      <small>{formatRelativeTime(session.updatedAt)}</small>
+                    </button>
+                  ))}
+                  {projectSessions.length === 0 && <div className="sidebar-empty">No sessions</div>}
+                </div>
               )}
-            </div>
-          </section>
-        ))}
+            </section>
+          );
+        })}
       </div>
       <button className="sidebar-settings" type="button" title="Settings" aria-label="Settings">
         <Settings size={15} />
@@ -776,20 +855,27 @@ function Sidebar({
 function NewSessionPanel({
   goal,
   mode,
+  projects,
+  selectedProjectId,
   onGoalChange,
   onModeChange,
+  onProjectChange,
   onClose,
   onCreate,
 }: {
   goal: string;
   mode: WorkflowMode;
+  projects: ImportedProject[];
+  selectedProjectId: string | null;
   onGoalChange: (goal: string) => void;
   onModeChange: (mode: WorkflowMode) => void;
+  onProjectChange: (projectId: string) => void;
   onClose: () => void;
   onCreate: () => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const hasGoal = goal.trim().length > 0;
+  const canCreate = hasGoal && selectedProjectId !== null;
 
   return (
     <div className="session-panel-backdrop" role="presentation" onMouseDown={onClose}>
@@ -832,12 +918,28 @@ function NewSessionPanel({
           >
             <Plus size={17} />
           </button>
+          <label className="session-project-picker">
+            <FolderOpen size={15} />
+            <select
+              value={selectedProjectId ?? ""}
+              disabled={projects.length === 0}
+              aria-label="Project"
+              onChange={(event) => onProjectChange(event.target.value)}
+            >
+              {projects.length === 0 && <option value="">No projects</option>}
+              {projects.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <ModeSwitch mode={mode} onChange={onModeChange} compact />
           <span className="session-panel-spacer" />
           <button
             className="icon-button session-panel-submit"
             type="submit"
-            disabled={!hasGoal}
+            disabled={!canCreate}
             title="Create"
           >
             <ArrowUp size={18} />

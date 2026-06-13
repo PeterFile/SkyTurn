@@ -53,6 +53,7 @@ export interface WorkspaceState {
   activeProjectId: string | null;
   activeSessionId: string | null;
   sidebarCollapsed: boolean;
+  collapsedProjectIds: string[];
 }
 
 export interface WorkspaceStore {
@@ -74,6 +75,7 @@ export function emptyWorkspace(): WorkspaceState {
     activeProjectId: null,
     activeSessionId: null,
     sidebarCollapsed: false,
+    collapsedProjectIds: [],
   };
 }
 
@@ -135,5 +137,6 @@ function normalizeWorkspace(value: Partial<WorkspaceState> | null): WorkspaceSta
     runs: value?.runs ?? {},
     runEvents: value?.runEvents ?? {},
     runEvidence: value?.runEvidence ?? {},
+    collapsedProjectIds: Array.isArray(value?.collapsedProjectIds) ? value.collapsedProjectIds : [],
   };
 }

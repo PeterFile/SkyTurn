@@ -1,4 +1,4 @@
-import type { CanvasSessionTab } from "@skyturn/project-core";
+import type { CanvasSessionTab, ImportedProject } from "@skyturn/project-core";
 
 export function renameSessionTitle(
   sessions: CanvasSessionTab[],
@@ -17,4 +17,37 @@ export function renameSessionTitle(
   });
 
   return changed ? nextSessions : sessions;
+}
+
+export function resolveSessionProjectId(
+  projects: ImportedProject[],
+  selectedProjectId: string | null | undefined,
+  activeProjectId: string | null | undefined,
+): string | null {
+  if (selectedProjectId && projects.some((project) => project.id === selectedProjectId)) {
+    return selectedProjectId;
+  }
+
+  if (activeProjectId && projects.some((project) => project.id === activeProjectId)) {
+    return activeProjectId;
+  }
+
+  return projects[0]?.id ?? null;
+}
+
+export function chooseActiveSessionIdForProject(
+  sessions: CanvasSessionTab[],
+  activeSessionId: string | null,
+  projectId: string,
+): string | null {
+  const activeSession = sessions.find((session) => session.id === activeSessionId);
+  if (activeSession?.projectId === projectId) return activeSession.id;
+
+  return sessions.find((session) => session.projectId === projectId)?.id ?? null;
+}
+
+export function toggleCollapsedProjectId(collapsedProjectIds: string[], projectId: string): string[] {
+  return collapsedProjectIds.includes(projectId)
+    ? collapsedProjectIds.filter((id) => id !== projectId)
+    : [...collapsedProjectIds, projectId];
 }
