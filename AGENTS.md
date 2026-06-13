@@ -61,5 +61,6 @@
 - Use `pnpm` for this monorepo. The root pins `pnpm@10.28.2`; Corepack-selected `pnpm@11.6.0` fails on the local Node `20.19.0` runtime.
 - Keep root package scripts as `turbo run` delegators. Put actual build, typecheck, lint, test, and dev commands in the package-level `package.json` files.
 - Workspace packages live under `apps/*` and `packages/*`. Internal imports must use `workspace:*` package dependencies, not cross-package relative paths.
+- Browser-consumed workspace packages that emit ESM `dist` must use `.js` suffixes for local source imports/exports so compiled files resolve in Vite/Node ESM.
 - Electron is pinned to `41.5.1` because newer Electron package metadata required Node `>=22.12.0`, while the initial local Node runtime was `20.19.0`.
 - Update this file only for reusable project knowledge, not story-specific notes.

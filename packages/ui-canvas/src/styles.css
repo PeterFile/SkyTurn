@@ -692,6 +692,7 @@ h2 {
   --sk-info: #3b6ea8;
   --sk-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
   --agent-card-width: 324px;
+  --agent-card-height: 202px;
   --agent-card-radius: 22px;
   --agent-surface: rgba(255, 255, 255, 0.82);
   --agent-surface-strong: rgba(255, 255, 255, 0.94);
@@ -823,7 +824,7 @@ h2,
 h1 {
   font-size: 20px;
   line-height: 1.25;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
 }
 
 h2 {
@@ -1545,7 +1546,7 @@ h2 {
   color: #0b1020;
   font-size: 17px;
   font-weight: 760;
-  letter-spacing: -0.035em;
+  letter-spacing: 0;
   line-height: 1.15;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1609,7 +1610,7 @@ h2 {
   color: #475569;
   font-size: 13px;
   font-weight: 450;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   line-height: 1.38;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
@@ -1624,7 +1625,7 @@ h2 {
   color: #64748b;
   font-size: 12px;
   font-weight: 620;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   white-space: nowrap;
 }
 
@@ -1657,6 +1658,228 @@ h2 {
 .footer-separator {
   flex: 0 0 auto;
   color: rgba(100, 116, 139, 0.72);
+}
+
+/* GSAP-owned runtime object animation layer. React Flow still owns node coordinates. */
+.agent-node-shell {
+  --state-rgb: 148 163 184;
+  position: relative;
+  width: var(--agent-card-width);
+  min-height: var(--agent-card-height);
+  border-radius: var(--agent-card-radius);
+  color: #0f172a;
+  isolation: isolate;
+}
+
+.agent-node-shell.pending {
+  --state-rgb: 148 163 184;
+}
+
+.agent-node-shell.running {
+  --state-rgb: 99 102 241;
+}
+
+.agent-node-shell.retrying {
+  --state-rgb: 217 119 6;
+}
+
+.agent-node-shell.completed {
+  --state-rgb: 47 125 80;
+}
+
+.agent-node-shell.failed {
+  --state-rgb: 180 83 74;
+}
+
+.agent-card {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  gap: 10px;
+  width: 100%;
+  min-height: var(--agent-card-height);
+  overflow: hidden;
+  border: 1px solid var(--agent-hairline);
+  border-radius: var(--agent-card-radius);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.8), transparent 34%),
+    linear-gradient(145deg, var(--agent-surface-strong), rgba(248, 250, 252, 0.8));
+  box-shadow:
+    var(--agent-shadow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    inset 0 -1px 0 rgba(15, 23, 42, 0.025);
+  padding: 18px 18px 16px;
+  text-align: left;
+  cursor: pointer;
+  outline: none;
+  backdrop-filter: blur(16px) saturate(1.06);
+  will-change: transform;
+}
+
+.agent-card::before {
+  position: absolute;
+  inset: 1px;
+  z-index: -1;
+  border-radius: calc(var(--agent-card-radius) - 1px);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.9), transparent 28%);
+  content: "";
+  pointer-events: none;
+}
+
+.agent-node-shell:hover .agent-card {
+  border-color: rgba(148, 163, 184, 0.34);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.86), transparent 34%),
+    linear-gradient(145deg, #ffffff, rgba(248, 250, 252, 0.9));
+  box-shadow:
+    var(--agent-shadow-hover),
+    inset 0 1px 0 rgba(255, 255, 255, 0.96),
+    inset 0 -1px 0 rgba(15, 23, 42, 0.03);
+}
+
+.agent-card:focus-visible,
+.agent-node-shell.selected .agent-card,
+.react-flow__node.selected .agent-node-shell .agent-card {
+  border-color: rgba(59, 130, 246, 0.28);
+  box-shadow:
+    var(--agent-shadow-hover),
+    0 0 0 4px var(--agent-focus),
+    inset 0 1px 0 rgba(255, 255, 255, 0.96);
+}
+
+.agent-node-shell.running .agent-card {
+  box-shadow:
+    0 28px 64px rgba(79, 70, 229, 0.13),
+    0 10px 24px rgba(6, 182, 212, 0.07),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+.agent-node-shell .energy-frame {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  padding: 0;
+  border-radius: inherit;
+  background: none;
+  opacity: 1;
+  filter: none;
+  pointer-events: none;
+  -webkit-mask: none;
+  mask: none;
+}
+
+.energy-frame-base,
+.energy-glint {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.25px;
+  vector-effect: non-scaling-stroke;
+}
+
+.energy-glint {
+  stroke-width: 1.45px;
+  opacity: 0;
+  filter: drop-shadow(0 0 6px rgb(var(--state-rgb) / 0.18));
+}
+
+.agent-node-shell.running .energy-glint {
+  filter: drop-shadow(0 0 8px rgb(var(--state-rgb) / 0.22));
+}
+
+.agent-handles {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  opacity: 0;
+  pointer-events: none;
+  transform: scale(0.92);
+  transform-origin: center;
+}
+
+.agent-node-shell .react-flow__handle.node-handle {
+  width: 9px;
+  height: 9px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  background: rgba(248, 250, 252, 0.98);
+  box-shadow:
+    0 0 0 1px rgb(var(--state-rgb) / 0.42),
+    0 6px 14px rgba(15, 23, 42, 0.12);
+  opacity: 1;
+  pointer-events: all;
+  scale: 1;
+  transition: none;
+}
+
+.agent-node-shell .agent-node-menu {
+  opacity: 0.72;
+}
+
+.runtime-phrase {
+  position: relative;
+  min-height: 17px;
+  margin: -1px 0 0;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 560;
+  letter-spacing: 0;
+  line-height: 1.35;
+}
+
+.runtime-phrase-copy {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-phrase-copy.exiting {
+  position: absolute;
+  inset: 0;
+}
+
+.agent-node-shell .agent-dot {
+  background: rgb(var(--state-rgb));
+  will-change: transform, opacity;
+}
+
+.agent-edge-flow {
+  animation: none;
+  will-change: stroke-dashoffset, opacity;
+}
+
+.agent-edge.running .agent-edge-flow {
+  stroke: rgba(125, 145, 255, 0.72);
+}
+
+.agent-edge.retrying .agent-edge-flow {
+  stroke: rgba(217, 119, 6, 0.58);
+}
+
+.agent-edge.failed .agent-edge-flow {
+  stroke: rgba(220, 107, 101, 0.58);
+}
+
+.modal-backdrop {
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  padding: 0;
+  background: rgba(17, 24, 39, 0.22);
+}
+
+.node-modal {
+  width: min(440px, calc(100vw - 28px));
+  height: 100vh;
+  max-height: none;
+  border-width: 0 0 0 1px;
+  border-radius: 0;
+  box-shadow: -16px 0 42px rgba(15, 23, 42, 0.14);
 }
 
 @media (prefers-reduced-motion: reduce) {

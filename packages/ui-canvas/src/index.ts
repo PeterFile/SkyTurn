@@ -1,1 +1,1 @@
-export { default as SkyTurnApp } from "./App";
+export { default as SkyTurnApp } from "./App.js";

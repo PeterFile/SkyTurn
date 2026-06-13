@@ -16,7 +16,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "lint": "pnpm run typecheck"
+    "lint": "pnpm run typecheck",
+    "test": "vitest run src"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",
@@ -35,6 +36,7 @@
   "devDependencies": {
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   }
 }
