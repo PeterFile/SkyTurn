@@ -560,14 +560,96 @@ h2 {
 
 .modal-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
-  overflow: auto hidden;
+  overflow: visible;
   border-bottom: 1px solid var(--sk-border-modal);
 }
 
 .modal-actions button {
   flex: 0 0 auto;
   padding: 0 10px;
+}
+
+.editor-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.modal-actions .editor-menu-trigger {
+  width: 54px;
+  gap: 6px;
+  padding: 0 8px;
+}
+
+.editor-menu-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  display: grid;
+  min-width: 168px;
+  gap: 2px;
+  border: 1px solid var(--sk-border-modal);
+  border-radius: var(--sk-radius-md);
+  background: var(--sk-white);
+  box-shadow: 0 14px 34px var(--sk-shadow-warm-md);
+  padding: 8px;
+}
+
+.modal-actions .editor-menu-item {
+  justify-content: flex-start;
+  min-height: 28px;
+  border: 0;
+  background: transparent;
+  padding: 0 6px;
+  font-weight: 600;
+}
+
+.modal-actions .editor-menu-item:hover,
+.modal-actions .editor-menu-item:focus-visible {
+  background: var(--sk-surface-warm-muted);
+}
+
+.editor-menu-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--sk-radius-xs);
+  color: var(--sk-white);
+  font-size: 8px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.editor-menu-icon.vscode {
+  background: #38a5ff;
+}
+
+.editor-menu-icon.zed {
+  background: #4b5563;
+}
+
+.editor-menu-icon.antigravity {
+  background: #64748b;
+}
+
+.editor-menu-icon.finder {
+  background: #60a5fa;
+}
+
+.editor-menu-icon.terminal {
+  background: #475569;
+}
+
+.editor-menu-icon.iterm2 {
+  background: #1f2937;
+}
+
+.editor-menu-icon.xcode {
+  background: #0ea5e9;
 }
 
 .modal-tabs {
