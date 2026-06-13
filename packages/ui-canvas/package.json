@@ -20,6 +20,7 @@
     "test": "vitest run src"
   },
   "dependencies": {
+    "@fontsource-variable/space-grotesk": "^5.2.10",
     "@gsap/react": "^2.1.2",
     "@skyturn/agent-runtime": "workspace:*",
     "@skyturn/git-worktree": "workspace:*",

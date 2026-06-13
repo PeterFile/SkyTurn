@@ -820,7 +820,7 @@ function CanvasView({
         maxZoom={1.35}
         proOptions={{ hideAttribution: true }}
       >
-        <Background color="#d8dee8" gap={18} size={1.15} />
+        <Background color="var(--sk-canvas-grid)" gap={18} size={1.15} />
         <Controls showInteractive={false} />
       </ReactFlow>
     </section>
@@ -1306,13 +1306,13 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
       >
         <defs>
           <linearGradient id={runningGradientId} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="#22d3ee" />
-            <stop offset="46%" stopColor="#818cf8" />
-            <stop offset="100%" stopColor="#a78bfa" />
+            <stop offset="0%" stopColor="var(--sk-status-running)" />
+            <stop offset="52%" stopColor="var(--sk-status-running-mid)" />
+            <stop offset="100%" stopColor="var(--sk-status-running-strong)" />
           </linearGradient>
           <linearGradient id={retryingGradientId} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="#f59e0b" />
-            <stop offset="100%" stopColor="#fbbf24" />
+            <stop offset="0%" stopColor="var(--sk-status-retrying)" />
+            <stop offset="100%" stopColor="var(--sk-status-retrying-mid)" />
           </linearGradient>
         </defs>
         <rect
@@ -1443,15 +1443,15 @@ function nodeTooltipForNode(node: CanvasNode, runtime: NodeRuntimeState): string
 function edgeColorForStatus(status: NodeStatus): string {
   switch (status) {
     case "running":
-      return "#7c8cff";
+      return "var(--sk-edge-active)";
     case "retrying":
-      return "#d97706";
+      return "var(--sk-edge-retrying)";
     case "failed":
-      return "#dc6b65";
+      return "var(--sk-edge-failed)";
     case "completed":
-      return "#a8b4c1";
+      return "var(--sk-edge-completed)";
     case "pending":
-      return "#cbd5e1";
+      return "var(--sk-edge-pending)";
   }
 }
 
@@ -1462,11 +1462,11 @@ function frameStrokeForStatus(status: NodeStatus, runningGradientId: string, ret
     case "retrying":
       return `url(#${retryingGradientId})`;
     case "completed":
-      return "rgba(63, 127, 95, 0.62)";
+      return "var(--sk-frame-completed)";
     case "failed":
-      return "rgba(180, 83, 74, 0.72)";
+      return "var(--sk-frame-failed)";
     case "pending":
-      return "rgba(148, 163, 184, 0.5)";
+      return "var(--sk-frame-pending)";
   }
 }
 
@@ -1477,26 +1477,26 @@ function glintStrokeForStatus(status: NodeStatus, runningGradientId: string, ret
     case "retrying":
       return `url(#${retryingGradientId})`;
     case "completed":
-      return "rgba(34, 197, 94, 0.82)";
+      return "var(--sk-glint-completed)";
     case "failed":
-      return "rgba(220, 107, 101, 0.8)";
+      return "var(--sk-glint-failed)";
     case "pending":
-      return "rgba(148, 163, 184, 0)";
+      return "var(--sk-glint-pending)";
   }
 }
 
 function statusColorForStatus(status: NodeStatus): string {
   switch (status) {
     case "running":
-      return "#6366f1";
+      return "var(--sk-status-running)";
     case "retrying":
-      return "#d97706";
+      return "var(--sk-status-retrying)";
     case "completed":
-      return "#2f7d50";
+      return "var(--sk-status-completed-text)";
     case "failed":
-      return "#b4534a";
+      return "var(--sk-status-failed-text)";
     case "pending":
-      return "#94a3b8";
+      return "var(--sk-status-pending)";
   }
 }
 
