@@ -1,6 +1,14 @@
 import type { CanvasNode, Changeset, WorktreeMetadata } from "@skyturn/project-core";
 
-export type EditorKind = "vscode" | "cursor" | "zed";
+export type EditorKind =
+  | "vscode"
+  | "cursor"
+  | "zed"
+  | "antigravity"
+  | "finder"
+  | "terminal"
+  | "iterm2"
+  | "xcode";
 
 export interface GitService {
   getBaseCommit(projectId: string): Promise<string>;

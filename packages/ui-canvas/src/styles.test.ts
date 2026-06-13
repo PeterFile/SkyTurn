@@ -44,4 +44,14 @@ describe("SkyTurn UI style tokens", () => {
     expect(source).not.toContain("56, 168, 255");
     expect(source).not.toContain("56 168 255");
   });
+
+  it("renders editor launch actions through a single dropdown trigger", async () => {
+    const appSource = await readSource("./App.tsx");
+
+    expect(appSource).toContain('className="editor-menu-trigger"');
+    expect(appSource).toContain('aria-haspopup="menu"');
+    expect(appSource).not.toContain("Open Worktree in VSCode");
+    expect(appSource).not.toContain("Open Worktree in Cursor");
+    expect(appSource).not.toContain("Open Worktree in Zed");
+  });
 });

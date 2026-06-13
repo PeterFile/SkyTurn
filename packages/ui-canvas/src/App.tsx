@@ -22,8 +22,8 @@ import {
   AlertTriangle,
   ArrowUp,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
-  ExternalLink,
   FolderOpen,
   GitBranch,
   MoreHorizontal,
@@ -99,6 +99,7 @@ import {
 } from "./canvasState.js";
 import DecryptedText from "./DecryptedText.js";
 import { renameSessionTitle } from "./sessionState.js";
+import { DEFAULT_EDITOR_LAUNCH_OPTION, EDITOR_LAUNCH_OPTIONS, type EditorLaunchOption } from "./editorLaunchOptions.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
 
 gsap.registerPlugin(useGSAP);
@@ -1791,18 +1792,7 @@ function NodeModal({
             <Plus size={15} />
             Insert Before
           </button>
-          <button onClick={() => onOpenEditor("vscode")}>
-            <ExternalLink size={15} />
-            Open Worktree in VSCode
-          </button>
-          <button onClick={() => onOpenEditor("cursor")}>
-            <ExternalLink size={15} />
-            Open Worktree in Cursor
-          </button>
-          <button onClick={() => onOpenEditor("zed")}>
-            <ExternalLink size={15} />
-            Open Worktree in Zed
-          </button>
+          <EditorLaunchMenu onOpenEditor={onOpenEditor} />
         </div>
         <nav className="modal-tabs" aria-label="Node details">
           {NODE_MODAL_TABS.map((item) => (
@@ -1822,6 +1812,81 @@ function NodeModal({
         </div>
       </section>
     </div>
+  );
+}
+
+function EditorLaunchMenu({ onOpenEditor }: { onOpenEditor: (editor: EditorKind) => void }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const menuId = useId();
+  const triggerOption = DEFAULT_EDITOR_LAUNCH_OPTION;
+
+  useEffect(() => {
+    if (!open) return;
+
+    function handlePointerDown(event: PointerEvent) {
+      const root = rootRef.current;
+      if (!root || root.contains(event.target as Node)) return;
+      setOpen(false);
+    }
+
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  function openEditor(option: EditorLaunchOption) {
+    setOpen(false);
+    onOpenEditor(option.editor);
+  }
+
+  return (
+    <div ref={rootRef} className="editor-menu">
+      <button
+        className="editor-menu-trigger"
+        type="button"
+        title="Open worktree"
+        aria-label="Open worktree menu"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <EditorLaunchIcon option={triggerOption} />
+        <ChevronDown size={14} aria-hidden="true" />
+      </button>
+      {open && (
+        <div id={menuId} className="editor-menu-list" role="menu" aria-label="Open worktree with">
+          {EDITOR_LAUNCH_OPTIONS.map((option) => (
+            <button
+              key={option.editor}
+              className="editor-menu-item"
+              type="button"
+              role="menuitem"
+              onClick={() => openEditor(option)}
+            >
+              <EditorLaunchIcon option={option} />
+              <span>{option.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EditorLaunchIcon({ option }: { option: EditorLaunchOption }) {
+  return (
+    <span className={`editor-menu-icon ${option.tone}`} aria-hidden="true">
+      {option.iconText}
+    </span>
   );
 }
 
