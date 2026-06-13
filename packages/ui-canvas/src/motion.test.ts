@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   EDGE_MOTION_BY_STATUS,
+  MOTION_DURATION,
   NODE_MOTION_BY_STATUS,
   phraseForRuntime,
   shouldLoopEdge,
@@ -31,6 +32,14 @@ describe("agent runtime motion policy", () => {
     expect(NODE_MOTION_BY_STATUS.failed.oneShot).toBe("failure-interruption");
     expect(EDGE_MOTION_BY_STATUS.completed.loop).toBe(false);
     expect(EDGE_MOTION_BY_STATUS.failed.loop).toBe(false);
+  });
+
+  it("keeps status animation policies restrained and non-disruptive", () => {
+    expect(MOTION_DURATION.energyLoop).toBe(2.2);
+    expect(NODE_MOTION_BY_STATUS.pending.frameOpacity).toBeLessThanOrEqual(0.3);
+    expect(NODE_MOTION_BY_STATUS.retrying.frameDasharray).toBe("6 8");
+    expect(NODE_MOTION_BY_STATUS.failed.frameDasharray).toBe("100");
+    expect(EDGE_MOTION_BY_STATUS.retrying.dasharray).toBe("6 8");
   });
 
   it("maps runtime phases to terse lifecycle phrases", () => {

@@ -8,6 +8,9 @@ export const MOTION_DURATION = {
   enter: 0.38,
   energyLoop: 2.2,
   shimmer: 0.68,
+  retryPulse: 0.42,
+  retryBackoff: 0.86,
+  failureFlash: 0.24,
   inspector: 0.28,
 } as const;
 
@@ -49,15 +52,15 @@ export const NODE_MOTION_BY_STATUS: Record<NodeStatus, NodeMotionPolicy> = {
     loop: false,
     oneShot: null,
     frameDasharray: "100",
-    frameOpacity: 0.34,
+    frameOpacity: 0.28,
     glintDasharray: "0 100",
   },
   running: {
     loop: true,
     oneShot: null,
     frameDasharray: "100",
-    frameOpacity: 0.72,
-    glintDasharray: "12 88",
+    frameOpacity: 0.68,
+    glintDasharray: "10 90",
   },
   retrying: {
     loop: true,
@@ -76,8 +79,8 @@ export const NODE_MOTION_BY_STATUS: Record<NodeStatus, NodeMotionPolicy> = {
   failed: {
     loop: false,
     oneShot: "failure-interruption",
-    frameDasharray: "10 8",
-    frameOpacity: 0.58,
+    frameDasharray: "100",
+    frameOpacity: 0.5,
     glintDasharray: "10 90",
   },
 };
@@ -85,7 +88,7 @@ export const NODE_MOTION_BY_STATUS: Record<NodeStatus, NodeMotionPolicy> = {
 export const EDGE_MOTION_BY_STATUS: Record<NodeStatus, EdgeMotionPolicy> = {
   pending: { loop: false, dasharray: "0 1", opacity: 0.24 },
   running: { loop: true, dasharray: "18 150", opacity: 0.72 },
-  retrying: { loop: false, dasharray: "6 12", opacity: 0.54 },
+  retrying: { loop: false, dasharray: "6 8", opacity: 0.54 },
   completed: { loop: false, dasharray: "0 1", opacity: 0.26 },
   failed: { loop: false, dasharray: "10 14", opacity: 0.58 },
 };

@@ -7,9 +7,11 @@ import {
   Position,
   ReactFlow,
   getSmoothStepPath,
+  useNodesState,
   type Edge as FlowEdge,
   type EdgeProps,
   type EdgeTypes,
+  type NodeChange,
   type Node as FlowNode,
   type NodeProps,
   type NodeTypes,
@@ -18,7 +20,9 @@ import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
 import {
   AlertTriangle,
+  ArrowUp,
   CheckCircle2,
+  ChevronRight,
   ExternalLink,
   FolderOpen,
   GitBranch,
@@ -28,7 +32,7 @@ import {
   Play,
   Plus,
   RefreshCw,
-  Send,
+  Settings,
   Square,
   Users,
   X,
@@ -85,10 +89,17 @@ import {
   MOTION_DISTANCE,
   MOTION_DURATION,
   NODE_MOTION_BY_STATUS,
-  phraseForRuntime,
   shouldLoopEdge,
   shouldLoopNode,
 } from "./motion.js";
+import {
+  applyCanvasNodePositionUpdates,
+  positionUpdatesFromNodeChanges,
+  type CanvasNodePositionUpdate,
+} from "./canvasState.js";
+import DecryptedText from "./DecryptedText.js";
+import { renameSessionTitle } from "./sessionState.js";
+import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
 
 gsap.registerPlugin(useGSAP);
 
@@ -133,7 +144,10 @@ export default function App() {
   const startedBridgeRuns = useRef(new Set<string>());
 
   const activeProject = workspace.projects.find((project) => project.id === workspace.activeProjectId) ?? null;
-  const activeSession = workspace.sessions.find((session) => session.id === workspace.activeSessionId) ?? null;
+  const activeSession =
+    workspace.sessions.find(
+      (session) => session.id === workspace.activeSessionId && session.projectId === activeProject?.id,
+    ) ?? null;
   const selectedNode =
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
@@ -219,6 +233,24 @@ export default function App() {
     setSelectedNodeId(nodeId);
     setModalTab("Output");
   }, []);
+
+  const activeCanvasSessionId = activeSession?.kind === "canvas" ? activeSession.id : null;
+  const updateActiveNodePositions = useCallback(
+    (updates: CanvasNodePositionUpdate[]) => {
+      if (!activeCanvasSessionId || updates.length === 0) return;
+      const updatedAt = new Date().toISOString();
+
+      setWorkspace((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) => {
+          if (session.id !== activeCanvasSessionId || session.kind !== "canvas") return session;
+          const nodes = applyCanvasNodePositionUpdates(session.nodes, updates);
+          return nodes === session.nodes ? session : { ...session, nodes, updatedAt };
+        }),
+      }));
+    },
+    [activeCanvasSessionId],
+  );
 
   async function openProject() {
     const result = window.devflow ? await window.devflow.openProject() : await openMockProject();
@@ -464,67 +496,72 @@ export default function App() {
   }
 
   return (
-    <div className="app-shell">
-      <TopBar
-        project={activeProject}
-        sessions={workspace.sessions.filter((session) => session.projectId === activeProject.id)}
-        activeSessionId={workspace.activeSessionId}
-        newTaskOpen={newTaskOpen}
-        newTaskGoal={newTaskGoal}
-        newTaskMode={newTaskMode}
-        onSelectSession={(sessionId) =>
-          setWorkspace((current) => ({ ...current, activeSessionId: sessionId }))
-        }
-        onToggleNewTask={() => setNewTaskOpen((open) => !open)}
-        onNewTaskGoal={setNewTaskGoal}
-        onNewTaskMode={setNewTaskMode}
-        onCreateSession={addSessionFromComposer}
-      />
+    <div className={workspace.sidebarCollapsed ? "app-shell sidebar-collapsed" : "app-shell"}>
+      <aside className={workspace.sidebarCollapsed ? "sidebar collapsed" : "sidebar"}>
+        <button
+          className="icon-button sidebar-toggle"
+          title={workspace.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-label={workspace.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+          onClick={() =>
+            setWorkspace((current) => ({ ...current, sidebarCollapsed: !current.sidebarCollapsed }))
+          }
+        >
+          {workspace.sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+        </button>
+        {!workspace.sidebarCollapsed && (
+          <Sidebar
+            projects={workspace.projects}
+            sessions={workspace.sessions}
+            activeProjectId={activeProject.id}
+            activeSessionId={workspace.activeSessionId}
+            onNewSession={() => setNewTaskOpen(true)}
+            onSelectProject={(projectId) =>
+              setWorkspace((current) => {
+                const keepsActiveSession = current.sessions.some(
+                  (session) => session.id === current.activeSessionId && session.projectId === projectId,
+                );
+                const activeSessionId = keepsActiveSession
+                  ? current.activeSessionId
+                  : current.sessions.find((session) => session.projectId === projectId)?.id ?? null;
 
-      <div className="workspace">
-        <aside className={workspace.sidebarCollapsed ? "sidebar collapsed" : "sidebar"}>
-          <button
-            className="icon-button sidebar-toggle"
-            title={workspace.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-            onClick={() =>
-              setWorkspace((current) => ({ ...current, sidebarCollapsed: !current.sidebarCollapsed }))
+                return { ...current, activeProjectId: projectId, activeSessionId };
+              })
             }
-          >
-            {workspace.sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
-          </button>
-          {!workspace.sidebarCollapsed && (
-	        <Sidebar
-	          projects={workspace.projects}
-	          sessions={workspace.sessions.filter((session) => session.projectId === activeProject.id)}
-	          agents={workspace.agents}
-	          activeProjectId={activeProject.id}
-              activeSessionId={workspace.activeSessionId}
-              onSelectProject={(projectId) =>
-                setWorkspace((current) => ({ ...current, activeProjectId: projectId }))
-              }
-              onSelectSession={(sessionId) =>
-                setWorkspace((current) => ({ ...current, activeSessionId: sessionId }))
-              }
-            />
-          )}
-        </aside>
+            onSelectSession={(sessionId, projectId) =>
+              setWorkspace((current) => ({ ...current, activeProjectId: projectId, activeSessionId: sessionId }))
+            }
+          />
+        )}
+      </aside>
+      <div className="main-shell">
+        <TopBar
+          activeSession={activeSession}
+          onRenameSession={(sessionId, title) =>
+            setWorkspace((current) => ({
+              ...current,
+              sessions: renameSessionTitle(current.sessions, sessionId, title, new Date().toISOString()),
+            }))
+          }
+          onToggleNewTask={() => setNewTaskOpen((open) => !open)}
+        />
 
         <main className="stage">
           {activeSession?.kind === "plan" && <PlanView session={activeSession} onConfirm={confirmPlan} />}
           {activeSession?.kind === "canvas" && (
-            <CanvasView session={activeSession} onOpenNode={openSelectedNode} />
+            <CanvasView
+              session={activeSession}
+              composerValue={bottomGoal}
+              composerDisabled={false}
+              onComposerChange={setBottomGoal}
+              onComposerSubmit={appendRequirementNode}
+              onComposerStop={stopActiveRun}
+              onNodePositionsChange={updateActiveNodePositions}
+              onOpenNode={openSelectedNode}
+            />
           )}
           {!activeSession && <EmptyWorkspace onNewTask={() => setNewTaskOpen(true)} />}
         </main>
       </div>
-
-      <BottomBar
-        value={bottomGoal}
-        onChange={setBottomGoal}
-        disabled={!activeSession || activeSession.kind !== "canvas"}
-        onSubmit={appendRequirementNode}
-        onStop={stopActiveRun}
-      />
 
       {selectedNode && activeSession?.kind === "canvas" && (
         <NodeModal
@@ -539,6 +576,16 @@ export default function App() {
           onReassign={() => reassignNode(selectedNode.id)}
           onInsertBefore={() => insertBefore(selectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, selectedNode)}
+        />
+      )}
+      {newTaskOpen && (
+        <NewSessionPanel
+          goal={newTaskGoal}
+          mode={newTaskMode}
+          onGoalChange={setNewTaskGoal}
+          onModeChange={setNewTaskMode}
+          onClose={() => setNewTaskOpen(false)}
+          onCreate={addSessionFromComposer}
         />
       )}
     </div>
@@ -558,6 +605,8 @@ function Home({
   onModeChange: (mode: WorkflowMode) => void;
   onOpenProject: () => void;
 }) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
   return (
     <main className="home">
       <section className="home-panel" aria-label="Open project">
@@ -585,72 +634,78 @@ function Home({
 }
 
 function TopBar({
-  project,
-  sessions,
-  activeSessionId,
-  newTaskOpen,
-  newTaskGoal,
-  newTaskMode,
-  onSelectSession,
+  activeSession,
+  onRenameSession,
   onToggleNewTask,
-  onNewTaskGoal,
-  onNewTaskMode,
-  onCreateSession,
 }: {
-  project: ImportedProject;
-  sessions: CanvasSessionTab[];
-  activeSessionId: string | null;
-  newTaskOpen: boolean;
-  newTaskGoal: string;
-  newTaskMode: WorkflowMode;
-  onSelectSession: (sessionId: string) => void;
+  activeSession: CanvasSessionTab | null;
+  onRenameSession: (sessionId: string, title: string) => void;
   onToggleNewTask: () => void;
-  onNewTaskGoal: (goal: string) => void;
-  onNewTaskMode: (mode: WorkflowMode) => void;
-  onCreateSession: () => void;
 }) {
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(activeSession?.title ?? "");
+
+  useEffect(() => {
+    setTitleDraft(activeSession?.title ?? "");
+    setEditingTitle(false);
+  }, [activeSession?.id, activeSession?.title]);
+
+  function commitTitleEdit() {
+    if (!activeSession) return;
+    const title = titleDraft.trim();
+    if (title) onRenameSession(activeSession.id, title);
+    setTitleDraft(title || activeSession.title);
+    setEditingTitle(false);
+  }
+
+  function cancelTitleEdit() {
+    setTitleDraft(activeSession?.title ?? "");
+    setEditingTitle(false);
+  }
+
+  function handleTitleKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter") commitTitleEdit();
+    if (event.key === "Escape") cancelTitleEdit();
+  }
+
   return (
     <header className="topbar">
-      <div className="project-chip">
-        <FolderOpen size={16} />
-        <span>{project.name}</span>
+      <div className="topbar-context">
+        <div className="topbar-field title-field" aria-label="Session title">
+          <GitBranch size={14} />
+          {editingTitle && activeSession ? (
+            <input
+              className="title-edit-input"
+              value={titleDraft}
+              autoFocus
+              onBlur={commitTitleEdit}
+              onChange={(event) => setTitleDraft(event.target.value)}
+              onKeyDown={handleTitleKeyDown}
+              aria-label="Edit session title"
+            />
+          ) : (
+            <button
+              className="title-edit-button"
+              type="button"
+              onClick={() => activeSession && setEditingTitle(true)}
+              disabled={!activeSession}
+              title="Edit title"
+            >
+              {activeSession?.title ?? "No session"}
+            </button>
+          )}
+        </div>
+        {activeSession && (
+          <div className="topbar-field type-field" aria-label="Session type">
+            <span className="session-type-value">{activeSession.mode}</span>
+          </div>
+        )}
       </div>
-      <nav className="session-tabs" aria-label="Canvas sessions">
-        {sessions.map((session, index) => (
-          <button
-            key={session.id}
-            className={session.id === activeSessionId ? "session-tab active" : "session-tab"}
-            onClick={() => onSelectSession(session.id)}
-          >
-            <span>{`Session ${index + 1}`}</span>
-            <small>{session.mode}</small>
-          </button>
-        ))}
-        <button className="new-tab-button" onClick={onToggleNewTask}>
+      <div className="topbar-actions">
+        <button className="new-tab-button icon-only" onClick={onToggleNewTask} title="New session">
           <Plus size={16} />
-          New Tab
         </button>
-      </nav>
-      {newTaskOpen && (
-        <form
-          className="new-task"
-          onSubmit={(event) => {
-            event.preventDefault();
-            onCreateSession();
-          }}
-        >
-          <input
-            value={newTaskGoal}
-            onChange={(event) => onNewTaskGoal(event.target.value)}
-            placeholder="New task goal"
-            aria-label="New task goal"
-          />
-          <ModeSwitch mode={newTaskMode} onChange={onNewTaskMode} compact />
-          <button className="icon-button solid" title="Create session" type="submit">
-            <Play size={16} />
-          </button>
-        </form>
-      )}
+      </div>
     </header>
   );
 }
@@ -658,69 +713,155 @@ function TopBar({
 function Sidebar({
   projects,
   sessions,
-  agents,
   activeProjectId,
   activeSessionId,
+  onNewSession,
   onSelectProject,
   onSelectSession,
 }: {
   projects: ImportedProject[];
   sessions: CanvasSessionTab[];
-  agents: WorkspaceState["agents"];
   activeProjectId: string;
   activeSessionId: string | null;
+  onNewSession: () => void;
   onSelectProject: (projectId: string) => void;
-  onSelectSession: (sessionId: string) => void;
+  onSelectSession: (sessionId: string, projectId: string) => void;
 }) {
   return (
     <div className="sidebar-inner">
-      <section>
+      <div className="sidebar-scroll">
+        <button className="sidebar-new-session" type="button" onClick={onNewSession}>
+          <Plus size={15} />
+          <span>New tab</span>
+          <ChevronRight size={14} />
+        </button>
         <h2>Projects</h2>
         {projects.map((project) => (
-          <button
-            key={project.id}
-            className={project.id === activeProjectId ? "sidebar-row active" : "sidebar-row"}
-            onClick={() => onSelectProject(project.id)}
-          >
-            <FolderOpen size={15} />
-            <span>{project.name}</span>
-          </button>
+          <section className="sidebar-project-group" key={project.id}>
+            <button
+              className={project.id === activeProjectId ? "sidebar-project-row active" : "sidebar-project-row"}
+              onClick={() => onSelectProject(project.id)}
+            >
+              <FolderOpen size={15} />
+              <span>{project.name}</span>
+            </button>
+            <div className="sidebar-session-list">
+              {sessions
+                .filter((session) => session.projectId === project.id)
+                .map((session) => (
+                  <button
+                    key={session.id}
+                    className={session.id === activeSessionId ? "sidebar-session-row active" : "sidebar-session-row"}
+                    onClick={() => onSelectSession(session.id, project.id)}
+                  >
+                    <span className="sidebar-session-title">{session.title}</span>
+                    <small>{formatRelativeTime(session.updatedAt)}</small>
+                  </button>
+                ))}
+              {sessions.every((session) => session.projectId !== project.id) && (
+                <div className="sidebar-empty">No sessions</div>
+              )}
+            </div>
+          </section>
         ))}
-      </section>
-      <section>
-        <h2>Sessions</h2>
-        {sessions.map((session) => (
-          <button
-            key={session.id}
-            className={session.id === activeSessionId ? "sidebar-row active" : "sidebar-row"}
-            onClick={() => onSelectSession(session.id)}
-          >
-            <GitBranch size={15} />
-            <span>{session.title}</span>
-          </button>
-        ))}
-      </section>
-      <section>
-        <h2>Status</h2>
-        {(["completed", "failed", "retrying", "running", "pending"] as NodeStatus[]).map((status) => (
-          <div className="status-row" key={status}>
-            <StatusLight status={status} />
-            <span>{status}</span>
-          </div>
-        ))}
-      </section>
-      <section>
-        <h2>Agents</h2>
-        {agents.map((agent) => (
-          <div className="agent-row" key={agent.kind}>
-            <span>{agent.label}</span>
-            <small>{`${agent.status} / ${agent.supportLevel}`}</small>
-          </div>
-        ))}
-        {agents.length === 0 && <div className="agent-row muted">No agents discovered</div>}
-      </section>
+      </div>
+      <button className="sidebar-settings" type="button" title="Settings" aria-label="Settings">
+        <Settings size={15} />
+        <span>Settings</span>
+      </button>
     </div>
   );
+}
+
+function NewSessionPanel({
+  goal,
+  mode,
+  onGoalChange,
+  onModeChange,
+  onClose,
+  onCreate,
+}: {
+  goal: string;
+  mode: WorkflowMode;
+  onGoalChange: (goal: string) => void;
+  onModeChange: (mode: WorkflowMode) => void;
+  onClose: () => void;
+  onCreate: () => void;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const hasGoal = goal.trim().length > 0;
+
+  return (
+    <div className="session-panel-backdrop" role="presentation" onMouseDown={onClose}>
+      <form
+        className={hasGoal ? "session-panel has-content" : "session-panel"}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Create session"
+        onMouseDown={(event) => event.stopPropagation()}
+        onSubmit={(event) => {
+          event.preventDefault();
+          onCreate();
+        }}
+      >
+        <button
+          className="icon-button session-panel-close"
+          title="Close"
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onClose();
+          }}
+        >
+          <X size={17} />
+        </button>
+        <textarea
+          className="session-panel-input"
+          ref={textareaRef}
+          value={goal}
+          onChange={(event) => onGoalChange(event.target.value)}
+          placeholder="What shall this canvas session build?"
+          aria-label="New task goal"
+        />
+        <footer className="session-panel-footer">
+          <button
+            className="icon-button session-panel-tool"
+            type="button"
+            title="Focus prompt"
+            onClick={() => textareaRef.current?.focus()}
+          >
+            <Plus size={17} />
+          </button>
+          <ModeSwitch mode={mode} onChange={onModeChange} compact />
+          <span className="session-panel-spacer" />
+          <button
+            className="icon-button session-panel-submit"
+            type="submit"
+            disabled={!hasGoal}
+            title="Create"
+          >
+            <ArrowUp size={18} />
+          </button>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
+function formatRelativeTime(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "";
+
+  const minutes = Math.max(1, Math.floor((Date.now() - timestamp) / 60_000));
+  if (minutes < 60) return `${minutes}m`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d`;
+
+  return `${Math.floor(days / 30)}mo`;
 }
 
 function EmptyWorkspace({ onNewTask }: { onNewTask: () => void }) {
@@ -764,18 +905,31 @@ function PlanView({ session, onConfirm }: { session: PlanSession; onConfirm: (se
 
 function CanvasView({
   session,
+  composerValue,
+  composerDisabled,
+  onComposerChange,
+  onComposerSubmit,
+  onComposerStop,
+  onNodePositionsChange,
   onOpenNode,
 }: {
   session: CanvasSession;
+  composerValue: string;
+  composerDisabled: boolean;
+  onComposerChange: (value: string) => void;
+  onComposerSubmit: () => void;
+  onComposerStop: () => void;
+  onNodePositionsChange: (updates: CanvasNodePositionUpdate[]) => void;
   onOpenNode: (nodeId: string) => void;
 }) {
   const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
-  const nodes = useMemo<AgentFlowNode[]>(
+  const nodesSource = useMemo<AgentFlowNode[]>(
     () =>
       session.nodes.map((node) => ({
         id: node.id,
         type: "agent",
         position: node.position,
+        draggable: true,
         initialWidth: ENERGY_FRAME.width,
         initialHeight: ENERGY_FRAME.height,
         handles: agentNodeHandles(),
@@ -806,14 +960,29 @@ function CanvasView({
       }),
     [nodeById, session.edges],
   );
+  const [flowNodes, setFlowNodes, onFlowNodesChange] = useNodesState<AgentFlowNode>(nodesSource);
+
+  useEffect(() => {
+    setFlowNodes((current) => mergeFlowNodeState(current, nodesSource));
+  }, [nodesSource, setFlowNodes]);
+
+  const handleNodesChange = useCallback(
+    (changes: NodeChange<AgentFlowNode>[]) => {
+      onFlowNodesChange(changes);
+      const updates = positionUpdatesFromNodeChanges(changes);
+      if (updates.length > 0) onNodePositionsChange(updates);
+    },
+    [onFlowNodesChange, onNodePositionsChange],
+  );
 
   return (
     <section className="canvas-stage">
       <ReactFlow
-        nodes={nodes}
+        nodes={flowNodes}
         edges={edges}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
+        onNodesChange={handleNodesChange}
         fitView
         fitViewOptions={{ padding: 0.18 }}
         minZoom={0.35}
@@ -823,8 +992,35 @@ function CanvasView({
         <Background color="#d8dee8" gap={18} size={1.15} />
         <Controls showInteractive={false} />
       </ReactFlow>
+      <CanvasComposer
+        value={composerValue}
+        disabled={composerDisabled}
+        onChange={onComposerChange}
+        onSubmit={onComposerSubmit}
+        onStop={onComposerStop}
+      />
     </section>
   );
+}
+
+function mergeFlowNodeState(current: AgentFlowNode[], next: AgentFlowNode[]): AgentFlowNode[] {
+  if (current.length === 0) return next;
+
+  const currentById = new Map(current.map((node) => [node.id, node]));
+  return next.map((node) => {
+    const existing = currentById.get(node.id);
+    if (!existing) return node;
+
+    return {
+      ...existing,
+      ...node,
+      dragging: existing.dragging,
+      height: existing.height,
+      measured: existing.measured,
+      selected: existing.selected,
+      width: existing.width,
+    };
+  });
 }
 
 const AGENT_HANDLE_SIZE = 9;
@@ -964,8 +1160,6 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   const frameRef = useRef<SVGRectElement | null>(null);
   const glintRef = useRef<SVGRectElement | null>(null);
   const statusDotRef = useRef<HTMLSpanElement | null>(null);
-  const phraseRef = useRef<HTMLSpanElement | null>(null);
-  const previousPhraseRef = useRef<HTMLSpanElement | null>(null);
   const handlesRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLButtonElement | null>(null);
   const previousStatusRef = useRef<NodeStatus>(node.status);
@@ -976,17 +1170,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   const runtime = runtimeForNode(node);
   const footer = nodeFooterForNode(node, runtime);
   const summary = nodeSummaryForNode(node);
-  const phrase = phraseForRuntime(runtime);
-  const [phraseState, setPhraseState] = useState<{ current: string; previous: string | null }>({
-    current: phrase,
-    previous: null,
-  });
-
-  useEffect(() => {
-    setPhraseState((current) =>
-      current.current === phrase ? current : { current: phrase, previous: current.current },
-    );
-  }, [phrase]);
+  const streamLine = streamingLogLineForNode(node, runtime);
 
   useGSAP(
     () => {
@@ -1086,24 +1270,37 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
 
         gsap.set(glint, { autoAlpha: 0.44, strokeDashoffset: 0 });
         const retryFrame = gsap.to(frame, {
-          strokeDashoffset: -14,
-          duration: 0.42,
+          strokeDashoffset: -16,
+          duration: MOTION_DURATION.retryPulse,
           ease: "sine.inOut",
           repeat: -1,
-          repeatDelay: 0.82,
+          repeatDelay: MOTION_DURATION.retryBackoff,
+        });
+        const retryGlint = gsap.fromTo(glint, {
+          autoAlpha: 0.12,
+          strokeDashoffset: 0,
+        }, {
+          autoAlpha: 0.44,
+          strokeDashoffset: -18,
+          duration: MOTION_DURATION.retryPulse,
+          ease: "sine.inOut",
+          repeat: -1,
+          repeatDelay: MOTION_DURATION.retryBackoff,
+          yoyo: true,
         });
         const retryDot = gsap.to(statusDot, {
           autoAlpha: 0.64,
           scale: 1.1,
-          duration: 0.4,
+          duration: MOTION_DURATION.retryPulse,
           ease: "sine.inOut",
           repeat: -1,
-          repeatDelay: 0.9,
+          repeatDelay: MOTION_DURATION.retryBackoff,
           yoyo: true,
         });
 
         return () => {
           retryFrame.kill();
+          retryGlint.kill();
           retryDot.kill();
         };
       }
@@ -1243,50 +1440,6 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
     { dependencies: [selected], scope: rootRef, revertOnUpdate: true },
   );
 
-  useGSAP(
-    (_context, contextSafe) => {
-      const current = phraseRef.current;
-      const previous = previousPhraseRef.current;
-      if (!current) return;
-      const safe = contextSafe ?? (<T extends (...args: never[]) => unknown>(fn: T) => fn);
-
-      gsap.killTweensOf([current, previous].filter(Boolean));
-      if (userPrefersReducedMotion()) {
-        gsap.set(current, { autoAlpha: 1, y: 0 });
-        if (previous) setPhraseState((state) => ({ ...state, previous: null }));
-        return;
-      }
-
-      const clearPrevious = safe(() => {
-        setPhraseState((state) => ({ ...state, previous: null }));
-      });
-      const phraseTimeline = gsap.timeline({ onComplete: previous ? clearPrevious : undefined });
-
-      if (previous) {
-        phraseTimeline.to(previous, {
-          autoAlpha: 0,
-          y: -MOTION_DISTANCE.phraseShift,
-          duration: MOTION_DURATION.normal,
-          ease: "power2.out",
-        }, 0);
-      }
-      phraseTimeline.fromTo(
-        current,
-        { autoAlpha: previous ? 0 : 1, y: previous ? MOTION_DISTANCE.phraseShift : 0 },
-        {
-          autoAlpha: 1,
-          y: 0,
-          duration: previous ? MOTION_DURATION.normal : 0,
-          ease: "power2.out",
-        },
-        previous ? 0.04 : 0,
-      );
-
-      return () => phraseTimeline.kill();
-    },
-    { dependencies: [phraseState.current, phraseState.previous], scope: rootRef, revertOnUpdate: true },
-  );
-
   function openFromKeyboard(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
@@ -1349,7 +1502,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
         className="agent-card"
         role="button"
         tabIndex={0}
-        aria-label={`${node.title}: ${agentIdentityForNode(node)}. ${footer.primary} ${footer.secondary}. ${summary}`}
+        aria-label={`${node.title}: ${agentIdentityForNode(node)}. ${footer.primary}${footer.secondary ? ` ${footer.secondary}` : ""}. ${summary}`}
         title={nodeTooltipForNode(node, runtime)}
         onClick={() => data.onOpen(node.id)}
         onKeyDown={openFromKeyboard}
@@ -1370,24 +1523,40 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
           <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
           <span>{agentIdentityForNode(node)}</span>
         </div>
-        <p className="agent-summary">{summary}</p>
-        <p className="runtime-phrase" aria-live="polite">
-          {phraseState.previous && (
-            <span ref={previousPhraseRef} className="runtime-phrase-copy exiting">
-              {phraseState.previous}
-            </span>
-          )}
-          <span ref={phraseRef} className="runtime-phrase-copy">
-            {phraseState.current}
-          </span>
-        </p>
+        <AgentStreamPreview line={streamLine} nodeId={node.id} />
         <div className={`agent-footer ${node.status}`} aria-label="Node status summary">
           {node.status === "completed" && <CheckCircle2 size={13} aria-hidden="true" />}
           {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
           <span>{footer.primary}</span>
-          <span className="footer-separator" aria-hidden="true">·</span>
-          <span>{footer.secondary}</span>
+          {footer.secondary && (
+            <>
+              <span className="footer-separator" aria-hidden="true">·</span>
+              <span>{footer.secondary}</span>
+            </>
+          )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function AgentStreamPreview({ line, nodeId }: { line: StreamingLogLine; nodeId: string }) {
+  const text = `${line.kind}: "${line.text}"`;
+
+  return (
+    <div className="agent-stream" aria-label="Streaming log placeholder">
+      <div className="agent-stream-row active">
+        <span className="agent-stream-prompt" aria-hidden="true">›</span>
+        <DecryptedText
+          key={`${nodeId}-${text}`}
+          text={text}
+          speed={16}
+          maxIterations={5}
+          animateOn="view"
+          className="agent-stream-copy"
+          encryptedClassName="agent-stream-copy encrypted"
+          parentClassName="agent-stream-text"
+        />
       </div>
     </div>
   );
@@ -1412,19 +1581,18 @@ function nodeSummaryForNode(node: CanvasNode): string {
 function nodeFooterForNode(
   node: CanvasNode,
   runtime: NodeRuntimeState,
-): { primary: string; secondary: string } {
-  const action = runtime.action.trim() || node.progress.trim() || "Waiting for evidence";
+): { primary: string; secondary?: string } {
   switch (node.status) {
     case "pending":
-      return { primary: "Queued", secondary: action };
+      return { primary: "Queued" };
     case "running":
-      return { primary: runtime.phase === "Think" ? "Thinking" : runtime.phase, secondary: action };
+      return { primary: runtime.phase === "Think" ? "Thinking" : runtime.phase };
     case "retrying":
-      return { primary: "Retrying", secondary: action };
+      return { primary: "Retrying" };
     case "completed":
       return { primary: "Verified", secondary: "Evidence ready" };
     case "failed":
-      return { primary: "Attention", secondary: action };
+      return { primary: "Attention" };
   }
 }
 
@@ -1730,7 +1898,7 @@ function ContextTab({ node }: { node: CanvasNode }) {
   );
 }
 
-function BottomBar({
+function CanvasComposer({
   value,
   disabled,
   onChange,
@@ -1743,25 +1911,50 @@ function BottomBar({
   onSubmit: () => void;
   onStop: () => void;
 }) {
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const hasValue = value.trim().length > 0;
+
   return (
-    <footer className="bottom-bar">
-      <button className="icon-button" title="Stop active run" onClick={onStop} disabled={disabled}>
-        <Square size={17} />
-      </button>
+    <div
+      className={hasValue ? "canvas-composer nodrag nopan has-content" : "canvas-composer nodrag nopan"}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
       <input
+        className="canvas-composer-input"
+        ref={inputRef}
         value={value}
         disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
         placeholder="Insert requirement or node"
         aria-label="Insert requirement or node"
         onKeyDown={(event) => {
-          if (event.key === "Enter") onSubmit();
+          if (event.key === "Enter" && hasValue) onSubmit();
         }}
       />
-      <button className="icon-button solid" title="Insert requirement" onClick={onSubmit} disabled={disabled}>
-        <Send size={17} />
-      </button>
-    </footer>
+      <div className="canvas-composer-toolbar">
+        <button
+          className="icon-button composer-tool"
+          title="Focus input"
+          onClick={() => inputRef.current?.focus()}
+          disabled={disabled}
+        >
+          <Plus size={17} />
+        </button>
+        <span className="composer-slash" aria-hidden="true">/</span>
+        <span className="composer-toolbar-spacer" />
+        <button className="icon-button composer-tool" title="Stop active run" onClick={onStop} disabled={disabled}>
+          <Square size={16} />
+        </button>
+        <button
+          className="icon-button composer-send"
+          title="Insert requirement"
+          onClick={onSubmit}
+          disabled={disabled || !hasValue}
+        >
+          <ArrowUp size={18} />
+        </button>
+      </div>
+    </div>
   );
 }
 
