@@ -19,12 +19,14 @@
     "lint": "pnpm run typecheck"
   },
   "dependencies": {
+    "@gsap/react": "^2.1.2",
     "@skyturn/agent-runtime": "workspace:*",
     "@skyturn/git-worktree": "workspace:*",
     "@skyturn/persistence": "workspace:*",
     "@skyturn/planner": "workspace:*",
     "@skyturn/project-core": "workspace:*",
     "@xyflow/react": "^12.11.0",
+    "gsap": "^3.15.0",
     "lucide-react": "^1.17.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",

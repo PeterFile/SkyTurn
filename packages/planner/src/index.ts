@@ -2,7 +2,9 @@ import type {
   AgentKind,
   CanvasEdge,
   CanvasNode,
+  CanvasNodeDisplay,
   CanvasSession,
+  NodeRuntimeState,
   PlanMarkdown,
   PlanSession,
 } from "@skyturn/project-core";
@@ -24,6 +26,9 @@ interface TaskSeed {
     x: number;
     y: number;
   };
+  status?: CanvasNode["status"];
+  runtime?: NodeRuntimeState;
+  display?: CanvasNodeDisplay;
 }
 
 const plan: PlanMarkdown = {
@@ -53,39 +58,98 @@ const plan: PlanMarkdown = {
 const fastSeeds: TaskSeed[] = [
   {
     id: "node-1",
-    title: "Orchestrate task graph",
+    title: "Ingest Customer Data",
     agent: "hermes",
-    progress: "Mapping graph",
-    brief: "Hermes converts the request into executable task nodes.",
+    progress: "waiting for dependency",
+    brief: "Data agent waits for upstream data readiness before ingesting customer records.",
     dependencies: [],
-    position: { x: 80, y: 110 },
+    position: { x: 20, y: 96 },
+    status: "pending",
+    runtime: {
+      phase: "Queued",
+      message: "正在等待调度",
+      action: "waiting for dependency",
+    },
+    display: {
+      agentLabel: "Data Agent",
+      meta: ["main/data-ingest", "TSK-1024"],
+    },
   },
   {
     id: "node-2",
-    title: "Implement app slice",
+    title: "Analyze Customer Intent",
     agent: "codex",
-    progress: "Waiting for graph",
-    brief: "Codex implements the smallest runnable vertical slice.",
+    progress: "analyzing requirements.json",
+    brief: "NLP agent analyzes customer intent from the normalized requirements input.",
     dependencies: ["node-1"],
-    position: { x: 400, y: 40 },
+    position: { x: 440, y: 96 },
+    status: "running",
+    runtime: {
+      phase: "Think",
+      message: "正在思考策略",
+      action: "analyzing requirements.json",
+    },
+    display: {
+      agentLabel: "NLP Agent",
+      meta: ["feat/intent-nlp", "TSK-1025"],
+    },
   },
   {
     id: "node-3",
-    title: "Review plan coverage",
-    agent: "claude-code",
-    progress: "Pending",
-    brief: "ClaudeCode reviews whether scope matches the session goal.",
-    dependencies: ["node-1"],
-    position: { x: 400, y: 210 },
+    title: "Fetch Knowledge Context",
+    agent: "gemini",
+    progress: "fetching repo context again",
+    brief: "Knowledge agent retries context retrieval with bounded backoff.",
+    dependencies: ["node-2"],
+    position: { x: 860, y: 96 },
+    status: "retrying",
+    runtime: {
+      phase: "Retrying",
+      message: "正在重新尝试",
+      action: "fetching repo context again",
+    },
+    display: {
+      agentLabel: "Knowledge Agent",
+      meta: ["feat/knowledge-retrieval", "TSK-1026"],
+    },
   },
   {
     id: "node-4",
-    title: "Verify worktree evidence",
-    agent: "gemini",
-    progress: "Pending",
-    brief: "Gemini checks changes, tests, and completion evidence.",
-    dependencies: ["node-2", "node-3"],
-    position: { x: 730, y: 125 },
+    title: "Generate Response",
+    agent: "claude-code",
+    progress: "final output verified",
+    brief: "LLM agent generates and verifies the response output.",
+    dependencies: ["node-2"],
+    position: { x: 250, y: 340 },
+    status: "completed",
+    runtime: {
+      phase: "Completed",
+      message: "已完成验证",
+      action: "final output verified",
+    },
+    display: {
+      agentLabel: "LLM Agent",
+      meta: ["feat/response-gen", "TSK-1027"],
+    },
+  },
+  {
+    id: "node-5",
+    title: "Send Response",
+    agent: "openclaw",
+    progress: "delivery timeout persisted",
+    brief: "Delivery agent records a persistent timeout that requires manual handling.",
+    dependencies: ["node-2"],
+    position: { x: 700, y: 340 },
+    status: "failed",
+    runtime: {
+      phase: "Failed",
+      message: "等待人工处理",
+      action: "delivery timeout persisted",
+    },
+    display: {
+      agentLabel: "Delivery Agent",
+      meta: ["fix/delivery-timeout", "TSK-1028"],
+    },
   },
 ];
 
@@ -180,7 +244,7 @@ function createCanvasSession({
       seed,
       input,
       sessionId,
-      status: index === 0 ? "running" : "pending",
+      status: seed.status ?? (index === 0 ? "running" : "pending"),
       relatedTasks: mode === "plan" ? plan.tasks : "Mock Hermes graph",
     }),
   );
@@ -195,7 +259,7 @@ function createCanvasSession({
     updatedAt: input.createdAt,
     nodes,
     edges: createEdges(seeds),
-    activeNodeId: nodes[0]?.id ?? null,
+    activeNodeId: nodes.find((node) => node.status === "running")?.id ?? nodes[0]?.id ?? null,
   };
 }
 
@@ -217,6 +281,8 @@ function createNode({
     title: seed.title,
     agent: seed.agent,
     progress: seed.progress,
+    runtime: seed.runtime,
+    display: seed.display,
     status,
     position: seed.position,
     runId: `run-${sessionId}-${seed.id}`,

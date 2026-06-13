@@ -1,18 +1,28 @@
 import {
   Background,
+  BaseEdge,
   Controls,
   Handle,
+  MarkerType,
   Position,
   ReactFlow,
+  getSmoothStepPath,
   type Edge as FlowEdge,
+  type EdgeProps,
+  type EdgeTypes,
   type Node as FlowNode,
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
+import gsap from "gsap";
+import { useGSAP } from "@gsap/react";
 import {
+  AlertTriangle,
+  CheckCircle2,
   ExternalLink,
   FolderOpen,
   GitBranch,
+  MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
   Play,
@@ -23,7 +33,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 
 import {
@@ -51,6 +61,7 @@ import {
   type Changeset,
   type ImportedProject,
   type NodeModalTab,
+  type NodeRuntimeState,
   type NodeStatus,
   type PlanSession,
   type AgentRun,
@@ -59,13 +70,28 @@ import {
   type WorkflowMode,
 } from "@skyturn/project-core";
 
-type TaskFlowNode = FlowNode<{
+gsap.registerPlugin(useGSAP);
+
+type AgentFlowNode = FlowNode<{
   node: CanvasNode;
   onOpen: (nodeId: string) => void;
-}>;
+}, "agent">;
+
+interface AgentEdgeData extends Record<string, unknown> {
+  status: NodeStatus;
+  active: boolean;
+  interrupted: boolean;
+}
+
+type AgentFlowEdge = FlowEdge<AgentEdgeData, "agent">;
 
 const nodeTypes: NodeTypes = {
-  task: TaskNode,
+  agent: AgentNode,
+  task: AgentNode,
+};
+
+const edgeTypes: EdgeTypes = {
+  agent: AgentEdge,
 };
 
 export default function App() {
@@ -87,7 +113,7 @@ export default function App() {
   const activeSession = workspace.sessions.find((session) => session.id === workspace.activeSessionId) ?? null;
   const selectedNode =
     activeSession?.kind === "canvas"
-      ? activeSession.nodes.find((node) => node.id === selectedNodeId) ?? null
+      ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
       : null;
 
   useEffect(() => {
@@ -241,7 +267,9 @@ export default function App() {
 
   function stopActiveRun() {
     if (!activeSession || activeSession.kind !== "canvas") return;
-    const running = activeSession.nodes.find((node) => node.status === "running" || node.status === "retrying");
+    const running = activeSession.nodes.find(
+      (node: CanvasNode) => node.status === "running" || node.status === "retrying",
+    );
     if (!running) return;
     if (window.devflow) {
       void window.devflow.cancelAgentRun(running.runId, "Stopped from workspace controls").then((result) => {
@@ -343,7 +371,7 @@ export default function App() {
 
   function insertBefore(nodeId: string) {
     if (!activeSession || activeSession.kind !== "canvas") return;
-    const target = activeSession.nodes.find((node) => node.id === nodeId);
+    const target = activeSession.nodes.find((node: CanvasNode) => node.id === nodeId);
     if (!target) return;
 
     const id = `node-${activeSession.nodes.length + 1}`;
@@ -718,24 +746,40 @@ function CanvasView({
   session: CanvasSession;
   onOpenNode: (nodeId: string) => void;
 }) {
-  const nodes = useMemo<TaskFlowNode[]>(
+  const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
+  const nodes = useMemo<AgentFlowNode[]>(
     () =>
       session.nodes.map((node) => ({
         id: node.id,
-        type: "task",
+        type: "agent",
         position: node.position,
         data: { node, onOpen: onOpenNode },
       })),
     [onOpenNode, session.nodes],
   );
-  const edges = useMemo<FlowEdge[]>(
+  const edges = useMemo<AgentFlowEdge[]>(
     () =>
-      session.edges.map((edge) => ({
-        ...edge,
-        animated: session.nodes.some((node) => node.id === edge.target && node.status === "running"),
-        style: { stroke: "#8d99ae", strokeWidth: 1.6 },
-      })),
-    [session.edges, session.nodes],
+      session.edges.map((edge) => {
+        const source = nodeById.get(edge.source);
+        const target = nodeById.get(edge.target);
+        const descends = Boolean(source && target && target.position.y > source.position.y + 120);
+        const status = target?.status ?? "pending";
+        const active = status === "running";
+        const isInterrupted = target?.status === "retrying" || target?.status === "failed";
+        const stroke = edgeColorForStatus(status);
+
+        return {
+          ...edge,
+          type: "agent",
+          sourceHandle: descends ? "source-bottom" : "source-right",
+          targetHandle: descends ? "target-top" : "target-left",
+          animated: active,
+          interactionWidth: 18,
+          markerEnd: { type: MarkerType.ArrowClosed, color: stroke, width: 14, height: 14 },
+          data: { status, active, interrupted: isInterrupted },
+        } satisfies AgentFlowEdge;
+      }),
+    [nodeById, session.edges],
   );
 
   return (
@@ -744,34 +788,301 @@ function CanvasView({
         nodes={nodes}
         edges={edges}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         fitView
+        fitViewOptions={{ padding: 0.18 }}
         minZoom={0.35}
         maxZoom={1.35}
         proOptions={{ hideAttribution: true }}
       >
-        <Background color="#d3dce9" gap={14} size={2} />
+        <Background color="#d8dee8" gap={18} size={1.15} />
         <Controls showInteractive={false} />
       </ReactFlow>
     </section>
   );
 }
 
-function TaskNode({ data }: NodeProps<TaskFlowNode>) {
-  const node = data.node;
+function AgentEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  markerEnd,
+  interactionWidth,
+  data,
+  selected,
+  animated,
+}: EdgeProps<AgentFlowEdge>) {
+  const [edgePath] = getSmoothStepPath({
+    sourceX,
+    sourceY,
+    sourcePosition,
+    targetX,
+    targetY,
+    targetPosition,
+    borderRadius: 28,
+  });
+  const status = data?.status ?? "pending";
+  const active = Boolean(data?.active || animated);
+
   return (
-    <button className={`task-node ${node.status}`} onClick={() => data.onOpen(node.id)}>
-      <Handle type="target" position={Position.Left} />
-      <div className="node-heading">
-        <StatusLight status={node.status} />
-        <span>{node.title}</span>
+    <g className={`agent-edge ${status}${active ? " active" : ""}${selected ? " selected" : ""}`}>
+      <BaseEdge
+        id={id}
+        path={edgePath}
+        markerEnd={markerEnd}
+        interactionWidth={interactionWidth ?? 18}
+        className="agent-edge-base"
+      />
+      {active && <path className="agent-edge-flow" d={edgePath} markerEnd={markerEnd} />}
+    </g>
+  );
+}
+
+function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
+  const node = data.node;
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const verificationShimmerRef = useRef<HTMLSpanElement | null>(null);
+  const completedShimmerPlayed = useRef(false);
+  const runtime = runtimeForNode(node);
+  const footer = nodeFooterForNode(node, runtime);
+  const summary = nodeSummaryForNode(node);
+
+  useGSAP(
+    () => {
+      const card = cardRef.current;
+      if (!card) return;
+
+      gsap.set(card, { autoAlpha: 1, scale: 1, y: 0, filter: "blur(0px)" });
+      if (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        return;
+      }
+
+      gsap.fromTo(
+        card,
+        { autoAlpha: 0, scale: 0.975, y: 12, filter: "blur(8px)" },
+        { autoAlpha: 1, scale: 1, y: 0, filter: "blur(0px)", duration: 0.38, ease: "power3.out", clearProps: "filter" },
+      );
+    },
+    { scope: cardRef },
+  );
+
+  useGSAP(
+    () => {
+      const card = cardRef.current;
+      if (!card) return;
+
+      gsap.set(card, {
+        "--loop-angle": "0deg",
+        "--loop-glow": node.status === "running" ? 0.72 : 0.34,
+      });
+
+      if (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        if (verificationShimmerRef.current) gsap.set(verificationShimmerRef.current, { autoAlpha: 0 });
+        return;
+      }
+
+      if (node.status === "running") {
+        const loopTween = gsap.to(card, {
+          "--loop-angle": "360deg",
+          duration: 2.7,
+          ease: "none",
+          repeat: -1,
+        });
+        const glowTween = gsap.to(card, {
+          "--loop-glow": 0.92,
+          duration: 1.35,
+          ease: "sine.inOut",
+          repeat: -1,
+          yoyo: true,
+        });
+
+        return () => {
+          loopTween.kill();
+          glowTween.kill();
+        };
+      }
+
+      if (node.status === "retrying") {
+        const loopTween = gsap.to(card, {
+          "--loop-angle": "360deg",
+          duration: 3.2,
+          ease: "none",
+          repeat: -1,
+        });
+        const pulseTween = gsap.to(card, {
+          "--loop-glow": 0.72,
+          duration: 0.36,
+          ease: "power1.inOut",
+          repeat: -1,
+          repeatDelay: 0.72,
+          yoyo: true,
+        });
+
+        return () => {
+          loopTween.kill();
+          pulseTween.kill();
+        };
+      }
+
+      if (node.status === "completed" && verificationShimmerRef.current && !completedShimmerPlayed.current) {
+        completedShimmerPlayed.current = true;
+        const shimmer = gsap.timeline();
+        shimmer
+          .fromTo(verificationShimmerRef.current, { xPercent: -135, autoAlpha: 0 }, { autoAlpha: 0.58, duration: 0.12 })
+          .to(verificationShimmerRef.current, { xPercent: 135, duration: 0.78, ease: "power2.out" }, 0)
+          .to(verificationShimmerRef.current, { autoAlpha: 0, duration: 0.16 }, 0.62);
+
+        return () => shimmer.kill();
+      }
+
+      if (node.status !== "completed") completedShimmerPlayed.current = false;
+    },
+    { dependencies: [node.id, node.status, runtime.phase, runtime.action], scope: cardRef, revertOnUpdate: true },
+  );
+
+  function openFromKeyboard(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    data.onOpen(node.id);
+  }
+
+  return (
+    <div
+      ref={cardRef}
+      className={`agent-node ${node.status}${selected ? " selected" : ""}`}
+      role="button"
+      tabIndex={0}
+      aria-label={`${node.title}: ${agentIdentityForNode(node)}. ${footer.primary} ${footer.secondary}. ${summary}`}
+      title={nodeTooltipForNode(node, runtime)}
+      onClick={() => data.onOpen(node.id)}
+      onKeyDown={openFromKeyboard}
+    >
+      <span className="energy-frame" aria-hidden="true" />
+      <span ref={verificationShimmerRef} className="verification-shimmer" aria-hidden="true" />
+      <Handle id="target-left" type="target" position={Position.Left} className="node-handle target-left" />
+      <Handle id="target-top" type="target" position={Position.Top} className="node-handle target-top" />
+      <Handle id="source-right" type="source" position={Position.Right} className="node-handle source-right" />
+      <Handle id="source-bottom" type="source" position={Position.Bottom} className="node-handle source-bottom" />
+      <div className="agent-card-content">
+        <div className="agent-node-header">
+          <span className="agent-node-title">{node.title}</span>
+          <button
+            className="agent-node-menu nodrag"
+            type="button"
+            aria-label={`Open actions for ${node.title}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <MoreHorizontal size={16} aria-hidden="true" />
+          </button>
+        </div>
+        <div className="agent-identity-pill">
+          <span className="agent-dot" aria-hidden="true" />
+          <span>{agentIdentityForNode(node)}</span>
+        </div>
+        <p className="agent-summary">{summary}</p>
+        <div className={`agent-footer ${node.status}`} aria-label="Node status summary">
+          {node.status === "completed" && <CheckCircle2 size={13} aria-hidden="true" />}
+          {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
+          <span>{footer.primary}</span>
+          <span className="footer-separator" aria-hidden="true">·</span>
+          <span>{footer.secondary}</span>
+        </div>
       </div>
-      <div className="node-meta">
-        <Users size={13} />
-        <span>{node.agent}</span>
-      </div>
-      <p>{node.progress}</p>
-      <Handle type="source" position={Position.Right} />
-    </button>
+    </div>
+  );
+}
+
+const AGENT_LABELS: Record<AgentKind, string> = {
+  hermes: "Hermes",
+  codex: "Codex",
+  gemini: "Gemini",
+  "claude-code": "ClaudeCode",
+  openclaw: "OpenClaw",
+};
+
+function agentIdentityForNode(node: CanvasNode): string {
+  return AGENT_LABELS[node.agent];
+}
+
+function nodeSummaryForNode(node: CanvasNode): string {
+  return node.context.brief.trim() || node.progress.trim() || "Waiting for execution context.";
+}
+
+function nodeFooterForNode(
+  node: CanvasNode,
+  runtime: NodeRuntimeState,
+): { primary: string; secondary: string } {
+  const action = runtime.action.trim() || node.progress.trim() || "Waiting for evidence";
+  switch (node.status) {
+    case "pending":
+      return { primary: "Queued", secondary: action };
+    case "running":
+      return { primary: runtime.phase === "Think" ? "Thinking" : runtime.phase, secondary: action };
+    case "retrying":
+      return { primary: "Retrying", secondary: action };
+    case "completed":
+      return { primary: "Verified", secondary: "Evidence ready" };
+    case "failed":
+      return { primary: "Attention", secondary: action };
+  }
+}
+
+function nodeTooltipForNode(node: CanvasNode, runtime: NodeRuntimeState): string {
+  return [
+    node.title,
+    `Status: ${node.status}`,
+    `Agent: ${agentIdentityForNode(node)}`,
+    `Run: ${node.runId}`,
+    `Branch: ${node.worktree.branchName}`,
+    `Worktree: ${node.worktree.path}`,
+    `Runtime: ${runtime.phase} — ${runtime.action}`,
+  ].join("\n");
+}
+
+function edgeColorForStatus(status: NodeStatus): string {
+  switch (status) {
+    case "running":
+      return "#7c8cff";
+    case "retrying":
+      return "#d97706";
+    case "failed":
+      return "#dc6b65";
+    case "completed":
+      return "#a8b4c1";
+    case "pending":
+      return "#cbd5e1";
+  }
+}
+
+function runtimeForNode(node: CanvasNode): NodeRuntimeState {
+  if (node.runtime && runtimeMatchesStatus(node.runtime, node.status)) return node.runtime;
+
+  const action = node.progress.trim() || "waiting for next evidence";
+  switch (node.status) {
+    case "pending":
+      return { phase: "Queued", message: "正在等待调度", action };
+    case "running":
+      return { phase: "Executing", message: "正在执行任务", action };
+    case "retrying":
+      return { phase: "Retrying", message: "正在重新尝试", action };
+    case "completed":
+      return { phase: "Completed", message: "已完成验证", action };
+    case "failed":
+      return { phase: "Failed", message: "等待人工处理", action };
+  }
+}
+
+function runtimeMatchesStatus(runtime: NodeRuntimeState, status: NodeStatus): boolean {
+  if (status === "pending") return runtime.phase === "Queued";
+  if (status === "retrying") return runtime.phase === "Retrying";
+  if (status === "completed") return runtime.phase === "Completed";
+  if (status === "failed") return runtime.phase === "Failed";
+  return ["Think", "Planning", "Executing", "Testing", "Validating", "Summarizing"].includes(
+    runtime.phase,
   );
 }
 
@@ -1006,7 +1317,7 @@ function changesetsForSession(session: CanvasSessionTab): WorkspaceState["change
 
 function advanceMockRun(session: CanvasSession): CanvasSession {
   const activeIndex = session.nodes.findIndex(
-    (node) => node.status === "running" || node.status === "retrying",
+    (node) => (node.status === "running" || node.status === "retrying") && !hasAuthoredDisplayState(node),
   );
   if (activeIndex === -1) return session;
 
@@ -1076,6 +1387,10 @@ function advanceMockRun(session: CanvasSession): CanvasSession {
   };
 }
 
+function hasAuthoredDisplayState(node: CanvasNode): boolean {
+  return node.runtime !== undefined || node.display !== undefined;
+}
+
 function nextMockOutputLine(node: CanvasNode, lineIndex: number): string {
   const lines = [
     `${node.agent} accepted run ${node.runId}.`,
@@ -1126,7 +1441,7 @@ function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRunResult
       session.kind === "canvas"
         ? {
             ...session,
-            nodes: session.nodes.map((node) =>
+            nodes: session.nodes.map((node: CanvasNode) =>
               node.runId === result.run.id
                 ? {
                     ...node,
@@ -1158,7 +1473,9 @@ function mergeRunEventsIntoWorkspace(
       session.kind === "canvas"
         ? {
             ...session,
-            nodes: session.nodes.map((node) => (node.runId === runId ? applyRunEventsToNode(node, deduped) : node)),
+            nodes: session.nodes.map((node: CanvasNode) =>
+              node.runId === runId ? applyRunEventsToNode(node, deduped) : node,
+            ),
           }
         : session,
     ),

@@ -2,6 +2,17 @@ export type WorkflowMode = "fast" | "plan";
 export type SessionKind = "plan" | "canvas";
 export type AgentKind = "hermes" | "codex" | "gemini" | "claude-code" | "openclaw";
 export type NodeStatus = "pending" | "running" | "retrying" | "completed" | "failed";
+export type NodeLifecyclePhase =
+  | "Queued"
+  | "Think"
+  | "Planning"
+  | "Executing"
+  | "Testing"
+  | "Validating"
+  | "Retrying"
+  | "Summarizing"
+  | "Completed"
+  | "Failed";
 export type NodeModalTab = "Output" | "Changes" | "Context";
 export type AgentAvailabilityStatus = "available" | "missing" | "needs-auth" | "unhealthy";
 export type AgentSupportLevel = "mock-only" | "detected-only" | "experimental-run" | "supported-run";
@@ -128,11 +139,24 @@ export interface CanvasNodeContext {
   constraints: string[];
 }
 
+export interface NodeRuntimeState {
+  phase: NodeLifecyclePhase;
+  message: string;
+  action: string;
+}
+
+export interface CanvasNodeDisplay {
+  agentLabel: string;
+  meta: string[];
+}
+
 export interface CanvasNode {
   id: string;
   title: string;
   agent: AgentKind;
   progress: string;
+  runtime?: NodeRuntimeState;
+  display?: CanvasNodeDisplay;
   status: NodeStatus;
   position: {
     x: number;

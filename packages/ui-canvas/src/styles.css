@@ -691,6 +691,14 @@ h2 {
   --sk-warning: #a16207;
   --sk-info: #3b6ea8;
   --sk-shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --agent-card-width: 324px;
+  --agent-card-radius: 22px;
+  --agent-surface: rgba(255, 255, 255, 0.82);
+  --agent-surface-strong: rgba(255, 255, 255, 0.94);
+  --agent-hairline: rgba(148, 163, 184, 0.22);
+  --agent-shadow: 0 24px 56px rgba(15, 23, 42, 0.11), 0 8px 22px rgba(15, 23, 42, 0.07);
+  --agent-shadow-hover: 0 34px 72px rgba(15, 23, 42, 0.15), 0 12px 28px rgba(15, 23, 42, 0.09);
+  --agent-focus: rgba(59, 130, 246, 0.18);
   color: var(--sk-text);
   background: var(--sk-bg);
   font-family:
@@ -806,6 +814,7 @@ h1,
 h2,
 .project-chip,
 .task-node,
+.agent-node,
 .agent-row,
 .diff-stat {
   color: var(--sk-text-strong);
@@ -1233,6 +1242,421 @@ h2 {
   border-radius: 8px;
   background: #111827;
   color: #e5e7eb;
+}
+
+/* Premium agent orchestration canvas: compact execution units and low-noise connections. */
+.canvas-stage {
+  background:
+    radial-gradient(circle at 50% -10%, rgba(59, 130, 246, 0.12), transparent 42%),
+    radial-gradient(circle at 8% 18%, rgba(148, 163, 184, 0.14), transparent 32%),
+    linear-gradient(180deg, #fbfcff 0%, #f4f7fb 100%);
+}
+
+.canvas-stage .react-flow__background {
+  opacity: 0.48;
+}
+
+.react-flow__node-agent {
+  border-radius: var(--agent-card-radius);
+}
+
+.agent-edge-base,
+.agent-edge-flow {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.agent-edge-base {
+  stroke: rgba(100, 116, 139, 0.24);
+  stroke-width: 1.45;
+}
+
+.agent-edge.pending .agent-edge-base,
+.agent-edge.completed .agent-edge-base {
+  stroke: rgba(100, 116, 139, 0.24);
+}
+
+.agent-edge.running .agent-edge-base {
+  stroke: rgba(99, 102, 241, 0.28);
+}
+
+.agent-edge.retrying .agent-edge-base {
+  stroke: rgba(217, 119, 6, 0.42);
+  stroke-dasharray: 6 9;
+}
+
+.agent-edge.failed .agent-edge-base {
+  stroke: rgba(220, 107, 101, 0.38);
+  stroke-dasharray: 10 8;
+}
+
+.agent-edge.selected .agent-edge-base {
+  stroke-width: 1.8;
+}
+
+.agent-edge-flow {
+  stroke: rgba(125, 145, 255, 0.72);
+  stroke-width: 2.2;
+  stroke-dasharray: 18 150;
+  stroke-dashoffset: 0;
+  opacity: 0.72;
+  filter: drop-shadow(0 0 5px rgba(99, 102, 241, 0.18));
+  pointer-events: none;
+  animation: agent-edge-flow 1.9s linear infinite;
+}
+
+@keyframes agent-edge-flow {
+  to {
+    stroke-dashoffset: -168;
+  }
+}
+
+.react-flow__handle.node-handle {
+  width: 10px;
+  height: 10px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  background: rgba(248, 250, 252, 0.98);
+  box-shadow:
+    0 0 0 1px rgb(var(--state-rgb, 100 116 139) / 0.46),
+    0 6px 14px rgba(15, 23, 42, 0.14);
+  opacity: 0;
+  scale: 0.72;
+  transition:
+    opacity 160ms ease,
+    scale 160ms ease;
+}
+
+.react-flow__handle.node-handle.target-left {
+  left: -5px;
+}
+
+.react-flow__handle.node-handle.source-right {
+  right: -5px;
+}
+
+.react-flow__handle.node-handle.target-top {
+  top: -5px;
+}
+
+.react-flow__handle.node-handle.source-bottom {
+  bottom: -5px;
+}
+
+.agent-node:hover .node-handle,
+.agent-node.selected .node-handle,
+.react-flow__node.selected .agent-node .node-handle {
+  opacity: 0.86;
+  scale: 1;
+}
+
+.agent-node {
+  --state-rgb: 100 116 139;
+  --loop-angle: 0deg;
+  --loop-glow: 0.34;
+  --loop-bg: conic-gradient(from var(--loop-angle), rgba(148, 163, 184, 0.28), rgba(203, 213, 225, 0.18), rgba(148, 163, 184, 0.28));
+  position: relative;
+  display: block;
+  width: var(--agent-card-width);
+  min-height: 176px;
+  overflow: hidden;
+  border: 1px solid var(--agent-hairline);
+  border-radius: var(--agent-card-radius);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.76), transparent 34%),
+    linear-gradient(145deg, var(--agent-surface-strong), rgba(248, 250, 252, 0.78));
+  color: #0f172a;
+  padding: 18px 18px 16px;
+  text-align: left;
+  box-shadow:
+    var(--agent-shadow),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    inset 0 -1px 0 rgba(15, 23, 42, 0.025);
+  cursor: pointer;
+  isolation: isolate;
+  outline: none;
+  transform: translateZ(0);
+  transition:
+    box-shadow 180ms ease,
+    transform 180ms ease,
+    border-color 180ms ease,
+    background 180ms ease;
+  will-change: transform;
+  backdrop-filter: blur(18px) saturate(1.08);
+}
+
+.agent-node::before {
+  position: absolute;
+  inset: 1px;
+  z-index: 1;
+  border-radius: calc(var(--agent-card-radius) - 1px);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), transparent 28%);
+  content: "";
+  pointer-events: none;
+}
+
+.agent-node:hover {
+  border-color: rgba(148, 163, 184, 0.34);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.84), transparent 34%),
+    linear-gradient(145deg, #ffffff, rgba(248, 250, 252, 0.88));
+  box-shadow:
+    var(--agent-shadow-hover),
+    inset 0 1px 0 rgba(255, 255, 255, 0.96),
+    inset 0 -1px 0 rgba(15, 23, 42, 0.03);
+  transform: translateY(-2px) translateZ(0);
+}
+
+.agent-node:focus-visible,
+.agent-node.selected,
+.react-flow__node.selected .agent-node {
+  border-color: rgba(59, 130, 246, 0.28);
+  box-shadow:
+    var(--agent-shadow-hover),
+    0 0 0 4px var(--agent-focus),
+    inset 0 1px 0 rgba(255, 255, 255, 0.96);
+}
+
+.agent-node.pending {
+  --state-rgb: 148 163 184;
+  --loop-glow: 0.28;
+  --loop-bg: conic-gradient(from var(--loop-angle), rgba(148, 163, 184, 0.32), rgba(226, 232, 240, 0.2), rgba(148, 163, 184, 0.32));
+}
+
+.agent-node.running {
+  --state-rgb: 99 102 241;
+  --loop-bg: conic-gradient(
+    from var(--loop-angle),
+    rgba(34, 211, 238, 0.92) 0deg,
+    rgba(96, 165, 250, 0.8) 26deg,
+    rgba(139, 92, 246, 0.86) 58deg,
+    rgba(14, 165, 233, 0.34) 112deg,
+    rgba(99, 102, 241, 0.4) 184deg,
+    rgba(34, 211, 238, 0.72) 270deg,
+    rgba(34, 211, 238, 0.92) 360deg
+  );
+  box-shadow:
+    0 28px 64px rgba(79, 70, 229, 0.15),
+    0 10px 24px rgba(6, 182, 212, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.95);
+}
+
+.agent-node.retrying {
+  --state-rgb: 217 119 6;
+  --loop-glow: 0.58;
+  --loop-bg: repeating-conic-gradient(
+    from var(--loop-angle),
+    rgba(217, 119, 6, 0.82) 0deg 12deg,
+    rgba(251, 191, 36, 0.28) 12deg 17deg,
+    transparent 17deg 31deg
+  );
+}
+
+.agent-node.completed {
+  --state-rgb: 34 197 94;
+  --loop-glow: 0.22;
+  --loop-bg: conic-gradient(from var(--loop-angle), rgba(34, 197, 94, 0.42), rgba(148, 163, 184, 0.12), rgba(34, 197, 94, 0.36));
+}
+
+.agent-node.failed {
+  --state-rgb: 220 107 101;
+  --loop-glow: 0.42;
+  --loop-bg: repeating-conic-gradient(
+    from -18deg,
+    rgba(220, 107, 101, 0.62) 0deg 14deg,
+    transparent 14deg 23deg,
+    rgba(185, 28, 28, 0.34) 23deg 34deg,
+    transparent 34deg 52deg
+  );
+}
+
+.energy-frame,
+.energy-frame::after {
+  position: absolute;
+  inset: -1px;
+  display: block;
+  border-radius: inherit;
+  pointer-events: none;
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+}
+
+.energy-frame {
+  z-index: 2;
+  padding: 1.5px;
+  background: var(--loop-bg);
+  opacity: var(--loop-glow);
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.agent-node.running .energy-frame,
+.agent-node.retrying .energy-frame {
+  filter: drop-shadow(0 0 12px rgb(var(--state-rgb) / 0.24));
+}
+
+.agent-node.running .energy-frame::after {
+  padding: 1.5px;
+  background: conic-gradient(from var(--loop-angle), transparent 0deg 286deg, rgba(255, 255, 255, 0.92) 304deg, transparent 328deg 360deg);
+  content: "";
+  opacity: 0.72;
+}
+
+.verification-shimmer {
+  position: absolute;
+  inset: 1px;
+  z-index: 3;
+  display: block;
+  width: 58%;
+  border-radius: calc(var(--agent-card-radius) - 1px);
+  background: linear-gradient(105deg, transparent, rgba(255, 255, 255, 0.82), rgba(187, 247, 208, 0.44), transparent);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-135%);
+  mix-blend-mode: screen;
+}
+
+.agent-card-content {
+  position: relative;
+  z-index: 4;
+  display: grid;
+  gap: 11px;
+  min-width: 0;
+}
+
+.agent-node-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  min-width: 0;
+}
+
+.agent-node-title {
+  min-width: 0;
+  overflow: hidden;
+  color: #0b1020;
+  font-size: 17px;
+  font-weight: 760;
+  letter-spacing: -0.035em;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-node-menu {
+  display: inline-grid;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.28);
+  color: #64748b;
+  padding: 0;
+}
+
+.agent-node-menu:hover,
+.agent-node-menu:focus-visible {
+  border-color: rgba(148, 163, 184, 0.26);
+  background: rgba(255, 255, 255, 0.74);
+  color: #0f172a;
+  outline: none;
+}
+
+.agent-identity-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  height: 30px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.58);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.82),
+    0 1px 2px rgba(15, 23, 42, 0.04);
+  color: #1e293b;
+  padding: 0 11px;
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.agent-dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: rgb(var(--state-rgb));
+  box-shadow: 0 0 0 3px rgb(var(--state-rgb) / 0.1);
+}
+
+.agent-summary {
+  display: -webkit-box;
+  min-height: 36px;
+  margin: 1px 0 0;
+  overflow: hidden;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 450;
+  letter-spacing: -0.01em;
+  line-height: 1.38;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.agent-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.agent-footer svg {
+  flex: 0 0 auto;
+  stroke-width: 2.2;
+}
+
+.agent-footer span:not(.footer-separator) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-footer.completed {
+  color: #2f7d50;
+}
+
+.agent-footer.failed {
+  color: #b4534a;
+}
+
+.agent-footer.retrying {
+  color: #a16207;
+}
+
+.agent-footer.running {
+  color: #4f46e5;
+}
+
+.footer-separator {
+  flex: 0 0 auto;
+  color: rgba(100, 116, 139, 0.72);
 }
 
 @media (prefers-reduced-motion: reduce) {
