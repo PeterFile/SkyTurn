@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
 
+import {
+  RENDERER_HOST,
+  DEFAULT_RENDERER_PORT,
+  findAvailablePort,
+  makeDevServerUrl,
+  rendererDevCommand,
+} from "./devServer.mjs";
+
 const children = [];
 
 function run(command, args, options = {}) {
@@ -48,11 +56,15 @@ await new Promise((resolve, reject) => {
   build.on("exit", (code) => (code === 0 ? resolve() : reject(new Error("Electron build failed"))));
 });
 
-run("pnpm", ["run", "dev:renderer"]);
-await waitFor("http://127.0.0.1:5173");
+const rendererPort = await findAvailablePort(DEFAULT_RENDERER_PORT, RENDERER_HOST);
+const devServerUrl = makeDevServerUrl(rendererPort, RENDERER_HOST);
+const [rendererCommand, rendererArgs] = rendererDevCommand(rendererPort, RENDERER_HOST);
+
+run(rendererCommand, rendererArgs);
+await waitFor(devServerUrl);
 run("electron", ["dist-electron/electron/main.js"], {
   env: {
     ...process.env,
-    VITE_DEV_SERVER_URL: "http://127.0.0.1:5173",
+    VITE_DEV_SERVER_URL: devServerUrl,
   },
 });
