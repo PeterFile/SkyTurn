@@ -512,8 +512,47 @@ h2 {
 }
 
 .empty-stage {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow: hidden;
+  padding: clamp(72px, 18vh, 150px) 24px 32px;
+  background:
+    radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--sk-canvas-dot) 72%, transparent) 1px, transparent 1.5px),
+    linear-gradient(145deg, color-mix(in srgb, var(--sk-accent) 5%, transparent), transparent 42%),
+    var(--sk-bg);
+  background-size: 18px 18px, 100% 100%, auto;
+  isolation: isolate;
+}
+
+.empty-stage::before {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background:
+    linear-gradient(118deg, transparent 0 44%, color-mix(in srgb, var(--sk-surface-muted) 54%, transparent) 44% 44.4%, transparent 44.4% 100%);
+  content: "";
+  opacity: 0.62;
+  pointer-events: none;
+}
+
+.project-start-page {
+  position: relative;
+  z-index: 1;
   display: grid;
-  place-items: center;
+  justify-items: center;
+  gap: 24px;
+  width: min(820px, 100%);
+}
+
+.project-start-title {
+  color: var(--sk-text-strong);
+  font-size: 28px;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.2;
+  text-align: center;
 }
 
 .bottom-bar {
@@ -949,7 +988,7 @@ h2 {
   --sk-mask-black: #000000;
   --agent-card-width: 324px;
   --agent-card-height: 202px;
-  --agent-card-radius: 12px;
+  --agent-card-radius: 22px;
   --agent-surface: rgba(255, 255, 255, 0.82);
   --agent-surface-strong: rgba(255, 255, 255, 0.94);
   --agent-hairline: rgba(148, 163, 184, 0.22);
@@ -1032,6 +1071,10 @@ textarea:focus-visible {
 .home-panel {
   width: min(680px, 100%);
   padding: 20px;
+}
+
+.home-panel .primary-action {
+  margin-top: 18px;
 }
 
 .brand-row,
@@ -2618,10 +2661,14 @@ h2 {
 }
 
 .sidebar-toggle {
-  top: 10px;
-  right: 8px;
-  width: 30px;
-  min-height: 30px;
+  top: 9px;
+  right: auto;
+  left: 10px;
+  width: auto;
+  min-width: 36px;
+  min-height: 32px;
+  gap: 7px;
+  justify-content: center;
   border-color: color-mix(in srgb, var(--sk-border) 82%, transparent);
   border-radius: 12px;
   background:
@@ -2630,20 +2677,19 @@ h2 {
   box-shadow:
     0 8px 20px rgba(15, 23, 42, 0.08),
     inset 0 1px 0 rgba(255, 255, 255, 0.78);
-  opacity: 0;
-  pointer-events: none;
+  opacity: 1;
+  padding: 0 10px;
   transition:
-    opacity 140ms ease,
     background 140ms ease,
     border-color 140ms ease,
     transform 140ms ease;
 }
 
-.sidebar:hover .sidebar-toggle,
-.sidebar:focus-within .sidebar-toggle,
-.sidebar-toggle:focus-visible {
-  opacity: 1;
-  pointer-events: auto;
+.sidebar-toggle-label {
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .sidebar-toggle:hover:not(:disabled) {
@@ -2656,25 +2702,21 @@ h2 {
     linear-gradient(180deg, color-mix(in srgb, var(--sk-surface) 96%, transparent), color-mix(in srgb, var(--sk-surface-muted) 90%, transparent));
 }
 
-.sidebar.collapsed::before {
-  content: "";
-  position: absolute;
-  z-index: 1;
-  top: 7px;
-  left: 5px;
-  width: 34px;
-  height: 36px;
-  border: 1px solid color-mix(in srgb, var(--sk-border) 72%, transparent);
-  border-radius: 14px;
-  background: color-mix(in srgb, var(--sk-surface) 82%, transparent);
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
-  pointer-events: none;
-}
-
 .sidebar.collapsed .sidebar-toggle {
   z-index: 2;
-  left: 7px;
+  left: 5px;
   right: auto;
+  width: 34px;
+  min-width: 34px;
+  padding: 0;
+}
+
+.sidebar.collapsed .sidebar-toggle-label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
 }
 
 .sidebar h2 {
@@ -2827,9 +2869,17 @@ h2 {
 }
 
 .agent-card {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: calc(100% - 4px);
+  height: calc(100% - 4px);
+  min-height: 0;
   grid-template-rows: auto auto minmax(0, 1fr) auto auto;
   gap: 11px;
+  margin: 0;
   border-color: rgba(148, 163, 184, 0.16);
+  border-radius: calc(var(--agent-card-radius) - 2px);
   background:
     radial-gradient(circle at 18% 10%, rgb(var(--state-rgb) / 0.08), transparent 34%),
     linear-gradient(150deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.72));
@@ -3039,19 +3089,6 @@ h2 {
   cursor: default;
 }
 
-.session-panel-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 18;
-  display: grid;
-  place-items: start center;
-  background:
-    radial-gradient(circle at 50% 0%, color-mix(in srgb, var(--sk-accent) 12%, transparent), transparent 42%),
-    rgba(248, 250, 252, 0.5);
-  padding-top: 58px;
-  backdrop-filter: blur(16px) saturate(1.08);
-}
-
 .session-panel {
   position: relative;
   overflow: hidden;
@@ -3069,6 +3106,13 @@ h2 {
     inset 0 1px 0 rgba(255, 255, 255, 0.78);
   padding: 22px 24px 20px;
   backdrop-filter: blur(20px) saturate(1.08);
+}
+
+.inline-session-panel {
+  width: min(820px, 100%);
+  box-shadow:
+    0 24px 80px rgba(15, 23, 42, 0.14),
+    inset 0 1px 0 rgba(255, 255, 255, 0.78);
 }
 
 .session-panel-footer {
@@ -3114,6 +3158,10 @@ h2 {
 
 .session-panel-input:focus {
   box-shadow: none;
+}
+
+.inline-session-panel .session-panel-input {
+  padding-right: 8px;
 }
 
 .session-panel-tool {
@@ -3228,4 +3276,74 @@ h2 {
   background: color-mix(in srgb, var(--sk-accent) 56%, var(--sk-surface));
   color: #ffffff;
   transform: translateY(-1px);
+}
+
+@media (max-width: 640px) {
+  .app-shell,
+  .app-shell.sidebar-collapsed {
+    grid-template-columns: 44px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    width: 44px;
+  }
+
+  .sidebar-inner {
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  .sidebar-toggle {
+    left: 5px;
+    width: 34px;
+    min-width: 34px;
+    padding: 0;
+  }
+
+  .sidebar-toggle-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .empty-stage {
+    padding: 56px 14px 20px;
+  }
+
+  .project-start-page {
+    gap: 18px;
+  }
+
+  .project-start-title {
+    font-size: 22px;
+  }
+
+  .session-panel {
+    width: min(820px, calc(100vw - 28px));
+    grid-template-rows: minmax(132px, 1fr) auto;
+    padding: 18px;
+  }
+
+  .inline-session-panel {
+    width: 100%;
+  }
+
+  .session-panel-footer {
+    flex-wrap: wrap;
+  }
+
+  .session-project-picker {
+    flex: 1 1 160px;
+    max-width: none;
+  }
+
+  .session-panel .mode-switch {
+    flex: 1 1 118px;
+  }
+
+  .session-panel-spacer {
+    display: none;
+  }
 }

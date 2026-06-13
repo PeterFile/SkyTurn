@@ -143,9 +143,6 @@ export default function App() {
     return emptyWorkspace();
   });
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
-  const [homeGoal, setHomeGoal] = useState("");
-  const [homeMode, setHomeMode] = useState<WorkflowMode>("fast");
-  const [newTaskOpen, setNewTaskOpen] = useState(false);
   const [newTaskGoal, setNewTaskGoal] = useState("");
   const [newTaskMode, setNewTaskMode] = useState<WorkflowMode>("fast");
   const [newTaskProjectId, setNewTaskProjectId] = useState<string | null>(null);
@@ -298,18 +295,18 @@ export default function App() {
     });
   }
 
-  function openNewSessionPanel(projectId = workspace.activeProjectId) {
-    setNewTaskProjectId(resolveSessionProjectId(workspace.projects, projectId, workspace.activeProjectId));
-    setNewTaskOpen(true);
-  }
+  function openProjectStartPage(projectId = workspace.activeProjectId) {
+    const resolvedProjectId = resolveSessionProjectId(workspace.projects, projectId, workspace.activeProjectId);
+    if (!resolvedProjectId) return;
 
-  function toggleNewSessionPanel() {
-    if (!newTaskOpen) {
-      setNewTaskProjectId(
-        resolveSessionProjectId(workspace.projects, workspace.activeProjectId, workspace.activeProjectId),
-      );
-    }
-    setNewTaskOpen((open) => !open);
+    setNewTaskProjectId(resolvedProjectId);
+    setNewTaskGoal("");
+    setNewTaskMode("fast");
+    setWorkspace((current) => ({
+      ...current,
+      activeProjectId: resolvedProjectId,
+      activeSessionId: null,
+    }));
   }
 
   function addSessionFromComposer() {
@@ -325,7 +322,6 @@ export default function App() {
       activeSessionId: session.id,
     }));
     setNewTaskGoal("");
-    setNewTaskOpen(false);
   }
 
   function confirmPlan(session: PlanSession) {
@@ -523,13 +519,7 @@ export default function App() {
 
   if (!activeProject) {
     return (
-      <Home
-        goal={homeGoal}
-        mode={homeMode}
-        onGoalChange={setHomeGoal}
-        onModeChange={setHomeMode}
-        onOpenProject={() => void importProject(homeGoal, homeMode)}
-      />
+      <Home onOpenProject={() => void importProject()} />
     );
   }
 
@@ -544,7 +534,8 @@ export default function App() {
             setWorkspace((current) => ({ ...current, sidebarCollapsed: !current.sidebarCollapsed }))
           }
         >
-          {workspace.sidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+          {workspace.sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          <span className="sidebar-toggle-label">{workspace.sidebarCollapsed ? "Expand" : "Collapse"}</span>
         </button>
         {!workspace.sidebarCollapsed && (
           <Sidebar
@@ -553,7 +544,7 @@ export default function App() {
             activeProjectId={activeProject.id}
             activeSessionId={workspace.activeSessionId}
             collapsedProjectIds={workspace.collapsedProjectIds}
-            onNewSession={() => openNewSessionPanel()}
+            onNewSession={() => openProjectStartPage()}
             onOpenProject={() => void importProject()}
             onSelectProject={(projectId) =>
               setWorkspace((current) => {
@@ -586,7 +577,7 @@ export default function App() {
               sessions: renameSessionTitle(current.sessions, sessionId, title, new Date().toISOString()),
             }))
           }
-          onToggleNewTask={toggleNewSessionPanel}
+          onToggleNewTask={() => openProjectStartPage()}
         />
 
         <main className="stage">
@@ -603,7 +594,18 @@ export default function App() {
               onOpenNode={openSelectedNode}
             />
           )}
-          {!activeSession && <EmptyWorkspace onNewTask={() => openNewSessionPanel()} />}
+          {!activeSession && (
+            <ProjectStartPage
+              goal={newTaskGoal}
+              mode={newTaskMode}
+              projects={workspace.projects}
+              selectedProjectId={resolvedNewTaskProjectId}
+              onGoalChange={setNewTaskGoal}
+              onModeChange={setNewTaskMode}
+              onProjectChange={setNewTaskProjectId}
+              onCreate={addSessionFromComposer}
+            />
+          )}
         </main>
       </div>
 
@@ -622,38 +624,11 @@ export default function App() {
           onOpenEditor={(editor) => openEditor(editor, selectedNode)}
         />
       )}
-      {newTaskOpen && (
-        <NewSessionPanel
-          goal={newTaskGoal}
-          mode={newTaskMode}
-          projects={workspace.projects}
-          selectedProjectId={resolvedNewTaskProjectId}
-          onGoalChange={setNewTaskGoal}
-          onModeChange={setNewTaskMode}
-          onProjectChange={setNewTaskProjectId}
-          onClose={() => setNewTaskOpen(false)}
-          onCreate={addSessionFromComposer}
-        />
-      )}
     </div>
   );
 }
 
-function Home({
-  goal,
-  mode,
-  onGoalChange,
-  onModeChange,
-  onOpenProject,
-}: {
-  goal: string;
-  mode: WorkflowMode;
-  onGoalChange: (value: string) => void;
-  onModeChange: (mode: WorkflowMode) => void;
-  onOpenProject: () => void;
-}) {
-  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-
+function Home({ onOpenProject }: { onOpenProject: () => void }) {
   return (
     <main className="home">
       <section className="home-panel" aria-label="Open project">
@@ -662,15 +637,7 @@ function Home({
             <p className="eyebrow">SkyTurn</p>
             <h1>Development workflow canvas</h1>
           </div>
-          <ModeSwitch mode={mode} onChange={onModeChange} />
         </div>
-        <textarea
-          className="home-input"
-          value={goal}
-          onChange={(event) => onGoalChange(event.target.value)}
-          placeholder="Task goal"
-          aria-label="Task goal"
-        />
         <button className="primary-action" onClick={onOpenProject}>
           <FolderOpen size={18} />
           Open Project
@@ -749,7 +716,13 @@ function TopBar({
         )}
       </div>
       <div className="topbar-actions">
-        <button className="new-tab-button icon-only" onClick={onToggleNewTask} title="New session">
+        <button
+          className="new-tab-button icon-only"
+          type="button"
+          onClick={onToggleNewTask}
+          title="New session"
+          aria-label="New session"
+        >
           <Plus size={16} />
         </button>
       </div>
@@ -857,7 +830,7 @@ function Sidebar({
   );
 }
 
-function NewSessionPanel({
+function ProjectStartPage({
   goal,
   mode,
   projects,
@@ -865,7 +838,6 @@ function NewSessionPanel({
   onGoalChange,
   onModeChange,
   onProjectChange,
-  onClose,
   onCreate,
 }: {
   goal: string;
@@ -875,26 +847,76 @@ function NewSessionPanel({
   onGoalChange: (goal: string) => void;
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
-  onClose: () => void;
+  onCreate: () => void;
+}) {
+  return (
+    <section className="empty-stage">
+      <div className="project-start-page">
+        <h1 className="project-start-title">What should we build in SkyTurn?</h1>
+        <SessionComposer
+          variant="inline"
+          goal={goal}
+          mode={mode}
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          ariaLabel="Create session"
+          onGoalChange={onGoalChange}
+          onModeChange={onModeChange}
+          onProjectChange={onProjectChange}
+          onCreate={onCreate}
+        />
+      </div>
+    </section>
+  );
+}
+
+function SessionComposer({
+  variant,
+  goal,
+  mode,
+  projects,
+  selectedProjectId,
+  ariaLabel,
+  onGoalChange,
+  onModeChange,
+  onProjectChange,
+  onClose,
+  onCreate,
+}: {
+  variant: "panel" | "inline";
+  goal: string;
+  mode: WorkflowMode;
+  projects: ImportedProject[];
+  selectedProjectId: string | null;
+  ariaLabel: string;
+  onGoalChange: (goal: string) => void;
+  onModeChange: (mode: WorkflowMode) => void;
+  onProjectChange: (projectId: string) => void;
+  onClose?: () => void;
   onCreate: () => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const hasGoal = goal.trim().length > 0;
   const canCreate = hasGoal && selectedProjectId !== null;
+  const className = [
+    "session-panel",
+    variant === "inline" ? "inline-session-panel" : "",
+    hasGoal ? "has-content" : "",
+  ].filter(Boolean).join(" ");
 
   return (
-    <div className="session-panel-backdrop" role="presentation" onMouseDown={onClose}>
-      <form
-        className={hasGoal ? "session-panel has-content" : "session-panel"}
-        role="dialog"
-        aria-modal="true"
-        aria-label="Create session"
-        onMouseDown={(event) => event.stopPropagation()}
-        onSubmit={(event) => {
-          event.preventDefault();
-          onCreate();
-        }}
-      >
+    <form
+      className={className}
+      role={variant === "panel" ? "dialog" : undefined}
+      aria-modal={variant === "panel" ? true : undefined}
+      aria-label={ariaLabel}
+      onMouseDown={variant === "panel" ? (event) => event.stopPropagation() : undefined}
+      onSubmit={(event) => {
+        event.preventDefault();
+        onCreate();
+      }}
+    >
+      {onClose && (
         <button
           className="icon-button session-panel-close"
           title="Close"
@@ -906,52 +928,52 @@ function NewSessionPanel({
         >
           <X size={17} />
         </button>
-        <textarea
-          className="session-panel-input"
-          ref={textareaRef}
-          value={goal}
-          onChange={(event) => onGoalChange(event.target.value)}
-          placeholder="What shall this canvas session build?"
-          aria-label="New task goal"
-        />
-        <footer className="session-panel-footer">
-          <button
-            className="icon-button session-panel-tool"
-            type="button"
-            title="Focus prompt"
-            onClick={() => textareaRef.current?.focus()}
+      )}
+      <textarea
+        className="session-panel-input"
+        ref={textareaRef}
+        value={goal}
+        onChange={(event) => onGoalChange(event.target.value)}
+        placeholder="What shall this canvas session build?"
+        aria-label="New task goal"
+      />
+      <footer className="session-panel-footer">
+        <button
+          className="icon-button session-panel-tool"
+          type="button"
+          title="Focus prompt"
+          onClick={() => textareaRef.current?.focus()}
+        >
+          <Plus size={17} />
+        </button>
+        <label className="session-project-picker">
+          <FolderOpen size={15} />
+          <select
+            value={selectedProjectId ?? ""}
+            disabled={projects.length === 0}
+            aria-label="Project"
+            onChange={(event) => onProjectChange(event.target.value)}
           >
-            <Plus size={17} />
-          </button>
-          <label className="session-project-picker">
-            <FolderOpen size={15} />
-            <select
-              value={selectedProjectId ?? ""}
-              disabled={projects.length === 0}
-              aria-label="Project"
-              onChange={(event) => onProjectChange(event.target.value)}
-            >
-              {projects.length === 0 && <option value="">No projects</option>}
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <ModeSwitch mode={mode} onChange={onModeChange} compact />
-          <span className="session-panel-spacer" />
-          <button
-            className="icon-button session-panel-submit"
-            type="submit"
-            disabled={!canCreate}
-            title="Create"
-          >
-            <ArrowUp size={18} />
-          </button>
-        </footer>
-      </form>
-    </div>
+            {projects.length === 0 && <option value="">No projects</option>}
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <ModeSwitch mode={mode} onChange={onModeChange} compact />
+        <span className="session-panel-spacer" />
+        <button
+          className="icon-button session-panel-submit"
+          type="submit"
+          disabled={!canCreate}
+          title="Create"
+        >
+          <ArrowUp size={18} />
+        </button>
+      </footer>
+    </form>
   );
 }
 
@@ -969,17 +991,6 @@ function formatRelativeTime(value: string): string {
   if (days < 30) return `${days}d`;
 
   return `${Math.floor(days / 30)}mo`;
-}
-
-function EmptyWorkspace({ onNewTask }: { onNewTask: () => void }) {
-  return (
-    <section className="empty-stage">
-      <button className="primary-action" onClick={onNewTask}>
-        <Plus size={18} />
-        New Tab
-      </button>
-    </section>
-  );
 }
 
 function PlanView({ session, onConfirm }: { session: PlanSession; onConfirm: (session: PlanSession) => void }) {

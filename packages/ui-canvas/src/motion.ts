@@ -20,14 +20,14 @@ export const MOTION_DISTANCE = {
   phraseShift: 4,
   failedShakeX: 1.5,
   enterScaleStart: 0.96,
-  selectedScale: 1.005,
+  selectedScale: 1,
 } as const;
 
 export const ENERGY_FRAME = {
   width: 324,
   height: 202,
   inset: 1,
-  radius: 21,
+  radius: 22,
   pathLength: 100,
 } as const;
 

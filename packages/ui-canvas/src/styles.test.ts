@@ -54,4 +54,39 @@ describe("SkyTurn UI style tokens", () => {
     expect(appSource).not.toContain("Open Worktree in Cursor");
     expect(appSource).not.toContain("Open Worktree in Zed");
   });
+
+  it("keeps session creation on the project start page instead of the launch page", async () => {
+    const appSource = await readSource("./App.tsx");
+
+    expect(appSource).toContain("<ProjectStartPage");
+    expect(appSource).toContain('variant="inline"');
+    expect(appSource).not.toContain('className="home-input"');
+  });
+
+  it("uses the project start page for new tabs without opening a modal composer", async () => {
+    const appSource = await readSource("./App.tsx");
+
+    expect(appSource).toContain("function openProjectStartPage");
+    expect(appSource).toContain("onNewSession={() => openProjectStartPage()}");
+    expect(appSource).toContain("onToggleNewTask={() => openProjectStartPage()}");
+    expect(appSource).not.toContain("newTaskOpen");
+    expect(appSource).not.toContain("<NewSessionPanel");
+    expect(appSource).not.toContain("session-panel-backdrop");
+  });
+
+  it("keeps sidebar controls visible and aligns node cards inside their energy frame", async () => {
+    const styles = await readSource("./styles.css");
+    const motionSource = await readSource("./motion.ts");
+    const sidebarToggleBlock = styles.match(/\.sidebar-toggle \{[\s\S]*?\n\}/)?.[0] ?? "";
+
+    expect(styles).toContain("sidebar-toggle-label");
+    expect(sidebarToggleBlock).toContain("position: absolute");
+    expect(sidebarToggleBlock).not.toContain("opacity: 0");
+    expect(sidebarToggleBlock).not.toContain("pointer-events: none");
+    expect(styles).toContain("radial-gradient(circle at 1px 1px");
+    expect(styles).toContain("--agent-card-radius: 22px");
+    expect(styles).toContain("width: calc(100% - 4px)");
+    expect(styles).toContain("height: calc(100% - 4px)");
+    expect(motionSource).toContain("radius: 22");
+  });
 });
