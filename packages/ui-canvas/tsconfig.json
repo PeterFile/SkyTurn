@@ -8,5 +8,6 @@
     "outDir": "dist",
     "tsBuildInfoFile": "../../node_modules/.tmp/ui-canvas.tsbuildinfo"
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/**/*.test.ts"]
 }
