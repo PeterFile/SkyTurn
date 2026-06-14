@@ -22,6 +22,7 @@ import {
   compileWorkflowIntent,
   createDefaultFlowPolicy,
   reduceWorkflowEvents,
+  scheduleReadyLanes,
   type FlowEvent,
   type FlowLane,
   type FlowProjection,
@@ -38,6 +39,7 @@ export async function startBridgeRun(
   session: CanvasSession,
   node: CanvasNode,
 ): Promise<BridgeRunResult | null> {
+  const sandbox = sandboxForNodeRun(node);
   const result = await window.devflow?.startAgentRun({
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
     runId: node.runId,
@@ -52,6 +54,7 @@ export async function startBridgeRun(
     projectRoot: project.rootPath,
     worktreePath: resolveRunWorktreePath(project, node),
     agentKind: node.agent,
+    ...(sandbox ? { sandbox } : {}),
     prompt: promptForNodeRun(session, node),
   });
   if (!result || !window.devflow) return null;
@@ -91,7 +94,8 @@ export function mergeRunEventsIntoWorkspace(
       ...session,
       nodes: session.nodes.map((node) => (node.runId === runId ? applyRunEventsToNode(node, session, deduped) : node)),
     };
-    return target.agent === "hermes" ? applyHermesWorkflowOutput(updatedSession, target, deduped) : updatedSession;
+    const projected = target.agent === "hermes" ? applyHermesWorkflowOutput(updatedSession, target, deduped) : updatedSession;
+    return scheduleFlowKernelLanes(projected);
   });
 
   return {
@@ -177,6 +181,37 @@ function applyWorkflowIntentProjection(
   };
 }
 
+function scheduleFlowKernelLanes(session: CanvasSession): CanvasSession {
+  if (!session.nodes.some((node) => node.display?.meta.includes("flow-kernel"))) return session;
+  const planner = session.nodes.find((node) => node.id === session.plannerNodeId);
+  if (planner && planner.status !== "completed") return session;
+
+  const projection = flowProjectionFromSession(session);
+  const runningScopes = projection.lanes
+    .filter((lane) => lane.status === "running")
+    .map((lane) => ({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes }));
+  const ready = scheduleReadyLanes(projection, { allowedParallelism: 1, runningScopes });
+  if (ready.length === 0) return session;
+
+  const readyIds = new Set(ready.map((lane) => lane.id));
+  const firstReady = ready[0]?.id ?? session.activeNodeId;
+  return {
+    ...session,
+    activeNodeId: firstReady,
+    updatedAt: new Date().toISOString(),
+    nodes: session.nodes.map((node) => {
+      if (!readyIds.has(node.id)) return node;
+      const action = node.display?.meta[0] ?? node.progress;
+      return {
+        ...node,
+        status: "running",
+        progress: "Scheduled by Flow Kernel",
+        runtime: runtimeForStatus("running", action),
+      };
+    }),
+  };
+}
+
 function dependenciesFromFlowEdges(projection: FlowProjection): Map<string, string[]> {
   const dependencies = new Map<string, string[]>();
   for (const edge of projection.edges) {
@@ -246,6 +281,10 @@ function flowLaneToCanvasNode(
   dependencies: string[],
 ): CanvasNode {
   const status = flowLaneStatusToNodeStatus(lane.status);
+  const laneOriginX = 460;
+  const laneOriginY = 140;
+  const laneColumnGap = 360;
+  const laneRowGap = 240;
   return {
     id: lane.id,
     title: lane.title,
@@ -263,7 +302,10 @@ function flowLaneToCanvasNode(
       semanticKey: lane.semanticKey,
     },
     status,
-    position: { x: 120 + (index % 3) * 340, y: 140 + Math.floor(index / 3) * 220 },
+    position: {
+      x: laneOriginX + (index % 3) * laneColumnGap,
+      y: laneOriginY + Math.floor(index / 3) * laneRowGap,
+    },
     runId: `run-${session.id}-${lane.id}`,
     changesetId: `changeset-${session.id}-${lane.id}`,
     output: lane.output.length > 0 ? lane.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
@@ -303,6 +345,19 @@ function progressForFlowLaneStatus(status: FlowLane["status"]): string {
 
 export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode): string {
   if (node.agent === "hermes") {
+    if (node.display?.meta.includes("flow-kernel") && node.id !== session.plannerNodeId) {
+      const dependencyEvidence = dependencyEvidenceForPrompt(session, node);
+      return [
+        `Task: ${node.context.brief}`,
+        `Session goal: ${session.goal}`,
+        `Node: ${node.id}`,
+        dependencyEvidence,
+        "Read-only review lane: do not modify files, do not stage changes, do not create commits, and do not create branches.",
+        "You may inspect repository state and run verification commands, but the Codex commit lane owns any commit.",
+        "Review the repository state, prior evidence, and dependency outcome for this lane.",
+        "Return concise findings, blockers, and verification notes. Do not output planner JSON or workflow-card tool JSON.",
+      ].filter(Boolean).join("\n");
+    }
     return buildHermesWorkflowPrompt({
       goal: hermesGoalForNode(session, node),
       sessionId: session.id,
@@ -319,17 +374,31 @@ export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode):
     });
   }
 
+  const laneKind = node.display?.meta[0] ?? "";
+  const laneInstruction = codexLaneInstruction(laneKind);
+  const dependencyEvidence = dependencyEvidenceForPrompt(session, node);
   return [
     `Task: ${node.context.brief}`,
     `Session goal: ${session.goal}`,
     `Node: ${node.id}`,
     `Worktree reference: ${node.worktree.path}`,
+    dependencyEvidence,
+    laneInstruction,
+    "Stay inside the current git repository. Do not run broad parent-directory scans such as `find ..`; if checking agent instructions, inspect only repo-local paths.",
     "Return a concise result summary and any blocker or verification evidence. Do not claim completion without evidence.",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function promptForNodeRun(session: CanvasSession, node: CanvasNode): string {
   return buildPromptForNodeRun(session, node);
+}
+
+function sandboxForNodeRun(node: CanvasNode): "workspace-write" | "danger-full-access" | undefined {
+  if (node.agent !== "codex") return undefined;
+  const laneKind = node.display?.meta[0] ?? "";
+  if (laneKind.includes("implementation")) return "workspace-write";
+  if (laneKind === "commit") return "danger-full-access";
+  return undefined;
 }
 
 function hermesGoalForNode(session: CanvasSession, node: CanvasNode): string {
@@ -337,6 +406,46 @@ function hermesGoalForNode(session: CanvasSession, node: CanvasNode): string {
   if (!brief || brief === "Decompose the user goal into workflow-card tool calls.") return session.goal;
   if (brief === session.goal.trim()) return session.goal;
   return `${session.goal}\nCurrent requirement: ${brief}`;
+}
+
+function codexLaneInstruction(laneKind: string): string {
+  if (laneKind.includes("implementation")) {
+    return "Implement the requested code and test change in this git repository. Run the relevant tests. Do not create a git commit in this lane.";
+  }
+  if (/validation|test|regression/.test(laneKind)) {
+    return "Run the relevant verification command and report the exact result. Do not create a git commit in this lane.";
+  }
+  if (laneKind === "commit") {
+    return [
+      "Before committing, read the dependency evidence above.",
+      "If review evidence reports blockers, fix them or report blocked; do not commit a known blocker.",
+      "Verify the working tree, run the relevant tests if needed, then git add only the relevant changed code/test files and create one commit with a concise message.",
+      "If git add, git commit, or verification fails, report the blocker and exit non-zero.",
+      "Do not stage `.devflow/`.",
+    ].join(" ");
+  }
+  return "";
+}
+
+function dependencyEvidenceForPrompt(session: CanvasSession, node: CanvasNode): string {
+  const dependencies = node.context.dependencies
+    .map((dependencyId) => session.nodes.find((candidate) => candidate.id === dependencyId))
+    .filter((candidate): candidate is CanvasNode => Boolean(candidate));
+  if (dependencies.length === 0) return "";
+
+  const sections = dependencies.map((dependency) => {
+    const output = dependency.output.join("\n").trim() || "(no output captured)";
+    return [
+      `Dependency ${dependency.id} (${dependency.title}, ${dependency.agent}, ${dependency.status}):`,
+      trimForPrompt(output, 2_000),
+    ].join("\n");
+  });
+  return ["Dependency evidence:", ...sections].join("\n");
+}
+
+function trimForPrompt(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `...${value.slice(value.length - maxLength)}`;
 }
 
 function resolveRunWorktreePath(project: ImportedProject, node: CanvasNode): string {

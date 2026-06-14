@@ -1,9 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { WorkspaceState } from "@skyturn/persistence";
-import type { CanvasNode, CanvasSession, RunEvent } from "@skyturn/project-core";
+import type { AgentRun, CanvasNode, CanvasSession, ImportedProject, RunEvent, RunEvidence, StartAgentRunInput } from "@skyturn/project-core";
 
-import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace } from "./workflowRuntime.js";
+import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace, startBridgeRun } from "./workflowRuntime.js";
 
 describe("workflow runtime event merging", () => {
   it("uses the workflow input requirement when building a Hermes planning prompt", () => {
@@ -125,6 +125,208 @@ describe("workflow runtime event merging", () => {
       "lane-design",
     ]);
     expect(session.nodes.find((node) => node.id === "lane-browser-validation")?.display?.meta).toContain("browser_validation");
+    expect(session.nodes.find((node) => node.id === "lane-discovery")?.position.x).toBeGreaterThan(
+      (session.nodes.find((node) => node.id === "node-1")?.position.x ?? 0) + 300,
+    );
+  });
+
+  it("starts the next Flow Kernel lane only after dependencies have evidence", () => {
+    const workspace = makeWorkspace();
+    const hermesRunId = "run-session-1-node-1";
+
+    const afterPlanner = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+      event(hermesRunId, 1, "output", {
+        text: JSON.stringify({
+          intentId: "intent-code-change-1",
+          sessionId: "session-1",
+          operations: [
+            {
+              type: "AnalyzeRequirement",
+              requirement:
+                "In this git repository, update src/tasks.js and add node:test coverage for listTasks status filtering.",
+            },
+            { type: "DiscoverProject", profile: { languages: ["javascript"], capabilities: [] } },
+            { type: "ProposeLanes" },
+          ],
+        }),
+      }),
+      event(hermesRunId, 2, "evidence", {
+        exitCode: 0,
+        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit 0" }],
+      }),
+      event(hermesRunId, 3, "status", {
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    const session = afterPlanner.sessions[0] as CanvasSession;
+    expect(session.nodes.find((node) => node.id === "lane-implementation")?.status).toBe("running");
+    expect(session.nodes.find((node) => node.id === "lane-validation")?.status).toBe("pending");
+
+    const implementationRunId = "run-session-1-lane-implementation";
+    const afterImplementation = mergeRunEventsIntoWorkspace(afterPlanner, implementationRunId, [
+      event(implementationRunId, 1, "output", {
+        text: "Implemented status filtering with tests.",
+      }),
+      event(implementationRunId, 2, "evidence", {
+        exitCode: 0,
+        checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed", detail: "exit 0" }],
+      }),
+      event(implementationRunId, 3, "status", {
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    const nextSession = afterImplementation.sessions[0] as CanvasSession;
+    expect(nextSession.nodes.find((node) => node.id === "lane-implementation")?.status).toBe("completed");
+    expect(nextSession.nodes.find((node) => node.id === "lane-validation")?.status).toBe("running");
+    expect(nextSession.nodes.find((node) => node.id === "lane-review")?.status).toBe("pending");
+  });
+
+  it("uses WorkflowIntent prompts only for the planner Hermes node", () => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-validation",
+        agent: "codex",
+        status: "completed",
+        runId: "run-session-1-lane-validation",
+        brief: "Run tests",
+        meta: ["validation", "lane-validation", "flow-kernel"],
+        output: ["npm test passed: 2 pass, 0 fail."],
+      }),
+      makeNode({
+        id: "lane-review",
+        agent: "hermes",
+        status: "running",
+        runId: "run-session-1-lane-review",
+        brief: "Review code evidence",
+        meta: ["review", "lane-review", "flow-kernel"],
+        dependencies: ["lane-validation"],
+      }),
+    ]);
+    const review = session.nodes.find((node) => node.id === "lane-review");
+
+    const prompt = buildPromptForNodeRun(session, review!);
+
+    expect(prompt).toContain("Task: Review code evidence");
+    expect(prompt).toContain("Dependency lane-validation");
+    expect(prompt).toContain("Read-only review lane");
+    expect(prompt).toContain("do not create commits");
+    expect(prompt).toContain("Codex commit lane owns any commit");
+    expect(prompt).not.toContain("You are Hermes-agent planning a SkyTurn workflow intent.");
+    expect(prompt).not.toContain("WorkflowIntent");
+  });
+
+  it("passes review evidence and repo-scoped scan guidance into commit lane prompts", () => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-review",
+        agent: "hermes",
+        status: "completed",
+        runId: "run-session-1-lane-review",
+        brief: "Review code evidence",
+        meta: ["review", "lane-review", "flow-kernel"],
+        output: ["Blockers:", "- `status` must be checked with `status !== undefined` before commit."],
+      }),
+      makeNode({
+        id: "lane-commit",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-commit",
+        brief: "Commit verified change",
+        meta: ["commit", "lane-commit", "flow-kernel"],
+        dependencies: ["lane-review"],
+      }),
+    ]);
+    const commit = session.nodes.find((node) => node.id === "lane-commit");
+
+    const prompt = buildPromptForNodeRun(session, commit!);
+
+    expect(prompt).toContain("Dependency lane-review");
+    expect(prompt).toContain("status !== undefined");
+    expect(prompt).toContain("do not commit a known blocker");
+    expect(prompt).toContain("Do not run broad parent-directory scans such as `find ..`");
+    expect(prompt).toContain("If git add, git commit, or verification fails");
+    expect(prompt).toContain("Do not stage `.devflow/`");
+  });
+
+  it("scopes Codex sandbox permissions by Flow Kernel lane", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = makeSession([
+      makeNode({
+        id: "lane-implementation",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-implementation",
+        meta: ["implementation", "lane-implementation", "flow-kernel"],
+      }),
+      makeNode({
+        id: "lane-validation",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-validation",
+        meta: ["validation", "lane-validation", "flow-kernel"],
+      }),
+      makeNode({
+        id: "lane-commit",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-commit",
+        meta: ["commit", "lane-commit", "flow-kernel"],
+      }),
+    ]);
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "succeeded",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({ protocolVersion: 1, events: [] }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: "run-session-1",
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies RunEvidence,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+      },
+    });
+
+    try {
+      for (const node of session.nodes.filter((node) => node.agent === "codex")) {
+        await startBridgeRun(project, session, node);
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(startAgentRun.mock.calls.map(([input]) => input.sandbox)).toEqual([
+      "workspace-write",
+      undefined,
+      "danger-full-access",
+    ]);
   });
 
   it("rejects malformed Hermes WorkflowIntent output without crashing the canvas projection", () => {
@@ -355,6 +557,9 @@ function makeNode(input: {
   status: CanvasNode["status"];
   runId: string;
   brief?: string;
+  meta?: string[];
+  dependencies?: string[];
+  output?: string[];
 }): CanvasNode {
   return {
     id: input.id,
@@ -365,7 +570,8 @@ function makeNode(input: {
     position: { x: 100, y: 100 },
     runId: input.runId,
     changesetId: `changeset-${input.id}`,
-    output: [],
+    output: input.output ?? [],
+    display: input.meta ? { agentLabel: input.agent, meta: input.meta } : undefined,
     worktree: {
       path: ".",
       branchName: `skyturn/session-1/${input.id}`,
@@ -377,7 +583,7 @@ function makeNode(input: {
       relatedRequirements: "",
       relatedDesign: "",
       relatedTasks: "",
-      dependencies: [],
+      dependencies: input.dependencies ?? [],
       constraints: [],
     },
   };

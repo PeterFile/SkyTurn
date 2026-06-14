@@ -235,8 +235,12 @@ function workspaceStorePath(): string {
 async function getAgentBridge(): Promise<AgentBridgeHost> {
   if (!agentBridge) {
     const { AgentBridge, createCodexCliAdapter, createHermesCliAdapter } = await import("@skyturn/agent-bridge");
+    const codexOptions = {
+      ...(process.env.SKYTURN_CODEX_SANDBOX === "workspace-write" ? { sandbox: "workspace-write" as const } : {}),
+      ...(process.env.SKYTURN_CODEX_IGNORE_USER_CONFIG === "1" ? { extraArgs: ["--ignore-user-config"] } : {}),
+    };
     const bridge = new AgentBridge({
-      adapters: [createHermesCliAdapter(), createCodexCliAdapter()],
+      adapters: [createHermesCliAdapter(), createCodexCliAdapter(codexOptions)],
     }) as AgentBridgeHost;
     bridge.onRunEvent((event) => {
       for (const window of BrowserWindow.getAllWindows()) {

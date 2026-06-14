@@ -76,6 +76,8 @@ codex exec --json --ephemeral --color never --sandbox read-only -c approval_poli
 
 The adapter does not invoke a shell string and does not use `--yolo` or `--dangerously-bypass-approvals-and-sandbox`. The default sandbox is `read-only`; `workspace-write` must be configured explicitly by the caller.
 
+Flow Kernel implementation lanes may pass a per-run `sandbox: "workspace-write"` so Codex can edit source and test files. Commit lanes may pass `sandbox: "danger-full-access"` so Codex can write git metadata for `git add` and `git commit`. Those permissions are lane-scoped and still use `approval_policy=never`; they must not become the adapter default or apply to validation lanes.
+
 Codex stdout is parsed as newline-delimited JSON when possible. `item.completed` events with `agent_message` text become SkyTurn `output` events. Non-JSON stdout and stderr become `progress` events. Process exit creates `RunEvidence`; `turn.completed` is progress only and does not mark a node complete.
 
 ## Roadmap

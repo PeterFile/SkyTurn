@@ -92,6 +92,58 @@ describe("Flow Kernel intent compiler", () => {
     expect(replayed.lanes).toEqual(first.lanes);
     expect(replayed.edges).toEqual(first.edges);
   });
+
+  it("routes small repository code changes to code execution lanes instead of frontend UI lanes", () => {
+    const policy = createDefaultFlowPolicy({ allowedParallelism: 1 });
+    const intent: WorkflowIntent = {
+      intentId: "intent-code-change-1",
+      sessionId: "session-1",
+      operations: [
+        {
+          type: "AnalyzeRequirement",
+          requirement:
+            "In this git repository, update src/tasks.js and add node:test coverage for listTasks status filtering.",
+        },
+        { type: "DiscoverProject", profile: { languages: ["javascript"], capabilities: [] } },
+        { type: "ProposeLanes" },
+      ],
+    };
+
+    const projection = reduceWorkflowEvents(compileWorkflowIntent(intent, emptyProjection("session-1"), policy, now).events);
+
+    expect(projection.lanes.map((lane) => [lane.kind, lane.agentKind, lane.title])).toEqual([
+      ["implementation", "codex", "Implement repository change"],
+      ["validation", "codex", "Run repository tests"],
+      ["review", "hermes", "Review code evidence"],
+      ["commit", "codex", "Commit verified change"],
+    ]);
+    expect(projection.edges.map((edge) => [edge.sourceLaneId, edge.targetLaneId])).toEqual([
+      ["lane-implementation", "lane-validation"],
+      ["lane-validation", "lane-review"],
+      ["lane-review", "lane-commit"],
+    ]);
+  });
+
+  it("gates WorkflowIntent operations against prior operations in the same intent", () => {
+    const policy = createDefaultFlowPolicy({ allowedParallelism: 1 });
+    const intent: WorkflowIntent = {
+      intentId: "intent-code-change-start",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/tasks.js and add node:test coverage." },
+        { type: "DiscoverProject", profile: { languages: ["javascript"], capabilities: [] } },
+        { type: "ProposeLanes" },
+        { type: "StartImplementation", laneId: "lane-implementation" },
+      ],
+    };
+
+    const compiled = compileWorkflowIntent(intent, emptyProjection("session-1"), policy, now);
+    const projection = reduceWorkflowEvents(compiled.events);
+
+    expect(compiled.ok).toBe(true);
+    expect(projection.rejectedIntents).toEqual([]);
+    expect(projection.lanes.map((lane) => lane.id)).toContain("lane-implementation");
+  });
 });
 
 describe("Flow Kernel gate engine and scheduler", () => {

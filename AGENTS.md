@@ -39,6 +39,7 @@
 - `agent-runtime` is contract-only: no process execution, discovery implementation, Electron, filesystem execution, or UI logic.
 - `agent-bridge` owns local Agent discovery, connection, run lifecycle, event stream, and run persistence; it must not do DAG orchestration.
 - Codex CLI real execution must stay in `agent-bridge` adapters: use `codex exec --json` inside a git repository, default to read-only sandbox, do not use `--yolo`, and derive completion from process exit `RunEvidence`.
+- Flow Kernel Codex implementation lanes may request per-run `workspace-write` for source/test edits; commit lanes may request per-run `danger-full-access` to write git metadata for `git add`/`git commit`; keep validation lanes on the adapter default sandbox unless a lane has a concrete reason to write.
 - Do not deeply couple the app to any single agent CLI internals.
 - Use mock adapters first when local CLIs or Hermes APIs are unavailable.
 - Each coding agent must load its own native config, skills, MCP, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, or equivalent files without polluting other agents.

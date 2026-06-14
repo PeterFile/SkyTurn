@@ -318,6 +318,12 @@ export function createDefaultFlowPolicy(input: Partial<Pick<FlowPolicy, "allowed
     ],
     joinRules: [{ id: "integration-join", upstreamLaneKinds: ["frontend_implementation", "backend_implementation", "persistence_implementation"], joinLaneKind: "integration_join" }],
     policyPacks: [
+      policyPack("code-change", ["code-change"], [
+        laneSuggestion("lane-implementation", "implementation", "Implement repository change", "codex", [], [], ["app"]),
+        laneSuggestion("lane-validation", "validation", "Run repository tests", "codex", ["lane-implementation"]),
+        laneSuggestion("lane-review", "review", "Review code evidence", "hermes", ["lane-validation"]),
+        laneSuggestion("lane-commit", "commit", "Commit verified change", "codex", ["lane-review"]),
+      ], ["test", "git"], ["validation"]),
       policyPack("frontend-ui", ["frontend-ui"], [
         laneSuggestion("lane-discovery", "discovery", "Discover UI surface", "hermes"),
         laneSuggestion("lane-design", "design", "Design compact control", "hermes", ["lane-discovery"]),
@@ -365,25 +371,6 @@ export function compileWorkflowIntent(
 ): CompileWorkflowIntentResult {
   if (projection.acceptedIntentIds.includes(intent.intentId)) return { ok: true, events: [] };
 
-  const invalid = intent.operations
-    .map((operation) => evaluateGate(projection, operation))
-    .find((result) => !result.allowed);
-  if (invalid) {
-    return {
-      ok: false,
-      reason: invalid.reason,
-      events: [
-        makeEvent(projection, {
-          kind: "workflow.intent.rejected",
-          source: "workflow-kernel",
-          payload: { intentId: intent.intentId, reason: invalid.reason },
-          now,
-          idempotencyKey: `intent:${intent.intentId}:rejected`,
-        }),
-      ],
-    };
-  }
-
   let working = projection;
   const events: FlowEvent[] = [
     makeEvent(working, {
@@ -397,6 +384,22 @@ export function compileWorkflowIntent(
   working = reduceWorkflowEvents([...working.events, ...events]);
 
   for (const operation of intent.operations) {
+    const gate = evaluateGate(working, operation);
+    if (!gate.allowed) {
+      return {
+        ok: false,
+        reason: gate.reason,
+        events: [
+          makeEvent(projection, {
+            kind: "workflow.intent.rejected",
+            source: "workflow-kernel",
+            payload: { intentId: intent.intentId, reason: gate.reason },
+            now,
+            idempotencyKey: `intent:${intent.intentId}:rejected`,
+          }),
+        ],
+      };
+    }
     const next = compileOperation(operation, intent, working, policy, now);
     events.push(...next);
     working = reduceWorkflowEvents([...working.events, ...next]);
@@ -676,8 +679,15 @@ function suggestedLanesForPolicy(
 function inferRequirementProfile(requirement: string): RequirementProfile {
   const text = requirement.toLowerCase();
   const isBackend = text.includes("endpoint") || text.includes("api");
+  const isRepositoryCodeChange =
+    text.includes("git repository") ||
+    text.includes("node:test") ||
+    /\bsrc\/[\w./-]+/.test(text) ||
+    /\b(test|tests?)\/[\w./-]+/.test(text) ||
+    /\b[\w-]+\.(js|ts|mjs|tsx)\b/.test(text);
   const capabilities = [
-    !isBackend && (text.includes("search") || text.includes("filter") || text.includes("ui") || text.includes("react")) ? "frontend-ui" : null,
+    isRepositoryCodeChange ? "code-change" : null,
+    !isBackend && !isRepositoryCodeChange && (text.includes("search") || text.includes("filter") || text.includes("ui") || text.includes("react")) ? "frontend-ui" : null,
     isBackend ? "backend-api" : null,
     text.includes("csv") || text.includes("data") ? "data-script" : null,
     text.includes("settings") || text.includes("fullstack") ? "fullstack-settings" : null,

@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
-import { access, appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
+import { access, appendFile, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -16,6 +16,7 @@ import {
   type AgentDescriptor,
   type AgentKind,
   type AgentRun,
+  type AgentRunSandbox,
   type AgentRunStatus,
   type RunEvent,
   type RunEvidence,
@@ -48,7 +49,7 @@ export interface AgentBridgeOptions {
   pathValue?: string;
 }
 
-export type CodexCliSandbox = "read-only" | "workspace-write" | "danger-full-access";
+export type CodexCliSandbox = AgentRunSandbox;
 
 export interface CodexCliAdapterOptions {
   executablePath?: string;
@@ -263,7 +264,7 @@ export async function loadRunEvents(projectRoot: string, runId: string): Promise
 }
 
 export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): LocalAgentAdapterContract {
-  const sandbox = options.sandbox ?? "read-only";
+  const defaultSandbox = options.sandbox ?? "read-only";
   return {
     kind: "codex",
     label: "Codex CLI",
@@ -285,7 +286,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       };
     },
     async startRun(input, sink) {
-      const workdir = input.worktreePath || input.projectRoot;
+      const workdir = await realpath(input.worktreePath || input.projectRoot);
       if (!(await hasGitMetadata(workdir))) {
         await sink.emit({
           kind: "error",
@@ -300,6 +301,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       }
 
       const executablePath = options.executablePath ?? "codex";
+      const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : defaultSandbox;
       const args = makeCodexExecArgs({
         prompt: input.prompt,
         sandbox,
@@ -309,6 +311,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       const child = spawn(executablePath, args, {
         cwd: workdir,
         env: { ...process.env, ...options.env },
+        detached: process.platform !== "win32",
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -434,9 +437,9 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
               kind: "status",
               payload: { status: "timed-out", reason: `Codex CLI timed out after ${timeoutMs}ms` },
             });
-            if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+            terminateProcessTree(child, "SIGTERM");
             killTimer = setTimeout(() => {
-              if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+              terminateProcessTree(child, "SIGKILL");
             }, killTimeoutMs);
           })();
         }, timeoutMs);
@@ -448,7 +451,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           cancelled = true;
           cancelReason = reason;
           if (timeoutTimer) clearTimeout(timeoutTimer);
-          if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+          terminateProcessTree(child, "SIGTERM");
         },
       };
     },
@@ -477,7 +480,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       };
     },
     async startRun(input, sink) {
-      const workdir = input.projectRoot;
+      const workdir = await realpath(input.projectRoot);
       const executablePath = options.executablePath ?? "hermes";
       const args = makeHermesChatArgs({
         prompt: input.prompt,
@@ -489,6 +492,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       const child = spawn(executablePath, args, {
         cwd: workdir,
         env: { ...process.env, ...options.env },
+        detached: process.platform !== "win32",
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -600,11 +604,26 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         async cancel(reason) {
           cancelled = true;
           cancelReason = reason;
-          if (!child.killed) child.kill("SIGTERM");
+          terminateProcessTree(child, "SIGTERM");
         },
       };
     },
   };
+}
+
+function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const pid = child.pid;
+  if (!pid) return;
+  if (process.platform === "win32") {
+    child.kill(signal);
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    child.kill(signal);
+  }
 }
 
 export async function readTaskOutput(projectRoot: string, nodeId: string): Promise<string> {
@@ -815,6 +834,10 @@ function isEvidenceCheck(value: unknown): value is NonNullable<RunEvidence["revi
   if (!value || typeof value !== "object") return false;
   const candidate = value as { name?: unknown; kind?: unknown; status?: unknown };
   return typeof candidate.name === "string" && typeof candidate.kind === "string" && typeof candidate.status === "string";
+}
+
+function isCodexCliSandbox(value: unknown): value is CodexCliSandbox {
+  return value === "read-only" || value === "workspace-write" || value === "danger-full-access";
 }
 
 function makeCodexExecArgs(input: {

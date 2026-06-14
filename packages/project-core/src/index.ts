@@ -34,6 +34,7 @@ export type AgentRunStatus =
   | "failed"
   | "cancelled"
   | "timed-out";
+export type AgentRunSandbox = "read-only" | "workspace-write" | "danger-full-access";
 export type RunEventKind = "output" | "status" | "error" | "approval" | "progress" | "evidence";
 export type EvidenceCheckStatus = "passed" | "failed" | "skipped";
 export type HermesPlannerTransport = "hermes_live_chat" | "hermes_session_resume" | "hermes_replay_recovery";
@@ -83,6 +84,7 @@ export interface StartAgentRunInput {
   projectRoot: string;
   worktreePath: string;
   agentKind: AgentKind;
+  sandbox?: AgentRunSandbox;
   prompt: string;
 }
 

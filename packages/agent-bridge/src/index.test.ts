@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -230,7 +230,7 @@ describe("agent bridge", () => {
       "-c",
       "approval_policy=never",
       "-C",
-      projectRoot,
+      await realpath(projectRoot),
       "Implement the task",
     ]);
     expect(events.map((event) => event.seq)).toEqual(events.map((_, index) => index + 1));
@@ -239,6 +239,112 @@ describe("agent bridge", () => {
     expect(events.some((event) => event.kind === "progress" && event.payload.format === "text")).toBe(true);
     expect(evidence.status).toBe("succeeded");
     expect(evidence.exitCode).toBe(0);
+  });
+
+  it("runs Codex from the canonical workdir so sandboxed git writes can reach .git", async () => {
+    const root = await makeTempRoot();
+    const projectRoot = join(root, "project");
+    const projectLink = join(root, "project-link");
+    await mkdir(join(projectRoot, ".git"), { recursive: true });
+    await symlink(projectRoot, projectLink);
+    const binRoot = await makeTempRoot();
+    const argsPath = join(binRoot, "args.json");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.SKYTURN_CODEX_ARGS_PATH, JSON.stringify({",
+        "  argv: process.argv.slice(2),",
+        "  cwd: process.cwd(),",
+        "}));",
+        "process.stdout.write('{\"type\":\"turn.completed\"}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: { SKYTURN_CODEX_ARGS_PATH: argsPath },
+          sandbox: "workspace-write",
+        }),
+      ],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-link",
+      sessionId: "session-1",
+      projectRoot: projectLink,
+      worktreePath: projectLink,
+      agentKind: "codex",
+      prompt: "Commit the task",
+    });
+    await completed;
+
+    const args = JSON.parse(await readFile(argsPath, "utf8")) as { argv: string[]; cwd: string };
+    const canonicalRoot = await realpath(projectRoot);
+
+    expect(args.cwd).toBe(canonicalRoot);
+    expect(args.argv).toContain(canonicalRoot);
+    expect(args.argv).not.toContain(projectLink);
+  });
+
+  it("lets a single Codex run override the adapter sandbox", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const argsPath = join(binRoot, "args.json");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.SKYTURN_CODEX_ARGS_PATH, JSON.stringify({",
+        "  argv: process.argv.slice(2),",
+        "}));",
+        "process.stdout.write('{\"type\":\"turn.completed\"}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: { SKYTURN_CODEX_ARGS_PATH: argsPath },
+          sandbox: "read-only",
+        }),
+      ],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-commit",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "danger-full-access",
+      prompt: "Commit the task",
+    });
+    await completed;
+
+    const args = JSON.parse(await readFile(argsPath, "utf8")) as { argv: string[] };
+    const sandboxIndex = args.argv.indexOf("--sandbox");
+
+    expect(sandboxIndex).toBeGreaterThanOrEqual(0);
+    expect(args.argv[sandboxIndex + 1]).toBe("danger-full-access");
   });
 
   it("times out a stalled Codex CLI run instead of leaving the card running", async () => {
@@ -293,6 +399,58 @@ describe("agent bridge", () => {
       status: "failed",
       detail: "timed out after 250ms",
     });
+  });
+
+  it("kills Codex child process groups on timeout", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const childPidPath = join(binRoot, "child.pid");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_PID_PATH, String(child.pid));",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: { SKYTURN_CHILD_PID_PATH: childPidPath },
+          timeoutMs: 250,
+          killTimeoutMs: 250,
+        }),
+      ],
+    });
+    const timedOut = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "timed-out",
+    );
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-process-group-timeout",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Hang with a child process",
+    });
+    await timedOut;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    const childPid = Number(await readFile(childPidPath, "utf8"));
+
+    expect(isPidAlive(childPid)).toBe(false);
   });
 
   it("runs Hermes chat planning without oneshot -z and marks replay recovery honestly", async () => {
@@ -491,4 +649,13 @@ function waitForEvent(bridge: AgentBridge, predicate: (event: RunEvent) => boole
       resolve(event);
     });
   });
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
