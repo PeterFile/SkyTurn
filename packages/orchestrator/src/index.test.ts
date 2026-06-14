@@ -5,6 +5,7 @@ import {
   applyWorkflowCardToolCalls,
   buildHermesWorkflowPrompt,
   dependencyAwareScheduler,
+  parseHermesWorkflowIntent,
   parseHermesWorkflowToolCalls,
 } from "./index";
 
@@ -351,7 +352,7 @@ describe("workflow-card tools", () => {
     ]);
   });
 
-  it("prompts Hermes with the SkyTurn card model and graph hygiene rules", () => {
+  it("prompts Hermes v2 to return WorkflowIntent instead of UI card mutations", () => {
     const prompt = buildHermesWorkflowPrompt({
       goal: "Update one file and verify it",
       sessionId: "session-1",
@@ -361,12 +362,34 @@ describe("workflow-card tools", () => {
     });
 
     expect(prompt).toContain("Planner session identity: hermes-planner-session-1");
-    expect(prompt).toContain("Card is SkyTurn task state, not the agent itself.");
-    expect(prompt).toContain("Hermes cards are planner/verifier tasks; Codex cards are executor tasks.");
-    expect(prompt).toContain("runId connects a card to a concrete local agent run.");
-    expect(prompt).toContain("Dependencies define xyflow edges and scheduling order.");
-    expect(prompt).toContain("Use updateWorkflowCard instead of createWorkflowCard when an equivalent card already exists.");
-    expect(prompt).toContain("At most one primary Codex implementation card and one Hermes verification card for a simple single-file task.");
+    expect(prompt).toContain("Return ONLY one JSON WorkflowIntent object.");
+    expect(prompt).toContain("sessionId MUST equal the SkyTurn Canvas Session value");
+    expect(prompt).toContain("AnalyzeRequirement MUST be");
+    expect(prompt).toContain("DiscoverProject MUST be");
+    expect(prompt).toContain("Allowed operations: AnalyzeRequirement, DiscoverProject, ProposeLanes, SplitLane, JoinLanes, StartImplementation, RequestValidation, RequestReview, RequestUserDecision, ReplanFromEvidence.");
+    expect(prompt).toContain("operations MUST include AnalyzeRequirement, DiscoverProject, and ProposeLanes.");
+    expect(prompt).toContain("Do not output workflow-card tools or UI mutations.");
+    expect(prompt).toContain("SkyTurn, not Hermes, deterministically compiles the intent into DAG lanes and edges.");
+    expect(prompt).not.toContain("createWorkflowCard");
+    expect(prompt).not.toContain("toolCalls");
+  });
+
+  it("parses Hermes v2 WorkflowIntent and rejects old UI card mutations", () => {
+    const accepted = parseHermesWorkflowIntent(JSON.stringify({
+      intentId: "intent-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Add search filtering" },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["frontend-ui"] } },
+        { type: "ProposeLanes" },
+      ],
+    }));
+
+    expect(accepted).toMatchObject({ ok: true, intent: { intentId: "intent-1" } });
+    expect(parseHermesWorkflowIntent(JSON.stringify({ toolCalls: [] }))).toMatchObject({
+      ok: false,
+      reason: expect.stringMatching(/WorkflowIntent/i),
+    });
   });
 
   it("applies Hermes workflow-card tool calls to create, update, and delete cards", () => {

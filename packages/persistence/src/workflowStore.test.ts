@@ -9,6 +9,7 @@ import {
   type WorkflowCardCreateInput,
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
+import type { WorkflowIntent } from "@skyturn/workflow-kernel";
 
 const roots: string[] = [];
 
@@ -338,6 +339,78 @@ describe("SQLite workflow store", () => {
     expect(first?.nodes.map((node) => node.id)).toEqual(["node-1", "node-plan", "node-code"]);
     expect(first?.edges).toEqual([{ id: "edge-node-plan-node-code", source: "node-plan", target: "node-code" }]);
     reopened.close();
+  });
+
+  it("persists accepted WorkflowIntent events and replays a deterministic Flow Kernel projection after restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const intent: WorkflowIntent = {
+      intentId: "intent-frontend-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Add a search filtering control" },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["frontend-ui"] } },
+        { type: "ProposeLanes" },
+      ],
+    };
+
+    const first = store.applyWorkflowIntent(intent, "2026-06-14T00:00:03.000Z");
+    const duplicate = store.applyWorkflowIntent(intent, "2026-06-14T00:00:04.000Z");
+    const projection = store.materializeFlowProjection("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const replayed = reopened.materializeFlowProjection("session-1");
+
+    expect(first.ok).toBe(true);
+    expect(duplicate.events).toEqual([]);
+    expect(projection.lanes.map((lane) => lane.kind)).toEqual([
+      "discovery",
+      "design",
+      "implementation",
+      "browser_validation",
+      "review",
+      "commit",
+    ]);
+    expect(replayed).toEqual(projection);
+    expect(reopened.listEvents("session-1").some((event) => event.kind === "workflow.intent.accepted")).toBe(true);
+    reopened.close();
+  });
+
+  it("persists rejected WorkflowIntent events when gate validation fails", async () => {
+    const store = await makeSeededStore();
+    const rejected = store.applyWorkflowIntent({
+      intentId: "intent-bad-review",
+      sessionId: "session-1",
+      operations: [{ type: "RequestReview", laneId: "lane-review" }],
+    }, "2026-06-14T00:00:03.000Z");
+
+    const projection = store.materializeFlowProjection("session-1");
+
+    expect(rejected).toMatchObject({ ok: false, reason: expect.stringMatching(/implementation evidence/i) });
+    expect(store.listEvents("session-1").at(-1)).toMatchObject({
+      kind: "workflow.intent.rejected",
+      payload: { intentId: "intent-bad-review", reason: expect.stringMatching(/implementation evidence/i) },
+    });
+    expect(projection.rejectedIntents).toEqual([
+      { intentId: "intent-bad-review", reason: expect.stringMatching(/implementation evidence/i) },
+    ]);
+  });
+
+  it("persists rejected WorkflowIntent events when schema validation fails", async () => {
+    const store = await makeSeededStore();
+    const rejected = store.applyWorkflowIntent({
+      intentId: "intent-missing-requirement",
+      sessionId: "session-1",
+      operations: [{ type: "AnalyzeRequirement" }, { type: "DiscoverProject" }, { type: "ProposeLanes" }],
+    }, "2026-06-14T00:00:03.000Z");
+
+    expect(rejected).toMatchObject({ ok: false, reason: expect.stringMatching(/AnalyzeRequirement.*requirement/i) });
+    expect(store.listEvents("session-1").at(-1)).toMatchObject({
+      kind: "workflow.intent.rejected",
+      payload: { intentId: "intent-missing-requirement", reason: expect.stringMatching(/AnalyzeRequirement.*requirement/i) },
+    });
   });
 });
 

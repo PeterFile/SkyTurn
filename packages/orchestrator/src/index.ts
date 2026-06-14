@@ -1,4 +1,8 @@
 import type { HermesOrchestratorAdapter } from "@skyturn/agent-runtime";
+import {
+  parseWorkflowIntent,
+  type ParseWorkflowIntentResult,
+} from "@skyturn/workflow-kernel";
 import type {
   AgentKind,
   CanvasEdge,
@@ -114,32 +118,32 @@ export interface HermesWorkflowPromptInput {
 
 export function buildHermesWorkflowPrompt(input: HermesWorkflowPromptInput): string {
   return [
-    "You are Hermes-agent planning a SkyTurn workflow canvas.",
-    "Return ONLY one JSON object. No markdown. No prose.",
-    "Schema: {\"toolCalls\":[{\"tool\":\"createWorkflowCard|updateWorkflowCard|deleteWorkflowCard\",\"toolCallId\":\"string\",\"input\":{\"id\":\"string\",\"taskKey\":\"string\",\"title\":\"string\",\"agent\":\"hermes|codex|gemini|claude-code|openclaw\",\"status\":\"pending|running|retrying|completed|failed\",\"brief\":\"string\",\"dependencies\":[\"node-id\"],\"worktreePath\":\"string\"}}]}",
-    "Use these exact tools: createWorkflowCard, updateWorkflowCard, deleteWorkflowCard.",
-    "Card is SkyTurn task state, not the agent itself.",
-    "Hermes cards are planner/verifier tasks; Codex cards are executor tasks.",
-    "runId connects a card to a concrete local agent run.",
+    "You are Hermes-agent planning a SkyTurn workflow intent.",
+    "Return ONLY one JSON WorkflowIntent object. No markdown. No prose.",
+    "Schema: {\"intentId\":\"string\",\"sessionId\":\"string\",\"operations\":[{\"type\":\"AnalyzeRequirement|DiscoverProject|ProposeLanes|SplitLane|JoinLanes|StartImplementation|RequestValidation|RequestReview|RequestUserDecision|ReplanFromEvidence\"}]}",
+    "sessionId MUST equal the SkyTurn Canvas Session value, not the Hermes planner session identity.",
+    "AnalyzeRequirement MUST be {\"type\":\"AnalyzeRequirement\",\"requirement\":\"the user requirement\"}.",
+    "DiscoverProject MUST be {\"type\":\"DiscoverProject\",\"profile\":{\"languages\":[],\"capabilities\":[],\"packages\":[],\"hasFrontend\":false,\"hasBackend\":false,\"hasPersistence\":false}}.",
+    "ProposeLanes MAY be {\"type\":\"ProposeLanes\"}; SkyTurn chooses policy-pack lanes when lanes are omitted.",
+    "Allowed operations: AnalyzeRequirement, DiscoverProject, ProposeLanes, SplitLane, JoinLanes, StartImplementation, RequestValidation, RequestReview, RequestUserDecision, ReplanFromEvidence.",
+    "For a new user requirement, operations MUST include AnalyzeRequirement, DiscoverProject, and ProposeLanes.",
+    "Do not output workflow-card tools or UI mutations.",
+    "SkyTurn, not Hermes, deterministically compiles the intent into DAG lanes and edges.",
+    "Policy packs may suggest lanes, but they must not hard-code a complete per-framework workflow.",
+    "Do not set completed status; completion is derived from concrete evidence only.",
+    "Request review only after implementation evidence, validation only after implementation, and joins only after upstream completion.",
     "The planner session identity is stable for this CanvasSession; runId is not a planner identity.",
     "Continue the same planner session for new requirements in this CanvasSession.",
-    "Dependencies define xyflow edges and scheduling order.",
-    "Use stable card IDs or stable taskKey values for semantically identical cards.",
-    "Use updateWorkflowCard instead of createWorkflowCard when an equivalent card already exists.",
-    "Every verification card must depend on the Codex implementation card it verifies.",
-    "No disconnected cards except the root planning card.",
-    "Do not set a verifier running until its dependencies are completed; create it pending when implementation is still running.",
-    "At most one primary Codex implementation card and one Hermes verification card for a simple single-file task.",
-    "Required vertical slice: create at least one running Codex code task.",
-    "Allowed agents: hermes, codex, gemini, claude-code, openclaw.",
-    "Allowed statuses: pending, running, retrying, completed, failed.",
-    "For the running Codex task, set worktreePath to \".\" and brief to a concrete software-development task.",
     `Session: ${input.sessionId}`,
     `Planner session identity: ${input.plannerSessionId}`,
     `Planning node: ${input.nodeId}`,
     `Existing nodes: ${JSON.stringify(input.existingNodes)}`,
     `User goal: ${input.goal}`,
   ].join("\n");
+}
+
+export function parseHermesWorkflowIntent(output: string): ParseWorkflowIntentResult {
+  return parseWorkflowIntent(output);
 }
 
 export function parseHermesWorkflowToolCalls(output: string): WorkflowCardToolCall[] {

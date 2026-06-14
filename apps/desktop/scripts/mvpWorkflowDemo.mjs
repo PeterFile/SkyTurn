@@ -10,13 +10,13 @@ import {
   createHermesCliAdapter,
   loadRunEvents,
 } from "@skyturn/agent-bridge";
-import { parseHermesWorkflowToolCalls } from "@skyturn/orchestrator";
+import { parseHermesWorkflowIntent } from "@skyturn/orchestrator";
 import { createFastCanvasSession } from "@skyturn/planner";
 import { addRequirementPlanningNode } from "@skyturn/ui-canvas/composer";
 import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace } from "@skyturn/ui-canvas/workflow-runtime";
 
 const root = await mkdtemp(join(tmpdir(), "skyturn-mvp-demo-"));
-let keepRoot = false;
+let keepRoot = true;
 
 try {
   await seedProject(root);
@@ -87,10 +87,18 @@ try {
 
   const activeSession = workspace.sessions.find((item) => item.id === session.id);
   const codexNode = activeSession?.kind === "canvas"
-    ? activeSession.nodes.find((node) => node.agent === "codex" && node.status === "running")
+    ? activeSession.nodes.find((node) => node.agent === "codex" && node.display?.meta.includes("flow-kernel"))
     : null;
   if (!codexNode) {
-    throw new Error("Hermes did not create a running Codex workflow card.");
+    console.log(JSON.stringify({
+      ok: false,
+      projectRoot: root,
+      error: "Hermes WorkflowIntent did not project a Codex Flow Kernel lane.",
+      firstHermesOutput: outputFromEvents(firstHermesEvents),
+      secondHermesOutput: outputFromEvents(hermesEvents),
+      activeSession: activeSession?.kind === "canvas" ? canvasSummary(activeSession) : null,
+    }, null, 2));
+    throw new Error("Hermes WorkflowIntent did not project a Codex Flow Kernel lane.");
   }
 
   const codexRun = await bridge.startRun({
@@ -117,23 +125,19 @@ try {
   }
   const finalHermesNode = finalSession.nodes.find((node) => node.id === hermesNode.id);
   const finalCodexNode = finalSession.nodes.find((node) => node.id === codexNode.id);
-  const firstHermesToolCalls = toolCallsFromEvents(firstHermesEvents);
-  const secondHermesToolCalls = toolCallsFromEvents(hermesEvents);
-  const toolCalls = [...firstHermesToolCalls, ...secondHermesToolCalls];
-  const toolsUsed = [...new Set(toolCalls.map((call) => call.tool))].sort();
-  const secondToolsUsed = [...new Set(secondHermesToolCalls.map((call) => call.tool))].sort();
-  const graph = workflowGraphSummary(finalSession, hermesNode.id, hermesRun.id);
+  const firstHermesIntents = workflowIntentsFromEvents(firstHermesEvents);
+  const secondHermesIntents = workflowIntentsFromEvents(hermesEvents);
+  const intents = [...firstHermesIntents, ...secondHermesIntents];
+  const graph = flowKernelGraphSummary(finalSession, hermesNode.id);
   const ok =
-    toolsUsed.includes("createWorkflowCard") &&
-    secondToolsUsed.includes("updateWorkflowCard") &&
+    intents.length >= 2 &&
     finalHermesNode?.status === "completed" &&
     finalCodexNode?.status === "completed" &&
     Boolean(workspace.runEvidence[codexRun.id]?.checks.some((check) => check.status === "passed")) &&
     graph.connected &&
     graph.rootDependencyIds.length === 0 &&
     graph.rootIncomingEdgeIds.length === 0 &&
-    graph.primaryCodexImplementationCount <= 1 &&
-    graph.hermesVerificationCount <= 1 &&
+    graph.codexLaneCount > 0 &&
     graph.duplicateSemanticKeys.length === 0;
 
   keepRoot = !ok;
@@ -151,9 +155,9 @@ try {
       runId: hermesRun.id,
       inputRequirement: hermesNode.context.brief,
       status: finalHermesNode?.status ?? null,
-      toolsUsed,
-      secondToolsUsed,
-      toolCallCount: toolCalls.length,
+      intentIds: intents.map((intent) => intent.intentId),
+      firstIntentIds: firstHermesIntents.map((intent) => intent.intentId),
+      secondIntentIds: secondHermesIntents.map((intent) => intent.intentId),
     },
     codex: {
       runId: codexRun.id,
@@ -249,11 +253,34 @@ function startHermesPlannerRun(bridge, root, session, hermesNode) {
   });
 }
 
-function toolCallsFromEvents(events) {
+function workflowIntentsFromEvents(events) {
   return events.flatMap((event) => {
     if (event.kind !== "output" || typeof event.payload.text !== "string") return [];
-    return parseHermesWorkflowToolCalls(event.payload.text);
+    const parsed = parseHermesWorkflowIntent(event.payload.text);
+    return parsed.ok ? [parsed.intent] : [];
   });
+}
+
+function outputFromEvents(events) {
+  return events
+    .filter((event) => event.kind === "output" && typeof event.payload.text === "string")
+    .map((event) => event.payload.text);
+}
+
+function canvasSummary(session) {
+  return {
+    id: session.id,
+    plannerNodeId: session.plannerNodeId,
+    nodes: session.nodes.map((node) => ({
+      id: node.id,
+      agent: node.agent,
+      status: node.status,
+      title: node.title,
+      meta: node.display?.meta ?? [],
+      dependencies: node.context.dependencies,
+    })),
+    edges: session.edges,
+  };
 }
 
 function run(command, args, cwd) {
@@ -273,8 +300,8 @@ function run(command, args, cwd) {
   });
 }
 
-function workflowGraphSummary(session, rootCardId, sourceRunId) {
-  const generated = session.nodes.filter((node) => node.id === rootCardId || node.workflowTrace?.sourceRunId === sourceRunId);
+function flowKernelGraphSummary(session, rootCardId) {
+  const generated = session.nodes.filter((node) => node.id === rootCardId || node.display?.meta.includes("flow-kernel"));
   const generatedIds = new Set(generated.map((node) => node.id));
   const generatedEdges = session.edges.filter((edge) => generatedIds.has(edge.source) && generatedIds.has(edge.target));
   const rootCard = session.nodes.find((node) => node.id === rootCardId);
@@ -288,17 +315,17 @@ function workflowGraphSummary(session, rootCardId, sourceRunId) {
     outgoing.get(edge.source)?.push(edge.target);
   }
 
-  const visited = new Set();
-  const queue = [rootCardId];
-  while (queue.length > 0) {
-    const id = queue.shift();
-    if (!id || visited.has(id)) continue;
-    visited.add(id);
-    for (const next of outgoing.get(id) ?? []) queue.push(next);
-  }
-
+  const flowLaneIds = new Set(generated.filter((node) => node.display?.meta.includes("flow-kernel")).map((node) => node.id));
   const disconnectedCardIds = generated
-    .filter((node) => node.id !== rootCardId && ((incoming.get(node.id) ?? 0) === 0 || !visited.has(node.id)))
+    .filter((node) => {
+      if (node.id === rootCardId) return false;
+      if (!flowLaneIds.has(node.id)) return false;
+      return node.context.dependencies.some((dependency) => !generatedIds.has(dependency));
+    })
+    .map((node) => node.id);
+  const dependencyMismatchIds = generated
+    .filter((node) => flowLaneIds.has(node.id))
+    .filter((node) => !arraysEqual([...node.context.dependencies].sort(), incomingDependencies(generatedEdges, node.id)))
     .map((node) => node.id);
   const semanticKeys = generated
     .map((node) => node.workflowTrace?.semanticKey ?? `${node.agent}:${normalizeText(node.title)}:${normalizeText(node.context.brief)}`)
@@ -306,23 +333,26 @@ function workflowGraphSummary(session, rootCardId, sourceRunId) {
   const duplicateSemanticKeys = [...new Set(semanticKeys.filter((key, index) => semanticKeys.indexOf(key) !== index))];
 
   return {
-    connected: disconnectedCardIds.length === 0,
+    connected: disconnectedCardIds.length === 0 && dependencyMismatchIds.length === 0,
     rootCardId,
     rootDependencyIds,
     rootIncomingEdgeIds,
     generatedCardIds: [...generatedIds],
     generatedEdges,
     disconnectedCardIds,
+    dependencyMismatchIds,
     duplicateSemanticKeys,
-    primaryCodexImplementationCount: generated.filter((node) => node.agent === "codex").length,
-    hermesVerificationCount: generated.filter((node) => node.id !== rootCardId && node.agent === "hermes" && isVerifierCard(node)).length,
+    codexLaneCount: generated.filter((node) => node.agent === "codex" && node.display?.meta.includes("flow-kernel")).length,
   };
 }
 
-function isVerifierCard(node) {
-  const text = normalizeText(`${node.title} ${node.context.brief}`);
-  return /\b(verify|verification|validate|validation|review|check|test|qa|audit)\b/.test(text) ||
-    /验证|验收|复核|检查|测试/.test(`${node.title} ${node.context.brief}`);
+function incomingDependencies(edges, nodeId) {
+  return edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source).sort();
+}
+
+function arraysEqual(left, right) {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
 }
 
 function normalizeText(value) {

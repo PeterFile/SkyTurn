@@ -13,6 +13,16 @@ import type {
   NodeStatus,
   WorkflowMode,
 } from "@skyturn/project-core";
+import {
+  compileWorkflowIntent,
+  createDefaultFlowPolicy,
+  parseWorkflowIntent,
+  reduceWorkflowEvents,
+  type CompileWorkflowIntentResult,
+  type FlowEvent,
+  type FlowEventKind,
+  type FlowProjection,
+} from "@skyturn/workflow-kernel";
 
 export type WorkflowLaneKind =
   | "planner"
@@ -61,7 +71,8 @@ export type WorkflowEventKind =
   | "checkpoint_created"
   | "review_completed"
   | "continuation_requested"
-  | "lane_status_changed";
+  | "lane_status_changed"
+  | FlowEventKind;
 
 export interface WorkflowCardCreateInput {
   id?: string;
@@ -512,6 +523,35 @@ export class WorkflowStore {
       return event;
     });
     return tx();
+  }
+
+  applyWorkflowIntent(intent: unknown, now: string): CompileWorkflowIntentResult {
+    const sessionId = workflowIntentSessionId(intent);
+    if (!sessionId) throw new Error("WorkflowIntent sessionId is required.");
+    const projection = this.materializeFlowProjection(sessionId);
+    const parsed = parseWorkflowIntent(stableJson(intent));
+    if (!parsed.ok) {
+      const rejected = makeRejectedFlowIntentEvent(projection, workflowIntentId(intent), parsed.reason, now);
+      const tx = this.db.transaction(() => {
+        this.insertFlowEventInTransaction(rejected, now);
+      });
+      tx();
+      return { ok: false, reason: parsed.reason, events: [rejected] };
+    }
+    const compiled = compileWorkflowIntent(parsed.intent, projection, createDefaultFlowPolicy(), now);
+    if (compiled.events.length === 0) return compiled;
+    const tx = this.db.transaction(() => {
+      for (const event of compiled.events) this.insertFlowEventInTransaction(event, now);
+    });
+    tx();
+    return compiled;
+  }
+
+  materializeFlowProjection(sessionId: string): FlowProjection {
+    const flowEvents = this.listEvents(sessionId)
+      .filter((event) => isFlowEventKind(event.kind))
+      .map(mapWorkflowRecordToFlowEvent);
+    return reduceWorkflowEvents([seedFlowUserInputEvent(sessionId), ...flowEvents]);
   }
 
   listEvents(sessionId: string): WorkflowEventRecord[] {
@@ -1012,6 +1052,17 @@ export class WorkflowStore {
       payload: input.payload,
       createdAt: input.now,
     };
+  }
+
+  private insertFlowEventInTransaction(event: FlowEvent, now: string): WorkflowEventRecord {
+    return this.insertEventInTransaction({
+      sessionId: event.sessionId,
+      kind: event.kind,
+      source: event.source,
+      idempotencyKey: event.idempotencyKey,
+      payload: event.payload,
+      now,
+    });
   }
 
   private projectEventInTransaction(event: WorkflowEventRecord): void {
@@ -1552,6 +1603,63 @@ function mapEvent(row: EventRow): WorkflowEventRecord {
     payload: parseJson(row.payload_json),
     createdAt: row.created_at,
   };
+}
+
+function mapWorkflowRecordToFlowEvent(event: WorkflowEventRecord): FlowEvent {
+  return {
+    id: event.id,
+    sessionId: event.sessionId,
+    seq: event.seq,
+    kind: event.kind as FlowEventKind,
+    source: event.source,
+    payload: event.payload,
+    createdAt: event.createdAt,
+    idempotencyKey: event.idempotencyKey,
+  };
+}
+
+function seedFlowUserInputEvent(sessionId: string): FlowEvent {
+  return {
+    id: `${sessionId}:flow-seed:user-input`,
+    sessionId,
+    seq: 0,
+    kind: "workflow.user_input",
+    source: "workflow_store",
+    payload: { sessionId },
+    createdAt: new Date(0).toISOString(),
+    idempotencyKey: `flow:${sessionId}:seed:user-input`,
+  };
+}
+
+function makeRejectedFlowIntentEvent(
+  projection: FlowProjection,
+  intentId: string,
+  reason: string,
+  now: string,
+): FlowEvent {
+  const seq = projection.events.length + 1;
+  return {
+    id: `${projection.sessionId}:flow-event:${String(seq).padStart(8, "0")}`,
+    sessionId: projection.sessionId,
+    seq,
+    kind: "workflow.intent.rejected",
+    source: "workflow-kernel",
+    payload: { intentId, reason },
+    createdAt: now,
+    idempotencyKey: `intent:${intentId}:rejected`,
+  };
+}
+
+function workflowIntentSessionId(intent: unknown): string | null {
+  return isRecord(intent) && typeof intent.sessionId === "string" ? intent.sessionId : null;
+}
+
+function workflowIntentId(intent: unknown): string {
+  return isRecord(intent) && typeof intent.intentId === "string" ? intent.intentId : "unknown-intent";
+}
+
+function isFlowEventKind(kind: WorkflowEventKind): kind is FlowEventKind {
+  return kind.startsWith("workflow.");
 }
 
 function mapLane(row: LaneRow): WorkflowLaneRecord {

@@ -21,6 +21,7 @@ import {
   type RunEvidence,
   type StartAgentRunInput,
 } from "@skyturn/project-core";
+import type { FlowEvent } from "@skyturn/workflow-kernel";
 
 export { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/project-core";
 
@@ -319,39 +320,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       let killTimer: NodeJS.Timeout | null = null;
       const timeoutMs = options.timeoutMs ?? defaultCliTimeoutMs;
       const killTimeoutMs = options.killTimeoutMs ?? defaultKillTimeoutMs;
-      const timeoutTimer =
-        timeoutMs > 0
-          ? setTimeout(() => {
-              void (async () => {
-                if (finalized) return;
-                finalized = true;
-                await drain();
-                await emit({
-                  kind: "evidence",
-                  payload: {
-                    exitCode: null,
-                    checks: [
-                      {
-                        kind: "run-timeout",
-                        name: "Codex CLI timeout",
-                        status: "failed",
-                        detail: `timed out after ${timeoutMs}ms`,
-                      },
-                    ],
-                  },
-                });
-                await emit({
-                  kind: "status",
-                  payload: { status: "timed-out", reason: `Codex CLI timed out after ${timeoutMs}ms` },
-                });
-                if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
-                killTimer = setTimeout(() => {
-                  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-                }, killTimeoutMs);
-              })();
-            }, timeoutMs)
-          : null;
-      timeoutTimer?.unref();
+      let timeoutTimer: NodeJS.Timeout | null = null;
 
       await emit({
         kind: "progress",
@@ -440,6 +409,39 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           });
         })();
       });
+
+      if (timeoutMs > 0) {
+        timeoutTimer = setTimeout(() => {
+          void (async () => {
+            if (finalized) return;
+            finalized = true;
+            await drain();
+            await emit({
+              kind: "evidence",
+              payload: {
+                exitCode: null,
+                checks: [
+                  {
+                    kind: "run-timeout",
+                    name: "Codex CLI timeout",
+                    status: "failed",
+                    detail: `timed out after ${timeoutMs}ms`,
+                  },
+                ],
+              },
+            });
+            await emit({
+              kind: "status",
+              payload: { status: "timed-out", reason: `Codex CLI timed out after ${timeoutMs}ms` },
+            });
+            if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+            killTimer = setTimeout(() => {
+              if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+            }, killTimeoutMs);
+          })();
+        }, timeoutMs);
+        timeoutTimer.unref();
+      }
 
       return {
         async cancel(reason) {
@@ -657,6 +659,82 @@ export function deriveEvidenceFromEvents(run: AgentRun, events: RunEvent[]): Run
     cancelReason,
     completedAt,
   };
+}
+
+export interface FlowEventsFromAgentRunInput {
+  sessionId: string;
+  laneId: string;
+  segmentId: string;
+  run: AgentRun;
+  events: RunEvent[];
+  evidence: RunEvidence;
+  now: string;
+}
+
+export function flowEventsFromAgentRun(input: FlowEventsFromAgentRunInput): FlowEvent[] {
+  const outputEvents = input.events.filter((event) => event.kind === "output" && typeof event.payload.text === "string");
+  const started = makeFlowEvent(input, 1, "workflow.segment.started", {
+    segment: {
+      id: input.segmentId,
+      laneId: input.laneId,
+      runId: input.run.id,
+      status: "running",
+      exitCode: null,
+    },
+  });
+  const output = outputEvents.map((event, index) =>
+    makeFlowEvent(input, index + 2, "workflow.segment.output_delta", {
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      text: event.payload.text,
+    }),
+  );
+  const evidenceSeq = output.length + 2;
+  const evidence = makeFlowEvent(input, evidenceSeq, "workflow.evidence.recorded", {
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    evidence: {
+      id: `evidence-${input.segmentId}`,
+      kind: "run-exit",
+      status: input.evidence.status === "succeeded" && input.evidence.exitCode === 0 ? "passed" : "failed",
+      checks: input.evidence.checks.map((check) => check.name),
+      artifacts: input.evidence.artifacts,
+      detail: input.evidence.errorReason ?? input.evidence.cancelReason ?? undefined,
+    },
+  });
+  const finished = makeFlowEvent(input, evidenceSeq + 1, "workflow.segment.finished", {
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    status: flowSegmentStatusFromRunEvidence(input.evidence),
+    exitCode: input.evidence.exitCode,
+    errorReason: input.evidence.errorReason,
+  });
+  return [started, ...output, evidence, finished];
+}
+
+function makeFlowEvent(
+  input: FlowEventsFromAgentRunInput,
+  seq: number,
+  kind: FlowEvent["kind"],
+  payload: Record<string, unknown>,
+): FlowEvent {
+  return {
+    id: `${input.sessionId}:agent-flow-event:${input.segmentId}:${String(seq).padStart(4, "0")}`,
+    sessionId: input.sessionId,
+    seq,
+    kind,
+    source: input.run.agentKind,
+    payload,
+    createdAt: input.now,
+    idempotencyKey: `segment:${input.segmentId}:${kind}:${seq}`,
+  };
+}
+
+function flowSegmentStatusFromRunEvidence(evidence: RunEvidence): "succeeded" | "failed" | "cancelled" | "timed-out" {
+  if (evidence.status === "cancelled") return "cancelled";
+  if (evidence.status === "timed-out") return "timed-out";
+  if (evidence.status === "succeeded" && evidence.exitCode === 0) return "succeeded";
+  return "failed";
 }
 
 async function findExecutable(commands: string[], pathValue: string): Promise<string | null> {

@@ -25,6 +25,7 @@ interface StartAgentRunInput {
 const RUN_PROTOCOL_VERSION = 1;
 const openedProjectRoots = new Set<string>();
 let agentBridge: AgentBridgeHost | null = null;
+const workflowStores = new Map<string, WorkflowStoreHost>();
 
 interface AgentBridgeHost {
   discoverAgents(): Promise<unknown[]>;
@@ -35,6 +36,13 @@ interface AgentBridgeHost {
   cancelRun(runId: string, reason: string): Promise<unknown>;
   loadEvents(projectRoot: string, runId: string): Promise<unknown[]>;
   getEvidence(projectRoot: string, runId: string): Promise<unknown>;
+}
+
+interface WorkflowStoreHost {
+  applyWorkflowIntent(intent: unknown, now: string): unknown;
+  materializeFlowProjection(sessionId: string): unknown;
+  listEvents(sessionId: string): unknown[];
+  close(): void;
 }
 
 async function createMainWindow(): Promise<void> {
@@ -168,6 +176,39 @@ ipcMain.handle("run:evidence", async (_event, projectRoot: string, runId: string
   };
 });
 
+ipcMain.handle("workflow:applyIntent", async (_event, projectRoot: string, intent: { sessionId?: unknown }) => {
+  assertKnownProjectRoot(projectRoot);
+  if (typeof intent?.sessionId !== "string") throw new Error("WorkflowIntent sessionId is required.");
+  const store = await getWorkflowStore(projectRoot);
+  const result = store.applyWorkflowIntent(intent, new Date().toISOString());
+  const projection = store.materializeFlowProjection(intent.sessionId);
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.webContents.send("workflow:event", { projectRoot, sessionId: intent.sessionId, projection });
+  }
+  return { protocolVersion: RUN_PROTOCOL_VERSION, result, projection };
+});
+
+ipcMain.handle("workflow:projection", async (_event, projectRoot: string, sessionId: string) => {
+  assertKnownProjectRoot(projectRoot);
+  const store = await getWorkflowStore(projectRoot);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    projection: store.materializeFlowProjection(sessionId),
+  };
+});
+
+ipcMain.handle("workflow:events", async (_event, projectRoot: string, sessionId: string) => {
+  assertKnownProjectRoot(projectRoot);
+  const store = await getWorkflowStore(projectRoot);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    events: store.listEvents(sessionId).filter((event) => {
+      const kind = (event as { kind?: unknown }).kind;
+      return typeof kind === "string" && kind.startsWith("workflow.");
+    }),
+  };
+});
+
 ipcMain.handle("workspace:load", async () => {
   try {
     const value = await fs.readFile(workspaceStorePath(), "utf8");
@@ -207,6 +248,15 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
   return agentBridge;
 }
 
+async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost> {
+  const existing = workflowStores.get(projectRoot);
+  if (existing) return existing;
+  const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+  const store = createWorkflowStore({ projectRoot }) as WorkflowStoreHost;
+  workflowStores.set(projectRoot, store);
+  return store;
+}
+
 function assertKnownProjectRoot(projectRoot: string): void {
   if (!path.isAbsolute(projectRoot) || !openedProjectRoots.has(projectRoot)) {
     throw new Error("Project root is not open in SkyTurn.");
@@ -226,6 +276,7 @@ function rememberProjectRoots(state: unknown): void {
 app.whenReady().then(createMainWindow);
 
 app.on("window-all-closed", () => {
+  closeWorkflowStores();
   if (process.platform !== "darwin") app.quit();
 });
 
@@ -234,3 +285,8 @@ app.on("activate", () => {
     void createMainWindow();
   }
 });
+
+function closeWorkflowStores(): void {
+  for (const store of workflowStores.values()) store.close();
+  workflowStores.clear();
+}

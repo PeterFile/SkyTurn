@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, it } from "vitest";
 import type { RunEvent } from "@skyturn/project-core";
+import { reduceWorkflowEvents, type FlowEvent } from "@skyturn/workflow-kernel";
 
 import {
   AgentBridge,
@@ -13,6 +14,7 @@ import {
   createHermesCliAdapter,
   createMockAgentAdapter,
   deriveEvidenceFromEvents,
+  flowEventsFromAgentRun,
   loadRunEvents,
   readTaskOutput,
 } from "./index";
@@ -93,6 +95,49 @@ describe("agent bridge", () => {
     expect(output).toContain("Mock run accepted");
     expect(output).toContain("completed");
     expect(deriveEvidenceFromEvents(run, events).status).toBe("succeeded");
+  });
+
+  it("maps agent run output and evidence into terminal Flow Kernel segment events", async () => {
+    const projectRoot = await makeTempRoot();
+    const bridge = new AgentBridge({
+      adapters: [createMockAgentAdapter()],
+    });
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "lane-implementation",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    const flowEvents = flowEventsFromAgentRun({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      segmentId: "segment-implementation-1",
+      run,
+      events,
+      evidence,
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    const projection = reduceWorkflowEvents([laneDeclaredEvent(), ...flowEvents]);
+
+    expect(flowEvents.map((event) => event.kind)).toEqual([
+      "workflow.segment.started",
+      "workflow.segment.output_delta",
+      "workflow.segment.output_delta",
+      "workflow.evidence.recorded",
+      "workflow.segment.finished",
+    ]);
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("completed");
+    expect(projection.evidence[0]).toMatchObject({
+      laneId: "lane-implementation",
+      segmentId: "segment-implementation-1",
+      status: "passed",
+    });
   });
 
   it("preserves output and cancel evidence", async () => {
@@ -216,7 +261,7 @@ describe("agent bridge", () => {
       adapters: [
         createCodexCliAdapter({
           executablePath: codexPath,
-          timeoutMs: 50,
+          timeoutMs: 250,
         }),
       ],
     });
@@ -246,7 +291,7 @@ describe("agent bridge", () => {
       kind: "run-timeout",
       name: "Codex CLI timeout",
       status: "failed",
-      detail: "timed out after 50ms",
+      detail: "timed out after 250ms",
     });
   });
 
@@ -406,6 +451,31 @@ async function makeTempRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "skyturn-agent-bridge-"));
   roots.push(root);
   return root;
+}
+
+function laneDeclaredEvent(): FlowEvent {
+  return {
+    id: "session-1:flow-event:00000001",
+    sessionId: "session-1",
+    seq: 1,
+    kind: "workflow.lane.declared",
+    source: "test",
+    payload: {
+      lane: {
+        id: "lane-implementation",
+        semanticKey: "lane-implementation",
+        kind: "implementation",
+        title: "Implement",
+        agentKind: "codex",
+        status: "pending",
+        fileScopes: [],
+        packageScopes: [],
+        requiredEvidence: [],
+      },
+    },
+    createdAt: "2026-06-14T00:00:00.000Z",
+    idempotencyKey: "lane:implementation",
+  };
 }
 
 function waitForEvent(bridge: AgentBridge, predicate: (event: RunEvent) => boolean): Promise<RunEvent> {

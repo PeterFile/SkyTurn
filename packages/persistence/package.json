@@ -21,11 +21,13 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "vitest run src"
+    "test": "vitest run src",
+    "flow-kernel:acceptance": "pnpm --filter @skyturn/workflow-kernel build && vitest run src/flowKernelStore.acceptance.test.ts"
   },
   "dependencies": {
     "@skyturn/git-worktree": "workspace:*",
     "@skyturn/project-core": "workspace:*",
+    "@skyturn/workflow-kernel": "workspace:*",
     "better-sqlite3": "^12.10.1"
   },
   "devDependencies": {

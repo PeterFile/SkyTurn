@@ -72,6 +72,9 @@ importers:
       '@skyturn/project-core':
         specifier: workspace:*
         version: link:../project-core
+      '@skyturn/workflow-kernel':
+        specifier: workspace:*
+        version: link:../workflow-kernel
     devDependencies:
       '@types/node':
         specifier: ^25.0.0
@@ -117,6 +120,9 @@ importers:
       '@skyturn/project-core':
         specifier: workspace:*
         version: link:../project-core
+      '@skyturn/workflow-kernel':
+        specifier: workspace:*
+        version: link:../workflow-kernel
     devDependencies:
       typescript:
         specifier: ^6.0.3
@@ -133,6 +139,9 @@ importers:
       '@skyturn/project-core':
         specifier: workspace:*
         version: link:../project-core
+      '@skyturn/workflow-kernel':
+        specifier: workspace:*
+        version: link:../workflow-kernel
       better-sqlite3:
         specifier: ^12.10.1
         version: 12.10.1
@@ -204,6 +213,9 @@ importers:
       '@skyturn/project-core':
         specifier: workspace:*
         version: link:../project-core
+      '@skyturn/workflow-kernel':
+        specifier: workspace:*
+        version: link:../workflow-kernel
       '@xyflow/react':
         specifier: ^12.11.0
         version: 12.11.0(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
@@ -235,6 +247,22 @@ importers:
       '@types/react-dom':
         specifier: ^19.2.3
         version: 19.2.3(@types/react@19.2.17)
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: ^4.1.8
+        version: 4.1.8(@types/node@25.9.3)(vite@8.0.16(@types/node@25.9.3))
+
+  packages/workflow-kernel:
+    dependencies:
+      '@skyturn/project-core':
+        specifier: workspace:*
+        version: link:../project-core
+    devDependencies:
+      '@types/node':
+        specifier: ^25.0.0
+        version: 25.9.3
       typescript:
         specifier: ^6.0.3
         version: 6.0.3

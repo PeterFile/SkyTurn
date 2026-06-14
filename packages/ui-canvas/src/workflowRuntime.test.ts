@@ -88,6 +88,64 @@ describe("workflow runtime event merging", () => {
     });
   });
 
+  it("projects Hermes WorkflowIntent output into dynamic Flow Kernel lanes and edges", () => {
+    const workspace = makeWorkspace();
+    const hermesRunId = "run-session-1-node-1";
+
+    const next = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+      event(hermesRunId, 1, "output", {
+        text: JSON.stringify({
+          intentId: "intent-frontend-1",
+          sessionId: "session-1",
+          operations: [
+            { type: "AnalyzeRequirement", requirement: "Add a search filtering control" },
+            { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["frontend-ui"] } },
+            { type: "ProposeLanes" },
+          ],
+        }),
+      }),
+    ]);
+
+    const session = next.sessions[0] as CanvasSession;
+    expect(session.nodes.map((node) => node.id)).toEqual([
+      "node-1",
+      "lane-discovery",
+      "lane-design",
+      "lane-implementation",
+      "lane-browser-validation",
+      "lane-review",
+      "lane-commit",
+    ]);
+    expect(session.edges).toContainEqual({
+      id: "edge-design-implementation",
+      source: "lane-design",
+      target: "lane-implementation",
+    });
+    expect(session.nodes.find((node) => node.id === "lane-implementation")?.context.dependencies).toEqual([
+      "lane-design",
+    ]);
+    expect(session.nodes.find((node) => node.id === "lane-browser-validation")?.display?.meta).toContain("browser_validation");
+  });
+
+  it("rejects malformed Hermes WorkflowIntent output without crashing the canvas projection", () => {
+    const workspace = makeWorkspace();
+    const hermesRunId = "run-session-1-node-1";
+
+    const next = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+      event(hermesRunId, 1, "output", {
+        text: JSON.stringify({
+          intentId: "intent-missing-payload",
+          sessionId: "session-1",
+          operations: [{ type: "AnalyzeRequirement" }, { type: "DiscoverProject" }, { type: "ProposeLanes" }],
+        }),
+      }),
+    ]);
+
+    const session = next.sessions[0] as CanvasSession;
+    expect(session.nodes.map((node) => node.id)).toEqual(["node-1"]);
+    expect(session.edges).toEqual([]);
+  });
+
   it("keeps the Hermes source card status derived from run evidence after tool mutations", () => {
     const workspace = makeWorkspace();
     const hermesRunId = "run-session-1-node-1";

@@ -1,5 +1,5 @@
 {
-  "name": "@skyturn/agent-bridge",
+  "name": "@skyturn/workflow-kernel",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -10,18 +10,22 @@
       "types": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./acceptance": {
+      "types": "./src/acceptance.ts",
+      "import": "./dist/acceptance.js",
+      "default": "./dist/acceptance.js"
     }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "pnpm --filter @skyturn/project-core build && pnpm --filter @skyturn/agent-runtime build && pnpm --filter @skyturn/workflow-kernel build && vitest run src"
+    "test": "vitest run src",
+    "flow-kernel:acceptance": "vitest run src/flowKernel.acceptance.test.ts"
   },
   "dependencies": {
-    "@skyturn/agent-runtime": "workspace:*",
-    "@skyturn/project-core": "workspace:*",
-    "@skyturn/workflow-kernel": "workspace:*"
+    "@skyturn/project-core": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^25.0.0",

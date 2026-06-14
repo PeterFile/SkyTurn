@@ -16,11 +16,12 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "vitest run src"
+    "test": "pnpm --filter @skyturn/project-core build && pnpm --filter @skyturn/workflow-kernel build && vitest run src"
   },
   "dependencies": {
     "@skyturn/agent-runtime": "workspace:*",
-    "@skyturn/project-core": "workspace:*"
+    "@skyturn/project-core": "workspace:*",
+    "@skyturn/workflow-kernel": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^6.0.3",
