@@ -10,6 +10,11 @@
       "types": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./workflow-store": {
+      "types": "./src/workflowStore.ts",
+      "import": "./dist/workflowStore.js",
+      "default": "./dist/workflowStore.js"
     }
   },
   "scripts": {
@@ -20,9 +25,12 @@
   },
   "dependencies": {
     "@skyturn/git-worktree": "workspace:*",
-    "@skyturn/project-core": "workspace:*"
+    "@skyturn/project-core": "workspace:*",
+    "better-sqlite3": "^12.10.1"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.9.3",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
   }

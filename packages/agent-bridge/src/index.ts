@@ -60,6 +60,7 @@ export interface HermesCliAdapterOptions {
   env?: NodeJS.ProcessEnv;
   extraArgs?: string[];
   pathValue?: string;
+  source?: string;
 }
 
 export function createDiscoveryService(options: DiscoveryOptions = {}): DiscoveryService {
@@ -408,7 +409,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
     label: "Hermes CLI",
     nativeConfigFiles: ["AGENTS.md"],
     supportLevel: "experimental-run",
-    capabilities: ["chat", "file-read", "file-write", "shell", "worktree"],
+    capabilities: ["chat", "file-read", "file-write", "shell", "worktree", "resume"],
     async detect() {
       const executablePath =
         options.executablePath ?? (await findExecutable(commandCandidates.hermes, options.pathValue ?? process.env.PATH ?? ""));
@@ -419,17 +420,20 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         version: null,
         status: executablePath ? "available" : "missing",
         supportLevel: executablePath ? "experimental-run" : "detected-only",
-        capabilities: ["chat", "file-read", "file-write", "shell", "worktree"],
+        capabilities: ["chat", "file-read", "file-write", "shell", "worktree", "resume"],
         configFiles: ["AGENTS.md"],
       };
     },
     async startRun(input, sink) {
       const workdir = input.projectRoot;
       const executablePath = options.executablePath ?? "hermes";
-      const args = makeHermesOneshotArgs({
+      const args = makeHermesChatArgs({
         prompt: input.prompt,
+        opaqueHandle: input.hermesSessionHandle,
         extraArgs: options.extraArgs,
+        source: options.source ?? "skyturn",
       });
+      const transport = input.hermesSessionHandle ? "hermes_session_resume" : "hermes_replay_recovery";
       const child = spawn(executablePath, args, {
         cwd: workdir,
         env: { ...process.env, ...options.env },
@@ -446,10 +450,17 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         payload: {
           source: "hermes",
           phase: "started",
-          command: "hermes -z",
-          transport: "oneshot-fallback",
+          command: "hermes chat -q",
+          transport,
           plannerSessionId: input.plannerSessionId ?? null,
           plannerInputId: input.plannerInputId ?? null,
+          opaqueHandle: input.hermesSessionHandle ?? null,
+          ...(transport === "hermes_replay_recovery"
+            ? {
+                recoveryReason:
+                  "This is not the same Hermes native session; continuity comes from SkyTurn workflow events and checkpoints.",
+              }
+            : {}),
         },
       });
 
@@ -701,8 +712,22 @@ function makeCodexExecArgs(input: {
   ];
 }
 
-function makeHermesOneshotArgs(input: { prompt: string; extraArgs?: string[] }): string[] {
-  return ["-z", input.prompt, ...(input.extraArgs ?? [])];
+function makeHermesChatArgs(input: {
+  prompt: string;
+  opaqueHandle?: string;
+  extraArgs?: string[];
+  source: string;
+}): string[] {
+  return [
+    "chat",
+    "-q",
+    input.prompt,
+    "--quiet",
+    "--source",
+    input.source,
+    ...(input.opaqueHandle ? ["--resume", input.opaqueHandle] : []),
+    ...(input.extraArgs ?? []),
+  ];
 }
 
 function codexStdoutLineToDrafts(line: string): RunEventDraft[] {

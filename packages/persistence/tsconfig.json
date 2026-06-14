@@ -6,6 +6,7 @@
     "moduleResolution": "Bundler",
     "rootDir": "src",
     "outDir": "dist",
+    "types": ["node"],
     "tsBuildInfoFile": "../../node_modules/.tmp/persistence.tsbuildinfo"
   },
   "include": ["src"]

@@ -196,7 +196,7 @@ describe("agent bridge", () => {
     expect(evidence.exitCode).toBe(0);
   });
 
-  it("runs Hermes one-shot planning and persists the workflow-card JSON output", async () => {
+  it("runs Hermes chat planning without oneshot -z and marks replay recovery honestly", async () => {
     const projectRoot = await makeTempRoot();
     const binRoot = await makeTempRoot();
     const argsPath = join(binRoot, "args.json");
@@ -247,7 +247,8 @@ describe("agent bridge", () => {
     const args = JSON.parse(await readFile(argsPath, "utf8")) as { argv: string[]; cwd: string };
 
     expect(args.cwd).toBe(await realpath(projectRoot));
-    expect(args.argv).toEqual(["-z", "Plan a workflow"]);
+    expect(args.argv).toEqual(["chat", "-q", "Plan a workflow", "--quiet", "--source", "skyturn"]);
+    expect(args.argv).not.toContain("-z");
     expect(run).toMatchObject({
       plannerSessionId: "hermes-planner-session-1",
       plannerInputId: "requirement-1",
@@ -259,7 +260,8 @@ describe("agent bridge", () => {
           source: "hermes",
           plannerSessionId: "hermes-planner-session-1",
           plannerInputId: "requirement-1",
-          transport: "oneshot-fallback",
+          transport: "hermes_replay_recovery",
+          recoveryReason: expect.stringContaining("not the same Hermes native session"),
         }),
       }),
     );
@@ -273,6 +275,76 @@ describe("agent bridge", () => {
       status: "passed",
       detail: "exit 0",
     });
+  });
+
+  it("uses Hermes public session resume when an opaque Hermes session handle is provided", async () => {
+    const projectRoot = await makeTempRoot();
+    const binRoot = await makeTempRoot();
+    const argsPath = join(binRoot, "args.json");
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.SKYTURN_HERMES_ARGS_PATH, JSON.stringify({",
+        "  argv: process.argv.slice(2),",
+        "  cwd: process.cwd(),",
+        "}));",
+        "process.stdout.write('{\"toolCalls\":[]}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createHermesCliAdapter({
+          executablePath: hermesPath,
+          env: { SKYTURN_HERMES_ARGS_PATH: argsPath },
+        }),
+      ],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes",
+      sessionId: "session-1",
+      plannerSessionId: "hermes-planner-session-1",
+      hermesSessionHandle: "opaque-hermes-session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "hermes",
+      prompt: "Continue the workflow",
+    });
+    await completed;
+
+    const events = await loadRunEvents(projectRoot, "run-session-1-node-hermes");
+    const args = JSON.parse(await readFile(argsPath, "utf8")) as { argv: string[]; cwd: string };
+
+    expect(args.argv).toEqual([
+      "chat",
+      "-q",
+      "Continue the workflow",
+      "--quiet",
+      "--source",
+      "skyturn",
+      "--resume",
+      "opaque-hermes-session-1",
+    ]);
+    expect(args.argv).not.toContain("-z");
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "progress",
+        payload: expect.objectContaining({
+          source: "hermes",
+          transport: "hermes_session_resume",
+          opaqueHandle: "opaque-hermes-session-1",
+        }),
+      }),
+    );
   });
 });
 

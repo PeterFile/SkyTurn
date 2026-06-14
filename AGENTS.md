@@ -70,6 +70,8 @@
 - Workspace packages live under `apps/*` and `packages/*`. Internal imports must use `workspace:*` package dependencies, not cross-package relative paths.
 - Browser-consumed workspace packages that emit ESM `dist` must use `.js` suffixes for local source imports/exports so compiled files resolve in Vite/Node ESM.
 - The node modal `Changes` tab renders patch previews through `packages/ui-canvas/src/diffViewer.ts` with `diff2html` output sanitized by `DOMPurify`; do not reintroduce renderer git execution or custom diff table rendering.
+- The SQLite workflow event store lives behind the Node-only `@skyturn/persistence/workflow-store` subpath; do not import `better-sqlite3` through the browser-facing `@skyturn/persistence` root entry or from renderer code.
+- `better-sqlite3` is an approved native workspace dependency for the workflow store; keep it scoped to backend/Electron-main-side code and listed in `pnpm-workspace.yaml` build approvals.
 - Electron is pinned to `41.5.1` because newer Electron package metadata required Node `>=22.12.0`, while the initial local Node runtime was `20.19.0`.
 - Desktop dev must get renderer host/port values from `apps/desktop/scripts/devServer.mjs`; do not hard-code `5173` in launcher code because Vite may need another local port.
 - A `CanvasSession` owns `hermesPlannerSessionId` and `plannerNodeId`; bottom workflow input must update that planner root card instead of appending a second Hermes root, and the planner root must remain dependency-free.

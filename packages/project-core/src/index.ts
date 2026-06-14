@@ -36,7 +36,7 @@ export type AgentRunStatus =
   | "timed-out";
 export type RunEventKind = "output" | "status" | "error" | "approval" | "progress" | "evidence";
 export type EvidenceCheckStatus = "passed" | "failed" | "skipped";
-export type HermesPlannerTransport = "native-session" | "oneshot-fallback";
+export type HermesPlannerTransport = "hermes_live_chat" | "hermes_session_resume" | "hermes_replay_recovery";
 
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
 export const RUN_EVENT_PROTOCOL_VERSION = 1;
@@ -79,6 +79,7 @@ export interface StartAgentRunInput {
   sessionId: string;
   plannerSessionId?: string;
   plannerInputId?: string;
+  hermesSessionHandle?: string;
   projectRoot: string;
   worktreePath: string;
   agentKind: AgentKind;
