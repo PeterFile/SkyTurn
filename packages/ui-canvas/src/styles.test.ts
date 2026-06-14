@@ -74,6 +74,21 @@ describe("SkyTurn UI style tokens", () => {
     expect(appSource).not.toContain("session-panel-backdrop");
   });
 
+  it("renders Changes as a structured code review diff instead of raw patch text", async () => {
+    const appSource = await readSource("./App.tsx");
+    const styles = await readSource("./styles.css");
+
+    expect(appSource).toContain("parseUnifiedDiff");
+    expect(appSource).toContain('className="changes-review"');
+    expect(appSource).toContain('className="review-file-header"');
+    expect(appSource).toContain('className={`diff-row ${row.kind}`}');
+    expect(appSource).not.toContain("<pre>{changeset.patchPreview}</pre>");
+    expect(styles).toContain(".changes-review");
+    expect(styles).toContain(".diff-row.added");
+    expect(styles).toContain(".diff-row.removed");
+    expect(styles).toContain(".diff-row-separator");
+  });
+
   it("keeps sidebar controls visible and aligns node cards inside their energy frame", async () => {
     const styles = await readSource("./styles.css");
     const motionSource = await readSource("./motion.ts");

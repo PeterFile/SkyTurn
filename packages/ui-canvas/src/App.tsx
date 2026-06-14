@@ -109,6 +109,11 @@ import {
   EDITOR_LAUNCH_OPTIONS,
   type EditorLaunchOption,
 } from "./editorLaunchOptions.js";
+import {
+  parseUnifiedDiff,
+  type ReviewDiffFile,
+  type ReviewDiffRow,
+} from "./diffViewer.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
 
 gsap.registerPlugin(useGSAP);
@@ -2031,24 +2036,110 @@ function ChangesTab({ node }: { node: CanvasNode }) {
     };
   }, [node]);
 
-  if (!changeset) return <p>Loading changes...</p>;
+  const reviewDiff = useMemo(
+    () => (changeset ? parseUnifiedDiff(changeset.patchPreview, changeset.files) : null),
+    [changeset],
+  );
+
+  if (!changeset || !reviewDiff) return <p>Loading changes...</p>;
 
   return (
-    <div className="changes-view">
-      <div className="diff-stat">
-        <span>+{changeset.diffStat.added}</span>
-        <span>~{changeset.diffStat.changed}</span>
-        <span>-{changeset.diffStat.deleted}</span>
-        <small>{changeset.source}</small>
-      </div>
-      <ul>
-        {changeset.files.map((file) => (
-          <li key={file}>{file}</li>
+    <section className="changes-review" aria-label="Code changes review">
+      <header className="changes-summary">
+        <div className="changes-summary-copy">
+          <p className="eyebrow">Turn Summary</p>
+          <h3>{changeset.source === "git" ? "Worktree diff review" : "Task diff preview"}</h3>
+          <p>{changeReviewSummary(node, changeset, reviewDiff.files.length)}</p>
+        </div>
+        <div className="diff-stat" aria-label="Diff statistics">
+          <span className="diff-stat-pill added">
+            <strong>+{changeset.diffStat.added}</strong>
+            <small>additions</small>
+          </span>
+          <span className="diff-stat-pill changed">
+            <strong>{changeset.diffStat.changed}</strong>
+            <small>files</small>
+          </span>
+          <span className="diff-stat-pill removed">
+            <strong>-{changeset.diffStat.deleted}</strong>
+            <small>deletions</small>
+          </span>
+        </div>
+      </header>
+
+      {reviewDiff.files.length > 0 ? (
+        <div className="review-file-stack">
+          {reviewDiff.files.map((file) => (
+            <ReviewDiffFileCard key={file.id} file={file} />
+          ))}
+        </div>
+      ) : (
+        <div className="changes-empty">No structured diff was available for this changeset.</div>
+      )}
+    </section>
+  );
+}
+
+function changeReviewSummary(node: CanvasNode, changeset: Changeset, fileCount: number): string {
+  const agent = agentIdentityForNode(node);
+  const source = changeset.source === "git" ? "git worktree" : "mock adapter";
+  const fileLabel = fileCount === 1 ? "file" : "files";
+  return `${agent} produced ${changeset.id} from the ${source}: ${fileCount} ${fileLabel} ready for review.`;
+}
+
+function ReviewDiffFileCard({ file }: { file: ReviewDiffFile }) {
+  return (
+    <article className="review-file">
+      <header className="review-file-header">
+        <div>
+          <span className="review-file-path">{file.displayPath}</span>
+          <span className="review-file-meta">
+            {file.hunks.length} {file.hunks.length === 1 ? "hunk" : "hunks"}
+          </span>
+        </div>
+        <div className="review-file-counts" aria-label={`Line changes for ${file.displayPath}`}>
+          <span className="added">+{file.added}</span>
+          <span className="removed">-{file.deleted}</span>
+        </div>
+      </header>
+
+      <div className="review-diff" role="table" aria-label={`Diff for ${file.displayPath}`}>
+        {file.hunks.map((hunk, hunkIndex) => (
+          <div className="diff-hunk" role="rowgroup" key={`${file.id}-${hunk.header}-${hunkIndex}`}>
+            <div className="diff-row diff-row-separator" role="row">
+              <span className="diff-gutter" role="cell" />
+              <span className="diff-gutter" role="cell" />
+              <span className="diff-marker" role="cell">·</span>
+              <code role="cell">{hunk.header}</code>
+            </div>
+            {hunk.rows.map((row, rowIndex) => (
+              <ReviewDiffRowView
+                key={`${row.kind}-${row.oldNumber ?? "x"}-${row.newNumber ?? "x"}-${rowIndex}`}
+                row={row}
+              />
+            ))}
+          </div>
         ))}
-      </ul>
-      <pre>{changeset.patchPreview}</pre>
+      </div>
+    </article>
+  );
+}
+
+function ReviewDiffRowView({ row }: { row: ReviewDiffRow }) {
+  return (
+    <div className={`diff-row ${row.kind}`} role="row">
+      <span className="diff-gutter old" role="cell">{row.oldNumber ?? ""}</span>
+      <span className="diff-gutter new" role="cell">{row.newNumber ?? ""}</span>
+      <span className="diff-marker" role="cell">{diffMarkerForRow(row.kind)}</span>
+      <code role="cell">{row.content || " "}</code>
     </div>
   );
+}
+
+function diffMarkerForRow(kind: ReviewDiffRow["kind"]): string {
+  if (kind === "added") return "+";
+  if (kind === "removed") return "-";
+  return " ";
 }
 
 function ContextTab({ node }: { node: CanvasNode }) {
