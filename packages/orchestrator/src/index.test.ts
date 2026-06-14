@@ -138,6 +138,98 @@ describe("workflow-card tools", () => {
     });
   });
 
+  it("infers the Hermes planner root when plannerNodeId is stale before cleaning dependencies", () => {
+    const staleSession: CanvasSession = {
+      ...makeSession(),
+      plannerNodeId: "missing-planner-node",
+    };
+    const seeded = applyWorkflowCardToolCalls(staleSession, [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code",
+        input: {
+          id: "node-code",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts.",
+          dependencies: ["node-1"],
+          worktreePath: ".",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:01.000Z",
+    }).session;
+
+    const result = applyWorkflowCardToolCalls(seeded, [
+      {
+        tool: "updateWorkflowCard",
+        toolCallId: "call-bad-root-dependency",
+        input: {
+          id: "node-1",
+          status: "running",
+          dependencies: ["node-code"],
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:02.000Z",
+    });
+
+    const planner = result.session.nodes.find((node) => node.id === "node-1");
+    expect(result.session.plannerNodeId).toBe("node-1");
+    expect(planner?.context.dependencies).toEqual([]);
+    expect(result.session.edges).not.toContainEqual({
+      id: "edge-node-code-node-1",
+      source: "node-code",
+      target: "node-1",
+    });
+  });
+
+  it("does not treat the planner root as a verifier when the plan brief mentions verification", () => {
+    const seeded = applyWorkflowCardToolCalls(makeSession(), [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code",
+        input: {
+          id: "node-code",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts.",
+          dependencies: ["node-1"],
+          worktreePath: ".",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:01.000Z",
+    }).session;
+
+    const result = applyWorkflowCardToolCalls(seeded, [
+      {
+        tool: "updateWorkflowCard",
+        toolCallId: "call-update-planner",
+        input: {
+          id: "node-1",
+          title: "Plan workflow helper change",
+          agent: "hermes",
+          status: "running",
+          brief: "Coordinate the implementation plus verification slice for the workflow helper.",
+          dependencies: [],
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:02.000Z",
+    });
+
+    const planner = result.session.nodes.find((node) => node.id === "node-1");
+    expect(planner?.status).toBe("running");
+    expect(planner?.context.dependencies).toEqual([]);
+  });
+
   it("repairs verifier dependencies to the Codex card and keeps verifier pending until dependencies complete", () => {
     const result = applyWorkflowCardToolCalls(makeSession(), [
       {

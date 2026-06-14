@@ -57,6 +57,7 @@
 - Completion must be tied to run status, git changes, tests, or concrete verification evidence.
 - Node status must be derived from `RunEvidence`; Agent text claiming success is only output.
 - Do not mark tasks complete without concrete verification.
+- Agent CLI adapters must emit terminal `RunEvidence` and `status` for timeout/cancel paths as well as normal process close; never leave a node running just because a child process failed to exit cleanly.
 - Use `pnpm --filter @skyturn/desktop run demo:mvp` to verify the real Hermes-to-Codex MVP loop; it requires local Hermes/Codex credentials and must not be replaced by mock-only evidence.
 - The bottom workflow input must create a running Hermes planning card that calls workflow-card tools; do not regress it into a local pending/mock node.
 
@@ -75,4 +76,5 @@
 - Electron is pinned to `41.5.1` because newer Electron package metadata required Node `>=22.12.0`, while the initial local Node runtime was `20.19.0`.
 - Desktop dev must get renderer host/port values from `apps/desktop/scripts/devServer.mjs`; do not hard-code `5173` in launcher code because Vite may need another local port.
 - A `CanvasSession` owns `hermesPlannerSessionId` and `plannerNodeId`; bottom workflow input must update that planner root card instead of appending a second Hermes root, and the planner root must remain dependency-free.
+- When merging Hermes run events, preserve source run evidence without overwriting graph hygiene; source-node restoration must not reintroduce planner dependencies or incoming planner edges.
 - Update this file only for reusable project knowledge, not story-specific notes.

@@ -123,7 +123,17 @@ function applyHermesWorkflowOutput(
   if (!sourceNode) return applied;
   return {
     ...applied,
-    nodes: applied.nodes.map((node) => (node.runId === sourceNode.runId ? sourceNode : node)),
+    nodes: applied.nodes.map((node) =>
+      node.runId === sourceNode.runId
+        ? {
+            ...node,
+            status: sourceNode.status,
+            runtime: sourceNode.runtime,
+            progress: sourceNode.progress,
+            output: sourceNode.output,
+          }
+        : node,
+    ),
   };
 }
 

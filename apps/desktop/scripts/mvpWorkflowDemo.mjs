@@ -130,6 +130,8 @@ try {
     finalCodexNode?.status === "completed" &&
     Boolean(workspace.runEvidence[codexRun.id]?.checks.some((check) => check.status === "passed")) &&
     graph.connected &&
+    graph.rootDependencyIds.length === 0 &&
+    graph.rootIncomingEdgeIds.length === 0 &&
     graph.primaryCodexImplementationCount <= 1 &&
     graph.hermesVerificationCount <= 1 &&
     graph.duplicateSemanticKeys.length === 0;
@@ -275,6 +277,9 @@ function workflowGraphSummary(session, rootCardId, sourceRunId) {
   const generated = session.nodes.filter((node) => node.id === rootCardId || node.workflowTrace?.sourceRunId === sourceRunId);
   const generatedIds = new Set(generated.map((node) => node.id));
   const generatedEdges = session.edges.filter((edge) => generatedIds.has(edge.source) && generatedIds.has(edge.target));
+  const rootCard = session.nodes.find((node) => node.id === rootCardId);
+  const rootDependencyIds = rootCard?.context.dependencies ?? [];
+  const rootIncomingEdgeIds = session.edges.filter((edge) => edge.target === rootCardId).map((edge) => edge.id);
   const incoming = new Map(generated.map((node) => [node.id, 0]));
   const outgoing = new Map(generated.map((node) => [node.id, []]));
 
@@ -303,12 +308,14 @@ function workflowGraphSummary(session, rootCardId, sourceRunId) {
   return {
     connected: disconnectedCardIds.length === 0,
     rootCardId,
+    rootDependencyIds,
+    rootIncomingEdgeIds,
     generatedCardIds: [...generatedIds],
     generatedEdges,
     disconnectedCardIds,
     duplicateSemanticKeys,
     primaryCodexImplementationCount: generated.filter((node) => node.agent === "codex").length,
-    hermesVerificationCount: generated.filter((node) => node.agent === "hermes" && isVerifierCard(node)).length,
+    hermesVerificationCount: generated.filter((node) => node.id !== rootCardId && node.agent === "hermes" && isVerifierCard(node)).length,
   };
 }
 

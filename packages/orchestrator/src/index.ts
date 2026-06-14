@@ -203,14 +203,19 @@ function applyWorkflowCardToolCall(
         : deleteWorkflowCard(session, call, context);
   return {
     ...next,
-    session: applyVerifierGraphHygiene(applyPlannerRootGraphHygiene(next.session), context),
+    session: applyWorkflowGraphHygiene(next.session, context),
   };
 }
 
+function applyWorkflowGraphHygiene(session: CanvasSession, context: WorkflowCardToolContext): CanvasSession {
+  return applyPlannerRootGraphHygiene(applyVerifierGraphHygiene(applyPlannerRootGraphHygiene(session), context));
+}
+
 function applyPlannerRootGraphHygiene(session: CanvasSession): CanvasSession {
-  const plannerNodeId = session.plannerNodeId;
-  const planner = session.nodes.find((node) => node.id === plannerNodeId);
+  const planner = plannerRootNodeForSession(session);
   if (!planner) return session;
+  const plannerNodeId = planner.id;
+  const shouldUpdatePlannerNodeId = session.plannerNodeId !== plannerNodeId;
 
   const nodes =
     planner.context.dependencies.length === 0
@@ -227,18 +232,35 @@ function applyPlannerRootGraphHygiene(session: CanvasSession): CanvasSession {
             : node,
         );
   const edges = session.edges.filter((edge) => edge.target !== plannerNodeId);
-  if (nodes === session.nodes && edges.length === session.edges.length) return session;
+  if (nodes === session.nodes && edges.length === session.edges.length && !shouldUpdatePlannerNodeId) return session;
   return {
     ...session,
+    plannerNodeId,
     nodes,
     edges,
   };
 }
 
+function plannerRootNodeForSession(session: CanvasSession): CanvasNode | null {
+  const explicit = session.nodes.find((node) => node.id === session.plannerNodeId);
+  if (explicit) return explicit;
+
+  const plannerSessionMeta = `planner-session:${session.hermesPlannerSessionId}`;
+  return (
+    session.nodes.find((node) => node.agent === "hermes" && node.display?.meta.includes(plannerSessionMeta)) ??
+    session.nodes.find((node) => node.agent === "hermes" && cardRole(node.agent, node.title, node.context.brief) === "planner") ??
+    session.nodes.find((node) => node.agent === "hermes" && node.context.dependencies.length === 0) ??
+    session.nodes.find((node) => node.agent === "hermes") ??
+    null
+  );
+}
+
 function applyVerifierGraphHygiene(session: CanvasSession, context: WorkflowCardToolContext): CanvasSession {
+  const plannerNodeId = plannerRootNodeForSession(session)?.id ?? null;
   const sourceNodeId = sourceNodeIdForContext(session, context);
   const changedIds = new Set<string>();
   const nodes = session.nodes.map((node) => {
+    if (node.id === plannerNodeId) return node;
     if (!isVerifierCard(node.agent, node.title, node.context.brief)) return node;
     const dependencies = repairDependencies(session, {
       id: node.id,
@@ -405,6 +427,7 @@ function mergeWorkflowCard(
     brief,
     requestedStatus,
     dependencies,
+    skipVerifierGate: isPlannerRootCard(session, target.id),
   });
   const nodes = session.nodes.map((node) => {
     if (node.id !== target.id) return node;
@@ -486,6 +509,7 @@ function updateWorkflowCard(
       brief,
       requestedStatus,
       dependencies,
+      skipVerifierGate: isPlannerRootCard(session, id),
     });
     return {
       ...node,
@@ -687,7 +711,7 @@ function repairDependencies(
     dependencies.push(input.sourceNodeId);
   }
 
-  if (isVerifierCard(input.agent, input.title, input.brief)) {
+  if (!isPlannerRootCard(session, input.id) && isVerifierCard(input.agent, input.title, input.brief)) {
     const target = findVerifiedCodexCard(session, input, dependencies);
     if (target && !dependencies.includes(target.id)) dependencies.push(target.id);
   }
@@ -731,12 +755,18 @@ function statusForExistingNode(
     brief: string;
     requestedStatus: NodeStatus;
     dependencies: string[];
+    skipVerifierGate?: boolean;
   },
 ): NodeStatus {
   const authoritativeStatus = context.authoritativeNodeStatuses?.[node.id];
   if (authoritativeStatus) return authoritativeStatus;
   if (node.status === "completed" || node.status === "failed") return node.status;
+  if (input.skipVerifierGate) return input.requestedStatus;
   return gateVerifierStatus(nodes, input);
+}
+
+function isPlannerRootCard(session: CanvasSession, id: string): boolean {
+  return plannerRootNodeForSession(session)?.id === id;
 }
 
 function gateVerifierStatus(

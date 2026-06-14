@@ -31,6 +31,8 @@ const commandCandidates: Record<AgentKind, string[]> = {
   "claude-code": ["claude", "claude-code"],
   openclaw: ["openclaw"],
 };
+const defaultCliTimeoutMs = 5 * 60 * 1_000;
+const defaultKillTimeoutMs = 5_000;
 
 export interface DiscoveryOptions {
   pathValue?: string;
@@ -50,6 +52,8 @@ export type CodexCliSandbox = "read-only" | "workspace-write" | "danger-full-acc
 export interface CodexCliAdapterOptions {
   executablePath?: string;
   sandbox?: CodexCliSandbox;
+  timeoutMs?: number;
+  killTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
   extraArgs?: string[];
   pathValue?: string;
@@ -310,7 +314,44 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       let cancelled = false;
       let cancelReason = "";
       let spawnFailed = false;
+      let finalized = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
+      let killTimer: NodeJS.Timeout | null = null;
+      const timeoutMs = options.timeoutMs ?? defaultCliTimeoutMs;
+      const killTimeoutMs = options.killTimeoutMs ?? defaultKillTimeoutMs;
+      const timeoutTimer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              void (async () => {
+                if (finalized) return;
+                finalized = true;
+                await drain();
+                await emit({
+                  kind: "evidence",
+                  payload: {
+                    exitCode: null,
+                    checks: [
+                      {
+                        kind: "run-timeout",
+                        name: "Codex CLI timeout",
+                        status: "failed",
+                        detail: `timed out after ${timeoutMs}ms`,
+                      },
+                    ],
+                  },
+                });
+                await emit({
+                  kind: "status",
+                  payload: { status: "timed-out", reason: `Codex CLI timed out after ${timeoutMs}ms` },
+                });
+                if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+                killTimer = setTimeout(() => {
+                  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+                }, killTimeoutMs);
+              })();
+            }, timeoutMs)
+          : null;
+      timeoutTimer?.unref();
 
       await emit({
         kind: "progress",
@@ -337,6 +378,10 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
 
       child.once("error", (error) => {
         spawnFailed = true;
+        if (finalized) return;
+        finalized = true;
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (killTimer) clearTimeout(killTimer);
         void emit({
           kind: "error",
           payload: { source: "codex", message: error.message, code: error.name },
@@ -347,6 +392,10 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       child.once("close", (code, signal) => {
         void (async () => {
           await drain();
+          if (killTimer) clearTimeout(killTimer);
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+          if (finalized) return;
+          finalized = true;
           if (spawnFailed) return;
           if (cancelled) {
             await emit({
@@ -396,7 +445,8 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         async cancel(reason) {
           cancelled = true;
           cancelReason = reason;
-          if (!child.killed) child.kill("SIGTERM");
+          if (timeoutTimer) clearTimeout(timeoutTimer);
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
         },
       };
     },

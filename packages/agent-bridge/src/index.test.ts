@@ -196,6 +196,60 @@ describe("agent bridge", () => {
     expect(evidence.exitCode).toBe(0);
   });
 
+  it("times out a stalled Codex CLI run instead of leaving the card running", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "process.stdout.write('{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"started but never closed\"}}\\n');",
+        "process.on('SIGTERM', () => {});",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          timeoutMs: 50,
+        }),
+      ],
+    });
+    const timedOut = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "timed-out",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-timeout",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Hang forever",
+    });
+    await timedOut;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+    const output = await readTaskOutput(projectRoot, "node-codex-timeout");
+
+    expect(output).toContain("started but never closed");
+    expect(evidence.status).toBe("timed-out");
+    expect(evidence.checks).toContainEqual({
+      kind: "run-timeout",
+      name: "Codex CLI timeout",
+      status: "failed",
+      detail: "timed out after 50ms",
+    });
+  });
+
   it("runs Hermes chat planning without oneshot -z and marks replay recovery honestly", async () => {
     const projectRoot = await makeTempRoot();
     const binRoot = await makeTempRoot();

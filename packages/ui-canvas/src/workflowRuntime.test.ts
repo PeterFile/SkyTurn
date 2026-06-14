@@ -135,6 +135,77 @@ describe("workflow runtime event merging", () => {
     expect(hermesNode?.progress).toBe("Evidence ready");
   });
 
+  it("does not restore stale planner dependencies while preserving Hermes run evidence state", () => {
+    const base = makeWorkspace([
+      makeNode({
+        id: "node-code",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-node-code",
+      }),
+    ]);
+    const session = base.sessions[0] as CanvasSession;
+    const workspace: WorkspaceState = {
+      ...base,
+      sessions: [
+        {
+          ...session,
+          edges: [{ id: "edge-node-code-node-1", source: "node-code", target: "node-1" }],
+          nodes: session.nodes.map((node) =>
+            node.id === "node-1"
+              ? {
+                  ...node,
+                  context: {
+                    ...node.context,
+                    dependencies: ["node-code"],
+                  },
+                }
+              : node,
+          ),
+        },
+      ],
+    };
+    const hermesRunId = "run-session-1-node-1";
+
+    const next = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+      event(hermesRunId, 1, "output", {
+        text: JSON.stringify({
+          toolCalls: [
+            {
+              tool: "createWorkflowCard",
+              toolCallId: "call-create-verify",
+              input: {
+                id: "node-verify",
+                title: "Verify implementation",
+                agent: "hermes",
+                status: "running",
+                brief: "Verify the Codex implementation.",
+              },
+            },
+          ],
+        }),
+      }),
+      event(hermesRunId, 2, "evidence", {
+        exitCode: 0,
+        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit 0" }],
+      }),
+      event(hermesRunId, 3, "status", {
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    const nextSession = next.sessions[0] as CanvasSession;
+    const hermesNode = nextSession.nodes.find((node) => node.id === "node-1");
+    expect(hermesNode?.status).toBe("completed");
+    expect(hermesNode?.context.dependencies).toEqual([]);
+    expect(nextSession.edges).not.toContainEqual({
+      id: "edge-node-code-node-1",
+      source: "node-code",
+      target: "node-1",
+    });
+  });
+
   it("reflects Codex output and concrete run evidence on the code task card", () => {
     const workspace = makeWorkspace([
       makeNode({
