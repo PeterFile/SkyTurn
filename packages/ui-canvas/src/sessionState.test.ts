@@ -15,6 +15,8 @@ const session = {
   goal: "Ship UI",
   mode: "fast",
   kind: "canvas",
+  hermesPlannerSessionId: "hermes-planner-session-1",
+  plannerNodeId: "node-1",
   createdAt: "2026-06-13T00:00:00.000Z",
   updatedAt: "2026-06-13T00:00:00.000Z",
   nodes: [],

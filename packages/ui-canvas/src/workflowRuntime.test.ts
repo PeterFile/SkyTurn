@@ -202,6 +202,8 @@ function makeSession(extraNodes: CanvasNode[]): CanvasSession {
     goal: "Build workflow",
     mode: "fast",
     kind: "canvas",
+    hermesPlannerSessionId: "hermes-planner-session-1",
+    plannerNodeId: "node-1",
     createdAt: "2026-06-10T00:00:00.000Z",
     updatedAt: "2026-06-10T00:00:00.000Z",
     activeNodeId: "node-1",

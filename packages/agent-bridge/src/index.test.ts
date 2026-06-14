@@ -232,6 +232,8 @@ describe("agent bridge", () => {
       protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
       nodeId: "node-hermes",
       sessionId: "session-1",
+      plannerSessionId: "hermes-planner-session-1",
+      plannerInputId: "requirement-1",
       projectRoot,
       worktreePath: projectRoot,
       agentKind: "hermes",
@@ -246,6 +248,21 @@ describe("agent bridge", () => {
 
     expect(args.cwd).toBe(await realpath(projectRoot));
     expect(args.argv).toEqual(["-z", "Plan a workflow"]);
+    expect(run).toMatchObject({
+      plannerSessionId: "hermes-planner-session-1",
+      plannerInputId: "requirement-1",
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "progress",
+        payload: expect.objectContaining({
+          source: "hermes",
+          plannerSessionId: "hermes-planner-session-1",
+          plannerInputId: "requirement-1",
+          transport: "oneshot-fallback",
+        }),
+      }),
+    );
     expect(output).toContain("createWorkflowCard");
     expect(events.some((event) => event.kind === "progress" && event.payload.stream === "stderr")).toBe(true);
     expect(evidence.status).toBe("succeeded");

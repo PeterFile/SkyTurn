@@ -122,6 +122,8 @@ export class AgentBridge {
       id: input.runId ?? makeRunId(input.sessionId, input.nodeId),
       nodeId: input.nodeId,
       sessionId: input.sessionId,
+      ...(input.plannerSessionId ? { plannerSessionId: input.plannerSessionId } : {}),
+      ...(input.plannerInputId ? { plannerInputId: input.plannerInputId } : {}),
       projectRoot: input.projectRoot,
       worktreePath: input.worktreePath,
       agentKind: input.agentKind,
@@ -441,7 +443,14 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
 
       await emit({
         kind: "progress",
-        payload: { source: "hermes", phase: "started", command: "hermes -z" },
+        payload: {
+          source: "hermes",
+          phase: "started",
+          command: "hermes -z",
+          transport: "oneshot-fallback",
+          plannerSessionId: input.plannerSessionId ?? null,
+          plannerInputId: input.plannerInputId ?? null,
+        },
       });
 
       if (child.stdout) {

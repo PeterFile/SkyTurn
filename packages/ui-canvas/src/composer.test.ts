@@ -21,6 +21,24 @@ describe("canvas composer", () => {
     expect(result.session.activeNodeId).toBe(node.id);
     expect(result.session.nodes).toContain(node);
   });
+
+  it("reuses one Hermes planner identity and visible root card for repeated workflow input", () => {
+    const first = addRequirementPlanningNode(makeSession(), "Add audit logging", {
+      projectName: "SkyTurn",
+      now: "2026-06-14T04:00:00.000Z",
+    });
+    const second = addRequirementPlanningNode(first.session, "Add retry evidence", {
+      projectName: "SkyTurn",
+      now: "2026-06-14T04:01:00.000Z",
+    });
+
+    expect(first.session.hermesPlannerSessionId).toBe("hermes-planner-session-1");
+    expect(second.session.hermesPlannerSessionId).toBe(first.session.hermesPlannerSessionId);
+    expect(second.node.id).toBe(first.node.id);
+    expect(second.node.runId).not.toBe(first.node.runId);
+    expect(second.node.context.brief).toBe("Add retry evidence");
+    expect(second.session.nodes.filter((node) => node.agent === "hermes" && node.context.dependencies.length === 0)).toHaveLength(1);
+  });
 });
 
 function makeSession(): CanvasSession {
@@ -36,5 +54,5 @@ function makeSession(): CanvasSession {
     activeNodeId: "node-1",
     edges: [],
     nodes: [],
-  };
+  } as CanvasSession;
 }

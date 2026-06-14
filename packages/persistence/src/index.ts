@@ -1,13 +1,16 @@
 import type { EditorAdapter, EditorKind } from "@skyturn/git-worktree";
-import type {
-  AgentDescriptor,
-  AgentRun,
-  CanvasSessionTab,
-  Changeset,
-  ImportedProject,
-  RunEvent,
-  RunEvidence,
-  StartAgentRunInput,
+import {
+  makeHermesPlannerSessionId,
+  type AgentDescriptor,
+  type AgentRun,
+  type CanvasNode,
+  type CanvasSession,
+  type CanvasSessionTab,
+  type Changeset,
+  type ImportedProject,
+  type RunEvent,
+  type RunEvidence,
+  type StartAgentRunInput,
 } from "@skyturn/project-core";
 
 export interface OpenProjectResult {
@@ -83,7 +86,7 @@ export const localWorkspaceStore: WorkspaceStore = {
   async load() {
     try {
       const value = window.localStorage.getItem(storageKey);
-      return normalizeWorkspace(value ? (JSON.parse(value) as Partial<WorkspaceState>) : null);
+      return normalizeWorkspaceState(value ? (JSON.parse(value) as Partial<WorkspaceState>) : null);
     } catch {
       return emptyWorkspace();
     }
@@ -97,7 +100,7 @@ export const fileBackedWorkspaceStore: WorkspaceStore = {
   async load() {
     if (!window.devflow) return localWorkspaceStore.load();
     const value = await window.devflow.loadWorkspace();
-    return normalizeWorkspace(value as Partial<WorkspaceState> | null);
+    return normalizeWorkspaceState(value as Partial<WorkspaceState> | null);
   },
   async save(state) {
     if (!window.devflow) {
@@ -126,12 +129,12 @@ export const browserEditorAdapter: EditorAdapter = {
   },
 };
 
-function normalizeWorkspace(value: Partial<WorkspaceState> | null): WorkspaceState {
+export function normalizeWorkspaceState(value: Partial<WorkspaceState> | null): WorkspaceState {
   return {
     ...emptyWorkspace(),
     ...value,
     projects: value?.projects ?? [],
-    sessions: value?.sessions ?? [],
+    sessions: (value?.sessions ?? []).map(normalizeSession),
     changesets: value?.changesets ?? {},
     agents: value?.agents ?? [],
     runs: value?.runs ?? {},
@@ -139,4 +142,32 @@ function normalizeWorkspace(value: Partial<WorkspaceState> | null): WorkspaceSta
     runEvidence: value?.runEvidence ?? {},
     collapsedProjectIds: Array.isArray(value?.collapsedProjectIds) ? value.collapsedProjectIds : [],
   };
+}
+
+function normalizeSession(session: CanvasSessionTab): CanvasSessionTab {
+  if (session.kind !== "canvas") return session;
+  return normalizeCanvasSession(session);
+}
+
+function normalizeCanvasSession(session: CanvasSession): CanvasSession {
+  const nodes = Array.isArray(session.nodes) ? session.nodes : [];
+  const edges = Array.isArray(session.edges) ? session.edges : [];
+  return {
+    ...session,
+    hermesPlannerSessionId: session.hermesPlannerSessionId || makeHermesPlannerSessionId(session.id),
+    plannerNodeId: session.plannerNodeId || inferPlannerNodeId(nodes, session.activeNodeId),
+    nodes,
+    edges,
+  };
+}
+
+function inferPlannerNodeId(nodes: CanvasNode[], activeNodeId: string | null): string {
+  const activeNode = nodes.find((node) => node.id === activeNodeId);
+  if (activeNode?.agent === "hermes") return activeNode.id;
+  return (
+    nodes.find((node) => node.agent === "hermes" && node.context.dependencies.length === 0)?.id ??
+    nodes.find((node) => node.agent === "hermes")?.id ??
+    nodes[0]?.id ??
+    "node-1"
+  );
 }

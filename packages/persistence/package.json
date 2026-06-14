@@ -15,13 +15,15 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "lint": "pnpm run typecheck"
+    "lint": "pnpm run typecheck",
+    "test": "vitest run src"
   },
   "dependencies": {
     "@skyturn/git-worktree": "workspace:*",
     "@skyturn/project-core": "workspace:*"
   },
   "devDependencies": {
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   }
 }

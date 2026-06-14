@@ -7,6 +7,7 @@ import type { WorkspaceState } from "@skyturn/persistence";
 import {
   RUN_EVENT_PROTOCOL_VERSION,
   deriveNodeStatusFromEvidence,
+  makeHermesPlannerSessionId,
   type AgentRun,
   type AgentRunStatus,
   type CanvasNode,
@@ -33,6 +34,12 @@ export async function startBridgeRun(
     runId: node.runId,
     nodeId: node.id,
     sessionId: session.id,
+    ...(node.agent === "hermes"
+      ? {
+          plannerSessionId: session.hermesPlannerSessionId || makeHermesPlannerSessionId(session.id),
+          plannerInputId: node.runId,
+        }
+      : {}),
     projectRoot: project.rootPath,
     worktreePath: resolveRunWorktreePath(project, node),
     agentKind: node.agent,
@@ -125,6 +132,7 @@ export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode):
     return buildHermesWorkflowPrompt({
       goal: hermesGoalForNode(session, node),
       sessionId: session.id,
+      plannerSessionId: session.hermesPlannerSessionId || makeHermesPlannerSessionId(session.id),
       nodeId: node.id,
       existingNodes: session.nodes.map((item) => ({
         id: item.id,

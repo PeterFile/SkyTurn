@@ -32,11 +32,11 @@ try {
     goal: "Improve the local workflow helper",
     createdAt: new Date().toISOString(),
   });
-  const input = addRequirementPlanningNode(completeSeedPlanningNode(seedSession), "Add a task-local evidence summary to a TypeScript workflow helper", {
+  const firstInput = addRequirementPlanningNode(completeSeedPlanningNode(seedSession), "Add a task-local evidence summary to a TypeScript workflow helper", {
     projectName: project.name,
     now: new Date().toISOString(),
   });
-  const session = input.session;
+  let session = firstInput.session;
   let workspace = {
     projects: [project],
     sessions: [session],
@@ -54,17 +54,33 @@ try {
     adapters: [createHermesCliAdapter(), createCodexCliAdapter()],
   });
 
-  const hermesNode = input.node;
-  const hermesRun = await bridge.startRun({
-    protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
-    runId: hermesNode.runId,
-    nodeId: hermesNode.id,
-    sessionId: session.id,
-    projectRoot: root,
-    worktreePath: root,
-    agentKind: "hermes",
-    prompt: buildPromptForNodeRun(session, hermesNode),
+  const firstHermesNode = firstInput.node;
+  const firstHermesRun = await startHermesPlannerRun(bridge, root, session, firstHermesNode);
+  await waitForFinalStatus(bridge, firstHermesRun.id);
+  const firstHermesEvents = await loadRunEvents(root, firstHermesRun.id);
+  workspace = mergeRunEventsIntoWorkspace(workspace, firstHermesRun.id, firstHermesEvents);
+
+  const afterFirst = workspace.sessions.find((item) => item.id === session.id);
+  if (!afterFirst || afterFirst.kind !== "canvas") {
+    throw new Error("First planning pass did not keep a canvas session.");
+  }
+  const secondInput = addRequirementPlanningNode(afterFirst, "Add a task-local evidence summary to a TypeScript workflow helper", {
+    projectName: project.name,
+    now: new Date(Date.now() + 1_000).toISOString(),
   });
+  const samePlannerIdentity = secondInput.session.hermesPlannerSessionId === firstInput.session.hermesPlannerSessionId;
+  const samePlannerRootCard = secondInput.node.id === firstInput.node.id;
+  if (!samePlannerIdentity || !samePlannerRootCard || secondInput.node.runId === firstInput.node.runId) {
+    throw new Error("Repeated workflow input did not reuse the CanvasSession Hermes planner identity.");
+  }
+  session = secondInput.session;
+  workspace = {
+    ...workspace,
+    sessions: workspace.sessions.map((item) => (item.id === session.id ? session : item)),
+  };
+
+  const hermesNode = secondInput.node;
+  const hermesRun = await startHermesPlannerRun(bridge, root, session, hermesNode);
   await waitForFinalStatus(bridge, hermesRun.id);
   const hermesEvents = await loadRunEvents(root, hermesRun.id);
   workspace = mergeRunEventsIntoWorkspace(workspace, hermesRun.id, hermesEvents);
@@ -101,15 +117,15 @@ try {
   }
   const finalHermesNode = finalSession.nodes.find((node) => node.id === hermesNode.id);
   const finalCodexNode = finalSession.nodes.find((node) => node.id === codexNode.id);
-  const hermesOutput = hermesEvents
-    .filter((event) => event.kind === "output" && typeof event.payload.text === "string")
-    .map((event) => event.payload.text)
-    .join("\n");
-  const toolCalls = parseHermesWorkflowToolCalls(hermesOutput);
+  const firstHermesToolCalls = toolCallsFromEvents(firstHermesEvents);
+  const secondHermesToolCalls = toolCallsFromEvents(hermesEvents);
+  const toolCalls = [...firstHermesToolCalls, ...secondHermesToolCalls];
   const toolsUsed = [...new Set(toolCalls.map((call) => call.tool))].sort();
+  const secondToolsUsed = [...new Set(secondHermesToolCalls.map((call) => call.tool))].sort();
   const graph = workflowGraphSummary(finalSession, hermesNode.id, hermesRun.id);
   const ok =
     toolsUsed.includes("createWorkflowCard") &&
+    secondToolsUsed.includes("updateWorkflowCard") &&
     finalHermesNode?.status === "completed" &&
     finalCodexNode?.status === "completed" &&
     Boolean(workspace.runEvidence[codexRun.id]?.checks.some((check) => check.status === "passed")) &&
@@ -122,11 +138,19 @@ try {
   console.log(JSON.stringify({
     ok,
     projectRoot: root,
+    planner: {
+      plannerSessionId: session.hermesPlannerSessionId,
+      samePlannerIdentity,
+      samePlannerRootCard,
+      firstRunId: firstHermesRun.id,
+      secondRunId: hermesRun.id,
+    },
     hermes: {
       runId: hermesRun.id,
       inputRequirement: hermesNode.context.brief,
       status: finalHermesNode?.status ?? null,
       toolsUsed,
+      secondToolsUsed,
       toolCallCount: toolCalls.length,
     },
     codex: {
@@ -205,6 +229,28 @@ function waitForFinalStatus(bridge, runId) {
       unsubscribe();
       resolve(event);
     });
+  });
+}
+
+function startHermesPlannerRun(bridge, root, session, hermesNode) {
+  return bridge.startRun({
+    protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+    runId: hermesNode.runId,
+    nodeId: hermesNode.id,
+    sessionId: session.id,
+    plannerSessionId: session.hermesPlannerSessionId,
+    plannerInputId: hermesNode.runId,
+    projectRoot: root,
+    worktreePath: root,
+    agentKind: "hermes",
+    prompt: buildPromptForNodeRun(session, hermesNode),
+  });
+}
+
+function toolCallsFromEvents(events) {
+  return events.flatMap((event) => {
+    if (event.kind !== "output" || typeof event.payload.text !== "string") return [];
+    return parseHermesWorkflowToolCalls(event.payload.text);
   });
 }
 

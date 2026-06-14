@@ -36,6 +36,7 @@ export type AgentRunStatus =
   | "timed-out";
 export type RunEventKind = "output" | "status" | "error" | "approval" | "progress" | "evidence";
 export type EvidenceCheckStatus = "passed" | "failed" | "skipped";
+export type HermesPlannerTransport = "native-session" | "oneshot-fallback";
 
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
 export const RUN_EVENT_PROTOCOL_VERSION = 1;
@@ -61,6 +62,8 @@ export interface AgentRun {
   id: string;
   nodeId: string;
   sessionId: string;
+  plannerSessionId?: string;
+  plannerInputId?: string;
   projectRoot: string;
   worktreePath: string;
   agentKind: AgentKind;
@@ -74,6 +77,8 @@ export interface StartAgentRunInput {
   runId?: string;
   nodeId: string;
   sessionId: string;
+  plannerSessionId?: string;
+  plannerInputId?: string;
   projectRoot: string;
   worktreePath: string;
   agentKind: AgentKind;
@@ -199,6 +204,8 @@ export interface SessionBase {
 
 export interface CanvasSession extends SessionBase {
   kind: "canvas";
+  hermesPlannerSessionId: string;
+  plannerNodeId: string;
   nodes: CanvasNode[];
   edges: CanvasEdge[];
   activeNodeId: string | null;
@@ -234,6 +241,10 @@ export function hasConcreteRunEvidence(evidence: RunEvidence | null | undefined)
   if (evidence.artifacts.length > 0) return true;
   if (evidence.review?.status === "passed") return true;
   return evidence.checks.some((check) => check.status === "passed");
+}
+
+export function makeHermesPlannerSessionId(sessionId: string): string {
+  return `hermes-planner-${sessionId}`;
 }
 
 export function deriveNodeStatusFromEvidence(

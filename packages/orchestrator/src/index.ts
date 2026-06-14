@@ -104,6 +104,7 @@ export type WorkflowCardToolCall =
 export interface HermesWorkflowPromptInput {
   goal: string;
   sessionId: string;
+  plannerSessionId: string;
   nodeId: string;
   existingNodes: Array<Pick<CanvasNode, "id" | "title" | "agent" | "status"> & {
     taskKey?: string;
@@ -120,6 +121,8 @@ export function buildHermesWorkflowPrompt(input: HermesWorkflowPromptInput): str
     "Card is SkyTurn task state, not the agent itself.",
     "Hermes cards are planner/verifier tasks; Codex cards are executor tasks.",
     "runId connects a card to a concrete local agent run.",
+    "The planner session identity is stable for this CanvasSession; runId is not a planner identity.",
+    "Continue the same planner session for new requirements in this CanvasSession.",
     "Dependencies define xyflow edges and scheduling order.",
     "Use stable card IDs or stable taskKey values for semantically identical cards.",
     "Use updateWorkflowCard instead of createWorkflowCard when an equivalent card already exists.",
@@ -132,6 +135,7 @@ export function buildHermesWorkflowPrompt(input: HermesWorkflowPromptInput): str
     "Allowed statuses: pending, running, retrying, completed, failed.",
     "For the running Codex task, set worktreePath to \".\" and brief to a concrete software-development task.",
     `Session: ${input.sessionId}`,
+    `Planner session identity: ${input.plannerSessionId}`,
     `Planning node: ${input.nodeId}`,
     `Existing nodes: ${JSON.stringify(input.existingNodes)}`,
     `User goal: ${input.goal}`,
@@ -197,7 +201,38 @@ function applyWorkflowCardToolCall(
       : call.tool === "updateWorkflowCard"
         ? updateWorkflowCard(session, call, context)
         : deleteWorkflowCard(session, call, context);
-  return { ...next, session: applyVerifierGraphHygiene(next.session, context) };
+  return {
+    ...next,
+    session: applyVerifierGraphHygiene(applyPlannerRootGraphHygiene(next.session), context),
+  };
+}
+
+function applyPlannerRootGraphHygiene(session: CanvasSession): CanvasSession {
+  const plannerNodeId = session.plannerNodeId;
+  const planner = session.nodes.find((node) => node.id === plannerNodeId);
+  if (!planner) return session;
+
+  const nodes =
+    planner.context.dependencies.length === 0
+      ? session.nodes
+      : session.nodes.map((node) =>
+          node.id === plannerNodeId
+            ? {
+                ...node,
+                context: {
+                  ...node.context,
+                  dependencies: [],
+                },
+              }
+            : node,
+        );
+  const edges = session.edges.filter((edge) => edge.target !== plannerNodeId);
+  if (nodes === session.nodes && edges.length === session.edges.length) return session;
+  return {
+    ...session,
+    nodes,
+    edges,
+  };
 }
 
 function applyVerifierGraphHygiene(session: CanvasSession, context: WorkflowCardToolContext): CanvasSession {

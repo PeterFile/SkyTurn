@@ -94,6 +94,50 @@ describe("workflow-card tools", () => {
     });
   });
 
+  it("keeps the CanvasSession planner root dependency-free even if Hermes updates it", () => {
+    const seeded = applyWorkflowCardToolCalls(makeSession(), [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code",
+        input: {
+          id: "node-code",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts.",
+          dependencies: ["node-1"],
+          worktreePath: ".",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:01.000Z",
+    }).session;
+
+    const result = applyWorkflowCardToolCalls(seeded, [
+      {
+        tool: "updateWorkflowCard",
+        toolCallId: "call-bad-root-dependency",
+        input: {
+          id: "node-1",
+          status: "running",
+          dependencies: ["node-code"],
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:02.000Z",
+    });
+
+    const planner = result.session.nodes.find((node) => node.id === "node-1");
+    expect(planner?.context.dependencies).toEqual([]);
+    expect(result.session.edges).not.toContainEqual({
+      id: "edge-node-code-node-1",
+      source: "node-code",
+      target: "node-1",
+    });
+  });
+
   it("repairs verifier dependencies to the Codex card and keeps verifier pending until dependencies complete", () => {
     const result = applyWorkflowCardToolCalls(makeSession(), [
       {
@@ -219,10 +263,12 @@ describe("workflow-card tools", () => {
     const prompt = buildHermesWorkflowPrompt({
       goal: "Update one file and verify it",
       sessionId: "session-1",
+      plannerSessionId: "hermes-planner-session-1",
       nodeId: "node-1",
       existingNodes: [{ id: "node-1", title: "Plan workflow", agent: "hermes", status: "running" }],
     });
 
+    expect(prompt).toContain("Planner session identity: hermes-planner-session-1");
     expect(prompt).toContain("Card is SkyTurn task state, not the agent itself.");
     expect(prompt).toContain("Hermes cards are planner/verifier tasks; Codex cards are executor tasks.");
     expect(prompt).toContain("runId connects a card to a concrete local agent run.");
@@ -385,6 +431,8 @@ function makeSession(): CanvasSession {
     goal: "Add persisted run evidence",
     mode: "fast",
     kind: "canvas",
+    hermesPlannerSessionId: "hermes-planner-fast-20260610",
+    plannerNodeId: "node-1",
     createdAt: "2026-06-10T00:00:00.000Z",
     updatedAt: "2026-06-10T00:00:00.000Z",
     activeNodeId: "node-1",

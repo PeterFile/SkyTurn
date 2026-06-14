@@ -16,6 +16,8 @@ describe("canvas session factory", () => {
 
     expect(session.kind).toBe("canvas");
     expect(session.mode).toBe("fast");
+    expect(session.hermesPlannerSessionId).toBe("hermes-planner-fast-202606100000");
+    expect(session.plannerNodeId).toBe("node-1");
     expect(session.nodes.map((node) => node.title)).toEqual([
       "Plan workflow cards",
     ]);
@@ -58,6 +60,8 @@ describe("canvas session factory", () => {
 
     expect(canvas.kind).toBe("canvas");
     expect(canvas.mode).toBe("plan");
+    expect(canvas.hermesPlannerSessionId).toBe("hermes-planner-plan-202606100000");
+    expect(canvas.plannerNodeId).toBe("node-1");
     expect(canvas.nodes.map((node) => node.title)).toEqual([
       "Confirm requirements",
       "Implement canvas shell",

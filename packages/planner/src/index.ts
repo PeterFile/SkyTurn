@@ -1,12 +1,13 @@
-import type {
-  AgentKind,
-  CanvasEdge,
-  CanvasNode,
-  CanvasNodeDisplay,
-  CanvasSession,
-  NodeRuntimeState,
-  PlanMarkdown,
-  PlanSession,
+import {
+  makeHermesPlannerSessionId,
+  type AgentKind,
+  type CanvasEdge,
+  type CanvasNode,
+  type CanvasNodeDisplay,
+  type CanvasSession,
+  type NodeRuntimeState,
+  type PlanMarkdown,
+  type PlanSession,
 } from "@skyturn/project-core";
 
 interface CreateSessionInput {
@@ -179,6 +180,11 @@ function createCanvasSession({
     goal: input.goal,
     mode,
     kind: "canvas",
+    hermesPlannerSessionId: makeHermesPlannerSessionId(sessionId),
+    plannerNodeId:
+      nodes.find((node) => node.agent === "hermes" && node.context.dependencies.length === 0)?.id ??
+      nodes[0]?.id ??
+      "node-1",
     createdAt: input.createdAt,
     updatedAt: input.createdAt,
     nodes,
