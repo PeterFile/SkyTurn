@@ -157,6 +157,8 @@ export interface CanvasNodeWorkflowTrace {
   sourceRunId: string;
   toolCallId?: string;
   lastTool: WorkflowCardToolName;
+  taskKey?: string;
+  semanticKey?: string;
 }
 
 export interface CanvasNode {

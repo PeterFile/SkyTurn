@@ -37,6 +37,7 @@ export const dependencyAwareScheduler: TaskGraphScheduler = {
 export interface WorkflowCardToolContext {
   sourceRunId: string;
   now: string;
+  authoritativeNodeStatuses?: Record<string, NodeStatus>;
 }
 
 export interface WorkflowCardToolResult {
@@ -53,6 +54,7 @@ export interface WorkflowCardToolApplication {
 
 export interface WorkflowCardCreateInput {
   id?: string;
+  taskKey?: string;
   title: string;
   agent: AgentKind;
   status?: NodeStatus;
@@ -66,6 +68,7 @@ export interface WorkflowCardCreateInput {
 
 export interface WorkflowCardUpdateInput {
   id: string;
+  taskKey?: string;
   title?: string;
   agent?: AgentKind;
   status?: NodeStatus;
@@ -102,16 +105,29 @@ export interface HermesWorkflowPromptInput {
   goal: string;
   sessionId: string;
   nodeId: string;
-  existingNodes: Array<Pick<CanvasNode, "id" | "title" | "agent" | "status">>;
+  existingNodes: Array<Pick<CanvasNode, "id" | "title" | "agent" | "status"> & {
+    taskKey?: string;
+    dependencies?: string[];
+  }>;
 }
 
 export function buildHermesWorkflowPrompt(input: HermesWorkflowPromptInput): string {
   return [
     "You are Hermes-agent planning a SkyTurn workflow canvas.",
     "Return ONLY one JSON object. No markdown. No prose.",
-    "Schema: {\"toolCalls\":[{\"tool\":\"createWorkflowCard|updateWorkflowCard|deleteWorkflowCard\",\"toolCallId\":\"string\",\"input\":{...}}]}",
+    "Schema: {\"toolCalls\":[{\"tool\":\"createWorkflowCard|updateWorkflowCard|deleteWorkflowCard\",\"toolCallId\":\"string\",\"input\":{\"id\":\"string\",\"taskKey\":\"string\",\"title\":\"string\",\"agent\":\"hermes|codex|gemini|claude-code|openclaw\",\"status\":\"pending|running|retrying|completed|failed\",\"brief\":\"string\",\"dependencies\":[\"node-id\"],\"worktreePath\":\"string\"}}]}",
     "Use these exact tools: createWorkflowCard, updateWorkflowCard, deleteWorkflowCard.",
-    "Required vertical slice: use create, update, and delete at least once; create at least one running Codex code task.",
+    "Card is SkyTurn task state, not the agent itself.",
+    "Hermes cards are planner/verifier tasks; Codex cards are executor tasks.",
+    "runId connects a card to a concrete local agent run.",
+    "Dependencies define xyflow edges and scheduling order.",
+    "Use stable card IDs or stable taskKey values for semantically identical cards.",
+    "Use updateWorkflowCard instead of createWorkflowCard when an equivalent card already exists.",
+    "Every verification card must depend on the Codex implementation card it verifies.",
+    "No disconnected cards except the root planning card.",
+    "Do not set a verifier running until its dependencies are completed; create it pending when implementation is still running.",
+    "At most one primary Codex implementation card and one Hermes verification card for a simple single-file task.",
+    "Required vertical slice: create at least one running Codex code task.",
     "Allowed agents: hermes, codex, gemini, claude-code, openclaw.",
     "Allowed statuses: pending, running, retrying, completed, failed.",
     "For the running Codex task, set worktreePath to \".\" and brief to a concrete software-development task.",
@@ -175,9 +191,69 @@ function applyWorkflowCardToolCall(
   call: WorkflowCardToolCall,
   context: WorkflowCardToolContext,
 ): { session: CanvasSession; result: WorkflowCardToolResult } {
-  if (call.tool === "createWorkflowCard") return createWorkflowCard(session, call, context);
-  if (call.tool === "updateWorkflowCard") return updateWorkflowCard(session, call, context);
-  return deleteWorkflowCard(session, call, context);
+  const next =
+    call.tool === "createWorkflowCard"
+      ? createWorkflowCard(session, call, context)
+      : call.tool === "updateWorkflowCard"
+        ? updateWorkflowCard(session, call, context)
+        : deleteWorkflowCard(session, call, context);
+  return { ...next, session: applyVerifierGraphHygiene(next.session, context) };
+}
+
+function applyVerifierGraphHygiene(session: CanvasSession, context: WorkflowCardToolContext): CanvasSession {
+  const sourceNodeId = sourceNodeIdForContext(session, context);
+  const changedIds = new Set<string>();
+  const nodes = session.nodes.map((node) => {
+    if (!isVerifierCard(node.agent, node.title, node.context.brief)) return node;
+    const dependencies = repairDependencies(session, {
+      id: node.id,
+      agent: node.agent,
+      title: node.title,
+      brief: node.context.brief,
+      dependencies: node.context.dependencies,
+      sourceNodeId,
+    });
+    const status = statusForExistingNode(session.nodes, node, context, {
+      agent: node.agent,
+      title: node.title,
+      brief: node.context.brief,
+      requestedStatus: node.status,
+      dependencies,
+    });
+    if (arraysEqual(dependencies, node.context.dependencies) && status === node.status) return node;
+
+    changedIds.add(node.id);
+    return {
+      ...node,
+      status,
+      runtime: runtimeForStatus(status),
+      progress: status === node.status ? node.progress : progressForStatus(status),
+      context: {
+        ...node.context,
+        dependencies,
+      },
+    };
+  });
+
+  if (changedIds.size === 0) return session;
+
+  let edges = session.edges;
+  for (const id of changedIds) {
+    const node = nodes.find((candidate) => candidate.id === id);
+    if (!node) continue;
+    edges = addDependencyEdges(removeTargetEdges(edges, id), id, node.context.dependencies);
+  }
+  const activeNodeId =
+    nodes.find((node) => node.id === session.activeNodeId && node.status === "running")?.id ??
+    nodes.find((node) => node.status === "running")?.id ??
+    session.activeNodeId;
+
+  return {
+    ...session,
+    nodes,
+    edges,
+    activeNodeId,
+  };
 }
 
 function createWorkflowCard(
@@ -187,33 +263,44 @@ function createWorkflowCard(
 ): { session: CanvasSession; result: WorkflowCardToolResult } {
   const input = call.input;
   const id = cleanId(input.id) || nextNodeId(session.nodes);
-  if (session.nodes.some((node) => node.id === id)) {
-    return {
-      session,
-      result: { tool: call.tool, nodeId: id, status: "skipped", message: "Card already exists." },
-    };
-  }
-
   const title = requireText(input.title, "title");
   const brief = requireText(input.brief, "brief");
   const agent = requireAgent(input.agent);
-  const status = input.status ? requireStatus(input.status) : "pending";
-  const dependencies = uniqueIds(input.dependencies ?? []);
+  const taskKey = normalizeTaskKey(input.taskKey);
+  const semanticKey = semanticKeyForCard({ agent, title, brief, taskKey });
+  const equivalent = findEquivalentCard(session.nodes, { id, agent, title, brief, taskKey, semanticKey });
+  if (equivalent) {
+    return mergeWorkflowCard(session, equivalent, call, context);
+  }
+
+  const sourceNodeId = sourceNodeIdForContext(session, context);
+  const requestedStatus = input.status ? requireStatus(input.status) : "pending";
+  const dependencies = repairDependencies(session, {
+    id,
+    agent,
+    title,
+    brief,
+    dependencies: uniqueIds(input.dependencies ?? []),
+    sourceNodeId,
+  });
+  const status = gateVerifierStatus(session.nodes, { agent, title, brief, requestedStatus, dependencies });
   const node: CanvasNode = {
     id,
     title,
     agent,
-    progress: input.progress?.trim() || progressForStatus(status),
+    progress: progressForInput(input.progress, requestedStatus, status),
     runtime: runtimeForStatus(status),
     display: {
       agentLabel: agentLabel(agent),
-      meta: ["workflow-card-tools", id],
+      meta: workflowCardMeta(id, taskKey),
     },
     workflowTrace: {
       source: "hermes" as const,
       sourceRunId: context.sourceRunId,
       toolCallId: call.toolCallId,
       lastTool: call.tool,
+      ...(taskKey ? { taskKey } : {}),
+      semanticKey,
     },
     status,
     position: input.position ?? nextNodePosition(session.nodes),
@@ -255,30 +342,130 @@ function createWorkflowCard(
   };
 }
 
+function mergeWorkflowCard(
+  session: CanvasSession,
+  target: CanvasNode,
+  call: Extract<WorkflowCardToolCall, { tool: "createWorkflowCard" }>,
+  context: WorkflowCardToolContext,
+): { session: CanvasSession; result: WorkflowCardToolResult } {
+  const input = call.input;
+  const title = requireText(input.title, "title");
+  const brief = requireText(input.brief, "brief");
+  const agent = requireAgent(input.agent);
+  const taskKey = normalizeTaskKey(input.taskKey) ?? target.workflowTrace?.taskKey;
+  const semanticKey = semanticKeyForCard({ agent, title, brief, taskKey });
+  const requestedStatus = input.status ? requireStatus(input.status) : target.status;
+  const sourceNodeId = sourceNodeIdForContext(session, context);
+  const dependencies = repairDependencies(session, {
+    id: target.id,
+    agent,
+    title,
+    brief,
+    dependencies: uniqueIds([...target.context.dependencies, ...(input.dependencies ?? [])]),
+    sourceNodeId,
+  });
+  const status = statusForExistingNode(session.nodes, target, context, {
+    agent,
+    title,
+    brief,
+    requestedStatus,
+    dependencies,
+  });
+  const nodes = session.nodes.map((node) => {
+    if (node.id !== target.id) return node;
+    return {
+      ...node,
+      title,
+      agent,
+      status,
+      progress: progressForInput(input.progress, requestedStatus, status, node.progress),
+      runtime: runtimeForStatus(status),
+      display: {
+        ...node.display,
+        agentLabel: agentLabel(agent),
+        meta: workflowCardMeta(target.id, taskKey),
+      },
+      workflowTrace: {
+        source: "hermes" as const,
+        sourceRunId: context.sourceRunId,
+        toolCallId: call.toolCallId,
+        lastTool: call.tool,
+        ...(taskKey ? { taskKey } : {}),
+        semanticKey,
+      },
+      output: [...node.output, ...normalizeOutput(input.output)],
+      worktree: {
+        ...node.worktree,
+        path: input.worktreePath?.trim() || node.worktree.path,
+      },
+      context: {
+        ...node.context,
+        brief,
+        dependencies,
+        relatedTasks: `Hermes tool call ${call.toolCallId ?? target.id}`,
+      },
+    };
+  });
+  const edges = addDependencyEdges(removeTargetEdges(session.edges, target.id), target.id, dependencies);
+
+  return {
+    session: {
+      ...session,
+      nodes,
+      edges,
+      activeNodeId: status === "running" ? target.id : session.activeNodeId,
+      updatedAt: context.now,
+    },
+    result: { tool: call.tool, nodeId: target.id, status: "applied", message: "Equivalent card merged." },
+  };
+}
+
 function updateWorkflowCard(
   session: CanvasSession,
   call: Extract<WorkflowCardToolCall, { tool: "updateWorkflowCard" }>,
   context: WorkflowCardToolContext,
 ): { session: CanvasSession; result: WorkflowCardToolResult } {
   const id = requireText(call.input.id, "id");
+  const sourceNodeId = sourceNodeIdForContext(session, context);
   let changed = false;
   const nodes = session.nodes.map((node) => {
     if (node.id !== id) return node;
     changed = true;
-    const status = call.input.status ? requireStatus(call.input.status) : node.status;
-    const dependencies = call.input.dependencies ? uniqueIds(call.input.dependencies) : node.context.dependencies;
+    const agent = call.input.agent ? requireAgent(call.input.agent) : node.agent;
+    const title = call.input.title?.trim() || node.title;
+    const brief = call.input.brief?.trim() || node.context.brief;
+    const taskKey = normalizeTaskKey(call.input.taskKey) ?? node.workflowTrace?.taskKey;
+    const semanticKey = semanticKeyForCard({ agent, title, brief, taskKey });
+    const requestedStatus = call.input.status ? requireStatus(call.input.status) : node.status;
+    const dependencies = repairDependencies(session, {
+      id,
+      agent,
+      title,
+      brief,
+      dependencies: call.input.dependencies ? uniqueIds(call.input.dependencies) : node.context.dependencies,
+      sourceNodeId,
+    });
+    const status = statusForExistingNode(session.nodes, node, context, {
+      agent,
+      title,
+      brief,
+      requestedStatus,
+      dependencies,
+    });
     return {
       ...node,
-      title: call.input.title?.trim() || node.title,
-      agent: call.input.agent ? requireAgent(call.input.agent) : node.agent,
+      title,
+      agent,
       status,
-      progress: call.input.progress?.trim() || node.progress,
+      progress: progressForInput(call.input.progress, requestedStatus, status, node.progress),
       runtime: runtimeForStatus(status),
       workflowTrace: {
         source: "hermes" as const,
         sourceRunId: context.sourceRunId,
         toolCallId: call.toolCallId,
         lastTool: call.tool,
+        ...(taskKey ? { taskKey } : {}),
+        semanticKey,
       },
       output: [...node.output, ...normalizeOutput(call.input.output)],
       worktree: {
@@ -287,7 +474,7 @@ function updateWorkflowCard(
       },
       context: {
         ...node.context,
-        brief: call.input.brief?.trim() || node.context.brief,
+        brief,
         dependencies,
         relatedTasks: `Hermes tool call ${call.toolCallId ?? id}`,
       },
@@ -399,6 +586,211 @@ function uniqueIds(values: string[]): string[] {
 
 function cleanId(value: unknown): string | null {
   return typeof value === "string" && /^[A-Za-z0-9._:-]+$/.test(value.trim()) ? value.trim() : null;
+}
+
+function normalizeTaskKey(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = normalizeText(value);
+  return normalized || undefined;
+}
+
+function semanticKeyForCard(input: {
+  agent: AgentKind;
+  title: string;
+  brief: string;
+  taskKey?: string;
+}): string {
+  if (input.taskKey) return `task-key:${input.taskKey}`;
+  return [
+    `agent:${input.agent}`,
+    `role:${cardRole(input.agent, input.title, input.brief)}`,
+    `title:${normalizeText(input.title)}`,
+    `brief:${normalizeText(input.brief)}`,
+  ].join("|");
+}
+
+function semanticKeyForNode(node: CanvasNode): string {
+  return node.workflowTrace?.semanticKey ?? semanticKeyForCard({
+    agent: node.agent,
+    title: node.title,
+    brief: node.context.brief,
+    taskKey: node.workflowTrace?.taskKey,
+  });
+}
+
+function findEquivalentCard(
+  nodes: CanvasNode[],
+  input: {
+    id: string;
+    agent: AgentKind;
+    title: string;
+    brief: string;
+    taskKey?: string;
+    semanticKey: string;
+  },
+): CanvasNode | null {
+  return nodes.find((node) => node.id === input.id || semanticKeyForNode(node) === input.semanticKey) ?? null;
+}
+
+function sourceNodeIdForContext(session: CanvasSession, context: WorkflowCardToolContext): string | null {
+  return session.nodes.find((node) => node.runId === context.sourceRunId)?.id ?? null;
+}
+
+function repairDependencies(
+  session: CanvasSession,
+  input: {
+    id: string;
+    agent: AgentKind;
+    title: string;
+    brief: string;
+    dependencies: string[];
+    sourceNodeId: string | null;
+  },
+): string[] {
+  const dependencies = uniqueIds(input.dependencies).filter((dependency) => dependency !== input.id);
+  if (dependencies.length === 0 && input.sourceNodeId && input.sourceNodeId !== input.id) {
+    dependencies.push(input.sourceNodeId);
+  }
+
+  if (isVerifierCard(input.agent, input.title, input.brief)) {
+    const target = findVerifiedCodexCard(session, input, dependencies);
+    if (target && !dependencies.includes(target.id)) dependencies.push(target.id);
+  }
+
+  return dependencies;
+}
+
+function findVerifiedCodexCard(
+  session: CanvasSession,
+  input: {
+    id: string;
+    title: string;
+    brief: string;
+  },
+  dependencies: string[],
+): CanvasNode | null {
+  const nodeById = new Map(session.nodes.map((node) => [node.id, node]));
+  if (dependencies.some((dependency) => nodeById.get(dependency)?.agent === "codex")) return null;
+
+  const candidates = session.nodes.filter((node) => node.id !== input.id && node.agent === "codex");
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0] ?? null;
+
+  const verifierTokens = tokenSet(`${input.title} ${input.brief}`);
+  const scored = candidates
+    .map((node) => ({
+      node,
+      score: overlapScore(verifierTokens, tokenSet(`${node.title} ${node.context.brief}`)),
+    }))
+    .sort((left, right) => right.score - left.score);
+  return scored[0]?.score ? scored[0].node : null;
+}
+
+function statusForExistingNode(
+  nodes: CanvasNode[],
+  node: CanvasNode,
+  context: WorkflowCardToolContext,
+  input: {
+    agent: AgentKind;
+    title: string;
+    brief: string;
+    requestedStatus: NodeStatus;
+    dependencies: string[];
+  },
+): NodeStatus {
+  const authoritativeStatus = context.authoritativeNodeStatuses?.[node.id];
+  if (authoritativeStatus) return authoritativeStatus;
+  if (node.status === "completed" || node.status === "failed") return node.status;
+  return gateVerifierStatus(nodes, input);
+}
+
+function gateVerifierStatus(
+  nodes: CanvasNode[],
+  input: {
+    agent: AgentKind;
+    title: string;
+    brief: string;
+    requestedStatus: NodeStatus;
+    dependencies: string[];
+  },
+): NodeStatus {
+  if (
+    input.requestedStatus === "running" &&
+    isVerifierCard(input.agent, input.title, input.brief) &&
+    !dependenciesCompleted(nodes, input.dependencies)
+  ) {
+    return "pending";
+  }
+  return input.requestedStatus;
+}
+
+function dependenciesCompleted(nodes: CanvasNode[], dependencies: string[]): boolean {
+  if (dependencies.length === 0) return true;
+  const completed = new Set(nodes.filter((node) => node.status === "completed").map((node) => node.id));
+  return dependencies.every((dependency) => completed.has(dependency));
+}
+
+function progressForInput(
+  value: string | undefined,
+  requestedStatus: NodeStatus,
+  status: NodeStatus,
+  fallback?: string,
+): string {
+  if (status !== requestedStatus) return progressForStatus(status);
+  return value?.trim() || fallback || progressForStatus(status);
+}
+
+function workflowCardMeta(id: string, taskKey: string | undefined): string[] {
+  return taskKey ? ["workflow-card-tools", id, `task-key:${taskKey}`] : ["workflow-card-tools", id];
+}
+
+function cardRole(agent: AgentKind, title: string, brief: string): "planner" | "verifier" | "executor" | "task" {
+  if (isVerifierCard(agent, title, brief)) return "verifier";
+  if (agent === "hermes" && /\b(plan|planning|decompose|orchestrate)\b/.test(normalizeText(`${title} ${brief}`))) {
+    return "planner";
+  }
+  if (agent === "codex") return "executor";
+  return "task";
+}
+
+function isVerifierCard(agent: AgentKind, title: string, brief: string): boolean {
+  if (agent !== "hermes") return false;
+  const text = normalizeText(`${title} ${brief}`);
+  return /\b(verify|verification|validate|validation|review|check|test|qa|audit)\b/.test(text) ||
+    /验证|验收|复核|检查|测试/.test(`${title} ${brief}`);
+}
+
+function normalizeText(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function tokenSet(value: string): Set<string> {
+  const ignored = new Set([
+    "the",
+    "and",
+    "for",
+    "with",
+    "card",
+    "task",
+    "codex",
+    "hermes",
+    "verify",
+    "verification",
+    "implementation",
+  ]);
+  return new Set(normalizeText(value).split(" ").filter((token) => token.length > 2 && !ignored.has(token)));
+}
+
+function overlapScore(left: Set<string>, right: Set<string>): number {
+  let score = 0;
+  for (const token of left) {
+    if (right.has(token)) score += 1;
+  }
+  return score;
+}
+
+function arraysEqual(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function skippedNodeId(call: WorkflowCardToolCall): string {

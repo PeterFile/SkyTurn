@@ -17,6 +17,11 @@
 - `New Tab` creates a new task canvas session, not a file tab.
 - A canvas is the visual task graph for one session.
 - A node is one executable agent task, preferably bound to a run and worktree.
+- A workflow card is SkyTurn task state, not the agent itself.
+- Hermes cards represent planner or verifier tasks.
+- Codex cards represent executor tasks.
+- `runId` connects a card to a concrete local agent run.
+- Dependencies define both `@xyflow/react` edges and scheduling order.
 - The node modal contains exactly three content tabs: `Output`, `Changes`, and `Context`.
 
 ## Canvas Requirements

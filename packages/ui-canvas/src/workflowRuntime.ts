@@ -131,6 +131,8 @@ export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode):
         title: item.title,
         agent: item.agent,
         status: item.status,
+        taskKey: item.workflowTrace?.taskKey,
+        dependencies: item.context.dependencies,
       })),
     });
   }

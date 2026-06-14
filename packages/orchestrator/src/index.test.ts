@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { CanvasSession } from "@skyturn/project-core";
 import {
   applyWorkflowCardToolCalls,
+  buildHermesWorkflowPrompt,
   dependencyAwareScheduler,
   parseHermesWorkflowToolCalls,
 } from "./index";
@@ -23,6 +24,213 @@ describe("dependencyAwareScheduler", () => {
 });
 
 describe("workflow-card tools", () => {
+  it("merges duplicate cards by semantic identity instead of id alone", () => {
+    const result = applyWorkflowCardToolCalls(makeSession(), [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code-a",
+        input: {
+          id: "node-code-a",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts to add a task-local evidence summary.",
+          worktreePath: ".",
+        },
+      },
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code-b",
+        input: {
+          id: "node-code-b",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts to add a task-local evidence summary.",
+          output: "Duplicate Hermes create call should merge into the first implementation card.",
+          worktreePath: ".",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:01.000Z",
+    });
+
+    const codexNodes = result.session.nodes.filter((node) => node.agent === "codex");
+    expect(codexNodes.map((node) => node.id)).toEqual(["node-code-a"]);
+    expect(codexNodes[0]?.output).toContain("Duplicate Hermes create call should merge into the first implementation card.");
+    expect(result.results[1]).toMatchObject({
+      tool: "createWorkflowCard",
+      nodeId: "node-code-a",
+      status: "applied",
+    });
+  });
+
+  it("connects new cards without dependencies to the source planning card", () => {
+    const result = applyWorkflowCardToolCalls(makeSession(), [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code",
+        input: {
+          id: "node-code",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts.",
+          worktreePath: ".",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:01.000Z",
+    });
+
+    const codeNode = result.session.nodes.find((node) => node.id === "node-code");
+    expect(codeNode?.context.dependencies).toEqual(["node-1"]);
+    expect(result.session.edges).toContainEqual({
+      id: "edge-node-1-node-code",
+      source: "node-1",
+      target: "node-code",
+    });
+  });
+
+  it("repairs verifier dependencies to the Codex card and keeps verifier pending until dependencies complete", () => {
+    const result = applyWorkflowCardToolCalls(makeSession(), [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code",
+        input: {
+          id: "node-code",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts to add a task-local evidence summary.",
+          worktreePath: ".",
+        },
+      },
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-verify",
+        input: {
+          id: "node-verify",
+          title: "Verify workflow helper",
+          agent: "hermes",
+          status: "running",
+          brief: "Verify the Codex implementation for the workflow helper.",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:01.000Z",
+    });
+
+    const verifyNode = result.session.nodes.find((node) => node.id === "node-verify");
+    expect(verifyNode?.status).toBe("pending");
+    expect(verifyNode?.context.dependencies).toContain("node-code");
+    expect(result.session.edges).toContainEqual({
+      id: "edge-node-code-node-verify",
+      source: "node-code",
+      target: "node-verify",
+    });
+  });
+
+  it("repairs verifier dependencies even when Hermes creates the verifier before the Codex card", () => {
+    const result = applyWorkflowCardToolCalls(makeSession(), [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-verify",
+        input: {
+          id: "node-verify",
+          title: "Verify workflow helper",
+          agent: "hermes",
+          status: "running",
+          brief: "Verify the Codex implementation for the workflow helper.",
+        },
+      },
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code",
+        input: {
+          id: "node-code",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts to add a task-local evidence summary.",
+          worktreePath: ".",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:01.000Z",
+    });
+
+    const verifyNode = result.session.nodes.find((node) => node.id === "node-verify");
+    expect(verifyNode?.context.dependencies).toContain("node-code");
+    expect(result.session.edges).toContainEqual({
+      id: "edge-node-code-node-verify",
+      source: "node-code",
+      target: "node-verify",
+    });
+  });
+
+  it("keeps repeated Hermes planning from creating duplicate Codex implementation cards", () => {
+    const first = applyWorkflowCardToolCalls(makeSession(), [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code-a",
+        input: {
+          id: "node-code-a",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts to add a task-local evidence summary.",
+          worktreePath: ".",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:01.000Z",
+    });
+
+    const second = applyWorkflowCardToolCalls(first.session, [
+      {
+        tool: "createWorkflowCard",
+        toolCallId: "call-create-code-b",
+        input: {
+          id: "node-code-b",
+          title: "Implement workflow helper",
+          agent: "codex",
+          status: "running",
+          brief: "Update src/workflow.ts to add a task-local evidence summary.",
+          worktreePath: ".",
+        },
+      },
+    ], {
+      sourceRunId: "run-fast-node-1",
+      now: "2026-06-10T00:00:02.000Z",
+    });
+
+    expect(second.session.nodes.filter((node) => node.agent === "codex").map((node) => node.id)).toEqual([
+      "node-code-a",
+    ]);
+  });
+
+  it("prompts Hermes with the SkyTurn card model and graph hygiene rules", () => {
+    const prompt = buildHermesWorkflowPrompt({
+      goal: "Update one file and verify it",
+      sessionId: "session-1",
+      nodeId: "node-1",
+      existingNodes: [{ id: "node-1", title: "Plan workflow", agent: "hermes", status: "running" }],
+    });
+
+    expect(prompt).toContain("Card is SkyTurn task state, not the agent itself.");
+    expect(prompt).toContain("Hermes cards are planner/verifier tasks; Codex cards are executor tasks.");
+    expect(prompt).toContain("runId connects a card to a concrete local agent run.");
+    expect(prompt).toContain("Dependencies define xyflow edges and scheduling order.");
+    expect(prompt).toContain("Use updateWorkflowCard instead of createWorkflowCard when an equivalent card already exists.");
+    expect(prompt).toContain("At most one primary Codex implementation card and one Hermes verification card for a simple single-file task.");
+  });
+
   it("applies Hermes workflow-card tool calls to create, update, and delete cards", () => {
     const session = makeSession();
 
@@ -86,7 +294,7 @@ describe("workflow-card tools", () => {
     expect(codeNode?.agent).toBe("codex");
     expect(codeNode?.status).toBe("running");
     expect(codeNode?.context.dependencies).toEqual(["node-1"]);
-    expect(codeNode?.workflowTrace).toEqual({
+    expect(codeNode?.workflowTrace).toMatchObject({
       source: "hermes",
       sourceRunId: "run-fast-node-1",
       toolCallId: "call-create-code",

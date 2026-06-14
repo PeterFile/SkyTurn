@@ -107,13 +107,16 @@ try {
     .join("\n");
   const toolCalls = parseHermesWorkflowToolCalls(hermesOutput);
   const toolsUsed = [...new Set(toolCalls.map((call) => call.tool))].sort();
+  const graph = workflowGraphSummary(finalSession, hermesNode.id, hermesRun.id);
   const ok =
     toolsUsed.includes("createWorkflowCard") &&
-    toolsUsed.includes("updateWorkflowCard") &&
-    toolsUsed.includes("deleteWorkflowCard") &&
     finalHermesNode?.status === "completed" &&
     finalCodexNode?.status === "completed" &&
-    Boolean(workspace.runEvidence[codexRun.id]?.checks.some((check) => check.status === "passed"));
+    Boolean(workspace.runEvidence[codexRun.id]?.checks.some((check) => check.status === "passed")) &&
+    graph.connected &&
+    graph.primaryCodexImplementationCount <= 1 &&
+    graph.hermesVerificationCount <= 1 &&
+    graph.duplicateSemanticKeys.length === 0;
 
   keepRoot = !ok;
   console.log(JSON.stringify({
@@ -139,7 +142,10 @@ try {
       agent: node.agent,
       status: node.status,
       title: node.title,
+      dependencies: node.context.dependencies,
     })),
+    edges: finalSession.edges,
+    graph,
   }, null, 2));
 
   if (!ok) process.exitCode = 1;
@@ -217,4 +223,55 @@ function run(command, args, cwd) {
       reject(new Error(`${command} ${args.join(" ")} exited ${code}`));
     });
   });
+}
+
+function workflowGraphSummary(session, rootCardId, sourceRunId) {
+  const generated = session.nodes.filter((node) => node.id === rootCardId || node.workflowTrace?.sourceRunId === sourceRunId);
+  const generatedIds = new Set(generated.map((node) => node.id));
+  const generatedEdges = session.edges.filter((edge) => generatedIds.has(edge.source) && generatedIds.has(edge.target));
+  const incoming = new Map(generated.map((node) => [node.id, 0]));
+  const outgoing = new Map(generated.map((node) => [node.id, []]));
+
+  for (const edge of generatedEdges) {
+    incoming.set(edge.target, (incoming.get(edge.target) ?? 0) + 1);
+    outgoing.get(edge.source)?.push(edge.target);
+  }
+
+  const visited = new Set();
+  const queue = [rootCardId];
+  while (queue.length > 0) {
+    const id = queue.shift();
+    if (!id || visited.has(id)) continue;
+    visited.add(id);
+    for (const next of outgoing.get(id) ?? []) queue.push(next);
+  }
+
+  const disconnectedCardIds = generated
+    .filter((node) => node.id !== rootCardId && ((incoming.get(node.id) ?? 0) === 0 || !visited.has(node.id)))
+    .map((node) => node.id);
+  const semanticKeys = generated
+    .map((node) => node.workflowTrace?.semanticKey ?? `${node.agent}:${normalizeText(node.title)}:${normalizeText(node.context.brief)}`)
+    .filter(Boolean);
+  const duplicateSemanticKeys = [...new Set(semanticKeys.filter((key, index) => semanticKeys.indexOf(key) !== index))];
+
+  return {
+    connected: disconnectedCardIds.length === 0,
+    rootCardId,
+    generatedCardIds: [...generatedIds],
+    generatedEdges,
+    disconnectedCardIds,
+    duplicateSemanticKeys,
+    primaryCodexImplementationCount: generated.filter((node) => node.agent === "codex").length,
+    hermesVerificationCount: generated.filter((node) => node.agent === "hermes" && isVerifierCard(node)).length,
+  };
+}
+
+function isVerifierCard(node) {
+  const text = normalizeText(`${node.title} ${node.context.brief}`);
+  return /\b(verify|verification|validate|validation|review|check|test|qa|audit)\b/.test(text) ||
+    /验证|验收|复核|检查|测试/.test(`${node.title} ${node.context.brief}`);
+}
+
+function normalizeText(value) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ").replace(/\s+/g, " ").trim();
 }
