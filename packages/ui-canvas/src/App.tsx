@@ -22,10 +22,19 @@ import {
   AlertTriangle,
   ArrowUp,
   CheckCircle2,
+  Check,
   ChevronDown,
   ChevronRight,
+  Columns2,
+  Copy,
+  Eye,
+  EyeOff,
+  FileText,
+  FoldVertical,
   FolderOpen,
   GitBranch,
+  GitPullRequest,
+  ListTree,
   MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
@@ -34,6 +43,7 @@ import {
   RefreshCw,
   Settings,
   Square,
+  WrapText,
   Users,
   X,
 } from "lucide-react";
@@ -46,6 +56,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import ReactMarkdown from "react-markdown";
 
@@ -106,9 +117,9 @@ import {
   type EditorLaunchOption,
 } from "./editorLaunchOptions.js";
 import {
-  parseUnifiedDiff,
-  type ReviewDiffFile,
-  type ReviewDiffRow,
+  DEFAULT_CHANGES_DIFF_OPTIONS,
+  renderChangesetDiffHtml,
+  type ChangesDiffViewOptions,
 } from "./diffViewer.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
 import {
@@ -1999,9 +2010,16 @@ function OutputTab({ node }: { node: CanvasNode }) {
 
 function ChangesTab({ node }: { node: CanvasNode }) {
   const [changeset, setChangeset] = useState<Changeset | null>(null);
+  const [diffHtml, setDiffHtml] = useState("");
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [refreshVersion, setRefreshVersion] = useState(0);
+  const [diffCollapsed, setDiffCollapsed] = useState(false);
+  const [options, setOptions] = useState<ChangesDiffViewOptions>(DEFAULT_CHANGES_DIFF_OPTIONS);
 
   useEffect(() => {
     let active = true;
+    setChangeset(null);
     void mockChangesetService.getChangeset(node).then((value) => {
       if (active) setChangeset(value);
     });
@@ -2010,12 +2028,59 @@ function ChangesTab({ node }: { node: CanvasNode }) {
     };
   }, [node]);
 
-  const reviewDiff = useMemo(
-    () => (changeset ? parseUnifiedDiff(changeset.patchPreview, changeset.files) : null),
-    [changeset],
-  );
+  useEffect(() => {
+    if (!changeset) return;
 
-  if (!changeset || !reviewDiff) return <p>Loading changes...</p>;
+    let active = true;
+    setDiffLoading(true);
+    setDiffError(null);
+    void renderChangesetDiffHtml(changeset.patchPreview, changeset.files, options)
+      .then((html) => {
+        if (!active) return;
+        setDiffHtml(html);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setDiffHtml("");
+        setDiffError(error instanceof Error ? error.message : "Unable to render diff preview.");
+      })
+      .finally(() => {
+        if (active) setDiffLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [
+    changeset,
+    options.hideWhitespace,
+    options.loadFullFiles,
+    options.outputFormat,
+    options.richPreview,
+    options.wordDiffs,
+    options.wordWrap,
+    refreshVersion,
+  ]);
+
+  function setDiffOption<K extends keyof ChangesDiffViewOptions>(key: K, value: ChangesDiffViewOptions[K]) {
+    setOptions((current) => ({ ...current, [key]: value }));
+  }
+
+  function toggleOutputFormat() {
+    setOptions((current) => ({
+      ...current,
+      outputFormat: current.outputFormat === "line-by-line" ? "side-by-side" : "line-by-line",
+    }));
+  }
+
+  if (!changeset) return <p>Loading changes...</p>;
+
+  const diffShellClassName = [
+    "diff2html-shell",
+    options.wordWrap ? "is-word-wrapped" : "",
+    diffCollapsed ? "is-collapsed" : "",
+    options.outputFormat === "side-by-side" ? "is-side-by-side" : "is-line-by-line",
+  ].filter(Boolean).join(" ");
 
   return (
     <section className="changes-review" aria-label="Code changes review">
@@ -2023,7 +2088,7 @@ function ChangesTab({ node }: { node: CanvasNode }) {
         <div className="changes-summary-copy">
           <p className="eyebrow">Turn Summary</p>
           <h3>{changeset.source === "git" ? "Worktree diff review" : "Task diff preview"}</h3>
-          <p>{changeReviewSummary(node, changeset, reviewDiff.files.length)}</p>
+          <p>{changeReviewSummary(node, changeset)}</p>
         </div>
         <div className="diff-stat" aria-label="Diff statistics">
           <span className="diff-stat-pill added">
@@ -2041,12 +2106,21 @@ function ChangesTab({ node }: { node: CanvasNode }) {
         </div>
       </header>
 
-      {reviewDiff.files.length > 0 ? (
-        <div className="review-file-stack">
-          {reviewDiff.files.map((file) => (
-            <ReviewDiffFileCard key={file.id} file={file} />
-          ))}
-        </div>
+      <ChangesDiffToolbar
+        collapsed={diffCollapsed}
+        options={options}
+        onCollapseToggle={() => setDiffCollapsed((current) => !current)}
+        onOption={setDiffOption}
+        onOutputFormatToggle={toggleOutputFormat}
+        onRefresh={() => setRefreshVersion((current) => current + 1)}
+      />
+
+      {diffError ? (
+        <div className="changes-empty" role="alert">{diffError}</div>
+      ) : diffLoading ? (
+        <div className="changes-empty">Rendering diff preview...</div>
+      ) : diffHtml ? (
+        <div className={diffShellClassName} dangerouslySetInnerHTML={{ __html: diffHtml }} />
       ) : (
         <div className="changes-empty">No structured diff was available for this changeset.</div>
       )}
@@ -2054,66 +2128,165 @@ function ChangesTab({ node }: { node: CanvasNode }) {
   );
 }
 
-function changeReviewSummary(node: CanvasNode, changeset: Changeset, fileCount: number): string {
+function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
   const agent = agentIdentityForNode(node);
   const source = changeset.source === "git" ? "git worktree" : "mock adapter";
-  const fileLabel = fileCount === 1 ? "file" : "files";
-  return `${agent} produced ${changeset.id} from the ${source}: ${fileCount} ${fileLabel} ready for review.`;
+  const fileLabel = changeset.diffStat.changed === 1 ? "file" : "files";
+  return `${agent} produced ${changeset.id} from the ${source}: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
 }
 
-function ReviewDiffFileCard({ file }: { file: ReviewDiffFile }) {
-  return (
-    <article className="review-file">
-      <header className="review-file-header">
-        <div>
-          <span className="review-file-path">{file.displayPath}</span>
-          <span className="review-file-meta">
-            {file.hunks.length} {file.hunks.length === 1 ? "hunk" : "hunks"}
-          </span>
-        </div>
-        <div className="review-file-counts" aria-label={`Line changes for ${file.displayPath}`}>
-          <span className="added">+{file.added}</span>
-          <span className="removed">-{file.deleted}</span>
-        </div>
-      </header>
+function ChangesDiffToolbar({
+  collapsed,
+  options,
+  onCollapseToggle,
+  onOption,
+  onOutputFormatToggle,
+  onRefresh,
+}: {
+  collapsed: boolean;
+  options: ChangesDiffViewOptions;
+  onCollapseToggle: () => void;
+  onOption: <K extends keyof ChangesDiffViewOptions>(key: K, value: ChangesDiffViewOptions[K]) => void;
+  onOutputFormatToggle: () => void;
+  onRefresh: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const menuId = useId();
+  const splitTitle = options.outputFormat === "side-by-side" ? "Switch to unified diff" : "Switch to split diff";
 
-      <div className="review-diff" role="table" aria-label={`Diff for ${file.displayPath}`}>
-        {file.hunks.map((hunk, hunkIndex) => (
-          <div className="diff-hunk" role="rowgroup" key={`${file.id}-${hunk.header}-${hunkIndex}`}>
-            <div className="diff-row diff-row-separator" role="row">
-              <span className="diff-gutter" role="cell" />
-              <span className="diff-gutter" role="cell" />
-              <span className="diff-marker" role="cell">·</span>
-              <code role="cell">{hunk.header}</code>
-            </div>
-            {hunk.rows.map((row, rowIndex) => (
-              <ReviewDiffRowView
-                key={`${row.kind}-${row.oldNumber ?? "x"}-${row.newNumber ?? "x"}-${rowIndex}`}
-                row={row}
-              />
-            ))}
+  useEffect(() => {
+    if (!open) return;
+
+    function handlePointerDown(event: PointerEvent) {
+      const root = rootRef.current;
+      if (!root || root.contains(event.target as Node)) return;
+      setOpen(false);
+    }
+
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") setOpen(false);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  function selectMenuAction(action: () => void) {
+    action();
+    setOpen(false);
+  }
+
+  return (
+    <div className="changes-toolbar" aria-label="Diff preview controls">
+      <button className="changes-tool-button" type="button" title="Refresh" onClick={onRefresh}>
+        <RefreshCw size={15} aria-hidden="true" />
+        <span>Refresh</span>
+      </button>
+      <button
+        className="changes-tool-button icon-only"
+        type="button"
+        title={splitTitle}
+        aria-label={splitTitle}
+        aria-pressed={options.outputFormat === "side-by-side"}
+        onClick={onOutputFormatToggle}
+      >
+        <Columns2 size={16} aria-hidden="true" />
+      </button>
+      <button className="changes-tool-button muted" type="button" disabled title="Commit or push is not wired yet">
+        <GitPullRequest size={15} aria-hidden="true" />
+        <span>Commit or push</span>
+      </button>
+      <div ref={rootRef} className="changes-menu">
+        <button
+          className="changes-tool-button icon-only"
+          type="button"
+          aria-haspopup="menu"
+          aria-expanded={open}
+          aria-controls={open ? menuId : undefined}
+          title="Diff display options"
+          onClick={() => setOpen((current) => !current)}
+        >
+          <MoreHorizontal size={16} aria-hidden="true" />
+        </button>
+        {open && (
+          <div id={menuId} className="changes-menu-list" role="menu" aria-label="Diff display options">
+            <ChangesMenuItem icon={<RefreshCw size={15} />} label="Refresh" onClick={() => selectMenuAction(onRefresh)} />
+            <ChangesMenuItem
+              active={options.wordWrap}
+              icon={<WrapText size={15} />}
+              label="Enable word wrap"
+              onClick={() => selectMenuAction(() => onOption("wordWrap", !options.wordWrap))}
+            />
+            <ChangesMenuItem
+              active={collapsed}
+              icon={<FoldVertical size={15} />}
+              label={collapsed ? "Expand all diffs" : "Collapse all diffs"}
+              onClick={() => selectMenuAction(onCollapseToggle)}
+            />
+            <div className="changes-menu-separator" role="separator" />
+            <ChangesMenuItem
+              active={!options.loadFullFiles}
+              icon={<FileText size={15} />}
+              label="Don't load full files"
+              onClick={() => selectMenuAction(() => onOption("loadFullFiles", !options.loadFullFiles))}
+            />
+            <ChangesMenuItem
+              active={options.richPreview}
+              icon={<Eye size={15} />}
+              label="Enable rich preview"
+              onClick={() => selectMenuAction(() => onOption("richPreview", !options.richPreview))}
+            />
+            <ChangesMenuItem
+              active={options.wordDiffs}
+              icon={<ListTree size={15} />}
+              label="Enable word diffs"
+              onClick={() => selectMenuAction(() => onOption("wordDiffs", !options.wordDiffs))}
+            />
+            <ChangesMenuItem
+              active={options.hideWhitespace}
+              icon={<EyeOff size={15} />}
+              label="Hide white space"
+              onClick={() => selectMenuAction(() => onOption("hideWhitespace", !options.hideWhitespace))}
+            />
+            <ChangesMenuItem disabled icon={<Copy size={15} />} label="Copy git apply command" />
           </div>
-        ))}
+        )}
       </div>
-    </article>
-  );
-}
-
-function ReviewDiffRowView({ row }: { row: ReviewDiffRow }) {
-  return (
-    <div className={`diff-row ${row.kind}`} role="row">
-      <span className="diff-gutter old" role="cell">{row.oldNumber ?? ""}</span>
-      <span className="diff-gutter new" role="cell">{row.newNumber ?? ""}</span>
-      <span className="diff-marker" role="cell">{diffMarkerForRow(row.kind)}</span>
-      <code role="cell">{row.content || " "}</code>
     </div>
   );
 }
 
-function diffMarkerForRow(kind: ReviewDiffRow["kind"]): string {
-  if (kind === "added") return "+";
-  if (kind === "removed") return "-";
-  return " ";
+function ChangesMenuItem({
+  active = false,
+  disabled = false,
+  icon,
+  label,
+  onClick,
+}: {
+  active?: boolean;
+  disabled?: boolean;
+  icon: ReactNode;
+  label: string;
+  onClick?: () => void;
+}) {
+  return (
+    <button
+      className="changes-menu-item"
+      type="button"
+      role="menuitemcheckbox"
+      aria-checked={active}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      <span className="changes-menu-icon" aria-hidden="true">{active ? <Check size={13} /> : icon}</span>
+      <span>{label}</span>
+    </button>
+  );
 }
 
 function ContextTab({ node }: { node: CanvasNode }) {

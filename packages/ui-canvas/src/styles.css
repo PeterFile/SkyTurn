@@ -1,3 +1,5 @@
+@import "diff2html/bundles/css/diff2html.min.css";
+
 :root {
   color: var(--sk-text-legacy);
   background: var(--sk-bg-warm);
@@ -808,148 +810,169 @@ h2 {
   color: var(--sk-diff-removed-text);
 }
 
-.review-file-stack {
-  display: grid;
-  gap: 12px;
-}
-
-.review-file {
-  overflow: hidden;
+.changes-toolbar {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
   border: 1px solid var(--sk-border);
   border-radius: var(--sk-radius-md);
-  background: var(--sk-surface);
+  background: var(--sk-white);
+  padding: 8px;
   box-shadow: var(--sk-shadow-sm);
 }
 
-.review-file-header {
-  display: flex;
+.changes-tool-button {
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  border-bottom: 1px solid var(--sk-border);
-  background: var(--sk-surface-muted);
-  padding: 9px 11px;
-}
-
-.review-file-header > div:first-child {
-  min-width: 0;
-}
-
-.review-file-path {
-  display: block;
-  overflow: hidden;
-  color: var(--sk-text-strong);
-  font-family: var(--sk-font-mono);
+  justify-content: center;
+  min-height: 30px;
+  gap: 7px;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-white);
+  color: var(--sk-text-legacy);
+  padding: 0 10px;
   font-size: 12px;
   font-weight: 800;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-.review-file-meta {
-  display: block;
-  margin-top: 2px;
+.changes-tool-button.icon-only {
+  width: 32px;
+  padding: 0;
+}
+
+.changes-tool-button[aria-pressed="true"] {
+  border-color: var(--sk-accent);
+  background: var(--sk-surface-blue-tint);
+  color: var(--sk-accent-strong);
+}
+
+.changes-tool-button.muted {
   color: var(--sk-muted);
-  font-size: 11px;
 }
 
-.review-file-counts {
-  display: flex;
-  flex: 0 0 auto;
-  gap: 8px;
-  font-family: var(--sk-font-mono);
-  font-size: 12px;
-  font-weight: 900;
+.changes-menu {
+  position: relative;
 }
 
-.review-file-counts .added {
-  color: var(--sk-diff-added-text);
-}
-
-.review-file-counts .removed {
-  color: var(--sk-diff-removed-text);
-}
-
-.review-diff {
-  overflow: auto;
-  background: var(--sk-diff-surface);
-  font-family: var(--sk-font-mono);
-  font-size: 12px;
-  line-height: 1.52;
-}
-
-.diff-hunk {
-  min-width: 620px;
-}
-
-.diff-row {
+.changes-menu-list {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 35;
   display: grid;
-  grid-template-columns: 42px 42px 24px minmax(0, 1fr);
-  min-height: 25px;
-  border-bottom: 1px solid var(--sk-diff-row-border);
+  min-width: 222px;
+  gap: 2px;
+  border: 1px solid var(--sk-border-modal);
+  border-radius: var(--sk-radius-md);
+  background: var(--sk-white);
+  box-shadow: 0 18px 48px var(--sk-shadow-warm-md);
+  padding: 8px;
 }
 
-.diff-row code {
-  overflow: visible;
-  color: var(--sk-code-review-text);
+.changes-menu-item {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-height: 28px;
+  border: 0;
+  border-radius: var(--sk-radius-sm);
+  background: transparent;
+  color: var(--sk-text-legacy);
+  padding: 0 8px;
+  text-align: left;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.changes-menu-item:hover:not(:disabled),
+.changes-menu-item:focus-visible {
+  background: var(--sk-surface-warm-muted);
+}
+
+.changes-menu-item:disabled {
+  color: var(--sk-muted);
+}
+
+.changes-menu-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--sk-muted-strong);
+}
+
+.changes-menu-item[aria-checked="true"] .changes-menu-icon {
+  color: var(--sk-accent-strong);
+}
+
+.changes-menu-separator {
+  height: 1px;
+  margin: 6px 4px;
+  background: var(--sk-border);
+}
+
+.diff2html-shell {
+  overflow: auto;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-md);
+  background: var(--sk-white);
+  box-shadow: var(--sk-shadow-sm);
+}
+
+.diff2html-shell .d2h-file-wrapper {
+  margin: 0;
+  border-color: var(--sk-border);
+  border-radius: 0;
+}
+
+.diff2html-shell .d2h-file-wrapper + .d2h-file-wrapper {
+  border-top: 0;
+}
+
+.diff2html-shell .d2h-file-header {
+  background: var(--sk-surface-muted);
   font-family: var(--sk-font-mono);
+}
+
+.diff2html-shell .d2h-file-name {
+  color: var(--sk-text-strong);
+  font-weight: 800;
+}
+
+.diff2html-shell .d2h-code-wrapper,
+.diff2html-shell .d2h-files-diff {
+  background: var(--sk-white);
+}
+
+.diff2html-shell .d2h-code-line-ctn {
+  font-family: var(--sk-font-mono);
+  font-size: 12px;
+}
+
+.diff2html-shell.is-word-wrapped .d2h-code-line-ctn {
+  overflow-wrap: normal;
+  white-space: pre-wrap;
+}
+
+.diff2html-shell.is-word-wrapped .d2h-code-line {
+  display: block;
+}
+
+.diff2html-shell.is-side-by-side .d2h-files-diff {
+  min-width: 760px;
+}
+
+.diff2html-shell.is-side-by-side .d2h-code-line-ctn {
+  overflow-wrap: normal;
   white-space: pre;
 }
 
-.diff-gutter,
-.diff-marker,
-.diff-row code {
-  padding: 3px 8px;
-}
-
-.diff-gutter {
-  border-right: 1px solid var(--sk-diff-row-border);
-  background: var(--sk-diff-gutter);
-  color: var(--sk-muted);
-  text-align: right;
-  user-select: none;
-}
-
-.diff-marker {
-  color: var(--sk-muted);
-  text-align: center;
-  user-select: none;
-}
-
-.diff-row.added {
-  background: var(--sk-diff-added-bg);
-}
-
-.diff-row.added .diff-gutter {
-  background: var(--sk-diff-added-gutter);
-}
-
-.diff-row.added .diff-marker,
-.diff-row.added code {
-  color: var(--sk-diff-added-text);
-}
-
-.diff-row.removed {
-  background: var(--sk-diff-removed-bg);
-}
-
-.diff-row.removed .diff-gutter {
-  background: var(--sk-diff-removed-gutter);
-}
-
-.diff-row.removed .diff-marker,
-.diff-row.removed code {
-  color: var(--sk-diff-removed-text);
-}
-
-.diff-row-separator {
-  background: var(--sk-diff-separator-bg);
-}
-
-.diff-row-separator code,
-.diff-row-separator .diff-marker {
-  color: var(--sk-accent-strong);
-  font-weight: 800;
+.diff2html-shell.is-collapsed .d2h-file-diff,
+.diff2html-shell.is-collapsed .d2h-files-diff {
+  display: none;
 }
 
 .changes-empty {

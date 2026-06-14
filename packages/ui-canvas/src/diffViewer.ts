@@ -1,192 +1,141 @@
-export type DiffRowKind = "context" | "added" | "removed";
+import type { Diff2HtmlConfig } from "diff2html";
 
-export interface ReviewDiffRow {
-  kind: DiffRowKind;
-  oldNumber: number | null;
-  newNumber: number | null;
-  content: string;
+export type ChangesDiffOutputFormat = "line-by-line" | "side-by-side";
+
+export interface ChangesDiffViewOptions {
+  hideWhitespace: boolean;
+  loadFullFiles: boolean;
+  outputFormat: ChangesDiffOutputFormat;
+  richPreview: boolean;
+  wordDiffs: boolean;
+  wordWrap: boolean;
 }
 
-export interface ReviewDiffHunk {
-  header: string;
-  rows: ReviewDiffRow[];
-}
+export type DiffHtmlSanitizer = (unsafeHtml: string) => Promise<string> | string;
 
-export interface ReviewDiffFile {
-  id: string;
-  oldPath: string;
-  newPath: string;
-  displayPath: string;
-  added: number;
-  deleted: number;
-  hunks: ReviewDiffHunk[];
-}
+export const DEFAULT_CHANGES_DIFF_OPTIONS: ChangesDiffViewOptions = {
+  hideWhitespace: false,
+  loadFullFiles: false,
+  outputFormat: "line-by-line",
+  richPreview: true,
+  wordDiffs: true,
+  wordWrap: false,
+};
 
-export interface ReviewDiff {
-  files: ReviewDiffFile[];
-  totals: {
-    added: number;
-    deleted: number;
+const BOUNDED_DIFF_MAX_CHANGES = 1200;
+const BOUNDED_DIFF_MAX_LINE_LENGTH = 2400;
+
+export function buildDiff2HtmlConfig(options: ChangesDiffViewOptions): Diff2HtmlConfig {
+  return {
+    diffMaxChanges: options.loadFullFiles ? undefined : BOUNDED_DIFF_MAX_CHANGES,
+    diffMaxLineLength: options.loadFullFiles ? undefined : BOUNDED_DIFF_MAX_LINE_LENGTH,
+    diffStyle: "word",
+    drawFileList: options.richPreview,
+    matching: options.wordDiffs ? "words" : "lines",
+    matchingMaxComparisons: options.wordDiffs ? 1200 : 2500,
+    maxLineLengthHighlight: 2000,
+    maxLineSizeInBlockForComparison: 200,
+    outputFormat: options.outputFormat,
+    renderNothingWhenEmpty: false,
   };
 }
 
-interface MutableDiffFile extends ReviewDiffFile {
-  hunks: MutableDiffHunk[];
+export async function renderChangesetDiffHtml(
+  patchPreview: string,
+  files: string[],
+  options: ChangesDiffViewOptions,
+  sanitizeHtml: DiffHtmlSanitizer = sanitizeDiffHtml,
+): Promise<string> {
+  const normalizedPatch = normalizePatchPreviewForDiff2Html(patchPreview, files);
+  const diffInput = options.hideWhitespace ? filterWhitespaceOnlyChanges(normalizedPatch) : normalizedPatch;
+  if (!diffInput.trim()) return "";
+
+  const { html } = await import("diff2html");
+  const unsafeHtml = html(diffInput, buildDiff2HtmlConfig(options));
+  return sanitizeHtml(unsafeHtml);
 }
 
-interface MutableDiffHunk extends ReviewDiffHunk {
-  oldLine: number;
-  newLine: number;
+export function normalizePatchPreviewForDiff2Html(patchPreview: string, fallbackFiles: string[] = []): string {
+  const trimmedPatch = patchPreview.trim();
+  if (!trimmedPatch) return "";
+  if (looksLikeUnifiedDiff(trimmedPatch)) return patchPreview;
+
+  const displayPath = fallbackFiles[0] ?? "changes.patch";
+  const diffLines = trimmedPatch.split(/\r?\n/).map(normalizeLoosePatchLine);
+  const oldLineCount = countSyntheticHunkLines(diffLines, "old");
+  const newLineCount = countSyntheticHunkLines(diffLines, "new");
+
+  return [
+    `diff --git a/${displayPath} b/${displayPath}`,
+    `--- a/${displayPath}`,
+    `+++ b/${displayPath}`,
+    `@@ -${formatSyntheticRange(oldLineCount)} +${formatSyntheticRange(newLineCount)} @@`,
+    ...diffLines,
+  ].join("\n");
 }
 
-export function parseUnifiedDiff(patchPreview: string, fallbackFiles: string[] = []): ReviewDiff {
-  const files: MutableDiffFile[] = [];
-  let currentFile: MutableDiffFile | null = null;
-  let currentHunk: MutableDiffHunk | null = null;
+export function filterWhitespaceOnlyChanges(patchPreview: string): string {
+  const lines = patchPreview.split(/\r?\n/);
+  const keptLines: string[] = [];
 
-  for (const line of patchPreview.split(/\r?\n/)) {
-    if (line.startsWith("diff --git ")) {
-      currentFile = createFileFromDiffHeader(line, files.length);
-      files.push(currentFile);
-      currentHunk = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const nextLine = lines[index + 1] ?? "";
+    if (isWhitespaceOnlyChangePair(line, nextLine)) {
+      index += 1;
       continue;
     }
-
-    if (line.startsWith("--- ") && currentFile) {
-      currentFile.oldPath = normalizeDiffPath(line.slice(4));
-      currentFile.displayPath = displayPathForFile(currentFile);
-      continue;
-    }
-
-    if (line.startsWith("+++ ") && currentFile) {
-      currentFile.newPath = normalizeDiffPath(line.slice(4));
-      currentFile.displayPath = displayPathForFile(currentFile);
-      continue;
-    }
-
-    if (line.startsWith("@@")) {
-      if (!currentFile) {
-        currentFile = createSyntheticFile(fallbackFiles[0] ?? "changes.patch", files.length);
-        files.push(currentFile);
-      }
-      currentHunk = createHunk(line);
-      currentFile.hunks.push(currentHunk);
-      continue;
-    }
-
-    if (!currentFile || !currentHunk || line.startsWith("\\ No newline")) continue;
-    appendDiffRow(currentFile, currentHunk, line);
+    keptLines.push(line);
   }
 
-  const parsedFiles: ReviewDiffFile[] = files.filter((file) => file.hunks.some((hunk) => hunk.rows.length > 0));
-  if (parsedFiles.length === 0 && patchPreview.trim()) {
-    parsedFiles.push(createLoosePatchFile(patchPreview, fallbackFiles[0] ?? "changes.patch"));
-  }
-
-  return {
-    files: parsedFiles,
-    totals: parsedFiles.reduce(
-      (totals, file) => ({
-        added: totals.added + file.added,
-        deleted: totals.deleted + file.deleted,
-      }),
-      { added: 0, deleted: 0 },
-    ),
-  };
+  return keptLines.join("\n");
 }
 
-function createFileFromDiffHeader(line: string, index: number): MutableDiffFile {
-  const match = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
-  const oldPath = match?.[1] ?? `file-${index + 1}`;
-  const newPath = match?.[2] ?? oldPath;
-  return {
-    id: `${index}-${newPath}`,
-    oldPath,
-    newPath,
-    displayPath: newPath,
-    added: 0,
-    deleted: 0,
-    hunks: [],
-  };
-}
-
-function createSyntheticFile(path: string, index: number): MutableDiffFile {
-  return {
-    id: `${index}-${path}`,
-    oldPath: path,
-    newPath: path,
-    displayPath: path,
-    added: 0,
-    deleted: 0,
-    hunks: [],
-  };
-}
-
-function createHunk(header: string): MutableDiffHunk {
-  const match = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(header);
-  return {
-    header,
-    oldLine: Number(match?.[1] ?? 1),
-    newLine: Number(match?.[2] ?? 1),
-    rows: [],
-  };
-}
-
-function appendDiffRow(file: MutableDiffFile, hunk: MutableDiffHunk, line: string): void {
-  if (line.startsWith("+") && !line.startsWith("+++")) {
-    hunk.rows.push({
-      kind: "added",
-      oldNumber: null,
-      newNumber: hunk.newLine,
-      content: line.slice(1),
-    });
-    hunk.newLine += 1;
-    file.added += 1;
-    return;
-  }
-
-  if (line.startsWith("-") && !line.startsWith("---")) {
-    hunk.rows.push({
-      kind: "removed",
-      oldNumber: hunk.oldLine,
-      newNumber: null,
-      content: line.slice(1),
-    });
-    hunk.oldLine += 1;
-    file.deleted += 1;
-    return;
-  }
-
-  const content = line.startsWith(" ") ? line.slice(1) : line;
-  hunk.rows.push({
-    kind: "context",
-    oldNumber: hunk.oldLine,
-    newNumber: hunk.newLine,
-    content,
+async function sanitizeDiffHtml(unsafeHtml: string): Promise<string> {
+  const { default: DOMPurify } = await import("dompurify");
+  return DOMPurify.sanitize(unsafeHtml, {
+    FORBID_ATTR: ["style"],
+    FORBID_TAGS: ["style"],
+    USE_PROFILES: { html: true },
   });
-  hunk.oldLine += 1;
-  hunk.newLine += 1;
 }
 
-function createLoosePatchFile(patchPreview: string, path: string): ReviewDiffFile {
-  const file = createSyntheticFile(path, 0);
-  const hunk: MutableDiffHunk = { header: "Changes", oldLine: 1, newLine: 1, rows: [] };
-  file.hunks.push(hunk);
-
-  for (const line of patchPreview.split(/\r?\n/).filter(Boolean)) {
-    appendDiffRow(file, hunk, line);
-  }
-
-  return file;
+function looksLikeUnifiedDiff(patchPreview: string): boolean {
+  return /(^|\n)(diff --git |--- |\+\+\+ |@@ )/.test(patchPreview) && /(^|\n)@@ /.test(patchPreview);
 }
 
-function normalizeDiffPath(path: string): string {
-  const trimmed = path.trim();
-  if (trimmed === "/dev/null") return trimmed;
-  return trimmed.replace(/^[ab]\//, "");
+function normalizeLoosePatchLine(line: string): string {
+  if (line.startsWith("+") || line.startsWith("-") || line.startsWith(" ") || line.startsWith("\\")) return line;
+  return ` ${line}`;
 }
 
-function displayPathForFile(file: Pick<ReviewDiffFile, "oldPath" | "newPath">): string {
-  if (file.newPath && file.newPath !== "/dev/null") return file.newPath;
-  return file.oldPath;
+function countSyntheticHunkLines(lines: string[], side: "old" | "new"): number {
+  const count = lines.reduce((total, line) => {
+    if (isAddedLine(line)) return side === "new" ? total + 1 : total;
+    if (isRemovedLine(line)) return side === "old" ? total + 1 : total;
+    return total + 1;
+  }, 0);
+
+  return Math.max(count, 1);
+}
+
+function formatSyntheticRange(lineCount: number): string {
+  return lineCount === 1 ? "1,1" : `1,${lineCount}`;
+}
+
+function isWhitespaceOnlyChangePair(line: string, nextLine: string): boolean {
+  if (!isRemovedLine(line) || !isAddedLine(nextLine)) return false;
+  return normalizeWhitespaceChange(line.slice(1)) === normalizeWhitespaceChange(nextLine.slice(1));
+}
+
+function normalizeWhitespaceChange(value: string): string {
+  return value.replace(/\s+/g, "");
+}
+
+function isAddedLine(line: string): boolean {
+  return line.startsWith("+") && !line.startsWith("+++");
+}
+
+function isRemovedLine(line: string): boolean {
+  return line.startsWith("-") && !line.startsWith("---");
 }

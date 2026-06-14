@@ -74,19 +74,41 @@ describe("SkyTurn UI style tokens", () => {
     expect(appSource).not.toContain("session-panel-backdrop");
   });
 
-  it("renders Changes as a structured code review diff instead of raw patch text", async () => {
+  it("renders Changes through diff2html instead of a self-authored diff table", async () => {
     const appSource = await readSource("./App.tsx");
+    const diffSource = await readSource("./diffViewer.ts");
     const styles = await readSource("./styles.css");
 
-    expect(appSource).toContain("parseUnifiedDiff");
+    expect(diffSource).toContain('import type { Diff2HtmlConfig } from "diff2html"');
+    expect(diffSource).toContain('await import("diff2html")');
+    expect(diffSource).toContain('await import("dompurify")');
+    expect(appSource).toContain("renderChangesetDiffHtml");
     expect(appSource).toContain('className="changes-review"');
-    expect(appSource).toContain('className="review-file-header"');
-    expect(appSource).toContain('className={`diff-row ${row.kind}`}');
+    expect(appSource).toContain("Enable word wrap");
+    expect(appSource).toContain("Collapse all diffs");
+    expect(appSource).toContain("Enable word diffs");
+    expect(appSource).toContain("Hide white space");
+    expect(appSource).toContain("dangerouslySetInnerHTML={{ __html: diffHtml }}");
+    expect(appSource).not.toContain("parseUnifiedDiff");
+    expect(appSource).not.toContain("ReviewDiffFileCard");
+    expect(appSource).not.toContain('className={`diff-row ${row.kind}`}');
     expect(appSource).not.toContain("<pre>{changeset.patchPreview}</pre>");
+    expect(styles).toContain('@import "diff2html/bundles/css/diff2html.min.css";');
     expect(styles).toContain(".changes-review");
-    expect(styles).toContain(".diff-row.added");
-    expect(styles).toContain(".diff-row.removed");
-    expect(styles).toContain(".diff-row-separator");
+    expect(styles).toContain(".diff2html-shell");
+    expect(styles).toContain(".d2h-file-wrapper");
+    expect(styles).not.toContain(".diff-row.added");
+    expect(styles).not.toContain(".diff-row.removed");
+    expect(styles).not.toContain(".diff-row-separator");
+  });
+
+  it("keeps split diff readable inside the node detail drawer", async () => {
+    const styles = await readSource("./styles.css");
+    const diff2htmlStyles = styles.slice(styles.indexOf(".diff2html-shell"), styles.indexOf(".changes-empty"));
+
+    expect(styles).toContain(".diff2html-shell.is-side-by-side .d2h-files-diff");
+    expect(styles).toContain("min-width: 760px");
+    expect(diff2htmlStyles).not.toContain("overflow-wrap: anywhere");
   });
 
   it("keeps sidebar controls visible and aligns node cards inside their energy frame", async () => {

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { parseUnifiedDiff } from "./diffViewer.js";
+import {
+  buildDiff2HtmlConfig,
+  filterWhitespaceOnlyChanges,
+  normalizePatchPreviewForDiff2Html,
+  renderChangesetDiffHtml,
+} from "./diffViewer.js";
 
 const patchPreview = [
   "diff --git a/src/workflow.ts b/src/workflow.ts",
@@ -29,66 +34,82 @@ const patchPreview = [
 ].join("\n");
 
 describe("diff viewer parsing", () => {
-  it("turns unified diffs into review files with hunk separators and line-numbered rows", () => {
-    const diff = parseUnifiedDiff(patchPreview, ["src/workflow.ts"]);
-
-    expect(diff.files).toHaveLength(2);
-    expect(diff.totals).toEqual({ added: 5, deleted: 2 });
-
-    const firstFile = diff.files[0];
-    expect(firstFile.displayPath).toBe("src/workflow.ts");
-    expect(firstFile.added).toBe(3);
-    expect(firstFile.deleted).toBe(1);
-    expect(firstFile.hunks).toHaveLength(2);
-    expect(firstFile.hunks[0].header).toBe("@@ -1,5 +1,6 @@");
-
-    expect(firstFile.hunks[0].rows.slice(0, 4)).toEqual([
-      {
-        kind: "context",
-        oldNumber: 1,
-        newNumber: 1,
-        content: "export function summarizeTurn() {",
-      },
-      {
-        kind: "removed",
-        oldNumber: 2,
-        newNumber: null,
-        content: '  return "old";',
-      },
-      {
-        kind: "added",
-        oldNumber: null,
-        newNumber: 2,
-        content: '  const label = "review";',
-      },
-      {
-        kind: "added",
-        oldNumber: null,
-        newNumber: 3,
-        content: "  return label;",
-      },
-    ]);
+  it("builds a bounded diff2html configuration from Changes view toggles", () => {
+    expect(
+      buildDiff2HtmlConfig({
+        hideWhitespace: false,
+        loadFullFiles: false,
+        outputFormat: "side-by-side",
+        richPreview: true,
+        wordDiffs: true,
+        wordWrap: true,
+      }),
+    ).toMatchObject({
+      diffMaxChanges: 1200,
+      diffMaxLineLength: 2400,
+      diffStyle: "word",
+      drawFileList: true,
+      matching: "words",
+      outputFormat: "side-by-side",
+      renderNothingWhenEmpty: false,
+    });
   });
 
-  it("falls back to a structured synthetic file instead of raw text for loose patch lines", () => {
-    const diff = parseUnifiedDiff("+ Created report\n- Removed placeholder", ["notes/result.md"]);
+  it("wraps loose patch lines as unified diff input for diff2html", () => {
+    expect(normalizePatchPreviewForDiff2Html("+ Created report\n- Removed placeholder", ["notes/result.md"])).toBe(
+      [
+        "diff --git a/notes/result.md b/notes/result.md",
+        "--- a/notes/result.md",
+        "+++ b/notes/result.md",
+        "@@ -1,1 +1,1 @@",
+        "+ Created report",
+        "- Removed placeholder",
+      ].join("\n"),
+    );
+  });
 
-    expect(diff.files).toHaveLength(1);
-    expect(diff.files[0].displayPath).toBe("notes/result.md");
-    expect(diff.files[0].hunks[0].header).toBe("Changes");
-    expect(diff.files[0].hunks[0].rows).toEqual([
+  it("can suppress whitespace-only changed pairs before handing the patch to diff2html", () => {
+    const patch = [
+      "diff --git a/src/example.ts b/src/example.ts",
+      "--- a/src/example.ts",
+      "+++ b/src/example.ts",
+      "@@ -1,3 +1,3 @@",
+      "-const value = 1;",
+      "+const   value = 1;",
+      "-const label = 'old';",
+      "+const label = 'new';",
+    ].join("\n");
+
+    const filtered = filterWhitespaceOnlyChanges(patch);
+
+    expect(filtered).not.toContain("const   value");
+    expect(filtered).toContain("const label = 'old'");
+    expect(filtered).toContain("const label = 'new'");
+  });
+
+  it("renders sanitized diff2html markup through an injectable sanitizer", async () => {
+    let sanitizerWasCalled = false;
+    const html = await renderChangesetDiffHtml(
+      `${patchPreview}\n+<img src=x onerror=alert(1)>`,
+      ["src/workflow.ts"],
       {
-        kind: "added",
-        oldNumber: null,
-        newNumber: 1,
-        content: " Created report",
+        hideWhitespace: false,
+        loadFullFiles: false,
+        outputFormat: "line-by-line",
+        richPreview: true,
+        wordDiffs: false,
+        wordWrap: false,
       },
-      {
-        kind: "removed",
-        oldNumber: 1,
-        newNumber: null,
-        content: " Removed placeholder",
+      async (unsafeHtml) => {
+        sanitizerWasCalled = true;
+        return unsafeHtml.replace(/<script[\s\S]*?<\/script>/g, "");
       },
-    ]);
+    );
+
+    expect(sanitizerWasCalled).toBe(true);
+    expect(html).toContain("d2h-file-list");
+    expect(html).toContain("d2h-file-wrapper");
+    expect(html).not.toContain("<img src=x");
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
   });
 });
