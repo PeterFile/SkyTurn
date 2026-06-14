@@ -17,9 +17,15 @@ importers:
       '@skyturn/agent-bridge':
         specifier: workspace:*
         version: link:../../packages/agent-bridge
+      '@skyturn/orchestrator':
+        specifier: workspace:*
+        version: link:../../packages/orchestrator
       '@skyturn/persistence':
         specifier: workspace:*
         version: link:../../packages/persistence
+      '@skyturn/planner':
+        specifier: workspace:*
+        version: link:../../packages/planner
       '@skyturn/project-memory':
         specifier: workspace:*
         version: link:../../packages/project-memory
@@ -174,6 +180,9 @@ importers:
       '@skyturn/git-worktree':
         specifier: workspace:*
         version: link:../git-worktree
+      '@skyturn/orchestrator':
+        specifier: workspace:*
+        version: link:../orchestrator
       '@skyturn/persistence':
         specifier: workspace:*
         version: link:../persistence

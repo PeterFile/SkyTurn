@@ -11,6 +11,16 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./workflow-runtime": {
+      "types": "./src/workflowRuntime.ts",
+      "import": "./dist/workflowRuntime.js",
+      "default": "./dist/workflowRuntime.js"
+    },
+    "./composer": {
+      "types": "./src/composer.ts",
+      "import": "./dist/composer.js",
+      "default": "./dist/composer.js"
+    },
     "./styles.css": "./src/styles.css"
   },
   "scripts": {
@@ -23,6 +33,7 @@
     "@gsap/react": "^2.1.2",
     "@skyturn/agent-runtime": "workspace:*",
     "@skyturn/git-worktree": "workspace:*",
+    "@skyturn/orchestrator": "workspace:*",
     "@skyturn/persistence": "workspace:*",
     "@skyturn/planner": "workspace:*",
     "@skyturn/project-core": "workspace:*",

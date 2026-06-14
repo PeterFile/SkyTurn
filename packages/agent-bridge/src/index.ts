@@ -55,6 +55,13 @@ export interface CodexCliAdapterOptions {
   pathValue?: string;
 }
 
+export interface HermesCliAdapterOptions {
+  executablePath?: string;
+  env?: NodeJS.ProcessEnv;
+  extraArgs?: string[];
+  pathValue?: string;
+}
+
 export function createDiscoveryService(options: DiscoveryOptions = {}): DiscoveryService {
   return {
     async discover() {
@@ -90,8 +97,11 @@ export class AgentBridge {
     this.discovery = createDiscoveryService({ pathValue: options.pathValue });
   }
 
-  discoverAgents(): Promise<AgentDescriptor[]> {
-    return this.discovery.discover();
+  async discoverAgents(): Promise<AgentDescriptor[]> {
+    const discovered = await this.discovery.discover();
+    const runnable = await Promise.all([...this.adapters.values()].map((adapter) => adapter.detect()));
+    const runnableByKind = new Map(runnable.map((agent) => [agent.kind, agent]));
+    return discovered.map((agent) => runnableByKind.get(agent.kind) ?? agent);
   }
 
   listRuns(): AgentRun[] {
@@ -390,6 +400,141 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
   };
 }
 
+export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): LocalAgentAdapterContract {
+  return {
+    kind: "hermes",
+    label: "Hermes CLI",
+    nativeConfigFiles: ["AGENTS.md"],
+    supportLevel: "experimental-run",
+    capabilities: ["chat", "file-read", "file-write", "shell", "worktree"],
+    async detect() {
+      const executablePath =
+        options.executablePath ?? (await findExecutable(commandCandidates.hermes, options.pathValue ?? process.env.PATH ?? ""));
+      return {
+        kind: "hermes",
+        label: "Hermes CLI",
+        executablePath,
+        version: null,
+        status: executablePath ? "available" : "missing",
+        supportLevel: executablePath ? "experimental-run" : "detected-only",
+        capabilities: ["chat", "file-read", "file-write", "shell", "worktree"],
+        configFiles: ["AGENTS.md"],
+      };
+    },
+    async startRun(input, sink) {
+      const workdir = input.projectRoot;
+      const executablePath = options.executablePath ?? "hermes";
+      const args = makeHermesOneshotArgs({
+        prompt: input.prompt,
+        extraArgs: options.extraArgs,
+      });
+      const child = spawn(executablePath, args, {
+        cwd: workdir,
+        env: { ...process.env, ...options.env },
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let cancelled = false;
+      let cancelReason = "";
+      let spawnFailed = false;
+      const { emit, drain } = createQueuedRunEventEmitter(sink);
+
+      await emit({
+        kind: "progress",
+        payload: { source: "hermes", phase: "started", command: "hermes -z" },
+      });
+
+      if (child.stdout) {
+        const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity });
+        stdout.on("line", (line) => {
+          if (!line.trim()) return;
+          void emit({
+            kind: "output",
+            payload: { source: "hermes", text: line },
+          });
+        });
+      }
+
+      if (child.stderr) {
+        const stderr = createInterface({ input: child.stderr, crlfDelay: Infinity });
+        stderr.on("line", (line) => {
+          if (!line.trim()) return;
+          void emit({
+            kind: "progress",
+            payload: { source: "hermes", stream: "stderr", format: "text", text: line },
+          });
+        });
+      }
+
+      child.once("error", (error) => {
+        spawnFailed = true;
+        void emit({
+          kind: "error",
+          payload: { source: "hermes", message: error.message, code: error.name },
+        });
+        void emit({ kind: "status", payload: { status: "failed", reason: error.message } });
+      });
+
+      child.once("close", (code, signal) => {
+        void (async () => {
+          await drain();
+          if (spawnFailed) return;
+          const exitCode = typeof code === "number" ? code : null;
+          if (cancelled) {
+            await emit({
+              kind: "evidence",
+              payload: {
+                exitCode,
+                checks: [
+                  {
+                    kind: "run-exit",
+                    name: "Hermes CLI exit",
+                    status: "skipped",
+                    detail: cancelReason || formatExitDetail(code, signal),
+                  },
+                ],
+              },
+            });
+            await emit({ kind: "status", payload: { status: "cancelled", reason: cancelReason } });
+            return;
+          }
+          const checkStatus = exitCode === 0 ? "passed" : "failed";
+          await emit({
+            kind: "evidence",
+            payload: {
+              exitCode,
+              checks: [
+                {
+                  kind: "run-exit",
+                  name: "Hermes CLI exit",
+                  status: checkStatus,
+                  detail: formatExitDetail(code, signal),
+                },
+              ],
+            },
+          });
+          await emit({
+            kind: "status",
+            payload: {
+              status: exitCode === 0 ? "succeeded" : "failed",
+              exitCode,
+              signal,
+            },
+          });
+        })();
+      });
+
+      return {
+        async cancel(reason) {
+          cancelled = true;
+          cancelReason = reason;
+          if (!child.killed) child.kill("SIGTERM");
+        },
+      };
+    },
+  };
+}
+
 export async function readTaskOutput(projectRoot: string, nodeId: string): Promise<string> {
   try {
     return await readFile(taskOutputPath(projectRoot, nodeId), "utf8");
@@ -545,6 +690,10 @@ function makeCodexExecArgs(input: {
     input.workdir,
     input.prompt,
   ];
+}
+
+function makeHermesOneshotArgs(input: { prompt: string; extraArgs?: string[] }): string[] {
+  return ["-z", input.prompt, ...(input.extraArgs ?? [])];
 }
 
 function codexStdoutLineToDrafts(line: string): RunEventDraft[] {

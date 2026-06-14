@@ -150,6 +150,15 @@ export interface CanvasNodeDisplay {
   meta: string[];
 }
 
+export type WorkflowCardToolName = "createWorkflowCard" | "updateWorkflowCard" | "deleteWorkflowCard";
+
+export interface CanvasNodeWorkflowTrace {
+  source: "hermes";
+  sourceRunId: string;
+  toolCallId?: string;
+  lastTool: WorkflowCardToolName;
+}
+
 export interface CanvasNode {
   id: string;
   title: string;
@@ -157,6 +166,7 @@ export interface CanvasNode {
   progress: string;
   runtime?: NodeRuntimeState;
   display?: CanvasNodeDisplay;
+  workflowTrace?: CanvasNodeWorkflowTrace;
   status: NodeStatus;
   position: {
     x: number;

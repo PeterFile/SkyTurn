@@ -52,6 +52,8 @@
 - Completion must be tied to run status, git changes, tests, or concrete verification evidence.
 - Node status must be derived from `RunEvidence`; Agent text claiming success is only output.
 - Do not mark tasks complete without concrete verification.
+- Use `pnpm --filter @skyturn/desktop run demo:mvp` to verify the real Hermes-to-Codex MVP loop; it requires local Hermes/Codex credentials and must not be replaced by mock-only evidence.
+- The bottom workflow input must create a running Hermes planning card that calls workflow-card tools; do not regress it into a local pending/mock node.
 
 ## Engineering Rules
 

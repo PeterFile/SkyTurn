@@ -65,7 +65,6 @@ import {
 import { convertPlanToCanvas, createFastCanvasSession, createPlanSession } from "@skyturn/planner";
 import {
   NODE_MODAL_TABS,
-  RUN_EVENT_PROTOCOL_VERSION,
   deriveNodeStatusFromEvidence,
   type AgentKind,
   type CanvasNode,
@@ -77,9 +76,6 @@ import {
   type NodeRuntimeState,
   type NodeStatus,
   type PlanSession,
-  type AgentRun,
-  type RunEvent,
-  type RunEvidence,
   type WorkflowMode,
 } from "@skyturn/project-core";
 
@@ -115,6 +111,13 @@ import {
   type ReviewDiffRow,
 } from "./diffViewer.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
+import {
+  applyBridgeRunResult,
+  applyRunEventToWorkspace,
+  mergeRunEventsIntoWorkspace,
+  startBridgeRun,
+} from "./workflowRuntime.js";
+import { addRequirementPlanningNode } from "./composer.js";
 
 gsap.registerPlugin(useGSAP);
 
@@ -400,43 +403,14 @@ export default function App() {
 
   function appendRequirementNode() {
     if (!activeSession || activeSession.kind !== "canvas" || !bottomGoal.trim()) return;
-    const id = `node-${activeSession.nodes.length + 1}`;
-    const lastNode = activeSession.nodes.at(-1);
-    const node: CanvasNode = {
-      id,
-      title: bottomGoal.trim().slice(0, 56),
-      agent: "hermes",
-      progress: "Inserted requirement",
-      status: "pending",
-      position: { x: 180 + activeSession.nodes.length * 150, y: 360 },
-      runId: `run-${activeSession.id}-${id}`,
-      changesetId: `changeset-${activeSession.id}-${id}`,
-      output: ["Requirement inserted into the task graph."],
-      worktree: {
-        path: `../${activeProject?.name ?? "project"}.worktrees/session-${activeSession.id}-task-${id}`,
-        branchName: `skyturn/${activeSession.id}/${id}`,
-        baseCommit: "mock-base-commit",
-      },
-      context: {
-        brief: bottomGoal.trim(),
-        sessionGoal: activeSession.goal,
-        relatedRequirements: "Inserted from the bottom input bar.",
-        relatedDesign: "Hermes will reconcile this with the existing graph.",
-        relatedTasks: "New task-local node.",
-        dependencies: lastNode ? [lastNode.id] : [],
-        constraints: ["No global console.", "Preserve task-local output.", "Verify before completion."],
-      },
-    };
-    const edge = lastNode ? { id: `edge-${lastNode.id}-${id}`, source: lastNode.id, target: id } : null;
-    updateCanvasSession(activeSession.id, (session) => ({
-      ...session,
-      nodes: [...session.nodes, node],
-      edges: edge ? [...session.edges, edge] : session.edges,
-      activeNodeId: node.id,
-    }));
+    const result = addRequirementPlanningNode(activeSession, bottomGoal, {
+      now: new Date().toISOString(),
+      projectName: activeProject?.name ?? "project",
+    });
+    updateCanvasSession(activeSession.id, () => result.session);
     setWorkspace((current) => ({
       ...current,
-      changesets: { ...current.changesets, [node.changesetId]: createMockChangeset(node) },
+      changesets: { ...current.changesets, [result.node.changesetId]: createMockChangeset(result.node) },
     }));
     setBottomGoal("");
   }
@@ -2352,108 +2326,6 @@ function nextMockOutputLine(node: CanvasNode, lineIndex: number): string {
     `${node.agent} text may say completed, but RunEvidence decides status.`,
   ];
   return lines[lineIndex] ?? `${node.agent} is waiting for the next checkpoint.`;
-}
-
-interface BridgeRunResult {
-  run: AgentRun;
-  events: RunEvent[];
-  evidence: RunEvidence;
-}
-
-async function startBridgeRun(
-  project: ImportedProject,
-  session: CanvasSession,
-  node: CanvasNode,
-): Promise<BridgeRunResult | null> {
-  const result = await window.devflow?.startAgentRun({
-    protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
-    runId: node.runId,
-    nodeId: node.id,
-    sessionId: session.id,
-    projectRoot: project.rootPath,
-    worktreePath: node.worktree.path,
-    agentKind: node.agent,
-    prompt: node.context.brief,
-  });
-  if (!result || !window.devflow) return null;
-  const [eventsResult, evidenceResult] = await Promise.all([
-    window.devflow.getRunEvents(project.rootPath, node.runId),
-    window.devflow.getRunEvidence(project.rootPath, node.runId),
-  ]);
-  return { run: result.run, events: eventsResult.events, evidence: evidenceResult.evidence };
-}
-
-function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRunResult): WorkspaceState {
-  const withEvents = mergeRunEventsIntoWorkspace(workspace, result.run.id, result.events);
-  const status = deriveNodeStatusFromEvidence(result.run, result.evidence);
-  return {
-    ...withEvents,
-    runs: { ...withEvents.runs, [result.run.id]: result.run },
-    runEvidence: { ...withEvents.runEvidence, [result.run.id]: result.evidence },
-    sessions: withEvents.sessions.map((session) =>
-      session.kind === "canvas"
-        ? {
-            ...session,
-            nodes: session.nodes.map((node: CanvasNode) =>
-              node.runId === result.run.id
-                ? {
-                    ...node,
-                    status,
-                    progress: status === "completed" ? "Evidence ready" : "Run evidence incomplete",
-                  }
-                : node,
-            ),
-          }
-        : session,
-    ),
-  };
-}
-
-function applyRunEventToWorkspace(workspace: WorkspaceState, event: RunEvent): WorkspaceState {
-  return mergeRunEventsIntoWorkspace(workspace, event.runId, [...(workspace.runEvents[event.runId] ?? []), event]);
-}
-
-function mergeRunEventsIntoWorkspace(
-  workspace: WorkspaceState,
-  runId: string,
-  events: RunEvent[],
-): WorkspaceState {
-  const deduped = dedupeRunEvents(events);
-  return {
-    ...workspace,
-    runEvents: { ...workspace.runEvents, [runId]: deduped },
-    sessions: workspace.sessions.map((session) =>
-      session.kind === "canvas"
-        ? {
-            ...session,
-            nodes: session.nodes.map((node: CanvasNode) =>
-              node.runId === runId ? applyRunEventsToNode(node, deduped) : node,
-            ),
-          }
-        : session,
-    ),
-  };
-}
-
-function applyRunEventsToNode(node: CanvasNode, events: RunEvent[]): CanvasNode {
-  const output = outputFromEvents(events);
-  if (output.length === 0) return node;
-  return {
-    ...node,
-    output,
-    progress: node.status === "running" ? "Streaming persisted output" : node.progress,
-  };
-}
-
-function outputFromEvents(events: RunEvent[]): string[] {
-  return events
-    .filter((event) => event.kind === "output")
-    .map((event) => (typeof event.payload.text === "string" ? event.payload.text : ""))
-    .filter(Boolean);
-}
-
-function dedupeRunEvents(events: RunEvent[]): RunEvent[] {
-  return [...new Map(events.map((event) => [event.seq, event])).values()].sort((left, right) => left.seq - right.seq);
 }
 
 function makeProject(project: { name: string; rootPath: string; devflowPath: string }): ImportedProject {

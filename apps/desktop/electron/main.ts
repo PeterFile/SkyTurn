@@ -193,8 +193,10 @@ function workspaceStorePath(): string {
 
 async function getAgentBridge(): Promise<AgentBridgeHost> {
   if (!agentBridge) {
-    const { AgentBridge } = await import("@skyturn/agent-bridge");
-    const bridge = new AgentBridge() as AgentBridgeHost;
+    const { AgentBridge, createCodexCliAdapter, createHermesCliAdapter } = await import("@skyturn/agent-bridge");
+    const bridge = new AgentBridge({
+      adapters: [createHermesCliAdapter(), createCodexCliAdapter()],
+    }) as AgentBridgeHost;
     bridge.onRunEvent((event) => {
       for (const window of BrowserWindow.getAllWindows()) {
         window.webContents.send("run:event", event);

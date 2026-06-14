@@ -11,11 +11,14 @@
     "build:electron": "tsc -p tsconfig.electron.json",
     "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "node --test scripts/*.test.mjs",
+    "demo:mvp": "node scripts/mvpWorkflowDemo.mjs",
     "lint": "pnpm run typecheck"
   },
   "dependencies": {
     "@skyturn/agent-bridge": "workspace:*",
+    "@skyturn/orchestrator": "workspace:*",
     "@skyturn/persistence": "workspace:*",
+    "@skyturn/planner": "workspace:*",
     "@skyturn/project-memory": "workspace:*",
     "@skyturn/ui-canvas": "workspace:*",
     "@xyflow/react": "^12.11.0",
