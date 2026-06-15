@@ -52,10 +52,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --prefer-offline
 
-      - name: Fetch base branch for Turbo filter
-        if: github.event_name == 'pull_request'
-        run: git fetch --no-tags --prune --depth=1 origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
-
       - name: Set Turbo filter
         id: turbo-filter
         shell: bash
