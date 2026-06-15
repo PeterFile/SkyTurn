@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { WorkspaceState } from "@skyturn/persistence";
 import type { AgentRun, CanvasNode, CanvasSession, ImportedProject, RunEvent, RunEvidence, StartAgentRunInput } from "@skyturn/project-core";
 
-import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace, startBridgeRun } from "./workflowRuntime.js";
+import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace, retryCanvasNode, startBridgeRun } from "./workflowRuntime.js";
 
 describe("workflow runtime event merging", () => {
   it("uses the workflow input requirement when building a Hermes planning prompt", () => {
@@ -219,6 +219,47 @@ describe("workflow runtime event merging", () => {
     expect(prompt).not.toContain("WorkflowIntent");
   });
 
+  it("keeps implementation prompts out of browser screenshot and persistent server work", () => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-implementation",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-implementation",
+        brief: "Implement the status screen",
+        meta: ["implementation", "lane-implementation", "flow-kernel"],
+      }),
+    ]);
+    const implementation = session.nodes.find((node) => node.id === "lane-implementation");
+
+    const prompt = buildPromptForNodeRun(session, implementation!);
+
+    expect(prompt).toContain("Do not capture browser screenshots in this lane");
+    expect(prompt).toContain("Do not start persistent dev servers");
+  });
+
+  it("tells browser screenshot lanes to stop any temporary dev server before exiting", () => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-browser",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-browser",
+        brief: "Capture browser screenshot evidence",
+        meta: ["browser_screenshot_validation", "lane-browser", "flow-kernel"],
+      }),
+    ]);
+    const browser = session.nodes.find((node) => node.id === "lane-browser");
+
+    const prompt = buildPromptForNodeRun(session, browser!);
+
+    expect(prompt).toContain("Capture browser screenshot evidence");
+    expect(prompt).toContain("node scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png");
+    expect(prompt).toContain("Stop any dev server before exiting");
+    expect(prompt).toContain("Do not create a git commit in this lane");
+    expect(prompt).toContain("the commit lane owns commits");
+  });
+
   it("passes review evidence and repo-scoped scan guidance into commit lane prompts", () => {
     const session = makeSession([
       makeNode({
@@ -236,6 +277,7 @@ describe("workflow runtime event merging", () => {
         status: "running",
         runId: "run-session-1-lane-commit",
         brief: "Commit verified change",
+        title: "Commit the verified SkyTurn delivery status screen change",
         meta: ["commit", "lane-commit", "flow-kernel"],
         dependencies: ["lane-review"],
       }),
@@ -250,6 +292,29 @@ describe("workflow runtime event merging", () => {
     expect(prompt).toContain("Do not run broad parent-directory scans such as `find ..`");
     expect(prompt).toContain("If git add, git commit, or verification fails");
     expect(prompt).toContain("Do not stage `.devflow/`");
+    expect(prompt).not.toContain("Do not create a git commit in this lane");
+  });
+
+  it("creates a fresh run evidence path when retrying a node", () => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-implementation",
+        agent: "codex",
+        status: "failed",
+        runId: "run-session-1-lane-implementation",
+        meta: ["implementation", "lane-implementation", "flow-kernel"],
+        output: ["Previous attempt failed."],
+      }),
+    ]);
+
+    const next = retryCanvasNode(session, "lane-implementation", "2026-06-14T04:05:06.000Z");
+    const retried = next.nodes.find((node) => node.id === "lane-implementation");
+
+    expect(retried?.status).toBe("retrying");
+    expect(retried?.runId).toBe("run-session-1-lane-implementation-attempt-20260614040506");
+    expect(retried?.changesetId).toBe("changeset-run-session-1-lane-implementation-attempt-20260614040506");
+    expect(retried?.output).toContain("Retry requested from run-session-1-lane-implementation.");
+    expect(next.activeNodeId).toBe("lane-implementation");
   });
 
   it("scopes Codex sandbox permissions by Flow Kernel lane", async () => {
@@ -557,13 +622,14 @@ function makeNode(input: {
   status: CanvasNode["status"];
   runId: string;
   brief?: string;
+  title?: string;
   meta?: string[];
   dependencies?: string[];
   output?: string[];
 }): CanvasNode {
   return {
     id: input.id,
-    title: input.id,
+    title: input.title ?? input.id,
     agent: input.agent,
     progress: "Running",
     status: input.status,

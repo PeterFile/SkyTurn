@@ -144,6 +144,108 @@ describe("Flow Kernel intent compiler", () => {
     expect(projection.rejectedIntents).toEqual([]);
     expect(projection.lanes.map((lane) => lane.id)).toContain("lane-implementation");
   });
+
+  it("compiles and schedules Hermes-provided dynamic lane DAGs only from concrete evidence", () => {
+    const policy = createDefaultFlowPolicy({ allowedParallelism: 2 });
+    const intent: WorkflowIntent = {
+      intentId: "intent-dynamic-react-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "On a React app, add a visible status badge and verify it in browser." },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["frontend-ui"] } },
+        {
+          type: "ProposeLanes",
+          lanes: [
+            {
+              id: "lane-understand-app",
+              semanticKey: "dynamic:understand-app",
+              kind: "repo_understanding",
+              title: "Understand current React app",
+              agentKind: "hermes",
+            },
+            {
+              id: "lane-change-badge",
+              semanticKey: "dynamic:change-badge",
+              kind: "react_badge_change",
+              title: "Implement visible status badge",
+              agentKind: "codex",
+              dependsOn: ["lane-understand-app"],
+              fileScopes: ["src/App.tsx"],
+              packageScopes: ["app"],
+            },
+            {
+              id: "lane-browser-proof",
+              semanticKey: "dynamic:browser-proof",
+              kind: "browser_screenshot_validation",
+              title: "Capture browser proof",
+              agentKind: "codex",
+              dependsOn: ["lane-change-badge"],
+              requiredEvidence: ["browser", "screenshot"],
+            },
+            {
+              id: "lane-human-review",
+              semanticKey: "dynamic:human-review",
+              kind: "evidence_review",
+              title: "Review evidence",
+              agentKind: "hermes",
+              dependsOn: ["lane-browser-proof"],
+            },
+          ],
+        },
+      ],
+    };
+
+    const projection = reduceWorkflowEvents(compileWorkflowIntent(intent, emptyProjection("session-1"), policy, now).events);
+
+    expect(projection.lanes.map((lane) => [lane.id, lane.kind, lane.agentKind])).toEqual([
+      ["lane-understand-app", "repo_understanding", "hermes"],
+      ["lane-change-badge", "react_badge_change", "codex"],
+      ["lane-browser-proof", "browser_screenshot_validation", "codex"],
+      ["lane-human-review", "evidence_review", "hermes"],
+    ]);
+    expect(projection.edges.map((edge) => [edge.sourceLaneId, edge.targetLaneId])).toEqual([
+      ["lane-understand-app", "lane-change-badge"],
+      ["lane-change-badge", "lane-browser-proof"],
+      ["lane-browser-proof", "lane-human-review"],
+    ]);
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([
+      "lane-understand-app",
+    ]);
+
+    const withoutEvidence = reduceWorkflowEvents([
+      ...projection.events,
+      event("workflow.segment.started", {
+        segment: { id: "segment-understand-1", laneId: "lane-understand-app", runId: "run-understand-1", status: "running" },
+      }),
+      event("workflow.segment.output_delta", {
+        laneId: "lane-understand-app",
+        segmentId: "segment-understand-1",
+        text: "Done; continue.",
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-understand-app",
+        segmentId: "segment-understand-1",
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    expect(scheduleReadyLanes(withoutEvidence, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([]);
+
+    const withEvidence = reduceWorkflowEvents([
+      ...withoutEvidence.events,
+      event("workflow.evidence.recorded", {
+        laneId: "lane-understand-app",
+        segmentId: "segment-understand-1",
+        evidence: { id: "evidence-understand-1", kind: "run-exit", status: "passed", checks: ["Hermes CLI exit"], artifacts: [] },
+      }),
+    ]);
+
+    expect(withEvidence.lanes.find((lane) => lane.id === "lane-understand-app")?.status).toBe("completed");
+    expect(scheduleReadyLanes(withEvidence, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([
+      "lane-change-badge",
+    ]);
+  });
 });
 
 describe("Flow Kernel gate engine and scheduler", () => {

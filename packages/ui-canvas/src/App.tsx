@@ -126,6 +126,7 @@ import {
   applyBridgeRunResult,
   applyRunEventToWorkspace,
   mergeRunEventsIntoWorkspace,
+  retryCanvasNode,
   startBridgeRun,
 } from "./workflowRuntime.js";
 import { addRequirementPlanningNode } from "./composer.js";
@@ -427,12 +428,8 @@ export default function App() {
   }
 
   function retryNode(nodeId: string) {
-    updateNode(nodeId, (node) => ({
-      ...node,
-      status: "retrying",
-      progress: "Retrying",
-      output: [...node.output, "Retry requested. Resume brief created from checkpoint."],
-    }));
+    if (!activeSession || activeSession.kind !== "canvas") return;
+    updateCanvasSession(activeSession.id, (session) => retryCanvasNode(session, nodeId, new Date().toISOString()));
   }
 
   function reassignNode(nodeId: string) {

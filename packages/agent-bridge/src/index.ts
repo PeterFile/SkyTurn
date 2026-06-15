@@ -33,8 +33,8 @@ const commandCandidates: Record<AgentKind, string[]> = {
   "claude-code": ["claude", "claude-code"],
   openclaw: ["openclaw"],
 };
-const defaultCliTimeoutMs = 5 * 60 * 1_000;
 const defaultKillTimeoutMs = 5_000;
+const defaultStallTelemetryMs = 60_000;
 
 export interface DiscoveryOptions {
   pathValue?: string;
@@ -56,6 +56,7 @@ export interface CodexCliAdapterOptions {
   sandbox?: CodexCliSandbox;
   timeoutMs?: number;
   killTimeoutMs?: number;
+  stallTelemetryMs?: number;
   env?: NodeJS.ProcessEnv;
   extraArgs?: string[];
   pathValue?: string;
@@ -125,8 +126,9 @@ export class AgentBridge {
     if (!adapter) throw new Error(`No local adapter registered for ${input.agentKind}`);
 
     const now = new Date().toISOString();
+    const runId = input.runId ?? (await nextAttemptRunId(input.projectRoot, input.sessionId, input.nodeId, this.runs));
     const run: AgentRun = {
-      id: input.runId ?? makeRunId(input.sessionId, input.nodeId),
+      id: runId,
       nodeId: input.nodeId,
       sessionId: input.sessionId,
       ...(input.plannerSessionId ? { plannerSessionId: input.plannerSessionId } : {}),
@@ -321,18 +323,62 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       let finalized = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
       let killTimer: NodeJS.Timeout | null = null;
-      const timeoutMs = options.timeoutMs ?? defaultCliTimeoutMs;
+      const timeoutMs = options.timeoutMs;
       const killTimeoutMs = options.killTimeoutMs ?? defaultKillTimeoutMs;
+      const stallTelemetryMs = options.stallTelemetryMs ?? defaultStallTelemetryMs;
       let timeoutTimer: NodeJS.Timeout | null = null;
+      let stallTimer: NodeJS.Timeout | null = null;
+      let lastActivityAt = Date.now();
+
+      const markActivity = () => {
+        lastActivityAt = Date.now();
+      };
+      const clearLifecycleTimers = () => {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (stallTimer) clearTimeout(stallTimer);
+        if (killTimer) clearTimeout(killTimer);
+      };
+      const scheduleKill = () => {
+        if (killTimer) clearTimeout(killTimer);
+        terminateProcessTree(child, "SIGTERM");
+        killTimer = setTimeout(() => {
+          terminateProcessTree(child, "SIGKILL");
+        }, killTimeoutMs);
+      };
+      const scheduleStallTelemetry = () => {
+        if (stallTelemetryMs <= 0) return;
+        stallTimer = setTimeout(() => {
+          void (async () => {
+            if (finalized) return;
+            const idleMs = Date.now() - lastActivityAt;
+            if (idleMs >= stallTelemetryMs) {
+              await emit({
+                kind: "progress",
+                payload: {
+                  source: "codex",
+                  phase: "stalled",
+                  status: "running",
+                  idleMs,
+                  detail: `Codex CLI still running after ${idleMs}ms without a hard timeout.`,
+                },
+              });
+            }
+            scheduleStallTelemetry();
+          })();
+        }, stallTelemetryMs);
+      };
 
       await emit({
         kind: "progress",
         payload: { source: "codex", phase: "started", command: "codex exec" },
       });
+      markActivity();
+      scheduleStallTelemetry();
 
       if (child.stdout) {
         const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity });
         stdout.on("line", (line) => {
+          markActivity();
           for (const draft of codexStdoutLineToDrafts(line)) void emit(draft);
         });
       }
@@ -341,6 +387,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         const stderr = createInterface({ input: child.stderr, crlfDelay: Infinity });
         stderr.on("line", (line) => {
           if (!line.trim()) return;
+          markActivity();
           void emit({
             kind: "progress",
             payload: { source: "codex", stream: "stderr", format: "text", text: line },
@@ -352,8 +399,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         spawnFailed = true;
         if (finalized) return;
         finalized = true;
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-        if (killTimer) clearTimeout(killTimer);
+        clearLifecycleTimers();
         void emit({
           kind: "error",
           payload: { source: "codex", message: error.message, code: error.name },
@@ -364,8 +410,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       child.once("close", (code, signal) => {
         void (async () => {
           await drain();
-          if (killTimer) clearTimeout(killTimer);
-          if (timeoutTimer) clearTimeout(timeoutTimer);
+          clearLifecycleTimers();
           if (finalized) return;
           finalized = true;
           if (spawnFailed) return;
@@ -413,11 +458,12 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         })();
       });
 
-      if (timeoutMs > 0) {
+      if (typeof timeoutMs === "number" && timeoutMs > 0) {
         timeoutTimer = setTimeout(() => {
           void (async () => {
             if (finalized) return;
             finalized = true;
+            if (stallTimer) clearTimeout(stallTimer);
             await drain();
             await emit({
               kind: "evidence",
@@ -437,10 +483,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
               kind: "status",
               payload: { status: "timed-out", reason: `Codex CLI timed out after ${timeoutMs}ms` },
             });
-            terminateProcessTree(child, "SIGTERM");
-            killTimer = setTimeout(() => {
-              terminateProcessTree(child, "SIGKILL");
-            }, killTimeoutMs);
+            scheduleKill();
           })();
         }, timeoutMs);
         timeoutTimer.unref();
@@ -451,7 +494,8 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           cancelled = true;
           cancelReason = reason;
           if (timeoutTimer) clearTimeout(timeoutTimer);
-          terminateProcessTree(child, "SIGTERM");
+          if (stallTimer) clearTimeout(stallTimer);
+          scheduleKill();
         },
       };
     },
@@ -798,6 +842,28 @@ function taskOutputPath(projectRoot: string, nodeId: string): string {
 
 function makeRunId(sessionId: string, nodeId: string): string {
   return `run-${sessionId}-${nodeId}`;
+}
+
+async function nextAttemptRunId(
+  projectRoot: string,
+  sessionId: string,
+  nodeId: string,
+  runs: ReadonlyMap<string, AgentRun>,
+): Promise<string> {
+  const base = makeRunId(sessionId, nodeId);
+  for (let attempt = 1; ; attempt += 1) {
+    const candidate = attempt === 1 ? base : `${base}-attempt-${attempt}`;
+    if (!runs.has(candidate) && !(await hasRunEvents(projectRoot, candidate))) return candidate;
+  }
+}
+
+async function hasRunEvents(projectRoot: string, runId: string): Promise<boolean> {
+  try {
+    await access(runEventsPath(projectRoot, runId), fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function makePersistedRun(projectRoot: string, runId: string): AgentRun {

@@ -74,6 +74,30 @@ export function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRu
   };
 }
 
+export function retryCanvasNode(session: CanvasSession, nodeId: string, now: string): CanvasSession {
+  const target = session.nodes.find((node) => node.id === nodeId);
+  if (!target) return session;
+  const runId = uniqueRetryRunId(session.nodes, target.runId, now);
+  return {
+    ...session,
+    activeNodeId: nodeId,
+    updatedAt: now,
+    nodes: session.nodes.map((node) =>
+      node.id === nodeId
+        ? {
+            ...node,
+            status: "retrying",
+            runId,
+            changesetId: `changeset-${runId}`,
+            progress: "Retrying",
+            runtime: runtimeForStatus("retrying", node.display?.meta[0] ?? node.progress),
+            output: [...node.output, `Retry requested from ${node.runId}.`],
+          }
+        : node,
+    ),
+  };
+}
+
 export function applyRunEventToWorkspace(workspace: WorkspaceState, event: RunEvent): WorkspaceState {
   return mergeRunEventsIntoWorkspace(workspace, event.runId, [...(workspace.runEvents[event.runId] ?? []), event]);
 }
@@ -375,7 +399,10 @@ export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode):
   }
 
   const laneKind = node.display?.meta[0] ?? "";
-  const laneInstruction = codexLaneInstruction(laneKind);
+  const laneInstruction = codexLaneInstruction(laneKind, node.title);
+  const screenshotHelperInstruction = /browser|screenshot/.test(`${laneKind} ${node.title}`.toLowerCase())
+    ? "If the repository provides `scripts/capture-screenshot.mjs`, run `node scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png` and report that artifact path."
+    : "";
   const dependencyEvidence = dependencyEvidenceForPrompt(session, node);
   return [
     `Task: ${node.context.brief}`,
@@ -384,6 +411,7 @@ export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode):
     `Worktree reference: ${node.worktree.path}`,
     dependencyEvidence,
     laneInstruction,
+    screenshotHelperInstruction,
     "Stay inside the current git repository. Do not run broad parent-directory scans such as `find ..`; if checking agent instructions, inspect only repo-local paths.",
     "Return a concise result summary and any blocker or verification evidence. Do not claim completion without evidence.",
   ].filter(Boolean).join("\n");
@@ -408,13 +436,8 @@ function hermesGoalForNode(session: CanvasSession, node: CanvasNode): string {
   return `${session.goal}\nCurrent requirement: ${brief}`;
 }
 
-function codexLaneInstruction(laneKind: string): string {
-  if (laneKind.includes("implementation")) {
-    return "Implement the requested code and test change in this git repository. Run the relevant tests. Do not create a git commit in this lane.";
-  }
-  if (/validation|test|regression/.test(laneKind)) {
-    return "Run the relevant verification command and report the exact result. Do not create a git commit in this lane.";
-  }
+function codexLaneInstruction(laneKind: string, title = ""): string {
+  const laneText = `${laneKind} ${title}`.toLowerCase();
   if (laneKind === "commit") {
     return [
       "Before committing, read the dependency evidence above.",
@@ -423,6 +446,15 @@ function codexLaneInstruction(laneKind: string): string {
       "If git add, git commit, or verification fails, report the blocker and exit non-zero.",
       "Do not stage `.devflow/`.",
     ].join(" ");
+  }
+  if (/browser|screenshot/.test(laneText)) {
+    return "Capture browser screenshot evidence with a bounded command. Prefer repo-provided screenshot scripts over ad hoc browser automation. Start any dev server only if needed, write the screenshot artifact, and Stop any dev server before exiting. Do not create a git commit in this lane; the commit lane owns commits.";
+  }
+  if (/implementation|implement|change|update|edit/.test(laneText)) {
+    return "Implement the requested code and test change in this git repository. Run the relevant tests. Do not create a git commit in this lane. Do not capture browser screenshots in this lane. Do not start persistent dev servers.";
+  }
+  if (/validation|test|regression/.test(laneText)) {
+    return "Run the relevant verification command and report the exact result. Do not create a git commit in this lane.";
   }
   return "";
 }
@@ -549,6 +581,18 @@ function dedupeRunEvents(events: RunEvent[]): RunEvent[] {
 
 function latestEventTimestamp(events: RunEvent[]): string | null {
   return events.at(-1)?.timestamp ?? null;
+}
+
+function uniqueRetryRunId(nodes: CanvasNode[], currentRunId: string, now: string): string {
+  const timestamp = now.replace(/\D/g, "").slice(0, 14) || "retry";
+  const base = currentRunId.replace(/-attempt-[0-9A-Za-z-]+$/, "");
+  const candidate = `${base}-attempt-${timestamp}`;
+  const used = new Set(nodes.map((node) => node.runId));
+  if (!used.has(candidate)) return candidate;
+  for (let index = 2; ; index += 1) {
+    const next = `${candidate}-${index}`;
+    if (!used.has(next)) return next;
+  }
 }
 
 function isRunStatus(value: unknown): value is AgentRunStatus {
