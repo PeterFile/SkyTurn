@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RunEvent } from "@skyturn/project-core";
 import { reduceWorkflowEvents, type FlowEvent } from "@skyturn/workflow-kernel";
 
@@ -22,6 +22,7 @@ import {
 const roots: string[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(roots.map((root) => rm(root, { force: true, recursive: true })));
   roots.length = 0;
 });
@@ -347,6 +348,116 @@ describe("agent bridge", () => {
     expect(args.argv[sandboxIndex + 1]).toBe("danger-full-access");
   });
 
+  it("does not apply a default hard timeout to Codex CLI runs and emits stalled telemetry", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          stallTelemetryMs: 25,
+        }),
+      ],
+    });
+    const events: RunEvent[] = [];
+    const unsubscribe = bridge.onRunEvent((event) => events.push(event));
+    const stalled = waitForEvent(
+      bridge,
+      (event) => event.kind === "progress" && event.payload.phase === "stalled",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-long",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Run as long as needed",
+    });
+    await stalled;
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "progress",
+        payload: expect.objectContaining({
+          source: "codex",
+          phase: "stalled",
+          status: "running",
+        }),
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: "status",
+        payload: expect.objectContaining({ status: "timed-out" }),
+      }),
+    );
+
+    unsubscribe();
+    await bridge.cancelRun(run.id, "test cleanup");
+  });
+
+  it("allocates a new attempt run id and event path when retrying the same node", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('{\"type\":\"turn.completed\"}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const input = {
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-retry",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex" as const,
+      prompt: "Try again",
+    };
+
+    const firstDone = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+    const first = await bridge.startRun(input);
+    await firstDone;
+    const secondDone = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+    const second = await bridge.startRun(input);
+    await secondDone;
+
+    expect(first.id).toBe("run-session-1-node-codex-retry");
+    expect(second.id).toBe("run-session-1-node-codex-retry-attempt-2");
+    const firstEvents = await loadRunEvents(projectRoot, first.id);
+    const secondEvents = await loadRunEvents(projectRoot, second.id);
+    expect(firstEvents.length).toBeGreaterThan(0);
+    expect(secondEvents.length).toBeGreaterThan(0);
+    expect(new Set(firstEvents.map((event) => event.runId))).toEqual(new Set([first.id]));
+    expect(new Set(secondEvents.map((event) => event.runId))).toEqual(new Set([second.id]));
+  });
+
   it("times out a stalled Codex CLI run instead of leaving the card running", async () => {
     const projectRoot = await makeTempRoot();
     await mkdir(join(projectRoot, ".git"));
@@ -368,6 +479,7 @@ describe("agent bridge", () => {
         createCodexCliAdapter({
           executablePath: codexPath,
           timeoutMs: 250,
+          killTimeoutMs: 100,
         }),
       ],
     });
@@ -451,6 +563,136 @@ describe("agent bridge", () => {
     const childPid = Number(await readFile(childPidPath, "utf8"));
 
     expect(isPidAlive(childPid)).toBe(false);
+  });
+
+  it("kills Codex child process groups on explicit cancel", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const parentPidPath = join(binRoot, "parent.pid");
+    const childPidPath = join(binRoot, "child.pid");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "fs.writeFileSync(process.env.SKYTURN_PARENT_PID_PATH, String(process.pid));",
+        "const child = spawn(process.execPath, ['-e', 'process.on(\"SIGTERM\", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_PID_PATH, String(child.pid));",
+        "process.on('SIGTERM', () => {});",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {
+            SKYTURN_PARENT_PID_PATH: parentPidPath,
+            SKYTURN_CHILD_PID_PATH: childPidPath,
+          },
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-cancel",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Cancel me",
+    });
+    const parentPid = Number(await waitForFile(parentPidPath));
+    const childPid = Number(await waitForFile(childPidPath));
+
+    try {
+      await bridge.cancelRun(run.id, "User stopped the run");
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+      expect(isPidAlive(parentPid)).toBe(false);
+      expect(isPidAlive(childPid)).toBe(false);
+    } finally {
+      killPid(parentPid);
+      killPid(childPid);
+    }
+  });
+
+  it("keeps killing the Codex process group after the parent exits on cancel", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const childPidPath = join(binRoot, "child.pid");
+    const childReadyPath = join(binRoot, "child.ready");
+    const childPath = join(binRoot, "stubborn-child.js");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      childPath,
+      [
+        "const fs = require('node:fs');",
+        "process.on('SIGTERM', () => {});",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_READY_PATH, 'ready');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "const child = spawn(process.execPath, [process.env.SKYTURN_CHILD_PATH], {",
+        "  env: process.env,",
+        "  stdio: 'ignore',",
+        "});",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_PID_PATH, String(child.pid));",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {
+            SKYTURN_CHILD_PATH: childPath,
+            SKYTURN_CHILD_PID_PATH: childPidPath,
+            SKYTURN_CHILD_READY_PATH: childReadyPath,
+          },
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-parent-exits",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Cancel me",
+    });
+    const childPid = Number(await waitForFile(childPidPath));
+    await waitForFile(childReadyPath);
+
+    try {
+      await bridge.cancelRun(run.id, "User stopped the run");
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+      expect(isPidAlive(childPid)).toBe(false);
+    } finally {
+      killPid(childPid);
+    }
   });
 
   it("runs Hermes chat planning without oneshot -z and marks replay recovery honestly", async () => {
@@ -657,5 +899,25 @@ function isPidAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function waitForFile(path: string): Promise<string> {
+  const started = Date.now();
+  for (;;) {
+    try {
+      return await readFile(path, "utf8");
+    } catch {
+      if (Date.now() - started > 2_000) throw new Error(`Timed out waiting for ${path}`);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}
+
+function killPid(pid: number): void {
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Already gone.
   }
 }

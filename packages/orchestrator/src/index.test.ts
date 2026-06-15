@@ -368,8 +368,15 @@ describe("workflow-card tools", () => {
     expect(prompt).toContain("DiscoverProject MUST be");
     expect(prompt).toContain("Allowed operations: AnalyzeRequirement, DiscoverProject, ProposeLanes, SplitLane, JoinLanes, StartImplementation, RequestValidation, RequestReview, RequestUserDecision, ReplanFromEvidence.");
     expect(prompt).toContain("operations MUST include AnalyzeRequirement, DiscoverProject, and ProposeLanes.");
+    expect(prompt).toContain("ProposeLanes MUST include a lanes array");
+    expect(prompt).toContain("Use agentKind codex for implementation, command validation, browser screenshot, and commit lanes");
+    expect(prompt).toContain("Use agentKind hermes for review lanes");
+    expect(prompt).toContain("root planning node already owns planning");
+    expect(prompt).toContain("Do not create a separate planning, scope, or intake lane");
     expect(prompt).toContain("Do not output workflow-card tools or UI mutations.");
-    expect(prompt).toContain("SkyTurn, not Hermes, deterministically compiles the intent into DAG lanes and edges.");
+    expect(prompt).toContain("Hermes owns lane granularity");
+    expect(prompt).toContain("SkyTurn validates and schedules the DAG");
+    expect(prompt).not.toContain("SkyTurn chooses policy-pack lanes when lanes are omitted.");
     expect(prompt).not.toContain("createWorkflowCard");
     expect(prompt).not.toContain("toolCalls");
   });
