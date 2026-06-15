@@ -335,6 +335,13 @@ describe("workflow runtime event merging", () => {
         meta: ["validation", "lane-validation", "flow-kernel"],
       }),
       makeNode({
+        id: "lane-browser",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-browser",
+        meta: ["browser_screenshot_validation", "lane-browser", "flow-kernel"],
+      }),
+      makeNode({
         id: "lane-commit",
         agent: "codex",
         status: "running",
@@ -390,6 +397,7 @@ describe("workflow runtime event merging", () => {
     expect(startAgentRun.mock.calls.map(([input]) => input.sandbox)).toEqual([
       "workspace-write",
       undefined,
+      "workspace-write",
       "danger-full-access",
     ]);
   });

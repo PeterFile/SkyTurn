@@ -421,11 +421,12 @@ function promptForNodeRun(session: CanvasSession, node: CanvasNode): string {
   return buildPromptForNodeRun(session, node);
 }
 
-function sandboxForNodeRun(node: CanvasNode): "workspace-write" | "danger-full-access" | undefined {
+export function sandboxForNodeRun(node: CanvasNode): "workspace-write" | "danger-full-access" | undefined {
   if (node.agent !== "codex") return undefined;
   const laneKind = node.display?.meta[0] ?? "";
-  if (laneKind.includes("implementation")) return "workspace-write";
-  if (laneKind === "commit") return "danger-full-access";
+  const laneText = `${laneKind} ${node.title}`.toLowerCase();
+  if (laneKind === "commit" || /\bcommit\b/.test(laneText)) return "danger-full-access";
+  if (/implementation|implement|change|update|edit|browser|screenshot/.test(laneText)) return "workspace-write";
   return undefined;
 }
 

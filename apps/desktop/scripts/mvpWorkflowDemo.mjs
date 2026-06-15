@@ -17,7 +17,7 @@ import {
 import { parseHermesWorkflowIntent } from "@skyturn/orchestrator";
 import { createFastCanvasSession } from "@skyturn/planner";
 import { addRequirementPlanningNode } from "@skyturn/ui-canvas/composer";
-import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace } from "@skyturn/ui-canvas/workflow-runtime";
+import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace, sandboxForNodeRun } from "@skyturn/ui-canvas/workflow-runtime";
 
 const require = createRequire(import.meta.url);
 const desktopRoot = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -399,6 +399,7 @@ function canvasSession(workspace, sessionId) {
 }
 
 function startNodeRun(bridge, projectRoot, session, node) {
+  const sandbox = sandboxForNodeRun(node);
   return bridge.startRun({
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
     runId: node.runId,
@@ -413,19 +414,9 @@ function startNodeRun(bridge, projectRoot, session, node) {
     projectRoot,
     worktreePath: projectRoot,
     agentKind: node.agent,
-    ...sandboxForNodeRun(node),
+    ...(sandbox ? { sandbox } : {}),
     prompt: buildPromptForNodeRun(session, node),
   });
-}
-
-function sandboxForNodeRun(node) {
-  if (node.agent !== "codex") return {};
-  const laneKind = node.display?.meta[0] ?? "";
-  const laneText = `${laneKind} ${node.title}`.toLowerCase();
-  if (/commit/.test(laneText)) return { sandbox: "danger-full-access" };
-  if (/browser|screenshot/.test(laneText)) return { sandbox: "danger-full-access" };
-  if (/implement|change|update|edit|browser|screenshot/.test(laneText)) return { sandbox: "workspace-write" };
-  return {};
 }
 
 function waitForFinalStatus(bridge, runId) {

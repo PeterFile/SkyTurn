@@ -333,16 +333,16 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       const markActivity = () => {
         lastActivityAt = Date.now();
       };
-      const clearLifecycleTimers = () => {
+      const clearLifecycleTimers = (options: { clearKillTimer?: boolean } = {}) => {
         if (timeoutTimer) clearTimeout(timeoutTimer);
         if (stallTimer) clearTimeout(stallTimer);
-        if (killTimer) clearTimeout(killTimer);
+        if (options.clearKillTimer !== false && killTimer) clearTimeout(killTimer);
       };
       const scheduleKill = () => {
         if (killTimer) clearTimeout(killTimer);
         terminateProcessTree(child, "SIGTERM");
         killTimer = setTimeout(() => {
-          terminateProcessTree(child, "SIGKILL");
+          terminateProcessTree(child, "SIGKILL", { forceProcessGroup: true });
         }, killTimeoutMs);
       };
       const scheduleStallTelemetry = () => {
@@ -410,7 +410,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       child.once("close", (code, signal) => {
         void (async () => {
           await drain();
-          clearLifecycleTimers();
+          clearLifecycleTimers({ clearKillTimer: !killTimer });
           if (finalized) return;
           finalized = true;
           if (spawnFailed) return;
@@ -655,18 +655,23 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
   };
 }
 
-function terminateProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+function terminateProcessTree(
+  child: ChildProcess,
+  signal: NodeJS.Signals,
+  options: { forceProcessGroup?: boolean } = {},
+): void {
   const pid = child.pid;
   if (!pid) return;
+  if (!options.forceProcessGroup && (child.exitCode !== null || child.signalCode !== null)) return;
   if (process.platform === "win32") {
+    if (child.exitCode !== null || child.signalCode !== null) return;
     child.kill(signal);
     return;
   }
   try {
     process.kill(-pid, signal);
   } catch {
-    child.kill(signal);
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
   }
 }
 

@@ -625,6 +625,76 @@ describe("agent bridge", () => {
     }
   });
 
+  it("keeps killing the Codex process group after the parent exits on cancel", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const childPidPath = join(binRoot, "child.pid");
+    const childReadyPath = join(binRoot, "child.ready");
+    const childPath = join(binRoot, "stubborn-child.js");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      childPath,
+      [
+        "const fs = require('node:fs');",
+        "process.on('SIGTERM', () => {});",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_READY_PATH, 'ready');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "const child = spawn(process.execPath, [process.env.SKYTURN_CHILD_PATH], {",
+        "  env: process.env,",
+        "  stdio: 'ignore',",
+        "});",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_PID_PATH, String(child.pid));",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {
+            SKYTURN_CHILD_PATH: childPath,
+            SKYTURN_CHILD_PID_PATH: childPidPath,
+            SKYTURN_CHILD_READY_PATH: childReadyPath,
+          },
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-parent-exits",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Cancel me",
+    });
+    const childPid = Number(await waitForFile(childPidPath));
+    await waitForFile(childReadyPath);
+
+    try {
+      await bridge.cancelRun(run.id, "User stopped the run");
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+      expect(isPidAlive(childPid)).toBe(false);
+    } finally {
+      killPid(childPid);
+    }
+  });
+
   it("runs Hermes chat planning without oneshot -z and marks replay recovery honestly", async () => {
     const projectRoot = await makeTempRoot();
     const binRoot = await makeTempRoot();
