@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v6
@@ -36,17 +38,49 @@ jobs:
           node-version: 20.19.0
           cache: pnpm
 
+      - name: Restore Turbo cache
+        id: restore-turbo-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .turbo/cache
+          key: turbo-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-${{ github.ref_name }}-
+            turbo-${{ runner.os }}-main-
+            turbo-${{ runner.os }}-
+
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Fetch base branch for Turbo filter
+        if: github.event_name == 'pull_request'
+        run: git fetch --no-tags --prune --depth=1 origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}
+
+      - name: Set Turbo filter
+        id: turbo-filter
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "value=--filter=...[origin/${{ github.base_ref }}]" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build
-        run: pnpm run build
+        run: pnpm exec turbo run build ${{ steps.turbo-filter.outputs.value }}
 
       - name: Lint
-        run: pnpm run lint
+        run: pnpm exec turbo run lint ${{ steps.turbo-filter.outputs.value }}
 
       - name: Test
-        run: pnpm run test
+        run: pnpm exec turbo run test ${{ steps.turbo-filter.outputs.value }}
 
       - name: Flow kernel acceptance
-        run: pnpm run flow-kernel:acceptance
+        run: pnpm exec turbo run flow-kernel:acceptance ${{ steps.turbo-filter.outputs.value }}
+
+      - name: Save Turbo cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.restore-turbo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .turbo/cache
+          key: turbo-${{ runner.os }}-main-${{ github.sha }}
