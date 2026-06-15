@@ -69,6 +69,7 @@
 - Prefer typed interfaces for orchestration, persistence, git, worktrees, changesets, and editor adapters.
 - Use `pnpm` for this monorepo. The root pins `pnpm@10.28.2`; Corepack-selected `pnpm@11.6.0` fails on the local Node `20.19.0` runtime.
 - Keep root package scripts as `turbo run` delegators. Put actual build, typecheck, lint, test, and dev commands in the package-level `package.json` files.
+- In clean CI, run root `pnpm run build` before root `pnpm run lint`; TypeScript project-reference typechecks consume generated workspace `dist/*.d.ts` outputs.
 - Workspace packages live under `apps/*` and `packages/*`. Internal imports must use `workspace:*` package dependencies, not cross-package relative paths.
 - Browser-consumed workspace packages that emit ESM `dist` must use `.js` suffixes for local source imports/exports so compiled files resolve in Vite/Node ESM.
 - The node modal `Changes` tab renders patch previews through `packages/ui-canvas/src/diffViewer.ts` with `diff2html` output sanitized by `DOMPurify`; do not reintroduce renderer git execution or custom diff table rendering.
