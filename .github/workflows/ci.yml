@@ -40,7 +40,7 @@ jobs:
 
       - name: Restore Turbo cache
         id: restore-turbo-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .turbo/cache
           key: turbo-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
@@ -76,7 +76,7 @@ jobs:
 
       - name: Save Turbo cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.restore-turbo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: .turbo/cache
           key: turbo-${{ runner.os }}-main-${{ github.sha }}
