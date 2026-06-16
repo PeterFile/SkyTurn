@@ -11,6 +11,8 @@ import {
   type RunEvent,
   type RunEvidence,
   type StartAgentRunInput,
+  type WorkflowLedgerSummary,
+  type WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
 
 export interface OpenProjectResult {
@@ -20,6 +22,23 @@ export interface OpenProjectResult {
     rootPath: string;
     devflowPath: string;
   };
+}
+
+export interface WorkflowApi {
+  createSession: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; session: unknown; projection: unknown }>;
+  appendUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; projection: unknown }>;
+  getLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: WorkflowLedgerSummary }>;
+  applyIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown }>;
+  scheduleReady: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; ready: unknown[] }>;
+  recordRunResult: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; events: unknown[]; projection: unknown }>;
+  getProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown }>;
+  getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
+  answerUserDecision: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; projection: unknown }>;
+  createWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown; worktree: WorkflowWorktreeIdentity }>;
+  compareWorktrees: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; comparison: unknown }>;
+  adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown }>;
+  cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown }>;
+  getChangeset: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; changeset: Changeset }>;
 }
 
 export interface DevflowApi {
@@ -36,6 +55,7 @@ export interface DevflowApi {
   getRunEvents: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; events: RunEvent[] }>;
   listAgentRuns: () => Promise<{ protocolVersion: number; runs: AgentRun[] }>;
   getRunEvidence: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;
+  workflow: WorkflowApi;
   applyWorkflowIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown }>;
   getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown }>;
   getWorkflowEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
