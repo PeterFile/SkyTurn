@@ -119,6 +119,7 @@ import {
   type ChangesDiffViewOptions,
 } from "./diffViewer.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
+import { agentIdentityForNode, canUseAgentNodeActions, nodeFooterForNode } from "./nodeDisplay.js";
 import {
   applyBridgeRunResult,
   applyRunEventToWorkspace,
@@ -264,7 +265,7 @@ export default function App() {
   useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
     for (const node of activeSession.nodes) {
-      if (node.executable === false) continue;
+      if (!canUseAgentNodeActions(node)) continue;
       if (node.status !== "running" && node.status !== "retrying") continue;
       if (startedBridgeRuns.current.has(node.runId)) continue;
       startedBridgeRuns.current.add(node.runId);
@@ -1728,18 +1729,6 @@ function AgentStreamPreview({ line, nodeId }: { line: StreamingLogLine; nodeId: 
   );
 }
 
-const AGENT_LABELS: Record<AgentKind, string> = {
-  hermes: "Hermes",
-  codex: "Codex",
-  gemini: "Gemini",
-  "claude-code": "ClaudeCode",
-  openclaw: "OpenClaw",
-};
-
-function agentIdentityForNode(node: CanvasNode): string {
-  return AGENT_LABELS[node.agent];
-}
-
 function actionForDecisionOption(option: string): UserDecisionAction {
   const value = option.toLowerCase();
   if (value.includes("backtrack")) return "backtrack";
@@ -1750,24 +1739,6 @@ function actionForDecisionOption(option: string): UserDecisionAction {
 
 function nodeSummaryForNode(node: CanvasNode): string {
   return node.context.brief.trim() || node.progress.trim() || "Waiting for execution context.";
-}
-
-function nodeFooterForNode(
-  node: CanvasNode,
-  runtime: NodeRuntimeState,
-): { primary: string; secondary?: string } {
-  switch (node.status) {
-    case "pending":
-      return { primary: "Queued" };
-    case "running":
-      return { primary: runtime.phase === "Think" ? "Thinking" : runtime.phase };
-    case "retrying":
-      return { primary: "Retrying" };
-    case "completed":
-      return { primary: "Verified", secondary: "Evidence ready" };
-    case "failed":
-      return { primary: "Attention" };
-  }
 }
 
 function nodeTooltipForNode(node: CanvasNode, runtime: NodeRuntimeState): string {
@@ -1939,14 +1910,14 @@ function NodeModal({
       .to(panel, { autoAlpha: 0, x: 28, duration: 0.2, ease: "power2.in" }, 0)
       .to(backdrop, { autoAlpha: 0, duration: 0.16, ease: "power2.out" }, 0);
   }
-  const canExecute = node.executable !== false;
+  const canExecute = canUseAgentNodeActions(node);
 
   return (
     <div ref={backdropRef} className="modal-backdrop" role="presentation">
       <section ref={panelRef} className="node-modal" role="dialog" aria-modal="true" aria-label={node.title}>
         <header className="modal-header">
           <div>
-            <p className="eyebrow">{node.agent}</p>
+            <p className="eyebrow">{agentIdentityForNode(node)}</p>
             <h2>{node.title}</h2>
           </div>
           <button className="icon-button" title="Close" onClick={closeWithMotion}>
@@ -1962,15 +1933,15 @@ function NodeModal({
             <RefreshCw size={15} />
             Retry
           </button>
-          <button onClick={onReassign}>
+          <button onClick={onReassign} disabled={!canExecute}>
             <Users size={15} />
             Reassign
           </button>
-          <button onClick={onInsertBefore}>
+          <button onClick={onInsertBefore} disabled={!canExecute}>
             <Plus size={15} />
             Insert Before
           </button>
-          <EditorLaunchMenu onOpenEditor={onOpenEditor} />
+          <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} />
         </div>
         <nav className="modal-tabs" aria-label="Node details">
           {NODE_MODAL_TABS.map((item) => (
@@ -1993,7 +1964,13 @@ function NodeModal({
   );
 }
 
-function EditorLaunchMenu({ onOpenEditor }: { onOpenEditor: (editor: EditorKind) => void }) {
+function EditorLaunchMenu({
+  disabled = false,
+  onOpenEditor,
+}: {
+  disabled?: boolean;
+  onOpenEditor: (editor: EditorKind) => void;
+}) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const menuId = useId();
@@ -2021,6 +1998,7 @@ function EditorLaunchMenu({ onOpenEditor }: { onOpenEditor: (editor: EditorKind)
   }, [open]);
 
   function openEditor(option: EditorLaunchOption) {
+    if (disabled) return;
     setOpen(false);
     onOpenEditor(option.editor);
   }
@@ -2035,6 +2013,7 @@ function EditorLaunchMenu({ onOpenEditor }: { onOpenEditor: (editor: EditorKind)
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
+        disabled={disabled}
         onClick={() => setOpen((current) => !current)}
       >
         <EditorLaunchIcon option={triggerOption} />
