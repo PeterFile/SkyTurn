@@ -60,11 +60,7 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 
-import {
-  createMockChangeset,
-  mockChangesetService,
-  type EditorKind,
-} from "@skyturn/git-worktree";
+import type { EditorKind } from "@skyturn/git-worktree";
 import {
   browserEditorAdapter,
   emptyWorkspace,
@@ -422,10 +418,6 @@ export default function App() {
       projectName: activeProject?.name ?? "project",
     });
     updateCanvasSession(activeSession.id, () => result.session);
-    setWorkspace((current) => ({
-      ...current,
-      changesets: { ...current.changesets, [result.node.changesetId]: createMockChangeset(result.node) },
-    }));
     setBottomGoal("");
   }
 
@@ -516,10 +508,6 @@ export default function App() {
         )
         .concat(node),
       edges: [...session.edges, { id: `edge-${id}-${target.id}`, source: id, target: target.id }],
-    }));
-    setWorkspace((current) => ({
-      ...current,
-      changesets: { ...current.changesets, [node.changesetId]: createMockChangeset(node) },
     }));
   }
 
@@ -626,6 +614,7 @@ export default function App() {
       {selectedNode && activeSession?.kind === "canvas" && (
         <NodeModal
           node={selectedNode}
+          projectRoot={activeProject.rootPath}
           tab={modalTab}
           onTab={setModalTab}
           onClose={() => setSelectedNodeId(null)}
@@ -1843,6 +1832,7 @@ function runtimeMatchesStatus(runtime: NodeRuntimeState, status: NodeStatus): bo
 
 function NodeModal({
   node,
+  projectRoot,
   tab,
   onTab,
   onClose,
@@ -1854,6 +1844,7 @@ function NodeModal({
   onDecisionAnswer,
 }: {
   node: CanvasNode;
+  projectRoot: string;
   tab: NodeModalTab;
   onTab: (tab: NodeModalTab) => void;
   onClose: () => void;
@@ -1950,7 +1941,7 @@ function NodeModal({
         </nav>
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
-          {tab === "Changes" && <ChangesTab node={node} />}
+          {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} />}
           {tab === "Context" && <ContextTab node={node} />}
         </div>
       </section>
@@ -2085,7 +2076,7 @@ function UserDecisionPanel({
   );
 }
 
-function ChangesTab({ node }: { node: CanvasNode }) {
+function ChangesTab({ node, projectRoot }: { node: CanvasNode; projectRoot: string }) {
   const [changeset, setChangeset] = useState<Changeset | null>(null);
   const [diffHtml, setDiffHtml] = useState("");
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -2097,16 +2088,29 @@ function ChangesTab({ node }: { node: CanvasNode }) {
   useEffect(() => {
     let active = true;
     setChangeset(null);
-    void mockChangesetService.getChangeset(node).then((value) => {
-      if (active) setChangeset(value);
-    });
+    setDiffHtml("");
+    setDiffError(null);
+    if (!window.devflow) {
+      setChangeset(unavailableChangeset(node));
+      return () => {
+        active = false;
+      };
+    }
+    void window.devflow.getChangeset(projectRoot, node)
+      .then((value) => {
+        if (active) setChangeset(value.changeset);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setChangeset(unavailableChangeset(node, error instanceof Error ? error.message : "Unable to load changeset."));
+      });
     return () => {
       active = false;
     };
-  }, [node]);
+  }, [node, projectRoot, refreshVersion]);
 
   useEffect(() => {
-    if (!changeset) return;
+    if (!changeset || !hasAvailableChangeEvidence(changeset)) return;
 
     let active = true;
     setDiffLoading(true);
@@ -2136,7 +2140,6 @@ function ChangesTab({ node }: { node: CanvasNode }) {
     options.richPreview,
     options.wordDiffs,
     options.wordWrap,
-    refreshVersion,
   ]);
 
   function setDiffOption<K extends keyof ChangesDiffViewOptions>(key: K, value: ChangesDiffViewOptions[K]) {
@@ -2151,6 +2154,26 @@ function ChangesTab({ node }: { node: CanvasNode }) {
   }
 
   if (!changeset) return <p>Loading changes...</p>;
+  const hasChangeEvidence = hasAvailableChangeEvidence(changeset);
+
+  if (!hasChangeEvidence) {
+    return (
+      <section className="changes-review" aria-label="Code changes review">
+        <header className="changes-summary">
+          <div className="changes-summary-copy">
+            <p className="eyebrow">Source: {changeset.source}</p>
+            <h3>Git changeset evidence</h3>
+            <p>{changeReviewSummary(node, changeset)}</p>
+          </div>
+        </header>
+        <div className="changes-empty" role={changeset.evidence?.status === "failed" ? "alert" : undefined}>
+          {changeset.evidence?.status === "failed"
+            ? changeset.evidence.errorReason ?? "Unable to collect git changeset evidence."
+            : "No available change evidence."}
+        </div>
+      </section>
+    );
+  }
 
   const diffShellClassName = [
     "diff2html-shell",
@@ -2163,8 +2186,8 @@ function ChangesTab({ node }: { node: CanvasNode }) {
     <section className="changes-review" aria-label="Code changes review">
       <header className="changes-summary">
         <div className="changes-summary-copy">
-          <p className="eyebrow">Turn Summary</p>
-          <h3>{changeset.source === "git" ? "Worktree diff review" : "Task diff preview"}</h3>
+          <p className="eyebrow">Source: {changeset.source}</p>
+          <h3>Git changeset evidence</h3>
           <p>{changeReviewSummary(node, changeset)}</p>
         </div>
         <div className="diff-stat" aria-label="Diff statistics">
@@ -2207,9 +2230,35 @@ function ChangesTab({ node }: { node: CanvasNode }) {
 
 function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
   const agent = agentIdentityForNode(node);
-  const source = changeset.source === "git" ? "git worktree" : "mock adapter";
   const fileLabel = changeset.diffStat.changed === 1 ? "file" : "files";
-  return `${agent} produced ${changeset.id} from the ${source}: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
+  if (changeset.evidence?.status === "empty") return `${agent} has no available change evidence for ${changeset.id}.`;
+  if (changeset.evidence?.status === "failed") return `${agent} has no usable git changeset for ${changeset.id}.`;
+  if (changeset.evidence?.status === "unknown") return `${agent} has unknown change evidence for ${changeset.id}.`;
+  return `${agent} produced ${changeset.id} from git: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
+}
+
+function hasAvailableChangeEvidence(changeset: Changeset): boolean {
+  return changeset.source === "git" && changeset.evidence?.status === "available" && changeset.files.length > 0;
+}
+
+function unavailableChangeset(node: CanvasNode, reason?: string): Changeset {
+  return {
+    id: node.changesetId,
+    files: [],
+    diffStat: { added: 0, changed: 0, deleted: 0 },
+    patchPreview: "",
+    source: "git",
+    evidence: {
+      evidenceId: `changeset-evidence-${node.changesetId}`,
+      changesetId: node.changesetId,
+      source: "git",
+      status: reason ? "failed" : "unknown",
+      files: [],
+      diffStat: { added: 0, changed: 0, deleted: 0 },
+      patchPreviewTruncated: false,
+      ...(reason ? { errorReason: reason } : {}),
+    },
+  };
 }
 
 function ChangesDiffToolbar({
@@ -2489,7 +2538,7 @@ function createSession(projectId: string, goal: string, mode: WorkflowMode): Can
 
 function changesetsForSession(session: CanvasSessionTab): WorkspaceState["changesets"] {
   if (session.kind !== "canvas") return {};
-  return Object.fromEntries(session.nodes.map((node) => [node.changesetId, createMockChangeset(node)]));
+  return {};
 }
 
 function advanceMockRun(session: CanvasSession): CanvasSession {

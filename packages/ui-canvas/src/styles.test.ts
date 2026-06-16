@@ -102,6 +102,17 @@ describe("SkyTurn UI style tokens", () => {
     expect(styles).not.toContain(".diff-row-separator");
   });
 
+  it("loads real Changes evidence through IPC instead of seeding mock changesets", async () => {
+    const appSource = await readSource("./App.tsx");
+    const persistenceSource = await readSource("../../persistence/src/index.ts");
+
+    expect(appSource).toContain("getChangeset");
+    expect(appSource).toContain("No available change evidence.");
+    expect(persistenceSource).toContain("getChangeset");
+    expect(appSource).not.toContain("mockChangesetService");
+    expect(appSource).not.toContain("createMockChangeset");
+  });
+
   it("keeps split diff readable inside the node detail drawer", async () => {
     const styles = await readSource("./styles.css");
     const diff2htmlStyles = styles.slice(styles.indexOf(".diff2html-shell"), styles.indexOf(".changes-empty"));

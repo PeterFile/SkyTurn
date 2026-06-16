@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@skyturn/agent-bridge": "workspace:*",
+    "@skyturn/git-worktree": "workspace:*",
     "@skyturn/orchestrator": "workspace:*",
     "@skyturn/persistence": "workspace:*",
     "@skyturn/planner": "workspace:*",

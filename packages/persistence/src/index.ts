@@ -36,6 +36,7 @@ export interface DevflowApi {
   getRunEvents: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; events: RunEvent[] }>;
   listAgentRuns: () => Promise<{ protocolVersion: number; runs: AgentRun[] }>;
   getRunEvidence: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;
+  getChangeset: (projectRoot: string, node: CanvasNode) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   applyWorkflowIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown }>;
   getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown }>;
   getWorkflowEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;

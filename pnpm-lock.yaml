@@ -17,6 +17,9 @@ importers:
       '@skyturn/agent-bridge':
         specifier: workspace:*
         version: link:../../packages/agent-bridge
+      '@skyturn/git-worktree':
+        specifier: workspace:*
+        version: link:../../packages/git-worktree
       '@skyturn/orchestrator':
         specifier: workspace:*
         version: link:../../packages/orchestrator
@@ -105,6 +108,9 @@ importers:
         specifier: workspace:*
         version: link:../project-core
     devDependencies:
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
       typescript:
         specifier: ^6.0.3
         version: 6.0.3

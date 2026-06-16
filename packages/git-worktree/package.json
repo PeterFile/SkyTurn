@@ -10,6 +10,11 @@
       "types": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./src/node.ts",
+      "import": "./dist/node.js",
+      "default": "./dist/node.js"
     }
   },
   "scripts": {
@@ -22,6 +27,7 @@
     "@skyturn/project-core": "workspace:*"
   },
   "devDependencies": {
+    "@types/node": "^25.9.3",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
   }

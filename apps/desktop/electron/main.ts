@@ -176,6 +176,16 @@ ipcMain.handle("run:evidence", async (_event, projectRoot: string, runId: string
   };
 });
 
+ipcMain.handle("changeset:get", async (_event, projectRoot: string, node: unknown) => {
+  assertKnownProjectRoot(projectRoot);
+  const { createGitChangesetService } = await import("@skyturn/git-worktree/node");
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const service = createGitChangesetService({ repoRoot: realProjectRoot });
+  const normalizedNode = await normalizeChangesetNodeForProject(realProjectRoot, node) as Parameters<typeof service.getChangeset>[0];
+  const changeset = await service.getChangeset(normalizedNode);
+  return { protocolVersion: RUN_PROTOCOL_VERSION, changeset };
+});
+
 ipcMain.handle("workflow:applyIntent", async (_event, projectRoot: string, intent: { sessionId?: unknown }) => {
   assertKnownProjectRoot(projectRoot);
   if (typeof intent?.sessionId !== "string") throw new Error("WorkflowIntent sessionId is required.");
@@ -265,6 +275,51 @@ function assertKnownProjectRoot(projectRoot: string): void {
   if (!path.isAbsolute(projectRoot) || !openedProjectRoots.has(projectRoot)) {
     throw new Error("Project root is not open in SkyTurn.");
   }
+}
+
+async function normalizeChangesetNodeForProject(
+  realProjectRoot: string,
+  node: unknown,
+): Promise<unknown> {
+  if (!node || typeof node !== "object") throw new Error("Canvas node is required.");
+  const value = node as { worktree?: unknown };
+  const worktree = value.worktree && typeof value.worktree === "object" ? value.worktree as { path?: unknown } : null;
+  if (!worktree || typeof worktree.path !== "string") throw new Error("Canvas node worktree path is required.");
+  const worktreePath = await resolveChangesetWorktreePath(realProjectRoot, worktree.path);
+  return {
+    ...value,
+    worktree: {
+      ...worktree,
+      path: worktreePath,
+    },
+  };
+}
+
+async function resolveChangesetWorktreePath(
+  realProjectRoot: string,
+  worktreePath: string,
+): Promise<string> {
+  if (!path.isAbsolute(worktreePath)) return realProjectRoot;
+  const resolved = await fs.realpath(worktreePath);
+  const projectWorktreesRoot = `${realProjectRoot}.worktrees`;
+  const realProjectWorktreesRoot = await fs.realpath(projectWorktreesRoot).catch(() => null);
+  if (
+    resolved === realProjectRoot ||
+    isPathInside(resolved, realProjectRoot) ||
+    (
+      realProjectWorktreesRoot !== null &&
+      realProjectWorktreesRoot === projectWorktreesRoot &&
+      isPathInside(resolved, realProjectWorktreesRoot)
+    )
+  ) {
+    return resolved;
+  }
+  throw new Error("Changeset worktree path is outside the opened project boundary.");
+}
+
+function isPathInside(candidate: string, parent: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
 function rememberProjectRoots(state: unknown): void {

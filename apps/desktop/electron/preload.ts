@@ -15,6 +15,7 @@ contextBridge.exposeInMainWorld("devflow", {
   getRunEvents: (projectRoot: string, runId: string) => ipcRenderer.invoke("run:events", projectRoot, runId),
   listAgentRuns: () => ipcRenderer.invoke("run:list"),
   getRunEvidence: (projectRoot: string, runId: string) => ipcRenderer.invoke("run:evidence", projectRoot, runId),
+  getChangeset: (projectRoot: string, node: unknown) => ipcRenderer.invoke("changeset:get", projectRoot, node),
   applyWorkflowIntent: (projectRoot: string, intent: unknown) => ipcRenderer.invoke("workflow:applyIntent", projectRoot, intent),
   getWorkflowProjection: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:projection", projectRoot, sessionId),
   getWorkflowEvents: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:events", projectRoot, sessionId),
