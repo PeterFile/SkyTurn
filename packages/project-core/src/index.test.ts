@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   AGENT_SUPPORT_LEVELS,
+  EVIDENCE_CHECK_KINDS,
   RUN_EVENT_PROTOCOL_VERSION,
   deriveNodeStatusFromEvidence,
   hasConcreteRunEvidence,
   type AgentDescriptor,
   type AgentRun,
+  type EvidenceCheck,
   type RunEvent,
   type RunEvidence,
 } from "./index";
@@ -40,6 +42,18 @@ describe("agent run contracts", () => {
 
     expect(event.protocolVersion).toBe(1);
     expect(event.seq).toBe(1);
+  });
+
+  it("allows run-timeout evidence checks for hard watchdog expiry", () => {
+    const check: EvidenceCheck = {
+      kind: "run-timeout",
+      name: "Codex CLI watchdog",
+      status: "failed",
+      detail: "timed out after 1800000ms",
+    };
+
+    expect(check.kind).toBe("run-timeout");
+    expect(EVIDENCE_CHECK_KINDS).toContain("run-timeout");
   });
 
   it("does not complete a node from agent text without concrete evidence", () => {

@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { access, appendFile, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { delimiter, join } from "node:path";
-import { createInterface } from "node:readline";
+import { createInterface, type Interface } from "node:readline";
 
 import type {
   AgentRunHandle,
@@ -35,6 +35,16 @@ const commandCandidates: Record<AgentKind, string[]> = {
 };
 const defaultKillTimeoutMs = 5_000;
 const defaultStallTelemetryMs = 60_000;
+const defaultRunWatchdogTimeoutMs = 30 * 60_000;
+
+interface AgentRunWatchdogPolicy {
+  source: AgentKind;
+  commandLabel: string;
+  timeoutCheckName: string;
+  timeoutMs: number;
+  stallTelemetryMs: number;
+  killTimeoutMs: number;
+}
 
 export interface DiscoveryOptions {
   pathValue?: string;
@@ -55,6 +65,7 @@ export interface CodexCliAdapterOptions {
   executablePath?: string;
   sandbox?: CodexCliSandbox;
   timeoutMs?: number;
+  defaultWatchdogTimeoutMs?: number;
   killTimeoutMs?: number;
   stallTelemetryMs?: number;
   env?: NodeJS.ProcessEnv;
@@ -64,6 +75,10 @@ export interface CodexCliAdapterOptions {
 
 export interface HermesCliAdapterOptions {
   executablePath?: string;
+  timeoutMs?: number;
+  defaultWatchdogTimeoutMs?: number;
+  killTimeoutMs?: number;
+  stallTelemetryMs?: number;
   env?: NodeJS.ProcessEnv;
   extraArgs?: string[];
   pathValue?: string;
@@ -159,12 +174,24 @@ export class AgentBridge {
   async cancelRun(runId: string, reason = "Run cancelled"): Promise<RunEvidence> {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`Unknown run ${runId}`);
-    await this.handles.get(runId)?.cancel(reason);
-    await this.recordEvent(runId, {
-      kind: "status",
-      payload: { status: "cancelled", reason },
-    });
-    const events = await loadRunEvents(run.projectRoot, runId);
+    let cancelError: unknown = null;
+    try {
+      await this.handles.get(runId)?.cancel(reason);
+    } catch (error) {
+      cancelError = error;
+    }
+    let events = await loadRunEvents(run.projectRoot, runId);
+    if (!events.some(isFinalStatusEvent)) {
+      try {
+        await this.recordEvent(runId, {
+          kind: "status",
+          payload: { status: "cancelled", reason },
+        });
+      } catch (statusError) {
+        throw cancelError ?? statusError;
+      }
+      events = await loadRunEvents(run.projectRoot, runId);
+    }
     return deriveEvidenceFromEvents(this.runs.get(runId) ?? run, events);
   }
 
@@ -192,7 +219,13 @@ export class AgentBridge {
     await appendRunEvent(run.projectRoot, event);
     if (event.kind === "output") await writeTaskOutputFromEvents(run.projectRoot, run.nodeId, runId);
     this.updateRunFromEvent(run, event);
-    for (const listener of this.listeners) listener(event);
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+        // Listener failures must not affect durable run state.
+      }
+    }
     return event;
   }
 
@@ -200,6 +233,7 @@ export class AgentBridge {
     if (event.kind !== "status") return;
     const status = event.payload.status;
     if (!isRunStatus(status)) return;
+    if (isFinalRunStatus(run.status) && !isFinalRunStatus(status)) return;
     this.runs.set(run.id, {
       ...run,
       status,
@@ -228,6 +262,7 @@ export function createMockAgentAdapter(options: { holdOpen?: boolean } = {}): Lo
       };
     },
     async startRun(input, sink) {
+      let finalized = false;
       await sink.emit({
         kind: "output",
         payload: { text: `Mock run accepted for ${input.nodeId}.` },
@@ -245,9 +280,21 @@ export function createMockAgentAdapter(options: { holdOpen?: boolean } = {}): Lo
           },
         });
         await sink.emit({ kind: "status", payload: { status: "succeeded", exitCode: 0 } });
+        finalized = true;
       }
       return {
-        async cancel() {},
+        async cancel(reason) {
+          if (finalized) return;
+          finalized = true;
+          await sink.emit({
+            kind: "evidence",
+            payload: {
+              exitCode: null,
+              checks: [{ kind: "run-exit", name: "Mock adapter exit", status: "skipped", detail: reason }],
+            },
+          });
+          await sink.emit({ kind: "status", payload: { status: "cancelled", reason } });
+        },
       };
     },
   };
@@ -262,6 +309,139 @@ export async function loadRunEvents(projectRoot: string, runId: string): Promise
       .map((line) => JSON.parse(line) as RunEvent);
   } catch {
     return [];
+  }
+}
+
+class AgentRunWatchdog {
+  private finalized = false;
+  private killTimer: NodeJS.Timeout | null = null;
+  private timeoutTimer: NodeJS.Timeout | null = null;
+  private stallTimer: NodeJS.Timeout | null = null;
+  private lastActivityAt = Date.now();
+
+  constructor(
+    private readonly child: ChildProcess,
+    private readonly policy: AgentRunWatchdogPolicy,
+    private readonly emit: (draft: RunEventDraft) => Promise<RunEvent>,
+    private readonly drain: () => Promise<void>,
+    private readonly stopChildOutput: () => void,
+  ) {}
+
+  start(): void {
+    this.markActivity();
+    this.scheduleStallTelemetry();
+    if (this.policy.timeoutMs <= 0) return;
+    this.timeoutTimer = setTimeout(() => {
+      void this.expire();
+    }, this.policy.timeoutMs);
+  }
+
+  markActivity(): void {
+    this.lastActivityAt = Date.now();
+  }
+
+  isFinalized(): boolean {
+    return this.finalized;
+  }
+
+  async cancel(reason: string): Promise<void> {
+    if (!this.tryFinalize()) return;
+    this.scheduleKill();
+    await this.drain();
+    await this.emit({
+      kind: "evidence",
+      payload: {
+        exitCode: null,
+        checks: [
+          {
+            kind: "run-exit",
+            name: `${this.policy.commandLabel} exit`,
+            status: "skipped",
+            detail: reason,
+          },
+        ],
+      },
+    });
+    await this.emit({ kind: "status", payload: { status: "cancelled", reason } });
+  }
+
+  async finalizeChildClose(): Promise<boolean> {
+    await this.drain();
+    return this.tryFinalize();
+  }
+
+  tryFinalize(): boolean {
+    if (this.finalized) return false;
+    this.finalized = true;
+    this.clearLifecycleTimers();
+    this.stopChildOutput();
+    return true;
+  }
+
+  private async expire(): Promise<void> {
+    if (!this.tryFinalize()) return;
+    this.scheduleKill();
+    await this.drain();
+    await this.emit({
+      kind: "evidence",
+      payload: {
+        exitCode: null,
+        checks: [
+          {
+            kind: "run-timeout",
+            name: this.policy.timeoutCheckName,
+            status: "failed",
+            detail: `timed out after ${this.policy.timeoutMs}ms`,
+          },
+        ],
+      },
+    });
+    await this.emit({
+      kind: "status",
+      payload: {
+        status: "timed-out",
+        reason: `${this.policy.commandLabel} timed out after ${this.policy.timeoutMs}ms`,
+      },
+    });
+  }
+
+  private scheduleStallTelemetry(): void {
+    if (this.policy.stallTelemetryMs <= 0 || this.finalized) return;
+    this.stallTimer = setTimeout(() => {
+      void (async () => {
+        if (this.finalized) return;
+        const idleMs = Date.now() - this.lastActivityAt;
+        if (idleMs >= this.policy.stallTelemetryMs) {
+          await this.emit({
+            kind: "progress",
+            payload: {
+              source: this.policy.source,
+              phase: "stalled",
+              status: "running",
+              idleMs,
+              detail: `${this.policy.commandLabel} still running after ${idleMs}ms without output.`,
+            },
+          });
+        }
+        this.scheduleStallTelemetry();
+      })();
+    }, this.policy.stallTelemetryMs);
+  }
+
+  private scheduleKill(): void {
+    if (this.killTimer) clearTimeout(this.killTimer);
+    terminateProcessTree(this.child, "SIGTERM", { forceProcessGroup: true });
+    this.killTimer = setTimeout(() => {
+      terminateProcessTree(this.child, "SIGKILL", { forceProcessGroup: true });
+    }, this.policy.killTimeoutMs);
+    this.killTimer.unref();
+  }
+
+  private clearLifecycleTimers(): void {
+    if (this.timeoutTimer) clearTimeout(this.timeoutTimer);
+    if (this.stallTimer) clearTimeout(this.stallTimer);
+    this.timeoutTimer = null;
+    this.stallTimer = null;
   }
 }
 
@@ -317,77 +497,50 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      let cancelled = false;
-      let cancelReason = "";
       let spawnFailed = false;
-      let finalized = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
-      let killTimer: NodeJS.Timeout | null = null;
-      const timeoutMs = options.timeoutMs;
-      const killTimeoutMs = options.killTimeoutMs ?? defaultKillTimeoutMs;
-      const stallTelemetryMs = options.stallTelemetryMs ?? defaultStallTelemetryMs;
-      let timeoutTimer: NodeJS.Timeout | null = null;
-      let stallTimer: NodeJS.Timeout | null = null;
-      let lastActivityAt = Date.now();
-
-      const markActivity = () => {
-        lastActivityAt = Date.now();
-      };
-      const clearLifecycleTimers = (options: { clearKillTimer?: boolean } = {}) => {
-        if (timeoutTimer) clearTimeout(timeoutTimer);
-        if (stallTimer) clearTimeout(stallTimer);
-        if (options.clearKillTimer !== false && killTimer) clearTimeout(killTimer);
-      };
-      const scheduleKill = () => {
-        if (killTimer) clearTimeout(killTimer);
-        terminateProcessTree(child, "SIGTERM");
-        killTimer = setTimeout(() => {
-          terminateProcessTree(child, "SIGKILL", { forceProcessGroup: true });
-        }, killTimeoutMs);
-      };
-      const scheduleStallTelemetry = () => {
-        if (stallTelemetryMs <= 0) return;
-        stallTimer = setTimeout(() => {
-          void (async () => {
-            if (finalized) return;
-            const idleMs = Date.now() - lastActivityAt;
-            if (idleMs >= stallTelemetryMs) {
-              await emit({
-                kind: "progress",
-                payload: {
-                  source: "codex",
-                  phase: "stalled",
-                  status: "running",
-                  idleMs,
-                  detail: `Codex CLI still running after ${idleMs}ms without a hard timeout.`,
-                },
-              });
-            }
-            scheduleStallTelemetry();
-          })();
-        }, stallTelemetryMs);
-      };
+      const outputReaders: Interface[] = [];
+      const watchdog = new AgentRunWatchdog(
+        child,
+        {
+          source: "codex",
+          commandLabel: "Codex CLI",
+          timeoutCheckName: "Codex CLI watchdog",
+          timeoutMs: options.timeoutMs ?? options.defaultWatchdogTimeoutMs ?? defaultRunWatchdogTimeoutMs,
+          stallTelemetryMs: options.stallTelemetryMs ?? defaultStallTelemetryMs,
+          killTimeoutMs: options.killTimeoutMs ?? defaultKillTimeoutMs,
+        },
+        emit,
+        drain,
+        () => closeReadlineInterfaces(outputReaders),
+      );
 
       await emit({
         kind: "progress",
         payload: { source: "codex", phase: "started", command: "codex exec" },
       });
-      markActivity();
-      scheduleStallTelemetry();
+      watchdog.start();
 
       if (child.stdout) {
         const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity });
+        outputReaders.push(stdout);
         stdout.on("line", (line) => {
-          markActivity();
-          for (const draft of codexStdoutLineToDrafts(line)) void emit(draft);
+          if (watchdog.isFinalized()) return;
+          watchdog.markActivity();
+          for (const draft of codexStdoutLineToDrafts(line)) {
+            if (watchdog.isFinalized()) return;
+            void emit(draft);
+          }
         });
       }
 
       if (child.stderr) {
         const stderr = createInterface({ input: child.stderr, crlfDelay: Infinity });
+        outputReaders.push(stderr);
         stderr.on("line", (line) => {
+          if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
-          markActivity();
+          watchdog.markActivity();
           void emit({
             kind: "progress",
             payload: { source: "codex", stream: "stderr", format: "text", text: line },
@@ -397,9 +550,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
 
       child.once("error", (error) => {
         spawnFailed = true;
-        if (finalized) return;
-        finalized = true;
-        clearLifecycleTimers();
+        if (!watchdog.tryFinalize()) return;
         void emit({
           kind: "error",
           payload: { source: "codex", message: error.message, code: error.name },
@@ -409,28 +560,8 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
 
       child.once("close", (code, signal) => {
         void (async () => {
-          await drain();
-          clearLifecycleTimers({ clearKillTimer: !killTimer });
-          if (finalized) return;
-          finalized = true;
+          if (!(await watchdog.finalizeChildClose())) return;
           if (spawnFailed) return;
-          if (cancelled) {
-            await emit({
-              kind: "evidence",
-              payload: {
-                exitCode: typeof code === "number" ? code : null,
-                checks: [
-                  {
-                    kind: "run-exit",
-                    name: "Codex CLI exit",
-                    status: "skipped",
-                    detail: cancelReason || formatExitDetail(code, signal),
-                  },
-                ],
-              },
-            });
-            return;
-          }
           const exitCode = typeof code === "number" ? code : null;
           const checkStatus = exitCode === 0 ? "passed" : "failed";
           await emit({
@@ -458,44 +589,9 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         })();
       });
 
-      if (typeof timeoutMs === "number" && timeoutMs > 0) {
-        timeoutTimer = setTimeout(() => {
-          void (async () => {
-            if (finalized) return;
-            finalized = true;
-            if (stallTimer) clearTimeout(stallTimer);
-            await drain();
-            await emit({
-              kind: "evidence",
-              payload: {
-                exitCode: null,
-                checks: [
-                  {
-                    kind: "run-timeout",
-                    name: "Codex CLI timeout",
-                    status: "failed",
-                    detail: `timed out after ${timeoutMs}ms`,
-                  },
-                ],
-              },
-            });
-            await emit({
-              kind: "status",
-              payload: { status: "timed-out", reason: `Codex CLI timed out after ${timeoutMs}ms` },
-            });
-            scheduleKill();
-          })();
-        }, timeoutMs);
-        timeoutTimer.unref();
-      }
-
       return {
         async cancel(reason) {
-          cancelled = true;
-          cancelReason = reason;
-          if (timeoutTimer) clearTimeout(timeoutTimer);
-          if (stallTimer) clearTimeout(stallTimer);
-          scheduleKill();
+          await watchdog.cancel(reason);
         },
       };
     },
@@ -540,10 +636,23 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      let cancelled = false;
-      let cancelReason = "";
       let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
+      const outputReaders: Interface[] = [];
+      const watchdog = new AgentRunWatchdog(
+        child,
+        {
+          source: "hermes",
+          commandLabel: "Hermes CLI",
+          timeoutCheckName: "Hermes CLI watchdog",
+          timeoutMs: options.timeoutMs ?? options.defaultWatchdogTimeoutMs ?? defaultRunWatchdogTimeoutMs,
+          stallTelemetryMs: options.stallTelemetryMs ?? defaultStallTelemetryMs,
+          killTimeoutMs: options.killTimeoutMs ?? defaultKillTimeoutMs,
+        },
+        emit,
+        drain,
+        () => closeReadlineInterfaces(outputReaders),
+      );
 
       await emit({
         kind: "progress",
@@ -563,11 +672,15 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
             : {}),
         },
       });
+      watchdog.start();
 
       if (child.stdout) {
         const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity });
+        outputReaders.push(stdout);
         stdout.on("line", (line) => {
+          if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
+          watchdog.markActivity();
           void emit({
             kind: "output",
             payload: { source: "hermes", text: line },
@@ -577,8 +690,11 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
 
       if (child.stderr) {
         const stderr = createInterface({ input: child.stderr, crlfDelay: Infinity });
+        outputReaders.push(stderr);
         stderr.on("line", (line) => {
+          if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
+          watchdog.markActivity();
           void emit({
             kind: "progress",
             payload: { source: "hermes", stream: "stderr", format: "text", text: line },
@@ -588,6 +704,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
 
       child.once("error", (error) => {
         spawnFailed = true;
+        if (!watchdog.tryFinalize()) return;
         void emit({
           kind: "error",
           payload: { source: "hermes", message: error.message, code: error.name },
@@ -597,27 +714,9 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
 
       child.once("close", (code, signal) => {
         void (async () => {
-          await drain();
+          if (!(await watchdog.finalizeChildClose())) return;
           if (spawnFailed) return;
           const exitCode = typeof code === "number" ? code : null;
-          if (cancelled) {
-            await emit({
-              kind: "evidence",
-              payload: {
-                exitCode,
-                checks: [
-                  {
-                    kind: "run-exit",
-                    name: "Hermes CLI exit",
-                    status: "skipped",
-                    detail: cancelReason || formatExitDetail(code, signal),
-                  },
-                ],
-              },
-            });
-            await emit({ kind: "status", payload: { status: "cancelled", reason: cancelReason } });
-            return;
-          }
           const checkStatus = exitCode === 0 ? "passed" : "failed";
           await emit({
             kind: "evidence",
@@ -646,9 +745,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
 
       return {
         async cancel(reason) {
-          cancelled = true;
-          cancelReason = reason;
-          terminateProcessTree(child, "SIGTERM");
+          await watchdog.cancel(reason);
         },
       };
     },
@@ -675,6 +772,13 @@ function terminateProcessTree(
   }
 }
 
+function closeReadlineInterfaces(readers: Interface[]): void {
+  for (const reader of readers) {
+    reader.removeAllListeners("line");
+    reader.close();
+  }
+}
+
 export async function readTaskOutput(projectRoot: string, nodeId: string): Promise<string> {
   try {
     return await readFile(taskOutputPath(projectRoot, nodeId), "utf8");
@@ -696,10 +800,14 @@ export function deriveEvidenceFromEvents(run: AgentRun, events: RunEvent[]): Run
 
   for (const event of events) {
     if (event.kind === "status" && isRunStatus(event.payload.status)) {
-      status = event.payload.status;
-      exitCode = typeof event.payload.exitCode === "number" ? event.payload.exitCode : exitCode;
-      cancelReason = typeof event.payload.reason === "string" ? event.payload.reason : cancelReason;
-      completedAt = isFinalRunStatus(status) ? event.timestamp : completedAt;
+      const nextStatus = event.payload.status;
+      if (!isFinalRunStatus(status) || isFinalRunStatus(nextStatus)) {
+        status = nextStatus;
+        exitCode = typeof event.payload.exitCode === "number" ? event.payload.exitCode : exitCode;
+        cancelReason =
+          status === "cancelled" && typeof event.payload.reason === "string" ? event.payload.reason : cancelReason;
+        completedAt = isFinalRunStatus(status) ? event.timestamp : completedAt;
+      }
     }
     if (event.kind === "error") {
       status = "failed";
@@ -895,6 +1003,10 @@ function isRunStatus(value: unknown): value is AgentRunStatus {
     value === "cancelled" ||
     value === "timed-out"
   );
+}
+
+function isFinalStatusEvent(event: RunEvent): boolean {
+  return event.kind === "status" && isRunStatus(event.payload.status) && isFinalRunStatus(event.payload.status);
 }
 
 function isFinalRunStatus(status: AgentRunStatus): boolean {

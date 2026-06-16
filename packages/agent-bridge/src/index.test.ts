@@ -1,9 +1,9 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RunEvent } from "@skyturn/project-core";
+import type { AgentRun, RunEvent } from "@skyturn/project-core";
 import { reduceWorkflowEvents, type FlowEvent } from "@skyturn/workflow-kernel";
 
 import {
@@ -20,6 +20,7 @@ import {
 } from "./index";
 
 const roots: string[] = [];
+const testDefaultWatchdogTimeoutMs = 250;
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -165,6 +166,61 @@ describe("agent bridge", () => {
     expect(output).toContain("Mock run accepted");
     expect(evidence.status).toBe("cancelled");
     expect(evidence.cancelReason).toBe("User stopped the run");
+  });
+
+  it("records terminal cancel status when adapter cancel persistence observers throw", async () => {
+    const projectRoot = await makeTempRoot();
+    const bridge = new AgentBridge({
+      adapters: [createMockAgentAdapter({ holdOpen: true })],
+    });
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-cancel-observer-throws",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: join(projectRoot, ".worktrees/node-cancel-observer-throws"),
+      agentKind: "codex",
+      prompt: "Hold",
+    });
+    const unsubscribe = bridge.onRunEvent((event) => {
+      if (event.kind === "evidence") throw new Error("observer failed");
+    });
+
+    try {
+      const evidence = await bridge.cancelRun(run.id, "User stopped the run");
+      const events = await loadRunEvents(projectRoot, run.id);
+
+      expect(evidence.status).toBe("cancelled");
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "status",
+          payload: expect.objectContaining({ status: "cancelled" }),
+        }),
+      );
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("keeps persisted custom review evidence kinds", () => {
+    const run = makeRun("run-review-custom");
+    const events: RunEvent[] = [
+      event("run-review-custom", 1, "evidence", {
+        review: {
+          kind: "policy-review",
+          name: "Architecture review",
+          status: "failed",
+          detail: "Preserved from older persisted events.",
+        },
+      }),
+    ];
+
+    expect(deriveEvidenceFromEvents(run, events).review).toEqual({
+      kind: "policy-review",
+      name: "Architecture review",
+      status: "failed",
+      detail: "Preserved from older persisted events.",
+    });
   });
 
   it("runs Codex CLI exec as JSONL and maps agent messages to durable output", async () => {
@@ -348,7 +404,7 @@ describe("agent bridge", () => {
     expect(args.argv[sandboxIndex + 1]).toBe("danger-full-access");
   });
 
-  it("does not apply a default hard timeout to Codex CLI runs and emits stalled telemetry", async () => {
+  it("emits non-terminal stalled telemetry before the Codex CLI hard timeout", async () => {
     const projectRoot = await makeTempRoot();
     await mkdir(join(projectRoot, ".git"));
     const binRoot = await makeTempRoot();
@@ -407,6 +463,79 @@ describe("agent bridge", () => {
 
     unsubscribe();
     await bridge.cancelRun(run.id, "test cleanup");
+  });
+
+  it("times out a Codex CLI run through the default watchdog", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          defaultWatchdogTimeoutMs: testDefaultWatchdogTimeoutMs,
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+    const events: RunEvent[] = [];
+    const unsubscribe = bridge.onRunEvent((event) => events.push(event));
+    const timedOut = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "timed-out",
+    );
+    let run: Awaited<ReturnType<AgentBridge["startRun"]>> | null = null;
+
+    try {
+      run = await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: "node-codex-default-timeout",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "codex",
+        prompt: "Hang forever",
+      });
+      await timedOut;
+
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "evidence",
+          payload: expect.objectContaining({
+            exitCode: null,
+            checks: [
+              {
+                kind: "run-timeout",
+                name: "Codex CLI watchdog",
+                status: "failed",
+                detail: `timed out after ${testDefaultWatchdogTimeoutMs}ms`,
+              },
+            ],
+          }),
+        }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "status",
+          payload: expect.objectContaining({ status: "timed-out" }),
+        }),
+      );
+    } finally {
+      unsubscribe();
+      if (run && !events.some((event) => event.kind === "status" && event.payload.status === "timed-out")) {
+        await bridge.cancelRun(run.id, "test cleanup");
+      }
+    }
   });
 
   it("allocates a new attempt run id and event path when retrying the same node", async () => {
@@ -478,7 +607,8 @@ describe("agent bridge", () => {
       adapters: [
         createCodexCliAdapter({
           executablePath: codexPath,
-          timeoutMs: 250,
+          defaultWatchdogTimeoutMs: 5_000,
+          timeoutMs: 500,
           killTimeoutMs: 100,
         }),
       ],
@@ -486,6 +616,13 @@ describe("agent bridge", () => {
     const timedOut = waitForEvent(
       bridge,
       (event) => event.kind === "status" && event.payload.status === "timed-out",
+    );
+    const outputStarted = waitForEvent(
+      bridge,
+      (event) =>
+        event.kind === "output" &&
+        typeof event.payload.text === "string" &&
+        event.payload.text.includes("started but never closed"),
     );
 
     const run = await bridge.startRun({
@@ -497,6 +634,7 @@ describe("agent bridge", () => {
       agentKind: "codex",
       prompt: "Hang forever",
     });
+    await outputStarted;
     await timedOut;
 
     const events = await loadRunEvents(projectRoot, run.id);
@@ -507,10 +645,120 @@ describe("agent bridge", () => {
     expect(evidence.status).toBe("timed-out");
     expect(evidence.checks).toContainEqual({
       kind: "run-timeout",
-      name: "Codex CLI timeout",
+      name: "Codex CLI watchdog",
       status: "failed",
-      detail: "timed out after 250ms",
+      detail: "timed out after 500ms",
     });
+    expect(events.filter((event) => event.kind === "evidence").length).toBe(1);
+    expect(events.filter((event) => event.kind === "status" && event.payload.status === "timed-out").length).toBe(1);
+  });
+
+  it("does not let late Codex stdout status overwrite a timed-out run", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "process.on('SIGTERM', () => {",
+        "  process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "});",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          timeoutMs: 250,
+          killTimeoutMs: 1_000,
+        }),
+      ],
+    });
+    const timedOut = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "timed-out",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-late-output-timeout",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Hang then emit after timeout",
+    });
+    await timedOut;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const timedOutIndex = events.findIndex((event) => event.kind === "status" && event.payload.status === "timed-out");
+    expect(timedOutIndex).toBeGreaterThanOrEqual(0);
+    expect(events.slice(timedOutIndex + 1)).not.toContainEqual(
+      expect.objectContaining({
+        kind: "status",
+        payload: expect.objectContaining({ status: "running" }),
+      }),
+    );
+    expect(deriveEvidenceFromEvents(run, events).status).toBe("timed-out");
+  });
+
+  it("records timed-out status when timeout evidence listeners throw", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          timeoutMs: 250,
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+    const unsubscribe = bridge.onRunEvent((event) => {
+      if (event.kind === "evidence") throw new Error("listener failed");
+    });
+
+    try {
+      const run = await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: "node-codex-timeout-listener-throws",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "codex",
+        prompt: "Hang forever",
+      });
+      await waitForPersistedEvent(projectRoot, run.id, (event) => event.kind === "evidence");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const events = await loadRunEvents(projectRoot, run.id);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "status",
+          payload: expect.objectContaining({ status: "timed-out" }),
+        }),
+      );
+      expect(deriveEvidenceFromEvents(run, events).status).toBe("timed-out");
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("kills Codex child process groups on timeout", async () => {
@@ -538,7 +786,7 @@ describe("agent bridge", () => {
         createCodexCliAdapter({
           executablePath: codexPath,
           env: { SKYTURN_CHILD_PID_PATH: childPidPath },
-          timeoutMs: 250,
+          timeoutMs: 500,
           killTimeoutMs: 250,
         }),
       ],
@@ -557,12 +805,63 @@ describe("agent bridge", () => {
       agentKind: "codex",
       prompt: "Hang with a child process",
     });
+    const childPid = Number(await waitForFile(childPidPath));
     await timedOut;
     await new Promise((resolve) => setTimeout(resolve, 500));
 
-    const childPid = Number(await readFile(childPidPath, "utf8"));
-
     expect(isPidAlive(childPid)).toBe(false);
+  });
+
+  it("kills Codex child processes even when cancel event persistence fails", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const parentPidPath = join(binRoot, "parent.pid");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.SKYTURN_PARENT_PID_PATH, String(process.pid));",
+        "process.on('SIGTERM', () => {});",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: { SKYTURN_PARENT_PID_PATH: parentPidPath },
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-cancel-persistence-fails",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Cancel me",
+    });
+    const parentPid = Number(await waitForFile(parentPidPath));
+    const eventsPath = join(projectRoot, ".devflow", "runs", run.id, "events.ndjson");
+    await chmod(eventsPath, 0o400);
+
+    try {
+      await expect(bridge.cancelRun(run.id, "User stopped the run")).rejects.toThrow();
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+      expect(isPidAlive(parentPid)).toBe(false);
+    } finally {
+      await chmod(eventsPath, 0o600);
+      killPid(parentPid);
+    }
   });
 
   it("kills Codex child process groups on explicit cancel", async () => {
@@ -776,6 +1075,256 @@ describe("agent bridge", () => {
     });
   });
 
+  it("emits non-terminal stalled telemetry before the Hermes CLI hard timeout", async () => {
+    const projectRoot = await makeTempRoot();
+    const binRoot = await makeTempRoot();
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('planning started\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createHermesCliAdapter({
+          executablePath: hermesPath,
+          stallTelemetryMs: 25,
+        }),
+      ],
+    });
+    const events: RunEvent[] = [];
+    const unsubscribe = bridge.onRunEvent((event) => events.push(event));
+    const stalled = waitForEvent(
+      bridge,
+      (event) => event.kind === "progress" && event.payload.phase === "stalled",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes-long",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "hermes",
+      prompt: "Plan as long as needed",
+    });
+    await stalled;
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "progress",
+        payload: expect.objectContaining({
+          source: "hermes",
+          phase: "stalled",
+          status: "running",
+        }),
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: "status",
+        payload: expect.objectContaining({ status: "timed-out" }),
+      }),
+    );
+
+    unsubscribe();
+    await bridge.cancelRun(run.id, "test cleanup");
+  });
+
+  it("times out a Hermes CLI run through the default watchdog", async () => {
+    const projectRoot = await makeTempRoot();
+    const binRoot = await makeTempRoot();
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('planning started\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createHermesCliAdapter({
+          executablePath: hermesPath,
+          defaultWatchdogTimeoutMs: testDefaultWatchdogTimeoutMs,
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+    const events: RunEvent[] = [];
+    const unsubscribe = bridge.onRunEvent((event) => events.push(event));
+    const timedOut = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "timed-out",
+    );
+    let run: Awaited<ReturnType<AgentBridge["startRun"]>> | null = null;
+
+    try {
+      run = await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: "node-hermes-default-timeout",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "hermes",
+        prompt: "Hang forever",
+      });
+      await timedOut;
+
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "evidence",
+          payload: expect.objectContaining({
+            exitCode: null,
+            checks: [
+              {
+                kind: "run-timeout",
+                name: "Hermes CLI watchdog",
+                status: "failed",
+                detail: `timed out after ${testDefaultWatchdogTimeoutMs}ms`,
+              },
+            ],
+          }),
+        }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          kind: "status",
+          payload: expect.objectContaining({ status: "timed-out" }),
+        }),
+      );
+    } finally {
+      unsubscribe();
+      if (run && !events.some((event) => event.kind === "status" && event.payload.status === "timed-out")) {
+        await bridge.cancelRun(run.id, "test cleanup");
+      }
+    }
+  });
+
+  it("lets Hermes CLI timeoutMs override the default watchdog", async () => {
+    const projectRoot = await makeTempRoot();
+    const binRoot = await makeTempRoot();
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('planning started\\n');",
+        "process.on('SIGTERM', () => {});",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createHermesCliAdapter({
+          executablePath: hermesPath,
+          defaultWatchdogTimeoutMs: 5_000,
+          timeoutMs: 250,
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+    const timedOut = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "timed-out",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes-timeout",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "hermes",
+      prompt: "Hang forever",
+    });
+    await timedOut;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    expect(evidence.status).toBe("timed-out");
+    expect(evidence.checks).toContainEqual({
+      kind: "run-timeout",
+      name: "Hermes CLI watchdog",
+      status: "failed",
+      detail: "timed out after 250ms",
+    });
+    expect(events.filter((event) => event.kind === "evidence").length).toBe(1);
+    expect(events.filter((event) => event.kind === "status" && event.payload.status === "timed-out").length).toBe(1);
+  });
+
+  it("kills Hermes child process groups on explicit cancel", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    const binRoot = await makeTempRoot();
+    const parentPidPath = join(binRoot, "hermes-parent.pid");
+    const childPidPath = join(binRoot, "hermes-child.pid");
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "fs.writeFileSync(process.env.SKYTURN_PARENT_PID_PATH, String(process.pid));",
+        "const child = spawn(process.execPath, ['-e', 'process.on(\"SIGTERM\", () => {}); setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_PID_PATH, String(child.pid));",
+        "process.on('SIGTERM', () => {});",
+        "process.stdout.write('planning started\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createHermesCliAdapter({
+          executablePath: hermesPath,
+          env: {
+            SKYTURN_PARENT_PID_PATH: parentPidPath,
+            SKYTURN_CHILD_PID_PATH: childPidPath,
+          },
+          killTimeoutMs: 100,
+        }),
+      ],
+    });
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes-cancel",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "hermes",
+      prompt: "Cancel me",
+    });
+    const parentPid = Number(await waitForFile(parentPidPath));
+    const childPid = Number(await waitForFile(childPidPath));
+
+    try {
+      await bridge.cancelRun(run.id, "User stopped the run");
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+      expect(isPidAlive(parentPid)).toBe(false);
+      expect(isPidAlive(childPid)).toBe(false);
+      const events = await loadRunEvents(projectRoot, run.id);
+      const evidence = deriveEvidenceFromEvents(run, events);
+      expect(evidence.status).toBe("cancelled");
+      expect(evidence.checks).not.toContainEqual(expect.objectContaining({ kind: "run-timeout" }));
+    } finally {
+      killPid(parentPid);
+      killPid(childPid);
+    }
+  });
+
   it("uses Hermes public session resume when an opaque Hermes session handle is provided", async () => {
     const projectRoot = await makeTempRoot();
     const binRoot = await makeTempRoot();
@@ -878,6 +1427,30 @@ function laneDeclaredEvent(): FlowEvent {
   };
 }
 
+function makeRun(runId: string): AgentRun {
+  return {
+    id: runId,
+    nodeId: "node-review",
+    sessionId: "session-1",
+    projectRoot: "/tmp/project",
+    worktreePath: "/tmp/project",
+    agentKind: "codex",
+    status: "running",
+    startedAt: "2026-06-10T00:00:00.000Z",
+  };
+}
+
+function event(runId: string, seq: number, kind: RunEvent["kind"], payload: Record<string, unknown>): RunEvent {
+  return {
+    protocolVersion: 1,
+    runId,
+    seq,
+    kind,
+    payload,
+    timestamp: `2026-06-10T00:00:0${seq}.000Z`,
+  };
+}
+
 function waitForEvent(bridge: AgentBridge, predicate: (event: RunEvent) => boolean): Promise<RunEvent> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -911,6 +1484,20 @@ async function waitForFile(path: string): Promise<string> {
       if (Date.now() - started > 2_000) throw new Error(`Timed out waiting for ${path}`);
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+  }
+}
+
+async function waitForPersistedEvent(
+  projectRoot: string,
+  runId: string,
+  predicate: (event: RunEvent) => boolean,
+): Promise<RunEvent> {
+  const started = Date.now();
+  for (;;) {
+    const event = (await loadRunEvents(projectRoot, runId)).find(predicate);
+    if (event) return event;
+    if (Date.now() - started > 2_000) throw new Error(`Timed out waiting for persisted event ${runId}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
 

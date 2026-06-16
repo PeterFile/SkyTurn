@@ -37,10 +37,20 @@ export type AgentRunStatus =
 export type AgentRunSandbox = "read-only" | "workspace-write" | "danger-full-access";
 export type RunEventKind = "output" | "status" | "error" | "approval" | "progress" | "evidence";
 export type EvidenceCheckStatus = "passed" | "failed" | "skipped";
+export type EvidenceCheckKind = "run-exit" | "run-timeout" | "git" | "test" | "typecheck" | "build" | "review";
 export type HermesPlannerTransport = "hermes_live_chat" | "hermes_session_resume" | "hermes_replay_recovery";
 
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
 export const RUN_EVENT_PROTOCOL_VERSION = 1;
+export const EVIDENCE_CHECK_KINDS: EvidenceCheckKind[] = [
+  "run-exit",
+  "run-timeout",
+  "git",
+  "test",
+  "typecheck",
+  "build",
+  "review",
+];
 export const AGENT_SUPPORT_LEVELS: AgentSupportLevel[] = [
   "mock-only",
   "detected-only",
@@ -98,7 +108,7 @@ export interface RunEvent {
 }
 
 export interface EvidenceCheck {
-  kind: "run-exit" | "git" | "test" | "typecheck" | "build" | "review";
+  kind: EvidenceCheckKind;
   name: string;
   status: EvidenceCheckStatus;
   detail?: string;
