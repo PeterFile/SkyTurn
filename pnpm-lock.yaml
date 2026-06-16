@@ -17,6 +17,9 @@ importers:
       '@skyturn/agent-bridge':
         specifier: workspace:*
         version: link:../../packages/agent-bridge
+      '@skyturn/git-worktree':
+        specifier: workspace:*
+        version: link:../../packages/git-worktree
       '@skyturn/orchestrator':
         specifier: workspace:*
         version: link:../../packages/orchestrator

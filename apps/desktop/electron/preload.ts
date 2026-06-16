@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld("devflow", {
   createWorkflowSession: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:createSession", projectRoot, input),
   appendWorkflowUserInput: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:appendUserInput", projectRoot, input),
   getWorkflowLedger: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:ledger", projectRoot, sessionId),
+  getChangeset: (projectRoot: string, node: unknown) => ipcRenderer.invoke("changeset:get", projectRoot, node),
   applyWorkflowIntent: (projectRoot: string, intent: unknown) => ipcRenderer.invoke("workflow:applyIntent", projectRoot, intent),
   scheduleWorkflowReadyLanes: (projectRoot: string, sessionId: string, input: unknown) => ipcRenderer.invoke("workflow:scheduleReady", projectRoot, sessionId, input),
   recordWorkflowRunResult: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:recordRunResult", projectRoot, input),

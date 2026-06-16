@@ -1,27 +1,30 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 import type {
   CanvasNode,
+  Changeset,
   ChangesetEvidence,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
   WorktreeMetadata,
 } from "@skyturn/project-core";
 
-import type {
-  ChangesetEvidenceInput,
-  ChangesetEvidenceService,
-  ManagedWorktreeCleanupInput,
-  ManagedWorktreeCleanupResult,
-  ManagedWorktreeCreateInput,
-  ManagedWorktreeService,
-  VariantComparisonEvidence,
-  VariantComparisonInput,
-  VariantAdoptionService,
-} from "./index";
+import {
+  buildAdjudicationMetrics,
+  type ChangesetEvidenceInput,
+  type ChangesetEvidenceService,
+  type ChangesetService,
+  type ManagedWorktreeCleanupInput,
+  type ManagedWorktreeCleanupResult,
+  type ManagedWorktreeCreateInput,
+  type ManagedWorktreeService,
+  type VariantComparisonEvidence,
+  type VariantComparisonInput,
+  type VariantAdoptionService,
+} from "./index.js";
 
 export type ManagedWorktreeWorkflowEventKind =
   | "workflow.worktree.create_requested"
@@ -99,6 +102,8 @@ interface ReconcileOptions {
 const execFileAsync = promisify(execFile);
 const gitOutputLimit = 8 * 1024 * 1024;
 const patchPreviewLimit = 24 * 1024;
+const defaultMaxPatchPreviewBytes = 64 * 1024;
+const defaultMaxGitOutputBytes = 1024 * 1024;
 
 export class GitCommandError extends Error {
   readonly stderr: string;
@@ -110,7 +115,7 @@ export class GitCommandError extends Error {
   }
 }
 
-export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAdoptionService, ChangesetEvidenceService {
+export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAdoptionService, ChangesetEvidenceService, ChangesetService {
   private readonly eventLog: ManagedWorktreeWorkflowEvent[];
   private readonly eventSink?: ManagedWorktreeEventSink;
   private readonly now: () => string;
@@ -234,6 +239,10 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
     const collectedAt = this.now();
     const left = await this.reconcileManagedWorktree(input.left);
     const right = await this.reconcileManagedWorktree(input.right);
+    const leftChangeset = await this.collectChangesetEvidence({ node: minimalNode(left), worktree: left });
+    const rightChangeset = await this.collectChangesetEvidence({ node: minimalNode(right), worktree: right });
+    const leftRecorded = { ...input.recordedEvidence?.[left.variantId], changeset: leftChangeset };
+    const rightRecorded = { ...input.recordedEvidence?.[right.variantId], changeset: rightChangeset };
     return {
       comparisonId: `comparison-${left.variantId}-${right.variantId}-${collectedAt}`,
       collectedAt,
@@ -241,12 +250,14 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
         {
           variantId: left.variantId,
           worktreeId: left.worktreeId,
-          changeset: await this.collectChangesetEvidence({ node: minimalNode(left), worktree: left }),
+          changeset: leftChangeset,
+          metrics: buildAdjudicationMetrics(leftRecorded),
         },
         {
           variantId: right.variantId,
           worktreeId: right.worktreeId,
-          changeset: await this.collectChangesetEvidence({ node: minimalNode(right), worktree: right }),
+          changeset: rightChangeset,
+          metrics: buildAdjudicationMetrics(rightRecorded),
         },
       ],
     };
@@ -329,39 +340,13 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
   }
 
   async collectChangesetEvidence(input: ChangesetEvidenceInput): Promise<ChangesetEvidence> {
-    const worktree = input.worktree ? await this.reconcileManagedWorktree(input.worktree) : null;
-    const cwd = worktree?.realPath ?? input.node.worktree.path;
-    try {
-      const diffRange = worktree ? [`${worktree.baseCommit}..${worktree.headCommit}`] : [];
-      const files = stringLines((await runGit(cwd, ["diff", "--name-only", ...diffRange, "--"])).stdout);
-      const numstat = (await runGit(cwd, ["diff", "--numstat", ...diffRange, "--"])).stdout;
-      const patch = (await runGit(cwd, ["diff", ...diffRange, "--"], { maxBuffer: gitOutputLimit })).stdout;
-      const diffStat = parseNumstat(numstat);
-      return {
-        evidenceId: `changeset-evidence-${worktree?.worktreeId ?? input.node.id}`,
-        changesetId: input.node.changesetId,
-        source: "git",
-        status: files.length === 0 ? "empty" : "available",
-        files,
-        diffStat,
-        patchPreviewTruncated: patch.length > patchPreviewLimit,
-        ...(worktree ? { worktreeId: worktree.worktreeId } : {}),
-        collectedAt: this.now(),
-      };
-    } catch (error) {
-      return {
-        evidenceId: `changeset-evidence-${worktree?.worktreeId ?? input.node.id}`,
-        changesetId: input.node.changesetId,
-        source: "git",
-        status: "failed",
-        files: [],
-        diffStat: { added: 0, changed: 0, deleted: 0 },
-        patchPreviewTruncated: false,
-        ...(worktree ? { worktreeId: worktree.worktreeId } : {}),
-        collectedAt: this.now(),
-        errorReason: errorMessage(error),
-      };
-    }
+    const worktree = input.worktree ? await this.reconcileManagedWorktree(input.worktree) : undefined;
+    const service = createGitChangesetService({ maxPatchPreviewBytes: patchPreviewLimit });
+    return service.collectChangesetEvidence({ node: input.node, ...(worktree ? { worktree } : {}) });
+  }
+
+  async getChangeset(node: CanvasNode): Promise<Changeset> {
+    return createGitChangesetService({ maxPatchPreviewBytes: patchPreviewLimit }).getChangeset(node);
   }
 
   private async planCreate(input: ManagedWorktreeCreateInput): Promise<ManagedWorktreePlan> {
@@ -451,6 +436,211 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
 
 export function createNodeGitWorktreeService(options: NodeGitWorktreeServiceOptions = {}): NodeGitWorktreeService {
   return new NodeGitWorktreeService(options);
+}
+
+export interface GitChangesetServiceOptions {
+  repoRoot?: string;
+  maxPatchPreviewBytes?: number;
+}
+
+export function createGitChangesetService(
+  options: GitChangesetServiceOptions = {},
+): ChangesetService & ChangesetEvidenceService {
+  return new GitChangesetService(options);
+}
+
+export function createGitVariantComparisonService(
+  options: GitChangesetServiceOptions = {},
+): Pick<ManagedWorktreeService, "compareVariants"> {
+  return new GitVariantComparisonService(options);
+}
+
+class GitChangesetService implements ChangesetService, ChangesetEvidenceService {
+  constructor(private readonly options: GitChangesetServiceOptions) {}
+
+  async getChangeset(node: CanvasNode): Promise<Changeset> {
+    try {
+      const repoRoot = await this.resolveRepoRoot(node);
+      await assertGitWorktree(repoRoot);
+      const status = await git(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all", "--"]);
+      if (status.truncated) throw new Error("Git status output exceeded the changeset evidence limit.");
+      const statusLines = parseStatusLines(status.stdout);
+      const files = filesFromStatus(statusLines);
+      if (files.length === 0) return this.emptyChangeset(node);
+
+      const untrackedFiles = untrackedFilesFromStatus(statusLines);
+      const diffStat = await diffStatForRepo(repoRoot, files.length, untrackedFiles);
+      const patch = await diffPreviewForRepo(
+        repoRoot,
+        this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes,
+        untrackedFiles,
+      );
+      const evidence = this.evidenceFor(node, "available", files, diffStat, patch.truncated);
+      return {
+        id: node.changesetId,
+        files,
+        diffStat,
+        patchPreview: patch.value,
+        source: "git",
+        evidence,
+      };
+    } catch (error: unknown) {
+      return this.failedChangeset(node, boundedReason(error instanceof Error ? error.message : "Unable to collect git changeset."));
+    }
+  }
+
+  async collectChangesetEvidence(input: ChangesetEvidenceInput): Promise<ChangesetEvidence> {
+    if (input.worktree) {
+      return this.collectCommittedWorktreeEvidence(input.node, input.worktree);
+    }
+    const changeset = await this.getChangeset(input.node);
+    return changeset.evidence ?? this.evidenceFor(input.node, "unknown", [], changeset.diffStat, false);
+  }
+
+  private async collectCommittedWorktreeEvidence(
+    node: CanvasNode,
+    worktree: WorkflowWorktreeIdentity,
+  ): Promise<ChangesetEvidence> {
+    const worktreeNode = nodeWithWorktree(node, worktree);
+    try {
+      const diffRange = `${worktree.baseCommit}..${worktree.headCommit}`;
+      const repoRoot = await realpath(worktree.realPath);
+      await assertGitWorktree(repoRoot);
+      const files = stringLines((await git(repoRoot, ["diff", "--name-only", diffRange, "--"])).stdout);
+      const numstat = (await git(repoRoot, ["diff", "--numstat", diffRange, "--"])).stdout;
+      const patch = await git(
+        repoRoot,
+        ["diff", "--no-ext-diff", diffRange, "--"],
+        { maxBytes: this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes },
+      );
+      return {
+        ...this.evidenceFor(
+          worktreeNode,
+          files.length === 0 ? "empty" : "available",
+          files,
+          parseNumstat(numstat),
+          patch.truncated,
+        ),
+        worktreeId: worktree.worktreeId,
+      };
+    } catch (error) {
+      return {
+        ...this.evidenceFor(worktreeNode, "failed", [], { added: 0, changed: 0, deleted: 0 }, false),
+        worktreeId: worktree.worktreeId,
+        errorReason: errorMessage(error),
+      };
+    }
+  }
+
+  private async resolveRepoRoot(node: CanvasNode): Promise<string> {
+    const candidate = isAbsolute(node.worktree.path)
+      ? node.worktree.path
+      : this.options.repoRoot ?? resolve(process.cwd(), node.worktree.path);
+    return realpath(candidate);
+  }
+
+  private emptyChangeset(node: CanvasNode): Changeset {
+    return {
+      id: node.changesetId,
+      files: [],
+      diffStat: { added: 0, changed: 0, deleted: 0 },
+      patchPreview: "",
+      source: "git",
+      evidence: this.evidenceFor(node, "empty", [], { added: 0, changed: 0, deleted: 0 }, false),
+    };
+  }
+
+  private failedChangeset(node: CanvasNode, reason: string): Changeset {
+    return {
+      id: node.changesetId,
+      files: [],
+      diffStat: { added: 0, changed: 0, deleted: 0 },
+      patchPreview: "",
+      source: "git",
+      evidence: {
+        ...this.evidenceFor(node, "failed", [], { added: 0, changed: 0, deleted: 0 }, false),
+        errorReason: reason,
+      },
+    };
+  }
+
+  private evidenceFor(
+    node: CanvasNode,
+    status: ChangesetEvidence["status"],
+    files: string[],
+    diffStat: Changeset["diffStat"],
+    patchPreviewTruncated: boolean,
+  ): ChangesetEvidence {
+    return {
+      evidenceId: `changeset-evidence-${node.changesetId}`,
+      changesetId: node.changesetId,
+      source: "git",
+      status,
+      files,
+      diffStat,
+      patchPreviewTruncated,
+      collectedAt: new Date().toISOString(),
+    };
+  }
+}
+
+class GitVariantComparisonService implements Pick<ManagedWorktreeService, "compareVariants"> {
+  constructor(private readonly options: GitChangesetServiceOptions) {}
+
+  async compareVariants(input: VariantComparisonInput): Promise<VariantComparisonEvidence> {
+    const service = createGitChangesetService(this.options);
+    const left = await collectVariantChangeset(service, input.left);
+    const right = await collectVariantChangeset(service, input.right);
+    const leftRecorded = { ...input.recordedEvidence?.[input.left.variantId], changeset: left };
+    const rightRecorded = { ...input.recordedEvidence?.[input.right.variantId], changeset: right };
+
+    return {
+      comparisonId: `comparison-${input.left.variantId}-${input.right.variantId}`,
+      variants: [
+        {
+          variantId: input.left.variantId,
+          worktreeId: input.left.worktreeId,
+          changeset: left,
+          metrics: buildAdjudicationMetrics(leftRecorded),
+        },
+        {
+          variantId: input.right.variantId,
+          worktreeId: input.right.worktreeId,
+          changeset: right,
+          metrics: buildAdjudicationMetrics(rightRecorded),
+        },
+      ],
+      collectedAt: new Date().toISOString(),
+    };
+  }
+}
+
+async function collectVariantChangeset(
+  service: ChangesetEvidenceService,
+  worktree: WorkflowWorktreeIdentity,
+): Promise<ChangesetEvidence> {
+  return service.collectChangesetEvidence({
+    node: minimalNode(worktree),
+    worktree,
+  });
+}
+
+function nodeWithWorktree(node: CanvasNode, worktree: WorkflowWorktreeIdentity): CanvasNode {
+  return {
+    ...node,
+    worktree: {
+      ...node.worktree,
+      path: worktree.realPath,
+      branchName: worktree.branchName,
+      baseCommit: worktree.baseCommit,
+      worktreeId: worktree.worktreeId,
+      variantId: worktree.variantId,
+      realPath: worktree.realPath,
+      gitdir: worktree.gitdir,
+      repoRoot: worktree.repoRoot,
+      headCommit: worktree.headCommit,
+    },
+  };
 }
 
 export function worktreeMetadataForVariant(worktree: WorkflowWorktreeIdentity): WorktreeMetadata {
@@ -778,4 +968,167 @@ function errorMessage(error: unknown): string {
 
 function truncate(value: string): string {
   return value.length > 1200 ? `${value.slice(0, 1200)}...` : value;
+}
+
+async function assertGitWorktree(repoRoot: string): Promise<void> {
+  const result = await git(repoRoot, ["rev-parse", "--is-inside-work-tree"]);
+  if (result.stdout.trim() !== "true") throw new Error("Path is not inside a git worktree.");
+}
+
+async function diffStatForRepo(
+  repoRoot: string,
+  changedFileCount: number,
+  untrackedFiles: string[],
+): Promise<Changeset["diffStat"]> {
+  const output = await diffTextAgainstHead(repoRoot, ["--numstat"]);
+  let added = 0;
+  let deleted = 0;
+  for (const line of `${output}${await untrackedNumstat(repoRoot, untrackedFiles)}`.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const [rawAdded, rawDeleted] = line.split(/\s+/, 3);
+    added += parseStatValue(rawAdded);
+    deleted += parseStatValue(rawDeleted);
+  }
+  return { added, changed: changedFileCount, deleted };
+}
+
+async function diffPreviewForRepo(
+  repoRoot: string,
+  maxPatchPreviewBytes: number,
+  untrackedFiles: string[],
+): Promise<{ value: string; truncated: boolean }> {
+  const result = await diffTextAgainstHeadBounded(repoRoot, ["--no-ext-diff"], maxPatchPreviewBytes);
+  if (result.truncated) return { value: `${result.stdout.trimEnd()}\n[diff truncated]\n`, truncated: true };
+
+  let value = result.stdout;
+  for (const file of untrackedFiles) {
+    const remaining = maxPatchPreviewBytes - Buffer.byteLength(value);
+    if (remaining <= 0) return { value: `${value.trimEnd()}\n[diff truncated]\n`, truncated: true };
+    const untracked = await untrackedFileDiff(repoRoot, file, ["--no-ext-diff"], remaining);
+    value += untracked.stdout;
+    if (untracked.truncated) return { value: `${value.trimEnd()}\n[diff truncated]\n`, truncated: true };
+  }
+  return { value, truncated: false };
+}
+
+async function diffTextAgainstHead(repoRoot: string, diffArgs: string[]): Promise<string> {
+  const args = ["diff", ...diffArgs, "HEAD", "--"];
+  try {
+    const result = await git(repoRoot, args);
+    return result.stdout;
+  } catch {
+    const unstaged = await git(repoRoot, ["diff", ...diffArgs, "--"]);
+    const staged = await git(repoRoot, ["diff", "--cached", ...diffArgs, "--"]);
+    return `${staged.stdout}${unstaged.stdout}`;
+  }
+}
+
+async function diffTextAgainstHeadBounded(
+  repoRoot: string,
+  diffArgs: string[],
+  maxBytes: number,
+): Promise<{ stdout: string; truncated: boolean }> {
+  const args = ["diff", ...diffArgs, "HEAD", "--"];
+  try {
+    return await git(repoRoot, args, { maxBytes });
+  } catch {
+    return git(repoRoot, ["diff", ...diffArgs, "--"], { maxBytes });
+  }
+}
+
+function parseStatusLines(output: string): string[] {
+  return output.split(/\r?\n/).filter((line) => line.trim().length > 0);
+}
+
+function filesFromStatus(lines: string[]): string[] {
+  const files = new Set<string>();
+  for (const line of lines) {
+    const value = line.slice(3).trim();
+    const renamed = value.includes(" -> ") ? value.split(" -> ").at(-1) : value;
+    if (renamed) files.add(renamed);
+  }
+  return [...files].sort();
+}
+
+function untrackedFilesFromStatus(lines: string[]): string[] {
+  return lines
+    .filter((line) => line.startsWith("?? "))
+    .map((line) => line.slice(3).trim())
+    .filter(Boolean)
+    .sort();
+}
+
+async function untrackedNumstat(repoRoot: string, files: string[]): Promise<string> {
+  const chunks: string[] = [];
+  for (const file of files) {
+    const result = await untrackedFileDiff(repoRoot, file, ["--numstat"]);
+    chunks.push(result.stdout);
+  }
+  return chunks.join("");
+}
+
+async function untrackedFileDiff(
+  repoRoot: string,
+  file: string,
+  diffArgs: string[],
+  maxBytes?: number,
+): Promise<{ stdout: string; truncated: boolean }> {
+  return git(repoRoot, ["diff", "--no-index", ...diffArgs, "--", "/dev/null", file], {
+    allowExitCodes: [0, 1],
+    ...(maxBytes ? { maxBytes } : {}),
+  });
+}
+
+function boundedReason(reason: string): string {
+  const maxLength = 1000;
+  if (reason.length <= maxLength) return reason;
+  return `${reason.slice(0, maxLength).trimEnd()}...`;
+}
+
+async function git(
+  cwd: string,
+  args: string[],
+  options: { maxBytes?: number; allowExitCodes?: number[] } = {},
+): Promise<{ stdout: string; truncated: boolean }> {
+  const maxBytes = options.maxBytes ?? defaultMaxGitOutputBytes;
+  const allowExitCodes = new Set([0, ...(options.allowExitCodes ?? [])]);
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let truncated = false;
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (stdoutBytes >= maxBytes) return;
+      const remaining = maxBytes - stdoutBytes;
+      const value = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
+      stdoutChunks.push(value);
+      stdoutBytes += value.byteLength;
+      if (chunk.byteLength >= remaining) {
+        truncated = true;
+        child.kill("SIGTERM");
+      }
+    });
+
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderrBytes >= defaultMaxGitOutputBytes) return;
+      const remaining = defaultMaxGitOutputBytes - stderrBytes;
+      const value = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
+      stderrChunks.push(value);
+      stderrBytes += value.byteLength;
+    });
+
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (!allowExitCodes.has(code ?? -1) && !truncated) {
+        reject(new Error(stderr.trim() || `git ${args[0]} failed with exit code ${code ?? "unknown"}.`));
+        return;
+      }
+      resolve({ stdout, truncated });
+  });
+  });
 }

@@ -54,3 +54,14 @@ test("preload exposes narrow Flow Kernel workflow wrappers", async () => {
   assert.doesNotMatch(preload, /ipcRenderer\s*:/);
   assert.doesNotMatch(preload, /return\s+ipcRenderer/);
 });
+
+test("changeset IPC resolves real paths before project boundary checks", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+
+  assert.match(main, /changeset:get/);
+  assert.match(main, /await fs\.realpath\(projectRoot\)/);
+  assert.match(main, /await fs\.realpath\(worktreePath\)/);
+  assert.match(main, /createGitChangesetService\(\{ repoRoot: realProjectRoot \}\)/);
+  assert.match(main, /const projectWorktreesRoot = `\$\{realProjectRoot\}\.worktrees`/);
+  assert.match(main, /realProjectWorktreesRoot === projectWorktreesRoot/);
+});

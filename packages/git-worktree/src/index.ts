@@ -2,6 +2,9 @@ import type {
   CanvasNode,
   Changeset,
   ChangesetEvidence,
+  EvidenceCheck,
+  EvidenceCheckStatus,
+  RunEvidence,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
   WorktreeMetadata,
@@ -58,6 +61,7 @@ export interface ManagedWorktreeCleanupResult {
 export interface VariantComparisonInput {
   left: WorkflowWorktreeIdentity;
   right: WorkflowWorktreeIdentity;
+  recordedEvidence?: Partial<Record<string, RecordedAdjudicationEvidence>>;
 }
 
 export interface VariantComparisonEvidence {
@@ -66,6 +70,7 @@ export interface VariantComparisonEvidence {
     variantId: string;
     worktreeId: string;
     changeset: ChangesetEvidence;
+    metrics: AdjudicationMetric[];
   }>;
   collectedAt: string;
 }
@@ -88,6 +93,37 @@ export interface ChangesetEvidenceInput {
 export interface ChangesetEvidenceService {
   collectChangesetEvidence(input: ChangesetEvidenceInput): Promise<ChangesetEvidence>;
 }
+
+export type AdjudicationMetricKind =
+  | "test"
+  | "build"
+  | "typecheck"
+  | "artifact"
+  | "changed-file-count"
+  | "diff-summary"
+  | "performance-output"
+  | "conflict-check";
+
+export type AdjudicationMetricStatus = EvidenceCheckStatus | "recorded" | "unknown" | "equivalent";
+
+export interface AdjudicationMetric {
+  kind: AdjudicationMetricKind;
+  label: string;
+  status: AdjudicationMetricStatus;
+  source: "recorded";
+  value?: number | string;
+  detail?: string;
+  artifactPaths?: string[];
+}
+
+export interface RecordedAdjudicationEvidence {
+  runEvidence?: RunEvidence | null;
+  changeset?: ChangesetEvidence | null;
+  performanceOutput?: string | null;
+  conflictCheck?: EvidenceCheck | null;
+}
+
+const MAX_ADJUDICATION_DETAIL_LENGTH = 1000;
 
 export interface EditorAdapter {
   openWorktree(editor: EditorKind, worktreePath: string): Promise<{ ok: boolean; message: string }>;
@@ -148,4 +184,141 @@ export function createMockChangeset(node: CanvasNode): Changeset {
     ].join("\n"),
     source: "mock",
   };
+}
+
+export function buildAdjudicationMetrics(recorded: RecordedAdjudicationEvidence): AdjudicationMetric[] {
+  const checks = recorded.runEvidence?.checks ?? [];
+  const artifactPaths = [
+    ...(recorded.runEvidence?.artifacts ?? []),
+    ...(recorded.changeset?.artifactPaths ?? []),
+  ];
+
+  return [
+    metricFromCheck("test", "Tests", findCheck(checks, "test")),
+    metricFromCheck("build", "Build", findCheck(checks, "build")),
+    metricFromCheck("typecheck", "Typecheck", findCheck(checks, "typecheck")),
+    artifactMetric(artifactPaths),
+    changedFileCountMetric(recorded.changeset),
+    diffSummaryMetric(recorded.changeset),
+    performanceMetric(recorded.performanceOutput),
+    metricFromCheck("conflict-check", "Conflict check", recorded.conflictCheck ?? null),
+  ];
+}
+
+function findCheck(checks: EvidenceCheck[], kind: EvidenceCheck["kind"]): EvidenceCheck | null {
+  return checks.find((check) => check.kind === kind) ?? null;
+}
+
+function metricFromCheck(
+  kind: AdjudicationMetricKind,
+  label: string,
+  check: EvidenceCheck | null,
+): AdjudicationMetric {
+  if (!check) return unknownMetric(kind, label);
+  return {
+    kind,
+    label,
+    status: check.status,
+    source: "recorded",
+    detail: boundedDetail(check.detail ?? check.name),
+  };
+}
+
+function artifactMetric(artifactPaths: string[]): AdjudicationMetric {
+  if (artifactPaths.length === 0) return unknownMetric("artifact", "Artifact");
+  return {
+    kind: "artifact",
+    label: "Artifact",
+    status: "recorded",
+    source: "recorded",
+    value: artifactPaths.length,
+    artifactPaths,
+  };
+}
+
+function changedFileCountMetric(changeset: ChangesetEvidence | null | undefined): AdjudicationMetric {
+  if (!changeset) return unknownMetric("changed-file-count", "Changed files");
+  if (changeset.status === "failed") {
+    return {
+      kind: "changed-file-count",
+      label: "Changed files",
+      status: "failed",
+      source: "recorded",
+      detail: boundedDetail(changeset.errorReason),
+    };
+  }
+  if (changeset.status === "empty") {
+    return {
+      kind: "changed-file-count",
+      label: "Changed files",
+      status: "equivalent",
+      source: "recorded",
+      value: 0,
+      detail: "No git changes recorded.",
+    };
+  }
+  if (changeset.status !== "available") return unknownMetric("changed-file-count", "Changed files");
+  return {
+    kind: "changed-file-count",
+    label: "Changed files",
+    status: "recorded",
+    source: "recorded",
+    value: changeset.files.length,
+  };
+}
+
+function diffSummaryMetric(changeset: ChangesetEvidence | null | undefined): AdjudicationMetric {
+  if (!changeset) return unknownMetric("diff-summary", "Diff summary");
+  if (changeset.status === "failed") {
+    return {
+      kind: "diff-summary",
+      label: "Diff summary",
+      status: "failed",
+      source: "recorded",
+      detail: boundedDetail(changeset.errorReason),
+    };
+  }
+  if (changeset.status === "empty") {
+    return {
+      kind: "diff-summary",
+      label: "Diff summary",
+      status: "equivalent",
+      source: "recorded",
+      detail: "No git diff recorded.",
+    };
+  }
+  if (changeset.status !== "available") return unknownMetric("diff-summary", "Diff summary");
+  return {
+    kind: "diff-summary",
+    label: "Diff summary",
+    status: "recorded",
+    source: "recorded",
+    detail: `+${changeset.diffStat.added} / -${changeset.diffStat.deleted} across ${changeset.files.length} files`,
+  };
+}
+
+function performanceMetric(performanceOutput: string | null | undefined): AdjudicationMetric {
+  const detail = performanceOutput?.trim();
+  if (!detail) return unknownMetric("performance-output", "Performance output");
+  return {
+    kind: "performance-output",
+    label: "Performance output",
+    status: "recorded",
+    source: "recorded",
+    detail: boundedDetail(detail),
+  };
+}
+
+function unknownMetric(kind: AdjudicationMetricKind, label: string): AdjudicationMetric {
+  return {
+    kind,
+    label,
+    status: "unknown",
+    source: "recorded",
+  };
+}
+
+function boundedDetail(detail: string | undefined): string | undefined {
+  if (!detail || detail.length <= MAX_ADJUDICATION_DETAIL_LENGTH) return detail;
+  return `${detail.slice(0, MAX_ADJUDICATION_DETAIL_LENGTH).trimEnd()}...`;
 }
