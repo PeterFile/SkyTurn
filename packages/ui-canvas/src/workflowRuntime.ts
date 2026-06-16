@@ -504,10 +504,14 @@ function evidenceFromRunEvents(runId: string, events: RunEvent[]): RunEvidence |
 
   for (const event of events) {
     if (event.kind === "status" && isRunStatus(event.payload.status)) {
-      status = event.payload.status;
-      exitCode = typeof event.payload.exitCode === "number" ? event.payload.exitCode : exitCode;
-      cancelReason = typeof event.payload.reason === "string" ? event.payload.reason : cancelReason;
-      completedAt = isFinalRunStatus(status) ? event.timestamp : completedAt;
+      const nextStatus = event.payload.status;
+      if (!isFinalRunStatus(status) || isFinalRunStatus(nextStatus)) {
+        status = nextStatus;
+        exitCode = typeof event.payload.exitCode === "number" ? event.payload.exitCode : exitCode;
+        cancelReason =
+          status === "cancelled" && typeof event.payload.reason === "string" ? event.payload.reason : cancelReason;
+        completedAt = isFinalRunStatus(status) ? event.timestamp : completedAt;
+      }
     }
     if (event.kind === "error") {
       status = "failed";

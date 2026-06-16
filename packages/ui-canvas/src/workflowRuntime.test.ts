@@ -572,6 +572,39 @@ describe("workflow runtime event merging", () => {
     expect(codeNode?.output).toContain("Implemented the smallest evidence reflection path.");
     expect(next.runEvidence[codexRunId]?.artifacts).toEqual([".devflow/tasks/node-code/output.md"]);
   });
+
+  it("preserves persisted custom review evidence kinds while merging run events", () => {
+    const workspace = makeWorkspace([
+      makeNode({
+        id: "node-review",
+        agent: "hermes",
+        status: "running",
+        runId: "run-session-1-node-review",
+      }),
+    ]);
+    const runId = "run-session-1-node-review";
+
+    const next = mergeRunEventsIntoWorkspace(workspace, runId, [
+      event(runId, 1, "evidence", {
+        review: {
+          kind: "policy-review",
+          name: "Architecture review",
+          status: "failed",
+          detail: "Preserved from older persisted events.",
+        },
+      }),
+      event(runId, 2, "status", {
+        status: "failed",
+      }),
+    ]);
+
+    expect(next.runEvidence[runId]?.review).toEqual({
+      kind: "policy-review",
+      name: "Architecture review",
+      status: "failed",
+      detail: "Preserved from older persisted events.",
+    });
+  });
 });
 
 function makeWorkspace(extraNodes: CanvasNode[] = []): WorkspaceState {
