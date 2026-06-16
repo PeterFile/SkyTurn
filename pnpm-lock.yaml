@@ -17,6 +17,9 @@ importers:
       '@skyturn/agent-bridge':
         specifier: workspace:*
         version: link:../../packages/agent-bridge
+      '@skyturn/git-worktree':
+        specifier: workspace:*
+        version: link:../../packages/git-worktree
       '@skyturn/orchestrator':
         specifier: workspace:*
         version: link:../../packages/orchestrator
@@ -32,6 +35,9 @@ importers:
       '@skyturn/ui-canvas':
         specifier: workspace:*
         version: link:../../packages/ui-canvas
+      '@skyturn/workflow-kernel':
+        specifier: workspace:*
+        version: link:../../packages/workflow-kernel
       '@xyflow/react':
         specifier: ^12.11.0
         version: 12.11.0(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
@@ -105,6 +111,9 @@ importers:
         specifier: workspace:*
         version: link:../project-core
     devDependencies:
+      '@types/node':
+        specifier: ^25.9.3
+        version: 25.9.3
       typescript:
         specifier: ^6.0.3
         version: 6.0.3

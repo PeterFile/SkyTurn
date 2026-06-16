@@ -4,6 +4,7 @@
     "composite": true,
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "types": ["node"],
     "rootDir": "src",
     "outDir": "dist",
     "tsBuildInfoFile": "../../node_modules/.tmp/git-worktree.tsbuildinfo"

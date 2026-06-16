@@ -381,6 +381,35 @@ describe("workflow-card tools", () => {
     expect(prompt).not.toContain("toolCalls");
   });
 
+  it("injects the redacted SkyTurn ledger as the planner continuity source", () => {
+    const prompt = buildHermesWorkflowPrompt({
+      goal: "Update one file and verify it",
+      sessionId: "session-1",
+      plannerSessionId: "hermes-planner-session-1",
+      nodeId: "node-1",
+      existingNodes: [{ id: "node-1", title: "Plan workflow", agent: "hermes", status: "running" }],
+      sessionLedger: {
+        throughSeq: 8,
+        checkpointSummary: "Planning accepted.",
+        facts: ["User asked for audit logging.", "Decision: keep retry behavior explicit."],
+        recentEvents: [
+          {
+            seq: 7,
+            kind: "workflow.user_input",
+            summary: "Now export a short ledger before Hermes starts again.",
+          },
+        ],
+        openQuestions: ["Choose validation depth."],
+      },
+    });
+
+    expect(prompt).toContain("Session ledger summary:");
+    expect(prompt).toContain("User asked for audit logging");
+    expect(prompt).toContain("Decision: keep retry behavior explicit");
+    expect(prompt).toContain("Now export a short ledger before Hermes starts again");
+    expect(prompt).toContain("If Hermes native resume is unavailable, planner continuity comes from this SkyTurn event ledger.");
+  });
+
   it("parses Hermes v2 WorkflowIntent and rejects old UI card mutations", () => {
     const accepted = parseHermesWorkflowIntent(JSON.stringify({
       intentId: "intent-1",

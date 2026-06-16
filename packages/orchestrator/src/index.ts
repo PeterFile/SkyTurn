@@ -141,6 +141,7 @@ export function buildHermesWorkflowPrompt(input: HermesWorkflowPromptInput): str
     "Request review only after implementation evidence, validation only after implementation, and joins only after upstream completion.",
     "The planner session identity is stable for this CanvasSession; runId is not a planner identity.",
     "Continue the same planner session for new requirements in this CanvasSession.",
+    "If Hermes native resume is unavailable, planner continuity comes from this SkyTurn event ledger.",
     `Session: ${input.sessionId}`,
     `Planner session identity: ${input.plannerSessionId}`,
     `Planning node: ${input.nodeId}`,

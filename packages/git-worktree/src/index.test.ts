@@ -9,9 +9,11 @@ import type {
 import { GIT_WORKTREE_CONTRACT_VERSION, createMockChangeset, mockWorktreeService } from "./index";
 import type {
   ChangesetEvidenceService,
+  RecordedAdjudicationEvidence,
   ManagedWorktreeService,
   VariantAdoptionService,
 } from "./index";
+import { buildAdjudicationMetrics } from "./index";
 
 describe("git worktree services", () => {
   it("versions the root contract ABI", () => {
@@ -88,7 +90,12 @@ describe("git worktree services", () => {
       async compareVariants() {
         return {
           comparisonId: "comparison-a",
-          variants: [{ variantId: identity.variantId, worktreeId: identity.worktreeId, changeset: evidence }],
+          variants: [{
+            variantId: identity.variantId,
+            worktreeId: identity.worktreeId,
+            changeset: evidence,
+            metrics: buildAdjudicationMetrics({ changeset: evidence }),
+          }],
           collectedAt: "2026-06-16T00:00:00.000Z",
         };
       },
@@ -117,5 +124,73 @@ describe("git worktree services", () => {
     })).resolves.toEqual(identity);
     await expect(adopter.adoptVariant(adoption)).resolves.toMatchObject({ status: "adopted" });
     await expect(changesets.collectChangesetEvidence({ node: { id: "node-1" } as CanvasNode, worktree: identity })).resolves.toEqual(evidence);
+  });
+
+  it("builds adjudication metrics only from recorded evidence and marks missing data unknown", () => {
+    const recorded: RecordedAdjudicationEvidence = {
+      runEvidence: {
+        runId: "run-a",
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: "changeset-a",
+        checks: [
+          { kind: "test", name: "unit", status: "passed", detail: "42 tests" },
+          { kind: "typecheck", name: "tsc", status: "failed", detail: "TS error" },
+        ],
+        artifacts: [".devflow/artifacts/screenshot.png"],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-16T00:00:00.000Z",
+      },
+      changeset: {
+        evidenceId: "changeset-evidence-a",
+        changesetId: "changeset-a",
+        source: "git",
+        status: "available",
+        files: ["src/index.ts", "src/index.test.ts"],
+        diffStat: { added: 12, changed: 2, deleted: 3 },
+        patchPreviewTruncated: false,
+      },
+    };
+
+    const metrics = buildAdjudicationMetrics(recorded);
+
+    expect(metrics).toContainEqual(expect.objectContaining({ kind: "test", status: "passed", source: "recorded" }));
+    expect(metrics).toContainEqual(expect.objectContaining({ kind: "typecheck", status: "failed", detail: "TS error" }));
+    expect(metrics).toContainEqual(expect.objectContaining({ kind: "artifact", status: "recorded", artifactPaths: [".devflow/artifacts/screenshot.png"] }));
+    expect(metrics).toContainEqual(expect.objectContaining({ kind: "changed-file-count", status: "recorded", value: 2 }));
+    expect(metrics).toContainEqual(expect.objectContaining({ kind: "diff-summary", status: "recorded", detail: "+12 / -3 across 2 files" }));
+    expect(metrics).toContainEqual(expect.objectContaining({ kind: "build", status: "unknown", source: "recorded" }));
+    expect(metrics).toContainEqual(expect.objectContaining({ kind: "performance-output", status: "unknown", source: "recorded" }));
+    expect(metrics).not.toEqual(expect.arrayContaining([expect.objectContaining({ detail: expect.stringMatching(/Hermes/i) })]));
+  });
+
+  it("bounds recorded adjudication details instead of forwarding raw output", () => {
+    const longDetail = "x".repeat(5000);
+    const metrics = buildAdjudicationMetrics({
+      runEvidence: {
+        runId: "run-a",
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: "changeset-a",
+        checks: [{ kind: "test", name: "unit", status: "passed", detail: longDetail }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-16T00:00:00.000Z",
+      },
+      performanceOutput: longDetail,
+      conflictCheck: { kind: "review", name: "conflict", status: "failed", detail: longDetail },
+    });
+
+    for (const metric of metrics.filter((item) => item.detail)) {
+      expect(metric.detail?.length).toBeLessThanOrEqual(1003);
+    }
+    expect(metrics).toContainEqual(expect.objectContaining({
+      kind: "performance-output",
+      detail: `${"x".repeat(1000)}...`,
+    }));
   });
 });

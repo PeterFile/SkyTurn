@@ -60,11 +60,7 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 
-import {
-  createMockChangeset,
-  mockChangesetService,
-  type EditorKind,
-} from "@skyturn/git-worktree";
+import type { EditorKind } from "@skyturn/git-worktree";
 import {
   browserEditorAdapter,
   emptyWorkspace,
@@ -123,6 +119,7 @@ import {
   type ChangesDiffViewOptions,
 } from "./diffViewer.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
+import { agentIdentityForNode, canUseAgentNodeActions, nodeFooterForNode } from "./nodeDisplay.js";
 import {
   applyBridgeRunResult,
   applyRunEventToWorkspace,
@@ -239,9 +236,36 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!window.devflow) return;
+    return window.devflow.onWorkflowEvent((event) => {
+      const canvasSession = canvasSessionFromWorkflowEvent(event);
+      if (!canvasSession) return;
+      setWorkspace((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
+      }));
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
+    let active = true;
+    void window.devflow.getWorkflowProjection(activeProject.rootPath, activeSession.id).then((result) => {
+      if (!active || !result.canvasSession) return;
+      setWorkspace((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) => (session.id === result.canvasSession?.id ? result.canvasSession : session)),
+      }));
+    });
+    return () => {
+      active = false;
+    };
+  }, [activeProject?.id, activeSession?.id]);
+
+  useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
     for (const node of activeSession.nodes) {
-      if (node.executable === false) continue;
+      if (!canUseAgentNodeActions(node)) continue;
       if (node.status !== "running" && node.status !== "retrying") continue;
       if (startedBridgeRuns.current.has(node.runId)) continue;
       startedBridgeRuns.current.add(node.runId);
@@ -300,6 +324,9 @@ export default function App() {
     const initialSession = goal
       ? createSession(project.id, goal, initialMode)
       : null;
+    if (initialSession?.kind === "canvas") {
+      await persistCanvasWorkflowSession(project, initialSession, "initial");
+    }
 
     setWorkspace((current) => {
       const sessions = initialSession ? [...current.sessions, initialSession] : current.sessions;
@@ -331,11 +358,15 @@ export default function App() {
     }));
   }
 
-  function addSessionFromComposer() {
+  async function addSessionFromComposer() {
     const goal = newTaskGoal.trim();
     if (!resolvedNewTaskProjectId || !goal) return;
     const projectId = resolvedNewTaskProjectId;
+    const project = workspace.projects.find((item) => item.id === projectId);
     const session = createSession(projectId, goal, newTaskMode);
+    if (project && session.kind === "canvas") {
+      await persistCanvasWorkflowSession(project, session, "composer");
+    }
     setWorkspace((current) => ({
       ...current,
       sessions: [...current.sessions, session],
@@ -346,8 +377,10 @@ export default function App() {
     setNewTaskGoal("");
   }
 
-  function confirmPlan(session: PlanSession) {
+  async function confirmPlan(session: PlanSession) {
     const canvas = convertPlanToCanvas(session);
+    const project = workspace.projects.find((item) => item.id === canvas.projectId);
+    if (project) await persistCanvasWorkflowSession(project, canvas, "plan-confirm");
     setWorkspace((current) => ({
       ...current,
       sessions: current.sessions.map((item) => (item.id === session.id ? canvas : item)),
@@ -415,17 +448,21 @@ export default function App() {
     }));
   }
 
-  function appendRequirementNode() {
+  async function appendRequirementNode() {
     if (!activeSession || activeSession.kind !== "canvas" || !bottomGoal.trim()) return;
+    if (window.devflow && activeProject) {
+      await window.devflow.appendWorkflowUserInput(activeProject.rootPath, {
+        sessionId: activeSession.id,
+        inputId: `bottom-${Date.now()}`,
+        text: bottomGoal.trim(),
+        now: new Date().toISOString(),
+      });
+    }
     const result = addRequirementPlanningNode(activeSession, bottomGoal, {
       now: new Date().toISOString(),
       projectName: activeProject?.name ?? "project",
     });
     updateCanvasSession(activeSession.id, () => result.session);
-    setWorkspace((current) => ({
-      ...current,
-      changesets: { ...current.changesets, [result.node.changesetId]: createMockChangeset(result.node) },
-    }));
     setBottomGoal("");
   }
 
@@ -516,10 +553,6 @@ export default function App() {
         )
         .concat(node),
       edges: [...session.edges, { id: `edge-${id}-${target.id}`, source: id, target: target.id }],
-    }));
-    setWorkspace((current) => ({
-      ...current,
-      changesets: { ...current.changesets, [node.changesetId]: createMockChangeset(node) },
     }));
   }
 
@@ -626,6 +659,7 @@ export default function App() {
       {selectedNode && activeSession?.kind === "canvas" && (
         <NodeModal
           node={selectedNode}
+          projectRoot={activeProject.rootPath}
           tab={modalTab}
           onTab={setModalTab}
           onClose={() => setSelectedNodeId(null)}
@@ -1695,18 +1729,6 @@ function AgentStreamPreview({ line, nodeId }: { line: StreamingLogLine; nodeId: 
   );
 }
 
-const AGENT_LABELS: Record<AgentKind, string> = {
-  hermes: "Hermes",
-  codex: "Codex",
-  gemini: "Gemini",
-  "claude-code": "ClaudeCode",
-  openclaw: "OpenClaw",
-};
-
-function agentIdentityForNode(node: CanvasNode): string {
-  return AGENT_LABELS[node.agent];
-}
-
 function actionForDecisionOption(option: string): UserDecisionAction {
   const value = option.toLowerCase();
   if (value.includes("backtrack")) return "backtrack";
@@ -1717,24 +1739,6 @@ function actionForDecisionOption(option: string): UserDecisionAction {
 
 function nodeSummaryForNode(node: CanvasNode): string {
   return node.context.brief.trim() || node.progress.trim() || "Waiting for execution context.";
-}
-
-function nodeFooterForNode(
-  node: CanvasNode,
-  runtime: NodeRuntimeState,
-): { primary: string; secondary?: string } {
-  switch (node.status) {
-    case "pending":
-      return { primary: "Queued" };
-    case "running":
-      return { primary: runtime.phase === "Think" ? "Thinking" : runtime.phase };
-    case "retrying":
-      return { primary: "Retrying" };
-    case "completed":
-      return { primary: "Verified", secondary: "Evidence ready" };
-    case "failed":
-      return { primary: "Attention" };
-  }
 }
 
 function nodeTooltipForNode(node: CanvasNode, runtime: NodeRuntimeState): string {
@@ -1843,6 +1847,7 @@ function runtimeMatchesStatus(runtime: NodeRuntimeState, status: NodeStatus): bo
 
 function NodeModal({
   node,
+  projectRoot,
   tab,
   onTab,
   onClose,
@@ -1854,6 +1859,7 @@ function NodeModal({
   onDecisionAnswer,
 }: {
   node: CanvasNode;
+  projectRoot: string;
   tab: NodeModalTab;
   onTab: (tab: NodeModalTab) => void;
   onClose: () => void;
@@ -1904,14 +1910,14 @@ function NodeModal({
       .to(panel, { autoAlpha: 0, x: 28, duration: 0.2, ease: "power2.in" }, 0)
       .to(backdrop, { autoAlpha: 0, duration: 0.16, ease: "power2.out" }, 0);
   }
-  const canExecute = node.executable !== false;
+  const canExecute = canUseAgentNodeActions(node);
 
   return (
     <div ref={backdropRef} className="modal-backdrop" role="presentation">
       <section ref={panelRef} className="node-modal" role="dialog" aria-modal="true" aria-label={node.title}>
         <header className="modal-header">
           <div>
-            <p className="eyebrow">{node.agent}</p>
+            <p className="eyebrow">{agentIdentityForNode(node)}</p>
             <h2>{node.title}</h2>
           </div>
           <button className="icon-button" title="Close" onClick={closeWithMotion}>
@@ -1927,15 +1933,15 @@ function NodeModal({
             <RefreshCw size={15} />
             Retry
           </button>
-          <button onClick={onReassign}>
+          <button onClick={onReassign} disabled={!canExecute}>
             <Users size={15} />
             Reassign
           </button>
-          <button onClick={onInsertBefore}>
+          <button onClick={onInsertBefore} disabled={!canExecute}>
             <Plus size={15} />
             Insert Before
           </button>
-          <EditorLaunchMenu onOpenEditor={onOpenEditor} />
+          <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} />
         </div>
         <nav className="modal-tabs" aria-label="Node details">
           {NODE_MODAL_TABS.map((item) => (
@@ -1950,7 +1956,7 @@ function NodeModal({
         </nav>
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
-          {tab === "Changes" && <ChangesTab node={node} />}
+          {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} />}
           {tab === "Context" && <ContextTab node={node} />}
         </div>
       </section>
@@ -1958,7 +1964,13 @@ function NodeModal({
   );
 }
 
-function EditorLaunchMenu({ onOpenEditor }: { onOpenEditor: (editor: EditorKind) => void }) {
+function EditorLaunchMenu({
+  disabled = false,
+  onOpenEditor,
+}: {
+  disabled?: boolean;
+  onOpenEditor: (editor: EditorKind) => void;
+}) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const menuId = useId();
@@ -1986,6 +1998,7 @@ function EditorLaunchMenu({ onOpenEditor }: { onOpenEditor: (editor: EditorKind)
   }, [open]);
 
   function openEditor(option: EditorLaunchOption) {
+    if (disabled) return;
     setOpen(false);
     onOpenEditor(option.editor);
   }
@@ -2000,6 +2013,7 @@ function EditorLaunchMenu({ onOpenEditor }: { onOpenEditor: (editor: EditorKind)
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
+        disabled={disabled}
         onClick={() => setOpen((current) => !current)}
       >
         <EditorLaunchIcon option={triggerOption} />
@@ -2085,7 +2099,7 @@ function UserDecisionPanel({
   );
 }
 
-function ChangesTab({ node }: { node: CanvasNode }) {
+function ChangesTab({ node, projectRoot }: { node: CanvasNode; projectRoot: string }) {
   const [changeset, setChangeset] = useState<Changeset | null>(null);
   const [diffHtml, setDiffHtml] = useState("");
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -2097,16 +2111,29 @@ function ChangesTab({ node }: { node: CanvasNode }) {
   useEffect(() => {
     let active = true;
     setChangeset(null);
-    void mockChangesetService.getChangeset(node).then((value) => {
-      if (active) setChangeset(value);
-    });
+    setDiffHtml("");
+    setDiffError(null);
+    if (!window.devflow) {
+      setChangeset(unavailableChangeset(node));
+      return () => {
+        active = false;
+      };
+    }
+    void window.devflow.getChangeset(projectRoot, node)
+      .then((value) => {
+        if (active) setChangeset(value.changeset);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setChangeset(unavailableChangeset(node, error instanceof Error ? error.message : "Unable to load changeset."));
+      });
     return () => {
       active = false;
     };
-  }, [node]);
+  }, [node, projectRoot, refreshVersion]);
 
   useEffect(() => {
-    if (!changeset) return;
+    if (!changeset || !hasAvailableChangeEvidence(changeset)) return;
 
     let active = true;
     setDiffLoading(true);
@@ -2136,7 +2163,6 @@ function ChangesTab({ node }: { node: CanvasNode }) {
     options.richPreview,
     options.wordDiffs,
     options.wordWrap,
-    refreshVersion,
   ]);
 
   function setDiffOption<K extends keyof ChangesDiffViewOptions>(key: K, value: ChangesDiffViewOptions[K]) {
@@ -2151,6 +2177,26 @@ function ChangesTab({ node }: { node: CanvasNode }) {
   }
 
   if (!changeset) return <p>Loading changes...</p>;
+  const hasChangeEvidence = hasAvailableChangeEvidence(changeset);
+
+  if (!hasChangeEvidence) {
+    return (
+      <section className="changes-review" aria-label="Code changes review">
+        <header className="changes-summary">
+          <div className="changes-summary-copy">
+            <p className="eyebrow">Source: {changeset.source}</p>
+            <h3>Git changeset evidence</h3>
+            <p>{changeReviewSummary(node, changeset)}</p>
+          </div>
+        </header>
+        <div className="changes-empty" role={changeset.evidence?.status === "failed" ? "alert" : undefined}>
+          {changeset.evidence?.status === "failed"
+            ? changeset.evidence.errorReason ?? "Unable to collect git changeset evidence."
+            : "No available change evidence."}
+        </div>
+      </section>
+    );
+  }
 
   const diffShellClassName = [
     "diff2html-shell",
@@ -2163,8 +2209,8 @@ function ChangesTab({ node }: { node: CanvasNode }) {
     <section className="changes-review" aria-label="Code changes review">
       <header className="changes-summary">
         <div className="changes-summary-copy">
-          <p className="eyebrow">Turn Summary</p>
-          <h3>{changeset.source === "git" ? "Worktree diff review" : "Task diff preview"}</h3>
+          <p className="eyebrow">Source: {changeset.source}</p>
+          <h3>Git changeset evidence</h3>
           <p>{changeReviewSummary(node, changeset)}</p>
         </div>
         <div className="diff-stat" aria-label="Diff statistics">
@@ -2207,9 +2253,35 @@ function ChangesTab({ node }: { node: CanvasNode }) {
 
 function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
   const agent = agentIdentityForNode(node);
-  const source = changeset.source === "git" ? "git worktree" : "mock adapter";
   const fileLabel = changeset.diffStat.changed === 1 ? "file" : "files";
-  return `${agent} produced ${changeset.id} from the ${source}: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
+  if (changeset.evidence?.status === "empty") return `${agent} has no available change evidence for ${changeset.id}.`;
+  if (changeset.evidence?.status === "failed") return `${agent} has no usable git changeset for ${changeset.id}.`;
+  if (changeset.evidence?.status === "unknown") return `${agent} has unknown change evidence for ${changeset.id}.`;
+  return `${agent} produced ${changeset.id} from git: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
+}
+
+function hasAvailableChangeEvidence(changeset: Changeset): boolean {
+  return changeset.source === "git" && changeset.evidence?.status === "available" && changeset.files.length > 0;
+}
+
+function unavailableChangeset(node: CanvasNode, reason?: string): Changeset {
+  return {
+    id: node.changesetId,
+    files: [],
+    diffStat: { added: 0, changed: 0, deleted: 0 },
+    patchPreview: "",
+    source: "git",
+    evidence: {
+      evidenceId: `changeset-evidence-${node.changesetId}`,
+      changesetId: node.changesetId,
+      source: "git",
+      status: reason ? "failed" : "unknown",
+      files: [],
+      diffStat: { added: 0, changed: 0, deleted: 0 },
+      patchPreviewTruncated: false,
+      ...(reason ? { errorReason: reason } : {}),
+    },
+  };
 }
 
 function ChangesDiffToolbar({
@@ -2480,6 +2552,48 @@ function StatusLight({ status }: { status: NodeStatus }) {
   return <span className={`status-light ${status}`} aria-label={status} />;
 }
 
+async function persistCanvasWorkflowSession(
+  project: ImportedProject,
+  session: CanvasSession,
+  inputSource: string,
+): Promise<void> {
+  if (!window.devflow) return;
+  await window.devflow.createWorkflowSession(project.rootPath, {
+    id: session.id,
+    projectId: session.projectId,
+    title: session.title,
+    goal: session.goal,
+    mode: session.mode,
+    plannerProfile: "default",
+    transport: "hermes_replay_recovery",
+    recoveryReason: "SkyTurn event ledger initializes planner continuity.",
+    now: session.createdAt,
+  });
+  await window.devflow.appendWorkflowUserInput(project.rootPath, {
+    sessionId: session.id,
+    inputId: `${inputSource}-${session.id}`,
+    text: session.goal,
+    now: session.createdAt,
+  });
+}
+
+function canvasSessionFromWorkflowEvent(event: unknown): CanvasSession | null {
+  if (!event || typeof event !== "object") return null;
+  const canvasSession = (event as { canvasSession?: unknown }).canvasSession;
+  return isCanvasSession(canvasSession) ? canvasSession : null;
+}
+
+function isCanvasSession(value: unknown): value is CanvasSession {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<CanvasSession>;
+  return (
+    candidate.kind === "canvas" &&
+    typeof candidate.id === "string" &&
+    Array.isArray(candidate.nodes) &&
+    Array.isArray(candidate.edges)
+  );
+}
+
 function createSession(projectId: string, goal: string, mode: WorkflowMode): CanvasSessionTab {
   const createdAt = new Date().toISOString();
   return mode === "fast"
@@ -2489,7 +2603,7 @@ function createSession(projectId: string, goal: string, mode: WorkflowMode): Can
 
 function changesetsForSession(session: CanvasSessionTab): WorkspaceState["changesets"] {
   if (session.kind !== "canvas") return {};
-  return Object.fromEntries(session.nodes.map((node) => [node.changesetId, createMockChangeset(node)]));
+  return {};
 }
 
 function advanceMockRun(session: CanvasSession): CanvasSession {

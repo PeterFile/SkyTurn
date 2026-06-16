@@ -397,11 +397,15 @@ function parseExternalLaneSuggestion(raw: Record<string, unknown>): LaneSuggesti
   const lane: LaneSuggestion = {
     id: raw.id.trim(),
     kind: raw.kind.trim(),
+    laneKind: laneKindForExternalKind(raw.kind.trim()),
     title: raw.title.trim(),
   };
-  if (isNonEmptyString(raw.semanticKey)) lane.semanticKey = raw.semanticKey.trim();
-  if (isWorkflowLaneKind(raw.laneKind)) lane.laneKind = raw.laneKind;
-  if (isNonEmptyString(raw.semanticSubtype)) lane.semanticSubtype = raw.semanticSubtype.trim();
+  if (isNonEmptyString(raw.semanticKey) && !isReservedRepairSemanticKey(raw.semanticKey.trim())) {
+    lane.semanticKey = raw.semanticKey.trim();
+  }
+  if (isNonEmptyString(raw.semanticSubtype) && raw.semanticSubtype.trim() !== "repair") {
+    lane.semanticSubtype = raw.semanticSubtype.trim();
+  }
   if (isAgentKind(raw.agentKind)) lane.agentKind = raw.agentKind;
   if (Array.isArray(raw.dependsOn)) lane.dependsOn = stringArray(raw.dependsOn);
   if (Array.isArray(raw.fileScopes)) lane.fileScopes = stringArray(raw.fileScopes);
@@ -546,6 +550,19 @@ export function evaluateGate(projection: FlowProjection, operation: WorkflowInte
     const hasValidation = projection.lanes.some((lane) => /validation|test|regression/.test(lane.kind) && lane.status === "completed");
     if (!hasReview || !hasValidation) return blocked("Commit before review and validation is rejected.");
   }
+  if (operation.type === "ReplanFromEvidence") {
+    const lane = projection.lanes.find((item) => item.id === operation.laneId);
+    if (!lane) return blocked("Replan requires an existing failed lane.");
+    if (lane.laneKind === "fix" || lane.semanticSubtype === "repair" || lane.semanticKey.startsWith("repair:")) {
+      return blocked("Failed repair lanes do not automatically create second-level repair.");
+    }
+    if (latestSegmentForLane(projection, lane.id)?.status === "cancelled") {
+      return blocked("Cancelled run does not trigger automatic repair.");
+    }
+    const evidence = projection.evidence.find((item) => item.id === operation.evidenceId && item.laneId === operation.laneId);
+    if (!evidence || evidence.status !== "failed") return blocked("Replan requires failed evidence.");
+    if (lane.status !== "failed") return blocked("Replan requires the source lane to remain failed.");
+  }
   return { allowed: true, reason: "allowed" };
 }
 
@@ -562,7 +579,8 @@ export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleRe
     if (selected.length >= input.allowedParallelism) break;
     if (!lane.executable) continue;
     if (lane.status !== "pending" && lane.status !== "ready") continue;
-    if (!(incoming.get(lane.id) ?? []).every((dependency) => completed.has(dependency))) continue;
+    if (isBlockedByWaitingDecision(projection, lane.id)) continue;
+    if (!(incoming.get(lane.id) ?? []).every((dependency) => dependencyIsSatisfied(projection, lane, dependency, completed))) continue;
     if (hasScopeConflict(lane, occupied)) continue;
     selected.push(lane);
     occupied.push({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes });
@@ -720,17 +738,68 @@ function compileOperation(
     ];
   }
   if (operation.type === "ReplanFromEvidence") {
+    const replanEvent = makeEvent(projection, {
+      kind: "workflow.replan.requested",
+      source: "workflow-kernel",
+      payload: { laneId: operation.laneId, evidenceId: operation.evidenceId },
+      now,
+      idempotencyKey: `replan:${operation.laneId}:${operation.evidenceId}:requested`,
+    });
+    const working = reduceWorkflowEvents([...projection.events, replanEvent]);
     return [
-      makeEvent(projection, {
-        kind: "workflow.replan.requested",
-        source: "workflow-kernel",
-        payload: { laneId: operation.laneId, evidenceId: operation.evidenceId },
+      replanEvent,
+      ...laneAndEdgeEvents(
+        working,
+        repairLaneSuggestionsForEvidence(working, operation.laneId, operation.evidenceId),
         now,
-        idempotencyKey: `intent:${intent.intentId}:replan:${operation.laneId}:${operation.evidenceId}`,
-      }),
+        `repair:${operation.laneId}:${operation.evidenceId}`,
+      ),
     ];
   }
   return [];
+}
+
+function repairLaneSuggestionsForEvidence(
+  projection: FlowProjection,
+  failedLaneId: string,
+  evidenceId: string,
+): LaneSuggestion[] {
+  const failedLane = projection.lanes.find((lane) => lane.id === failedLaneId);
+  const evidence = projection.evidence.find((item) => item.id === evidenceId && item.laneId === failedLaneId);
+  if (!failedLane || !evidence) return [];
+
+  const suffix = `${idFragment(failedLaneId)}-${idFragment(evidenceId)}`;
+  const fixLaneId = `lane-fix-${suffix}`;
+  const regressionLaneId = `lane-regression-${suffix}`;
+  const evidenceKind = evidence.kind.trim() ? evidence.kind : "run-exit";
+  return [
+    {
+      id: fixLaneId,
+      semanticKey: `repair:${failedLaneId}:${evidenceId}`,
+      kind: "fix",
+      laneKind: "fix",
+      semanticSubtype: "repair",
+      title: `Fix ${failedLane.title}`,
+      agentKind: "codex",
+      dependsOn: [failedLaneId],
+      fileScopes: failedLane.fileScopes,
+      packageScopes: failedLane.packageScopes,
+      requiredEvidence: [evidenceKind],
+    },
+    {
+      id: regressionLaneId,
+      semanticKey: `regression:${failedLaneId}:${evidenceId}`,
+      kind: "regression_check",
+      laneKind: "regression",
+      semanticSubtype: "regression_check",
+      title: `Validate fix for ${failedLane.title}`,
+      agentKind: "codex",
+      dependsOn: [fixLaneId],
+      fileScopes: failedLane.fileScopes,
+      packageScopes: failedLane.packageScopes,
+      requiredEvidence: ["test"],
+    },
+  ];
 }
 
 function laneAndEdgeEvents(
@@ -1007,6 +1076,16 @@ function laneKindForLegacyKind(kind: string): WorkflowLaneKind {
   return "implementation";
 }
 
+function laneKindForExternalKind(kind: string): WorkflowLaneKind {
+  const laneKind = laneKindForLegacyKind(kind);
+  // External fix-like lanes are normal implementation; trusted repair lanes come from ReplanFromEvidence.
+  return laneKind === "fix" ? "implementation" : laneKind;
+}
+
+function isReservedRepairSemanticKey(value: string): boolean {
+  return value.startsWith("repair:") || value.startsWith("regression:");
+}
+
 function semanticSubtypeForLegacyKind(kind: string, laneKind: WorkflowLaneKind): WorkflowLaneSemanticSubtype {
   if (kind === laneKind && laneKind === "fix") return "repair";
   return kind as WorkflowLaneSemanticSubtype;
@@ -1106,23 +1185,20 @@ function upsertUserDecision(projection: FlowProjection, decision: UserDecisionPr
 
 function answerUserDecision(projection: FlowProjection, answer: UserDecisionAnsweredPayload): void {
   const index = projection.userDecisions.findIndex((item) => item.decisionId === answer.decisionId);
-  const existing = index === -1 ? null : projection.userDecisions[index];
+  if (index === -1) return;
+  const existing = projection.userDecisions[index];
   const next: UserDecisionProjection = {
     decisionId: answer.decisionId,
-    prompt: existing?.prompt ?? "",
-    options: existing?.options ?? [],
-    reason: existing?.reason ?? "",
-    targetLaneId: answer.targetLaneId ?? existing?.targetLaneId,
-    targetSegmentId: answer.targetSegmentId ?? existing?.targetSegmentId,
+    prompt: existing.prompt,
+    options: existing.options,
+    reason: existing.reason,
+    targetLaneId: answer.targetLaneId ?? existing.targetLaneId,
+    targetSegmentId: answer.targetSegmentId ?? existing.targetSegmentId,
     status: "answered",
     selectedOption: answer.selectedOption,
     action: answer.action,
     ...(answer.comment ? { comment: answer.comment } : {}),
   };
-  if (index === -1) {
-    projection.userDecisions.push(next);
-    return;
-  }
   projection.userDecisions[index] = next;
 }
 
@@ -1244,6 +1320,53 @@ function appendLaneOutput(projection: FlowProjection, laneId: string, text: stri
   projection.lanes = projection.lanes.map((lane) => (lane.id === laneId ? { ...lane, output: [...lane.output, text] } : lane));
 }
 
+function dependencyIsSatisfied(
+  projection: FlowProjection,
+  lane: FlowLane,
+  dependencyId: string,
+  completed: Set<string>,
+): boolean {
+  if (completed.has(dependencyId)) return true;
+  if (lane.laneKind !== "fix") return false;
+  return isTrustedFailedRepairDependency(projection, lane, dependencyId);
+}
+
+function isTrustedFailedRepairDependency(projection: FlowProjection, lane: FlowLane, dependencyId: string): boolean {
+  const dependency = projection.lanes.find((item) => item.id === dependencyId);
+  if (dependency?.status !== "failed") return false;
+  const match = /^repair:([^:]+):([^:]+)$/.exec(lane.semanticKey);
+  if (!match || match[1] !== dependencyId) return false;
+  return projection.evidence.some((evidence) => evidence.id === match[2] && evidence.laneId === dependencyId && evidence.status === "failed");
+}
+
+function isBlockedByWaitingDecision(projection: FlowProjection, laneId: string): boolean {
+  return projection.userDecisions.some((decision) => {
+    if (decision.status !== "waiting_input" || !decision.targetLaneId) return false;
+    return laneId === decision.targetLaneId || laneDependsOn(projection.edges, laneId, decision.targetLaneId);
+  });
+}
+
+function laneDependsOn(edges: FlowEdge[], laneId: string, dependencyId: string): boolean {
+  const incoming = new Map<string, string[]>();
+  for (const edge of edges) {
+    incoming.set(edge.targetLaneId, [...(incoming.get(edge.targetLaneId) ?? []), edge.sourceLaneId]);
+  }
+  const queue = incoming.get(laneId) ?? [];
+  const visited = new Set<string>();
+  while (queue.length > 0) {
+    const current = queue.shift() as string;
+    if (current === dependencyId) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    queue.push(...(incoming.get(current) ?? []));
+  }
+  return false;
+}
+
+function latestSegmentForLane(projection: FlowProjection, laneId: string): FlowSegment | null {
+  return [...projection.segments].reverse().find((segment) => segment.laneId === laneId) ?? null;
+}
+
 function hasScopeConflict(lane: FlowLane, occupied: Array<{ fileScopes: string[]; packageScopes: string[] }>): boolean {
   return occupied.some((scope) => intersects(lane.fileScopes, scope.fileScopes) || intersects(lane.packageScopes, scope.packageScopes));
 }
@@ -1343,6 +1466,11 @@ function isUserDecisionAction(value: unknown): value is UserDecisionAction {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function idFragment(value: string): string {
+  const fragment = value.replace(/^lane-/, "").replace(/^evidence-/, "").replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
+  return fragment.length > 0 ? fragment : "item";
 }
 
 function requireString(value: unknown, field: string): string {
