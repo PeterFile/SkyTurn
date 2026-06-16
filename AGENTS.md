@@ -84,3 +84,22 @@
 - `packages/workflow-kernel` must stay browser-safe and pure; Node/SQLite acceptance belongs in backend-side packages such as `packages/persistence`.
 - `pnpm flow-kernel:acceptance` must cover both kernel scenario execution and SQLite event-stream replay; do not reduce it to static JSON snapshots or mock-only projection checks.
 - Update this file only for reusable project knowledge, not story-specific notes.
+
+## Commit Messages and Pull Requests
+
+- Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) and [Chris Beams](http://chris.beams.io/posts/git-commit/) style for commit messages.
+- Write commit messages focused on user impact, not implementation details.
+- Use `type(scope): imperative user-impact summary` for commit subjects and PR titles.
+- Keep PR titles aligned with the intended squash-merge commit title.
+- Do not end commit subjects, PR titles, or squash-merge titles with a period.
+- NEVER add `Co-Authored-By` with yourself as co-author of the commit. Agents cannot be authors; humans can be. Agents are assistants.
+- Every pull request should answer:
+  - **What changed?**
+  - **Why?**
+  - **Breaking changes?**
+  - **Server PR** (if the change requires a coordinated server update)
+- Use `None.` for **Breaking changes?** and **Server PR** when they do not apply.
+- For squash merges, use the PR title as the merge commit title unless a clearer Conventional Commit subject is needed.
+- For squash merges, make the merge commit body the cleaned PR body: preserve user impact, rationale, breaking changes, and server coordination; remove checklist noise, generated logs, and agent attribution.
+- Comments should be complete sentences and end with a period.
+- Update documentation for user-facing changes.
