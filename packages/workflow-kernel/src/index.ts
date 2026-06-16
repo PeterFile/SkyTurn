@@ -1,4 +1,30 @@
-import type { AgentKind } from "@skyturn/project-core";
+import type {
+  AgentKind,
+  AgentRunSandbox,
+  ChangesetEvidence,
+  UserDecisionAction,
+  UserDecisionAnsweredPayload,
+  UserDecisionProjection,
+  UserDecisionRequestedPayload,
+  WorkflowLaneKind,
+  WorkflowLaneSemanticSubtype,
+  WorkflowProjectionNodeKind,
+  WorkflowRuntimePolicy,
+  WorkflowSideEffectKind,
+  WorkflowVariantAdoption,
+  WorkflowWorktreeIdentity,
+} from "@skyturn/project-core";
+
+export type {
+  ChangesetEvidence,
+  UserDecisionAnsweredPayload,
+  UserDecisionRequestedPayload,
+  WorkflowLaneKind,
+  WorkflowLaneSemanticSubtype,
+  WorkflowRuntimePolicy,
+  WorkflowVariantAdoption,
+  WorkflowWorktreeIdentity,
+} from "@skyturn/project-core";
 
 export type WorkflowIntentOperationType =
   | "AnalyzeRequirement"
@@ -29,7 +55,7 @@ export type WorkflowIntentOperation =
   | { type: "StartImplementation"; laneId: string }
   | { type: "RequestValidation"; laneId: string }
   | { type: "RequestReview"; laneId: string; status?: string; agentKind?: AgentKind }
-  | { type: "RequestUserDecision"; prompt: string; options: string[] }
+  | ({ type: "RequestUserDecision" } & UserDecisionRequestedPayload)
   | { type: "ReplanFromEvidence"; laneId: string; evidenceId: string }
   | { type: "Commit"; laneId: string }
   | { type: "DeclareEdge"; sourceLaneId: string; targetLaneId: string };
@@ -80,8 +106,12 @@ export interface LaneSuggestion {
   id: string;
   semanticKey?: string;
   kind: string;
+  laneKind?: WorkflowLaneKind;
+  semanticSubtype?: WorkflowLaneSemanticSubtype;
   title: string;
   agentKind?: AgentKind;
+  executable?: boolean;
+  runtimePolicy?: WorkflowRuntimePolicy;
   dependsOn?: string[];
   fileScopes?: string[];
   packageScopes?: string[];
@@ -92,8 +122,13 @@ export interface FlowLane {
   id: string;
   semanticKey: string;
   kind: string;
+  laneKind: WorkflowLaneKind;
+  semanticSubtype: WorkflowLaneSemanticSubtype;
   title: string;
   agentKind: AgentKind;
+  nodeKind: WorkflowProjectionNodeKind;
+  executable: boolean;
+  runtimePolicy: WorkflowRuntimePolicy;
   status: FlowLaneStatus;
   fileScopes: string[];
   packageScopes: string[];
@@ -128,6 +163,15 @@ export interface FlowEvidence {
   detail?: string;
 }
 
+export interface FlowProjectionNode {
+  id: string;
+  nodeKind: WorkflowProjectionNodeKind;
+  laneId?: string;
+  decisionId?: string;
+  executable: boolean;
+  runtimePolicy: WorkflowRuntimePolicy;
+}
+
 export type FlowEventKind =
   | "workflow.user_input"
   | "workflow.profile"
@@ -139,10 +183,21 @@ export type FlowEventKind =
   | "workflow.segment.output_delta"
   | "workflow.segment.finished"
   | "workflow.evidence.recorded"
+  | "workflow.changeset.evidence_recorded"
   | "workflow.join.completed"
   | "workflow.replan.requested"
   | "workflow.user_decision.requested"
-  | "workflow.commit.created";
+  | "workflow.user_decision.answered"
+  | "workflow.commit.created"
+  | "workflow.worktree.create_requested"
+  | "workflow.worktree.created"
+  | "workflow.worktree.create_failed"
+  | "workflow.worktree.clean_requested"
+  | "workflow.worktree.cleaned"
+  | "workflow.variant.adopt_requested"
+  | "workflow.variant.adopted"
+  | "workflow.variant.adopt_failed"
+  | "workflow.variant.rejected";
 
 export interface FlowEvent {
   id: string;
@@ -159,9 +214,14 @@ export interface FlowProjection {
   sessionId: string;
   events: FlowEvent[];
   lanes: FlowLane[];
+  projectionNodes: FlowProjectionNode[];
+  userDecisions: UserDecisionProjection[];
   edges: FlowEdge[];
   segments: FlowSegment[];
   evidence: FlowEvidence[];
+  changesetEvidence: ChangesetEvidence[];
+  worktrees: WorkflowWorktreeIdentity[];
+  variantAdoptions: WorkflowVariantAdoption[];
   rejectedIntents: Array<{ intentId: string; reason: string }>;
   acceptedIntentIds: string[];
   projectProfile: ProjectProfile | null;
@@ -263,14 +323,17 @@ function parseWorkflowIntentOperation(raw: Record<string, unknown>): WorkflowInt
       return isRecord(raw.profile)
         ? { type: raw.type, profile: raw.profile }
         : "DiscoverProject requires a project profile object.";
-    case "ProposeLanes":
-      return raw.lanes === undefined || Array.isArray(raw.lanes)
-        ? { type: raw.type, ...(raw.lanes === undefined ? {} : { lanes: raw.lanes as LaneSuggestion[] }) }
-        : "ProposeLanes lanes must be an array when present.";
-    case "SplitLane":
-      return typeof raw.sourceLaneId === "string" && Array.isArray(raw.lanes)
-        ? { type: raw.type, sourceLaneId: raw.sourceLaneId, lanes: raw.lanes as LaneSuggestion[] }
-        : "SplitLane requires sourceLaneId and lanes.";
+    case "ProposeLanes": {
+      if (raw.lanes === undefined) return { type: raw.type };
+      const lanes = parseExternalLaneSuggestions(raw.lanes, "ProposeLanes lanes");
+      return typeof lanes === "string" ? lanes : { type: raw.type, lanes };
+    }
+    case "SplitLane": {
+      const lanes = parseExternalLaneSuggestions(raw.lanes, "SplitLane lanes");
+      return typeof raw.sourceLaneId === "string" && typeof lanes !== "string"
+        ? { type: raw.type, sourceLaneId: raw.sourceLaneId, lanes }
+        : typeof lanes === "string" ? lanes : "SplitLane requires sourceLaneId and lanes.";
+    }
     case "JoinLanes":
       return typeof raw.joinLaneId === "string" && isStringArray(raw.upstreamLaneIds) && raw.upstreamLaneIds.length > 0
         ? { type: raw.type, joinLaneId: raw.joinLaneId, upstreamLaneIds: raw.upstreamLaneIds }
@@ -289,9 +352,20 @@ function parseWorkflowIntentOperation(raw: Record<string, unknown>): WorkflowInt
           }
         : "RequestReview requires laneId.";
     case "RequestUserDecision":
-      return typeof raw.prompt === "string" && isStringArray(raw.options)
-        ? { type: raw.type, prompt: raw.prompt, options: raw.options }
-        : "RequestUserDecision requires prompt and options.";
+      return typeof raw.decisionId === "string" &&
+        typeof raw.prompt === "string" &&
+        isStringArray(raw.options) &&
+        typeof raw.reason === "string"
+        ? {
+            type: raw.type,
+            decisionId: raw.decisionId,
+            prompt: raw.prompt,
+            options: raw.options,
+            reason: raw.reason,
+            ...(typeof raw.targetLaneId === "string" ? { targetLaneId: raw.targetLaneId } : {}),
+            ...(typeof raw.targetSegmentId === "string" ? { targetSegmentId: raw.targetSegmentId } : {}),
+          }
+        : "RequestUserDecision requires decisionId, prompt, options, and reason.";
     case "ReplanFromEvidence":
       return typeof raw.laneId === "string" && typeof raw.evidenceId === "string"
         ? { type: raw.type, laneId: raw.laneId, evidenceId: raw.evidenceId }
@@ -302,6 +376,38 @@ function parseWorkflowIntentOperation(raw: Record<string, unknown>): WorkflowInt
         : "DeclareEdge requires sourceLaneId and targetLaneId.";
   }
   return "WorkflowIntent contains an unsupported operation.";
+}
+
+function parseExternalLaneSuggestions(value: unknown, field: string): LaneSuggestion[] | string {
+  if (!Array.isArray(value)) return `${field} must be an array.`;
+  const lanes: LaneSuggestion[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return `${field} entries must be objects.`;
+    const lane = parseExternalLaneSuggestion(item);
+    if (typeof lane === "string") return lane;
+    lanes.push(lane);
+  }
+  return lanes;
+}
+
+function parseExternalLaneSuggestion(raw: Record<string, unknown>): LaneSuggestion | string {
+  if (!isNonEmptyString(raw.id) || !isNonEmptyString(raw.kind) || !isNonEmptyString(raw.title)) {
+    return "Lane suggestions require id, kind, and title.";
+  }
+  const lane: LaneSuggestion = {
+    id: raw.id.trim(),
+    kind: raw.kind.trim(),
+    title: raw.title.trim(),
+  };
+  if (isNonEmptyString(raw.semanticKey)) lane.semanticKey = raw.semanticKey.trim();
+  if (isWorkflowLaneKind(raw.laneKind)) lane.laneKind = raw.laneKind;
+  if (isNonEmptyString(raw.semanticSubtype)) lane.semanticSubtype = raw.semanticSubtype.trim();
+  if (isAgentKind(raw.agentKind)) lane.agentKind = raw.agentKind;
+  if (Array.isArray(raw.dependsOn)) lane.dependsOn = stringArray(raw.dependsOn);
+  if (Array.isArray(raw.fileScopes)) lane.fileScopes = stringArray(raw.fileScopes);
+  if (Array.isArray(raw.packageScopes)) lane.packageScopes = stringArray(raw.packageScopes);
+  if (Array.isArray(raw.requiredEvidence)) lane.requiredEvidence = stringArray(raw.requiredEvidence);
+  return lane;
 }
 
 export function createDefaultFlowPolicy(input: Partial<Pick<FlowPolicy, "allowedParallelism">> = {}): FlowPolicy {
@@ -454,6 +560,7 @@ export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleRe
 
   for (const lane of projection.lanes) {
     if (selected.length >= input.allowedParallelism) break;
+    if (!lane.executable) continue;
     if (lane.status !== "pending" && lane.status !== "ready") continue;
     if (!(incoming.get(lane.id) ?? []).every((dependency) => completed.has(dependency))) continue;
     if (hasScopeConflict(lane, occupied)) continue;
@@ -513,12 +620,34 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
       projection.evidence.push(evidence);
       if (evidence.status === "passed") setLaneStatus(projection, evidence.laneId, "completed");
     }
+    if (event.kind === "workflow.changeset.evidence_recorded" && isRecord(event.payload.evidence)) {
+      projection.changesetEvidence.push(event.payload.evidence as unknown as ChangesetEvidence);
+    }
+    if (event.kind === "workflow.user_decision.requested") {
+      upsertUserDecision(projection, normalizeUserDecisionRequested(event.payload));
+    }
+    if (event.kind === "workflow.user_decision.answered") {
+      answerUserDecision(projection, normalizeUserDecisionAnswered(event.payload));
+    }
+    if (event.kind === "workflow.worktree.created" && isRecord(event.payload.worktree)) {
+      upsertWorktree(projection, event.payload.worktree as unknown as WorkflowWorktreeIdentity);
+    }
+    if (
+      (event.kind === "workflow.variant.adopt_requested" ||
+        event.kind === "workflow.variant.adopted" ||
+        event.kind === "workflow.variant.adopt_failed" ||
+        event.kind === "workflow.variant.rejected") &&
+      isRecord(event.payload.adoption)
+    ) {
+      upsertVariantAdoption(projection, event.payload.adoption as unknown as WorkflowVariantAdoption);
+    }
     if (event.kind === "workflow.join.completed" || event.kind === "workflow.commit.created") {
       const laneId = typeof event.payload.laneId === "string" ? event.payload.laneId : null;
       if (laneId) setLaneStatus(projection, laneId, "completed");
     }
   }
 
+  refreshProjectionNodes(projection);
   return projection;
 }
 
@@ -577,9 +706,16 @@ function compileOperation(
       makeEvent(projection, {
         kind: "workflow.user_decision.requested",
         source: "workflow-kernel",
-        payload: { prompt: operation.prompt, options: operation.options },
+        payload: {
+          decisionId: operation.decisionId,
+          prompt: operation.prompt,
+          options: operation.options,
+          reason: operation.reason,
+          ...(operation.targetLaneId ? { targetLaneId: operation.targetLaneId } : {}),
+          ...(operation.targetSegmentId ? { targetSegmentId: operation.targetSegmentId } : {}),
+        },
         now,
-        idempotencyKey: `intent:${intent.intentId}:user-decision`,
+        idempotencyKey: `decision:${operation.decisionId}:requested`,
       }),
     ];
   }
@@ -730,10 +866,13 @@ function laneSuggestion(
   fileScopes: string[] = [],
   packageScopes: string[] = [],
 ): LaneSuggestion {
+  const laneKind = laneKindForLegacyKind(kind);
   return {
     id,
     semanticKey: id,
     kind,
+    laneKind,
+    semanticSubtype: semanticSubtypeForLegacyKind(kind, laneKind),
     title,
     agentKind,
     dependsOn,
@@ -780,9 +919,14 @@ function emptyFlowProjection(sessionId: string): FlowProjection {
     sessionId,
     events: [],
     lanes: [],
+    projectionNodes: [],
+    userDecisions: [],
     edges: [],
     segments: [],
     evidence: [],
+    changesetEvidence: [],
+    worktrees: [],
+    variantAdoptions: [],
     rejectedIntents: [],
     acceptedIntentIds: [],
     projectProfile: null,
@@ -826,18 +970,196 @@ function normalizeLane(value: Record<string, unknown> | LaneSuggestion | FlowLan
   const record = value as Record<string, unknown>;
   const id = requireString(record.id, "lane.id");
   const kind = requireString(record.kind, "lane.kind");
+  const laneKind = isWorkflowLaneKind(record.laneKind) ? record.laneKind : laneKindForLegacyKind(kind);
+  const semanticSubtype =
+    typeof record.semanticSubtype === "string" ? record.semanticSubtype : semanticSubtypeForLegacyKind(kind, laneKind);
+  const executable = typeof record.executable === "boolean" ? record.executable : true;
   return {
     id,
     semanticKey: typeof record.semanticKey === "string" ? record.semanticKey : id,
     kind,
+    laneKind,
+    semanticSubtype,
     title: typeof record.title === "string" ? record.title : id,
     agentKind: isAgentKind(record.agentKind) ? record.agentKind : "codex",
+    nodeKind: "agent_task",
+    executable,
+    runtimePolicy: normalizeRuntimePolicy(record.runtimePolicy, laneKind, executable),
     status: isLaneStatus(record.status) ? record.status : "pending",
     fileScopes: stringArray(record.fileScopes),
     packageScopes: stringArray(record.packageScopes),
     requiredEvidence: stringArray(record.requiredEvidence),
     output: stringArray(record.output),
   };
+}
+
+function laneKindForLegacyKind(kind: string): WorkflowLaneKind {
+  const value = kind.toLowerCase();
+  if (isWorkflowLaneKind(value)) return value;
+  if (/fix|repair/.test(value)) return "fix";
+  if (/regression/.test(value)) return "regression";
+  if (/validation|test|browser|screenshot|check/.test(value)) return "validation";
+  if (/review/.test(value)) return "review";
+  if (/commit|adopt/.test(value)) return "commit";
+  if (/join|integration/.test(value)) return "join";
+  if (/design/.test(value)) return "design";
+  if (/discover|profile|understanding|analysis/.test(value)) return "discovery";
+  return "implementation";
+}
+
+function semanticSubtypeForLegacyKind(kind: string, laneKind: WorkflowLaneKind): WorkflowLaneSemanticSubtype {
+  if (kind === laneKind && laneKind === "fix") return "repair";
+  return kind as WorkflowLaneSemanticSubtype;
+}
+
+function normalizeRuntimePolicy(
+  value: unknown,
+  laneKind: WorkflowLaneKind,
+  executable: boolean,
+): WorkflowRuntimePolicy {
+  const fallback = defaultRuntimePolicyForLane(laneKind, executable);
+  if (!isRecord(value)) return fallback;
+  return {
+    source: "workflow_projection",
+    trusted: true,
+    executable,
+    sandbox: isAgentRunSandbox(value.sandbox) ? value.sandbox : fallback.sandbox,
+    sideEffects: normalizeSideEffects(value.sideEffects, fallback.sideEffects),
+    reason: typeof value.reason === "string" && value.reason.trim() ? value.reason : fallback.reason,
+  };
+}
+
+function defaultRuntimePolicyForLane(laneKind: WorkflowLaneKind, executable: boolean): WorkflowRuntimePolicy {
+  if (!executable) {
+    return {
+      source: "workflow_projection",
+      trusted: true,
+      executable: false,
+      sandbox: "read-only",
+      sideEffects: [],
+      reason: "Projection node is not executable.",
+    };
+  }
+  const sandbox = sandboxForLaneKind(laneKind);
+  return {
+    source: "workflow_projection",
+    trusted: true,
+    executable: true,
+    sandbox,
+    sideEffects: sideEffectsForLaneKind(laneKind),
+    reason: `Runtime policy derived from workflow lane kind ${laneKind}.`,
+  };
+}
+
+function sandboxForLaneKind(laneKind: WorkflowLaneKind): AgentRunSandbox {
+  if (laneKind === "commit") return "danger-full-access";
+  if (laneKind === "implementation" || laneKind === "fix") return "workspace-write";
+  return "read-only";
+}
+
+function sideEffectsForLaneKind(laneKind: WorkflowLaneKind): WorkflowSideEffectKind[] {
+  if (laneKind === "commit") return ["git", "filesystem", "process"];
+  if (laneKind === "implementation" || laneKind === "fix") return ["filesystem", "process"];
+  if (laneKind === "validation" || laneKind === "regression" || laneKind === "review") return ["process", "artifact"];
+  return ["process"];
+}
+
+function normalizeSideEffects(value: unknown, fallback: WorkflowSideEffectKind[]): WorkflowSideEffectKind[] {
+  const values = Array.isArray(value) ? value.filter(isWorkflowSideEffectKind) : fallback;
+  return [...new Set(values)];
+}
+
+function normalizeUserDecisionRequested(payload: Record<string, unknown>): UserDecisionProjection {
+  const requested = payload as Partial<UserDecisionRequestedPayload>;
+  const decisionId = requireString(requested.decisionId, "decision.decisionId");
+  return {
+    decisionId,
+    prompt: typeof requested.prompt === "string" ? requested.prompt : "",
+    options: stringArray(requested.options),
+    reason: typeof requested.reason === "string" ? requested.reason : "",
+    status: "waiting_input",
+    ...(typeof requested.targetLaneId === "string" ? { targetLaneId: requested.targetLaneId } : {}),
+    ...(typeof requested.targetSegmentId === "string" ? { targetSegmentId: requested.targetSegmentId } : {}),
+  };
+}
+
+function normalizeUserDecisionAnswered(payload: Record<string, unknown>): UserDecisionAnsweredPayload {
+  const decisionId = requireString(payload.decisionId, "decision.decisionId");
+  return {
+    decisionId,
+    selectedOption: typeof payload.selectedOption === "string" ? payload.selectedOption : "",
+    action: isUserDecisionAction(payload.action) ? payload.action : "continue",
+    ...(typeof payload.comment === "string" ? { comment: payload.comment } : {}),
+    ...(typeof payload.targetLaneId === "string" ? { targetLaneId: payload.targetLaneId } : {}),
+    ...(typeof payload.targetSegmentId === "string" ? { targetSegmentId: payload.targetSegmentId } : {}),
+  };
+}
+
+function upsertUserDecision(projection: FlowProjection, decision: UserDecisionProjection): void {
+  const index = projection.userDecisions.findIndex((item) => item.decisionId === decision.decisionId);
+  if (index === -1) {
+    projection.userDecisions.push(decision);
+    return;
+  }
+  projection.userDecisions[index] = { ...projection.userDecisions[index], ...decision };
+}
+
+function answerUserDecision(projection: FlowProjection, answer: UserDecisionAnsweredPayload): void {
+  const index = projection.userDecisions.findIndex((item) => item.decisionId === answer.decisionId);
+  const existing = index === -1 ? null : projection.userDecisions[index];
+  const next: UserDecisionProjection = {
+    decisionId: answer.decisionId,
+    prompt: existing?.prompt ?? "",
+    options: existing?.options ?? [],
+    reason: existing?.reason ?? "",
+    targetLaneId: answer.targetLaneId ?? existing?.targetLaneId,
+    targetSegmentId: answer.targetSegmentId ?? existing?.targetSegmentId,
+    status: "answered",
+    selectedOption: answer.selectedOption,
+    action: answer.action,
+    ...(answer.comment ? { comment: answer.comment } : {}),
+  };
+  if (index === -1) {
+    projection.userDecisions.push(next);
+    return;
+  }
+  projection.userDecisions[index] = next;
+}
+
+function refreshProjectionNodes(projection: FlowProjection): void {
+  const laneNodes: FlowProjectionNode[] = projection.lanes.map((lane) => ({
+    id: lane.id,
+    laneId: lane.id,
+    nodeKind: lane.nodeKind,
+    executable: lane.executable,
+    runtimePolicy: lane.runtimePolicy,
+  }));
+  const decisionNodes: FlowProjectionNode[] = projection.userDecisions.map((decision) => ({
+    id: decision.decisionId,
+    decisionId: decision.decisionId,
+    nodeKind: "user_decision",
+    executable: false,
+    runtimePolicy: defaultRuntimePolicyForLane("decision", false),
+  }));
+  projection.projectionNodes = [...laneNodes, ...decisionNodes];
+}
+
+function upsertWorktree(projection: FlowProjection, worktree: WorkflowWorktreeIdentity): void {
+  const index = projection.worktrees.findIndex((item) => item.worktreeId === worktree.worktreeId);
+  if (index === -1) {
+    projection.worktrees.push(worktree);
+    return;
+  }
+  projection.worktrees[index] = { ...projection.worktrees[index], ...worktree };
+}
+
+function upsertVariantAdoption(projection: FlowProjection, adoption: WorkflowVariantAdoption): void {
+  const index = projection.variantAdoptions.findIndex((item) => item.adoptionId === adoption.adoptionId);
+  if (index === -1) {
+    projection.variantAdoptions.push(adoption);
+    return;
+  }
+  projection.variantAdoptions[index] = { ...projection.variantAdoptions[index], ...adoption };
 }
 
 function normalizeEdge(value: Record<string, unknown>): FlowEdge {
@@ -988,8 +1310,39 @@ function isLaneStatus(value: unknown): value is FlowLaneStatus {
   return value === "pending" || value === "ready" || value === "running" || value === "waiting_input" || value === "completed" || value === "failed" || value === "blocked";
 }
 
+function isWorkflowLaneKind(value: unknown): value is WorkflowLaneKind {
+  return (
+    value === "discovery" ||
+    value === "design" ||
+    value === "implementation" ||
+    value === "fix" ||
+    value === "validation" ||
+    value === "regression" ||
+    value === "review" ||
+    value === "commit" ||
+    value === "join" ||
+    value === "decision"
+  );
+}
+
 function isAgentKind(value: unknown): value is AgentKind {
   return value === "hermes" || value === "codex" || value === "gemini" || value === "claude-code" || value === "openclaw";
+}
+
+function isAgentRunSandbox(value: unknown): value is AgentRunSandbox {
+  return value === "read-only" || value === "workspace-write" || value === "danger-full-access";
+}
+
+function isWorkflowSideEffectKind(value: unknown): value is WorkflowSideEffectKind {
+  return value === "filesystem" || value === "git" || value === "network" || value === "process" || value === "artifact";
+}
+
+function isUserDecisionAction(value: unknown): value is UserDecisionAction {
+  return value === "backtrack" || value === "parallel_worktree" || value === "continue" || value === "abort";
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function requireString(value: unknown, field: string): string {

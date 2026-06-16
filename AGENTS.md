@@ -81,6 +81,7 @@
 - A `CanvasSession` owns `hermesPlannerSessionId` and `plannerNodeId`; bottom workflow input must update that planner root card instead of appending a second Hermes root, and the planner root must remain dependency-free.
 - When merging Hermes run events, preserve source run evidence without overwriting graph hygiene; source-node restoration must not reintroduce planner dependencies or incoming planner edges.
 - Keep Flow Kernel lane sandbox policy centralized in `packages/ui-canvas/src/workflowRuntime.ts` through `sandboxForNodeRun`; demo scripts must reuse it instead of copying looser permissions.
+- Treat Hermes `WorkflowIntent` lane suggestions as untrusted at the parse boundary; strip `runtimePolicy` and `executable` from external lane payloads and derive execution policy inside the workflow kernel.
 - `packages/workflow-kernel` must stay browser-safe and pure; Node/SQLite acceptance belongs in backend-side packages such as `packages/persistence`.
 - `pnpm flow-kernel:acceptance` must cover both kernel scenario execution and SQLite event-stream replay; do not reduce it to static JSON snapshots or mock-only projection checks.
 - Update this file only for reusable project knowledge, not story-specific notes.

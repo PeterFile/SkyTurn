@@ -39,9 +39,54 @@ export type RunEventKind = "output" | "status" | "error" | "approval" | "progres
 export type EvidenceCheckStatus = "passed" | "failed" | "skipped";
 export type EvidenceCheckKind = "run-exit" | "run-timeout" | "git" | "test" | "typecheck" | "build" | "review";
 export type HermesPlannerTransport = "hermes_live_chat" | "hermes_session_resume" | "hermes_replay_recovery";
+export type WorkflowLaneKind =
+  | "discovery"
+  | "design"
+  | "implementation"
+  | "fix"
+  | "validation"
+  | "regression"
+  | "review"
+  | "commit"
+  | "join"
+  | "decision";
+export type WorkflowLaneSemanticSubtype =
+  | "coding"
+  | "frontend_implementation"
+  | "backend_implementation"
+  | "persistence_implementation"
+  | "repair"
+  | "browser_validation"
+  | "unit_test"
+  | "integration_test"
+  | "fixture_validation"
+  | "regression_check"
+  | "evidence_review"
+  | "commit"
+  | (string & {});
+export type WorkflowProjectionNodeKind = "agent_task" | "user_decision";
+export type WorkflowRuntimePolicySource = "workflow_projection";
+export type WorkflowSideEffectKind = "filesystem" | "git" | "network" | "process" | "artifact";
+export type UserDecisionAction = "backtrack" | "parallel_worktree" | "continue" | "abort";
+export type UserDecisionNodeStatus = "waiting_input" | "answered";
+export type WorkflowVariantAdoptionStrategy = "merge" | "cherry-pick";
+export type WorkflowVariantAdoptionStatus = "requested" | "adopted" | "failed" | "rejected";
+export type ChangesetEvidenceStatus = "available" | "empty" | "failed" | "unknown";
 
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
 export const RUN_EVENT_PROTOCOL_VERSION = 1;
+export const WORKFLOW_LANE_KINDS: WorkflowLaneKind[] = [
+  "discovery",
+  "design",
+  "implementation",
+  "fix",
+  "validation",
+  "regression",
+  "review",
+  "commit",
+  "join",
+  "decision",
+];
 export const EVIDENCE_CHECK_KINDS: EvidenceCheckKind[] = [
   "run-exit",
   "run-timeout",
@@ -145,6 +190,108 @@ export interface WorktreeMetadata {
   path: string;
   branchName: string;
   baseCommit: string;
+  worktreeId?: string;
+  variantId?: string;
+  realPath?: string;
+  gitdir?: string;
+  repoRoot?: string;
+  headCommit?: string;
+}
+
+export interface WorkflowRuntimePolicy {
+  source: WorkflowRuntimePolicySource;
+  trusted: true;
+  executable: boolean;
+  sandbox: AgentRunSandbox;
+  sideEffects: WorkflowSideEffectKind[];
+  reason: string;
+}
+
+export interface UserDecisionRequestedPayload {
+  decisionId: string;
+  prompt: string;
+  options: string[];
+  reason: string;
+  targetLaneId?: string;
+  targetSegmentId?: string;
+}
+
+export interface UserDecisionAnsweredPayload {
+  decisionId: string;
+  selectedOption: string;
+  action: UserDecisionAction;
+  comment?: string;
+  targetLaneId?: string;
+  targetSegmentId?: string;
+}
+
+export interface UserDecisionProjection {
+  decisionId: string;
+  prompt: string;
+  options: string[];
+  reason: string;
+  status: UserDecisionNodeStatus;
+  targetLaneId?: string;
+  targetSegmentId?: string;
+  selectedOption?: string;
+  action?: UserDecisionAction;
+  comment?: string;
+}
+
+export interface WorkflowLedgerSummaryEvent {
+  seq: number;
+  kind: string;
+  summary: string;
+  laneId?: string;
+}
+
+export interface WorkflowLedgerSummary {
+  throughSeq: number;
+  checkpointSummary: string | null;
+  facts: string[];
+  recentEvents: WorkflowLedgerSummaryEvent[];
+  openQuestions: string[];
+}
+
+export interface WorkflowWorktreeIdentity {
+  worktreeId: string;
+  variantId: string;
+  path: string;
+  realPath: string;
+  gitdir: string;
+  repoRoot: string;
+  branchName: string;
+  baseCommit: string;
+  headCommit: string;
+  parentLaneId: string;
+  parentSegmentId?: string;
+}
+
+export interface WorkflowVariantAdoption {
+  adoptionId: string;
+  variantId: string;
+  worktreeId: string;
+  strategy: WorkflowVariantAdoptionStrategy;
+  status: WorkflowVariantAdoptionStatus;
+  baseCommit: string;
+  headCommit: string;
+  targetBranchName: string;
+  adoptedCommit?: string;
+  failureReason?: string;
+}
+
+export interface ChangesetEvidence {
+  evidenceId: string;
+  changesetId: string;
+  source: Changeset["source"];
+  status: ChangesetEvidenceStatus;
+  files: string[];
+  diffStat: Changeset["diffStat"];
+  patchPreviewTruncated: boolean;
+  worktreeId?: string;
+  collectedAt?: string;
+  artifactPaths?: string[];
+  errorReason?: string;
 }
 
 export interface CanvasNodeContext {
@@ -184,6 +331,12 @@ export interface CanvasNode {
   title: string;
   agent: AgentKind;
   progress: string;
+  nodeKind?: WorkflowProjectionNodeKind;
+  executable?: boolean;
+  laneKind?: WorkflowLaneKind;
+  semanticSubtype?: WorkflowLaneSemanticSubtype;
+  runtimePolicy?: WorkflowRuntimePolicy;
+  userDecision?: UserDecisionProjection;
   runtime?: NodeRuntimeState;
   display?: CanvasNodeDisplay;
   workflowTrace?: CanvasNodeWorkflowTrace;
@@ -245,6 +398,7 @@ export interface Changeset {
   };
   patchPreview: string;
   source: "mock" | "git";
+  evidence?: ChangesetEvidence;
 }
 
 export function hasConcreteRunEvidence(evidence: RunEvidence | null | undefined): boolean {

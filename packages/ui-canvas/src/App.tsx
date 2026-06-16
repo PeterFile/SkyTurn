@@ -87,6 +87,7 @@ import {
   type NodeRuntimeState,
   type NodeStatus,
   type PlanSession,
+  type UserDecisionAction,
   type WorkflowMode,
 } from "@skyturn/project-core";
 
@@ -240,6 +241,7 @@ export default function App() {
   useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
     for (const node of activeSession.nodes) {
+      if (node.executable === false) continue;
       if (node.status !== "running" && node.status !== "retrying") continue;
       if (startedBridgeRuns.current.has(node.runId)) continue;
       startedBridgeRuns.current.add(node.runId);
@@ -432,6 +434,31 @@ export default function App() {
     updateCanvasSession(activeSession.id, (session) => retryCanvasNode(session, nodeId, new Date().toISOString()));
   }
 
+  function answerUserDecision(nodeId: string, selectedOption: string) {
+    if (!activeSession || activeSession.kind !== "canvas") return;
+    const now = new Date().toISOString();
+    const action = actionForDecisionOption(selectedOption);
+    updateCanvasSession(activeSession.id, (session) => ({
+      ...session,
+      updatedAt: now,
+      nodes: session.nodes.map((node) => {
+        if (node.id !== nodeId || !node.userDecision) return node;
+        return {
+          ...node,
+          status: "completed",
+          progress: "Decision answered",
+          userDecision: {
+            ...node.userDecision,
+            status: "answered",
+            selectedOption,
+            action,
+          },
+          output: [...node.output, `Selected: ${selectedOption}`],
+        };
+      }),
+    }));
+  }
+
   function reassignNode(nodeId: string) {
     const order: AgentKind[] = ["hermes", "codex", "gemini", "claude-code", "openclaw"];
     updateNode(nodeId, (node) => {
@@ -609,6 +636,7 @@ export default function App() {
           onReassign={() => reassignNode(selectedNode.id)}
           onInsertBefore={() => insertBefore(selectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, selectedNode)}
+          onDecisionAnswer={(option) => answerUserDecision(selectedNode.id, option)}
         />
       )}
     </div>
@@ -1679,6 +1707,14 @@ function agentIdentityForNode(node: CanvasNode): string {
   return AGENT_LABELS[node.agent];
 }
 
+function actionForDecisionOption(option: string): UserDecisionAction {
+  const value = option.toLowerCase();
+  if (value.includes("backtrack")) return "backtrack";
+  if (value.includes("parallel") || value.includes("worktree")) return "parallel_worktree";
+  if (value.includes("abort") || value.includes("cancel") || value.includes("stop")) return "abort";
+  return "continue";
+}
+
 function nodeSummaryForNode(node: CanvasNode): string {
   return node.context.brief.trim() || node.progress.trim() || "Waiting for execution context.";
 }
@@ -1815,6 +1851,7 @@ function NodeModal({
   onReassign,
   onInsertBefore,
   onOpenEditor,
+  onDecisionAnswer,
 }: {
   node: CanvasNode;
   tab: NodeModalTab;
@@ -1825,6 +1862,7 @@ function NodeModal({
   onReassign: () => void;
   onInsertBefore: () => void;
   onOpenEditor: (editor: EditorKind) => void;
+  onDecisionAnswer: (option: string) => void;
 }) {
   const backdropRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
@@ -1866,6 +1904,7 @@ function NodeModal({
       .to(panel, { autoAlpha: 0, x: 28, duration: 0.2, ease: "power2.in" }, 0)
       .to(backdrop, { autoAlpha: 0, duration: 0.16, ease: "power2.out" }, 0);
   }
+  const canExecute = node.executable !== false;
 
   return (
     <div ref={backdropRef} className="modal-backdrop" role="presentation">
@@ -1880,11 +1919,11 @@ function NodeModal({
           </button>
         </header>
         <div className="modal-actions">
-          <button onClick={onStop}>
+          <button onClick={onStop} disabled={!canExecute}>
             <Square size={15} />
             Stop
           </button>
-          <button onClick={onRetry}>
+          <button onClick={onRetry} disabled={!canExecute}>
             <RefreshCw size={15} />
             Retry
           </button>
@@ -1910,7 +1949,7 @@ function NodeModal({
           ))}
         </nav>
         <div className="modal-body">
-          {tab === "Output" && <OutputTab node={node} />}
+          {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab node={node} />}
           {tab === "Context" && <ContextTab node={node} />}
         </div>
@@ -1994,14 +2033,55 @@ function EditorLaunchIcon({ option }: { option: EditorLaunchOption }) {
   );
 }
 
-function OutputTab({ node }: { node: CanvasNode }) {
+function OutputTab({
+  node,
+  onDecisionAnswer,
+}: {
+  node: CanvasNode;
+  onDecisionAnswer: (option: string) => void;
+}) {
   return (
     <div className="output-lines">
+      {node.userDecision && (
+        <UserDecisionPanel node={node} onDecisionAnswer={onDecisionAnswer} />
+      )}
       {node.output.map((line, index) => (
         <p key={`${node.id}-${index}`}>{line}</p>
       ))}
       {node.output.length === 0 && <p>No node output yet.</p>}
     </div>
+  );
+}
+
+function UserDecisionPanel({
+  node,
+  onDecisionAnswer,
+}: {
+  node: CanvasNode;
+  onDecisionAnswer: (option: string) => void;
+}) {
+  const decision = node.userDecision;
+  if (!decision) return null;
+  const answered = decision.status === "answered";
+
+  return (
+    <section className="decision-panel" aria-label={decision.prompt}>
+      <p className="decision-prompt">{decision.prompt}</p>
+      <p className="decision-reason">{decision.reason}</p>
+      <div className="decision-options">
+        {decision.options.map((option) => (
+          <button
+            key={option}
+            type="button"
+            disabled={answered}
+            onClick={() => onDecisionAnswer(option)}
+          >
+            {answered && decision.selectedOption === option && <Check size={14} aria-hidden="true" />}
+            <span>{option}</span>
+          </button>
+        ))}
+      </div>
+    </section>
   );
 }
 

@@ -1,4 +1,13 @@
-import type { CanvasNode, Changeset, WorktreeMetadata } from "@skyturn/project-core";
+import type {
+  CanvasNode,
+  Changeset,
+  ChangesetEvidence,
+  WorkflowVariantAdoption,
+  WorkflowWorktreeIdentity,
+  WorktreeMetadata,
+} from "@skyturn/project-core";
+
+export const GIT_WORKTREE_CONTRACT_VERSION = 1;
 
 export type EditorKind =
   | "vscode"
@@ -21,6 +30,63 @@ export interface WorktreeService {
 
 export interface ChangesetService {
   getChangeset(node: CanvasNode): Promise<Changeset>;
+}
+
+export interface ManagedWorktreeCreateInput {
+  sessionId: string;
+  variantId: string;
+  repoRoot: string;
+  baseCommit: string;
+  branchName: string;
+  parentLaneId: string;
+  parentSegmentId?: string;
+}
+
+export interface ManagedWorktreeCleanupInput {
+  worktree: WorkflowWorktreeIdentity;
+  deleteBranch?: boolean;
+}
+
+export interface ManagedWorktreeCleanupResult {
+  ok: boolean;
+  worktreeId: string;
+  cleanedAt: string;
+  branchDeleted?: boolean;
+  reason?: string;
+}
+
+export interface VariantComparisonInput {
+  left: WorkflowWorktreeIdentity;
+  right: WorkflowWorktreeIdentity;
+}
+
+export interface VariantComparisonEvidence {
+  comparisonId: string;
+  variants: Array<{
+    variantId: string;
+    worktreeId: string;
+    changeset: ChangesetEvidence;
+  }>;
+  collectedAt: string;
+}
+
+export interface ManagedWorktreeService {
+  createManagedWorktree(input: ManagedWorktreeCreateInput): Promise<WorkflowWorktreeIdentity>;
+  compareVariants(input: VariantComparisonInput): Promise<VariantComparisonEvidence>;
+  cleanManagedWorktree(input: ManagedWorktreeCleanupInput): Promise<ManagedWorktreeCleanupResult>;
+}
+
+export interface VariantAdoptionService {
+  adoptVariant(input: WorkflowVariantAdoption): Promise<WorkflowVariantAdoption>;
+}
+
+export interface ChangesetEvidenceInput {
+  node: CanvasNode;
+  worktree?: WorkflowWorktreeIdentity;
+}
+
+export interface ChangesetEvidenceService {
+  collectChangesetEvidence(input: ChangesetEvidenceInput): Promise<ChangesetEvidence>;
 }
 
 export interface EditorAdapter {
