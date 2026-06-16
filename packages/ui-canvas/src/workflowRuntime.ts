@@ -30,6 +30,8 @@ import {
   type FlowProjection,
 } from "@skyturn/workflow-kernel";
 
+import { safeCompactPhrase } from "./safeNodePhrase.js";
+
 export interface BridgeRunResult {
   run: AgentRun;
   events: RunEvent[];
@@ -41,6 +43,7 @@ export async function startBridgeRun(
   session: CanvasSession,
   node: CanvasNode,
 ): Promise<BridgeRunResult | null> {
+  if (!canStartNodeRun(node)) return null;
   const sandbox = sandboxForNodeRun(node);
   const result = await window.devflow?.startAgentRun({
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
@@ -137,12 +140,13 @@ function applyRunEventsToNode(node: CanvasNode, session: CanvasSession, events: 
   const evidence = evidenceFromRunEvents(node.runId, events);
   const run = runFromEvents(node, session, events);
   const status = run ? deriveNodeStatusFromEvidence(run, evidence) : node.status;
+  const progress = progressFromEvents(status, events, node.progress);
   return {
     ...node,
     status,
-    runtime: runtimeForStatus(status, node.progress),
+    runtime: runtimeForStatus(status, progress),
     output: output.length > 0 ? output : node.output,
-    progress: progressFromEvents(status, events, node.progress),
+    progress,
   };
 }
 
@@ -151,11 +155,27 @@ function applyHermesWorkflowOutput(
   hermesNode: CanvasNode,
   events: RunEvent[],
 ): CanvasSession {
+  let projected = session;
+  let appliedIntent = false;
+  for (const event of outputEvents(events)) {
+    const intent = parseHermesWorkflowIntent(event.text);
+    if (!intent.ok) continue;
+    projected = applyWorkflowIntentProjection(projected, hermesNode, intent.intent, event.timestamp);
+    appliedIntent = true;
+  }
+  if (appliedIntent) return projected;
+
   const text = outputFromEvents(events).join("\n");
   const intent = parseHermesWorkflowIntent(text);
   if (intent.ok) {
-    return applyWorkflowIntentProjection(session, hermesNode, intent.intent, latestEventTimestamp(events) ?? new Date().toISOString());
+    return applyWorkflowIntentProjection(
+      session,
+      hermesNode,
+      intent.intent,
+      latestEventTimestamp(events) ?? new Date().toISOString(),
+    );
   }
+
   const calls = parseHermesWorkflowToolCalls(text);
   if (calls.length === 0) return session;
   const sourceNode = session.nodes.find((node) => node.runId === hermesNode.runId);
@@ -191,13 +211,16 @@ function applyWorkflowIntentProjection(
   const projection = reduceWorkflowEvents([...baseProjection.events, ...compiled.events]);
   const planner = session.nodes.find((node) => node.id === session.plannerNodeId) ?? hermesNode;
   const dependenciesByLaneId = dependenciesFromFlowEdges(projection);
+  const existingById = new Map(session.nodes.map((node) => [node.id, node]));
   const flowLaneNodes = projection.lanes.map((lane, index) =>
-    flowLaneToCanvasNode(session, lane, index, dependenciesByLaneId.get(lane.id) ?? []),
+    flowLaneToCanvasNode(session, lane, index, dependenciesByLaneId.get(lane.id) ?? [], existingById.get(lane.id)),
   );
   const decisionNodes = projection.userDecisions.map((decision, index) =>
-    userDecisionToCanvasNode(session, decision, projection.lanes.length + index),
+    userDecisionToCanvasNode(session, decision, projection.lanes.length + index, existingById.get(decision.decisionId)),
   );
   const flowNodes = [...flowLaneNodes, ...decisionNodes];
+  const activeProjectedNode = flowNodes.find((node) => node.status === "running" || node.status === "retrying");
+  const currentActiveNode = flowNodes.find((node) => node.id === session.activeNodeId) ?? planner;
   return {
     ...session,
     nodes: [planner, ...flowNodes],
@@ -206,7 +229,7 @@ function applyWorkflowIntentProjection(
       source: edge.sourceLaneId,
       target: edge.targetLaneId,
     })),
-    activeNodeId: flowNodes.find((node) => node.status === "running" || node.status === "retrying")?.id ?? planner.id,
+    activeNodeId: activeProjectedNode?.id ?? currentActiveNode.id,
     updatedAt: now,
   };
 }
@@ -362,8 +385,10 @@ function flowLaneToCanvasNode(
   lane: FlowLane,
   index: number,
   dependencies: string[],
+  existing?: CanvasNode,
 ): CanvasNode {
   const status = flowLaneStatusToNodeStatus(lane.status);
+  const progress = progressForFlowLane(lane, status, existing);
   const laneOriginX = 460;
   const laneOriginY = 140;
   const laneColumnGap = 360;
@@ -372,13 +397,13 @@ function flowLaneToCanvasNode(
     id: lane.id,
     title: lane.title,
     agent: lane.agentKind,
-    progress: progressForFlowLaneStatus(lane.status),
+    progress,
     nodeKind: lane.nodeKind,
     executable: lane.executable,
     laneKind: lane.laneKind,
     semanticSubtype: lane.semanticSubtype,
     runtimePolicy: lane.runtimePolicy,
-    runtime: runtimeForStatus(status, lane.kind),
+    runtime: runtimeForStatus(status, progress),
     display: {
       agentLabel: lane.agentKind === "hermes" ? "Hermes" : "Codex",
       meta: [lane.kind, lane.id, "flow-kernel"],
@@ -391,12 +416,12 @@ function flowLaneToCanvasNode(
     },
     status,
     position: {
-      x: laneOriginX + (index % 3) * laneColumnGap,
-      y: laneOriginY + Math.floor(index / 3) * laneRowGap,
+      x: existing?.position.x ?? laneOriginX + (index % 3) * laneColumnGap,
+      y: existing?.position.y ?? laneOriginY + Math.floor(index / 3) * laneRowGap,
     },
     runId: `run-${session.id}-${lane.id}`,
     changesetId: `changeset-${session.id}-${lane.id}`,
-    output: lane.output.length > 0 ? lane.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
+    output: lane.output.length > 0 ? lane.output : existing?.output.length ? existing.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
     worktree: {
       path: ".",
       branchName: `skyturn/${session.id}/${lane.id}`,
@@ -421,6 +446,7 @@ function userDecisionToCanvasNode(
   session: CanvasSession,
   decision: UserDecisionProjection,
   index: number,
+  existing?: CanvasNode,
 ): CanvasNode {
   const status: CanvasNode["status"] = decision.status === "answered" ? "completed" : "pending";
   const laneOriginX = 460;
@@ -458,16 +484,18 @@ function userDecisionToCanvasNode(
     },
     status,
     position: {
-      x: laneOriginX + (index % 3) * laneColumnGap,
-      y: laneOriginY + Math.floor(index / 3) * laneRowGap,
+      x: existing?.position.x ?? laneOriginX + (index % 3) * laneColumnGap,
+      y: existing?.position.y ?? laneOriginY + Math.floor(index / 3) * laneRowGap,
     },
     runId: `run-${session.id}-${decision.decisionId}`,
     changesetId: `changeset-${session.id}-${decision.decisionId}`,
-    output: [
-      decision.prompt,
-      `Reason: ${decision.reason}`,
-      `Options: ${decision.options.join(", ")}`,
-    ],
+    output: existing?.output.length
+      ? existing.output
+      : [
+          decision.prompt,
+          `Reason: ${decision.reason}`,
+          `Options: ${decision.options.join(", ")}`,
+        ],
     worktree: {
       path: ".",
       branchName: `skyturn/${session.id}/${decision.decisionId}`,
@@ -497,6 +525,18 @@ function progressForFlowLaneStatus(status: FlowLane["status"]): string {
   if (status === "running") return "Streaming output";
   if (status === "failed" || status === "blocked") return "Gate rejected";
   return "Waiting for scheduler";
+}
+
+function progressForFlowLane(
+  lane: FlowLane,
+  status: CanvasNode["status"],
+  existing?: CanvasNode,
+): string {
+  if (status === "completed") return "Evidence ready";
+  if (status === "failed") return safeCompactPhrase(existing?.progress ?? "", "Run failed") ?? "Run failed";
+  const projected = progressForFlowLaneStatus(lane.status);
+  if (!existing || existing.status !== status) return projected;
+  return safeCompactPhrase(existing.progress, projected) ?? projected;
 }
 
 export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode): string {
@@ -562,6 +602,10 @@ export function sandboxForNodeRun(node: CanvasNode): AgentRunSandbox | undefined
   if (laneKind === "commit" || /\bcommit\b/.test(laneText)) return "danger-full-access";
   if (/implementation|implement|change|update|edit|browser|screenshot/.test(laneText)) return "workspace-write";
   return undefined;
+}
+
+function canStartNodeRun(node: CanvasNode): boolean {
+  return node.nodeKind !== "user_decision" && node.executable !== false && node.runtimePolicy?.executable !== false;
 }
 
 function hermesGoalForNode(session: CanvasSession, node: CanvasNode): string {
@@ -693,16 +737,57 @@ function runFromEvents(node: CanvasNode, session: CanvasSession, events: RunEven
 
 function progressFromEvents(status: CanvasNode["status"], events: RunEvent[], fallback: string): string {
   if (status === "completed") return "Evidence ready";
-  if (status === "failed") return errorMessageFromEvents(events) ?? "Run evidence incomplete";
-  if (status === "running") return "Streaming persisted output";
+  if (status === "failed") return failurePhraseFromEvents(events) ?? "Run failed";
+  if (status === "running") return progressPhraseFromEvents(events) ?? safeCompactPhrase(fallback) ?? "Streaming persisted output";
+  if (status === "retrying") return progressPhraseFromEvents(events) ?? safeCompactPhrase(fallback) ?? "Retry checkpoint";
   return fallback;
 }
 
-function errorMessageFromEvents(events: RunEvent[]): string | null {
+function failurePhraseFromEvents(events: RunEvent[]): string | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.kind === "evidence") {
+      const check = latestEvidenceCheckName(event.payload.checks);
+      if (check) return `${check} failed`;
+    }
+  }
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (event?.kind !== "error") continue;
-    return typeof event.payload.message === "string" ? event.payload.message : null;
+    const source = typeof event.payload.source === "string" ? event.payload.source : "Adapter";
+    return safeCompactPhrase(`${source} error`, "Run failed") ?? "Run failed";
+  }
+  return null;
+}
+
+function progressPhraseFromEvents(events: RunEvent[]): string | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.kind !== "progress") continue;
+    const phrase = progressPhraseFromPayload(event.payload);
+    if (phrase) return phrase;
+  }
+  return null;
+}
+
+function progressPhraseFromPayload(payload: Record<string, unknown>): string | null {
+  const command = typeof payload.command === "string" ? safeCompactPhrase(payload.command) : null;
+  if (command) return command;
+  const action = typeof payload.action === "string" ? safeCompactPhrase(payload.action) : null;
+  if (action) return action;
+  const check = typeof payload.checkName === "string" ? safeCompactPhrase(payload.checkName) : null;
+  if (check) return check;
+  const phase = typeof payload.phase === "string" ? safeCompactPhrase(payload.phase) : null;
+  return phase ? `${phase}` : null;
+}
+
+function latestEvidenceCheckName(value: unknown): string | null {
+  if (!Array.isArray(value)) return null;
+  for (let index = value.length - 1; index >= 0; index -= 1) {
+    const check = value[index] as { name?: unknown; status?: unknown };
+    if (typeof check.name !== "string" || check.status !== "failed") continue;
+    const phrase = safeCompactPhrase(check.name);
+    if (phrase) return phrase;
   }
   return null;
 }
@@ -712,6 +797,13 @@ function outputFromEvents(events: RunEvent[]): string[] {
     .filter((event) => event.kind === "output")
     .map((event) => (typeof event.payload.text === "string" ? event.payload.text : ""))
     .filter(Boolean);
+}
+
+function outputEvents(events: RunEvent[]): Array<{ text: string; timestamp: string }> {
+  return events.flatMap((event) => {
+    if (event.kind !== "output" || typeof event.payload.text !== "string") return [];
+    return [{ text: event.payload.text, timestamp: event.timestamp }];
+  });
 }
 
 function dedupeRunEvents(events: RunEvent[]): RunEvent[] {

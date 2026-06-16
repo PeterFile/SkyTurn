@@ -1,5 +1,7 @@
 import type { CanvasNode, NodeRuntimeState } from "@skyturn/project-core";
 
+import { safeCompactPhrase } from "./safeNodePhrase.js";
+
 export interface StreamingLogLine {
   kind: "skill_view" | "todo" | "terminal" | "process" | "read_file" | "patch";
   text: string;
@@ -29,11 +31,11 @@ function actionKindForRuntime(runtime: NodeRuntimeState): StreamingLogLine["kind
 }
 
 function actionTextForNode(node: CanvasNode, runtime: NodeRuntimeState): string {
-  const action = normalizeStreamText(runtime.action || node.progress || node.context.brief);
+  const action = safeCompactPhrase(runtime.action || node.progress || node.context.brief, "processing workflow event");
 
   switch (node.status) {
     case "completed":
-      return `verified ${action}`;
+      return `verified ${settledActionText(action)}`;
     case "failed":
       return action || "attention required";
     case "retrying":
@@ -45,6 +47,7 @@ function actionTextForNode(node: CanvasNode, runtime: NodeRuntimeState): string 
   }
 }
 
-function normalizeStreamText(value: string): string {
-  return value.trim().replace(/\s+/g, " ").replace(/^evidence ready$/i, "evidence ready");
+function settledActionText(action: string | null): string {
+  if (!action) return "evidence ready";
+  return action.replace(/^evidence ready$/i, "evidence ready");
 }

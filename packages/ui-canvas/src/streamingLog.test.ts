@@ -58,4 +58,36 @@ describe("streaming log placeholder line", () => {
       text: "verified evidence ready",
     });
   });
+
+  it("redacts raw intent and stderr-shaped text from compact card phrases", () => {
+    const runtime: NodeRuntimeState = {
+      phase: "Executing",
+      message: "running",
+      action:
+        'WorkflowIntent {"intentId":"intent-leak","operations":[{"type":"ProposeLanes"}]}\nstderr: token=secret stack trace'.repeat(
+          4,
+        ),
+    };
+
+    const line = streamingLogLineForNode(node(), runtime);
+
+    expect(line.text).toBe("processing workflow event");
+    expect(line.text).not.toContain("WorkflowIntent");
+    expect(line.text).not.toContain("token=secret");
+    expect(line.text.length).toBeLessThanOrEqual(80);
+  });
+
+  it("redacts secret-shaped command text from compact card phrases", () => {
+    const runtime: NodeRuntimeState = {
+      phase: "Executing",
+      message: "running",
+      action: "OPENAI_API_KEY=sk-secret pnpm --filter @skyturn/ui-canvas test",
+    };
+
+    const line = streamingLogLineForNode(node(), runtime);
+
+    expect(line.text).toBe("processing workflow event");
+    expect(line.text).not.toContain("OPENAI_API_KEY");
+    expect(line.text).not.toContain("sk-secret");
+  });
 });

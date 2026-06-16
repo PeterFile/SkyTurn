@@ -136,6 +136,159 @@ describe("workflow runtime event merging", () => {
     );
   });
 
+  it("incrementally projects multiple Hermes WorkflowIntent output events", () => {
+    const workspace = makeWorkspace();
+    const hermesRunId = "run-session-1-node-1";
+    const first = event(hermesRunId, 1, "output", {
+      text: JSON.stringify({
+        intentId: "intent-incremental-1",
+        sessionId: "session-1",
+        operations: [
+          {
+            type: "ProposeLanes",
+            lanes: [
+              {
+                id: "lane-implementation",
+                semanticKey: "dynamic:implementation",
+                kind: "implementation",
+                title: "Implement streaming canvas",
+                agentKind: "codex",
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const second = event(hermesRunId, 2, "output", {
+      text: JSON.stringify({
+        intentId: "intent-incremental-2",
+        sessionId: "session-1",
+        operations: [
+          {
+            type: "ProposeLanes",
+            lanes: [
+              {
+                id: "lane-validation",
+                semanticKey: "dynamic:validation",
+                kind: "validation",
+                title: "Validate streaming canvas",
+                agentKind: "codex",
+                dependsOn: ["lane-implementation"],
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    const afterFirst = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [first]);
+    const afterSecond = mergeRunEventsIntoWorkspace(afterFirst, hermesRunId, [first, second]);
+    const session = afterSecond.sessions[0] as CanvasSession;
+
+    expect(session.nodes.map((node) => node.id)).toEqual([
+      "node-1",
+      "lane-implementation",
+      "lane-validation",
+    ]);
+    expect(session.edges).toContainEqual({
+      id: "edge-implementation-validation",
+      source: "lane-implementation",
+      target: "lane-validation",
+    });
+  });
+
+  it("projects a WorkflowIntent split across output events", () => {
+    const workspace = makeWorkspace();
+    const hermesRunId = "run-session-1-node-1";
+
+    const next = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+      event(hermesRunId, 1, "output", {
+        text: '{"intentId":"intent-split-1","sessionId":"session-1","operations":[',
+      }),
+      event(hermesRunId, 2, "output", {
+        text: JSON.stringify({
+          type: "ProposeLanes",
+          lanes: [
+            {
+              id: "lane-implementation",
+              semanticKey: "dynamic:implementation",
+              kind: "implementation",
+              title: "Implement streamed intent parsing",
+              agentKind: "codex",
+            },
+          ],
+        }).concat("]}"),
+      }),
+    ]);
+
+    const session = next.sessions[0] as CanvasSession;
+    expect(session.nodes.map((node) => node.id)).toEqual(["node-1", "lane-implementation"]);
+  });
+
+  it("preserves existing lane positions when Hermes projection is replayed", () => {
+    const workspace = makeWorkspace();
+    const hermesRunId = "run-session-1-node-1";
+    const first = event(hermesRunId, 1, "output", {
+      text: JSON.stringify({
+        intentId: "intent-position-1",
+        sessionId: "session-1",
+        operations: [
+          {
+            type: "ProposeLanes",
+            lanes: [
+              {
+                id: "lane-implementation",
+                semanticKey: "dynamic:implementation",
+                kind: "implementation",
+                title: "Implement position persistence",
+                agentKind: "codex",
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const second = event(hermesRunId, 2, "output", {
+      text: JSON.stringify({
+        intentId: "intent-position-2",
+        sessionId: "session-1",
+        operations: [
+          {
+            type: "ProposeLanes",
+            lanes: [
+              {
+                id: "lane-validation",
+                semanticKey: "dynamic:validation",
+                kind: "validation",
+                title: "Validate position persistence",
+                agentKind: "codex",
+                dependsOn: ["lane-implementation"],
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    const afterFirst = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [first]);
+    const firstSession = afterFirst.sessions[0] as CanvasSession;
+    const movedSession: CanvasSession = {
+      ...firstSession,
+      nodes: firstSession.nodes.map((node) =>
+        node.id === "lane-implementation" ? { ...node, position: { x: 777, y: 222 } } : node,
+      ),
+    };
+    const movedWorkspace: WorkspaceState = {
+      ...afterFirst,
+      sessions: [movedSession],
+    };
+
+    const afterSecond = mergeRunEventsIntoWorkspace(movedWorkspace, hermesRunId, [first, second]);
+    const session = afterSecond.sessions[0] as CanvasSession;
+
+    expect(session.nodes.find((node) => node.id === "lane-implementation")?.position).toEqual({ x: 777, y: 222 });
+    expect(session.nodes.find((node) => node.id === "lane-validation")?.position.x).toBeGreaterThan(400);
+  });
+
   it("projects and restores Hermes user decision requests as canvas nodes", () => {
     const workspace = makeWorkspace();
     const hermesRunId = "run-session-1-node-1";
@@ -517,6 +670,44 @@ describe("workflow runtime event merging", () => {
     expect(sandboxForNodeRun(decisionNode)).toBeUndefined();
   });
 
+  it("does not start non-executable user decision nodes", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = makeSession([
+      makeNode({
+        id: "decision-architecture-risk",
+        agent: "hermes",
+        status: "running",
+        runId: "run-session-1-decision-architecture-risk",
+        title: "User decision required",
+      }),
+    ]);
+    const decisionNode = session.nodes.find((node) => node.id === "decision-architecture-risk")!;
+    decisionNode.nodeKind = "user_decision";
+    decisionNode.executable = false;
+    decisionNode.userDecision = {
+      decisionId: "decision-architecture-risk",
+      prompt: "Continue?",
+      options: ["Continue", "Abort"],
+      reason: "Architecture risk changed.",
+      status: "waiting_input",
+    };
+    const startAgentRun = vi.fn();
+    vi.stubGlobal("window", {
+      devflow: {
+        startAgentRun,
+      },
+    });
+
+    try {
+      const result = await startBridgeRun(project, session, decisionNode);
+
+      expect(result).toBeNull();
+      expect(startAgentRun).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("rejects malformed Hermes WorkflowIntent output without crashing the canvas projection", () => {
     const workspace = makeWorkspace();
     const hermesRunId = "run-session-1-node-1";
@@ -686,6 +877,33 @@ describe("workflow runtime event merging", () => {
     expect(codeNode?.progress).toBe("Evidence ready");
     expect(codeNode?.output).toContain("Implemented the smallest evidence reflection path.");
     expect(next.runEvidence[codexRunId]?.artifacts).toEqual([".devflow/tasks/node-code/output.md"]);
+  });
+
+  it("updates node short phrases from safe run progress fields", () => {
+    const workspace = makeWorkspace([
+      makeNode({
+        id: "node-code",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-node-code",
+      }),
+    ]);
+    const codexRunId = "run-session-1-node-code";
+
+    const next = mergeRunEventsIntoWorkspace(workspace, codexRunId, [
+      event(codexRunId, 1, "progress", {
+        phase: "started",
+        command: "pnpm --filter @skyturn/ui-canvas test",
+        text: '{"intentId":"leak","operations":[{"type":"WorkflowIntent"}]}',
+      }),
+    ]);
+
+    const session = next.sessions[0] as CanvasSession;
+    const codeNode = session.nodes.find((node) => node.id === "node-code");
+
+    expect(codeNode?.progress).toBe("pnpm --filter @skyturn/ui-canvas test");
+    expect(codeNode?.runtime?.action).toBe("pnpm --filter @skyturn/ui-canvas test");
+    expect(codeNode?.progress).not.toContain("WorkflowIntent");
   });
 
   it("preserves persisted custom review evidence kinds while merging run events", () => {
