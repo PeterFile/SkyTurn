@@ -35,6 +35,9 @@ importers:
       '@skyturn/ui-canvas':
         specifier: workspace:*
         version: link:../../packages/ui-canvas
+      '@skyturn/workflow-kernel':
+        specifier: workspace:*
+        version: link:../../packages/workflow-kernel
       '@xyflow/react':
         specifier: ^12.11.0
         version: 12.11.0(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
