@@ -76,6 +76,34 @@ describe("SQLite workflow store", () => {
     ]);
   });
 
+  it("materializes the SQLite planner root before any WorkflowIntent projection nodes exist", async () => {
+    const store = await makeStore();
+
+    store.createWorkflowSession({
+      id: "session-1",
+      projectId: "project-1",
+      title: "Persisted workflow",
+      goal: "Implement event sourced workflow",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Hermes live chat handle was not available during test setup.",
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+    const canvasSession = store.materializeCanvasSession("session-1");
+
+    expect(projection.projectionNodes).toEqual([]);
+    expect(canvasSession?.plannerNodeId).toBe("node-1");
+    expect(canvasSession?.nodes).toMatchObject([
+      {
+        id: "node-1",
+        agent: "hermes",
+        status: "running",
+      },
+    ]);
+  });
+
   it("allocates event seq monotonically and dedupes idempotency keys", async () => {
     const store = await makeSeededStore();
 
