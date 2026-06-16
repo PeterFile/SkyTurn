@@ -1,6 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 
 import {
   DEVFLOW_DIRECTORIES,
@@ -13,6 +15,8 @@ import {
   workflowIpcError,
   workflowStartInputError,
 } from "./workflowIpcContracts";
+
+const execFileAsync = promisify(execFile);
 
 interface OpenProjectResult {
   canceled: boolean;
@@ -68,6 +72,18 @@ interface FlowProjectionLike {
     decisionId?: string;
     executable: boolean;
   }>;
+}
+
+interface GitChangesetLike {
+  id: string;
+  files: string[];
+  diffStat: {
+    added: number;
+    changed: number;
+    deleted: number;
+  };
+  patchPreview: string;
+  source: "git";
 }
 
 const RUN_PROTOCOL_VERSION = 1;
@@ -780,12 +796,6 @@ function workflowHandler<T extends unknown[], R>(
       throw normalizeWorkflowIpcError(error);
     }
   };
-}
-
-function broadcastWorkflowProjection(projectRoot: string, sessionId: string, projection: unknown): void {
-  for (const window of BrowserWindow.getAllWindows()) {
-    window.webContents.send("workflow:event", { projectRoot, sessionId, projection });
-  }
 }
 
 function workflowEventsOnly(events: unknown[]): unknown[] {

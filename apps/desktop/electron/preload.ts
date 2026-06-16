@@ -42,9 +42,6 @@ contextBridge.exposeInMainWorld("devflow", {
   getWorkflowProjection: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:projection", projectRoot, sessionId),
   getWorkflowEvents: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:events", projectRoot, sessionId),
   workflow,
-  applyWorkflowIntent: workflow.applyIntent,
-  getWorkflowProjection: workflow.getProjection,
-  getWorkflowEvents: workflow.getEvents,
   onRunEvent: (listener: (event: unknown) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value);
     ipcRenderer.on("run:event", handler);
