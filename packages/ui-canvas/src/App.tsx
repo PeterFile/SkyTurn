@@ -121,9 +121,12 @@ import {
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
 import { agentIdentityForNode, canUseAgentNodeActions, nodeFooterForNode } from "./nodeDisplay.js";
 import {
+  applyCompletedBridgeRunPersistenceResult,
   applyBridgeRunResult,
   applyRunEventToWorkspace,
+  claimCompletedBridgeRunPersistence,
   mergeRunEventsIntoWorkspace,
+  persistCompletedBridgeRunResult,
   retryCanvasNode,
   startBridgeRun,
 } from "./workflowRuntime.js";
@@ -168,6 +171,8 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
   const startedBridgeRuns = useRef(new Set<string>());
+  const completedBridgeRunPersistenceClaims = useRef(new Set<string>());
+  const workspaceRef = useRef(workspace);
 
   const activeProject = workspace.projects.find((project) => project.id === workspace.activeProjectId) ?? null;
   const activeSession =
@@ -201,6 +206,10 @@ export default function App() {
   }, [workspace, workspaceLoaded]);
 
   useEffect(() => {
+    workspaceRef.current = workspace;
+  }, [workspace]);
+
+  useEffect(() => {
     if (window.devflow) return;
     const timer = window.setInterval(() => {
       setWorkspace((current) => ({
@@ -232,6 +241,19 @@ export default function App() {
     if (!window.devflow) return;
     return window.devflow.onRunEvent((event) => {
       setWorkspace((current) => applyRunEventToWorkspace(current, event));
+      const claim = claimCompletedBridgeRunPersistence(
+        workspaceRef.current,
+        event,
+        completedBridgeRunPersistenceClaims.current,
+      );
+      if (!claim) return;
+      void persistCompletedBridgeRunResult(claim.project, claim.session, claim.node).then((result) => {
+        if (!result) {
+          completedBridgeRunPersistenceClaims.current.delete(claim.runId);
+          return;
+        }
+        setWorkspace((current) => applyCompletedBridgeRunPersistenceResult(current, claim.runId, result));
+      });
     });
   }, []);
 

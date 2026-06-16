@@ -10,6 +10,7 @@ import {
   defaultDevflowFileContent,
 } from "@skyturn/project-memory";
 import {
+  isTrustedPlannerRootStartInput,
   normalizeWorkflowIpcError,
   rejectMissingWorkflowProjectionNode,
   workflowIpcError,
@@ -782,6 +783,7 @@ async function assertExecutableStartInput(input: StartAgentRunInput): Promise<vo
     throw workflowIpcError("NON_EXECUTABLE_NODE", "Workflow projection node is not executable.");
   }
   if (!projectedNode && rejectMissingWorkflowProjectionNode(input, workflowEventCount)) {
+    if (isTrustedPlannerRootStartInput(input, store)) return;
     throw workflowIpcError("INVALID_INPUT", "Workflow projection node is not known.");
   }
 }

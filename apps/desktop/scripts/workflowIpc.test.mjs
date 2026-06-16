@@ -37,6 +37,7 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(main, /scheduleReadyLanes/);
   assert.match(main, /recordRunResult/);
   assert.match(main, /materializeFlowProjection/);
+  assert.match(main, /isTrustedPlannerRootStartInput/);
   assert.match(main, /assertExecutableStartInput/);
   assert.match(main, /rejectMissingWorkflowProjectionNode/);
 
@@ -141,6 +142,83 @@ test("workflow IPC contract errors are recognizable and block decision nodes", a
     false,
   );
   assert.equal(contracts.WORKFLOW_IPC_CHANNELS.worktreeCreate, "workflow:worktree:create");
+});
+
+test("run start guard trusts only the SQLite planner root CanvasSession fallback", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const input = { sessionId: "session-1", nodeId: "node-1" };
+  const store = {
+    materializeCanvasSession(sessionId) {
+      assert.equal(sessionId, "session-1");
+      return {
+        id: "session-1",
+        plannerNodeId: "node-1",
+        nodes: [
+          {
+            id: "node-1",
+            agent: "hermes",
+            status: "running",
+          },
+        ],
+      };
+    },
+  };
+
+  assert.equal(contracts.rejectMissingWorkflowProjectionNode(input, 1), true);
+  assert.equal(contracts.isTrustedPlannerRootStartInput(input, store), true);
+});
+
+test("run start guard keeps rejecting missing non-planner projection nodes", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const store = {
+    materializeCanvasSession() {
+      return {
+        plannerNodeId: "node-1",
+        nodes: [
+          {
+            id: "node-1",
+            agent: "hermes",
+            status: "running",
+          },
+        ],
+      };
+    },
+  };
+
+  assert.equal(
+    contracts.rejectMissingWorkflowProjectionNode({ sessionId: "session-1", nodeId: "node-2" }, 1),
+    true,
+  );
+  assert.equal(
+    contracts.isTrustedPlannerRootStartInput({ sessionId: "session-1", nodeId: "node-2" }, store),
+    false,
+  );
+});
+
+test("run start guard rejects non-executable planner-like fallback nodes", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const makeStore = (node) => ({
+    materializeCanvasSession() {
+      return {
+        plannerNodeId: "node-1",
+        nodes: [node],
+      };
+    },
+  });
+  const input = { sessionId: "session-1", nodeId: "node-1" };
+
+  for (const node of [
+    { id: "node-1", agent: "hermes", nodeKind: "user_decision", status: "running" },
+    { id: "node-1", agent: "hermes", executable: false, status: "running" },
+    {
+      id: "node-1",
+      agent: "hermes",
+      runtimePolicy: { executable: false },
+      status: "running",
+    },
+  ]) {
+    assert.equal(contracts.isTrustedPlannerRootStartInput(input, makeStore(node)), false);
+  }
 });
 
 async function loadWorkflowIpcContracts() {

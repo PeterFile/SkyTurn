@@ -9,6 +9,7 @@
     "dev:electron": "pnpm run build:electron && VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron dist-electron/electron/main.js",
     "build": "pnpm run typecheck && vite build && pnpm run build:electron",
     "build:electron": "tsc -p tsconfig.electron.json",
+    "rebuild:native": "electron-rebuild -f -w better-sqlite3 --version 41.5.1 --module-dir ../../packages/persistence",
     "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "node --test scripts/*.test.mjs",
     "demo:mvp": "node scripts/mvpWorkflowDemo.mjs",
@@ -28,6 +29,7 @@
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@electron/rebuild": "^3.7.2",
     "@types/node": "^25.0.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",

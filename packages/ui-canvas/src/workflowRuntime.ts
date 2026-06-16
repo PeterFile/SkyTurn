@@ -8,6 +8,7 @@ import type { WorkspaceState } from "@skyturn/persistence";
 import {
   RUN_EVENT_PROTOCOL_VERSION,
   deriveNodeStatusFromEvidence,
+  hasConcreteRunEvidence,
   makeHermesPlannerSessionId,
   type AgentRun,
   type AgentRunSandbox,
@@ -38,6 +39,19 @@ export interface BridgeRunResult {
   events: RunEvent[];
   evidence: RunEvidence;
   workflowSession?: CanvasSession | null;
+}
+
+export interface CompletedBridgeRunPersistenceResult {
+  events: RunEvent[];
+  evidence: RunEvidence;
+  workflowSession?: CanvasSession | null;
+}
+
+export interface CompletedBridgeRunPersistenceClaim {
+  project: ImportedProject;
+  session: CanvasSession;
+  node: CanvasNode;
+  runId: string;
 }
 
 export async function startBridgeRun(
@@ -72,6 +86,63 @@ export async function startBridgeRun(
   ]);
   const workflowSession = await persistWorkflowRunResult(project, session, node, eventsResult.events, evidenceResult.evidence);
   return { run: result.run, events: eventsResult.events, evidence: evidenceResult.evidence, workflowSession };
+}
+
+export async function persistCompletedBridgeRunResult(
+  project: ImportedProject,
+  session: CanvasSession,
+  node: CanvasNode,
+): Promise<CompletedBridgeRunPersistenceResult | null> {
+  if (!canStartNodeRun(node) || !window.devflow) return null;
+  const [eventsResult, evidenceResult] = await Promise.all([
+    window.devflow.getRunEvents(project.rootPath, node.runId),
+    window.devflow.getRunEvidence(project.rootPath, node.runId),
+  ]);
+  if (!hasTerminalRunEvidence(evidenceResult.evidence)) return null;
+  const workflowSession = await persistWorkflowRunResult(
+    project,
+    session,
+    node,
+    eventsResult.events,
+    evidenceResult.evidence,
+  );
+  return { events: eventsResult.events, evidence: evidenceResult.evidence, workflowSession };
+}
+
+export function claimCompletedBridgeRunPersistence(
+  workspace: WorkspaceState,
+  event: RunEvent,
+  claims: Set<string>,
+): CompletedBridgeRunPersistenceClaim | null {
+  if (!isTerminalRunPersistenceEvent(event) || claims.has(event.runId)) return null;
+  for (const session of workspace.sessions) {
+    if (session.kind !== "canvas") continue;
+    const node = session.nodes.find((candidate) => candidate.runId === event.runId);
+    if (!node || !canStartNodeRun(node)) continue;
+    if (node.status !== "running" && node.status !== "retrying") continue;
+    const project = workspace.projects.find((candidate) => candidate.id === session.projectId);
+    if (!project) continue;
+    claims.add(event.runId);
+    return { project, session, node, runId: event.runId };
+  }
+  return null;
+}
+
+export function applyCompletedBridgeRunPersistenceResult(
+  workspace: WorkspaceState,
+  runId: string,
+  result: CompletedBridgeRunPersistenceResult,
+): WorkspaceState {
+  const withEvents = mergeRunEventsIntoWorkspace(workspace, runId, result.events);
+  return {
+    ...withEvents,
+    sessions: result.workflowSession
+      ? withEvents.sessions.map((session) =>
+          session.id === result.workflowSession?.id ? result.workflowSession : session,
+        )
+      : withEvents.sessions,
+    runEvidence: { ...withEvents.runEvidence, [runId]: result.evidence },
+  };
 }
 
 export function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRunResult): WorkspaceState {
@@ -110,8 +181,10 @@ async function persistWorkflowRunResult(
   evidence: RunEvidence,
 ): Promise<CanvasSession | null> {
   if (!window.devflow) return null;
+  if (!hasTerminalRunEvidence(evidence)) return null;
   const now = evidence.completedAt ?? latestEventTimestamp(events) ?? new Date().toISOString();
-  if (node.agent === "hermes") {
+  if (isPlannerRootNode(session, node)) {
+    if (evidence.status !== "succeeded") return null;
     if (
       typeof window.devflow.applyWorkflowIntent !== "function" ||
       typeof window.devflow.scheduleWorkflowReadyLanes !== "function"
@@ -149,6 +222,10 @@ async function persistWorkflowRunResult(
     now,
   });
   return scheduled.canvasSession ?? recorded.canvasSession ?? null;
+}
+
+function isPlannerRootNode(session: CanvasSession, node: CanvasNode): boolean {
+  return node.agent === "hermes" && node.id === session.plannerNodeId;
 }
 
 function shouldUseRendererWorkflowProjection(): boolean {
@@ -200,7 +277,9 @@ export function mergeRunEventsIntoWorkspace(
       nodes: session.nodes.map((node) => (node.runId === runId ? applyRunEventsToNode(node, session, deduped) : node)),
     };
     if (!shouldUseRendererWorkflowProjection()) return updatedSession;
-    const projected = target.agent === "hermes" ? applyHermesWorkflowOutput(updatedSession, target, deduped) : updatedSession;
+    const projected = isPlannerRootNode(updatedSession, target)
+      ? applyHermesWorkflowOutput(updatedSession, target, deduped)
+      : updatedSession;
     return scheduleFlowKernelLanes(projected);
   });
 
@@ -938,6 +1017,25 @@ function isRunStatus(value: unknown): value is AgentRunStatus {
     value === "failed" ||
     value === "cancelled" ||
     value === "timed-out"
+  );
+}
+
+function isTerminalRunPersistenceEvent(event: RunEvent): boolean {
+  if (event.kind === "error") return true;
+  return event.kind === "status" && isRunStatus(event.payload.status) && isFinalRunStatus(event.payload.status);
+}
+
+function hasTerminalRunEvidence(evidence: RunEvidence): boolean {
+  if (!isFinalRunStatus(evidence.status)) return false;
+  if (evidence.status === "succeeded") return hasConcreteRunEvidence(evidence);
+  return Boolean(
+    evidence.completedAt ||
+      evidence.exitCode !== null ||
+      evidence.errorReason ||
+      evidence.cancelReason ||
+      evidence.checks.length > 0 ||
+      evidence.artifacts.length > 0 ||
+      evidence.review,
   );
 }
 
