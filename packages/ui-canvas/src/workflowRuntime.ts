@@ -10,6 +10,7 @@ import {
   deriveNodeStatusFromEvidence,
   makeHermesPlannerSessionId,
   type AgentRun,
+  type AgentRunSandbox,
   type AgentRunStatus,
   type CanvasNode,
   type CanvasSession,
@@ -17,6 +18,7 @@ import {
   type NodeRuntimeState,
   type RunEvent,
   type RunEvidence,
+  type UserDecisionProjection,
 } from "@skyturn/project-core";
 import {
   compileWorkflowIntent,
@@ -189,9 +191,13 @@ function applyWorkflowIntentProjection(
   const projection = reduceWorkflowEvents([...baseProjection.events, ...compiled.events]);
   const planner = session.nodes.find((node) => node.id === session.plannerNodeId) ?? hermesNode;
   const dependenciesByLaneId = dependenciesFromFlowEdges(projection);
-  const flowNodes = projection.lanes.map((lane, index) =>
+  const flowLaneNodes = projection.lanes.map((lane, index) =>
     flowLaneToCanvasNode(session, lane, index, dependenciesByLaneId.get(lane.id) ?? []),
   );
+  const decisionNodes = projection.userDecisions.map((decision, index) =>
+    userDecisionToCanvasNode(session, decision, projection.lanes.length + index),
+  );
+  const flowNodes = [...flowLaneNodes, ...decisionNodes];
   return {
     ...session,
     nodes: [planner, ...flowNodes],
@@ -259,6 +265,32 @@ function flowProjectionFromSession(session: CanvasSession): FlowProjection {
   ];
   for (const node of session.nodes) {
     if (!node.display?.meta.includes("flow-kernel")) continue;
+    if (node.nodeKind === "user_decision" && node.userDecision) {
+      events.push({
+        id: `${session.id}:flow-event:${String(events.length + 1).padStart(8, "0")}`,
+        sessionId: session.id,
+        seq: events.length + 1,
+        kind: "workflow.user_decision.requested",
+        source: "ui-canvas",
+        payload: userDecisionRequestedPayload(node.userDecision),
+        createdAt: session.updatedAt,
+        idempotencyKey: `session:${session.id}:decision:${node.userDecision.decisionId}:requested`,
+      });
+      const answeredPayload = userDecisionAnsweredPayload(node.userDecision);
+      if (answeredPayload) {
+        events.push({
+          id: `${session.id}:flow-event:${String(events.length + 1).padStart(8, "0")}`,
+          sessionId: session.id,
+          seq: events.length + 1,
+          kind: "workflow.user_decision.answered",
+          source: "ui-canvas",
+          payload: answeredPayload,
+          createdAt: session.updatedAt,
+          idempotencyKey: `session:${session.id}:decision:${node.userDecision.decisionId}:answered`,
+        });
+      }
+      continue;
+    }
     events.push({
       id: `${session.id}:flow-event:${String(events.length + 1).padStart(8, "0")}`,
       sessionId: session.id,
@@ -272,6 +304,10 @@ function flowProjectionFromSession(session: CanvasSession): FlowProjection {
           kind: node.display.meta[0] ?? "implementation",
           title: node.title,
           agentKind: node.agent,
+          laneKind: node.laneKind,
+          semanticSubtype: node.semanticSubtype,
+          executable: node.executable,
+          runtimePolicy: node.runtimePolicy,
           status: node.status,
           fileScopes: [],
           packageScopes: [],
@@ -298,6 +334,29 @@ function flowProjectionFromSession(session: CanvasSession): FlowProjection {
   return reduceWorkflowEvents(events);
 }
 
+function userDecisionRequestedPayload(decision: UserDecisionProjection): Record<string, unknown> {
+  return {
+    decisionId: decision.decisionId,
+    prompt: decision.prompt,
+    options: decision.options,
+    reason: decision.reason,
+    ...(decision.targetLaneId ? { targetLaneId: decision.targetLaneId } : {}),
+    ...(decision.targetSegmentId ? { targetSegmentId: decision.targetSegmentId } : {}),
+  };
+}
+
+function userDecisionAnsweredPayload(decision: UserDecisionProjection): Record<string, unknown> | null {
+  if (decision.status !== "answered" || !decision.selectedOption || !decision.action) return null;
+  return {
+    decisionId: decision.decisionId,
+    selectedOption: decision.selectedOption,
+    action: decision.action,
+    ...(decision.comment ? { comment: decision.comment } : {}),
+    ...(decision.targetLaneId ? { targetLaneId: decision.targetLaneId } : {}),
+    ...(decision.targetSegmentId ? { targetSegmentId: decision.targetSegmentId } : {}),
+  };
+}
+
 function flowLaneToCanvasNode(
   session: CanvasSession,
   lane: FlowLane,
@@ -314,6 +373,11 @@ function flowLaneToCanvasNode(
     title: lane.title,
     agent: lane.agentKind,
     progress: progressForFlowLaneStatus(lane.status),
+    nodeKind: lane.nodeKind,
+    executable: lane.executable,
+    laneKind: lane.laneKind,
+    semanticSubtype: lane.semanticSubtype,
+    runtimePolicy: lane.runtimePolicy,
     runtime: runtimeForStatus(status, lane.kind),
     display: {
       agentLabel: lane.agentKind === "hermes" ? "Hermes" : "Codex",
@@ -349,6 +413,74 @@ function flowLaneToCanvasNode(
         "Renderer renders projection only.",
         "Completion follows evidence events, not agent prose.",
       ],
+    },
+  };
+}
+
+function userDecisionToCanvasNode(
+  session: CanvasSession,
+  decision: UserDecisionProjection,
+  index: number,
+): CanvasNode {
+  const status: CanvasNode["status"] = decision.status === "answered" ? "completed" : "pending";
+  const laneOriginX = 460;
+  const laneOriginY = 140;
+  const laneColumnGap = 360;
+  const laneRowGap = 240;
+  return {
+    id: decision.decisionId,
+    title: "User decision required",
+    agent: "hermes",
+    progress: decision.status === "answered" ? "Decision answered" : "Waiting for user decision",
+    nodeKind: "user_decision",
+    executable: false,
+    laneKind: "decision",
+    semanticSubtype: "user_decision",
+    runtimePolicy: {
+      source: "workflow_projection",
+      trusted: true,
+      executable: false,
+      sandbox: "read-only",
+      sideEffects: [],
+      reason: "User decision nodes are not executable.",
+    },
+    userDecision: decision,
+    runtime: runtimeForStatus(status, "decision"),
+    display: {
+      agentLabel: "User",
+      meta: ["decision", decision.decisionId, "flow-kernel"],
+    },
+    workflowTrace: {
+      source: "hermes",
+      sourceRunId: "workflow-intent",
+      lastTool: "createWorkflowCard",
+      semanticKey: decision.decisionId,
+    },
+    status,
+    position: {
+      x: laneOriginX + (index % 3) * laneColumnGap,
+      y: laneOriginY + Math.floor(index / 3) * laneRowGap,
+    },
+    runId: `run-${session.id}-${decision.decisionId}`,
+    changesetId: `changeset-${session.id}-${decision.decisionId}`,
+    output: [
+      decision.prompt,
+      `Reason: ${decision.reason}`,
+      `Options: ${decision.options.join(", ")}`,
+    ],
+    worktree: {
+      path: ".",
+      branchName: `skyturn/${session.id}/${decision.decisionId}`,
+      baseCommit: "flow-kernel",
+    },
+    context: {
+      brief: decision.prompt,
+      sessionGoal: session.goal,
+      relatedRequirements: decision.reason,
+      relatedDesign: "Hermes requested a user decision before continuing the workflow.",
+      relatedTasks: decision.targetLaneId ?? decision.decisionId,
+      dependencies: decision.targetLaneId ? [decision.targetLaneId] : [],
+      constraints: ["This node is not executable.", "The answer is restored through Flow Kernel user decision state."],
     },
   };
 }
@@ -421,8 +553,10 @@ function promptForNodeRun(session: CanvasSession, node: CanvasNode): string {
   return buildPromptForNodeRun(session, node);
 }
 
-export function sandboxForNodeRun(node: CanvasNode): "workspace-write" | "danger-full-access" | undefined {
+export function sandboxForNodeRun(node: CanvasNode): AgentRunSandbox | undefined {
+  if (node.executable === false || node.runtimePolicy?.executable === false) return undefined;
   if (node.agent !== "codex") return undefined;
+  if (node.runtimePolicy?.source === "workflow_projection" && node.runtimePolicy.trusted) return node.runtimePolicy.sandbox;
   const laneKind = node.display?.meta[0] ?? "";
   const laneText = `${laneKind} ${node.title}`.toLowerCase();
   if (laneKind === "commit" || /\bcommit\b/.test(laneText)) return "danger-full-access";

@@ -3,7 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 import type { WorkspaceState } from "@skyturn/persistence";
 import type { AgentRun, CanvasNode, CanvasSession, ImportedProject, RunEvent, RunEvidence, StartAgentRunInput } from "@skyturn/project-core";
 
-import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace, retryCanvasNode, startBridgeRun } from "./workflowRuntime.js";
+import {
+  buildPromptForNodeRun,
+  mergeRunEventsIntoWorkspace,
+  retryCanvasNode,
+  sandboxForNodeRun,
+  startBridgeRun,
+} from "./workflowRuntime.js";
 
 describe("workflow runtime event merging", () => {
   it("uses the workflow input requirement when building a Hermes planning prompt", () => {
@@ -127,6 +133,75 @@ describe("workflow runtime event merging", () => {
     expect(session.nodes.find((node) => node.id === "lane-browser-validation")?.display?.meta).toContain("browser_validation");
     expect(session.nodes.find((node) => node.id === "lane-discovery")?.position.x).toBeGreaterThan(
       (session.nodes.find((node) => node.id === "node-1")?.position.x ?? 0) + 300,
+    );
+  });
+
+  it("projects and restores Hermes user decision requests as canvas nodes", () => {
+    const workspace = makeWorkspace();
+    const hermesRunId = "run-session-1-node-1";
+
+    const withDecision = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+      event(hermesRunId, 1, "output", {
+        text: JSON.stringify({
+          intentId: "intent-decision-1",
+          sessionId: "session-1",
+          operations: [
+            {
+              type: "RequestUserDecision",
+              decisionId: "decision-architecture-risk",
+              prompt: "Backtrack or continue?",
+              options: ["Backtrack", "Continue"],
+              reason: "Earlier design may be wrong.",
+              targetLaneId: "lane-implementation",
+            },
+          ],
+        }),
+      }),
+    ]);
+    const decisionSession = withDecision.sessions[0] as CanvasSession;
+    const decisionNode = decisionSession.nodes.find((node) => node.id === "decision-architecture-risk");
+
+    expect(decisionNode).toMatchObject({
+      nodeKind: "user_decision",
+      executable: false,
+      userDecision: {
+        decisionId: "decision-architecture-risk",
+        status: "waiting_input",
+        options: ["Backtrack", "Continue"],
+      },
+    });
+
+    const withLanes = mergeRunEventsIntoWorkspace(withDecision, hermesRunId, [
+      event(hermesRunId, 2, "output", {
+        text: JSON.stringify({
+          intentId: "intent-lanes-after-decision",
+          sessionId: "session-1",
+          operations: [
+            {
+              type: "ProposeLanes",
+              lanes: [
+                {
+                  id: "lane-implementation",
+                  semanticKey: "dynamic:implementation",
+                  kind: "implementation",
+                  title: "Implement fix",
+                  agentKind: "codex",
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+    ]);
+    const restoredSession = withLanes.sessions[0] as CanvasSession;
+
+    expect(restoredSession.nodes.map((node) => node.id)).toEqual([
+      "node-1",
+      "lane-implementation",
+      "decision-architecture-risk",
+    ]);
+    expect(restoredSession.nodes.find((node) => node.id === "decision-architecture-risk")?.nodeKind).toBe(
+      "user_decision",
     );
   });
 
@@ -400,6 +475,46 @@ describe("workflow runtime event merging", () => {
       "workspace-write",
       "danger-full-access",
     ]);
+  });
+
+  it("prefers trusted projection runtime policy over text heuristics", () => {
+    const commitTitledNode = makeNode({
+      id: "lane-review",
+      agent: "codex",
+      status: "pending",
+      runId: "run-session-1-lane-review",
+      title: "Review before commit",
+      meta: ["review", "lane-review", "flow-kernel"],
+    });
+    const decisionNode = makeNode({
+      id: "decision-architecture-risk",
+      agent: "codex",
+      status: "pending",
+      runId: "run-session-1-decision-architecture-risk",
+      title: "Commit to parallel worktree?",
+    });
+
+    commitTitledNode.runtimePolicy = {
+      source: "workflow_projection",
+      trusted: true,
+      executable: true,
+      sandbox: "workspace-write",
+      sideEffects: ["filesystem"],
+      reason: "Policy is projected by workflow kernel.",
+    };
+    decisionNode.nodeKind = "user_decision";
+    decisionNode.executable = false;
+    decisionNode.runtimePolicy = {
+      source: "workflow_projection",
+      trusted: true,
+      executable: false,
+      sandbox: "danger-full-access",
+      sideEffects: ["git"],
+      reason: "Decision node is not executable.",
+    };
+
+    expect(sandboxForNodeRun(commitTitledNode)).toBe("workspace-write");
+    expect(sandboxForNodeRun(decisionNode)).toBeUndefined();
   });
 
   it("rejects malformed Hermes WorkflowIntent output without crashing the canvas projection", () => {

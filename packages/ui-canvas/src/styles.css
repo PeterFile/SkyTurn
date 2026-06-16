@@ -724,6 +724,53 @@ h2 {
   gap: 8px;
 }
 
+.decision-panel {
+  display: grid;
+  gap: 10px;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-md);
+  background: var(--sk-surface);
+  padding: 12px;
+}
+
+.decision-prompt,
+.decision-reason {
+  margin: 0;
+  color: var(--sk-text);
+}
+
+.decision-prompt {
+  font-weight: 800;
+}
+
+.decision-reason {
+  color: var(--sk-muted-strong);
+}
+
+.decision-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.decision-options button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-surface-muted);
+  color: var(--sk-text);
+  padding: 0 10px;
+  font-weight: 700;
+}
+
+.decision-options button:hover:not(:disabled),
+.decision-options button:focus-visible {
+  border-color: var(--sk-accent-strong);
+}
+
 .output-lines p {
   margin: 0;
   border-left: 3px solid var(--sk-accent);

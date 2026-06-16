@@ -11,6 +11,7 @@ import type {
   NodeRuntimeState,
   NodeStatus,
   PlanSession,
+  WorkflowLedgerSummary,
   WorkflowCardToolName,
 } from "@skyturn/project-core";
 
@@ -110,6 +111,7 @@ export interface HermesWorkflowPromptInput {
   sessionId: string;
   plannerSessionId: string;
   nodeId: string;
+  sessionLedger?: WorkflowLedgerSummary;
   existingNodes: Array<Pick<CanvasNode, "id" | "title" | "agent" | "status"> & {
     taskKey?: string;
     dependencies?: string[];
@@ -125,6 +127,8 @@ export function buildHermesWorkflowPrompt(input: HermesWorkflowPromptInput): str
     "AnalyzeRequirement MUST be {\"type\":\"AnalyzeRequirement\",\"requirement\":\"the user requirement\"}.",
     "DiscoverProject MUST be {\"type\":\"DiscoverProject\",\"profile\":{\"languages\":[],\"capabilities\":[],\"packages\":[],\"hasFrontend\":false,\"hasBackend\":false,\"hasPersistence\":false}}.",
     "ProposeLanes MUST include a lanes array; each lane needs id, kind, title, agentKind, and dependsOn when it has dependencies.",
+    "Lane kind should use the canonical workflow meaning; use semanticSubtype for narrower terms such as browser_validation, regression_check, or frontend_implementation.",
+    "RequestUserDecision MUST include decisionId, prompt, options, reason, and optional targetLaneId or targetSegmentId.",
     "Use agentKind codex for implementation, command validation, browser screenshot, and commit lanes because those lanes run local commands or write git metadata.",
     "Use agentKind hermes for review lanes; the root planning node already owns planning.",
     "Do not create a separate planning, scope, or intake lane; put that reasoning in AnalyzeRequirement and DiscoverProject.",
@@ -141,6 +145,7 @@ export function buildHermesWorkflowPrompt(input: HermesWorkflowPromptInput): str
     `Planner session identity: ${input.plannerSessionId}`,
     `Planning node: ${input.nodeId}`,
     `Existing nodes: ${JSON.stringify(input.existingNodes)}`,
+    ...(input.sessionLedger ? [`Session ledger summary: ${JSON.stringify(input.sessionLedger)}`] : []),
     `User goal: ${input.goal}`,
   ].join("\n");
 }

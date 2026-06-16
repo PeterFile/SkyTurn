@@ -4,13 +4,22 @@ import {
   AGENT_SUPPORT_LEVELS,
   EVIDENCE_CHECK_KINDS,
   RUN_EVENT_PROTOCOL_VERSION,
+  WORKFLOW_LANE_KINDS,
   deriveNodeStatusFromEvidence,
   hasConcreteRunEvidence,
   type AgentDescriptor,
   type AgentRun,
+  type CanvasNode,
+  type ChangesetEvidence,
   type EvidenceCheck,
   type RunEvent,
   type RunEvidence,
+  type UserDecisionAnsweredPayload,
+  type UserDecisionRequestedPayload,
+  type WorkflowLedgerSummary,
+  type WorkflowRuntimePolicy,
+  type WorkflowVariantAdoption,
+  type WorkflowWorktreeIdentity,
 } from "./index";
 
 describe("agent run contracts", () => {
@@ -83,5 +92,123 @@ describe("agent run contracts", () => {
 
     expect(hasConcreteRunEvidence(evidence)).toBe(false);
     expect(deriveNodeStatusFromEvidence(run, evidence)).toBe("failed");
+  });
+
+  it("exports canonical workflow lane semantics for natural flow contracts", () => {
+    expect(WORKFLOW_LANE_KINDS).toEqual(
+      expect.arrayContaining(["implementation", "fix", "validation", "regression", "review", "commit"]),
+    );
+  });
+
+  it("models trusted runtime policy and non-executable user decision nodes", () => {
+    const runtimePolicy: WorkflowRuntimePolicy = {
+      source: "workflow_projection",
+      trusted: true,
+      executable: false,
+      sandbox: "read-only",
+      sideEffects: [],
+      reason: "Human decision nodes are not agent tasks.",
+    };
+    const node = {
+      id: "decision-architecture-risk",
+      title: "Choose architecture path",
+      agent: "hermes",
+      progress: "Waiting for input",
+      nodeKind: "user_decision",
+      executable: false,
+      runtimePolicy,
+      userDecision: {
+        decisionId: "decision-architecture-risk",
+        prompt: "Backtrack or continue?",
+        options: ["Backtrack", "Continue"],
+        reason: "Earlier design may be wrong.",
+        status: "waiting_input",
+      },
+      status: "running",
+      position: { x: 0, y: 0 },
+      runId: "run-decision-architecture-risk",
+      changesetId: "changeset-decision-architecture-risk",
+      output: [],
+      worktree: { path: ".", branchName: "main", baseCommit: "base" },
+      context: {
+        brief: "Choose architecture path.",
+        sessionGoal: "Ship safely.",
+        relatedRequirements: "",
+        relatedDesign: "",
+        relatedTasks: "",
+        dependencies: [],
+        constraints: [],
+      },
+    } satisfies CanvasNode;
+
+    expect(node.executable).toBe(false);
+    expect(node.runtimePolicy.sandbox).toBe("read-only");
+    expect(node.userDecision?.status).toBe("waiting_input");
+  });
+
+  it("publishes ledger, decision, worktree, variant, and changeset evidence contracts", () => {
+    const ledger: WorkflowLedgerSummary = {
+      throughSeq: 12,
+      checkpointSummary: "Implementation failed on typecheck.",
+      facts: ["lane-implementation failed typecheck"],
+      recentEvents: [{ seq: 12, kind: "workflow.evidence.recorded", summary: "typecheck failed", laneId: "lane-implementation" }],
+      openQuestions: ["Backtrack or repair?"],
+    };
+    const requested: UserDecisionRequestedPayload = {
+      decisionId: "decision-typecheck-strategy",
+      prompt: "Choose repair strategy.",
+      options: ["Repair in place", "Open parallel worktree"],
+      reason: "The failure may be architectural.",
+      targetLaneId: "lane-implementation",
+      targetSegmentId: "segment-implementation-1",
+    };
+    const answered: UserDecisionAnsweredPayload = {
+      decisionId: requested.decisionId,
+      selectedOption: "Open parallel worktree",
+      action: "parallel_worktree",
+      comment: "Compare both approaches.",
+      targetLaneId: requested.targetLaneId,
+      targetSegmentId: requested.targetSegmentId,
+    };
+    const worktree: WorkflowWorktreeIdentity = {
+      worktreeId: "worktree-a",
+      variantId: "variant-a",
+      path: "/repo.worktrees/session-1-variant-a",
+      realPath: "/repo.worktrees/session-1-variant-a",
+      gitdir: "/repo/.git/worktrees/session-1-variant-a",
+      repoRoot: "/repo",
+      branchName: "skyturn/session-1/variant-a",
+      baseCommit: "abc123",
+      headCommit: "def456",
+      parentLaneId: "lane-implementation",
+      parentSegmentId: "segment-implementation-1",
+    };
+    const adoption: WorkflowVariantAdoption = {
+      adoptionId: "adopt-variant-a",
+      variantId: worktree.variantId,
+      worktreeId: worktree.worktreeId,
+      strategy: "merge",
+      status: "requested",
+      baseCommit: worktree.baseCommit,
+      headCommit: worktree.headCommit,
+      targetBranchName: "main",
+    };
+    const changesetEvidence: ChangesetEvidence = {
+      evidenceId: "changeset-evidence-a",
+      changesetId: "changeset-a",
+      source: "git",
+      status: "available",
+      files: ["src/index.ts"],
+      diffStat: { added: 4, changed: 1, deleted: 0 },
+      patchPreviewTruncated: true,
+      worktreeId: worktree.worktreeId,
+      collectedAt: "2026-06-16T00:00:00.000Z",
+    };
+
+    expect(ledger.recentEvents[0]?.laneId).toBe("lane-implementation");
+    expect(answered.action).toBe("parallel_worktree");
+    expect(worktree.gitdir).toContain("/.git/worktrees/");
+    expect(adoption.status).toBe("requested");
+    expect(changesetEvidence.source).toBe("git");
   });
 });
