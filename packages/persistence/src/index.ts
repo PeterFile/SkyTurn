@@ -2,6 +2,7 @@ import type { EditorAdapter, EditorKind } from "@skyturn/git-worktree";
 import {
   makeHermesPlannerSessionId,
   type AgentDescriptor,
+  type AgentKind,
   type AgentRun,
   type CanvasNode,
   type CanvasSession,
@@ -22,6 +23,15 @@ export interface OpenProjectResult {
   };
 }
 
+export interface WorkflowRunResultRecordRequest {
+  sessionId: string;
+  laneId: string;
+  segmentId: string;
+  runId: string;
+  agentKind: AgentKind;
+  now: string;
+}
+
 export interface DevflowApi {
   openProject: () => Promise<OpenProjectResult>;
   initializeProjectMemory: (rootPath: string) => Promise<{ ok: boolean; devflowPath: string }>;
@@ -36,8 +46,13 @@ export interface DevflowApi {
   getRunEvents: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; events: RunEvent[] }>;
   listAgentRuns: () => Promise<{ protocolVersion: number; runs: AgentRun[] }>;
   getRunEvidence: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;
-  applyWorkflowIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown }>;
-  getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown }>;
+  createWorkflowSession: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; session: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  appendWorkflowUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  getWorkflowLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: unknown }>;
+  applyWorkflowIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  scheduleWorkflowReadyLanes: (projectRoot: string, sessionId: string, input: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  recordWorkflowRunResult: (projectRoot: string, input: WorkflowRunResultRecordRequest) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
+  getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getWorkflowEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   onRunEvent: (listener: (event: RunEvent) => void) => () => void;
   onWorkflowEvent: (listener: (event: unknown) => void) => () => void;

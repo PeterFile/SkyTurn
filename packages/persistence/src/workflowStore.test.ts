@@ -9,6 +9,7 @@ import {
   type WorkflowCardCreateInput,
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
+import type { RunEvidence } from "@skyturn/project-core";
 import type { WorkflowIntent } from "@skyturn/workflow-kernel";
 
 const roots: string[] = [];
@@ -376,6 +377,207 @@ describe("SQLite workflow store", () => {
     expect(replayed).toEqual(projection);
     expect(reopened.listEvents("session-1").some((event) => event.kind === "workflow.intent.accepted")).toBe(true);
     reopened.close();
+  });
+
+  it("builds a redacted ledger summary from persisted user inputs and recent events", async () => {
+    const store = await makeSeededStore();
+
+    store.appendUserInput({
+      sessionId: "session-1",
+      inputId: "input-1",
+      text: "Add audit logging and keep the retry decision explicit. token=sk-secret-123",
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    store.applyWorkflowIntent({
+      intentId: "intent-audit-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Add audit logging and preserve key retry decisions" },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
+        { type: "ProposeLanes" },
+      ],
+    }, "2026-06-14T00:00:02.000Z");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.output_delta",
+      source: "codex",
+      laneId: "lane-implementation",
+      segmentId: "segment-implementation-1",
+      idempotencyKey: "raw-output",
+      payload: {
+        laneId: "lane-implementation",
+        text: [
+          "stderr BEGIN",
+          "OPENAI_API_KEY=sk-do-not-leak",
+          "read .env with DATABASE_URL=postgres://secret",
+          "diff --git a/src/a.ts b/src/a.ts",
+          "+".repeat(7000),
+          "stderr END",
+        ].join("\n"),
+      },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.appendUserInput({
+      sessionId: "session-1",
+      inputId: "input-2",
+      text: "Now export the ledger summary before Hermes starts again.",
+      now: "2026-06-14T00:00:04.000Z",
+    });
+
+    const ledger = store.buildLedgerSummary("session-1");
+    const serialized = JSON.stringify(ledger);
+
+    expect(ledger.throughSeq).toBe(store.listEvents("session-1").at(-1)?.seq);
+    expect(ledger.facts.join("\n")).toContain("Add audit logging");
+    expect(ledger.facts.join("\n")).toContain("retry decision");
+    expect(ledger.recentEvents.map((event) => event.kind)).toContain("workflow.user_input");
+    expect(serialized).toContain("[REDACTED]");
+    expect(serialized).not.toContain("sk-do-not-leak");
+    expect(serialized).not.toContain("OPENAI_API_KEY");
+    expect(serialized).not.toContain(".env");
+    expect(serialized).not.toContain("diff --git");
+    expect(serialized).not.toContain("stderr BEGIN");
+    expect(serialized.length).toBeLessThan(4_000);
+  });
+
+  it("schedules runnable lanes and records RunEvidence through the Flow Kernel event stream", async () => {
+    const store = await makeSeededStore();
+    store.appendUserInput({
+      sessionId: "session-1",
+      inputId: "input-1",
+      text: "In this git repository, update src/tasks.ts and add tests.",
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    store.applyWorkflowIntent({
+      intentId: "intent-code-change-1",
+      sessionId: "session-1",
+      operations: [
+        {
+          type: "AnalyzeRequirement",
+          requirement: "In this git repository, update src/tasks.ts and add tests.",
+        },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
+        { type: "ProposeLanes" },
+      ],
+    }, "2026-06-14T00:00:02.000Z");
+
+    const scheduled = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    const duplicateSchedule = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:04.000Z",
+    });
+
+    expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual(["lane-implementation"]);
+    expect(scheduled.readyLanes[0]?.runId).toBe("run-session-1-lane-implementation");
+    expect(duplicateSchedule.readyLanes).toEqual([]);
+    expect(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.started")).toHaveLength(1);
+
+    const evidence = {
+      runId: "run-session-1-lane-implementation",
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: "changeset-implementation-1",
+      checks: [{ kind: "test", name: "pnpm test", status: "passed", detail: "2 passed" }],
+      artifacts: [".devflow/tasks/session-1/lane-implementation/result.md"],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:05.000Z",
+    } satisfies RunEvidence;
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      runId: evidence.runId,
+      agentKind: "codex",
+      outputSummary: "Implemented status filtering with tests.",
+      evidence,
+      now: "2026-06-14T00:00:05.000Z",
+    });
+
+    const projection = store.materializeFlowProjection("session-1");
+    const canvas = store.materializeCanvasSession("session-1");
+
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("completed");
+    expect(projection.evidence).toMatchObject([
+      {
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        status: "passed",
+      },
+    ]);
+    expect(canvas?.nodes.find((node) => node.id === "lane-implementation")).toMatchObject({
+      status: "completed",
+      runId: evidence.runId,
+      changesetId: "changeset-implementation-1",
+      output: expect.arrayContaining(["Implemented status filtering with tests."]),
+    });
+  });
+
+  it("redacts run output and evidence before persisting event-stream projection data", async () => {
+    const store = await makeSeededStore();
+    const evidence = {
+      runId: "run-session-1-lane-implementation",
+      status: "failed",
+      exitCode: 1,
+      changesetId: "changeset-implementation-1",
+      checks: [
+        {
+          kind: "test",
+          name: "pnpm test OPENAI_API_KEY=sk-check-secret",
+          status: "failed",
+          detail: "DATABASE_URL=postgres://db-secret",
+        },
+      ],
+      artifacts: [".devflow/tasks/session-1/.env.secret"],
+      review: {
+        kind: "review",
+        name: "review",
+        status: "failed",
+        detail: "Authorization: Bearer live-token",
+      },
+      errorReason: "stderr OPENAI_API_KEY=sk-error-secret from .env",
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:05.000Z",
+    } satisfies RunEvidence;
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      runId: evidence.runId,
+      agentKind: "codex",
+      outputSummary: [
+        "stderr BEGIN",
+        "OPENAI_API_KEY=sk-output-secret",
+        "diff --git a/src/a.ts b/src/a.ts",
+        "+const token = 'sk-diff-secret';",
+      ].join("\n"),
+      evidence,
+      now: "2026-06-14T00:00:05.000Z",
+    });
+
+    const serializedEvents = JSON.stringify(store.listEvents("session-1"));
+    const serializedCanvas = JSON.stringify(store.materializeCanvasSession("session-1"));
+
+    expect(serializedEvents).toContain("[REDACTED]");
+    expect(serializedEvents).toContain("Patch content omitted");
+    expect(serializedEvents).toContain("runEvidence");
+    for (const serialized of [serializedEvents, serializedCanvas]) {
+      expect(serialized).not.toContain("sk-output-secret");
+      expect(serialized).not.toContain("sk-diff-secret");
+      expect(serialized).not.toContain("sk-error-secret");
+      expect(serialized).not.toContain("sk-check-secret");
+      expect(serialized).not.toContain("db-secret");
+      expect(serialized).not.toContain("live-token");
+      expect(serialized).not.toContain(".env");
+      expect(serialized).not.toContain("diff --git");
+      expect(serialized).not.toContain("stderr BEGIN");
+    }
   });
 
   it("persists rejected WorkflowIntent events when gate validation fails", async () => {

@@ -19,6 +19,7 @@ import {
   type RunEvent,
   type RunEvidence,
   type UserDecisionProjection,
+  type WorkflowLedgerSummary,
 } from "@skyturn/project-core";
 import {
   compileWorkflowIntent,
@@ -34,6 +35,7 @@ export interface BridgeRunResult {
   run: AgentRun;
   events: RunEvent[];
   evidence: RunEvidence;
+  workflowSession?: CanvasSession | null;
 }
 
 export async function startBridgeRun(
@@ -41,7 +43,9 @@ export async function startBridgeRun(
   session: CanvasSession,
   node: CanvasNode,
 ): Promise<BridgeRunResult | null> {
+  if (node.executable === false || node.runtimePolicy?.executable === false) return null;
   const sandbox = sandboxForNodeRun(node);
+  const ledger = node.agent === "hermes" ? await loadWorkflowLedger(project, session.id) : undefined;
   const result = await window.devflow?.startAgentRun({
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
     runId: node.runId,
@@ -57,23 +61,96 @@ export async function startBridgeRun(
     worktreePath: resolveRunWorktreePath(project, node),
     agentKind: node.agent,
     ...(sandbox ? { sandbox } : {}),
-    prompt: promptForNodeRun(session, node),
+    prompt: promptForNodeRun(session, node, ledger),
   });
   if (!result || !window.devflow) return null;
   const [eventsResult, evidenceResult] = await Promise.all([
     window.devflow.getRunEvents(project.rootPath, node.runId),
     window.devflow.getRunEvidence(project.rootPath, node.runId),
   ]);
-  return { run: result.run, events: eventsResult.events, evidence: evidenceResult.evidence };
+  const workflowSession = await persistWorkflowRunResult(project, session, node, eventsResult.events, evidenceResult.evidence);
+  return { run: result.run, events: eventsResult.events, evidence: evidenceResult.evidence, workflowSession };
 }
 
 export function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRunResult): WorkspaceState {
   const withEvents = mergeRunEventsIntoWorkspace(workspace, result.run.id, result.events);
+  if (result.workflowSession) {
+    return {
+      ...withEvents,
+      sessions: withEvents.sessions.map((session) =>
+        session.id === result.workflowSession?.id ? result.workflowSession : session,
+      ),
+      runs: { ...withEvents.runs, [result.run.id]: result.run },
+      runEvidence: { ...withEvents.runEvidence, [result.run.id]: result.evidence },
+    };
+  }
   return {
     ...withEvents,
     runs: { ...withEvents.runs, [result.run.id]: result.run },
     runEvidence: { ...withEvents.runEvidence, [result.run.id]: result.evidence },
   };
+}
+
+async function loadWorkflowLedger(
+  project: ImportedProject,
+  sessionId: string,
+): Promise<WorkflowLedgerSummary | undefined> {
+  if (!window.devflow || typeof window.devflow.getWorkflowLedger !== "function") return undefined;
+  const result = await window.devflow.getWorkflowLedger(project.rootPath, sessionId);
+  return isWorkflowLedgerSummary(result.ledger) ? result.ledger : undefined;
+}
+
+async function persistWorkflowRunResult(
+  project: ImportedProject,
+  session: CanvasSession,
+  node: CanvasNode,
+  events: RunEvent[],
+  evidence: RunEvidence,
+): Promise<CanvasSession | null> {
+  if (!window.devflow) return null;
+  const now = evidence.completedAt ?? latestEventTimestamp(events) ?? new Date().toISOString();
+  if (node.agent === "hermes") {
+    if (
+      typeof window.devflow.applyWorkflowIntent !== "function" ||
+      typeof window.devflow.scheduleWorkflowReadyLanes !== "function"
+    ) {
+      return null;
+    }
+    const intent = parseHermesWorkflowIntent(outputFromEvents(events).join("\n"));
+    if (!intent.ok) return null;
+    if (intent.intent.sessionId !== session.id) return null;
+    const applied = await window.devflow.applyWorkflowIntent(project.rootPath, intent.intent);
+    const scheduled = await window.devflow.scheduleWorkflowReadyLanes(project.rootPath, session.id, {
+      allowedParallelism: 1,
+      now,
+    });
+    return scheduled.canvasSession ?? applied.canvasSession ?? null;
+  }
+
+  if (!node.display?.meta.includes("flow-kernel") || node.executable === false) return null;
+  if (
+    typeof window.devflow.recordWorkflowRunResult !== "function" ||
+    typeof window.devflow.scheduleWorkflowReadyLanes !== "function"
+  ) {
+    return null;
+  }
+  const recorded = await window.devflow.recordWorkflowRunResult(project.rootPath, {
+    sessionId: session.id,
+    laneId: node.id,
+    segmentId: segmentIdForNode(session.id, node.id),
+    runId: node.runId,
+    agentKind: node.agent,
+    now,
+  });
+  const scheduled = await window.devflow.scheduleWorkflowReadyLanes(project.rootPath, session.id, {
+    allowedParallelism: 1,
+    now,
+  });
+  return scheduled.canvasSession ?? recorded.canvasSession ?? null;
+}
+
+function shouldUseRendererWorkflowProjection(): boolean {
+  return typeof window === "undefined" || !window.devflow;
 }
 
 export function retryCanvasNode(session: CanvasSession, nodeId: string, now: string): CanvasSession {
@@ -120,6 +197,7 @@ export function mergeRunEventsIntoWorkspace(
       ...session,
       nodes: session.nodes.map((node) => (node.runId === runId ? applyRunEventsToNode(node, session, deduped) : node)),
     };
+    if (!shouldUseRendererWorkflowProjection()) return updatedSession;
     const projected = target.agent === "hermes" ? applyHermesWorkflowOutput(updatedSession, target, deduped) : updatedSession;
     return scheduleFlowKernelLanes(projected);
   });
@@ -499,7 +577,11 @@ function progressForFlowLaneStatus(status: FlowLane["status"]): string {
   return "Waiting for scheduler";
 }
 
-export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode): string {
+export function buildPromptForNodeRun(
+  session: CanvasSession,
+  node: CanvasNode,
+  sessionLedger?: WorkflowLedgerSummary,
+): string {
   if (node.agent === "hermes") {
     if (node.display?.meta.includes("flow-kernel") && node.id !== session.plannerNodeId) {
       const dependencyEvidence = dependencyEvidenceForPrompt(session, node);
@@ -519,6 +601,7 @@ export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode):
       sessionId: session.id,
       plannerSessionId: session.hermesPlannerSessionId || makeHermesPlannerSessionId(session.id),
       nodeId: node.id,
+      sessionLedger,
       existingNodes: session.nodes.map((item) => ({
         id: item.id,
         title: item.title,
@@ -549,8 +632,12 @@ export function buildPromptForNodeRun(session: CanvasSession, node: CanvasNode):
   ].filter(Boolean).join("\n");
 }
 
-function promptForNodeRun(session: CanvasSession, node: CanvasNode): string {
-  return buildPromptForNodeRun(session, node);
+function promptForNodeRun(
+  session: CanvasSession,
+  node: CanvasNode,
+  sessionLedger?: WorkflowLedgerSummary,
+): string {
+  return buildPromptForNodeRun(session, node, sessionLedger);
 }
 
 export function sandboxForNodeRun(node: CanvasNode): AgentRunSandbox | undefined {
@@ -613,6 +700,22 @@ function dependencyEvidenceForPrompt(session: CanvasSession, node: CanvasNode): 
 function trimForPrompt(value: string, maxLength: number): string {
   if (value.length <= maxLength) return value;
   return `...${value.slice(value.length - maxLength)}`;
+}
+
+function segmentIdForNode(sessionId: string, nodeId: string): string {
+  return `segment-${sessionId}-${nodeId}`;
+}
+
+function isWorkflowLedgerSummary(value: unknown): value is WorkflowLedgerSummary {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<WorkflowLedgerSummary>;
+  return (
+    typeof candidate.throughSeq === "number" &&
+    (candidate.checkpointSummary === null || typeof candidate.checkpointSummary === "string") &&
+    Array.isArray(candidate.facts) &&
+    Array.isArray(candidate.recentEvents) &&
+    Array.isArray(candidate.openQuestions)
+  );
 }
 
 function resolveRunWorktreePath(project: ImportedProject, node: CanvasNode): string {

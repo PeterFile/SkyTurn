@@ -22,6 +22,15 @@ interface StartAgentRunInput {
   [key: string]: unknown;
 }
 
+interface WorkflowRunResultInput {
+  sessionId?: unknown;
+  laneId?: unknown;
+  segmentId?: unknown;
+  runId?: unknown;
+  agentKind?: unknown;
+  now?: unknown;
+}
+
 const RUN_PROTOCOL_VERSION = 1;
 const openedProjectRoots = new Set<string>();
 let agentBridge: AgentBridgeHost | null = null;
@@ -39,8 +48,14 @@ interface AgentBridgeHost {
 }
 
 interface WorkflowStoreHost {
+  createWorkflowSession(input: unknown): unknown;
+  appendUserInput(input: unknown): unknown;
+  buildLedgerSummary(sessionId: string): unknown;
   applyWorkflowIntent(intent: unknown, now: string): unknown;
+  scheduleReadyLanes(sessionId: string, input: unknown): unknown;
+  recordRunResult(input: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
+  materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
   close(): void;
 }
@@ -176,36 +191,125 @@ ipcMain.handle("run:evidence", async (_event, projectRoot: string, runId: string
   };
 });
 
+ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, input: { id?: unknown }) => {
+  assertKnownProjectRoot(projectRoot);
+  const sessionId = assertWorkflowSessionId(input.id);
+  const store = await getWorkflowStore(projectRoot);
+  const session = store.createWorkflowSession(input);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    session,
+    projection: store.materializeFlowProjection(sessionId),
+    canvasSession: store.materializeCanvasSession(sessionId),
+  };
+});
+
+ipcMain.handle("workflow:appendUserInput", async (_event, projectRoot: string, input: { sessionId?: unknown }) => {
+  assertKnownProjectRoot(projectRoot);
+  const sessionId = assertWorkflowSessionId(input.sessionId);
+  const store = await getWorkflowStore(projectRoot);
+  const event = store.appendUserInput(input);
+  broadcastWorkflowProjection(projectRoot, sessionId, store);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    event,
+    ledger: store.buildLedgerSummary(sessionId),
+    projection: store.materializeFlowProjection(sessionId),
+    canvasSession: store.materializeCanvasSession(sessionId),
+  };
+});
+
+ipcMain.handle("workflow:ledger", async (_event, projectRoot: string, sessionId: string) => {
+  assertKnownProjectRoot(projectRoot);
+  const workflowSessionId = assertWorkflowSessionId(sessionId);
+  const store = await getWorkflowStore(projectRoot);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    ledger: store.buildLedgerSummary(workflowSessionId),
+  };
+});
+
 ipcMain.handle("workflow:applyIntent", async (_event, projectRoot: string, intent: { sessionId?: unknown }) => {
   assertKnownProjectRoot(projectRoot);
-  if (typeof intent?.sessionId !== "string") throw new Error("WorkflowIntent sessionId is required.");
+  const sessionId = assertWorkflowSessionId(intent?.sessionId);
   const store = await getWorkflowStore(projectRoot);
   const result = store.applyWorkflowIntent(intent, new Date().toISOString());
-  const projection = store.materializeFlowProjection(intent.sessionId);
-  for (const window of BrowserWindow.getAllWindows()) {
-    window.webContents.send("workflow:event", { projectRoot, sessionId: intent.sessionId, projection });
-  }
-  return { protocolVersion: RUN_PROTOCOL_VERSION, result, projection };
+  const projection = store.materializeFlowProjection(sessionId);
+  broadcastWorkflowProjection(projectRoot, sessionId, store);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    result,
+    projection,
+    canvasSession: store.materializeCanvasSession(sessionId),
+  };
+});
+
+ipcMain.handle("workflow:scheduleReady", async (_event, projectRoot: string, sessionId: string, input: unknown) => {
+  assertKnownProjectRoot(projectRoot);
+  const workflowSessionId = assertWorkflowSessionId(sessionId);
+  const store = await getWorkflowStore(projectRoot);
+  const result = store.scheduleReadyLanes(workflowSessionId, input);
+  broadcastWorkflowProjection(projectRoot, workflowSessionId, store);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    result,
+    projection: store.materializeFlowProjection(workflowSessionId),
+    canvasSession: store.materializeCanvasSession(workflowSessionId),
+  };
+});
+
+ipcMain.handle("workflow:recordRunResult", async (_event, projectRoot: string, input: WorkflowRunResultInput) => {
+  assertKnownProjectRoot(projectRoot);
+  const sessionId = assertWorkflowSessionId(input.sessionId);
+  const laneId = assertRequiredText(input.laneId, "Workflow laneId is required.");
+  const segmentId = assertRequiredText(input.segmentId, "Workflow segmentId is required.");
+  const runId = assertRequiredText(input.runId, "Workflow runId is required.");
+  const agentKind = assertWorkflowAgentKind(input.agentKind);
+  const now = typeof input.now === "string" && input.now.trim() ? input.now : new Date().toISOString();
+  const bridge = await getAgentBridge();
+  const [events, evidence] = await Promise.all([
+    bridge.loadEvents(projectRoot, runId),
+    bridge.getEvidence(projectRoot, runId),
+  ]);
+  const store = await getWorkflowStore(projectRoot);
+  const projection = store.recordRunResult({
+    sessionId,
+    laneId,
+    segmentId,
+    runId,
+    agentKind,
+    outputSummary: summarizeRunOutput(events),
+    evidence,
+    now,
+  });
+  broadcastWorkflowProjection(projectRoot, sessionId, store);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    projection,
+    canvasSession: store.materializeCanvasSession(sessionId),
+  };
 });
 
 ipcMain.handle("workflow:projection", async (_event, projectRoot: string, sessionId: string) => {
   assertKnownProjectRoot(projectRoot);
+  const workflowSessionId = assertWorkflowSessionId(sessionId);
   const store = await getWorkflowStore(projectRoot);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
-    projection: store.materializeFlowProjection(sessionId),
+    projection: store.materializeFlowProjection(workflowSessionId),
+    canvasSession: store.materializeCanvasSession(workflowSessionId),
   };
 });
 
 ipcMain.handle("workflow:events", async (_event, projectRoot: string, sessionId: string) => {
   assertKnownProjectRoot(projectRoot);
+  const workflowSessionId = assertWorkflowSessionId(sessionId);
   const store = await getWorkflowStore(projectRoot);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
-    events: store.listEvents(sessionId).filter((event) => {
-      const kind = (event as { kind?: unknown }).kind;
-      return typeof kind === "string" && kind.startsWith("workflow.");
-    }),
+    events: store.listEvents(workflowSessionId)
+      .filter(isWorkflowEventRecord)
+      .map(redactWorkflowEventForRenderer),
   };
 });
 
@@ -259,6 +363,106 @@ async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost>
   const store = createWorkflowStore({ projectRoot }) as WorkflowStoreHost;
   workflowStores.set(projectRoot, store);
   return store;
+}
+
+function broadcastWorkflowProjection(projectRoot: string, sessionId: string, store: WorkflowStoreHost): void {
+  const projection = store.materializeFlowProjection(sessionId);
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.webContents.send("workflow:event", { projectRoot, sessionId, projection, canvasSession });
+  }
+}
+
+function assertWorkflowSessionId(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error("Workflow sessionId is required.");
+  return value;
+}
+
+function assertRequiredText(value: unknown, message: string): string {
+  if (typeof value !== "string" || !value.trim()) throw new Error(message);
+  return value;
+}
+
+function assertWorkflowAgentKind(value: unknown): string {
+  if (
+    value === "hermes" ||
+    value === "codex" ||
+    value === "gemini" ||
+    value === "claude-code" ||
+    value === "openclaw"
+  ) {
+    return value;
+  }
+  throw new Error("Workflow agentKind is required.");
+}
+
+function summarizeRunOutput(events: unknown[]): string | undefined {
+  const output = events
+    .map((event) => {
+      if (!event || typeof event !== "object") return null;
+      const candidate = event as { kind?: unknown; payload?: { text?: unknown } };
+      return candidate.kind === "output" && typeof candidate.payload?.text === "string"
+        ? candidate.payload.text
+        : null;
+    })
+    .filter((text): text is string => Boolean(text))
+    .join("\n")
+    .trim();
+  if (!output) return undefined;
+  return output.length > 1_000 ? output.slice(0, 1_000) : output;
+}
+
+function isWorkflowEventRecord(event: unknown): event is Record<string, unknown> & { kind: string } {
+  return Boolean(event) && typeof event === "object" && typeof (event as { kind?: unknown }).kind === "string" &&
+    (event as { kind: string }).kind.startsWith("workflow.");
+}
+
+function redactWorkflowEventForRenderer(event: Record<string, unknown> & { kind: string }): Record<string, unknown> {
+  return {
+    id: event.id,
+    sessionId: event.sessionId,
+    seq: event.seq,
+    kind: event.kind,
+    source: event.source,
+    laneId: event.laneId,
+    segmentId: event.segmentId,
+    causationId: event.causationId,
+    correlationId: event.correlationId,
+    createdAt: event.createdAt,
+    payload: {
+      redacted: true,
+      summary: workflowEventSummary(event.kind),
+    },
+  };
+}
+
+function workflowEventSummary(kind: string): string {
+  switch (kind) {
+    case "workflow.user_input":
+      return "User input recorded.";
+    case "workflow.intent.accepted":
+      return "WorkflowIntent accepted.";
+    case "workflow.intent.rejected":
+      return "WorkflowIntent rejected.";
+    case "workflow.lane.declared":
+      return "Lane declared.";
+    case "workflow.edge.declared":
+      return "Edge declared.";
+    case "workflow.segment.started":
+      return "Run segment started.";
+    case "workflow.segment.output_delta":
+      return "Run output summary recorded.";
+    case "workflow.segment.finished":
+      return "Run segment finished.";
+    case "workflow.evidence.recorded":
+      return "Run evidence recorded.";
+    case "workflow.user_decision.requested":
+      return "User decision requested.";
+    case "workflow.user_decision.answered":
+      return "User decision answered.";
+    default:
+      return "Workflow event recorded.";
+  }
 }
 
 function assertKnownProjectRoot(projectRoot: string): void {

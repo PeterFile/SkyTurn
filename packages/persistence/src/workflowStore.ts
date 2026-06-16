@@ -11,6 +11,10 @@ import type {
   NodeLifecyclePhase,
   NodeRuntimeState,
   NodeStatus,
+  RunEvidence,
+  UserDecisionProjection,
+  WorkflowLedgerSummary,
+  WorkflowLedgerSummaryEvent,
   WorkflowMode,
 } from "@skyturn/project-core";
 import {
@@ -18,9 +22,11 @@ import {
   createDefaultFlowPolicy,
   parseWorkflowIntent,
   reduceWorkflowEvents,
+  scheduleReadyLanes as scheduleFlowReadyLanes,
   type CompileWorkflowIntentResult,
   type FlowEvent,
   type FlowEventKind,
+  type FlowLane,
   type FlowProjection,
 } from "@skyturn/workflow-kernel";
 
@@ -230,6 +236,45 @@ export interface AppendWorkflowEventInput {
   correlationId?: string | null;
   idempotencyKey?: string | null;
   payload: Record<string, unknown>;
+  now: string;
+}
+
+export interface AppendUserInput {
+  sessionId: string;
+  inputId: string;
+  text: string;
+  now: string;
+}
+
+export interface WorkflowLedgerOptions {
+  recentEventLimit?: number;
+  factLimit?: number;
+  maxSummaryLength?: number;
+}
+
+export interface ScheduledWorkflowLane extends FlowLane {
+  runId: string;
+  segmentId: string;
+}
+
+export interface ScheduleReadyWorkflowLanesInput {
+  allowedParallelism?: number;
+  now: string;
+}
+
+export interface ScheduleReadyWorkflowLanesResult {
+  readyLanes: ScheduledWorkflowLane[];
+  projection: FlowProjection;
+}
+
+export interface RecordRunResultInput {
+  sessionId: string;
+  laneId: string;
+  segmentId: string;
+  runId: string;
+  agentKind: AgentKind;
+  outputSummary?: string;
+  evidence: RunEvidence;
   now: string;
 }
 
@@ -525,6 +570,22 @@ export class WorkflowStore {
     return tx();
   }
 
+  appendUserInput(input: AppendUserInput): WorkflowEventRecord {
+    return this.appendWorkflowEvent({
+      sessionId: input.sessionId,
+      kind: "workflow.user_input",
+      source: "user",
+      idempotencyKey: `user-input:${input.inputId}`,
+      payload: { inputId: input.inputId, text: input.text },
+      now: input.now,
+    });
+  }
+
+  buildLedgerSummary(sessionId: string, options: WorkflowLedgerOptions = {}): WorkflowLedgerSummary {
+    const sanitizer = new LedgerSanitizer(options);
+    return sanitizer.build(this.listEvents(sessionId));
+  }
+
   applyWorkflowIntent(intent: unknown, now: string): CompileWorkflowIntentResult {
     const sessionId = workflowIntentSessionId(intent);
     if (!sessionId) throw new Error("WorkflowIntent sessionId is required.");
@@ -545,6 +606,120 @@ export class WorkflowStore {
     });
     tx();
     return compiled;
+  }
+
+  scheduleReadyLanes(
+    sessionId: string,
+    input: ScheduleReadyWorkflowLanesInput,
+  ): ScheduleReadyWorkflowLanesResult {
+    const projection = this.materializeFlowProjection(sessionId);
+    const runningScopes = projection.lanes
+      .filter((lane) => lane.status === "running")
+      .map((lane) => ({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes }));
+    const ready = scheduleFlowReadyLanes(projection, {
+      allowedParallelism: input.allowedParallelism ?? 1,
+      runningScopes,
+    });
+    const scheduled = ready.map((lane) => ({
+      ...lane,
+      runId: runIdForLane(sessionId, lane.id),
+      segmentId: segmentIdForLane(sessionId, lane.id),
+    }));
+    if (scheduled.length === 0) return { readyLanes: [], projection };
+
+    const tx = this.db.transaction(() => {
+      for (const lane of scheduled) {
+        this.insertFlowEventInTransaction({
+          id: `${sessionId}:flow-schedule:${lane.id}`,
+          sessionId,
+          seq: 0,
+          kind: "workflow.segment.started",
+          source: "workflow-scheduler",
+          payload: {
+            laneId: lane.id,
+            segment: {
+              id: lane.segmentId,
+              laneId: lane.id,
+              runId: lane.runId,
+              status: "running",
+              exitCode: null,
+            },
+          },
+          createdAt: input.now,
+          idempotencyKey: `schedule:${lane.segmentId}:started`,
+        }, input.now);
+      }
+    });
+    tx();
+
+    return {
+      readyLanes: scheduled,
+      projection: this.materializeFlowProjection(sessionId),
+    };
+  }
+
+  recordRunResult(input: RecordRunResultInput): FlowProjection {
+    const safeEvidence = sanitizeRunEvidence(input.evidence);
+    const outputSummary = sanitizeWorkflowStoredText(input.outputSummary ?? resultSummaryFromEvidence(safeEvidence));
+    const status = flowStatusFromRunEvidence(input.evidence);
+    const evidenceStatus = status === "succeeded" ? "passed" : input.evidence.status === "cancelled" ? "skipped" : "failed";
+    const tx = this.db.transaction(() => {
+      this.insertFlowEventInTransaction({
+        id: `${input.sessionId}:flow-output:${input.segmentId}`,
+        sessionId: input.sessionId,
+        seq: 0,
+        kind: "workflow.segment.output_delta",
+        source: input.agentKind,
+        payload: {
+          laneId: input.laneId,
+          segmentId: input.segmentId,
+          text: outputSummary,
+        },
+        createdAt: input.now,
+        idempotencyKey: `segment:${input.segmentId}:output-summary`,
+      }, input.now);
+      this.insertFlowEventInTransaction({
+        id: `${input.sessionId}:flow-evidence:${input.segmentId}`,
+        sessionId: input.sessionId,
+        seq: 0,
+        kind: "workflow.evidence.recorded",
+        source: input.agentKind,
+        payload: {
+          laneId: input.laneId,
+          segmentId: input.segmentId,
+          evidence: {
+            id: `evidence-${input.segmentId}`,
+            kind: "run-exit",
+            status: evidenceStatus,
+            changesetId: safeEvidence.changesetId,
+            checks: safeEvidence.checks.map((check) => `${check.kind}:${check.name}:${check.status}`),
+            artifacts: safeEvidence.artifacts,
+            detail: safeEvidence.errorReason ?? safeEvidence.review?.detail ?? null,
+            runEvidence: safeEvidence,
+          },
+        },
+        createdAt: input.now,
+        idempotencyKey: `segment:${input.segmentId}:evidence`,
+      }, input.now);
+      this.insertFlowEventInTransaction({
+        id: `${input.sessionId}:flow-finished:${input.segmentId}`,
+        sessionId: input.sessionId,
+        seq: 0,
+        kind: "workflow.segment.finished",
+        source: input.agentKind,
+        payload: {
+          laneId: input.laneId,
+          segmentId: input.segmentId,
+          status,
+          exitCode: safeEvidence.exitCode,
+          errorReason: safeEvidence.errorReason ?? safeEvidence.cancelReason ?? null,
+        },
+        createdAt: input.now,
+        idempotencyKey: `segment:${input.segmentId}:finished`,
+      }, input.now);
+    });
+    tx();
+    return this.materializeFlowProjection(input.sessionId);
   }
 
   materializeFlowProjection(sessionId: string): FlowProjection {
@@ -733,6 +908,10 @@ export class WorkflowStore {
   materializeCanvasSession(sessionId: string): CanvasSession | null {
     const session = this.getWorkflowSession(sessionId);
     if (!session) return null;
+    const flowProjection = this.materializeFlowProjection(sessionId);
+    if (flowProjection.lanes.length > 0 || flowProjection.userDecisions.length > 0) {
+      return this.materializeFlowCanvasSession(session, flowProjection);
+    }
     const lanes = this.listLanes(sessionId).filter((lane) => !lane.archived);
     const edges = (this.statements.listEdges.all(sessionId) as EdgeRow[]).map((row) => ({
       id: row.id,
@@ -754,6 +933,41 @@ export class WorkflowStore {
       nodes,
       edges,
       activeNodeId: nodes.find((node) => node.status === "running" || node.status === "retrying")?.id ?? null,
+    };
+  }
+
+  private materializeFlowCanvasSession(session: WorkflowSessionRecord, projection: FlowProjection): CanvasSession {
+    const plannerLane = this.getLane(session.id, session.plannerLaneId);
+    const plannerNode = plannerLane
+      ? this.materializeNode(session, plannerLane, 0)
+      : flowPlannerNode(session);
+    const dependenciesByLaneId = dependenciesFromFlowProjection(projection);
+    const changesetsByLaneId = changesetsFromFlowEvents(this.listEvents(session.id));
+    const flowNodes = projection.lanes.map((lane, index) =>
+      flowLaneToCanvasNode(session, projection, lane, index + 1, dependenciesByLaneId.get(lane.id) ?? [], changesetsByLaneId.get(lane.id)),
+    );
+    const decisionNodes = projection.userDecisions.map((decision, index) =>
+      flowDecisionToCanvasNode(session, decision, projection.lanes.length + index + 1),
+    );
+    const nodes = [plannerNode, ...flowNodes, ...decisionNodes];
+    return {
+      id: session.id,
+      projectId: session.projectId,
+      title: session.title,
+      goal: session.goal,
+      mode: session.mode,
+      kind: "canvas",
+      hermesPlannerSessionId: session.hermesSessionId,
+      plannerNodeId: session.plannerLaneId,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      nodes,
+      edges: projection.edges.map((edge) => ({
+        id: edge.id,
+        source: edge.sourceLaneId,
+        target: edge.targetLaneId,
+      })),
+      activeNodeId: nodes.find((node) => node.status === "running" || node.status === "retrying")?.id ?? plannerNode.id,
     };
   }
 
@@ -1183,8 +1397,413 @@ export class WorkflowStore {
   }
 }
 
+class LedgerSanitizer {
+  private readonly recentEventLimit: number;
+  private readonly factLimit: number;
+  private readonly maxSummaryLength: number;
+
+  constructor(options: WorkflowLedgerOptions) {
+    this.recentEventLimit = options.recentEventLimit ?? 12;
+    this.factLimit = options.factLimit ?? 8;
+    this.maxSummaryLength = options.maxSummaryLength ?? 320;
+  }
+
+  build(events: WorkflowEventRecord[]): WorkflowLedgerSummary {
+    const workflowEvents = events.filter((event) => event.kind.startsWith("workflow."));
+    const facts: string[] = [];
+    const requestedQuestions = new Map<string, string>();
+    const answeredQuestions = new Set<string>();
+
+    for (const event of workflowEvents) {
+      if (event.kind === "workflow.user_input" && typeof event.payload.text === "string") {
+        facts.push(`User input: ${this.sanitize(event.payload.text)}`);
+      }
+      if (event.kind === "workflow.profile" && isRecord(event.payload.requirementProfile)) {
+        const text = event.payload.requirementProfile.text;
+        if (typeof text === "string" && text.trim()) facts.push(`Requirement: ${this.sanitize(text)}`);
+      }
+      if (event.kind === "workflow.user_decision.requested" && typeof event.payload.decisionId === "string") {
+        requestedQuestions.set(event.payload.decisionId, this.sanitize(String(event.payload.prompt ?? event.payload.reason ?? "")));
+      }
+      if (event.kind === "workflow.user_decision.answered" && typeof event.payload.decisionId === "string") {
+        answeredQuestions.add(event.payload.decisionId);
+        if (typeof event.payload.selectedOption === "string") {
+          facts.push(`Decision: ${this.sanitize(event.payload.selectedOption)}`);
+        }
+      }
+    }
+
+    const recentEvents = workflowEvents
+      .map((event) => this.summarizeEvent(event))
+      .filter((event): event is WorkflowLedgerSummaryEvent => Boolean(event))
+      .slice(-this.recentEventLimit);
+    const openQuestions = [...requestedQuestions]
+      .filter(([decisionId]) => !answeredQuestions.has(decisionId))
+      .map(([, prompt]) => prompt)
+      .filter(Boolean);
+
+    return {
+      throughSeq: workflowEvents.at(-1)?.seq ?? 0,
+      checkpointSummary: null,
+      facts: compactStrings(facts).slice(-this.factLimit),
+      recentEvents,
+      openQuestions,
+    };
+  }
+
+  private summarizeEvent(event: WorkflowEventRecord): WorkflowLedgerSummaryEvent | null {
+    const summary = this.summaryText(event);
+    if (!summary) return null;
+    const laneId = event.laneId ?? laneIdFromPayload(event.payload);
+    return {
+      seq: event.seq,
+      kind: event.kind,
+      summary,
+      ...(laneId ? { laneId } : {}),
+    };
+  }
+
+  private summaryText(event: WorkflowEventRecord): string {
+    switch (event.kind) {
+      case "workflow.user_input":
+        return `User input: ${this.sanitize(String(event.payload.text ?? ""))}`;
+      case "workflow.intent.accepted":
+        return `WorkflowIntent accepted: ${this.sanitize(String(event.payload.intentId ?? ""))}`;
+      case "workflow.intent.rejected":
+        return `WorkflowIntent rejected: ${this.sanitize(String(event.payload.reason ?? ""))}`;
+      case "workflow.lane.declared":
+        return `Lane declared: ${this.sanitize(laneTitleFromPayload(event.payload))}`;
+      case "workflow.edge.declared":
+        return `Edge declared: ${this.sanitize(edgeSummaryFromPayload(event.payload))}`;
+      case "workflow.segment.started":
+        return `Run started: ${this.sanitize(segmentSummaryFromPayload(event.payload))}`;
+      case "workflow.segment.output_delta":
+        return `Output summary: ${this.sanitize(String(event.payload.text ?? ""))}`;
+      case "workflow.segment.finished":
+        return `Run finished: ${this.sanitize(String(event.payload.status ?? "unknown"))}`;
+      case "workflow.evidence.recorded":
+        return `Evidence recorded: ${this.sanitize(evidenceSummaryFromPayload(event.payload))}`;
+      case "workflow.user_decision.requested":
+        return `Decision requested: ${this.sanitize(String(event.payload.prompt ?? event.payload.reason ?? ""))}`;
+      case "workflow.user_decision.answered":
+        return `Decision answered: ${this.sanitize(String(event.payload.selectedOption ?? ""))}`;
+      default:
+        return this.sanitize(String(event.kind));
+    }
+  }
+
+  private sanitize(value: string): string {
+    return sanitizeLedgerText(value, this.maxSummaryLength);
+  }
+}
+
 export function createWorkflowStore(options: WorkflowStoreOptions): WorkflowStore {
   return new WorkflowStore(options);
+}
+
+function flowPlannerNode(session: WorkflowSessionRecord): CanvasNode {
+  return {
+    id: session.plannerLaneId,
+    title: "Hermes planner",
+    agent: "hermes",
+    progress: "Running",
+    runtime: { phase: "Planning", message: "Running", action: "planning" },
+    display: { agentLabel: "Hermes", meta: ["planner", session.plannerLaneId] },
+    status: "running",
+    position: { x: 120, y: 120 },
+    runId: runIdForLane(session.id, session.plannerLaneId),
+    changesetId: `changeset-${session.id}-${session.plannerLaneId}`,
+    output: ["Workflow planner is active."],
+    worktree: {
+      path: ".",
+      branchName: `skyturn/${session.id}/${session.plannerLaneId}`,
+      baseCommit: "event-stream",
+    },
+    context: {
+      brief: session.goal,
+      sessionGoal: session.goal,
+      relatedRequirements: "Projected from SQLite workflow_events.",
+      relatedDesign: "CanvasSession is a deterministic projection, not the fact source.",
+      relatedTasks: "planner:root",
+      dependencies: [],
+      constraints: [
+        "Renderer does not access SQLite directly.",
+        "Completion follows evidence events, not agent prose.",
+      ],
+    },
+  };
+}
+
+function flowLaneToCanvasNode(
+  session: WorkflowSessionRecord,
+  projection: FlowProjection,
+  lane: FlowLane,
+  index: number,
+  dependencies: string[],
+  changesetId: string | undefined,
+): CanvasNode {
+  const latestSegment = [...projection.segments].reverse().find((segment) => segment.laneId === lane.id);
+  const status = flowLaneStatusToNodeStatus(lane.status);
+  return {
+    id: lane.id,
+    title: lane.title,
+    agent: lane.agentKind,
+    progress: progressForFlowLaneStatus(lane.status),
+    nodeKind: lane.nodeKind,
+    executable: lane.executable,
+    laneKind: lane.laneKind,
+    semanticSubtype: lane.semanticSubtype,
+    runtimePolicy: lane.runtimePolicy,
+    runtime: runtimeForNodeStatus(status, lane.kind),
+    display: {
+      agentLabel: agentLabel(lane.agentKind),
+      meta: [lane.kind, lane.id, "flow-kernel"],
+    },
+    workflowTrace: {
+      source: "hermes",
+      sourceRunId: "workflow-event-stream",
+      lastTool: "createWorkflowCard",
+      semanticKey: lane.semanticKey,
+    },
+    status,
+    position: { x: 460 + ((index - 1) % 3) * 340, y: 140 + Math.floor((index - 1) / 3) * 220 },
+    runId: latestSegment?.runId ?? runIdForLane(session.id, lane.id),
+    changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
+    output: lane.output.length > 0 ? lane.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
+    worktree: {
+      path: ".",
+      branchName: `skyturn/${session.id}/${lane.id}`,
+      baseCommit: "event-stream",
+    },
+    context: {
+      brief: lane.title,
+      sessionGoal: session.goal,
+      relatedRequirements: "Compiled from Hermes WorkflowIntent.",
+      relatedDesign: "Flow Kernel policy/gate/compiler creates the DAG projection.",
+      relatedTasks: lane.semanticKey,
+      dependencies,
+      constraints: [
+        "Renderer renders projection only.",
+        "Completion follows evidence events, not agent prose.",
+      ],
+    },
+  };
+}
+
+function flowDecisionToCanvasNode(
+  session: WorkflowSessionRecord,
+  decision: UserDecisionProjection,
+  index: number,
+): CanvasNode {
+  const status: NodeStatus = decision.status === "answered" ? "completed" : "pending";
+  return {
+    id: decision.decisionId,
+    title: "User decision required",
+    agent: "hermes",
+    progress: decision.status === "answered" ? "Decision answered" : "Waiting for user decision",
+    nodeKind: "user_decision",
+    executable: false,
+    laneKind: "decision",
+    semanticSubtype: "user_decision",
+    runtimePolicy: {
+      source: "workflow_projection",
+      trusted: true,
+      executable: false,
+      sandbox: "read-only",
+      sideEffects: [],
+      reason: "User decision nodes are not executable.",
+    },
+    userDecision: decision,
+    runtime: runtimeForNodeStatus(status, "decision"),
+    display: { agentLabel: "User", meta: ["decision", decision.decisionId, "flow-kernel"] },
+    workflowTrace: {
+      source: "hermes",
+      sourceRunId: "workflow-event-stream",
+      lastTool: "createWorkflowCard",
+      semanticKey: decision.decisionId,
+    },
+    status,
+    position: { x: 460 + ((index - 1) % 3) * 340, y: 140 + Math.floor((index - 1) / 3) * 220 },
+    runId: runIdForLane(session.id, decision.decisionId),
+    changesetId: `changeset-${session.id}-${decision.decisionId}`,
+    output: [
+      decision.prompt,
+      `Reason: ${decision.reason}`,
+      `Options: ${decision.options.join(", ")}`,
+    ],
+    worktree: {
+      path: ".",
+      branchName: `skyturn/${session.id}/${decision.decisionId}`,
+      baseCommit: "event-stream",
+    },
+    context: {
+      brief: decision.prompt,
+      sessionGoal: session.goal,
+      relatedRequirements: decision.reason,
+      relatedDesign: "Hermes requested a user decision before continuing the workflow.",
+      relatedTasks: decision.targetLaneId ?? decision.decisionId,
+      dependencies: decision.targetLaneId ? [decision.targetLaneId] : [],
+      constraints: ["This node is not executable.", "The answer is restored through Flow Kernel user decision state."],
+    },
+  };
+}
+
+function dependenciesFromFlowProjection(projection: FlowProjection): Map<string, string[]> {
+  const dependencies = new Map<string, string[]>();
+  for (const edge of projection.edges) {
+    dependencies.set(edge.targetLaneId, [...(dependencies.get(edge.targetLaneId) ?? []), edge.sourceLaneId]);
+  }
+  return dependencies;
+}
+
+function changesetsFromFlowEvents(events: WorkflowEventRecord[]): Map<string, string> {
+  const changesets = new Map<string, string>();
+  for (const event of events) {
+    if (event.kind !== "workflow.evidence.recorded") continue;
+    const laneId = laneIdFromPayload(event.payload);
+    const evidence = isRecord(event.payload.evidence) ? event.payload.evidence : null;
+    const changesetId = evidence && typeof evidence.changesetId === "string" ? evidence.changesetId : null;
+    if (laneId && changesetId) changesets.set(laneId, changesetId);
+  }
+  return changesets;
+}
+
+function flowLaneStatusToNodeStatus(status: FlowLane["status"]): NodeStatus {
+  if (status === "completed") return "completed";
+  if (status === "failed" || status === "blocked") return "failed";
+  if (status === "running" || status === "waiting_input") return "running";
+  return "pending";
+}
+
+function progressForFlowLaneStatus(status: FlowLane["status"]): string {
+  if (status === "completed") return "Evidence ready";
+  if (status === "running") return "Streaming output";
+  if (status === "failed" || status === "blocked") return "Gate rejected";
+  return "Waiting for scheduler";
+}
+
+function runtimeForNodeStatus(status: NodeStatus, action: string): NodeRuntimeState {
+  switch (status) {
+    case "pending":
+      return { phase: "Queued", message: "Waiting for scheduler", action };
+    case "running":
+      return { phase: "Executing", message: "Running", action };
+    case "retrying":
+      return { phase: "Retrying", message: "Retrying", action };
+    case "completed":
+      return { phase: "Completed", message: "Evidence ready", action };
+    case "failed":
+      return { phase: "Failed", message: "Needs attention", action };
+  }
+}
+
+function runIdForLane(sessionId: string, laneId: string): string {
+  return `run-${sessionId}-${laneId}`;
+}
+
+function segmentIdForLane(sessionId: string, laneId: string): string {
+  return `segment-${sessionId}-${laneId}`;
+}
+
+function flowStatusFromRunEvidence(evidence: RunEvidence): "succeeded" | "failed" | "cancelled" | "timed-out" {
+  if (evidence.status === "cancelled") return "cancelled";
+  if (evidence.status === "timed-out") return "timed-out";
+  return evidence.exitCode === 0 || evidence.status === "succeeded" ? "succeeded" : "failed";
+}
+
+function resultSummaryFromEvidence(evidence: RunEvidence): string {
+  const status = evidence.exitCode === 0 ? "succeeded" : evidence.status;
+  const checkNames = evidence.checks.map((check) => `${check.name}: ${check.status}`).join(", ");
+  return checkNames ? `Run ${status}; ${checkNames}.` : `Run ${status}.`;
+}
+
+function sanitizeRunEvidence(evidence: RunEvidence): RunEvidence {
+  return {
+    runId: evidence.runId,
+    status: evidence.status,
+    exitCode: evidence.exitCode,
+    changesetId: sanitizeOptionalWorkflowText(evidence.changesetId),
+    checks: evidence.checks.map(sanitizeEvidenceCheck),
+    artifacts: evidence.artifacts.map(sanitizeWorkflowStoredText),
+    review: evidence.review ? sanitizeEvidenceCheck(evidence.review) : null,
+    errorReason: sanitizeOptionalWorkflowText(evidence.errorReason),
+    cancelReason: sanitizeOptionalWorkflowText(evidence.cancelReason),
+    completedAt: evidence.completedAt,
+  };
+}
+
+function sanitizeEvidenceCheck(check: RunEvidence["checks"][number]): RunEvidence["checks"][number] {
+  const detail = sanitizeOptionalWorkflowText(check.detail);
+  return {
+    kind: check.kind,
+    name: sanitizeWorkflowStoredText(check.name),
+    status: check.status,
+    ...(detail ? { detail } : {}),
+  };
+}
+
+function sanitizeOptionalWorkflowText(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return sanitizeWorkflowStoredText(value) || null;
+}
+
+function sanitizeWorkflowStoredText(value: string): string {
+  return sanitizeLedgerText(value, 320);
+}
+
+function compactStrings(values: string[]): string[] {
+  return values.map((value) => value.trim()).filter(Boolean);
+}
+
+function laneIdFromPayload(payload: Record<string, unknown>): string | null {
+  if (typeof payload.laneId === "string") return payload.laneId;
+  if (isRecord(payload.segment) && typeof payload.segment.laneId === "string") return payload.segment.laneId;
+  if (isRecord(payload.lane) && typeof payload.lane.id === "string") return payload.lane.id;
+  return null;
+}
+
+function laneTitleFromPayload(payload: Record<string, unknown>): string {
+  if (isRecord(payload.lane)) {
+    return [payload.lane.id, payload.lane.kind, payload.lane.title].filter((value) => typeof value === "string").join(" ");
+  }
+  return "";
+}
+
+function edgeSummaryFromPayload(payload: Record<string, unknown>): string {
+  if (!isRecord(payload.edge)) return "";
+  return [payload.edge.sourceLaneId, "->", payload.edge.targetLaneId].filter((value) => typeof value === "string").join(" ");
+}
+
+function segmentSummaryFromPayload(payload: Record<string, unknown>): string {
+  if (!isRecord(payload.segment)) return "";
+  return [payload.segment.laneId, payload.segment.runId].filter((value) => typeof value === "string").join(" ");
+}
+
+function evidenceSummaryFromPayload(payload: Record<string, unknown>): string {
+  const laneId = laneIdFromPayload(payload);
+  const evidence = isRecord(payload.evidence) ? payload.evidence : null;
+  const checks = evidence && Array.isArray(evidence.checks) ? evidence.checks.length : 0;
+  const artifacts = evidence && Array.isArray(evidence.artifacts) ? evidence.artifacts.length : 0;
+  const status = evidence && typeof evidence.status === "string" ? evidence.status : "unknown";
+  return `${laneId ?? "lane"} ${status}; checks=${checks}; artifacts=${artifacts}`;
+}
+
+function sanitizeLedgerText(value: string, maxLength: number): string {
+  const hasPatch = /(^|\n)diff --git\b/.test(value) || /(^|\n)(\+\+\+|---) [ab]\//.test(value);
+  let sanitized = hasPatch ? "Patch content omitted; only summary is available." : value;
+  sanitized = sanitized
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[REDACTED]")
+    .replace(/\bAuthorization:\s*Bearer\s+\S+/gi, "Authorization: Bearer [REDACTED]")
+    .replace(/\b(DATABASE_URL|DB_URL|PGURI|PGURL|MYSQL_URL|REDIS_URL|MONGODB_URI)\s*[:=]\s*['"]?[^'"\s]+['"]?/gi, "[REDACTED]")
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@[^\s]+/gi, "[REDACTED_URL]")
+    .replace(/\b[A-Z0-9_]*(TOKEN|KEY|SECRET|COOKIE|PASSWORD|AUTH)[A-Z0-9_]*\s*[:=]\s*['"]?[^'"\s]+['"]?/gi, "[REDACTED]")
+    .replace(/\btoken\s*[:=]\s*['"]?[^'"\s]+['"]?/gi, "[REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, "[REDACTED]")
+    .replace(/\.env[\w.-]*/g, "[REDACTED_FILE]")
+    .replace(/^.*\bstderr\b.*$/gim, "[log output omitted]");
+  sanitized = sanitized.replace(/\s+/g, " ").trim();
+  if (sanitized.length <= maxLength) return sanitized;
+  return `${sanitized.slice(0, maxLength - 22).trimEnd()}... [truncated]`;
 }
 
 function applyMigrations(db: Database.Database): void {

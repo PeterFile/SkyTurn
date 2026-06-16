@@ -239,6 +239,33 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!window.devflow) return;
+    return window.devflow.onWorkflowEvent((event) => {
+      const canvasSession = canvasSessionFromWorkflowEvent(event);
+      if (!canvasSession) return;
+      setWorkspace((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
+      }));
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
+    let active = true;
+    void window.devflow.getWorkflowProjection(activeProject.rootPath, activeSession.id).then((result) => {
+      if (!active || !result.canvasSession) return;
+      setWorkspace((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) => (session.id === result.canvasSession?.id ? result.canvasSession : session)),
+      }));
+    });
+    return () => {
+      active = false;
+    };
+  }, [activeProject?.id, activeSession?.id]);
+
+  useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
     for (const node of activeSession.nodes) {
       if (node.executable === false) continue;
@@ -300,6 +327,9 @@ export default function App() {
     const initialSession = goal
       ? createSession(project.id, goal, initialMode)
       : null;
+    if (initialSession?.kind === "canvas") {
+      await persistCanvasWorkflowSession(project, initialSession, "initial");
+    }
 
     setWorkspace((current) => {
       const sessions = initialSession ? [...current.sessions, initialSession] : current.sessions;
@@ -331,11 +361,15 @@ export default function App() {
     }));
   }
 
-  function addSessionFromComposer() {
+  async function addSessionFromComposer() {
     const goal = newTaskGoal.trim();
     if (!resolvedNewTaskProjectId || !goal) return;
     const projectId = resolvedNewTaskProjectId;
+    const project = workspace.projects.find((item) => item.id === projectId);
     const session = createSession(projectId, goal, newTaskMode);
+    if (project && session.kind === "canvas") {
+      await persistCanvasWorkflowSession(project, session, "composer");
+    }
     setWorkspace((current) => ({
       ...current,
       sessions: [...current.sessions, session],
@@ -346,8 +380,10 @@ export default function App() {
     setNewTaskGoal("");
   }
 
-  function confirmPlan(session: PlanSession) {
+  async function confirmPlan(session: PlanSession) {
     const canvas = convertPlanToCanvas(session);
+    const project = workspace.projects.find((item) => item.id === canvas.projectId);
+    if (project) await persistCanvasWorkflowSession(project, canvas, "plan-confirm");
     setWorkspace((current) => ({
       ...current,
       sessions: current.sessions.map((item) => (item.id === session.id ? canvas : item)),
@@ -415,8 +451,16 @@ export default function App() {
     }));
   }
 
-  function appendRequirementNode() {
+  async function appendRequirementNode() {
     if (!activeSession || activeSession.kind !== "canvas" || !bottomGoal.trim()) return;
+    if (window.devflow && activeProject) {
+      await window.devflow.appendWorkflowUserInput(activeProject.rootPath, {
+        sessionId: activeSession.id,
+        inputId: `bottom-${Date.now()}`,
+        text: bottomGoal.trim(),
+        now: new Date().toISOString(),
+      });
+    }
     const result = addRequirementPlanningNode(activeSession, bottomGoal, {
       now: new Date().toISOString(),
       projectName: activeProject?.name ?? "project",
@@ -2478,6 +2522,48 @@ function ModeSwitch({
 
 function StatusLight({ status }: { status: NodeStatus }) {
   return <span className={`status-light ${status}`} aria-label={status} />;
+}
+
+async function persistCanvasWorkflowSession(
+  project: ImportedProject,
+  session: CanvasSession,
+  inputSource: string,
+): Promise<void> {
+  if (!window.devflow) return;
+  await window.devflow.createWorkflowSession(project.rootPath, {
+    id: session.id,
+    projectId: session.projectId,
+    title: session.title,
+    goal: session.goal,
+    mode: session.mode,
+    plannerProfile: "default",
+    transport: "hermes_replay_recovery",
+    recoveryReason: "SkyTurn event ledger initializes planner continuity.",
+    now: session.createdAt,
+  });
+  await window.devflow.appendWorkflowUserInput(project.rootPath, {
+    sessionId: session.id,
+    inputId: `${inputSource}-${session.id}`,
+    text: session.goal,
+    now: session.createdAt,
+  });
+}
+
+function canvasSessionFromWorkflowEvent(event: unknown): CanvasSession | null {
+  if (!event || typeof event !== "object") return null;
+  const canvasSession = (event as { canvasSession?: unknown }).canvasSession;
+  return isCanvasSession(canvasSession) ? canvasSession : null;
+}
+
+function isCanvasSession(value: unknown): value is CanvasSession {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Partial<CanvasSession>;
+  return (
+    candidate.kind === "canvas" &&
+    typeof candidate.id === "string" &&
+    Array.isArray(candidate.nodes) &&
+    Array.isArray(candidate.edges)
+  );
 }
 
 function createSession(projectId: string, goal: string, mode: WorkflowMode): CanvasSessionTab {
