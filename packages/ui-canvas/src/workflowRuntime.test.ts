@@ -136,6 +136,215 @@ describe("workflow runtime event merging", () => {
     );
   });
 
+  it("does not locally project Hermes WorkflowIntent when Electron workflow IPC is available", () => {
+    vi.stubGlobal("window", {
+      devflow: {},
+    });
+    try {
+      const workspace = makeWorkspace();
+      const hermesRunId = "run-session-1-node-1";
+
+      const next = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+        event(hermesRunId, 1, "output", {
+          text: JSON.stringify({
+            intentId: "intent-frontend-1",
+            sessionId: "session-1",
+            operations: [
+              { type: "AnalyzeRequirement", requirement: "Add a search filtering control" },
+              { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["frontend-ui"] } },
+              { type: "ProposeLanes" },
+            ],
+          }),
+        }),
+      ]);
+
+      const session = next.sessions[0] as CanvasSession;
+      expect(session.nodes.map((node) => node.id)).toEqual(["node-1"]);
+      expect(session.edges).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("injects ledger context and applies Hermes WorkflowIntent through Node workflow IPC", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = makeSession([]);
+    const node = session.nodes[0] as CanvasNode;
+    const intentText = JSON.stringify({
+      intentId: "intent-ledger-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Continue from previous audit logging decision" },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
+        { type: "ProposeLanes" },
+      ],
+    });
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "succeeded",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({
+      protocolVersion: 1,
+      events: [event(node.runId, 1, "output", { text: intentText })],
+    }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: node.runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit 0" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-10T00:00:01.000Z",
+      } satisfies RunEvidence,
+    }));
+    const getWorkflowLedger = vi.fn(async () => ({
+      protocolVersion: 1,
+      ledger: {
+        throughSeq: 4,
+        checkpointSummary: null,
+        facts: ["Decision: keep retry behavior explicit."],
+        recentEvents: [{ seq: 4, kind: "workflow.user_input", summary: "Add audit logging first." }],
+        openQuestions: [],
+      },
+    }));
+    const projectedSession: CanvasSession = {
+      ...session,
+      nodes: [
+        ...session.nodes,
+        makeNode({
+          id: "lane-implementation",
+          agent: "codex",
+          status: "running",
+          runId: "run-session-1-lane-implementation",
+          meta: ["implementation", "lane-implementation", "flow-kernel"],
+        }),
+      ],
+    };
+    const applyWorkflowIntent = vi.fn(async () => ({
+      protocolVersion: 1,
+      result: { ok: true },
+      projection: {},
+      canvasSession: session,
+    }));
+    const scheduleWorkflowReadyLanes = vi.fn(async () => ({
+      protocolVersion: 1,
+      result: { readyLanes: [{ id: "lane-implementation" }] },
+      projection: {},
+      canvasSession: projectedSession,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+        getWorkflowLedger,
+        applyWorkflowIntent,
+        scheduleWorkflowReadyLanes,
+      },
+    });
+
+    try {
+      const result = await startBridgeRun(project, session, node);
+
+      expect(startAgentRun.mock.calls[0]?.[0].prompt).toContain("Decision: keep retry behavior explicit.");
+      expect(applyWorkflowIntent).toHaveBeenCalledWith(project.rootPath, expect.objectContaining({ intentId: "intent-ledger-1" }));
+      expect(scheduleWorkflowReadyLanes).toHaveBeenCalledWith(project.rootPath, session.id, expect.objectContaining({ allowedParallelism: 1 }));
+      expect(result?.workflowSession?.nodes.map((item) => item.id)).toContain("lane-implementation");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("rejects Hermes WorkflowIntent for a different canvas session before Node workflow IPC", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = makeSession([]);
+    const node = session.nodes[0] as CanvasNode;
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "succeeded",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({
+      protocolVersion: 1,
+      events: [
+        event(node.runId, 1, "output", {
+          text: JSON.stringify({
+            intentId: "intent-wrong-session",
+            sessionId: "session-2",
+            operations: [
+              { type: "AnalyzeRequirement", requirement: "Write into the wrong session" },
+              { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
+              { type: "ProposeLanes" },
+            ],
+          }),
+        }),
+      ],
+    }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: node.runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-10T00:00:01.000Z",
+      } satisfies RunEvidence,
+    }));
+    const getWorkflowLedger = vi.fn(async () => ({
+      protocolVersion: 1,
+      ledger: { throughSeq: 1, checkpointSummary: null, facts: [], recentEvents: [], openQuestions: [] },
+    }));
+    const applyWorkflowIntent = vi.fn();
+    const scheduleWorkflowReadyLanes = vi.fn();
+    vi.stubGlobal("window", {
+      devflow: {
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+        getWorkflowLedger,
+        applyWorkflowIntent,
+        scheduleWorkflowReadyLanes,
+      },
+    });
+
+    try {
+      const result = await startBridgeRun(project, session, node);
+
+      expect(result?.workflowSession).toBeNull();
+      expect(applyWorkflowIntent).not.toHaveBeenCalled();
+      expect(scheduleWorkflowReadyLanes).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("projects and restores Hermes user decision requests as canvas nodes", () => {
     const workspace = makeWorkspace();
     const hermesRunId = "run-session-1-node-1";
@@ -475,6 +684,128 @@ describe("workflow runtime event merging", () => {
       "workspace-write",
       "danger-full-access",
     ]);
+  });
+
+  it("records Flow Kernel run results by identifier and leaves evidence ownership in Electron main", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = makeSession([
+      makeNode({
+        id: "lane-implementation",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-implementation",
+        meta: ["implementation", "lane-implementation", "flow-kernel"],
+      }),
+    ]);
+    const node = session.nodes.find((item) => item.id === "lane-implementation") as CanvasNode;
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "succeeded",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({
+      protocolVersion: 1,
+      events: [event(node.runId, 1, "output", { text: "renderer sees output but does not own ledger evidence" })],
+    }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: node.runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: "changeset-implementation-1",
+        checks: [{ kind: "test", name: "pnpm test", status: "passed", detail: "2 passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-10T00:00:01.000Z",
+      } satisfies RunEvidence,
+    }));
+    const recordWorkflowRunResult = vi.fn(async () => ({
+      protocolVersion: 1,
+      projection: {},
+      canvasSession: session,
+    }));
+    const scheduleWorkflowReadyLanes = vi.fn(async () => ({
+      protocolVersion: 1,
+      result: { readyLanes: [] },
+      projection: {},
+      canvasSession: session,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+        recordWorkflowRunResult,
+        scheduleWorkflowReadyLanes,
+      },
+    });
+
+    try {
+      await startBridgeRun(project, session, node);
+
+      expect(recordWorkflowRunResult).toHaveBeenCalledWith(project.rootPath, {
+        sessionId: session.id,
+        laneId: node.id,
+        segmentId: `segment-${session.id}-${node.id}`,
+        runId: node.runId,
+        agentKind: node.agent,
+        now: "2026-06-10T00:00:01.000Z",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("refuses to start non-executable workflow projection nodes", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const decisionNode = makeNode({
+      id: "decision-architecture-risk",
+      agent: "hermes",
+      status: "running",
+      runId: "run-session-1-decision-architecture-risk",
+      title: "User decision required",
+      meta: ["decision", "decision-architecture-risk", "flow-kernel"],
+    });
+    decisionNode.nodeKind = "user_decision";
+    decisionNode.executable = false;
+    decisionNode.runtimePolicy = {
+      source: "workflow_projection",
+      trusted: true,
+      executable: false,
+      sandbox: "read-only",
+      sideEffects: [],
+      reason: "Decision nodes are user gates, not agent runs.",
+    };
+    const session = makeSession([decisionNode]);
+    const startAgentRun = vi.fn();
+    const getWorkflowLedger = vi.fn();
+    vi.stubGlobal("window", {
+      devflow: {
+        startAgentRun,
+        getWorkflowLedger,
+      },
+    });
+
+    try {
+      const result = await startBridgeRun(project, session, decisionNode);
+
+      expect(result).toBeNull();
+      expect(startAgentRun).not.toHaveBeenCalled();
+      expect(getWorkflowLedger).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("prefers trusted projection runtime policy over text heuristics", () => {
