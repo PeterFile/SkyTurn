@@ -109,6 +109,7 @@ describe("SkyTurn UI style tokens", () => {
     expect(composerSource).toContain('"new-session-intake"');
     expect(composerSource).toContain("<ProjectDropdown");
     expect(composerSource).not.toContain("<select");
+    expect(composerSource).toContain("rows={5}");
     expect(appSource).toContain("function ProjectDropdown");
     expect(appSource).toContain('aria-haspopup="listbox"');
     expect(appSource).toContain('role="listbox"');
@@ -128,6 +129,21 @@ describe("SkyTurn UI style tokens", () => {
     expect(styles).toContain("background-color: #eee7d8");
     expect(styles).toContain("#758696");
     expect(styles).toContain("background-color: #083176");
+  });
+
+  it("keeps node details as a transparent right-side drawer", async () => {
+    const styles = await readSource("./styles.css");
+    const drawerBlock = styles.slice(styles.indexOf("/* Right-side node detail drawer"));
+
+    expect(drawerBlock).toContain(".modal-backdrop");
+    expect(drawerBlock).toContain("justify-content: end");
+    expect(drawerBlock).toContain("background: transparent");
+    expect(drawerBlock).toContain("pointer-events: none");
+    expect(drawerBlock).toContain(".node-modal");
+    expect(drawerBlock).toContain("width: min(560px, calc(100vw - 280px))");
+    expect(drawerBlock).toContain("height: calc(100vh - 32px)");
+    expect(drawerBlock).toContain("border-radius: 6px 0 0 6px");
+    expect(drawerBlock).toContain("pointer-events: auto");
   });
 
   it("renders Changes through diff2html instead of a self-authored diff table", async () => {

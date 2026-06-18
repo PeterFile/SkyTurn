@@ -1065,6 +1065,7 @@ function SessionComposer({
           onChange={(event) => onGoalChange(event.target.value)}
           placeholder="What shall this canvas session build?"
           aria-label="New task goal"
+          rows={5}
         />
       </div>
       <div className="control-strip">
@@ -1960,6 +1961,7 @@ function NodeModal({
   const backdropRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
   const closingRef = useRef(false);
+  const { contextSafe } = useGSAP({ scope: backdropRef });
 
   useGSAP(
     () => {
@@ -1973,7 +1975,6 @@ function NodeModal({
       gsap.set(panel, { autoAlpha: 1, x: 0 });
       if (userPrefersReducedMotion()) return;
 
-      gsap.fromTo(backdrop, { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.18, ease: "power2.out" });
       gsap.fromTo(
         panel,
         { autoAlpha: 0, x: 28 },
@@ -1983,7 +1984,7 @@ function NodeModal({
     { dependencies: [node.id], scope: backdropRef, revertOnUpdate: true },
   );
 
-  function closeWithMotion() {
+  const closeWithMotion = contextSafe(() => {
     const backdrop = backdropRef.current;
     const panel = panelRef.current;
     if (closingRef.current || !backdrop || !panel || userPrefersReducedMotion()) {
@@ -1994,9 +1995,9 @@ function NodeModal({
     closingRef.current = true;
     gsap.killTweensOf([backdrop, panel]);
     gsap.timeline({ onComplete: onClose })
-      .to(panel, { autoAlpha: 0, x: 28, duration: 0.2, ease: "power2.in" }, 0)
-      .to(backdrop, { autoAlpha: 0, duration: 0.16, ease: "power2.out" }, 0);
-  }
+      .to(panel, { autoAlpha: 0, x: 28, duration: 0.18, ease: "power2.in" }, 0)
+      .to(backdrop, { autoAlpha: 0, duration: 0.12, ease: "power2.out" }, 0);
+  });
   const canExecute = canUseAgentNodeActions(node);
 
   return (
