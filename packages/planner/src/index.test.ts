@@ -67,6 +67,8 @@ describe("canvas session factory", () => {
       "Implement canvas shell",
       "Verify completion evidence",
     ]);
+    expect(canvas.nodes[1]?.position.x).toBeGreaterThanOrEqual((canvas.nodes[0]?.position.x ?? 0) + 560);
+    expect(canvas.nodes[2]?.position.x).toBeGreaterThanOrEqual((canvas.nodes[1]?.position.x ?? 0) + 560);
     expect(canvas.edges).toEqual([
       { id: "edge-node-1-node-2", source: "node-1", target: "node-2" },
       { id: "edge-node-2-node-3", source: "node-2", target: "node-3" },

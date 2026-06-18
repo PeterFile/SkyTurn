@@ -64,7 +64,7 @@ const fastSeeds: TaskSeed[] = [
     progress: "Calling workflow-card tools",
     brief: "Decompose the user goal into workflow-card tool calls.",
     dependencies: [],
-    position: { x: 100, y: 120 },
+    position: { x: 72, y: 148 },
     status: "running",
     runtime: {
       phase: "Planning",
@@ -86,7 +86,7 @@ const planSeeds: TaskSeed[] = [
     progress: "Ready",
     brief: "Confirm the rendered requirements before execution.",
     dependencies: [],
-    position: { x: 100, y: 120 },
+    position: { x: 72, y: 148 },
   },
   {
     id: "node-2",
@@ -95,7 +95,7 @@ const planSeeds: TaskSeed[] = [
     progress: "Pending",
     brief: "Build the Electron React canvas-first app shell.",
     dependencies: ["node-1"],
-    position: { x: 430, y: 120 },
+    position: { x: 640, y: 148 },
   },
   {
     id: "node-3",
@@ -104,7 +104,7 @@ const planSeeds: TaskSeed[] = [
     progress: "Pending",
     brief: "Tie completion to git/worktree, tests, and concrete evidence.",
     dependencies: ["node-2"],
-    position: { x: 760, y: 120 },
+    position: { x: 1208, y: 148 },
   },
 ];
 

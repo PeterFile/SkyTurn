@@ -1,5 +1,7 @@
 import { makeHermesPlannerSessionId, type CanvasNode, type CanvasSession } from "@skyturn/project-core";
 
+import { plannerRootPosition } from "./canvasLayout.js";
+
 export interface RequirementPlanningNodeOptions {
   now: string;
   projectName: string;
@@ -88,7 +90,7 @@ function planningNodeForRequirement(input: {
       agentLabel: "Hermes",
       meta: ["workflow-card-tools", input.id, `planner-session:${input.plannerSessionId}`],
     },
-    position: base?.position ?? { x: 180 + input.session.nodes.length * 150, y: 360 },
+    position: base?.position ?? plannerRootPosition(),
     runId,
     changesetId: `changeset-${runId}`,
     output: [
