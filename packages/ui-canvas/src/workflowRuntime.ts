@@ -33,6 +33,7 @@ import {
 } from "@skyturn/workflow-kernel";
 
 import { safeCompactPhrase } from "./safeNodePhrase.js";
+import { workflowLanePosition } from "./canvasLayout.js";
 
 export interface BridgeRunResult {
   run: AgentRun;
@@ -545,10 +546,7 @@ function flowLaneToCanvasNode(
 ): CanvasNode {
   const status = flowLaneStatusToNodeStatus(lane.status);
   const progress = progressForFlowLane(lane, status, existing);
-  const laneOriginX = 460;
-  const laneOriginY = 140;
-  const laneColumnGap = 360;
-  const laneRowGap = 240;
+  const fallbackPosition = workflowLanePosition(index);
   return {
     id: lane.id,
     title: lane.title,
@@ -572,8 +570,8 @@ function flowLaneToCanvasNode(
     },
     status,
     position: {
-      x: existing?.position.x ?? laneOriginX + (index % 3) * laneColumnGap,
-      y: existing?.position.y ?? laneOriginY + Math.floor(index / 3) * laneRowGap,
+      x: existing?.position.x ?? fallbackPosition.x,
+      y: existing?.position.y ?? fallbackPosition.y,
     },
     runId: `run-${session.id}-${lane.id}`,
     changesetId: `changeset-${session.id}-${lane.id}`,
@@ -605,10 +603,7 @@ function userDecisionToCanvasNode(
   existing?: CanvasNode,
 ): CanvasNode {
   const status: CanvasNode["status"] = decision.status === "answered" ? "completed" : "pending";
-  const laneOriginX = 460;
-  const laneOriginY = 140;
-  const laneColumnGap = 360;
-  const laneRowGap = 240;
+  const fallbackPosition = workflowLanePosition(index);
   return {
     id: decision.decisionId,
     title: "User decision required",
@@ -640,8 +635,8 @@ function userDecisionToCanvasNode(
     },
     status,
     position: {
-      x: existing?.position.x ?? laneOriginX + (index % 3) * laneColumnGap,
-      y: existing?.position.y ?? laneOriginY + Math.floor(index / 3) * laneRowGap,
+      x: existing?.position.x ?? fallbackPosition.x,
+      y: existing?.position.y ?? fallbackPosition.y,
     },
     runId: `run-${session.id}-${decision.decisionId}`,
     changesetId: `changeset-${session.id}-${decision.decisionId}`,

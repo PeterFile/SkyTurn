@@ -1,5 +1,4 @@
 import {
-  Background,
   BaseEdge,
   Controls,
   Handle,
@@ -8,6 +7,7 @@ import {
   ReactFlow,
   getSmoothStepPath,
   useNodesState,
+  useReactFlow,
   type Edge as FlowEdge,
   type EdgeProps,
   type EdgeTypes,
@@ -101,6 +101,12 @@ import {
   positionUpdatesFromNodeChanges,
   type CanvasNodePositionUpdate,
 } from "./canvasState.js";
+import {
+  CANVAS_NODE_LAYOUT,
+  canvasFitPadding,
+  canvasViewportSignature,
+  shouldAutoFitCanvas,
+} from "./canvasLayout.js";
 import DecryptedText from "./DecryptedText.js";
 import {
   chooseActiveSessionIdForProject,
@@ -835,7 +841,7 @@ function Sidebar({
           <ChevronRight size={14} />
         </button>
         <div className="sidebar-section-heading">
-          <h2>Projects</h2>
+          <h2>PROJECTS / 01</h2>
           <button
             className="sidebar-hover-action"
             type="button"
@@ -991,6 +997,7 @@ function SessionComposer({
         <button
           className="icon-button session-panel-close"
           title="Close"
+          aria-label="Close"
           type="button"
           onClick={(event) => {
             event.stopPropagation();
@@ -1013,6 +1020,7 @@ function SessionComposer({
           className="icon-button session-panel-tool"
           type="button"
           title="Focus prompt"
+          aria-label="Focus prompt"
           onClick={() => textareaRef.current?.focus()}
         >
           <Plus size={17} />
@@ -1040,6 +1048,7 @@ function SessionComposer({
           type="submit"
           disabled={!canCreate}
           title="Create"
+          aria-label="Create"
         >
           <ArrowUp size={18} />
         </button>
@@ -1112,6 +1121,9 @@ function CanvasView({
   onOpenNode: (nodeId: string) => void;
 }) {
   const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
+  const autoFitCanvas = shouldAutoFitCanvas(session.nodes);
+  const fitPadding = canvasFitPadding(session.nodes);
+  const viewportSignature = canvasViewportSignature(session.nodes);
   const nodesSource = useMemo<AgentFlowNode[]>(
     () =>
       session.nodes.map((node) => ({
@@ -1172,13 +1184,16 @@ function CanvasView({
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         onNodesChange={handleNodesChange}
-        fitView
-        fitViewOptions={{ padding: 0.18 }}
-        minZoom={0.35}
+        defaultViewport={{ x: 0, y: 0, zoom: CANVAS_NODE_LAYOUT.singleNodeZoom }}
+        minZoom={0.22}
         maxZoom={1.35}
         proOptions={{ hideAttribution: true }}
       >
-        <Background color="var(--sk-canvas-grid)" gap={18} size={1.15} />
+        <CanvasViewportController
+          autoFit={autoFitCanvas}
+          fitPadding={fitPadding}
+          viewportSignature={viewportSignature}
+        />
         <Controls showInteractive={false} />
       </ReactFlow>
       <CanvasComposer
@@ -1190,6 +1205,49 @@ function CanvasView({
       />
     </section>
   );
+}
+
+function CanvasViewportController({
+  autoFit,
+  fitPadding,
+  viewportSignature,
+}: {
+  autoFit: boolean;
+  fitPadding: number;
+  viewportSignature: string;
+}) {
+  const { fitView, setViewport } = useReactFlow<AgentFlowNode, AgentFlowEdge>();
+
+  useEffect(() => {
+    let frame = 0;
+
+    const applyViewport = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        if (!autoFit) {
+          void setViewport({ x: 0, y: 0, zoom: CANVAS_NODE_LAYOUT.singleNodeZoom }, { duration: 180 });
+          return;
+        }
+
+        void fitView({
+          duration: 260,
+          maxZoom: 1,
+          minZoom: 0.22,
+          padding: fitPadding,
+        });
+      });
+    };
+
+    applyViewport();
+    window.addEventListener("resize", applyViewport);
+
+    return () => {
+      window.removeEventListener("resize", applyViewport);
+      window.cancelAnimationFrame(frame);
+    };
+  }, [autoFit, fitPadding, fitView, setViewport, viewportSignature]);
+
+  return null;
 }
 
 function mergeFlowNodeState(current: AgentFlowNode[], next: AgentFlowNode[]): AgentFlowNode[] {
@@ -1360,6 +1418,8 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   const footer = nodeFooterForNode(node, runtime);
   const summary = nodeSummaryForNode(node);
   const streamLine = streamingLogLineForNode(node, runtime);
+  const eyebrow = nodeEyebrowForNode(node);
+  const metadata = nodeMetadataForNode(node);
 
   useGSAP(
     () => {
@@ -1697,7 +1757,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
         onKeyDown={openFromKeyboard}
       >
         <div className="agent-node-header">
-          <span className="agent-node-title">{node.title}</span>
+          <span className="agent-node-eyebrow">{eyebrow}</span>
           <button
             ref={menuRef}
             className="agent-node-menu nodrag"
@@ -1708,15 +1768,21 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
             <MoreHorizontal size={16} aria-hidden="true" />
           </button>
         </div>
-        <div className="agent-identity-pill">
-          <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
-          <span>{agentIdentityForNode(node)}</span>
+        <span className="agent-node-title">{node.title}</span>
+        <div className="agent-node-meta-row">
+          <div className="agent-identity-pill">
+            <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
+            <span>{agentIdentityForNode(node)}</span>
+          </div>
+          <div className={`agent-status-chip ${node.status}`} aria-label="Node status summary">
+            {node.status === "completed" && <CheckCircle2 size={13} aria-hidden="true" />}
+            {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
+            <span>{footer.primary}</span>
+          </div>
         </div>
         <AgentStreamPreview line={streamLine} nodeId={node.id} />
-        <div className={`agent-footer ${node.status}`} aria-label="Node status summary">
-          {node.status === "completed" && <CheckCircle2 size={13} aria-hidden="true" />}
-          {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
-          <span>{footer.primary}</span>
+        <div className={`agent-footer ${node.status}`} aria-label="Node metadata">
+          <span>{metadata}</span>
           {footer.secondary && (
             <>
               <span className="footer-separator" aria-hidden="true">·</span>
@@ -1727,6 +1793,19 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
       </div>
     </div>
   );
+}
+
+function nodeEyebrowForNode(node: CanvasNode): string {
+  if (node.userDecision || node.nodeKind === "user_decision") return "DECISION / INPUT";
+  if (node.agent === "hermes" && node.context.dependencies.length === 0) return "PLAN / WORKFLOW";
+  if (node.agent === "hermes") return "VERIFY / WORKFLOW";
+  return "TASK / EXECUTION";
+}
+
+function nodeMetadataForNode(node: CanvasNode): string {
+  const dependencyCount = node.context.dependencies.length;
+  const dependencyLabel = dependencyCount === 1 ? "1 dependency" : `${dependencyCount} dependencies`;
+  return `${node.id} · ${dependencyLabel}`;
 }
 
 function AgentStreamPreview({ line, nodeId }: { line: StreamingLogLine; nodeId: string }) {
@@ -1942,7 +2021,7 @@ function NodeModal({
             <p className="eyebrow">{agentIdentityForNode(node)}</p>
             <h2>{node.title}</h2>
           </div>
-          <button className="icon-button" title="Close" onClick={closeWithMotion}>
+          <button className="icon-button" title="Close" aria-label="Close" onClick={closeWithMotion}>
             <X size={18} />
           </button>
         </header>
@@ -2380,6 +2459,7 @@ function ChangesDiffToolbar({
           aria-expanded={open}
           aria-controls={open ? menuId : undefined}
           title="Diff display options"
+          aria-label="Diff display options"
           onClick={() => setOpen((current) => !current)}
         >
           <MoreHorizontal size={16} aria-hidden="true" />
@@ -2526,6 +2606,7 @@ function CanvasComposer({
         <button
           className="icon-button composer-tool"
           title="Focus input"
+          aria-label="Focus input"
           onClick={() => inputRef.current?.focus()}
           disabled={disabled}
         >
@@ -2533,12 +2614,19 @@ function CanvasComposer({
         </button>
         <span className="composer-slash" aria-hidden="true">/</span>
         <span className="composer-toolbar-spacer" />
-        <button className="icon-button composer-tool" title="Stop active run" onClick={onStop} disabled={disabled}>
+        <button
+          className="icon-button composer-tool"
+          title="Stop active run"
+          aria-label="Stop active run"
+          onClick={onStop}
+          disabled={disabled}
+        >
           <Square size={16} />
         </button>
         <button
           className="icon-button composer-send"
           title="Insert requirement"
+          aria-label="Insert requirement"
           onClick={onSubmit}
           disabled={disabled || !hasValue}
         >

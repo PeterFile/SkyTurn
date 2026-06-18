@@ -24,10 +24,10 @@ export const MOTION_DISTANCE = {
 } as const;
 
 export const ENERGY_FRAME = {
-  width: 324,
-  height: 202,
+  width: 440,
+  height: 176,
   inset: 1,
-  radius: 22,
+  radius: 4,
   pathLength: 100,
 } as const;
 

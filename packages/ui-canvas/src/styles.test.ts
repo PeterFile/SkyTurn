@@ -6,27 +6,53 @@ async function readSource(path: string): Promise<string> {
   return readFile(new URL(path, import.meta.url), "utf8");
 }
 
+function lastCssBlock(styles: string, selector: string): string {
+  const escaped = selector.replaceAll(".", "\\.");
+  const matches = Array.from(styles.matchAll(new RegExp(`${escaped} \\{[\\s\\S]*?\\n\\}`, "g")), (match) => match[0]);
+  return matches.at(-1) ?? "";
+}
+
+function cssBlockContaining(styles: string, selector: string, expected: string): string {
+  const escaped = selector.replaceAll(".", "\\.");
+  const matches = Array.from(styles.matchAll(new RegExp(`${escaped} \\{[\\s\\S]*?\\n\\}`, "g")), (match) => match[0]);
+  return matches.find((block) => block.includes(expected)) ?? "";
+}
+
 describe("SkyTurn UI style tokens", () => {
-  it("keeps the existing font stack and theme colors stable", async () => {
+  it("uses the paper collage material tokens instead of the old SaaS palette", async () => {
     const styles = await readSource("./styles.css");
 
     expect(styles).not.toContain("@fontsource-variable");
     expect(styles).not.toContain("Space Grotesk");
-    expect(styles).toContain("--sk-accent: #0ea5e9");
-    expect(styles).toContain("--sk-accent-strong: #0284c7");
-    expect(styles).toContain("--sk-status-running: #6366f1");
-    expect(styles).toContain("--sk-running-gradient-start: #22d3ee");
-    expect(styles).toContain("--sk-running-gradient-mid: #818cf8");
-    expect(styles).toContain("--sk-running-gradient-end: #a78bfa");
-    expect(styles).toContain("--sk-edge-active: #7c8cff");
-    expect(styles).toContain("--sk-shadow-running: rgba(79, 70, 229, 0.15)");
-    expect(styles).toContain("--sk-loop-running-deep: rgba(139, 92, 246, 0.86)");
+    expect(styles).toContain("--sk-paper-base: #f4f0e3");
+    expect(styles).toContain("--sk-cobalt: #0e53c9");
+    expect(styles).toContain("--sk-yellow: #fff127");
+    expect(styles).toContain("--sk-pink: #ff9ed1");
+    expect(styles).toContain('--sk-paper-white: url("./assets/paper/paper-white.webp")');
+    expect(styles).toContain('--sk-paper-rip-white: url("./assets/paper/paper-rip-white.webp")');
+    expect(styles).toContain('--sk-paper-sidebar-edge: url("./assets/paper/paper-sidebar-edge.png")');
+    expect(styles).toContain("--sk-accent: var(--sk-cobalt)");
+    expect(styles).toContain("--sk-status-running: var(--sk-cobalt)");
+  });
+
+  it("uses Paper Ops Board proportions instead of oversized collage decoration", async () => {
+    const styles = await readSource("./styles.css");
+    const motionSource = await readSource("./motion.ts");
+
+    expect(styles).toContain("--sk-ui-texture-opacity: 0.15");
+    expect(styles).toContain("--node-texture-shield");
+    expect(styles).toContain("linear-gradient(var(--node-texture-shield), var(--node-texture-shield)), var(--node-paper)");
+    expect(styles).toContain("--agent-card-width: 440px");
+    expect(styles).toContain("--agent-card-height: auto");
+    expect(styles).toContain("grid-template-columns: 232px minmax(0, 1fr)");
+    expect(motionSource).toContain("width: 440");
+    expect(motionSource).toContain("height: 176");
   });
 
   it("routes runtime paint decisions through CSS tokens", async () => {
     const appSource = await readSource("./App.tsx");
 
-    expect(appSource).toContain('color="var(--sk-canvas-grid)"');
+    expect(appSource).not.toContain("<Background");
     expect(appSource).toContain('stopColor="var(--sk-running-gradient-start)"');
     expect(appSource).toContain('stopColor="var(--sk-running-gradient-mid)"');
     expect(appSource).toContain('stopColor="var(--sk-running-gradient-end)"');
@@ -36,13 +62,16 @@ describe("SkyTurn UI style tokens", () => {
     expect(appSource).toContain('return "var(--sk-status-running)"');
   });
 
-  it("does not reintroduce the discarded token-branch theme direction", async () => {
+  it("does not reintroduce the discarded token-branch theme direction or dot grid", async () => {
     const source = `${await readSource("./styles.css")}\n${await readSource("./App.tsx")}`;
 
     expect(source).not.toContain("--sk-accent: #38a8ff");
     expect(source).not.toContain("--sk-status-running: #38a8ff");
     expect(source).not.toContain("56, 168, 255");
     expect(source).not.toContain("56 168 255");
+    expect(source).not.toContain("radial-gradient(circle at 1px 1px");
+    expect(source).not.toContain("react-flow__background");
+    expect(source).not.toContain("gap={18}");
   });
 
   it("renders editor launch actions through a single dropdown trigger", async () => {
@@ -122,19 +151,43 @@ describe("SkyTurn UI style tokens", () => {
     expect(diff2htmlStyles).not.toContain("overflow-wrap: anywhere");
   });
 
-  it("keeps sidebar controls visible and aligns node cards inside their energy frame", async () => {
+  it("keeps sidebar controls visible and renders Paper Ops cards inside their energy frame", async () => {
     const styles = await readSource("./styles.css");
     const motionSource = await readSource("./motion.ts");
     const sidebarToggleBlock = styles.match(/\.sidebar-toggle \{[\s\S]*?\n\}/)?.[0] ?? "";
+    const sidebarHoverBlock = styles.match(/\.sidebar-project-row:hover,[\s\S]*?\.sidebar-settings:hover \{[\s\S]*?\n\}/)?.[0] ?? "";
+    const cardBlock = cssBlockContaining(styles, ".agent-card", "border: var(--node-border)");
+    const composerBlock = cssBlockContaining(styles, ".canvas-composer", "min-height: 64px");
 
     expect(styles).toContain("sidebar-toggle-label");
     expect(sidebarToggleBlock).toContain("position: absolute");
     expect(sidebarToggleBlock).not.toContain("opacity: 0");
     expect(sidebarToggleBlock).not.toContain("pointer-events: none");
-    expect(styles).toContain("radial-gradient(circle at 1px 1px");
-    expect(styles).toContain("--agent-card-radius: 22px");
-    expect(styles).toContain("width: calc(100% - 4px)");
-    expect(styles).toContain("height: calc(100% - 4px)");
-    expect(motionSource).toContain("radius: 22");
+    expect(styles).toContain(".sidebar::after");
+    expect(styles).not.toContain(".sidebar::before");
+    expect(styles).toContain(".sidebar-session-row.active::before");
+    expect(styles).toContain("background-color: #eaf2ff");
+    expect(styles).toContain("height: 40px");
+    expect(sidebarHoverBlock).not.toContain("scale(");
+    expect(styles).toContain("--agent-card-radius: 4px");
+    expect(styles).toContain("background-image: var(--sk-paper-white)");
+    expect(styles).toContain("background-image: var(--sk-paper-cobalt)");
+    expect(styles).toContain("background-image: var(--sk-paper-rip-white)");
+    expect(styles).toContain(".agent-node-shell::before");
+    expect(styles).toContain("--node-border: 1px solid rgba(5, 29, 72, 0.12)");
+    expect(styles).toContain("--node-tab-opacity: 0");
+    expect(styles).toContain("--node-border: 1px solid var(--sk-yellow)");
+    expect(styles).toContain("--node-border: 1px solid var(--sk-red-paper)");
+    expect(styles).toContain("--node-border: 1px solid var(--sk-cobalt)");
+    expect(styles).not.toContain(".agent-card::after");
+    expect(styles).not.toContain(".canvas-composer::after");
+    expect(styles).toContain(".canvas-composer:focus-within");
+    expect(styles).toContain(".canvas-composer.has-content");
+    expect(composerBlock).toContain("min-height: 64px");
+    expect(composerBlock).toContain("background-color: var(--sk-paper-warm)");
+    expect(composerBlock).not.toContain("background-color: var(--sk-pink)");
+    expect(cardBlock).toContain("border: var(--node-border)");
+    expect(cardBlock).not.toContain("height: calc(100% - 4px)");
+    expect(motionSource).toContain("radius: 4");
   });
 });
