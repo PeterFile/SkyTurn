@@ -8,14 +8,8 @@ async function readSource(path: string): Promise<string> {
 
 function lastCssBlock(styles: string, selector: string): string {
   const escaped = selector.replaceAll(".", "\\.");
-  const matches = Array.from(styles.matchAll(new RegExp(`${escaped} \\{[\\s\\S]*?\\n\\}`, "g")), (match) => match[0]);
+  const matches = Array.from(styles.matchAll(new RegExp(`(?:^|\\n)${escaped} \\{[\\s\\S]*?\\n\\}`, "g")), (match) => match[0]);
   return matches.at(-1) ?? "";
-}
-
-function cssBlockContaining(styles: string, selector: string, expected: string): string {
-  const escaped = selector.replaceAll(".", "\\.");
-  const matches = Array.from(styles.matchAll(new RegExp(`${escaped} \\{[\\s\\S]*?\\n\\}`, "g")), (match) => match[0]);
-  return matches.find((block) => block.includes(expected)) ?? "";
 }
 
 describe("SkyTurn UI style tokens", () => {
@@ -53,12 +47,13 @@ describe("SkyTurn UI style tokens", () => {
     const appSource = await readSource("./App.tsx");
 
     expect(appSource).not.toContain("<Background");
-    expect(appSource).toContain('stopColor="var(--sk-running-gradient-start)"');
-    expect(appSource).toContain('stopColor="var(--sk-running-gradient-mid)"');
-    expect(appSource).toContain('stopColor="var(--sk-running-gradient-end)"');
+    expect(appSource).toContain('data-state={node.status}');
+    expect(appSource).toContain("data-phase={runtime.phase}");
+    expect(appSource).toContain('className="evidence-marker"');
+    expect(appSource).toContain('"--tape-press": 1');
+    expect(appSource).toContain('"--ink-absorb-opacity": node.status === "running" ? 0.12 : 0.07');
+    expect(appSource).toContain('<Eye size={19} strokeWidth={2.6} />');
     expect(appSource).toContain('return "var(--sk-edge-active)"');
-    expect(appSource).toContain('return "var(--sk-frame-completed)"');
-    expect(appSource).toContain('return "var(--sk-glint-failed)"');
     expect(appSource).toContain('return "var(--sk-status-running)"');
   });
 
@@ -156,8 +151,9 @@ describe("SkyTurn UI style tokens", () => {
     const motionSource = await readSource("./motion.ts");
     const sidebarToggleBlock = styles.match(/\.sidebar-toggle \{[\s\S]*?\n\}/)?.[0] ?? "";
     const sidebarHoverBlock = styles.match(/\.sidebar-project-row:hover,[\s\S]*?\.sidebar-settings:hover \{[\s\S]*?\n\}/)?.[0] ?? "";
-    const cardBlock = cssBlockContaining(styles, ".agent-card", "border: var(--node-border)");
-    const composerBlock = cssBlockContaining(styles, ".canvas-composer", "min-height: 64px");
+    const hardResetBlock = styles.slice(styles.indexOf("/* Evidence-board paper construction hard reset. */"));
+    const cardBlock = lastCssBlock(styles, ".agent-card");
+    const composerBlock = lastCssBlock(styles, ".canvas-composer");
 
     expect(styles).toContain("sidebar-toggle-label");
     expect(sidebarToggleBlock).toContain("position: absolute");
@@ -169,25 +165,33 @@ describe("SkyTurn UI style tokens", () => {
     expect(styles).toContain("background-color: #eaf2ff");
     expect(styles).toContain("height: 40px");
     expect(sidebarHoverBlock).not.toContain("scale(");
-    expect(styles).toContain("--agent-card-radius: 4px");
     expect(styles).toContain("background-image: var(--sk-paper-white)");
     expect(styles).toContain("background-image: var(--sk-paper-cobalt)");
     expect(styles).toContain("background-image: var(--sk-paper-rip-white)");
-    expect(styles).toContain(".agent-node-shell::before");
-    expect(styles).toContain("--node-border: 1px solid rgba(5, 29, 72, 0.12)");
-    expect(styles).toContain("--node-tab-opacity: 0");
-    expect(styles).toContain("--node-border: 1px solid var(--sk-yellow)");
-    expect(styles).toContain("--node-border: 1px solid var(--sk-red-paper)");
-    expect(styles).toContain("--node-border: 1px solid var(--sk-cobalt)");
-    expect(styles).not.toContain(".agent-card::after");
-    expect(styles).not.toContain(".canvas-composer::after");
-    expect(styles).toContain(".canvas-composer:focus-within");
-    expect(styles).toContain(".canvas-composer.has-content");
-    expect(composerBlock).toContain("min-height: 64px");
-    expect(composerBlock).toContain("background-color: var(--sk-paper-warm)");
+    expect(styles).not.toContain(".paper-corner-curl");
+    expect(hardResetBlock).toContain(".agent-node-shell::before");
+    expect(hardResetBlock).toContain("--underlayer-paper: var(--sk-paper-white)");
+    expect(hardResetBlock).toContain("--underlayer-paper: var(--sk-paper-yellow)");
+    expect(hardResetBlock).toContain("--underlayer-bg: var(--sk-red-paper)");
+    expect(hardResetBlock).toContain('.agent-node-shell.running[data-phase="Planning"]');
+    expect(hardResetBlock).toContain("--tape-bg: rgba(181, 40, 34, 0.88)");
+    expect(hardResetBlock).toContain("--body-edge: polygon");
+    expect(hardResetBlock).toContain(".agent-card::after");
+    expect(hardResetBlock).toContain(".canvas-composer-shell::before");
+    expect(hardResetBlock).toContain(".canvas-composer::after");
+    expect(hardResetBlock).toContain(".canvas-composer:focus-within");
+    expect(hardResetBlock).toContain(".canvas-composer.has-content");
+    expect(hardResetBlock).toContain("--intake-scale-x: 1");
+    expect(composerBlock).toContain("min-height: 68px");
+    expect(composerBlock).toContain("background-color: #fffdf2");
+    expect(composerBlock).toContain("border: 0");
+    expect(composerBlock).toContain("border-radius: 0");
+    expect(composerBlock).toContain("clip-path: polygon");
     expect(composerBlock).not.toContain("background-color: var(--sk-pink)");
-    expect(cardBlock).toContain("border: var(--node-border)");
+    expect(cardBlock).toContain("border: 0");
+    expect(cardBlock).toContain("border-radius: 0");
+    expect(cardBlock).toContain("clip-path: var(--body-edge)");
     expect(cardBlock).not.toContain("height: calc(100% - 4px)");
-    expect(motionSource).toContain("radius: 4");
+    expect(motionSource).toContain("radius: 0");
   });
 });

@@ -6,20 +6,17 @@ export const MOTION_DURATION = {
   normal: 0.22,
   slow: 0.36,
   enter: 0.38,
-  energyLoop: 2.2,
-  shimmer: 0.68,
   retryPulse: 0.42,
   retryBackoff: 0.86,
-  failureFlash: 0.24,
   inspector: 0.28,
 } as const;
 
 export const MOTION_DISTANCE = {
-  hoverLift: -2,
-  enterY: 8,
+  hoverLift: 0,
+  enterY: 1.2,
   phraseShift: 4,
-  failedShakeX: 1.5,
-  enterScaleStart: 0.96,
+  failedShakeX: 0,
+  enterScaleStart: 1,
   selectedScale: 1,
 } as const;
 
@@ -27,18 +24,15 @@ export const ENERGY_FRAME = {
   width: 440,
   height: 176,
   inset: 1,
-  radius: 4,
+  radius: 0,
   pathLength: 100,
 } as const;
 
-type OneShotMotion = "verification-shimmer" | "failure-interruption" | null;
+type OneShotMotion = "verification-stamp" | "failure-tear" | null;
 
 export interface NodeMotionPolicy {
   loop: boolean;
   oneShot: OneShotMotion;
-  frameDasharray: string;
-  frameOpacity: number;
-  glintDasharray: string;
 }
 
 export interface EdgeMotionPolicy {
@@ -51,37 +45,22 @@ export const NODE_MOTION_BY_STATUS: Record<NodeStatus, NodeMotionPolicy> = {
   pending: {
     loop: false,
     oneShot: null,
-    frameDasharray: "100",
-    frameOpacity: 0.28,
-    glintDasharray: "0 100",
   },
   running: {
     loop: true,
     oneShot: null,
-    frameDasharray: "100",
-    frameOpacity: 0.68,
-    glintDasharray: "10 90",
   },
   retrying: {
     loop: true,
     oneShot: null,
-    frameDasharray: "6 8",
-    frameOpacity: 0.66,
-    glintDasharray: "4 12",
   },
   completed: {
     loop: false,
-    oneShot: "verification-shimmer",
-    frameDasharray: "100",
-    frameOpacity: 0.42,
-    glintDasharray: "16 84",
+    oneShot: "verification-stamp",
   },
   failed: {
     loop: false,
-    oneShot: "failure-interruption",
-    frameDasharray: "100",
-    frameOpacity: 0.5,
-    glintDasharray: "10 90",
+    oneShot: "failure-tear",
   },
 };
 

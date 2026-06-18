@@ -1404,16 +1404,12 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   const node = data.node;
   const rootRef = useRef<HTMLDivElement | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
-  const frameRef = useRef<SVGRectElement | null>(null);
-  const glintRef = useRef<SVGRectElement | null>(null);
+  const markerRef = useRef<HTMLSpanElement | null>(null);
   const statusDotRef = useRef<HTMLSpanElement | null>(null);
   const handlesRef = useRef<HTMLDivElement | null>(null);
   const menuRef = useRef<HTMLButtonElement | null>(null);
   const previousStatusRef = useRef<NodeStatus>(node.status);
-  const completedShimmerPlayed = useRef(false);
-  const gradientKey = useId().replaceAll(":", "");
-  const runningGradientId = `agent-running-${gradientKey}`;
-  const retryingGradientId = `agent-retrying-${gradientKey}`;
+  const completedStampPlayed = useRef(false);
   const runtime = runtimeForNode(node);
   const footer = nodeFooterForNode(node, runtime);
   const summary = nodeSummaryForNode(node);
@@ -1424,32 +1420,45 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   useGSAP(
     () => {
       const root = rootRef.current;
-      if (!root) return;
+      const card = cardRef.current;
+      if (!root || !card) return;
 
-      gsap.set(root, { autoAlpha: 1, clearProps: "transform,filter" });
+      gsap.set(root, {
+        autoAlpha: 1,
+        "--paper-layer-opacity": 1,
+        "--tape-press": 1,
+        "--tape-nudge": "0px",
+        clearProps: "transform,filter",
+      });
       if (userPrefersReducedMotion()) {
         return;
       }
 
-      gsap.fromTo(
-        root,
-        {
-          autoAlpha: 0,
-          scale: MOTION_DISTANCE.enterScaleStart,
-          y: MOTION_DISTANCE.enterY,
-          filter: "blur(8px)",
-        },
-        {
-          autoAlpha: 1,
-          scale: 1,
-          y: 0,
-          filter: "blur(0px)",
-          duration: MOTION_DURATION.enter,
-          ease: "power3.out",
-          immediateRender: false,
-          clearProps: "transform,filter",
-        },
-      );
+      const press = gsap.timeline({ defaults: { ease: "power2.out" } });
+      press
+        .set(root, { "--paper-layer-opacity": 0, "--tape-press": 0.72 })
+        .to(root, { "--paper-layer-opacity": 1, duration: 0.08 }, 0)
+        .fromTo(
+          card,
+          {
+            scale: MOTION_DISTANCE.enterScaleStart,
+            y: MOTION_DISTANCE.enterY,
+            rotation: -0.36,
+            transformOrigin: "50% 12%",
+          },
+          {
+            scale: 1,
+            y: 0,
+            rotation: 0,
+            duration: MOTION_DURATION.enter,
+            clearProps: "transform",
+          },
+          0.04,
+        )
+        .to(root, { "--tape-press": 1.08, duration: 0.07, ease: "power1.out" }, 0.25)
+        .to(root, { "--tape-press": 1, duration: 0.09, ease: "sine.out" }, 0.32);
+
+      return () => press.kill();
     },
     { scope: rootRef },
   );
@@ -1457,30 +1466,30 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   useGSAP(
     () => {
       const card = cardRef.current;
-      const frame = frameRef.current;
-      const glint = glintRef.current;
+      const marker = markerRef.current;
       const statusDot = statusDotRef.current;
-      if (!card || !frame || !glint || !statusDot) return;
+      const root = rootRef.current;
+      if (!card || !marker || !statusDot || !root) return;
 
-      const policy = NODE_MOTION_BY_STATUS[node.status];
       const previousStatus = previousStatusRef.current;
       const cameFromActive = previousStatus === "running" || previousStatus === "retrying";
+      const hasEvidenceMarker = node.status === "completed" || node.status === "failed";
       previousStatusRef.current = node.status;
-      if (node.status !== "completed") completedShimmerPlayed.current = false;
+      if (node.status !== "completed") completedStampPlayed.current = false;
 
-      gsap.killTweensOf([card, frame, glint, statusDot]);
-      gsap.set(card, { x: 0 });
-      gsap.set(frame, {
-        autoAlpha: policy.frameOpacity,
-        stroke: frameStrokeForStatus(node.status, runningGradientId, retryingGradientId),
-        strokeDasharray: policy.frameDasharray,
-        strokeDashoffset: 0,
+      gsap.killTweensOf([card, marker, statusDot, root]);
+      gsap.set(root, {
+        "--ink-absorb-opacity": node.status === "running" ? 0.12 : 0.07,
+        "--tape-nudge": "0px",
+        "--tear-peel": "0px",
       });
-      gsap.set(glint, {
-        autoAlpha: 0,
-        stroke: glintStrokeForStatus(node.status, runningGradientId, retryingGradientId),
-        strokeDasharray: policy.glintDasharray,
-        strokeDashoffset: 0,
+      gsap.set(card, { x: 0, y: 0, rotation: 0, scale: 1 });
+      gsap.set(marker, {
+        autoAlpha: hasEvidenceMarker ? 1 : 0,
+        filter: "none",
+        rotation: 0,
+        scale: 1,
+        transformOrigin: "50% 50%",
       });
       gsap.set(statusDot, {
         autoAlpha: 1,
@@ -1495,51 +1504,39 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
 
       if (shouldLoopNode(node.status)) {
         if (node.status === "running") {
-          gsap.set(glint, { autoAlpha: 0.76, strokeDashoffset: 0 });
-          const loop = gsap.to(glint, {
-            strokeDashoffset: -ENERGY_FRAME.pathLength,
-            duration: MOTION_DURATION.energyLoop,
-            ease: "none",
-            repeat: -1,
-          });
           const dot = gsap.to(statusDot, {
-            autoAlpha: 0.55,
-            scale: 1.16,
-            duration: 1.18,
+            autoAlpha: 0.68,
+            scale: 1.07,
+            duration: 1.24,
+            ease: "sine.inOut",
+            repeat: -1,
+            yoyo: true,
+          });
+          const absorb = gsap.to(root, {
+            "--ink-absorb-opacity": 0.15,
+            duration: 1.5,
             ease: "sine.inOut",
             repeat: -1,
             yoyo: true,
           });
 
           return () => {
-            loop.kill();
             dot.kill();
+            absorb.kill();
           };
         }
 
-        gsap.set(glint, { autoAlpha: 0.44, strokeDashoffset: 0 });
-        const retryFrame = gsap.to(frame, {
-          strokeDashoffset: -16,
-          duration: MOTION_DURATION.retryPulse,
-          ease: "sine.inOut",
-          repeat: -1,
-          repeatDelay: MOTION_DURATION.retryBackoff,
-        });
-        const retryGlint = gsap.fromTo(glint, {
-          autoAlpha: 0.12,
-          strokeDashoffset: 0,
-        }, {
-          autoAlpha: 0.44,
-          strokeDashoffset: -18,
+        const retryDot = gsap.to(statusDot, {
+          autoAlpha: 0.7,
+          scale: 1.06,
           duration: MOTION_DURATION.retryPulse,
           ease: "sine.inOut",
           repeat: -1,
           repeatDelay: MOTION_DURATION.retryBackoff,
           yoyo: true,
         });
-        const retryDot = gsap.to(statusDot, {
-          autoAlpha: 0.64,
-          scale: 1.1,
+        const tape = gsap.to(root, {
+          "--tape-nudge": "1px",
           duration: MOTION_DURATION.retryPulse,
           ease: "sine.inOut",
           repeat: -1,
@@ -1548,57 +1545,33 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
         });
 
         return () => {
-          retryFrame.kill();
-          retryGlint.kill();
           retryDot.kill();
+          tape.kill();
         };
       }
 
-      if (node.status === "completed" && cameFromActive && !completedShimmerPlayed.current) {
-        completedShimmerPlayed.current = true;
-        const shimmer = gsap.timeline();
-        shimmer
-          .set(glint, {
-            autoAlpha: 0.86,
-            stroke: glintStrokeForStatus("completed", runningGradientId, retryingGradientId),
-            strokeDasharray: policy.glintDasharray,
-            strokeDashoffset: 28,
-          })
-          .to(glint, {
-            strokeDashoffset: -ENERGY_FRAME.pathLength,
-            duration: MOTION_DURATION.shimmer,
-            ease: "power2.out",
-          })
-          .to(glint, { autoAlpha: 0, duration: 0.12, ease: "power2.out" }, 0.56);
+      if (node.status === "completed" && cameFromActive && !completedStampPlayed.current) {
+        completedStampPlayed.current = true;
+        const stamp = gsap.timeline({ defaults: { ease: "power2.out" } });
+        stamp
+          .fromTo(
+            marker,
+            { autoAlpha: 0.62, scale: 0.88, rotation: -2 },
+            { autoAlpha: 1, scale: 1, rotation: 0, duration: 0.16, ease: "back.out(1.7)" },
+            0,
+          )
+          .fromTo(card, { y: 1.2 }, { y: 0, duration: 0.18 }, 0)
+          .to(marker, { filter: "contrast(1.08)", duration: 0.12, yoyo: true, repeat: 1 }, 0.08);
 
-        return () => shimmer.kill();
+        return () => stamp.kill();
       }
 
       if (node.status === "failed" && cameFromActive) {
-        const failure = gsap.timeline();
+        const failure = gsap.timeline({ defaults: { ease: "power1.inOut" } });
         failure
-          .set(glint, {
-            autoAlpha: 0.7,
-            stroke: glintStrokeForStatus("failed", runningGradientId, retryingGradientId),
-            strokeDasharray: policy.glintDasharray,
-            strokeDashoffset: 18,
-          })
-          .to(frame, { autoAlpha: 0.82, duration: 0.08, ease: "power2.out" }, 0)
-          .to(
-            card,
-            {
-              x: MOTION_DISTANCE.failedShakeX,
-              duration: 0.045,
-              ease: "power1.inOut",
-              repeat: 3,
-              yoyo: true,
-            },
-            0,
-          )
-          .to(glint, { strokeDashoffset: -34, duration: 0.2, ease: "power2.out" }, 0)
-          .to(glint, { autoAlpha: 0, duration: 0.12, ease: "power2.out" }, 0.14)
-          .to(frame, { autoAlpha: policy.frameOpacity, duration: 0.16, ease: "power2.out" }, 0.1)
-          .set(card, { x: 0 });
+          .to(root, { "--tear-peel": "5px", duration: 0.1 }, 0)
+          .fromTo(marker, { scale: 0.86, rotation: -6 }, { scale: 1, rotation: 0, duration: 0.18 }, 0.02)
+          .to(root, { "--tear-peel": "3px", duration: 0.12, ease: "power2.out" }, 0.12);
 
         return () => failure.kill();
       }
@@ -1615,8 +1588,17 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
       if (!root || !card || !handles || !menu) return;
       const safe = contextSafe ?? (<T extends (...args: never[]) => unknown>(fn: T) => fn);
 
-      gsap.killTweensOf([card, handles, menu]);
-      gsap.set(card, { y: 0, scale: selected ? MOTION_DISTANCE.selectedScale : 1 });
+      gsap.killTweensOf([root, card, handles, menu]);
+      gsap.set(root, {
+        "--paper-curl-opacity": selected ? 0.8 : 0,
+        "--paper-curl-x": selected ? "2px" : "0px",
+        "--paper-curl-y": selected ? "-1px" : "0px",
+        "--paper-curl-rotate": selected ? "1.4deg" : "0deg",
+        "--underlayer-peek": selected ? "4px" : "0px",
+        "--tape-shadow-y": selected ? "2px" : "0px",
+        "--tape-shadow-blur": selected ? "3px" : "0px",
+      });
+      gsap.set(card, { y: 0, rotation: 0, scale: 1 });
       gsap.set(handles, {
         autoAlpha: selected ? 1 : 0,
         scale: selected ? 1 : 0.92,
@@ -1629,9 +1611,22 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
       }
 
       const activate = safe(() => {
+        gsap.to(root, {
+          "--paper-curl-opacity": 0.8,
+          "--paper-curl-x": "2px",
+          "--paper-curl-y": "-1px",
+          "--paper-curl-rotate": "1.4deg",
+          "--underlayer-peek": selected ? "5px" : "3px",
+          "--tape-shadow-y": "2px",
+          "--tape-shadow-blur": "3px",
+          duration: MOTION_DURATION.fast,
+          ease: "power2.out",
+          overwrite: "auto",
+        });
         gsap.to(card, {
-          y: MOTION_DISTANCE.hoverLift,
-          scale: selected ? MOTION_DISTANCE.selectedScale : 1,
+          y: 0,
+          rotation: 0,
+          scale: 1,
           duration: MOTION_DURATION.fast,
           ease: "power2.out",
           overwrite: "auto",
@@ -1652,9 +1647,22 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
       });
 
       const deactivate = safe(() => {
+        gsap.to(root, {
+          "--paper-curl-opacity": selected ? 0.8 : 0,
+          "--paper-curl-x": selected ? "2px" : "0px",
+          "--paper-curl-y": selected ? "-1px" : "0px",
+          "--paper-curl-rotate": selected ? "1.4deg" : "0deg",
+          "--underlayer-peek": selected ? "4px" : "0px",
+          "--tape-shadow-y": selected ? "2px" : "0px",
+          "--tape-shadow-blur": selected ? "3px" : "0px",
+          duration: MOTION_DURATION.fast,
+          ease: "power2.out",
+          overwrite: "auto",
+        });
         gsap.to(card, {
           y: 0,
-          scale: selected ? MOTION_DISTANCE.selectedScale : 1,
+          rotation: 0,
+          scale: 1,
           duration: MOTION_DURATION.fast,
           ease: "power2.out",
           overwrite: "auto",
@@ -1699,47 +1707,9 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
     <div
       ref={rootRef}
       className={`agent-node-shell ${node.status}${selected ? " selected" : ""}`}
+      data-state={node.status}
+      data-phase={runtime.phase}
     >
-      <svg
-        className="energy-frame"
-        aria-hidden="true"
-        viewBox={`0 0 ${ENERGY_FRAME.width} ${ENERGY_FRAME.height}`}
-        preserveAspectRatio="none"
-      >
-        <defs>
-          <linearGradient id={runningGradientId} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="var(--sk-running-gradient-start)" />
-            <stop offset="46%" stopColor="var(--sk-running-gradient-mid)" />
-            <stop offset="100%" stopColor="var(--sk-running-gradient-end)" />
-          </linearGradient>
-          <linearGradient id={retryingGradientId} x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" stopColor="var(--sk-retrying-gradient-start)" />
-            <stop offset="100%" stopColor="var(--sk-retrying-gradient-end)" />
-          </linearGradient>
-        </defs>
-        <rect
-          ref={frameRef}
-          className="energy-frame-base"
-          x={ENERGY_FRAME.inset}
-          y={ENERGY_FRAME.inset}
-          width={ENERGY_FRAME.width - ENERGY_FRAME.inset * 2}
-          height={ENERGY_FRAME.height - ENERGY_FRAME.inset * 2}
-          rx={ENERGY_FRAME.radius}
-          ry={ENERGY_FRAME.radius}
-          pathLength={ENERGY_FRAME.pathLength}
-        />
-        <rect
-          ref={glintRef}
-          className="energy-glint"
-          x={ENERGY_FRAME.inset}
-          y={ENERGY_FRAME.inset}
-          width={ENERGY_FRAME.width - ENERGY_FRAME.inset * 2}
-          height={ENERGY_FRAME.height - ENERGY_FRAME.inset * 2}
-          rx={ENERGY_FRAME.radius}
-          ry={ENERGY_FRAME.radius}
-          pathLength={ENERGY_FRAME.pathLength}
-        />
-      </svg>
       <div ref={handlesRef} className="agent-handles">
         <Handle id="target-left" type="target" position={Position.Left} className="node-handle target-left" />
         <Handle id="target-top" type="target" position={Position.Top} className="node-handle target-top" />
@@ -1756,6 +1726,10 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
         onClick={() => data.onOpen(node.id)}
         onKeyDown={openFromKeyboard}
       >
+        <span ref={markerRef} className="evidence-marker" aria-hidden="true">
+          {node.status === "completed" && <Eye size={19} strokeWidth={2.6} />}
+          {node.status === "failed" && <X size={20} strokeWidth={3} />}
+        </span>
         <div className="agent-node-header">
           <span className="agent-node-eyebrow">{eyebrow}</span>
           <button
@@ -1869,35 +1843,6 @@ function edgeColorForStatus(status: NodeStatus): string {
   }
 }
 
-function frameStrokeForStatus(status: NodeStatus, runningGradientId: string, retryingGradientId: string): string {
-  switch (status) {
-    case "running":
-      return `url(#${runningGradientId})`;
-    case "retrying":
-      return `url(#${retryingGradientId})`;
-    case "completed":
-      return "var(--sk-frame-completed)";
-    case "failed":
-      return "var(--sk-frame-failed)";
-    case "pending":
-      return "var(--sk-frame-pending)";
-  }
-}
-
-function glintStrokeForStatus(status: NodeStatus, runningGradientId: string, retryingGradientId: string): string {
-  switch (status) {
-    case "running":
-      return `url(#${runningGradientId})`;
-    case "retrying":
-      return `url(#${retryingGradientId})`;
-    case "completed":
-      return "var(--sk-glint-completed)";
-    case "failed":
-      return "var(--sk-glint-failed)";
-    case "pending":
-      return "var(--sk-glint-pending)";
-  }
-}
 
 function statusColorForStatus(status: NodeStatus): string {
   switch (status) {
@@ -2583,55 +2528,91 @@ function CanvasComposer({
   onStop: () => void;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const composerRef = useRef<HTMLDivElement | null>(null);
   const hasValue = value.trim().length > 0;
+  const handleSubmit = useCallback(() => {
+    if (disabled || !hasValue) return;
+
+    const composer = composerRef.current;
+    if (composer && !userPrefersReducedMotion()) {
+      gsap.killTweensOf(composer);
+      const fold = gsap.timeline({ defaults: { ease: "power1.inOut" } });
+      fold
+        .to(composer, { "--intake-scale-x": 0.982, "--intake-scale-y": 0.974, duration: 0.08 }, 0)
+        .to(composer, { "--intake-scale-x": 1, "--intake-scale-y": 1, duration: 0.16, ease: "power2.out" }, 0.08);
+    }
+
+    onSubmit();
+  }, [disabled, hasValue, onSubmit]);
+
+  useGSAP(
+    () => {
+      const composer = composerRef.current;
+      if (!composer) return;
+
+      gsap.to(composer, {
+        "--intake-write-scale": hasValue ? 1.03 : 1,
+        duration: userPrefersReducedMotion() ? 0 : 0.16,
+        ease: "power2.out",
+        overwrite: "auto",
+      });
+    },
+    { scope: composerRef, dependencies: [hasValue] },
+  );
 
   return (
     <div
-      className={hasValue ? "canvas-composer nodrag nopan has-content" : "canvas-composer nodrag nopan"}
+      ref={composerRef}
+      className={hasValue ? "canvas-composer-shell nodrag nopan has-content" : "canvas-composer-shell nodrag nopan"}
       onPointerDown={(event) => event.stopPropagation()}
     >
-      <input
-        className="canvas-composer-input"
-        ref={inputRef}
-        value={value}
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder="Insert requirement or node"
-        aria-label="Insert requirement or node"
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && hasValue) onSubmit();
-        }}
-      />
-      <div className="canvas-composer-toolbar">
-        <button
-          className="icon-button composer-tool"
-          title="Focus input"
-          aria-label="Focus input"
-          onClick={() => inputRef.current?.focus()}
+      <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
+        <input
+          className="canvas-composer-input"
+          ref={inputRef}
+          value={value}
           disabled={disabled}
-        >
-          <Plus size={17} />
-        </button>
-        <span className="composer-slash" aria-hidden="true">/</span>
-        <span className="composer-toolbar-spacer" />
-        <button
-          className="icon-button composer-tool"
-          title="Stop active run"
-          aria-label="Stop active run"
-          onClick={onStop}
-          disabled={disabled}
-        >
-          <Square size={16} />
-        </button>
-        <button
-          className="icon-button composer-send"
-          title="Insert requirement"
-          aria-label="Insert requirement"
-          onClick={onSubmit}
-          disabled={disabled || !hasValue}
-        >
-          <ArrowUp size={18} />
-        </button>
+          onChange={(event) => onChange(event.target.value)}
+          placeholder="Insert requirement or node"
+          aria-label="Insert requirement or node"
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && hasValue) {
+              event.preventDefault();
+              handleSubmit();
+            }
+          }}
+        />
+        <div className="canvas-composer-toolbar">
+          <button
+            className="icon-button composer-tool"
+            title="Focus input"
+            aria-label="Focus input"
+            onClick={() => inputRef.current?.focus()}
+            disabled={disabled}
+          >
+            <Plus size={17} />
+          </button>
+          <span className="composer-slash" aria-hidden="true">/</span>
+          <span className="composer-toolbar-spacer" />
+          <button
+            className="icon-button composer-tool"
+            title="Stop active run"
+            aria-label="Stop active run"
+            onClick={onStop}
+            disabled={disabled}
+          >
+            <Square size={16} />
+          </button>
+          <button
+            className="icon-button composer-send"
+            title="Insert requirement"
+            aria-label="Insert requirement"
+            onClick={handleSubmit}
+            disabled={disabled || !hasValue}
+          >
+            <ArrowUp size={18} />
+          </button>
+        </div>
       </div>
     </div>
   );
