@@ -98,6 +98,38 @@ describe("SkyTurn UI style tokens", () => {
     expect(appSource).not.toContain("session-panel-backdrop");
   });
 
+  it("renders the New Session composer as a Paper Ops intake slip with a custom project listbox", async () => {
+    const appSource = await readSource("./App.tsx");
+    const styles = await readSource("./styles.css");
+    const composerSource = appSource.slice(
+      appSource.indexOf("function SessionComposer"),
+      appSource.indexOf("function formatRelativeTime"),
+    );
+
+    expect(composerSource).toContain('"new-session-intake"');
+    expect(composerSource).toContain("<ProjectDropdown");
+    expect(composerSource).not.toContain("<select");
+    expect(appSource).toContain("function ProjectDropdown");
+    expect(appSource).toContain('aria-haspopup="listbox"');
+    expect(appSource).toContain('role="listbox"');
+    expect(appSource).toContain('role="option"');
+    expect(appSource).toContain('event.key === "ArrowDown"');
+    expect(appSource).toContain('event.key === "ArrowUp"');
+    expect(appSource).toContain('event.key === "Escape"');
+    expect(styles).toContain(".empty-stage");
+    expect(styles).toContain(".folder-backing");
+    expect(styles).toContain(".folder-backing::after");
+    expect(styles).toContain(".intake-sheet");
+    expect(styles).toContain(".control-strip");
+    expect(styles).toContain(".control-strip::after");
+    expect(styles).toContain(".project-dropdown-trigger");
+    expect(styles).toContain(".project-dropdown-listbox");
+    expect(styles).toContain("background-color: #dceaff");
+    expect(styles).toContain("background-color: #eee7d8");
+    expect(styles).toContain("#758696");
+    expect(styles).toContain("background-color: #083176");
+  });
+
   it("renders Changes through diff2html instead of a self-authored diff table", async () => {
     const appSource = await readSource("./App.tsx");
     const diffSource = await readSource("./diffViewer.ts");

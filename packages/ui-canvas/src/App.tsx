@@ -55,6 +55,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type FormEvent,
   type KeyboardEvent,
   type ReactNode,
 } from "react";
@@ -973,86 +974,126 @@ function SessionComposer({
   onCreate: () => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const formRef = useRef<HTMLFormElement>(null);
   const hasGoal = goal.trim().length > 0;
   const canCreate = hasGoal && selectedProjectId !== null;
   const className = [
-    "session-panel",
-    variant === "inline" ? "inline-session-panel" : "",
+    "new-session-intake",
+    variant === "inline" ? "inline-session-intake" : "",
     hasGoal ? "has-content" : "",
   ].filter(Boolean).join(" ");
 
+  const { contextSafe } = useGSAP({ scope: formRef });
+
+  useGSAP(() => {
+    if (!formRef.current || userPrefersReducedMotion()) return;
+    const form = formRef.current;
+
+    const folder = form.querySelector<HTMLElement>(".folder-backing");
+    const sheet = form.querySelector<HTMLElement>(".intake-sheet");
+    const strip = form.querySelector<HTMLElement>(".control-strip");
+    const tape = form.querySelector<HTMLElement>(".paper-tape");
+    if (!folder || !sheet || !strip || !tape) return;
+
+    gsap.set(folder, { y: 15, rotation: -2, opacity: 0 });
+    gsap.set(sheet, { y: 10, rotation: 1, opacity: 0 });
+    gsap.set(strip, { y: 5, rotation: -1, opacity: 0 });
+    gsap.set(tape, { scaleY: 0, opacity: 0 });
+
+    const timeline = gsap.timeline();
+    timeline
+      .to(folder, { y: 0, rotation: -0.5, opacity: 1, duration: 0.25, ease: "power2.out" })
+      .to(sheet, { y: 0, rotation: 0.5, opacity: 1, duration: 0.2, ease: "power2.out" }, "-=0.1")
+      .to(strip, { y: 0, rotation: -0.2, opacity: 1, duration: 0.2, ease: "power2.out" }, "-=0.05")
+      .to(tape, { scaleY: 1, opacity: 0.85, duration: 0.15, ease: "power1.out" }, "-=0.05");
+    timeline.eventCallback("onComplete", () => {
+      gsap.set([folder, sheet, strip, tape], { clearProps: "transform,opacity" });
+    });
+  }, { scope: formRef });
+
+  const handleSubmit = contextSafe((event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canCreate) return;
+    if (!userPrefersReducedMotion() && formRef.current) {
+      const sheet = formRef.current.querySelector<HTMLElement>(".intake-sheet");
+      if (sheet) {
+        gsap.to(sheet, {
+          y: -3,
+          scaleY: 0.955,
+          rotation: -0.8,
+          duration: 0.18,
+          ease: "power2.in",
+          onComplete: onCreate,
+        });
+        return;
+      }
+    }
+    onCreate();
+  });
+
   return (
     <form
+      ref={formRef}
       className={className}
       role={variant === "panel" ? "dialog" : undefined}
       aria-modal={variant === "panel" ? true : undefined}
       aria-label={ariaLabel}
       onMouseDown={variant === "panel" ? (event) => event.stopPropagation() : undefined}
-      onSubmit={(event) => {
-        event.preventDefault();
-        onCreate();
-      }}
+      onSubmit={handleSubmit}
     >
-      {onClose && (
+      <div className="folder-backing" />
+      <div className="intake-sheet">
+        <div className="paper-tape" />
+        {onClose && (
+          <button
+            className="icon-button session-panel-close"
+            title="Close"
+            aria-label="Close"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation();
+              onClose();
+            }}
+          >
+            <X size={17} />
+          </button>
+        )}
+        <textarea
+          className="session-panel-input"
+          ref={textareaRef}
+          value={goal}
+          onChange={(event) => onGoalChange(event.target.value)}
+          placeholder="What shall this canvas session build?"
+          aria-label="New task goal"
+        />
+      </div>
+      <div className="control-strip">
         <button
-          className="icon-button session-panel-close"
-          title="Close"
-          aria-label="Close"
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            onClose();
-          }}
-        >
-          <X size={17} />
-        </button>
-      )}
-      <textarea
-        className="session-panel-input"
-        ref={textareaRef}
-        value={goal}
-        onChange={(event) => onGoalChange(event.target.value)}
-        placeholder="What shall this canvas session build?"
-        aria-label="New task goal"
-      />
-      <footer className="session-panel-footer">
-        <button
-          className="icon-button session-panel-tool"
+          className="paper-pin-btn"
           type="button"
           title="Focus prompt"
           aria-label="Focus prompt"
           onClick={() => textareaRef.current?.focus()}
         >
-          <Plus size={17} />
+          <Plus size={14} />
         </button>
-        <label className="session-project-picker">
-          <FolderOpen size={15} />
-          <select
-            value={selectedProjectId ?? ""}
-            disabled={projects.length === 0}
-            aria-label="Project"
-            onChange={(event) => onProjectChange(event.target.value)}
-          >
-            {projects.length === 0 && <option value="">No projects</option>}
-            {projects.map((project) => (
-              <option key={project.id} value={project.id}>
-                {project.name}
-              </option>
-            ))}
-          </select>
-        </label>
+        <ProjectDropdown
+          projects={projects}
+          selectedProjectId={selectedProjectId}
+          onChange={onProjectChange}
+        />
         <ModeSwitch mode={mode} onChange={onModeChange} compact />
         <span className="session-panel-spacer" />
         <button
-          className="icon-button session-panel-submit"
+          className="send-stamp-btn"
           type="submit"
           disabled={!canCreate}
           title="Create"
           aria-label="Create"
         >
-          <ArrowUp size={18} />
+          <ArrowUp size={18} strokeWidth={3} className="send-arrow" />
         </button>
-      </footer>
+      </div>
     </form>
   );
 }
@@ -2618,6 +2659,150 @@ function CanvasComposer({
   );
 }
 
+function ProjectDropdown({
+  projects,
+  selectedProjectId,
+  onChange,
+}: {
+  projects: ImportedProject[];
+  selectedProjectId: string | null;
+  onChange: (projectId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const listboxRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const listboxId = useId();
+  const optionIdPrefix = useId();
+
+  const selectedProject = projects.find((project) => project.id === selectedProjectId);
+  const selectedIndex = Math.max(0, projects.findIndex((project) => project.id === selectedProjectId));
+  const activeProject = projects[activeIndex] ?? selectedProject ?? projects[0];
+
+  useEffect(() => {
+    if (open) {
+      setActiveIndex(selectedIndex);
+    }
+  }, [open, selectedIndex]);
+
+  useEffect(() => {
+    if (!open) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [open]);
+
+  useGSAP(() => {
+    if (open && listboxRef.current && !userPrefersReducedMotion()) {
+      gsap.fromTo(
+        listboxRef.current,
+        { y: -10, opacity: 0, clipPath: "polygon(0 0, 100% 0, 100% 0, 0 0)" },
+        {
+          y: 0,
+          opacity: 1,
+          clipPath: "polygon(0 0, 100% 0, 99% 100%, 1% 100%)",
+          duration: 0.2,
+          ease: "power2.out",
+        },
+      );
+    }
+  }, [open]);
+
+  function openListbox(nextIndex = selectedIndex) {
+    if (projects.length === 0) return;
+    setActiveIndex(nextIndex);
+    setOpen(true);
+  }
+
+  function moveActive(direction: 1 | -1) {
+    if (projects.length === 0) return;
+    setActiveIndex((current) => (current + direction + projects.length) % projects.length);
+  }
+
+  function selectProject(projectId: string) {
+    onChange(projectId);
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
+
+  function handleTriggerKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (open && activeProject) {
+        selectProject(activeProject.id);
+      } else {
+        openListbox();
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!open) {
+        openListbox(event.key === "ArrowDown" ? selectedIndex : Math.max(0, selectedIndex - 1));
+        return;
+      }
+      moveActive(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+
+    if (event.key === "Escape" && open) {
+      event.preventDefault();
+      setOpen(false);
+    }
+  }
+
+  return (
+    <div className={`project-dropdown ${open ? "open" : ""}`} ref={rootRef}>
+      <button
+        type="button"
+        className="project-dropdown-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listboxId : undefined}
+        aria-activedescendant={open && activeProject ? `${optionIdPrefix}-${activeProject.id}` : undefined}
+        aria-label="Project"
+        onClick={() => (open ? setOpen(false) : openListbox())}
+        onKeyDown={handleTriggerKeyDown}
+        ref={triggerRef}
+        disabled={projects.length === 0}
+      >
+        <FolderOpen size={15} className="folder-icon" />
+        <span className="project-name">{selectedProject ? selectedProject.name : "No projects"}</span>
+        <ChevronDown size={14} className="chevron-icon" />
+      </button>
+      {open && (
+        <div id={listboxId} ref={listboxRef} className="project-dropdown-listbox" role="listbox" aria-label="Projects">
+          {projects.map((project, index) => (
+            <button
+              key={project.id}
+              id={`${optionIdPrefix}-${project.id}`}
+              type="button"
+              role="option"
+              aria-selected={project.id === selectedProjectId}
+              className={[
+                "project-option",
+                project.id === selectedProjectId ? "selected" : "",
+                index === activeIndex ? "active" : "",
+              ].filter(Boolean).join(" ")}
+              onMouseEnter={() => setActiveIndex(index)}
+              onClick={() => selectProject(project.id)}
+            >
+              {project.id === selectedProjectId && <span className="project-option-indicator" />}
+              {project.name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ModeSwitch({
   mode,
   compact = false,
@@ -2628,11 +2813,11 @@ function ModeSwitch({
   onChange: (mode: WorkflowMode) => void;
 }) {
   return (
-    <div className={compact ? "mode-switch compact" : "mode-switch"} role="group" aria-label="Mode">
-      <button className={mode === "fast" ? "active" : ""} onClick={() => onChange("fast")} type="button">
+    <div className={`stamp-toggle ${compact ? "compact" : ""}`} role="group" aria-label="Mode">
+      <button className={`stamp-btn fast-stamp ${mode === "fast" ? "active" : ""}`} onClick={() => onChange("fast")} type="button">
         Fast
       </button>
-      <button className={mode === "plan" ? "active" : ""} onClick={() => onChange("plan")} type="button">
+      <button className={`stamp-btn plan-stamp ${mode === "plan" ? "active" : ""}`} onClick={() => onChange("plan")} type="button">
         Plan
       </button>
     </div>
