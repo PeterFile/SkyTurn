@@ -54,5 +54,9 @@ describe("workspace persistence compatibility", () => {
     if (session?.kind !== "canvas") return;
     expect(session.hermesPlannerSessionId).toBe("hermes-planner-session-1");
     expect(session.plannerNodeId).toBe("node-1");
+    expect(session.target).toEqual({
+      executionTarget: "current_branch",
+      selectedBranch: "HEAD",
+    });
   });
 });

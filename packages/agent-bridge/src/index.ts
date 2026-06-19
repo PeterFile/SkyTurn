@@ -21,6 +21,7 @@ import {
   type RunEvent,
   type RunEvidence,
   type StartAgentRunInput,
+  type StructuredRunChange,
 } from "@skyturn/project-core";
 import type { FlowEvent } from "@skyturn/workflow-kernel";
 
@@ -36,6 +37,7 @@ const commandCandidates: Record<AgentKind, string[]> = {
 const defaultKillTimeoutMs = 5_000;
 const defaultStallTelemetryMs = 60_000;
 const defaultRunWatchdogTimeoutMs = 30 * 60_000;
+const maxStructuredChangeDiffBytes = 64_000;
 
 interface AgentRunWatchdogPolicy {
   source: AgentKind;
@@ -1072,6 +1074,7 @@ function codexStdoutLineToDrafts(line: string): RunEventDraft[] {
   }
 
   const eventType = typeof event.type === "string" ? event.type : "unknown";
+  const structuredChanges = codexStructuredChangesDraft(event, eventType);
   if (eventType === "thread.started") {
     return [
       {
@@ -1088,11 +1091,15 @@ function codexStdoutLineToDrafts(line: string): RunEventDraft[] {
     return [{ kind: "status", payload: { status: "running", source: "codex", eventType } }];
   }
   if (eventType === "turn.completed") {
+    if (structuredChanges) {
+      return [structuredChanges, { kind: "progress", payload: { source: "codex", eventType, usage: event.usage ?? null } }];
+    }
     return [{ kind: "progress", payload: { source: "codex", eventType, usage: event.usage ?? null } }];
   }
   if (eventType === "item.completed") {
     const text = getCodexAgentMessage(event);
     if (text) return [{ kind: "output", payload: { source: "codex", text } }];
+    if (structuredChanges) return [structuredChanges];
     return [{ kind: "progress", payload: { source: "codex", eventType, itemType: getNestedString(event, "item", "type") } }];
   }
   if (eventType === "error" || eventType === "turn.failed") {
@@ -1103,7 +1110,135 @@ function codexStdoutLineToDrafts(line: string): RunEventDraft[] {
       },
     ];
   }
+  if (structuredChanges) return [structuredChanges];
   return [{ kind: "progress", payload: { source: "codex", eventType } }];
+}
+
+function codexStructuredChangesDraft(event: Record<string, unknown>, eventType: string): RunEventDraft | null {
+  const changes = extractCodexStructuredChanges(event);
+  if (changes.length === 0) return null;
+  const files = [...new Set(changes.flatMap((change) => [change.previousPath, change.path]).filter((file): file is string => Boolean(file)))];
+  const patchPreview = changes
+    .map((change) => change.unifiedDiff)
+    .filter((diff): diff is string => Boolean(diff))
+    .join("\n");
+  const boundedPatchPreview = boundStructuredDiff(patchPreview);
+  return {
+    kind: "changes",
+    payload: {
+      source: "codex",
+      status: "available",
+      eventType,
+      files,
+      changes,
+      ...(boundedPatchPreview.value ? { patchPreview: boundedPatchPreview.value } : {}),
+      ...(boundedPatchPreview.truncated ? { patchPreviewTruncated: true } : {}),
+    },
+  };
+}
+
+function extractCodexStructuredChanges(event: Record<string, unknown>): StructuredRunChange[] {
+  const candidates = [
+    event.item,
+    event.patch,
+    event.diff,
+    event.file_change,
+    event.fileChange,
+    event.turn_diff,
+    event.turnDiff,
+    event,
+  ].filter(isRecord);
+  const changes: StructuredRunChange[] = [];
+  for (const candidate of candidates) {
+    const nestedChanges = arrayField(candidate, "changes") ?? arrayField(candidate, "file_changes") ?? arrayField(candidate, "fileChanges");
+    if (nestedChanges) {
+      for (const nested of nestedChanges) {
+        if (isRecord(nested)) {
+          const change = structuredChangeFromRecord(nested);
+          if (change) changes.push(change);
+        }
+      }
+    }
+    const change = structuredChangeFromRecord(candidate);
+    if (change) changes.push(change);
+  }
+  return dedupeStructuredChanges(changes);
+}
+
+function structuredChangeFromRecord(record: Record<string, unknown>): StructuredRunChange | null {
+  const itemType = stringField(record, "type");
+  const hasStructuredType = itemType === "file_change" || itemType === "patch" || itemType === "turn_diff";
+  const operation = normalizeChangeOperation(
+    stringField(record, "operation") ??
+      stringField(record, "kind") ??
+      stringField(record, "change_type") ??
+      stringField(record, "status"),
+  );
+  const path =
+    stringField(record, "path") ??
+    stringField(record, "file") ??
+    stringField(record, "file_path") ??
+    stringField(record, "target_path") ??
+    stringField(record, "new_path");
+  const unifiedDiff =
+    stringField(record, "unifiedDiff") ??
+    stringField(record, "unified_diff") ??
+    stringField(record, "diff") ??
+    stringField(record, "patch");
+  const boundedUnifiedDiff = unifiedDiff ? boundStructuredDiff(unifiedDiff).value : null;
+  if (!path || (!operation && !unifiedDiff && !hasStructuredType)) return null;
+  const previousPath =
+    stringField(record, "previousPath") ??
+    stringField(record, "previous_path") ??
+    stringField(record, "old_path") ??
+    stringField(record, "source_path") ??
+    stringField(record, "from");
+  return {
+    operation: operation ?? "update",
+    path,
+    ...(previousPath ? { previousPath } : {}),
+    ...(boundedUnifiedDiff ? { unifiedDiff: boundedUnifiedDiff } : {}),
+  };
+}
+
+function boundStructuredDiff(value: string): { value: string; truncated: boolean } {
+  if (!value || Buffer.byteLength(value) <= maxStructuredChangeDiffBytes) return { value, truncated: false };
+  let output = "";
+  for (const char of value) {
+    if (Buffer.byteLength(`${output}${char}\n[diff truncated]\n`) > maxStructuredChangeDiffBytes) break;
+    output += char;
+  }
+  return { value: `${output.trimEnd()}\n[diff truncated]\n`, truncated: true };
+}
+
+function normalizeChangeOperation(value: string | null): StructuredRunChange["operation"] | null {
+  const normalized = value?.toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "add" || normalized === "added" || normalized === "create" || normalized === "created") return "add";
+  if (normalized === "delete" || normalized === "deleted" || normalized === "remove" || normalized === "removed") return "delete";
+  if (normalized === "move" || normalized === "moved" || normalized === "rename" || normalized === "renamed") return "move";
+  if (normalized === "update" || normalized === "updated" || normalized === "modify" || normalized === "modified" || normalized === "change") return "update";
+  return null;
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function arrayField(record: Record<string, unknown>, key: string): unknown[] | null {
+  const value = record[key];
+  return Array.isArray(value) ? value : null;
+}
+
+function dedupeStructuredChanges(changes: StructuredRunChange[]): StructuredRunChange[] {
+  const seen = new Set<string>();
+  return changes.filter((change) => {
+    const key = `${change.operation}:${change.previousPath ?? ""}:${change.path}:${change.unifiedDiff ?? ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function createQueuedRunEventEmitter(sink: RunEventSink): {

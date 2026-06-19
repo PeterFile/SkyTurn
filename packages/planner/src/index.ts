@@ -1,5 +1,6 @@
 import {
   makeHermesPlannerSessionId,
+  normalizeSessionTarget,
   type AgentKind,
   type CanvasEdge,
   type CanvasNode,
@@ -8,12 +9,15 @@ import {
   type NodeRuntimeState,
   type PlanMarkdown,
   type PlanSession,
+  type SessionTarget,
+  type WorktreeMetadata,
 } from "@skyturn/project-core";
 
 interface CreateSessionInput {
   projectId: string;
   goal: string;
   createdAt: string;
+  target?: SessionTarget;
 }
 
 interface TaskSeed {
@@ -121,6 +125,7 @@ export function createFastCanvasSession(input: CreateSessionInput): CanvasSessio
 
 export function createPlanSession(input: CreateSessionInput): PlanSession {
   const sessionId = makeSessionId("plan", input.createdAt);
+  const target = normalizeSessionTarget(input.target);
   return {
     id: sessionId,
     projectId: input.projectId,
@@ -128,6 +133,7 @@ export function createPlanSession(input: CreateSessionInput): PlanSession {
     goal: input.goal,
     mode: "plan",
     kind: "plan",
+    target,
     createdAt: input.createdAt,
     updatedAt: input.createdAt,
     plan,
@@ -143,6 +149,7 @@ export function convertPlanToCanvas(session: PlanSession): CanvasSession {
       projectId: session.projectId,
       goal: session.goal,
       createdAt: session.createdAt,
+      target: session.target,
     },
     sessionId: session.id,
     mode: "plan",
@@ -164,11 +171,13 @@ function createCanvasSession({
   seeds: TaskSeed[];
   title: string;
 }): CanvasSession {
+  const target = normalizeSessionTarget(input.target);
   const nodes = seeds.map((seed, index) =>
     createNode({
       seed,
       input,
       sessionId,
+      target,
       status: seed.status ?? (index === 0 ? "running" : "pending"),
       relatedTasks: mode === "plan" ? plan.tasks : "Mock Hermes graph",
     }),
@@ -180,6 +189,7 @@ function createCanvasSession({
     goal: input.goal,
     mode,
     kind: "canvas",
+    target,
     hermesPlannerSessionId: makeHermesPlannerSessionId(sessionId),
     plannerNodeId:
       nodes.find((node) => node.agent === "hermes" && node.context.dependencies.length === 0)?.id ??
@@ -197,12 +207,14 @@ function createNode({
   seed,
   input,
   sessionId,
+  target,
   status,
   relatedTasks,
 }: {
   seed: TaskSeed;
   input: CreateSessionInput;
   sessionId: string;
+  target: SessionTarget;
   status: CanvasNode["status"];
   relatedTasks: string;
 }): CanvasNode {
@@ -218,11 +230,7 @@ function createNode({
     runId: `run-${sessionId}-${seed.id}`,
     changesetId: `changeset-${sessionId}-${seed.id}`,
     output: seed.agent === "hermes" ? ["Hermes accepted the session goal."] : [],
-    worktree: {
-      path: `../${input.projectId}.worktrees/session-${sessionId}-task-${seed.id}`,
-      branchName: `skyturn/${sessionId}/${seed.id}`,
-      baseCommit: "mock-base-commit",
-    },
+    worktree: worktreeForNode(target, sessionId, seed.id),
     context: {
       brief: seed.brief,
       sessionGoal: input.goal,
@@ -237,6 +245,30 @@ function createNode({
         "Completion requires concrete verification evidence.",
       ],
     },
+  };
+}
+
+function worktreeForNode(target: SessionTarget, sessionId: string, nodeId: string): WorktreeMetadata {
+  if (target.executionTarget === "new_worktree") {
+    return {
+      path: ".",
+      branchName: target.selectedBranch,
+      baseCommit: target.baseRef ?? target.selectedBranch,
+      executionTarget: target.executionTarget,
+      selectedBranch: target.selectedBranch,
+      ...(target.baseRef ? { baseRef: target.baseRef } : {}),
+      baselineRef: target.baseRef ?? target.selectedBranch,
+      worktreeId: `worktree-${sessionId}-${nodeId}`,
+      variantId: `variant-${sessionId}-${nodeId}`,
+    };
+  }
+  return {
+    path: ".",
+    branchName: target.selectedBranch,
+    baseCommit: target.selectedBranch,
+    executionTarget: target.executionTarget,
+    selectedBranch: target.selectedBranch,
+    baselineRef: target.selectedBranch,
   };
 }
 

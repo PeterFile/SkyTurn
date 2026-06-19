@@ -35,10 +35,11 @@ export type AgentRunStatus =
   | "cancelled"
   | "timed-out";
 export type AgentRunSandbox = "read-only" | "workspace-write" | "danger-full-access";
-export type RunEventKind = "output" | "status" | "error" | "approval" | "progress" | "evidence";
+export type RunEventKind = "output" | "status" | "error" | "approval" | "progress" | "evidence" | "changes";
 export type EvidenceCheckStatus = "passed" | "failed" | "skipped";
 export type EvidenceCheckKind = "run-exit" | "run-timeout" | "git" | "test" | "typecheck" | "build" | "review";
 export type HermesPlannerTransport = "hermes_live_chat" | "hermes_session_resume" | "hermes_replay_recovery";
+export type SessionExecutionTarget = "current_branch" | "new_worktree";
 export type WorkflowLaneKind =
   | "discovery"
   | "design"
@@ -72,9 +73,15 @@ export type UserDecisionNodeStatus = "waiting_input" | "answered";
 export type WorkflowVariantAdoptionStrategy = "merge" | "cherry-pick";
 export type WorkflowVariantAdoptionStatus = "requested" | "adopted" | "failed" | "rejected";
 export type ChangesetEvidenceStatus = "available" | "empty" | "failed" | "unknown";
+export type LiveRunChangeOperation = "add" | "delete" | "update" | "move";
+export type FinalChangesetReconciliationStatus = "available" | "empty" | "failed" | "mismatch";
 
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
 export const RUN_EVENT_PROTOCOL_VERSION = 1;
+export const DEFAULT_SESSION_TARGET: SessionTarget = {
+  executionTarget: "current_branch",
+  selectedBranch: "HEAD",
+};
 export const WORKFLOW_LANE_KINDS: WorkflowLaneKind[] = [
   "discovery",
   "design",
@@ -186,10 +193,20 @@ export interface PlanMarkdown {
   tasks: string;
 }
 
+export interface SessionTarget {
+  executionTarget: SessionExecutionTarget;
+  selectedBranch: string;
+  baseRef?: string;
+}
+
 export interface WorktreeMetadata {
   path: string;
   branchName: string;
   baseCommit: string;
+  executionTarget?: SessionExecutionTarget;
+  selectedBranch?: string;
+  baseRef?: string;
+  baselineRef?: string;
   worktreeId?: string;
   variantId?: string;
   realPath?: string;
@@ -294,6 +311,48 @@ export interface ChangesetEvidence {
   errorReason?: string;
 }
 
+export interface StructuredRunChange {
+  operation: LiveRunChangeOperation;
+  path: string;
+  previousPath?: string;
+  unifiedDiff?: string;
+}
+
+export interface LiveRunChangesEvidence {
+  source: "codex";
+  status: "available" | "unknown";
+  files: string[];
+  changes: StructuredRunChange[];
+  patchPreview?: string;
+  patchPreviewTruncated?: boolean;
+  collectedAt?: string;
+}
+
+export interface ChangesetReconciliationMetadata {
+  source: "git";
+  executionTarget: SessionExecutionTarget;
+  selectedBranch: string;
+  baselineRef: string;
+  baseRef?: string;
+  worktreeId?: string;
+  variantId?: string;
+}
+
+export interface ChangesetReconciliationMismatch {
+  kind: "file-set";
+  liveFiles: string[];
+  gitFiles: string[];
+}
+
+export interface FinalChangesetReconciliation {
+  status: FinalChangesetReconciliationStatus;
+  changeset: Changeset;
+  metadata: ChangesetReconciliationMetadata;
+  liveChanges?: LiveRunChangesEvidence;
+  mismatches?: ChangesetReconciliationMismatch[];
+  errorReason?: string;
+}
+
 export interface CanvasNodeContext {
   brief: string;
   sessionGoal: string;
@@ -364,6 +423,7 @@ export interface SessionBase {
   title: string;
   goal: string;
   mode: WorkflowMode;
+  target: SessionTarget;
   createdAt: string;
   updatedAt: string;
 }
@@ -414,6 +474,25 @@ export function makeHermesPlannerSessionId(sessionId: string): string {
   return `hermes-planner-${sessionId}`;
 }
 
+export function normalizeSessionTarget(value: unknown, fallbackSelectedBranch = "HEAD"): SessionTarget {
+  const fallback = cleanSessionRef(fallbackSelectedBranch) || DEFAULT_SESSION_TARGET.selectedBranch;
+  if (!isRecord(value)) return { ...DEFAULT_SESSION_TARGET, selectedBranch: fallback };
+  const executionTarget = value.executionTarget === "new_worktree" ? "new_worktree" : "current_branch";
+  const selectedBranch = cleanSessionRef(value.selectedBranch);
+  if (executionTarget === "current_branch") {
+    return {
+      executionTarget,
+      selectedBranch: selectedBranch || fallback,
+    };
+  }
+  const baseRef = cleanSessionRef(value.baseRef) || selectedBranch || fallback;
+  return {
+    executionTarget,
+    selectedBranch: selectedBranch || baseRef,
+    baseRef,
+  };
+}
+
 export function deriveNodeStatusFromEvidence(
   run: AgentRun | null | undefined,
   evidence: RunEvidence | null | undefined,
@@ -427,4 +506,12 @@ export function deriveNodeStatusFromEvidence(
     return hasConcreteRunEvidence(evidence) ? "completed" : "failed";
   }
   return "failed";
+}
+
+function cleanSessionRef(value: unknown): string {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : "";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }

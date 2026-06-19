@@ -108,7 +108,6 @@ describe("SkyTurn UI style tokens", () => {
 
     expect(composerSource).toContain('"new-session-intake"');
     expect(composerSource).toContain("<ProjectDropdown");
-    expect(composerSource).not.toContain("<select");
     expect(composerSource).toContain("rows={5}");
     expect(appSource).toContain("function ProjectDropdown");
     expect(appSource).toContain('aria-haspopup="listbox"');
@@ -178,9 +177,9 @@ describe("SkyTurn UI style tokens", () => {
     const appSource = await readSource("./App.tsx");
     const persistenceSource = await readSource("../../persistence/src/index.ts");
 
-    expect(appSource).toContain("getChangeset");
+    expect(appSource).toContain("reconcileFinalChangeset");
     expect(appSource).toContain("No available change evidence.");
-    expect(persistenceSource).toContain("getChangeset");
+    expect(persistenceSource).toContain("reconcileFinalChangeset");
     expect(appSource).not.toContain("mockChangesetService");
     expect(appSource).not.toContain("createMockChangeset");
   });

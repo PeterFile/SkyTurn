@@ -4,9 +4,11 @@ import {
   AGENT_SUPPORT_LEVELS,
   EVIDENCE_CHECK_KINDS,
   RUN_EVENT_PROTOCOL_VERSION,
+  normalizeSessionTarget,
   WORKFLOW_LANE_KINDS,
   deriveNodeStatusFromEvidence,
   hasConcreteRunEvidence,
+  type FinalChangesetReconciliation,
   type AgentDescriptor,
   type AgentRun,
   type CanvasNode,
@@ -18,6 +20,8 @@ import {
   type UserDecisionRequestedPayload,
   type WorkflowLedgerSummary,
   type WorkflowRuntimePolicy,
+  type LiveRunChangesEvidence,
+  type SessionTarget,
   type WorkflowVariantAdoption,
   type WorkflowWorktreeIdentity,
 } from "./index";
@@ -51,6 +55,72 @@ describe("agent run contracts", () => {
 
     expect(event.protocolVersion).toBe(1);
     expect(event.seq).toBe(1);
+  });
+
+  it("models session execution targets and normalizes old sessions to current branch", () => {
+    const currentBranch = normalizeSessionTarget(null);
+    const explicitCurrentBranch: SessionTarget = normalizeSessionTarget({
+      executionTarget: "current_branch",
+      selectedBranch: "feature/session-target",
+      baseRef: "main",
+    });
+    const newWorktree: SessionTarget = normalizeSessionTarget({
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+    });
+
+    expect(currentBranch).toEqual({
+      executionTarget: "current_branch",
+      selectedBranch: "HEAD",
+    });
+    expect(explicitCurrentBranch).toEqual({
+      executionTarget: "current_branch",
+      selectedBranch: "feature/session-target",
+    });
+    expect(newWorktree).toEqual({
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+    });
+  });
+
+  it("publishes structured live changes and final git reconciliation contracts", () => {
+    const liveChanges: LiveRunChangesEvidence = {
+      source: "codex",
+      status: "available",
+      files: ["src/index.ts"],
+      changes: [
+        {
+          operation: "update",
+          path: "src/index.ts",
+          unifiedDiff: "diff --git a/src/index.ts b/src/index.ts",
+        },
+      ],
+      collectedAt: "2026-06-19T00:00:00.000Z",
+    };
+    const reconciliation: FinalChangesetReconciliation = {
+      status: "mismatch",
+      changeset: {
+        id: "changeset-1",
+        files: ["src/other.ts"],
+        diffStat: { added: 1, changed: 0, deleted: 0 },
+        patchPreview: "diff --git a/src/other.ts b/src/other.ts",
+        source: "git",
+      },
+      metadata: {
+        source: "git",
+        executionTarget: "current_branch",
+        selectedBranch: "main",
+        baselineRef: "main",
+      },
+      liveChanges,
+      mismatches: [{ kind: "file-set", liveFiles: ["src/index.ts"], gitFiles: ["src/other.ts"] }],
+    };
+
+    expect(liveChanges.changes[0]?.operation).toBe("update");
+    expect(reconciliation.status).toBe("mismatch");
+    expect(reconciliation.liveChanges?.files).toEqual(["src/index.ts"]);
   });
 
   it("allows run-timeout evidence checks for hard watchdog expiry", () => {

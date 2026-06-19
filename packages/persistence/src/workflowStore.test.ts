@@ -32,8 +32,8 @@ describe("SQLite workflow store", () => {
     expect(first.databasePath).toBe(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
     expect(pragmas.journalMode).toBe("wal");
     expect(pragmas.foreignKeys).toBe(1);
-    expect(firstMigrations).toEqual([1]);
-    expect(second.listAppliedMigrations()).toEqual([1]);
+    expect(firstMigrations).toEqual([1, 2]);
+    expect(second.listAppliedMigrations()).toEqual([1, 2]);
     second.close();
   });
 
@@ -74,6 +74,79 @@ describe("SQLite workflow store", () => {
         status: "running",
       },
     ]);
+  });
+
+  it("persists default current branch session target facts", async () => {
+    const store = await makeStore();
+
+    const session = store.createWorkflowSession({
+      id: "session-1",
+      projectId: "project-1",
+      title: "Persisted workflow",
+      goal: "Implement on current branch",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Hermes live chat handle was not available during test setup.",
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    const canvasSession = store.materializeCanvasSession("session-1");
+    const started = store.listEvents("session-1").find((event) => event.kind === "hermes_session_started");
+
+    expect(session.target).toEqual({
+      executionTarget: "current_branch",
+      selectedBranch: "HEAD",
+    });
+    expect(canvasSession?.target).toEqual(session.target);
+    expect(canvasSession?.nodes[0]?.worktree).toMatchObject({
+      path: ".",
+      branchName: "HEAD",
+      baseCommit: "HEAD",
+      executionTarget: "current_branch",
+      selectedBranch: "HEAD",
+    });
+    expect(started?.payload.target).toEqual(session.target);
+  });
+
+  it("persists new worktree target metadata without claiming a created worktree", async () => {
+    const store = await makeStore();
+
+    const session = store.createWorkflowSession({
+      id: "session-1",
+      projectId: "project-1",
+      title: "Persisted workflow",
+      goal: "Implement in candidate worktree",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Hermes live chat handle was not available during test setup.",
+      target: {
+        executionTarget: "new_worktree",
+        selectedBranch: "main",
+        baseRef: "origin/main",
+      },
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    const canvasSession = store.materializeCanvasSession("session-1");
+    const planner = canvasSession?.nodes.find((node) => node.id === canvasSession.plannerNodeId);
+
+    expect(session.target).toEqual({
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+    });
+    expect(planner?.worktree).toMatchObject({
+      path: ".",
+      branchName: "main",
+      baseCommit: "origin/main",
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+      worktreeId: "worktree-session-1-node-1",
+      variantId: "variant-session-1-node-1",
+    });
+    expect(planner?.worktree.realPath).toBeUndefined();
+    expect(planner?.worktree.gitdir).toBeUndefined();
   });
 
   it("materializes the SQLite planner root before any WorkflowIntent projection nodes exist", async () => {

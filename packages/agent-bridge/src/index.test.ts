@@ -298,6 +298,57 @@ describe("agent bridge", () => {
     expect(evidence.exitCode).toBe(0);
   });
 
+  it("maps Codex structured file changes to change events without treating agent prose as truth", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"I changed src/prose.ts\"}}\\n');",
+        "process.stdout.write(JSON.stringify({type:\"item.completed\",item:{type:\"file_change\",operation:\"update\",path:\"src/index.ts\",diff:\"diff --git a/src/index.ts b/src/index.ts\"}}) + \"\\n\");",
+        "process.stdout.write(JSON.stringify({type:\"turn.diff\",changes:[{operation:\"add\",path:\"src/new.ts\",unified_diff:\"diff --git a/src/new.ts b/src/new.ts\"}]}) + \"\\n\");",
+        "process.stdout.write('{\"type\":\"turn.completed\"}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-changes",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+    await completed;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const changeEvents = events.filter((event) => event.kind === "changes");
+    const changedFiles = changeEvents.flatMap((event) => event.payload.files as string[]);
+
+    expect(events.find((event) => event.kind === "output")?.payload.text).toBe("I changed src/prose.ts");
+    expect(changedFiles).toEqual(["src/index.ts", "src/new.ts"]);
+    expect(JSON.stringify(changeEvents)).not.toContain("src/prose.ts");
+    expect(changeEvents[0]?.payload.changes).toEqual([
+      {
+        operation: "update",
+        path: "src/index.ts",
+        unifiedDiff: "diff --git a/src/index.ts b/src/index.ts",
+      },
+    ]);
+  });
+
   it("runs Codex from the canonical workdir so sandboxed git writes can reach .git", async () => {
     const root = await makeTempRoot();
     const projectRoot = join(root, "project");

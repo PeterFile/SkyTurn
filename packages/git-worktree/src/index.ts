@@ -2,9 +2,12 @@ import type {
   CanvasNode,
   Changeset,
   ChangesetEvidence,
+  FinalChangesetReconciliation,
+  LiveRunChangesEvidence,
   EvidenceCheck,
   EvidenceCheckStatus,
   RunEvidence,
+  SessionTarget,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
   WorktreeMetadata,
@@ -33,6 +36,22 @@ export interface WorktreeService {
 
 export interface ChangesetService {
   getChangeset(node: CanvasNode): Promise<Changeset>;
+}
+
+export interface ChangesetReconciliationInput {
+  node: CanvasNode;
+  target: SessionTarget;
+  baselineRef?: string;
+  liveChanges?: LiveRunChangesEvidence | null;
+}
+
+export interface ChangesetReconciliationService {
+  reconcileFinalChangeset(input: ChangesetReconciliationInput): Promise<FinalChangesetReconciliation>;
+}
+
+export interface GitBranchFacts {
+  currentBranch: string;
+  branches: string[];
 }
 
 export interface ManagedWorktreeCreateInput {

@@ -80,6 +80,8 @@ Flow Kernel implementation lanes may pass a per-run `sandbox: "workspace-write"`
 
 Codex stdout is parsed as newline-delimited JSON when possible. `item.completed` events with `agent_message` text become SkyTurn `output` events. Non-JSON stdout and stderr become `progress` events. Process exit creates `RunEvidence`; `turn.completed` is progress only and does not mark a node complete.
 
+For code-change display, the adapter should prefer structured Codex change events over text. The design target follows Codex TUI: patch/file-change events and per-turn diff events feed the live Changes view, while git-backed reconciliation supplies final changeset evidence.
+
 ## Roadmap
 
 - P0: contracts, bridge skeleton, mock runs, discovery with `supportLevel`, durable event log, docs.

@@ -66,6 +66,36 @@ interface WorkflowRecordRunResultInput {
   now?: unknown;
 }
 
+interface WorkflowFinalChangesetInput {
+  node?: unknown;
+  target?: unknown;
+  baselineRef?: unknown;
+  runEvents?: unknown;
+}
+
+interface FinalSessionTarget {
+  executionTarget: "current_branch" | "new_worktree";
+  selectedBranch: string;
+  baseRef?: string;
+}
+
+interface StructuredRunChange {
+  operation: "add" | "delete" | "update" | "move";
+  path: string;
+  previousPath?: string;
+  unifiedDiff?: string;
+}
+
+interface LiveRunChangesEvidence {
+  source: "codex";
+  status: "available";
+  files: string[];
+  changes: StructuredRunChange[];
+  patchPreview?: string;
+  patchPreviewTruncated?: boolean;
+  collectedAt?: string;
+}
+
 interface FlowProjectionLike {
   projectionNodes: Array<{
     id: string;
@@ -177,6 +207,14 @@ ipcMain.handle("project:initDevflow", async (_event, rootPath: string) => {
     }
   }
   return { ok: true, devflowPath: path.join(rootPath, ".devflow") };
+});
+
+ipcMain.handle("project:branchFacts", async (_event, projectRoot: string) => {
+  assertKnownProjectRoot(projectRoot);
+  const { getGitBranchFacts } = await import("@skyturn/git-worktree/node");
+  const realProjectRoot = await fs.realpath(projectRoot).catch(() => projectRoot);
+  const facts = await getGitBranchFacts(realProjectRoot);
+  return { protocolVersion: RUN_PROTOCOL_VERSION, ...facts };
 });
 
 ipcMain.handle("editor:openWorktree", async (_event, editor: string, worktreePath: string) => {
@@ -313,6 +351,27 @@ ipcMain.handle("changeset:get", async (_event, projectRoot: string, node: unknow
   const changeset = await service.getChangeset(normalizedNode);
   return { protocolVersion: RUN_PROTOCOL_VERSION, changeset };
 });
+
+ipcMain.handle("workflow:changeset:reconcileFinal", workflowHandler(async (projectRoot: string, input: WorkflowFinalChangesetInput) => {
+  assertKnownProjectRoot(projectRoot);
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Final changeset input must be an object.");
+  if (!isRecord(input.target)) throw workflowIpcError("INVALID_INPUT", "Canvas session target is required.");
+  const { createGitChangesetService } = await import("@skyturn/git-worktree/node");
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const service = createGitChangesetService({ repoRoot: realProjectRoot });
+  type ReconcileInput = Parameters<typeof service.reconcileFinalChangeset>[0];
+  const node = await normalizeChangesetNodeForProject(realProjectRoot, input.node) as ReconcileInput["node"];
+  const target = normalizeFinalSessionTarget(input.target) as ReconcileInput["target"];
+  const liveChanges = liveChangesFromRunEvents(input.runEvents) as ReconcileInput["liveChanges"];
+  const baselineRef = optionalText(input.baselineRef);
+  const reconciliation = await service.reconcileFinalChangeset({
+    node,
+    target,
+    ...(baselineRef ? { baselineRef } : {}),
+    ...(liveChanges ? { liveChanges } : {}),
+  });
+  return { protocolVersion: RUN_PROTOCOL_VERSION, reconciliation };
+}));
 
 ipcMain.handle("workflow:applyIntent", async (_event, projectRoot: string, intent: { sessionId?: unknown }) => {
   assertKnownProjectRoot(projectRoot);
@@ -621,6 +680,87 @@ function summarizeRunOutput(events: unknown[]): string | undefined {
     .trim();
   if (!output) return undefined;
   return output.length > 1_000 ? output.slice(0, 1_000) : output;
+}
+
+function liveChangesFromRunEvents(value: unknown): LiveRunChangesEvidence | null {
+  if (!Array.isArray(value)) return null;
+  const changes: StructuredRunChange[] = [];
+  const files: string[] = [];
+  const patchPreviewParts: string[] = [];
+  let patchPreviewTruncated = false;
+  let collectedAt: string | undefined;
+
+  for (const event of value) {
+    if (!isRecord(event) || event.kind !== "changes" || !isRecord(event.payload)) continue;
+    const payload = event.payload;
+    if (payload.source !== "codex" || payload.status !== "available") continue;
+    const eventChanges = structuredRunChangesFromValue(payload.changes);
+    if (eventChanges.length === 0) continue;
+    changes.push(...eventChanges);
+    if (Array.isArray(payload.files)) {
+      files.push(...payload.files.filter((file): file is string => typeof file === "string" && file.trim().length > 0));
+    }
+    files.push(...eventChanges.flatMap((change) => [change.previousPath, change.path]).filter((file): file is string => Boolean(file)));
+    if (typeof payload.patchPreview === "string" && payload.patchPreview) patchPreviewParts.push(payload.patchPreview);
+    if (payload.patchPreviewTruncated === true) patchPreviewTruncated = true;
+    if (typeof event.timestamp === "string") collectedAt = event.timestamp;
+  }
+
+  const dedupedChanges = dedupeStructuredRunChanges(changes);
+  if (dedupedChanges.length === 0) return null;
+  const patchPreview = patchPreviewParts.join("\n");
+  return {
+    source: "codex",
+    status: "available",
+    files: uniqueStrings(files),
+    changes: dedupedChanges,
+    ...(patchPreview ? { patchPreview: truncatePatch(patchPreview) } : {}),
+    ...(patchPreviewTruncated || patchPreview.length > 12000 ? { patchPreviewTruncated: true } : {}),
+    ...(collectedAt ? { collectedAt } : {}),
+  };
+}
+
+function normalizeFinalSessionTarget(value: Record<string, unknown>): FinalSessionTarget {
+  const executionTarget = value.executionTarget === "new_worktree" ? "new_worktree" : "current_branch";
+  const selectedBranch = optionalText(value.selectedBranch) ?? "HEAD";
+  if (executionTarget === "current_branch") return { executionTarget, selectedBranch };
+  const baseRef = optionalText(value.baseRef) ?? selectedBranch;
+  return { executionTarget, selectedBranch, baseRef };
+}
+
+function structuredRunChangesFromValue(value: unknown): StructuredRunChange[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(structuredRunChangeFromValue).filter((change): change is StructuredRunChange => Boolean(change));
+}
+
+function structuredRunChangeFromValue(value: unknown): StructuredRunChange | null {
+  if (!isRecord(value)) return null;
+  const operation = normalizeRunChangeOperation(value.operation);
+  const pathValue = optionalText(value.path);
+  if (!operation || !pathValue) return null;
+  const previousPath = optionalText(value.previousPath);
+  const unifiedDiff = optionalText(value.unifiedDiff);
+  return {
+    operation,
+    path: pathValue,
+    ...(previousPath ? { previousPath } : {}),
+    ...(unifiedDiff ? { unifiedDiff } : {}),
+  };
+}
+
+function normalizeRunChangeOperation(value: unknown): StructuredRunChange["operation"] | null {
+  if (value === "add" || value === "delete" || value === "update" || value === "move") return value;
+  return null;
+}
+
+function dedupeStructuredRunChanges(changes: StructuredRunChange[]): StructuredRunChange[] {
+  const seen = new Set<string>();
+  return changes.filter((change) => {
+    const key = `${change.operation}\0${change.previousPath ?? ""}\0${change.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function isWorkflowEventRecord(event: unknown): event is Record<string, unknown> & { kind: string } {

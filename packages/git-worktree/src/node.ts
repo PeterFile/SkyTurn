@@ -7,6 +7,7 @@ import type {
   CanvasNode,
   Changeset,
   ChangesetEvidence,
+  FinalChangesetReconciliation,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
   WorktreeMetadata,
@@ -16,7 +17,10 @@ import {
   buildAdjudicationMetrics,
   type ChangesetEvidenceInput,
   type ChangesetEvidenceService,
+  type ChangesetReconciliationInput,
+  type ChangesetReconciliationService,
   type ChangesetService,
+  type GitBranchFacts,
   type ManagedWorktreeCleanupInput,
   type ManagedWorktreeCleanupResult,
   type ManagedWorktreeCreateInput,
@@ -445,7 +449,7 @@ export interface GitChangesetServiceOptions {
 
 export function createGitChangesetService(
   options: GitChangesetServiceOptions = {},
-): ChangesetService & ChangesetEvidenceService {
+): ChangesetService & ChangesetEvidenceService & ChangesetReconciliationService {
   return new GitChangesetService(options);
 }
 
@@ -455,7 +459,23 @@ export function createGitVariantComparisonService(
   return new GitVariantComparisonService(options);
 }
 
-class GitChangesetService implements ChangesetService, ChangesetEvidenceService {
+export async function getGitBranchFacts(repoRoot: string): Promise<GitBranchFacts> {
+  const [branchResult, refsResult] = await Promise.all([
+    runGit(repoRoot, ["branch", "--show-current"], { allowFailure: true }),
+    runGit(repoRoot, ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { allowFailure: true }),
+  ]);
+  const currentBranch = branchResult.exitCode === 0 && branchResult.stdout ? branchResult.stdout : "HEAD";
+  const branches = unionSorted([
+    currentBranch,
+    ...(refsResult.exitCode === 0 ? stringLines(refsResult.stdout) : []),
+  ]);
+  return {
+    currentBranch,
+    branches: branches.length > 0 ? branches : ["HEAD"],
+  };
+}
+
+class GitChangesetService implements ChangesetService, ChangesetEvidenceService, ChangesetReconciliationService {
   constructor(private readonly options: GitChangesetServiceOptions) {}
 
   async getChangeset(node: CanvasNode): Promise<Changeset> {
@@ -495,6 +515,77 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService 
     }
     const changeset = await this.getChangeset(input.node);
     return changeset.evidence ?? this.evidenceFor(input.node, "unknown", [], changeset.diffStat, false);
+  }
+
+  async reconcileFinalChangeset(input: ChangesetReconciliationInput): Promise<FinalChangesetReconciliation> {
+    const baselineRef = input.baselineRef ?? input.node.worktree.baselineRef ?? input.node.worktree.baseCommit ?? input.target.baseRef ?? input.target.selectedBranch;
+    try {
+      const repoRoot = await this.resolveRepoRoot(input.node);
+      await assertGitWorktree(repoRoot);
+      await verifyGitRef(repoRoot, baselineRef);
+      const status = await git(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all", "--"]);
+      if (status.truncated) throw new Error("Git status output exceeded the changeset evidence limit.");
+      const statusLines = parseStatusLines(status.stdout);
+      const untrackedFiles = untrackedFilesFromStatus(statusLines);
+      const files = unionSorted([
+        ...stringLines((await git(repoRoot, ["diff", "--name-only", baselineRef, "--"])).stdout),
+        ...filesFromStatus(statusLines),
+      ]);
+      const diffStat = files.length === 0
+        ? { added: 0, changed: 0, deleted: 0 }
+        : await diffStatForRepo(repoRoot, files.length, untrackedFiles, baselineRef);
+      const patch = files.length === 0
+        ? { value: "", truncated: false }
+        : await diffPreviewForRepo(
+            repoRoot,
+            this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes,
+            untrackedFiles,
+            baselineRef,
+          );
+      const evidence = this.evidenceFor(input.node, files.length === 0 ? "empty" : "available", files, diffStat, patch.truncated);
+      const changeset: Changeset = {
+        id: input.node.changesetId,
+        files,
+        diffStat,
+        patchPreview: patch.value,
+        source: "git",
+        evidence,
+      };
+      const mismatches = mismatchAgainstLiveChanges(input.liveChanges, files);
+      return {
+        status: mismatches.length > 0 ? "mismatch" : evidence.status === "empty" ? "empty" : "available",
+        changeset,
+        metadata: {
+          source: "git",
+          executionTarget: input.target.executionTarget,
+          selectedBranch: input.target.selectedBranch,
+          baselineRef,
+          ...(input.target.baseRef ? { baseRef: input.target.baseRef } : {}),
+          ...(input.node.worktree.worktreeId ? { worktreeId: input.node.worktree.worktreeId } : {}),
+          ...(input.node.worktree.variantId ? { variantId: input.node.worktree.variantId } : {}),
+        },
+        ...(input.liveChanges ? { liveChanges: input.liveChanges } : {}),
+        ...(mismatches.length > 0 ? { mismatches } : {}),
+      };
+    } catch (error) {
+      const reason = boundedReason(error instanceof Error ? error.message : "Unable to reconcile git changeset.");
+      const changeset = this.failedChangeset(input.node, reason);
+      return {
+        status: "failed",
+        changeset,
+        metadata: {
+          source: "git",
+          executionTarget: input.target.executionTarget,
+          selectedBranch: input.target.selectedBranch,
+          baselineRef,
+          ...(input.target.baseRef ? { baseRef: input.target.baseRef } : {}),
+          ...(input.node.worktree.worktreeId ? { worktreeId: input.node.worktree.worktreeId } : {}),
+          ...(input.node.worktree.variantId ? { variantId: input.node.worktree.variantId } : {}),
+        },
+        ...(input.liveChanges ? { liveChanges: input.liveChanges } : {}),
+        errorReason: reason,
+      };
+    }
   }
 
   private async collectCommittedWorktreeEvidence(
@@ -678,6 +769,15 @@ async function verifyCommit(repoRoot: string, commit: string, label: string): Pr
   return (await runGit(repoRoot, ["rev-parse", "--verify", `${commit}^{commit}`])).stdout;
 }
 
+async function verifyGitRef(repoRoot: string, ref: string): Promise<string> {
+  validateGitRef(ref);
+  try {
+    return (await git(repoRoot, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
+  } catch (error) {
+    throw new Error(`Baseline ref does not resolve: ${ref}: ${errorMessage(error)}`);
+  }
+}
+
 async function validateSkyTurnBranch(repoRoot: string, branchName: string): Promise<void> {
   validateBranchName(branchName, { requireSkyTurnPrefix: true });
   await runGit(repoRoot, ["check-ref-format", "--branch", branchName]);
@@ -703,6 +803,12 @@ function validateBranchName(branchName: string, input: { requireSkyTurnPrefix: b
 function validateCommitHash(commit: string, label: string): void {
   if (!/^[0-9a-fA-F]{7,64}$/.test(commit)) {
     throw new Error(`Invalid ${label}: ${commit}.`);
+  }
+}
+
+function validateGitRef(ref: string): void {
+  if (!ref || ref.startsWith("-") || /[\s\0-\x1f]/.test(ref)) {
+    throw new Error(`Invalid baseline ref: ${ref}.`);
   }
 }
 
@@ -960,6 +1066,23 @@ function stringLines(output: string): string[] {
   return output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
+function unionSorted(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))].sort();
+}
+
+function mismatchAgainstLiveChanges(
+  liveChanges: ChangesetReconciliationInput["liveChanges"],
+  gitFiles: string[],
+): NonNullable<FinalChangesetReconciliation["mismatches"]> {
+  if (!liveChanges || liveChanges.status !== "available") return [];
+  const liveFiles = unionSorted(liveChanges.files);
+  const normalizedGitFiles = unionSorted(gitFiles);
+  if (liveFiles.length === normalizedGitFiles.length && liveFiles.every((file, index) => file === normalizedGitFiles[index])) {
+    return [];
+  }
+  return [{ kind: "file-set", liveFiles, gitFiles: normalizedGitFiles }];
+}
+
 function errorMessage(error: unknown): string {
   if (error instanceof GitCommandError && error.stderr) return truncate(error.stderr);
   if (error instanceof Error) return truncate(error.message);
@@ -979,8 +1102,9 @@ async function diffStatForRepo(
   repoRoot: string,
   changedFileCount: number,
   untrackedFiles: string[],
+  baselineRef = "HEAD",
 ): Promise<Changeset["diffStat"]> {
-  const output = await diffTextAgainstHead(repoRoot, ["--numstat"]);
+  const output = await diffTextAgainstRef(repoRoot, baselineRef, ["--numstat"]);
   let added = 0;
   let deleted = 0;
   for (const line of `${output}${await untrackedNumstat(repoRoot, untrackedFiles)}`.split(/\r?\n/)) {
@@ -996,8 +1120,9 @@ async function diffPreviewForRepo(
   repoRoot: string,
   maxPatchPreviewBytes: number,
   untrackedFiles: string[],
+  baselineRef = "HEAD",
 ): Promise<{ value: string; truncated: boolean }> {
-  const result = await diffTextAgainstHeadBounded(repoRoot, ["--no-ext-diff"], maxPatchPreviewBytes);
+  const result = await diffTextAgainstRefBounded(repoRoot, baselineRef, ["--no-ext-diff"], maxPatchPreviewBytes);
   if (result.truncated) return { value: `${result.stdout.trimEnd()}\n[diff truncated]\n`, truncated: true };
 
   let value = result.stdout;
@@ -1011,8 +1136,9 @@ async function diffPreviewForRepo(
   return { value, truncated: false };
 }
 
-async function diffTextAgainstHead(repoRoot: string, diffArgs: string[]): Promise<string> {
-  const args = ["diff", ...diffArgs, "HEAD", "--"];
+async function diffTextAgainstRef(repoRoot: string, baselineRef: string, diffArgs: string[]): Promise<string> {
+  validateGitRef(baselineRef);
+  const args = ["diff", ...diffArgs, baselineRef, "--"];
   try {
     const result = await git(repoRoot, args);
     return result.stdout;
@@ -1023,12 +1149,14 @@ async function diffTextAgainstHead(repoRoot: string, diffArgs: string[]): Promis
   }
 }
 
-async function diffTextAgainstHeadBounded(
+async function diffTextAgainstRefBounded(
   repoRoot: string,
+  baselineRef: string,
   diffArgs: string[],
   maxBytes: number,
 ): Promise<{ stdout: string; truncated: boolean }> {
-  const args = ["diff", ...diffArgs, "HEAD", "--"];
+  validateGitRef(baselineRef);
+  const args = ["diff", ...diffArgs, baselineRef, "--"];
   try {
     return await git(repoRoot, args, { maxBytes });
   } catch {

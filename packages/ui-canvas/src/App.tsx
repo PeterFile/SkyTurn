@@ -79,11 +79,14 @@ import {
   type CanvasSession,
   type CanvasSessionTab,
   type Changeset,
+  type FinalChangesetReconciliation,
   type ImportedProject,
   type NodeModalTab,
   type NodeRuntimeState,
   type NodeStatus,
   type PlanSession,
+  type RunEvent,
+  type SessionTarget,
   type UserDecisionAction,
   type WorkflowMode,
 } from "@skyturn/project-core";
@@ -350,8 +353,19 @@ export default function App() {
 
     const project = makeProject(result.project);
     const goal = initialGoal.trim();
+
+    let target: SessionTarget = { executionTarget: "current_branch", selectedBranch: "HEAD" };
+    if (window.devflow) {
+      try {
+        const facts = await window.devflow.getProjectBranchFacts(project.rootPath);
+        if (facts?.currentBranch) {
+          target.selectedBranch = facts.currentBranch;
+        }
+      } catch (e) {}
+    }
+
     const initialSession = goal
-      ? createSession(project.id, goal, initialMode)
+      ? createSession(project.id, goal, initialMode, target)
       : null;
     if (initialSession?.kind === "canvas") {
       await persistCanvasWorkflowSession(project, initialSession, "initial");
@@ -387,12 +401,12 @@ export default function App() {
     }));
   }
 
-  async function addSessionFromComposer() {
+  async function addSessionFromComposer(target: SessionTarget) {
     const goal = newTaskGoal.trim();
     if (!resolvedNewTaskProjectId || !goal) return;
     const projectId = resolvedNewTaskProjectId;
     const project = workspace.projects.find((item) => item.id === projectId);
-    const session = createSession(projectId, goal, newTaskMode);
+    const session = createSession(projectId, goal, newTaskMode, target);
     if (project && session.kind === "canvas") {
       await persistCanvasWorkflowSession(project, session, "composer");
     }
@@ -689,6 +703,8 @@ export default function App() {
         <NodeModal
           node={selectedNode}
           projectRoot={activeProject.rootPath}
+          session={activeSession}
+          runEvents={workspace.runEvents?.[selectedNode.runId] ?? []}
           tab={modalTab}
           onTab={setModalTab}
           onClose={() => setSelectedNodeId(null)}
@@ -925,7 +941,7 @@ function ProjectStartPage({
   onGoalChange: (goal: string) => void;
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
-  onCreate: () => void;
+  onCreate: (target: SessionTarget) => void;
 }) {
   return (
     <section className="empty-stage">
@@ -946,6 +962,12 @@ function ProjectStartPage({
       </div>
     </section>
   );
+}
+
+export function deriveSessionTarget(executionTarget: "current_branch" | "new_worktree", selectedBranch: string): SessionTarget {
+  return executionTarget === "current_branch"
+    ? { executionTarget, selectedBranch }
+    : { executionTarget, selectedBranch, baseRef: selectedBranch };
 }
 
 function SessionComposer({
@@ -971,12 +993,36 @@ function SessionComposer({
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
   onClose?: () => void;
-  onCreate: () => void;
+  onCreate: (target: SessionTarget) => void;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const hasGoal = goal.trim().length > 0;
   const canCreate = hasGoal && selectedProjectId !== null;
+
+  const [executionTarget, setExecutionTarget] = useState<"current_branch" | "new_worktree">("current_branch");
+  const [selectedBranch, setSelectedBranch] = useState<string>("HEAD");
+  const [branches, setBranches] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    const project = projects.find(p => p.id === selectedProjectId);
+    if (!project || !window.devflow) return;
+
+    let active = true;
+    window.devflow.getProjectBranchFacts(project.rootPath).then(facts => {
+      if (!active) return;
+      setBranches(facts.branches.length > 0 ? facts.branches : ["HEAD"]);
+      setSelectedBranch(facts.currentBranch || "HEAD");
+    }).catch(() => {
+      if (!active) return;
+      setBranches(["HEAD"]);
+      setSelectedBranch("HEAD");
+    });
+    return () => { active = false; };
+  }, [selectedProjectId, projects]);
+
+  const activeTarget = deriveSessionTarget(executionTarget, selectedBranch);
   const className = [
     "new-session-intake",
     variant === "inline" ? "inline-session-intake" : "",
@@ -1023,12 +1069,12 @@ function SessionComposer({
           rotation: -0.8,
           duration: 0.18,
           ease: "power2.in",
-          onComplete: onCreate,
+          onComplete: () => onCreate(activeTarget),
         });
         return;
       }
     }
-    onCreate();
+    onCreate(activeTarget);
   });
 
   return (
@@ -1084,6 +1130,33 @@ function SessionComposer({
           onChange={onProjectChange}
         />
         <ModeSwitch mode={mode} onChange={onModeChange} compact />
+
+        <div className="target-selector">
+          <div className="target-selector-controls">
+            <select
+              value={executionTarget}
+              onChange={e => setExecutionTarget(e.target.value as "current_branch" | "new_worktree")}
+              className="execution-target-select"
+            >
+              <option value="current_branch">Current branch</option>
+              <option value="new_worktree">New worktree</option>
+            </select>
+            <select
+              value={selectedBranch}
+              onChange={e => setSelectedBranch(e.target.value)}
+              className="branch-select"
+            >
+              {branches.map(b => <option key={b} value={b}>{b}</option>)}
+              {!branches.includes(selectedBranch) && <option value={selectedBranch}>{selectedBranch}</option>}
+            </select>
+          </div>
+          <span className="target-selector-hint">
+            {executionTarget === "current_branch"
+              ? "Develop directly on the selected branch."
+              : "Create a candidate worktree from the selected branch."}
+          </span>
+        </div>
+
         <span className="session-panel-spacer" />
         <button
           className="send-stamp-btn"
@@ -1936,6 +2009,8 @@ function runtimeMatchesStatus(runtime: NodeRuntimeState, status: NodeStatus): bo
 function NodeModal({
   node,
   projectRoot,
+  session,
+  runEvents,
   tab,
   onTab,
   onClose,
@@ -1948,6 +2023,8 @@ function NodeModal({
 }: {
   node: CanvasNode;
   projectRoot: string;
+  session: CanvasSession;
+  runEvents: RunEvent[];
   tab: NodeModalTab;
   onTab: (tab: NodeModalTab) => void;
   onClose: () => void;
@@ -2044,7 +2121,7 @@ function NodeModal({
         </nav>
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
-          {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} />}
+          {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
           {tab === "Context" && <ContextTab node={node} />}
         </div>
       </section>
@@ -2187,7 +2264,8 @@ function UserDecisionPanel({
   );
 }
 
-function ChangesTab({ node, projectRoot }: { node: CanvasNode; projectRoot: string }) {
+function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNode; projectRoot: string; session: CanvasSession; runEvents: RunEvent[] }) {
+  const [reconciliation, setReconciliation] = useState<FinalChangesetReconciliation | null>(null);
   const [changeset, setChangeset] = useState<Changeset | null>(null);
   const [diffHtml, setDiffHtml] = useState("");
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -2198,27 +2276,44 @@ function ChangesTab({ node, projectRoot }: { node: CanvasNode; projectRoot: stri
 
   useEffect(() => {
     let active = true;
+    setReconciliation(null);
     setChangeset(null);
     setDiffHtml("");
     setDiffError(null);
-    if (!window.devflow) {
-      setChangeset(unavailableChangeset(node));
-      return () => {
-        active = false;
-      };
-    }
-    void window.devflow.getChangeset(projectRoot, node)
-      .then((value) => {
-        if (active) setChangeset(value.changeset);
-      })
-      .catch((error: unknown) => {
+
+    const devflow = window.devflow;
+    if (devflow && typeof devflow.reconcileFinalChangeset === "function") {
+      void devflow.reconcileFinalChangeset(projectRoot, {
+        node,
+        target: session.target,
+        baselineRef: node.worktree.baselineRef,
+        runEvents,
+      }).then((result) => {
+        if (active) {
+          setReconciliation(result.reconciliation);
+          setChangeset(result.reconciliation.changeset);
+        }
+      }).catch((error: unknown) => {
         if (!active) return;
-        setChangeset(unavailableChangeset(node, error instanceof Error ? error.message : "Unable to load changeset."));
+        setChangeset(unavailableChangeset(node, error instanceof Error ? error.message : "Unable to reconcile final changeset."));
       });
+    } else if (devflow && typeof devflow.getChangeset === "function") {
+      void devflow.getChangeset(projectRoot, node)
+        .then((value) => {
+          if (active) setChangeset(value.changeset);
+        })
+        .catch((error: unknown) => {
+          if (!active) return;
+          setChangeset(unavailableChangeset(node, error instanceof Error ? error.message : "Unable to load changeset."));
+        });
+    } else {
+      setChangeset(unavailableChangeset(node));
+    }
+
     return () => {
       active = false;
     };
-  }, [node, projectRoot, refreshVersion]);
+  }, [node, projectRoot, session.target, runEvents, refreshVersion]);
 
   useEffect(() => {
     if (!changeset || !hasAvailableChangeEvidence(changeset)) return;
@@ -2265,20 +2360,26 @@ function ChangesTab({ node, projectRoot }: { node: CanvasNode; projectRoot: stri
   }
 
   if (!changeset) return <p>Loading changes...</p>;
-  const hasChangeEvidence = hasAvailableChangeEvidence(changeset);
 
-  if (!hasChangeEvidence) {
+  const hasGitEvidence = hasFinalGitEvidence(reconciliation, changeset);
+
+  if (!hasGitEvidence && !reconciliation?.liveChanges) {
     return (
       <section className="changes-review" aria-label="Code changes review">
         <header className="changes-summary">
           <div className="changes-summary-copy">
             <p className="eyebrow">Source: {changeset.source}</p>
             <h3>Git changeset evidence</h3>
-            <p>{changeReviewSummary(node, changeset)}</p>
+            <p>{reconciliation ? `Status: ${reconciliation.status}` : changeReviewSummary(node, changeset)}</p>
+          {reconciliation?.metadata && (
+              <p className="metadata-summary">Target: {reconciliation.metadata.executionTarget} | Branch: {reconciliation.metadata.selectedBranch} | Base: {reconciliation.metadata.baselineRef || "N/A"}</p>
+          )}
           </div>
         </header>
-        <div className="changes-empty" role={changeset.evidence?.status === "failed" ? "alert" : undefined}>
-          {changeset.evidence?.status === "failed"
+        <div className="changes-empty" role={changeset.evidence?.status === "failed" || reconciliation?.status === "failed" ? "alert" : undefined}>
+          {reconciliation?.status === "failed"
+            ? reconciliation.errorReason ?? "Unable to reconcile git changeset."
+            : changeset.evidence?.status === "failed"
             ? changeset.evidence.errorReason ?? "Unable to collect git changeset evidence."
             : "No available change evidence."}
         </div>
@@ -2296,25 +2397,52 @@ function ChangesTab({ node, projectRoot }: { node: CanvasNode; projectRoot: stri
   return (
     <section className="changes-review" aria-label="Code changes review">
       <header className="changes-summary">
+        {reconciliation?.liveChanges && (
+          <div className="live-changes-layer">
+            <p className="eyebrow">Live Run Output</p>
+            <h3>Structured live changes ({reconciliation.liveChanges.status})</h3>
+            <ul>
+              {reconciliation.liveChanges.changes.map((c, i) => (
+                <li key={i}><strong>{c.operation}</strong>: {c.path}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         <div className="changes-summary-copy">
           <p className="eyebrow">Source: {changeset.source}</p>
           <h3>Git changeset evidence</h3>
-          <p>{changeReviewSummary(node, changeset)}</p>
+          <p>{reconciliation ? `Status: ${reconciliation.status}` : changeReviewSummary(node, changeset)}</p>
+          {reconciliation?.metadata && (
+             <p className="metadata-summary">Target: {reconciliation.metadata.executionTarget} | Branch: {reconciliation.metadata.selectedBranch} | Base: {reconciliation.metadata.baselineRef || "N/A"}</p>
+          )}
+          {reconciliation?.mismatches && reconciliation.mismatches.length > 0 && (
+             <div className="mismatch-alert" role="alert">
+               <strong>Mismatch detected: Live output files differ from git changeset</strong>
+               {reconciliation.mismatches.map((m, i) => (
+                 <div key={i} className="mismatch-alert-file-list">
+                   <div><strong>Live:</strong> {m.liveFiles.length > 0 ? m.liveFiles.join(", ") : "(none)"}</div>
+                   <div><strong>Git:</strong> {m.gitFiles.length > 0 ? m.gitFiles.join(", ") : "(none)"}</div>
+                 </div>
+               ))}
+             </div>
+          )}
         </div>
-        <div className="diff-stat" aria-label="Diff statistics">
-          <span className="diff-stat-pill added">
-            <strong>+{changeset.diffStat.added}</strong>
-            <small>additions</small>
-          </span>
-          <span className="diff-stat-pill changed">
-            <strong>{changeset.diffStat.changed}</strong>
-            <small>files</small>
-          </span>
-          <span className="diff-stat-pill removed">
-            <strong>-{changeset.diffStat.deleted}</strong>
-            <small>deletions</small>
-          </span>
-        </div>
+        {hasGitEvidence && (
+          <div className="diff-stat" aria-label="Diff statistics">
+            <span className="diff-stat-pill added">
+              <strong>+{changeset.diffStat.added}</strong>
+              <small>additions</small>
+            </span>
+            <span className="diff-stat-pill changed">
+              <strong>{changeset.diffStat.changed}</strong>
+              <small>files</small>
+            </span>
+            <span className="diff-stat-pill removed">
+              <strong>-{changeset.diffStat.deleted}</strong>
+              <small>deletions</small>
+            </span>
+          </div>
+        )}
       </header>
 
       <ChangesDiffToolbar
@@ -2339,7 +2467,7 @@ function ChangesTab({ node, projectRoot }: { node: CanvasNode; projectRoot: stri
   );
 }
 
-function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
+export function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
   const agent = agentIdentityForNode(node);
   const fileLabel = changeset.diffStat.changed === 1 ? "file" : "files";
   if (changeset.evidence?.status === "empty") return `${agent} has no available change evidence for ${changeset.id}.`;
@@ -2348,11 +2476,16 @@ function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
   return `${agent} produced ${changeset.id} from git: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
 }
 
-function hasAvailableChangeEvidence(changeset: Changeset): boolean {
+export function hasAvailableChangeEvidence(changeset: Changeset): boolean {
   return changeset.source === "git" && changeset.evidence?.status === "available" && changeset.files.length > 0;
 }
 
-function unavailableChangeset(node: CanvasNode, reason?: string): Changeset {
+export function hasFinalGitEvidence(reconciliation: FinalChangesetReconciliation | null, changeset: Changeset | null): boolean {
+  if (reconciliation) return reconciliation.status === "available" || reconciliation.status === "mismatch";
+  return changeset ? hasAvailableChangeEvidence(changeset) : false;
+}
+
+export function unavailableChangeset(node: CanvasNode, reason?: string): Changeset {
   return {
     id: node.changesetId,
     files: [],
@@ -2841,6 +2974,7 @@ async function persistCanvasWorkflowSession(
     title: session.title,
     goal: session.goal,
     mode: session.mode,
+    target: session.target,
     plannerProfile: "default",
     transport: "hermes_replay_recovery",
     recoveryReason: "SkyTurn event ledger initializes planner continuity.",
@@ -2871,11 +3005,11 @@ function isCanvasSession(value: unknown): value is CanvasSession {
   );
 }
 
-function createSession(projectId: string, goal: string, mode: WorkflowMode): CanvasSessionTab {
+function createSession(projectId: string, goal: string, mode: WorkflowMode, target: SessionTarget): CanvasSessionTab {
   const createdAt = new Date().toISOString();
   return mode === "fast"
-    ? createFastCanvasSession({ projectId, goal, createdAt })
-    : createPlanSession({ projectId, goal, createdAt });
+    ? createFastCanvasSession({ projectId, goal, createdAt, target })
+    : createPlanSession({ projectId, goal, createdAt, target });
 }
 
 function changesetsForSession(session: CanvasSessionTab): WorkspaceState["changesets"] {

@@ -15,11 +15,13 @@ const workflow = {
   adoptWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:adopt", projectRoot, input),
   cleanWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:clean", projectRoot, input),
   getChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset", projectRoot, input),
+  reconcileFinalChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset:reconcileFinal", projectRoot, input),
 };
 
 contextBridge.exposeInMainWorld("devflow", {
   openProject: () => ipcRenderer.invoke("project:open"),
   initializeProjectMemory: (rootPath: string) => ipcRenderer.invoke("project:initDevflow", rootPath),
+  getProjectBranchFacts: (projectRoot: string) => ipcRenderer.invoke("project:branchFacts", projectRoot),
   loadWorkspace: () => ipcRenderer.invoke("workspace:load"),
   saveWorkspace: (state: unknown) => ipcRenderer.invoke("workspace:save", state),
   openEditor: (editor: string, worktreePath: string) =>
@@ -36,6 +38,7 @@ contextBridge.exposeInMainWorld("devflow", {
   appendWorkflowUserInput: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:appendUserInput", projectRoot, input),
   getWorkflowLedger: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:ledger", projectRoot, sessionId),
   getChangeset: (projectRoot: string, node: unknown) => ipcRenderer.invoke("changeset:get", projectRoot, node),
+  reconcileFinalChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset:reconcileFinal", projectRoot, input),
   applyWorkflowIntent: (projectRoot: string, intent: unknown) => ipcRenderer.invoke("workflow:applyIntent", projectRoot, intent),
   scheduleWorkflowReadyLanes: (projectRoot: string, sessionId: string, input: unknown) => ipcRenderer.invoke("workflow:scheduleReady", projectRoot, sessionId, input),
   recordWorkflowRunResult: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:recordRunResult", projectRoot, input),

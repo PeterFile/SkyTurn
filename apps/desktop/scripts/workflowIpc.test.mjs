@@ -28,7 +28,9 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:worktree:adopt",
     "workflow:worktree:clean",
     "workflow:changeset",
+    "workflow:changeset:reconcileFinal",
     "changeset:get",
+    "project:branchFacts",
   ]) {
     assert.match(main, new RegExp(`ipcMain\\.handle\\("${escapeRegExp(channel)}"`));
   }
@@ -94,6 +96,8 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "compareWorktrees",
     "adoptWorktree",
     "cleanWorktree",
+    "reconcileFinalChangeset",
+    "getProjectBranchFacts",
   ]) {
     assert.match(preload, new RegExp(`${wrapper}\\s*:`));
   }
@@ -107,11 +111,28 @@ test("changeset IPC resolves real paths before project boundary checks", async (
 
   assert.match(main, /changeset:get/);
   assert.match(main, /workflow:changeset/);
+  assert.match(main, /workflow:changeset:reconcileFinal/);
   assert.match(main, /await fs\.realpath\(projectRoot\)/);
   assert.match(main, /await fs\.realpath\(worktreePath\)/);
   assert.match(main, /createGitChangesetService\(\{ repoRoot: realProjectRoot \}\)/);
+  assert.match(main, /reconcileFinalChangeset/);
+  assert.match(main, /liveChangesFromRunEvents/);
   assert.match(main, /const projectWorktreesRoot = `\$\{realProjectRoot\}\.worktrees`/);
   assert.match(main, /realProjectWorktreesRoot === projectWorktreesRoot/);
+});
+
+test("branch facts IPC stays in Electron main and uses git-worktree node helpers", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const preload = await readFile(join(root, "electron", "preload.ts"), "utf8");
+
+  const branchFactsHandler = main.slice(
+    main.indexOf('ipcMain.handle("project:branchFacts"'),
+    main.indexOf('ipcMain.handle("editor:openWorktree"'),
+  );
+  assert.match(branchFactsHandler, /assertKnownProjectRoot\(projectRoot\)/);
+  assert.match(branchFactsHandler, /getGitBranchFacts/);
+  assert.match(branchFactsHandler, /protocolVersion:\s*RUN_PROTOCOL_VERSION/);
+  assert.match(preload, /getProjectBranchFacts:\s*\(projectRoot: string\) => ipcRenderer\.invoke\("project:branchFacts", projectRoot\)/);
 });
 
 test("workflow IPC contract errors are recognizable and block decision nodes", async () => {

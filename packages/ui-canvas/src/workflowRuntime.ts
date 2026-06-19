@@ -63,6 +63,8 @@ export async function startBridgeRun(
   if (!canStartNodeRun(node)) return null;
   const sandbox = sandboxForNodeRun(node);
   const ledger = node.agent === "hermes" ? await loadWorkflowLedger(project, session.id) : undefined;
+  const worktreePath = resolveRunWorktreePath(project, session, node);
+  if (!worktreePath) return null;
   const result = await window.devflow?.startAgentRun({
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
     runId: node.runId,
@@ -75,7 +77,7 @@ export async function startBridgeRun(
         }
       : {}),
     projectRoot: project.rootPath,
-    worktreePath: resolveRunWorktreePath(project, node),
+    worktreePath,
     agentKind: node.agent,
     ...(sandbox ? { sandbox } : {}),
     prompt: promptForNodeRun(session, node, ledger),
@@ -835,9 +837,12 @@ function isWorkflowLedgerSummary(value: unknown): value is WorkflowLedgerSummary
   );
 }
 
-function resolveRunWorktreePath(project: ImportedProject, node: CanvasNode): string {
+function resolveRunWorktreePath(project: ImportedProject, session: CanvasSession, node: CanvasNode): string | null {
   if (node.agent === "hermes") return project.rootPath;
-  return isAbsoluteLocalPath(node.worktree.path) ? node.worktree.path : project.rootPath;
+  const executionTarget = node.worktree.executionTarget ?? session.target.executionTarget;
+  if (executionTarget === "current_branch") return project.rootPath;
+  const candidate = node.worktree.realPath ?? node.worktree.path;
+  return isAbsoluteLocalPath(candidate) ? candidate : null;
 }
 
 function isAbsoluteLocalPath(value: string): boolean {

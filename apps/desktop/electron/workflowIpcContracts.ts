@@ -15,6 +15,7 @@ export const WORKFLOW_IPC_CHANNELS = {
   worktreeAdopt: "workflow:worktree:adopt",
   worktreeClean: "workflow:worktree:clean",
   changeset: "workflow:changeset",
+  changesetReconcileFinal: "workflow:changeset:reconcileFinal",
 } as const;
 
 export type WorkflowIpcErrorCode =

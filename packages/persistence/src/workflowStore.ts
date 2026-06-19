@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { normalizeSessionTarget } from "@skyturn/project-core";
 import type {
   AgentKind,
   CanvasNode,
@@ -12,7 +13,9 @@ import type {
   NodeRuntimeState,
   NodeStatus,
   RunEvidence,
+  SessionTarget,
   UserDecisionProjection,
+  WorktreeMetadata,
   WorkflowLedgerSummary,
   WorkflowLedgerSummaryEvent,
   WorkflowMode,
@@ -133,6 +136,7 @@ export interface CreateWorkflowSessionInput {
   processId?: number;
   opaqueHandle?: string;
   recoveryReason?: string;
+  target?: SessionTarget;
   now: string;
 }
 
@@ -144,6 +148,7 @@ export interface WorkflowSessionRecord {
   title: string;
   goal: string;
   mode: WorkflowMode;
+  target: SessionTarget;
   createdAt: string;
   updatedAt: string;
 }
@@ -347,6 +352,9 @@ interface SessionRow {
   title: string;
   goal: string;
   mode: WorkflowMode;
+  execution_target: string;
+  selected_branch: string;
+  base_ref: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -486,6 +494,7 @@ export class WorkflowStore {
     validateHermesTransport(input);
     const existing = this.getWorkflowSession(input.id);
     if (existing) return existing;
+    const target = normalizeSessionTarget(input.target);
 
     const tx = this.db.transaction(() => {
       const hermesSessionId = `hermes-${input.id}`;
@@ -498,6 +507,9 @@ export class WorkflowStore {
         title: input.title,
         goal: input.goal,
         mode: input.mode,
+        execution_target: target.executionTarget,
+        selected_branch: target.selectedBranch,
+        base_ref: target.baseRef ?? null,
         created_at: input.now,
         updated_at: input.now,
       });
@@ -524,6 +536,7 @@ export class WorkflowStore {
           plannerLaneId,
           transport: input.transport,
           recoveryReason: input.recoveryReason ?? null,
+          target,
         },
         idempotencyKey: `session:${input.id}:hermes-started`,
         now: input.now,
@@ -926,6 +939,7 @@ export class WorkflowStore {
       goal: session.goal,
       mode: session.mode,
       kind: "canvas",
+      target: session.target,
       hermesPlannerSessionId: session.hermesSessionId,
       plannerNodeId: session.plannerLaneId,
       createdAt: session.createdAt,
@@ -957,6 +971,7 @@ export class WorkflowStore {
       goal: session.goal,
       mode: session.mode,
       kind: "canvas",
+      target: session.target,
       hermesPlannerSessionId: session.hermesSessionId,
       plannerNodeId: session.plannerLaneId,
       createdAt: session.createdAt,
@@ -1162,11 +1177,7 @@ export class WorkflowStore {
       runId: latestSegment?.runId ?? `run-${session.id}-${lane.nodeId}`,
       changesetId,
       output: output.length > 0 ? output : [`Workflow lane ${lane.status}.`],
-      worktree: {
-        path: latestSegment?.worktreePath ?? ".",
-        branchName: `skyturn/${session.id}/${lane.nodeId}`,
-        baseCommit: "event-stream",
-      },
+      worktree: worktreeForSessionTarget(session, lane.nodeId, latestSegment?.worktreePath),
       context: {
         brief: lane.brief,
         sessionGoal: session.goal,
@@ -1514,11 +1525,7 @@ function flowPlannerNode(session: WorkflowSessionRecord): CanvasNode {
     runId: runIdForLane(session.id, session.plannerLaneId),
     changesetId: `changeset-${session.id}-${session.plannerLaneId}`,
     output: ["Workflow planner is active."],
-    worktree: {
-      path: ".",
-      branchName: `skyturn/${session.id}/${session.plannerLaneId}`,
-      baseCommit: "event-stream",
-    },
+    worktree: worktreeForSessionTarget(session, session.plannerLaneId),
     context: {
       brief: session.goal,
       sessionGoal: session.goal,
@@ -1570,11 +1577,7 @@ function flowLaneToCanvasNode(
     runId: latestSegment?.runId ?? runIdForLane(session.id, lane.id),
     changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
     output: lane.output.length > 0 ? lane.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
-    worktree: {
-      path: ".",
-      branchName: `skyturn/${session.id}/${lane.id}`,
-      baseCommit: "event-stream",
-    },
+    worktree: worktreeForSessionTarget(session, lane.id),
     context: {
       brief: lane.title,
       sessionGoal: session.goal,
@@ -1631,11 +1634,7 @@ function flowDecisionToCanvasNode(
       `Reason: ${decision.reason}`,
       `Options: ${decision.options.join(", ")}`,
     ],
-    worktree: {
-      path: ".",
-      branchName: `skyturn/${session.id}/${decision.decisionId}`,
-      baseCommit: "event-stream",
-    },
+    worktree: worktreeForSessionTarget(session, decision.decisionId),
     context: {
       brief: decision.prompt,
       sessionGoal: session.goal,
@@ -1645,6 +1644,34 @@ function flowDecisionToCanvasNode(
       dependencies: decision.targetLaneId ? [decision.targetLaneId] : [],
       constraints: ["This node is not executable.", "The answer is restored through Flow Kernel user decision state."],
     },
+  };
+}
+
+function worktreeForSessionTarget(
+  session: WorkflowSessionRecord,
+  nodeId: string,
+  worktreePath?: string,
+): WorktreeMetadata {
+  if (session.target.executionTarget === "new_worktree") {
+    return {
+      path: worktreePath ?? ".",
+      branchName: session.target.selectedBranch,
+      baseCommit: session.target.baseRef ?? session.target.selectedBranch,
+      executionTarget: session.target.executionTarget,
+      selectedBranch: session.target.selectedBranch,
+      ...(session.target.baseRef ? { baseRef: session.target.baseRef } : {}),
+      baselineRef: session.target.baseRef ?? session.target.selectedBranch,
+      worktreeId: `worktree-${session.id}-${nodeId}`,
+      variantId: `variant-${session.id}-${nodeId}`,
+    };
+  }
+  return {
+    path: ".",
+    branchName: session.target.selectedBranch,
+    baseCommit: session.target.selectedBranch,
+    executionTarget: session.target.executionTarget,
+    selectedBranch: session.target.selectedBranch,
+    baselineRef: session.target.selectedBranch,
   };
 }
 
@@ -1821,6 +1848,9 @@ function applyMigrations(db: Database.Database): void {
       title TEXT NOT NULL,
       goal TEXT NOT NULL,
       mode TEXT NOT NULL,
+      execution_target TEXT NOT NULL DEFAULT 'current_branch',
+      selected_branch TEXT NOT NULL DEFAULT 'HEAD',
+      base_ref TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -1921,6 +1951,21 @@ function applyMigrations(db: Database.Database): void {
     );
   `);
   db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))").run();
+  applySessionTargetMigration(db);
+  db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, datetime('now'))").run();
+}
+
+function applySessionTargetMigration(db: Database.Database): void {
+  const columns = new Set((db.prepare("PRAGMA table_info(workflow_sessions)").all() as Array<{ name: string }>).map((row) => row.name));
+  if (!columns.has("execution_target")) {
+    db.exec("ALTER TABLE workflow_sessions ADD COLUMN execution_target TEXT NOT NULL DEFAULT 'current_branch'");
+  }
+  if (!columns.has("selected_branch")) {
+    db.exec("ALTER TABLE workflow_sessions ADD COLUMN selected_branch TEXT NOT NULL DEFAULT 'HEAD'");
+  }
+  if (!columns.has("base_ref")) {
+    db.exec("ALTER TABLE workflow_sessions ADD COLUMN base_ref TEXT");
+  }
 }
 
 function prepareStatements(db: Database.Database): WorkflowStoreStatements {
@@ -1980,8 +2025,8 @@ function prepareStatements(db: Database.Database): WorkflowStoreStatements {
     ),
     insertSession: db.prepare(
       [
-        "INSERT INTO workflow_sessions(id, project_id, hermes_session_id, planner_lane_id, title, goal, mode, created_at, updated_at)",
-        "VALUES (@id, @project_id, @hermes_session_id, @planner_lane_id, @title, @goal, @mode, @created_at, @updated_at)",
+        "INSERT INTO workflow_sessions(id, project_id, hermes_session_id, planner_lane_id, title, goal, mode, execution_target, selected_branch, base_ref, created_at, updated_at)",
+        "VALUES (@id, @project_id, @hermes_session_id, @planner_lane_id, @title, @goal, @mode, @execution_target, @selected_branch, @base_ref, @created_at, @updated_at)",
       ].join(" "),
     ),
     insertHermesSession: db.prepare(
@@ -2185,6 +2230,11 @@ function mapSession(row: SessionRow): WorkflowSessionRecord {
     title: row.title,
     goal: row.goal,
     mode: row.mode,
+    target: normalizeSessionTarget({
+      executionTarget: row.execution_target,
+      selectedBranch: row.selected_branch,
+      baseRef: row.base_ref ?? undefined,
+    }),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
