@@ -7,10 +7,11 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { CanvasNode, WorkflowVariantAdoption } from "@skyturn/project-core";
+import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption } from "@skyturn/project-core";
 import {
   createGitChangesetService,
   createNodeGitWorktreeService,
+  getGitBranchFacts,
   type ManagedWorktreeWorkflowEvent,
   worktreeMetadataForVariant,
 } from "./node.js";
@@ -330,6 +331,41 @@ describe("GitChangesetService", () => {
     await Promise.all(changesetTempRoots.splice(0).map((root) => rm(root, { force: true, recursive: true })));
   });
 
+  it("returns current checkout branch facts from local git refs", async () => {
+    const repoRoot = await createRepo();
+    await gitAsync(repoRoot, "branch", "-m", "main");
+    await gitAsync(repoRoot, "checkout", "-b", "feature/api");
+
+    const facts = await getGitBranchFacts(repoRoot);
+
+    expect(facts.currentBranch).toBe("feature/api");
+    expect(facts.branches).toContain("main");
+    expect(facts.branches).toContain("feature/api");
+  });
+
+  it("uses HEAD as the current branch fallback for detached checkouts", async () => {
+    const repoRoot = await createRepo();
+    await gitAsync(repoRoot, "branch", "-m", "main");
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim();
+    await gitAsync(repoRoot, "checkout", "--detach", head);
+
+    const facts = await getGitBranchFacts(repoRoot);
+
+    expect(facts.currentBranch).toBe("HEAD");
+    expect(facts.branches).toContain("HEAD");
+    expect(facts.branches).toContain("main");
+  });
+
+  it("returns HEAD fallback facts when branch git commands fail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skyturn-branch-facts-nongit-"));
+    changesetTempRoots.push(root);
+
+    await expect(getGitBranchFacts(root)).resolves.toEqual({
+      currentBranch: "HEAD",
+      branches: ["HEAD"],
+    });
+  });
+
   it("collects source git changeset evidence from a modified tracked file", async () => {
     const repoRoot = await createRepo();
     await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\nexport const added = true;\n", "utf8");
@@ -387,6 +423,94 @@ describe("GitChangesetService", () => {
     expect(changeset.patchPreview).toContain("diff --git a/src/new.ts b/src/new.ts");
     expect(changeset.patchPreview).toContain("+export const created = true;");
     await gitAsync(repoRoot, "diff", "--quiet", "--cached");
+  });
+
+  it("returns empty final reconciliation for a clean current branch target", async () => {
+    const repoRoot = await createRepo();
+
+    const service = createGitChangesetService();
+    const reconciliation = await service.reconcileFinalChangeset({
+      node: nodeForRepo(repoRoot),
+      target: {
+        executionTarget: "current_branch",
+        selectedBranch: "main",
+      },
+      baselineRef: "HEAD",
+    });
+
+    expect(reconciliation.status).toBe("empty");
+    expect(reconciliation.metadata).toMatchObject({
+      executionTarget: "current_branch",
+      selectedBranch: "main",
+      baselineRef: "HEAD",
+    });
+    expect(reconciliation.changeset.files).toEqual([]);
+  });
+
+  it("returns available final reconciliation with a bounded git diff preview", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+
+    const service = createGitChangesetService();
+    const reconciliation = await service.reconcileFinalChangeset({
+      node: nodeForRepo(repoRoot),
+      target: {
+        executionTarget: "current_branch",
+        selectedBranch: "main",
+      },
+      baselineRef: "HEAD",
+    });
+
+    expect(reconciliation.status).toBe("available");
+    expect(reconciliation.changeset.files).toEqual(["src.ts"]);
+    expect(reconciliation.changeset.patchPreview).toContain("diff --git a/src.ts b/src.ts");
+  });
+
+  it("returns failed final reconciliation when the baseline ref is invalid", async () => {
+    const repoRoot = await createRepo();
+
+    const service = createGitChangesetService();
+    const reconciliation = await service.reconcileFinalChangeset({
+      node: nodeForRepo(repoRoot),
+      target: {
+        executionTarget: "current_branch",
+        selectedBranch: "main",
+      },
+      baselineRef: "refs/heads/does-not-exist",
+    });
+
+    expect(reconciliation.status).toBe("failed");
+    expect(reconciliation.errorReason).toMatch(/does-not-exist|unknown revision|ambiguous/i);
+    expect(reconciliation.changeset.evidence?.status).toBe("failed");
+  });
+
+  it("reports mismatch when live structured changes disagree with git reconciliation", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    const liveChanges: LiveRunChangesEvidence = {
+      source: "codex",
+      status: "available",
+      files: ["src/other.ts"],
+      changes: [{ operation: "update", path: "src/other.ts" }],
+      collectedAt: "2026-06-19T00:00:00.000Z",
+    };
+
+    const service = createGitChangesetService();
+    const reconciliation = await service.reconcileFinalChangeset({
+      node: nodeForRepo(repoRoot),
+      target: {
+        executionTarget: "current_branch",
+        selectedBranch: "main",
+      },
+      baselineRef: "HEAD",
+      liveChanges,
+    });
+
+    expect(reconciliation.status).toBe("mismatch");
+    expect(reconciliation.mismatches).toEqual([
+      { kind: "file-set", liveFiles: ["src/other.ts"], gitFiles: ["src.ts"] },
+    ]);
+    expect(reconciliation.liveChanges).toEqual(liveChanges);
   });
 });
 

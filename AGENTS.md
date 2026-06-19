@@ -15,6 +15,7 @@
 - The product model is `Project -> Canvas Session Tab -> Canvas -> Node -> Node Modal`.
 - `Open Project` imports a local folder as one project.
 - `New Tab` creates a new task canvas session, not a file tab.
+- New Session input must expose two separate development-target controls: an execution target and a branch selector. The execution target defaults to Current branch; New worktree is explicit opt-in. The branch selector picks the development branch in Current branch mode and the base branch/ref in New worktree mode.
 - A canvas is the visual task graph for one session.
 - A node is one executable agent task, preferably bound to a run and worktree.
 - A workflow card is SkyTurn task state, not the agent itself.
@@ -54,6 +55,7 @@
 ## Completion Evidence
 
 - Git, worktree, and change detection are part of completion evidence.
+- The node modal `Changes` tab must source live changes from structured agent/run events when available, Codex-style patch/file-change/turn-diff events for Codex, and final changesets from git-backed reconciliation. Agent prose is not a changed-file source.
 - Do not mark a task or node complete only because an agent says it is done.
 - Completion must be tied to run status, git changes, tests, or concrete verification evidence.
 - Node status must be derived from `RunEvidence`; Agent text claiming success is only output.

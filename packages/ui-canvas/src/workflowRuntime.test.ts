@@ -1034,6 +1034,126 @@ describe("workflow runtime event merging", () => {
     ]);
   });
 
+  it("runs current-branch sessions in the project root even when node metadata has a candidate path", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = {
+      ...makeSession([
+        makeNode({
+          id: "lane-implementation",
+          agent: "codex",
+          status: "running",
+          runId: "run-session-1-lane-implementation",
+          meta: ["implementation", "lane-implementation", "flow-kernel"],
+        }),
+      ]),
+      target: {
+        executionTarget: "current_branch" as const,
+        selectedBranch: "feature/session-target",
+      },
+    };
+    const node = {
+      ...(session.nodes.find((item) => item.id === "lane-implementation") as CanvasNode),
+      worktree: {
+        path: "/tmp/project.worktrees/session-1-lane-implementation",
+        branchName: "feature/session-target",
+        baseCommit: "feature/session-target",
+        executionTarget: "current_branch" as const,
+        selectedBranch: "feature/session-target",
+      },
+    };
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "running",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({ protocolVersion: 1, events: [] }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: node.runId,
+        status: "running",
+        exitCode: null,
+        changesetId: null,
+        checks: [],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: null,
+      } satisfies RunEvidence,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+      },
+    });
+
+    try {
+      await startBridgeRun(project, session, node);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
+      projectRoot: project.rootPath,
+      worktreePath: project.rootPath,
+    }));
+  });
+
+  it("does not start new-worktree Codex runs until a real worktree path exists", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = {
+      ...makeSession([
+        makeNode({
+          id: "lane-implementation",
+          agent: "codex",
+          status: "running",
+          runId: "run-session-1-lane-implementation",
+          meta: ["implementation", "lane-implementation", "flow-kernel"],
+        }),
+      ]),
+      target: {
+        executionTarget: "new_worktree" as const,
+        selectedBranch: "main",
+        baseRef: "origin/main",
+      },
+    };
+    const node = {
+      ...(session.nodes.find((item) => item.id === "lane-implementation") as CanvasNode),
+      worktree: {
+        path: ".",
+        branchName: "main",
+        baseCommit: "origin/main",
+        executionTarget: "new_worktree" as const,
+        selectedBranch: "main",
+        baseRef: "origin/main",
+        baselineRef: "origin/main",
+        worktreeId: "worktree-session-1-lane-implementation",
+        variantId: "variant-session-1-lane-implementation",
+      },
+    };
+    const startAgentRun = vi.fn();
+    vi.stubGlobal("window", { devflow: { startAgentRun } });
+
+    try {
+      const result = await startBridgeRun(project, session, node);
+      expect(result).toBeNull();
+      expect(startAgentRun).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("records Flow Kernel run results by identifier and leaves evidence ownership in Electron main", async () => {
     const project = makeWorkspace().projects[0] as ImportedProject;
     const session = makeSession([
@@ -1589,6 +1709,10 @@ function makeSession(extraNodes: CanvasNode[]): CanvasSession {
     goal: "Build workflow",
     mode: "fast",
     kind: "canvas",
+    target: {
+      executionTarget: "current_branch",
+      selectedBranch: "HEAD",
+    },
     hermesPlannerSessionId: "hermes-planner-session-1",
     plannerNodeId: "node-1",
     createdAt: "2026-06-10T00:00:00.000Z",

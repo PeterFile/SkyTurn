@@ -1,6 +1,7 @@
-import type { EditorAdapter, EditorKind } from "@skyturn/git-worktree";
+import type { EditorAdapter, EditorKind, GitBranchFacts } from "@skyturn/git-worktree";
 import {
   makeHermesPlannerSessionId,
+  normalizeSessionTarget,
   type AgentDescriptor,
   type AgentKind,
   type AgentRun,
@@ -8,9 +9,11 @@ import {
   type CanvasSession,
   type CanvasSessionTab,
   type Changeset,
+  type FinalChangesetReconciliation,
   type ImportedProject,
   type RunEvent,
   type RunEvidence,
+  type SessionTarget,
   type StartAgentRunInput,
   type WorkflowLedgerSummary,
   type WorkflowWorktreeIdentity,
@@ -34,6 +37,13 @@ export interface WorkflowRunResultRecordRequest {
   now: string;
 }
 
+export interface FinalChangesetReconciliationRequest {
+  node: CanvasNode;
+  target: SessionTarget;
+  baselineRef?: string;
+  runEvents?: RunEvent[];
+}
+
 export interface WorkflowApi {
   createSession: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; session: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   appendUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
@@ -49,11 +59,13 @@ export interface WorkflowApi {
   adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown }>;
   cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown }>;
   getChangeset: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; changeset: Changeset }>;
+  reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
 }
 
 export interface DevflowApi {
   openProject: () => Promise<OpenProjectResult>;
   initializeProjectMemory: (rootPath: string) => Promise<{ ok: boolean; devflowPath: string }>;
+  getProjectBranchFacts: (projectRoot: string) => Promise<{ protocolVersion: number } & GitBranchFacts>;
   loadWorkspace: () => Promise<unknown | null>;
   saveWorkspace: (state: unknown) => Promise<{ ok: boolean }>;
   openEditor: (editor: EditorKind, worktreePath: string) => Promise<{ ok: boolean; message: string }>;
@@ -69,6 +81,7 @@ export interface DevflowApi {
   appendWorkflowUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   getWorkflowLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: unknown }>;
   getChangeset: (projectRoot: string, node: CanvasNode) => Promise<{ protocolVersion: number; changeset: Changeset }>;
+  reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
   applyWorkflowIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   scheduleWorkflowReadyLanes: (projectRoot: string, sessionId: string, input: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   recordWorkflowRunResult: (projectRoot: string, input: WorkflowRunResultRecordRequest) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
@@ -192,8 +205,15 @@ function normalizeSession(session: CanvasSessionTab): CanvasSessionTab {
 function normalizeCanvasSession(session: CanvasSession): CanvasSession {
   const nodes = Array.isArray(session.nodes) ? session.nodes : [];
   const edges = Array.isArray(session.edges) ? session.edges : [];
+  const legacyTarget = session as unknown as {
+    target?: unknown;
+    executionTarget?: unknown;
+    selectedBranch?: unknown;
+    baseRef?: unknown;
+  };
   return {
     ...session,
+    target: normalizeSessionTarget(legacyTarget.target ?? legacyTarget),
     hermesPlannerSessionId: session.hermesPlannerSessionId || makeHermesPlannerSessionId(session.id),
     plannerNodeId: session.plannerNodeId || inferPlannerNodeId(nodes, session.activeNodeId),
     nodes,

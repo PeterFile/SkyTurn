@@ -39,6 +39,7 @@ Actions such as Stop, Retry, Reassign, Insert Before, and editor launch buttons 
 - Canvas dominates the workspace.
 - The left sidebar is collapsible.
 - The bottom input bar is a reduced task input.
+- New Session input exposes two separate development-target controls: execution target and branch selector. Current branch is the default execution target; New worktree is explicit opt-in. The branch selector chooses the development branch in Current branch mode and the base branch/ref in New worktree mode.
 - No file tabs.
 - No global Agent Console.
 - No inline code editor.

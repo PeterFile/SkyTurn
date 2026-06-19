@@ -32,9 +32,70 @@ describe("canvas session factory", () => {
       agentLabel: "Hermes",
       meta: ["workflow-card-tools", "TSK-0001"],
     });
-    expect(session.nodes.every((node) => node.worktree.branchName.startsWith("skyturn/"))).toBe(true);
+    expect(session.target).toEqual({
+      executionTarget: "current_branch",
+      selectedBranch: "HEAD",
+    });
+    expect(session.nodes.every((node) => node.worktree.branchName === "HEAD")).toBe(true);
     expect(session.nodes[0]?.context.relatedTasks).toContain("createWorkflowCard");
     expect(session.edges).toEqual([]);
+  });
+
+  it("uses selected current branch metadata without inventing a managed worktree", () => {
+    const session = createFastCanvasSession({
+      projectId: "project-1",
+      goal: "Ship on selected branch",
+      createdAt: "2026-06-10T00:00:00.000Z",
+      target: {
+        executionTarget: "current_branch",
+        selectedBranch: "feature/runtime-target",
+        baseRef: "main",
+      },
+    });
+
+    expect(session.target).toEqual({
+      executionTarget: "current_branch",
+      selectedBranch: "feature/runtime-target",
+    });
+    expect(session.nodes[0]?.worktree).toMatchObject({
+      path: ".",
+      branchName: "feature/runtime-target",
+      baseCommit: "feature/runtime-target",
+      executionTarget: "current_branch",
+      selectedBranch: "feature/runtime-target",
+    });
+    expect(session.nodes[0]?.worktree.worktreeId).toBeUndefined();
+  });
+
+  it("records new worktree candidate metadata without claiming it was created", () => {
+    const session = createFastCanvasSession({
+      projectId: "project-1",
+      goal: "Try candidate worktree",
+      createdAt: "2026-06-10T00:00:00.000Z",
+      target: {
+        executionTarget: "new_worktree",
+        selectedBranch: "main",
+        baseRef: "origin/main",
+      },
+    });
+
+    expect(session.target).toEqual({
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+    });
+    expect(session.nodes[0]?.worktree).toMatchObject({
+      path: ".",
+      branchName: "main",
+      baseCommit: "origin/main",
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+      worktreeId: "worktree-fast-202606100000-node-1",
+      variantId: "variant-fast-202606100000-node-1",
+    });
+    expect(session.nodes[0]?.worktree.realPath).toBeUndefined();
+    expect(session.nodes[0]?.worktree.gitdir).toBeUndefined();
   });
 
   it("keeps plan sessions in a Markdown planning state until confirmed", () => {

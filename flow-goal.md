@@ -397,19 +397,21 @@ Agent 运行：
 - contextCheckpointId 可空
 
 Codex 执行线：
-- 默认隔离 worktree
+- 默认在 New Session 选定的当前分支/当前项目工作区运行
+- 只有用户显式选择 New worktree 时，才从所选分支派生候选工作树
 - 默认不允许 commit/push/merge，除非节点明确授权
 - 默认 sandbox 仍保持安全
+- Changes 来源优先使用结构化 patch/file-change/turn-diff 事件，最终用 git 对账
 - 输出必须写 segment_output_delta
 - 退出后写 segment_evidence 和 segment_finished
 - Codex 自述完成不是完成证据
 - Controller 必须检查 diff、测试、构建或审查证据
 
 并行执行规则：
-- 默认最多 2 到 3 条并行 Codex 执行线
+- 并行度由运行时能力和调度策略决定，不写死固定上限
 - 热点文件重叠时禁止并行
 - 每条执行线必须有允许范围、禁止范围、最快验证命令
-- 每条执行线必须有独立 worktree 或等价隔离
+- 多条候选实现并行时必须有独立 worktree 或等价隔离；当前分支模式不默认并行写同一个工作区
 - 如果执行线产生超范围 diff，lane 必须进入 failed 或 waiting_input，不得自动推进
 
 验证层级：
