@@ -29,18 +29,19 @@ packages/
   persistence/          # workspace state and renderer host persistence adapters
 ```
 
-## MVP Scope
+## Current Scope
 
 - Desktop shell: Electron + React + TypeScript + Vite.
 - Canvas engine: `@xyflow/react`.
-- Orchestrator boundary: Hermes-agent adapter first, mocked for the MVP.
-- Agent backends: Hermes, Codex CLI, Gemini, Claude Code, and OpenClaw through contract-only adapter interfaces.
-- Agent bridge: local discovery, mock run streaming, durable run events, and RunEvidence-backed node status.
+- Workflow source of truth: SQLite workflow events under `.devflow/skyturn-workflow.sqlite`, exposed through Electron main / Node-only persistence APIs.
+- Orchestration: Hermes produces `WorkflowIntent`; `workflow-kernel` validates, compiles, gates, schedules, and projects lanes/edges.
+- Agent bridge: Hermes and Codex CLI have real `experimental-run` adapters; run status is derived from `RunEvidence`, not agent prose.
+- Changes: the node modal `Changes` tab can use structured live Codex change events plus git-backed final reconciliation.
+- Session target: New Session exposes Current branch by default and New worktree as explicit opt-in.
 - Project memory: `.devflow` under the imported project root.
-- Completion evidence: run status, changeset data, worktree metadata, and verification output.
 
 ## Current Verification
 
-The MVP shell currently uses deterministic mock adapters for agent orchestration, bridge runs, git changesets, worktrees, and editor launches. Real CLI execution is intentionally behind `supportLevel`; unverified local CLIs are `detected-only`, not `supported-run`.
+The real Hermes-to-Codex path has passed `pnpm --filter @skyturn/desktop run demo:mvp` on this machine, and the Electron UI has run a real workflow against a temporary git project. These paths depend on local Hermes/Codex credentials and remain `experimental-run`, not `supported-run`.
 
-Codex CLI has an explicit `experimental-run` adapter in `packages/agent-bridge`. It follows Hermes' Codex skill boundary: run `codex exec --json` inside a git repository, persist SkyTurn events, and derive completion from process exit evidence rather than Codex prose. The desktop UI should keep using mock runs unless real local execution is intentionally wired in.
+Browser-only and mock paths still exist for development and tests. Managed worktree create/adopt/clean is not yet fully wired through the desktop IPC path: the Node-side implementation exists in `@skyturn/git-worktree/node`, but desktop `workflow:worktree:create`, `workflow:worktree:adopt`, and `workflow:worktree:clean` currently record requested events rather than performing the filesystem/git operation.

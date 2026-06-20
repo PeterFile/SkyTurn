@@ -1,5 +1,7 @@
 # MVP Verification Plan
 
+Status: historical scaffold verification. This file records the original MVP build-out and early mock verification. It is not the current capability source. For current workflow/runtime facts, use `README.md`, `docs/natural-workflow-design.md`, `docs/flow-kernel-v1-acceptance.md`, and the code paths under `apps/desktop/electron`, `packages/persistence/src/workflowStore.ts`, `packages/workflow-kernel`, `packages/agent-bridge`, and `packages/git-worktree/src/node.ts`.
+
 ## Current State
 
 - Repository contents inspected on 2026-06-10.
