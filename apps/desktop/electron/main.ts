@@ -42,6 +42,7 @@ interface WorkflowSessionCreateInput {
   title?: unknown;
   goal?: unknown;
   mode?: unknown;
+  target?: unknown;
   plannerProfile?: unknown;
   transport?: unknown;
   processId?: unknown;
@@ -317,6 +318,7 @@ ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, inp
     title: optionalText(input.title) ?? "Workflow session",
     goal: requireText(input.goal, "workflow session goal"),
     mode: input.mode === "plan" ? "plan" : "fast",
+    target: normalizeWorkflowSessionTarget(input.target),
     plannerProfile: optionalText(input.plannerProfile) ?? "default",
     transport: normalizeHermesTransport(input.transport),
     processId: typeof input.processId === "number" ? input.processId : undefined,
@@ -783,6 +785,11 @@ function normalizeFinalSessionTarget(value: Record<string, unknown>): FinalSessi
   if (executionTarget === "current_branch") return { executionTarget, selectedBranch };
   const baseRef = optionalText(value.baseRef) ?? selectedBranch;
   return { executionTarget, selectedBranch, baseRef };
+}
+
+function normalizeWorkflowSessionTarget(value: unknown): FinalSessionTarget {
+  if (!isRecord(value)) return { executionTarget: "current_branch", selectedBranch: "HEAD" };
+  return normalizeFinalSessionTarget(value);
 }
 
 function structuredRunChangesFromValue(value: unknown): StructuredRunChange[] {

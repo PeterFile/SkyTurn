@@ -21,6 +21,7 @@ import {
   type RunEvidence,
   type UserDecisionProjection,
   type WorkflowLedgerSummary,
+  type WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
 import {
   compileWorkflowIntent,
@@ -63,7 +64,7 @@ export async function startBridgeRun(
   if (!canStartNodeRun(node)) return null;
   const sandbox = sandboxForNodeRun(node);
   const ledger = node.agent === "hermes" ? await loadWorkflowLedger(project, session.id) : undefined;
-  const worktreePath = resolveRunWorktreePath(project, session, node);
+  const worktreePath = await ensureRunWorktreePath(project, session, node);
   if (!worktreePath) return null;
   const result = await window.devflow?.startAgentRun({
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
@@ -837,11 +838,38 @@ function isWorkflowLedgerSummary(value: unknown): value is WorkflowLedgerSummary
   );
 }
 
+async function ensureRunWorktreePath(project: ImportedProject, session: CanvasSession, node: CanvasNode): Promise<string | null> {
+  const existing = resolveRunWorktreePath(project, session, node);
+  if (existing) return existing;
+  if (!requiresManagedRunWorktree(session, node)) return null;
+  if (typeof window.devflow?.workflow?.createWorktree !== "function") return null;
+
+  const result = await window.devflow.workflow.createWorktree(project.rootPath, {
+    sessionId: session.id,
+    variantId: node.id,
+    repoRoot: project.rootPath,
+    baseRef: node.worktree.baseRef ?? session.target.baseRef ?? node.worktree.baseCommit,
+    baseCommit: node.worktree.baseCommit,
+    parentLaneId: node.id,
+  });
+  return absolutePathFromWorktree(result.worktree);
+}
+
 function resolveRunWorktreePath(project: ImportedProject, session: CanvasSession, node: CanvasNode): string | null {
-  if (node.agent === "hermes") return project.rootPath;
+  if (isPlannerRootNode(session, node)) return project.rootPath;
   const executionTarget = node.worktree.executionTarget ?? session.target.executionTarget;
   if (executionTarget === "current_branch") return project.rootPath;
   const candidate = node.worktree.realPath ?? node.worktree.path;
+  return isAbsoluteLocalPath(candidate) ? candidate : null;
+}
+
+function requiresManagedRunWorktree(session: CanvasSession, node: CanvasNode): boolean {
+  if (isPlannerRootNode(session, node)) return false;
+  return (node.worktree.executionTarget ?? session.target.executionTarget) === "new_worktree";
+}
+
+function absolutePathFromWorktree(worktree: WorkflowWorktreeIdentity): string | null {
+  const candidate = worktree.realPath || worktree.path;
   return isAbsoluteLocalPath(candidate) ? candidate : null;
 }
 

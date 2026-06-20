@@ -1110,7 +1110,7 @@ describe("workflow runtime event merging", () => {
     }));
   });
 
-  it("does not start new-worktree Codex runs until a real worktree path exists", async () => {
+  it("creates and binds a managed worktree before starting new-worktree Codex runs", async () => {
     const project = makeWorkspace().projects[0] as ImportedProject;
     const session = {
       ...makeSession([
@@ -1139,16 +1139,182 @@ describe("workflow runtime event merging", () => {
         baseRef: "origin/main",
         baselineRef: "origin/main",
         worktreeId: "worktree-session-1-lane-implementation",
-        variantId: "variant-session-1-lane-implementation",
+        variantId: "lane-implementation",
       },
     };
-    const startAgentRun = vi.fn();
-    vi.stubGlobal("window", { devflow: { startAgentRun } });
+    const createdWorktreePath = "/tmp/project.worktrees/session-session-1-variant-lane-implementation";
+    const createWorktree = vi.fn(async () => ({
+      protocolVersion: 1,
+      status: "created" as const,
+      event: {},
+      worktree: {
+        worktreeId: "worktree-session-1-lane-implementation",
+        variantId: "lane-implementation",
+        path: createdWorktreePath,
+        realPath: createdWorktreePath,
+        gitdir: "/tmp/project/.git/worktrees/session-session-1-variant-lane-implementation",
+        repoRoot: project.rootPath,
+        branchName: "skyturn/session-1/lane-implementation",
+        baseCommit: "abc123",
+        headCommit: "abc123",
+        parentLaneId: "lane-implementation",
+      },
+    }));
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "running",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({ protocolVersion: 1, events: [] }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: node.runId,
+        status: "running",
+        exitCode: null,
+        changesetId: null,
+        checks: [],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: null,
+      } satisfies RunEvidence,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        workflow: { createWorktree },
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+      },
+    });
 
     try {
       const result = await startBridgeRun(project, session, node);
-      expect(result).toBeNull();
-      expect(startAgentRun).not.toHaveBeenCalled();
+      expect(result?.run.worktreePath).toBe(createdWorktreePath);
+      expect(createWorktree).toHaveBeenCalledWith(project.rootPath, expect.objectContaining({
+        sessionId: session.id,
+        variantId: "lane-implementation",
+        baseRef: "origin/main",
+        parentLaneId: "lane-implementation",
+        repoRoot: project.rootPath,
+      }));
+      expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
+        projectRoot: project.rootPath,
+        worktreePath: createdWorktreePath,
+      }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("creates and binds a managed worktree before starting non-planner Hermes runs", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = {
+      ...makeSession([
+        makeNode({
+          id: "lane-review",
+          agent: "hermes",
+          status: "running",
+          runId: "run-session-1-lane-review",
+          meta: ["review", "lane-review", "flow-kernel"],
+        }),
+      ]),
+      target: {
+        executionTarget: "new_worktree" as const,
+        selectedBranch: "main",
+        baseRef: "origin/main",
+      },
+    };
+    const node = {
+      ...(session.nodes.find((item) => item.id === "lane-review") as CanvasNode),
+      worktree: {
+        path: ".",
+        branchName: "main",
+        baseCommit: "origin/main",
+        executionTarget: "new_worktree" as const,
+        selectedBranch: "main",
+        baseRef: "origin/main",
+        baselineRef: "origin/main",
+        worktreeId: "worktree-session-1-lane-review",
+        variantId: "lane-review",
+      },
+    };
+    const createdWorktreePath = "/tmp/project.worktrees/session-session-1-variant-lane-review";
+    const createWorktree = vi.fn(async () => ({
+      protocolVersion: 1,
+      status: "created" as const,
+      event: {},
+      worktree: {
+        worktreeId: "worktree-session-1-lane-review",
+        variantId: "lane-review",
+        path: createdWorktreePath,
+        realPath: createdWorktreePath,
+        gitdir: "/tmp/project/.git/worktrees/session-session-1-variant-lane-review",
+        repoRoot: project.rootPath,
+        branchName: "skyturn/session-1/lane-review",
+        baseCommit: "abc123",
+        headCommit: "abc123",
+        parentLaneId: "lane-review",
+      },
+    }));
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "running",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({ protocolVersion: 1, events: [] }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: node.runId,
+        status: "running",
+        exitCode: null,
+        changesetId: null,
+        checks: [],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: null,
+      } satisfies RunEvidence,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        workflow: { createWorktree },
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+      },
+    });
+
+    try {
+      await startBridgeRun(project, session, node);
+      expect(createWorktree).toHaveBeenCalledWith(project.rootPath, expect.objectContaining({
+        variantId: "lane-review",
+        parentLaneId: "lane-review",
+      }));
+      expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
+        agentKind: "hermes",
+        worktreePath: createdWorktreePath,
+      }));
     } finally {
       vi.unstubAllGlobals();
     }
