@@ -661,9 +661,14 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
     ) {
       upsertVariantAdoption(projection, event.payload.adoption as unknown as WorkflowVariantAdoption);
     }
-    if (event.kind === "workflow.join.completed" || event.kind === "workflow.commit.created") {
+    if (event.kind === "workflow.join.completed") {
       const laneId = typeof event.payload.laneId === "string" ? event.payload.laneId : null;
       if (laneId) setLaneStatus(projection, laneId, "completed");
+    }
+    if (event.kind === "workflow.commit.created") {
+      const laneId = typeof event.payload.laneId === "string" ? event.payload.laneId : null;
+      const lane = projection.lanes.find((item) => item.id === laneId);
+      if (lane?.laneKind === "commit") setLaneStatus(projection, lane.id, "completed");
     }
   }
 

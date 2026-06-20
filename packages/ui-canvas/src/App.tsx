@@ -2293,6 +2293,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [diffCollapsed, setDiffCollapsed] = useState(false);
   const [options, setOptions] = useState<ChangesDiffViewOptions>(DEFAULT_CHANGES_DIFF_OPTIONS);
+  const [deliveryStatus, setDeliveryStatus] = useState<"idle" | "committing" | string>("idle");
 
   useEffect(() => {
     let active = true;
@@ -2379,9 +2380,51 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     }));
   }
 
+  async function handleCommit() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.createDeliveryCommit) return;
+    if (!changeset || changeset.source !== "git" || changeset.files.length === 0) return;
+
+    const acceptMismatch = reconciliation?.status === "mismatch";
+    if (acceptMismatch) {
+      const proceed = window.confirm("Live output files differ from git changeset. Are you sure you want to commit these git changes?");
+      if (!proceed) return;
+    }
+
+    const subject = window.prompt("Commit subject", "feat(workflow): commit verified changes");
+    if (!subject || subject.trim() === "") return;
+
+    setDeliveryStatus("committing");
+    try {
+      const worktreePath = node.worktree.realPath ?? node.worktree.path ?? projectRoot;
+      const result = await devflow.workflow.createDeliveryCommit(projectRoot, {
+        sessionId: session.id,
+        laneId: node.id,
+        worktreePath,
+        files: changeset.files,
+        subject: subject.trim(),
+        reconciliationStatus: reconciliation?.status,
+        ...(acceptMismatch ? { acceptMismatch: true } : {}),
+      });
+      if (result.status === "committed") {
+        setDeliveryStatus(`committed: ${result.evidence.commitSha.substring(0, 7)}`);
+        setRefreshVersion(v => v + 1);
+      } else {
+        setDeliveryStatus("error");
+        setDiffError("Unexpected delivery status.");
+      }
+    } catch (e) {
+      setDeliveryStatus("error");
+      setDiffError(e instanceof Error ? e.message : "Failed to commit changes.");
+    }
+  }
+
   if (!changeset) return <p>Loading changes...</p>;
 
   const hasGitEvidence = hasFinalGitEvidence(reconciliation, changeset);
+  const devflowAvailable = !!window.devflow?.workflow?.createDeliveryCommit;
+  const isCommitLane = node.laneKind === "commit";
+  const canCommit = devflowAvailable && isCommitLane && hasGitEvidence && changeset.source === "git" && changeset.files.length > 0;
 
   if (!hasGitEvidence && !reconciliation?.liveChanges) {
     return (
@@ -2472,6 +2515,13 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         onOption={setDiffOption}
         onOutputFormatToggle={toggleOutputFormat}
         onRefresh={() => setRefreshVersion((current) => current + 1)}
+        onCommit={handleCommit}
+        commitDisabled={!canCommit || deliveryStatus === "committing"}
+        commitStatusLabel={
+          deliveryStatus === "committing" ? "Committing..."
+          : deliveryStatus.startsWith("committed:") ? `Committed ${deliveryStatus.split(":")[1]}`
+          : "Commit changes"
+        }
       />
 
       {diffError ? (
@@ -2532,6 +2582,9 @@ function ChangesDiffToolbar({
   onOption,
   onOutputFormatToggle,
   onRefresh,
+  onCommit,
+  commitDisabled,
+  commitStatusLabel,
 }: {
   collapsed: boolean;
   options: ChangesDiffViewOptions;
@@ -2539,6 +2592,9 @@ function ChangesDiffToolbar({
   onOption: <K extends keyof ChangesDiffViewOptions>(key: K, value: ChangesDiffViewOptions[K]) => void;
   onOutputFormatToggle: () => void;
   onRefresh: () => void;
+  onCommit?: () => void;
+  commitDisabled?: boolean;
+  commitStatusLabel?: string;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -2587,9 +2643,15 @@ function ChangesDiffToolbar({
       >
         <Columns2 size={16} aria-hidden="true" />
       </button>
-      <button className="changes-tool-button muted" type="button" disabled title="Commit or push is not wired yet">
+      <button
+        className="changes-tool-button"
+        type="button"
+        disabled={commitDisabled}
+        title={commitDisabled ? "Backend unavailable or changes not eligible for commit" : "Create delivery commit"}
+        onClick={onCommit}
+      >
         <GitPullRequest size={15} aria-hidden="true" />
-        <span>Commit or push</span>
+        <span>{commitStatusLabel || "Commit changes"}</span>
       </button>
       <div ref={rootRef} className="changes-menu">
         <button

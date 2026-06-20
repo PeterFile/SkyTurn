@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink as fsSymlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption } from "@skyturn/project-core";
 import {
+  createDeliveryCommit,
   createGitChangesetService,
   createNodeGitWorktreeService,
   getGitBranchFacts,
@@ -806,6 +807,208 @@ describe("node git worktree service", () => {
 
     await expect(service.recoverRequestedWorktreeCreates()).resolves.toEqual([]);
     expect(events.map((event) => event.kind)).toEqual(["workflow.worktree.created"]);
+  });
+});
+
+describe("delivery commits", () => {
+  const tempRoots: string[] = [];
+
+  afterEach(() => {
+    for (const root of tempRoots.splice(0)) {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stages only verified changed files and returns commit evidence", async () => {
+    const repo = await createTestRepo("skyturn-delivery-commit-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    await writeFile(join(repo.repoRoot, "scratch.txt"), "scratch\n");
+
+    const evidence = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+      body: "Commit only the reconciled file.",
+    });
+
+    expect(evidence).toMatchObject({
+      branch: "main",
+      stagedFiles: ["feature.txt"],
+      worktreePath: realpathSync(repo.repoRoot),
+      command: {
+        ok: true,
+        exitCode: 0,
+      },
+    });
+    expect(evidence.commitSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(git(repo.repoRoot, ["show", "--name-only", "--format=%s", "--no-renames", evidence.commitSha])).toContain("feature.txt");
+    expect(git(repo.repoRoot, ["show", "--name-only", "--format=", "--no-renames", evidence.commitSha])).not.toContain("scratch.txt");
+    expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all", "--"])).toBe("?? scratch.txt");
+  });
+
+  it("commits only requested files when unrelated files are already staged", async () => {
+    const repo = await createTestRepo("skyturn-delivery-only-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    await writeFile(join(repo.repoRoot, "extra.txt"), "extra\n");
+    git(repo.repoRoot, ["add", "extra.txt"]);
+
+    const evidence = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    });
+
+    expect(git(repo.repoRoot, ["diff-tree", "--no-commit-id", "--name-only", "-r", evidence.commitSha])).toBe("feature.txt");
+    expect(git(repo.repoRoot, ["diff", "--cached", "--name-only", "--"])).toBe("extra.txt");
+  });
+
+  it("allows mismatch reconciliation only with explicit mismatch acceptance", async () => {
+    const repo = await createTestRepo("skyturn-delivery-mismatch-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+      reconciliationStatus: "mismatch",
+    })).rejects.toThrow(/reconciliation|mismatch/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+      reconciliationStatus: "mismatch",
+      acceptMismatch: true,
+    })).resolves.toMatchObject({
+      branch: "main",
+      stagedFiles: ["feature.txt"],
+    });
+  });
+
+  it("rejects git pathspec magic before staging any files", async () => {
+    for (const magicPath of [":!feature.txt", ":^feature.txt"]) {
+      const repo = await createTestRepo("skyturn-delivery-pathspec-");
+      tempRoots.push(repo.tempRoot);
+      await writeFile(join(repo.repoRoot, magicPath), "pathspec magic\n");
+      await writeFile(join(repo.repoRoot, "unrelated.txt"), "unrelated\n");
+      const cachedBefore = git(repo.repoRoot, ["diff", "--cached", "--name-only", "--"]);
+
+      await expect(createDeliveryCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        files: [magicPath],
+        subject: "feat(delivery): add verified commit action",
+      })).rejects.toThrow(/ambiguous/i);
+
+      expect(git(repo.repoRoot, ["diff", "--cached", "--name-only", "--"])).toBe(cachedBefore);
+    }
+  });
+
+  it("rejects empty file lists, missing subjects, unmanaged paths, ambiguous files, and unchanged files", async () => {
+    const repo = await createTestRepo("skyturn-delivery-guard-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    const outsideRoot = await mkdtemp(join(tmpdir(), "skyturn-delivery-outside-"));
+    tempRoots.push(outsideRoot);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: [],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/non-empty/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "   ",
+    })).rejects.toThrow(/subject/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: outsideRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/managed.*boundary|project boundary/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt", "./feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/ambiguous|duplicate/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["missing.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/reconciled|changed/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+      reconciliationStatus: "failed",
+    })).rejects.toThrow(/reconciliation/i);
+  });
+
+  it("allows managed project worktrees and rejects file paths outside that worktree", async () => {
+    const repo = await createTestRepo("skyturn-delivery-managed-");
+    tempRoots.push(repo.tempRoot);
+    const service = createNodeGitWorktreeService();
+    const worktree = await service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "delivery",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/delivery",
+      parentLaneId: "lane-commit",
+    });
+    await writeFile(join(worktree.realPath, "feature.txt"), "managed change\n");
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      files: ["../project/feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/inside the worktree/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).resolves.toMatchObject({
+      branch: "skyturn/session-1/delivery",
+      stagedFiles: ["feature.txt"],
+      worktreePath: worktree.realPath,
+    });
+  });
+
+  it("rejects requested file paths traversing through symlinked directories outside the worktree", async () => {
+    const repo = await createTestRepo("skyturn-delivery-symlink-");
+    tempRoots.push(repo.tempRoot);
+    const outsideRoot = await mkdtemp(join(tmpdir(), "skyturn-delivery-outside-"));
+    tempRoots.push(outsideRoot);
+    await writeFile(join(outsideRoot, "secret.txt"), "outside\n");
+    await fsSymlink(outsideRoot, join(repo.repoRoot, "outside-link"), "dir");
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["outside-link/secret.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/inside the worktree|symlink/i);
   });
 });
 
