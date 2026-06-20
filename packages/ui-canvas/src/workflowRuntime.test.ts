@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { WorkspaceState } from "@skyturn/persistence";
 import type { AgentRun, CanvasNode, CanvasSession, ImportedProject, RunEvent, RunEvidence, StartAgentRunInput } from "@skyturn/project-core";
 
+import * as WorkflowRuntime from "./workflowRuntime.js";
 import {
   buildPromptForNodeRun,
   claimCompletedBridgeRunPersistence,
@@ -1843,6 +1844,93 @@ describe("workflow runtime event merging", () => {
   });
 });
 
+describe("workflow scheduling policy", () => {
+  it("keeps current-branch write lanes serial", () => {
+    const session = completePlanner(makeSession([
+      withRuntimePolicy(makeNode({
+        id: "lane-implementation-a",
+        agent: "codex",
+        status: "pending",
+        runId: "run-session-1-lane-implementation-a",
+        meta: ["implementation", "lane-implementation-a", "flow-kernel"],
+      }), "workspace-write", ["filesystem", "process"]),
+      withRuntimePolicy(makeNode({
+        id: "lane-implementation-b",
+        agent: "codex",
+        status: "pending",
+        runId: "run-session-1-lane-implementation-b",
+        meta: ["implementation", "lane-implementation-b", "flow-kernel"],
+      }), "workspace-write", ["filesystem", "process"]),
+    ]));
+
+    expect(policyForSession(session).allowedParallelism).toBe(1);
+  });
+
+  it("allows current-branch read-only lanes to run concurrently through Flow Kernel scope gates", () => {
+    const session = completePlanner(makeSession([
+      withRuntimePolicy(makeNode({
+        id: "lane-validation",
+        agent: "codex",
+        status: "pending",
+        runId: "run-session-1-lane-validation",
+        meta: ["validation", "lane-validation", "flow-kernel"],
+      }), "read-only", ["process", "artifact"]),
+      withRuntimePolicy(makeNode({
+        id: "lane-review",
+        agent: "hermes",
+        status: "pending",
+        runId: "run-session-1-lane-review",
+        meta: ["review", "lane-review", "flow-kernel"],
+      }), "read-only", ["process", "artifact"]),
+    ]));
+
+    expect(policyForSession(session).allowedParallelism).toBe(2);
+  });
+
+  it("allows write lanes in distinct real managed worktrees to run concurrently", () => {
+    const session = {
+      ...completePlanner(makeSession([
+        managedWorktreeNode(withRuntimePolicy(makeNode({
+          id: "lane-implementation-a",
+          agent: "codex",
+          status: "pending",
+          runId: "run-session-1-lane-implementation-a",
+          meta: ["implementation", "lane-implementation-a", "flow-kernel"],
+        }), "workspace-write", ["filesystem", "process"]), "worktree-a", "/tmp/project.worktrees/session-1-a"),
+        managedWorktreeNode(withRuntimePolicy(makeNode({
+          id: "lane-implementation-b",
+          agent: "codex",
+          status: "pending",
+          runId: "run-session-1-lane-implementation-b",
+          meta: ["implementation", "lane-implementation-b", "flow-kernel"],
+        }), "workspace-write", ["filesystem", "process"]), "worktree-b", "/tmp/project.worktrees/session-1-b"),
+      ])),
+      target: {
+        executionTarget: "new_worktree" as const,
+        selectedBranch: "main",
+        baseRef: "origin/main",
+      },
+    };
+
+    expect(policyForSession(session).allowedParallelism).toBe(2);
+  });
+});
+
+type WorkflowSchedulingPolicy = {
+  allowedParallelism: number;
+  runningScopes: Array<{ fileScopes: string[]; packageScopes: string[] }>;
+};
+
+type WorkflowSchedulingPolicyForSession = (session: CanvasSession) => WorkflowSchedulingPolicy;
+
+function policyForSession(session: CanvasSession): WorkflowSchedulingPolicy {
+  const policy = (WorkflowRuntime as typeof WorkflowRuntime & {
+    workflowSchedulingPolicyForSession?: WorkflowSchedulingPolicyForSession;
+  }).workflowSchedulingPolicyForSession;
+  expect(policy).toBeTypeOf("function");
+  return policy!(session);
+}
+
 function makeWorkspace(extraNodes: CanvasNode[] = []): WorkspaceState {
   return {
     projects: [
@@ -1864,6 +1952,55 @@ function makeWorkspace(extraNodes: CanvasNode[] = []): WorkspaceState {
     activeSessionId: "session-1",
     sidebarCollapsed: false,
     collapsedProjectIds: [],
+  };
+}
+
+function completePlanner(session: CanvasSession): CanvasSession {
+  return {
+    ...session,
+    nodes: session.nodes.map((node) =>
+      node.id === session.plannerNodeId ? { ...node, status: "completed" } : node,
+    ),
+  };
+}
+
+function withRuntimePolicy(
+  node: CanvasNode,
+  sandbox: NonNullable<CanvasNode["runtimePolicy"]>["sandbox"],
+  sideEffects: NonNullable<CanvasNode["runtimePolicy"]>["sideEffects"],
+): CanvasNode {
+  return {
+    ...node,
+    runtimePolicy: {
+      source: "workflow_projection",
+      trusted: true,
+      executable: true,
+      sandbox,
+      sideEffects,
+      reason: "Test runtime policy.",
+    },
+  };
+}
+
+function managedWorktreeNode(node: CanvasNode, worktreeId: string, realPath: string): CanvasNode {
+  return {
+    ...node,
+    worktree: {
+      ...node.worktree,
+      path: realPath,
+      branchName: `skyturn/session-1/${node.id}`,
+      baseCommit: "origin/main",
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+      baselineRef: "origin/main",
+      worktreeId,
+      variantId: node.id,
+      realPath,
+      gitdir: `/tmp/project/.git/worktrees/${worktreeId}`,
+      repoRoot: "/tmp/project",
+      headCommit: "abc123",
+    },
   };
 }
 
