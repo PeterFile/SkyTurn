@@ -57,6 +57,17 @@ test("Electron main owns natural workflow IPC channels", async () => {
   );
   assert.match(workflowEventsHandler, /redactWorkflowEventForRenderer/);
   assert.doesNotMatch(workflowEventsHandler, /events:\s*store\.listEvents\(sessionId\)\.filter/);
+
+  const worktreeCreateHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:create"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:compare"'),
+  );
+  assert.match(worktreeCreateHandler, /createNodeGitWorktreeService/);
+  assert.match(worktreeCreateHandler, /eventSink/);
+  assert.match(worktreeCreateHandler, /appendWorkflowEvent/);
+  assert.match(worktreeCreateHandler, /resolveGitCommit/);
+  assert.match(worktreeCreateHandler, /createManagedWorktree/);
+  assert.doesNotMatch(worktreeCreateHandler, /status:\s*"requested"/);
 });
 
 test("Electron project memory IPC does not register arbitrary renderer paths", async () => {
@@ -104,6 +115,17 @@ test("preload exposes narrow natural workflow wrappers", async () => {
   assert.doesNotMatch(preload, /ipcRenderer\s*:/);
   assert.doesNotMatch(preload, /return\s+ipcRenderer/);
   assert.doesNotMatch(preload, /execFile|spawn|shell|fs\./);
+});
+
+test("workflow createWorktree public type contract returns created status", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const createWorktreeContract = persistence.slice(
+    persistence.indexOf("createWorktree:"),
+    persistence.indexOf("compareWorktrees:"),
+  );
+
+  assert.match(createWorktreeContract, /status:\s*"created"/);
+  assert.doesNotMatch(createWorktreeContract, /status:\s*"requested"/);
 });
 
 test("changeset IPC resolves real paths before project boundary checks", async () => {

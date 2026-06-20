@@ -117,6 +117,26 @@ interface GitChangesetLike {
   source: "git";
 }
 
+type ManagedWorktreeWorkflowEventKind =
+  | "workflow.worktree.create_requested"
+  | "workflow.worktree.created"
+  | "workflow.worktree.create_failed"
+  | "workflow.worktree.clean_requested"
+  | "workflow.worktree.cleaned"
+  | "workflow.variant.adopt_requested"
+  | "workflow.variant.adopted"
+  | "workflow.variant.adopt_failed"
+  | "workflow.variant.rejected";
+
+interface ManagedWorktreeWorkflowEventLike {
+  kind: ManagedWorktreeWorkflowEventKind;
+  source: "git-worktree";
+  payload: Record<string, unknown>;
+  createdAt: string;
+  idempotencyKey: string;
+  sessionId?: string;
+}
+
 const RUN_PROTOCOL_VERSION = 1;
 const openedProjectRoots = new Set<string>();
 let agentBridge: AgentBridgeHost | null = null;
@@ -498,30 +518,67 @@ ipcMain.handle("workflow:userDecision:answer", workflowHandler(async (projectRoo
 
 ipcMain.handle("workflow:worktree:create", workflowHandler(async (projectRoot: string, input: unknown) => {
   assertKnownProjectRoot(projectRoot);
-  const sessionId = requireText(readField(input, "sessionId"), "workflow session id");
-  const variantId = requireText(readField(input, "variantId"), "workflow variant id");
-  const baseCommit = requireText(readField(input, "baseCommit"), "worktree base commit");
+  const sessionId = requireWorktreeToken(readField(input, "sessionId"), "workflow session id");
+  const variantId = requireWorktreeToken(readField(input, "variantId"), "workflow variant id");
+  const baseRef = optionalText(readField(input, "baseRef")) ?? requireText(readField(input, "baseCommit"), "worktree base commit");
   const parentLaneId = requireText(readField(input, "parentLaneId"), "parent lane id");
   const parentSegmentId = optionalText(readField(input, "parentSegmentId"));
-  const repoRoot = path.resolve(optionalText(readField(input, "repoRoot")) ?? projectRoot);
-  if (repoRoot !== path.resolve(projectRoot)) throw workflowIpcError("UNKNOWN_PROJECT", "Worktree repoRoot must match the open project root.");
-  const worktree = managedWorktreeIdentity(projectRoot, {
-    sessionId,
-    variantId,
-    baseCommit,
-    parentLaneId,
-    ...(parentSegmentId ? { parentSegmentId } : {}),
-  });
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const repoRoot = await fs.realpath(path.resolve(optionalText(readField(input, "repoRoot")) ?? projectRoot));
+  if (repoRoot !== realProjectRoot) throw workflowIpcError("UNKNOWN_PROJECT", "Worktree repoRoot must match the open project root.");
   const store = await getWorkflowStore(projectRoot);
-  const event = store.appendWorkflowEvent({
-    sessionId,
-    kind: "workflow.worktree.create_requested",
-    source: "electron-main",
-    idempotencyKey: `worktree:${worktree.worktreeId}:create-requested`,
-    payload: { worktree },
-    now: new Date().toISOString(),
+  const branchName = `skyturn/${sessionId}/${variantId}`;
+  const worktreeId = `worktree-${sessionId}-${variantId}`;
+  const baseCommit = await resolveGitCommit(repoRoot, baseRef).catch((error) => {
+    recordWorktreeCreateFailure(store, {
+      sessionId,
+      worktreeId,
+      variantId,
+      repoRoot,
+      branchName,
+      baseCommit: baseRef,
+      parentLaneId,
+      ...(parentSegmentId ? { parentSegmentId } : {}),
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
   });
-  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "requested", event, worktree };
+  const existingEvents = store.listEvents(sessionId);
+  const appendedEvents: unknown[] = [];
+  const { createNodeGitWorktreeService } = await import("@skyturn/git-worktree/node");
+  const service = createNodeGitWorktreeService({
+    initialEvents: managedWorktreeEventsFromStore(existingEvents),
+    eventSink: {
+      append: async (event) => {
+        appendedEvents.push(store.appendWorkflowEvent({
+          sessionId: event.sessionId ?? sessionId,
+          kind: event.kind,
+          source: event.source,
+          idempotencyKey: event.idempotencyKey,
+          payload: event.payload,
+          now: event.createdAt,
+        }));
+      },
+    },
+  });
+  try {
+    const worktree = await service.createManagedWorktree({
+      sessionId,
+      variantId,
+      repoRoot,
+      baseCommit,
+      branchName,
+      parentLaneId,
+      ...(parentSegmentId ? { parentSegmentId } : {}),
+    });
+    const event = findWorktreeCreatedEvent(appendedEvents, worktree.worktreeId)
+      ?? findWorktreeCreatedEvent(store.listEvents(sessionId), worktree.worktreeId);
+    broadcastWorkflowProjection(projectRoot, sessionId, store);
+    return { protocolVersion: RUN_PROTOCOL_VERSION, status: "created", event, worktree };
+  } catch (error) {
+    broadcastWorkflowProjection(projectRoot, sessionId, store);
+    throw error;
+  }
 }));
 
 ipcMain.handle("workflow:worktree:compare", workflowHandler(async (projectRoot: string, input: unknown) => {
@@ -1063,34 +1120,119 @@ function normalizeUserDecisionAction(value: unknown): string {
   throw workflowIpcError("INVALID_INPUT", "User decision action is invalid.");
 }
 
-function managedWorktreeIdentity(
-  projectRoot: string,
+async function resolveGitCommit(repoRoot: string, ref: string): Promise<string> {
+  validateGitRefText(ref);
+  try {
+    const result = await execFileAsync("git", ["-C", repoRoot, "rev-parse", "--verify", `${ref}^{commit}`], {
+      encoding: "utf8",
+      maxBuffer: 2_000_000,
+      shell: false,
+    });
+    const commit = String(result.stdout).trim();
+    if (!/^[0-9a-fA-F]{40}$/.test(commit)) throw new Error("resolved ref is not a full commit hash");
+    return commit;
+  } catch {
+    throw workflowIpcError("INVALID_INPUT", `Worktree base ref does not resolve to a commit: ${ref}.`);
+  }
+}
+
+function validateGitRefText(ref: string): void {
+  if (!ref || ref.startsWith("-") || /[\s\0-\x1f]/.test(ref)) {
+    throw workflowIpcError("INVALID_INPUT", "Worktree base ref is invalid.");
+  }
+  if (
+    ref.includes("..") ||
+    ref.includes("@{") ||
+    ref.includes("\\") ||
+    ref.includes("//") ||
+    ref.includes(":") ||
+    ref.includes("~") ||
+    ref.includes("^") ||
+    ref.includes("?") ||
+    ref.includes("*") ||
+    ref.includes("[") ||
+    ref.endsWith(".lock") ||
+    ref.startsWith("/") ||
+    ref.endsWith("/")
+  ) {
+    throw workflowIpcError("INVALID_INPUT", "Worktree base ref is invalid.");
+  }
+}
+
+function recordWorktreeCreateFailure(
+  store: WorkflowStoreHost,
   input: {
     sessionId: string;
+    worktreeId: string;
     variantId: string;
+    repoRoot: string;
+    branchName: string;
     baseCommit: string;
     parentLaneId: string;
     parentSegmentId?: string;
+    reason: string;
   },
-): Record<string, string> {
-  const safeSessionId = safePathToken(input.sessionId);
-  const safeVariantId = safePathToken(input.variantId);
-  const managerRoot = `${path.resolve(projectRoot)}.worktrees`;
-  const worktreePath = path.join(managerRoot, `session-${safeSessionId}-variant-${safeVariantId}`);
-  assertManagedWorktreePath(projectRoot, worktreePath);
-  return {
-    worktreeId: `worktree-${safeSessionId}-${safeVariantId}`,
-    variantId: input.variantId,
-    path: worktreePath,
-    realPath: worktreePath,
-    gitdir: path.join(path.resolve(projectRoot), ".git", "worktrees", `session-${safeSessionId}-variant-${safeVariantId}`),
-    repoRoot: path.resolve(projectRoot),
-    branchName: `skyturn/${safeSessionId}/${safeVariantId}`,
-    baseCommit: input.baseCommit,
-    headCommit: input.baseCommit,
-    parentLaneId: input.parentLaneId,
-    ...(input.parentSegmentId ? { parentSegmentId: input.parentSegmentId } : {}),
-  };
+): void {
+  store.appendWorkflowEvent({
+    sessionId: input.sessionId,
+    kind: "workflow.worktree.create_failed",
+    source: "electron-main",
+    idempotencyKey: `worktree:${input.worktreeId}:create-failed`,
+    payload: {
+      sessionId: input.sessionId,
+      worktreeId: input.worktreeId,
+      variantId: input.variantId,
+      repoRoot: input.repoRoot,
+      branchName: input.branchName,
+      baseCommit: input.baseCommit,
+      parentLaneId: input.parentLaneId,
+      ...(input.parentSegmentId ? { parentSegmentId: input.parentSegmentId } : {}),
+      status: "failed",
+      reason: sanitizeSnippet(input.reason),
+    },
+    now: new Date().toISOString(),
+  });
+}
+
+function managedWorktreeEventsFromStore(events: unknown[]): ManagedWorktreeWorkflowEventLike[] {
+  const managedEvents: ManagedWorktreeWorkflowEventLike[] = [];
+  for (const event of events) {
+    if (!isRecord(event) || !isManagedWorktreeEventKind(event.kind)) continue;
+    const idempotencyKey = optionalText(event.idempotencyKey);
+    if (!idempotencyKey || !isRecord(event.payload)) continue;
+    const eventSessionId = optionalText(event.sessionId);
+    managedEvents.push({
+      kind: event.kind,
+      source: "git-worktree",
+      payload: event.payload,
+      createdAt: optionalText(event.createdAt) ?? new Date().toISOString(),
+      idempotencyKey,
+      ...(eventSessionId ? { sessionId: eventSessionId } : {}),
+    });
+  }
+  return managedEvents;
+}
+
+function isManagedWorktreeEventKind(kind: unknown): kind is ManagedWorktreeWorkflowEventKind {
+  return kind === "workflow.worktree.create_requested" ||
+    kind === "workflow.worktree.created" ||
+    kind === "workflow.worktree.create_failed" ||
+    kind === "workflow.worktree.clean_requested" ||
+    kind === "workflow.worktree.cleaned" ||
+    kind === "workflow.variant.adopt_requested" ||
+    kind === "workflow.variant.adopted" ||
+    kind === "workflow.variant.adopt_failed" ||
+    kind === "workflow.variant.rejected";
+}
+
+function findWorktreeCreatedEvent(events: unknown[], worktreeId: string): unknown | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!isRecord(event) || event.kind !== "workflow.worktree.created") continue;
+    if (!isRecord(event.payload) || !isRecord(event.payload.worktree)) continue;
+    if (event.payload.worktree.worktreeId === worktreeId) return event;
+  }
+  return null;
 }
 
 async function collectChangesetEvidenceForWorktree(
@@ -1230,10 +1372,6 @@ function isInsidePath(parent: string, child: string): boolean {
   return relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-function safePathToken(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "default";
-}
-
 function positiveInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
 }
@@ -1250,6 +1388,14 @@ function requireRecord(value: unknown, field: string): Record<string, unknown> {
 function requireText(value: unknown, field: string): string {
   const text = optionalText(value);
   if (!text) throw workflowIpcError("INVALID_INPUT", `${field} is required.`);
+  return text;
+}
+
+function requireWorktreeToken(value: unknown, field: string): string {
+  const text = requireText(value, field);
+  if (!/^[A-Za-z0-9._-]+$/.test(text)) {
+    throw workflowIpcError("INVALID_INPUT", `${field} must contain only letters, numbers, dot, underscore, or dash.`);
+  }
   return text;
 }
 

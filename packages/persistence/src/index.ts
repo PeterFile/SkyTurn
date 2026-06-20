@@ -54,7 +54,7 @@ export interface WorkflowApi {
   getProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   answerUserDecision: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; projection: unknown }>;
-  createWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown; worktree: WorkflowWorktreeIdentity }>;
+  createWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown; worktree: WorkflowWorktreeIdentity }>;
   compareWorktrees: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; comparison: unknown }>;
   adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown }>;
   cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown }>;
