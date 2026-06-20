@@ -55,6 +55,7 @@ export interface GitBranchFacts {
 }
 
 export type DeliveryCommitErrorCode = "INVALID_INPUT" | "UNSAFE_WORKTREE_PATH" | "DELIVERY_REJECTED";
+export type DeliveryRemoteActionErrorCode = DeliveryCommitErrorCode | "GH_UNAVAILABLE" | "AUTH_REQUIRED" | "REMOTE_HEAD_MISMATCH";
 
 export interface DeliveryCommitInput {
   projectRoot: string;
@@ -67,7 +68,7 @@ export interface DeliveryCommitInput {
 }
 
 export interface DeliveryCommandResult {
-  command: "git";
+  command: "git" | "gh";
   args: string[];
   ok: boolean;
   exitCode: number;
@@ -241,6 +242,50 @@ export function createMockChangeset(node: CanvasNode): Changeset {
     ].join("\n"),
     source: "mock",
   };
+}
+
+export interface DeliveryPushInput {
+  projectRoot: string;
+  worktreePath: string;
+  commitSha: string;
+  remote?: string;
+  branch?: string;
+}
+
+export interface DeliveryPushEvidence {
+  status: "pushed";
+  remote: string;
+  branch: string;
+  commitSha: string;
+  worktreePath: string;
+  command: DeliveryCommandResult;
+}
+
+export interface DeliveryPullRequestInput {
+  projectRoot: string;
+  worktreePath: string;
+  commitSha: string;
+  baseBranch: string;
+  headBranch?: string;
+  remote?: string;
+  title: string;
+  body?: string;
+  whatChanged?: string;
+  why?: string;
+  breakingChanges?: string;
+  serverPr?: string;
+}
+
+export interface DeliveryPullRequestEvidence {
+  status: "created";
+  url: string;
+  number: number;
+  head: string;
+  base: string;
+  remote: string;
+  commitSha: string;
+  title: string;
+  command: DeliveryCommandResult;
 }
 
 export function buildAdjudicationMetrics(recorded: RecordedAdjudicationEvidence): AdjudicationMetric[] {

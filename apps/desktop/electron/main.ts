@@ -86,6 +86,34 @@ interface WorkflowDeliveryCommitInput {
   acceptMismatch?: unknown;
 }
 
+interface WorkflowDeliveryPushInput {
+  sessionId?: unknown;
+  laneId?: unknown;
+  segmentId?: unknown;
+  worktreePath?: unknown;
+  remote?: unknown;
+  commitSha?: unknown;
+  branch?: unknown;
+}
+
+interface WorkflowPullRequestCreateInput {
+  sessionId?: unknown;
+  laneId?: unknown;
+  commitLaneId?: unknown;
+  segmentId?: unknown;
+  worktreePath?: unknown;
+  remote?: unknown;
+  baseBranch?: unknown;
+  headBranch?: unknown;
+  commitSha?: unknown;
+  title?: unknown;
+  body?: unknown;
+  whatChanged?: unknown;
+  why?: unknown;
+  breakingChanges?: unknown;
+  serverPr?: unknown;
+}
+
 interface FinalSessionTarget {
   executionTarget: "current_branch" | "new_worktree";
   selectedBranch: string;
@@ -123,6 +151,16 @@ interface WorkflowDeliveryFlowProjectionLike {
     id: string;
     laneKind?: string;
   }>;
+  edges?: Array<{
+    sourceLaneId?: string;
+    targetLaneId?: string;
+  }>;
+}
+
+interface DeliveryCommitEvidenceLike {
+  commitSha: string;
+  branch: string;
+  worktreePath: string;
 }
 
 interface GitChangesetLike {
@@ -788,6 +826,121 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
   return { protocolVersion: RUN_PROTOCOL_VERSION, status: "committed", event, evidence };
 }));
 
+ipcMain.handle("workflow:delivery:push", workflowHandler(async (projectRoot: string, input: WorkflowDeliveryPushInput) => {
+  assertKnownProjectRoot(projectRoot);
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Delivery push input must be an object.");
+  const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, sessionId);
+  const laneId = requireText(readField(input, "laneId"), "workflow commit laneId");
+  assertWorkflowDeliveryCommitLane(store, sessionId, laneId);
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const rawWorktreePath = optionalText(readField(input, "worktreePath"));
+  const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, laneId, rawWorktreePath, realProjectRoot);
+  const segmentId = optionalText(readField(input, "segmentId"));
+  const commitEvidence = await findDeliveryCommitEvidence(store, sessionId, laneId, segmentId, worktreePath);
+  assertDeliveryEvidenceInputMatches(input, commitEvidence);
+  const remote = optionalText(readField(input, "remote"));
+  const { pushDeliveryBranch } = await import("@skyturn/git-worktree/node");
+  let evidence: Awaited<ReturnType<typeof pushDeliveryBranch>>;
+  try {
+    evidence = await pushDeliveryBranch({
+      projectRoot: realProjectRoot,
+      worktreePath,
+      commitSha: commitEvidence.commitSha,
+      branch: commitEvidence.branch,
+      ...(remote ? { remote } : {}),
+    });
+  } catch (error) {
+    throw normalizeDeliveryRemoteIpcError(error);
+  }
+
+  const event = store.appendWorkflowEvent({
+    sessionId,
+    kind: "workflow.delivery.pushed",
+    source: "electron-main",
+    laneId,
+    segmentId,
+    idempotencyKey: `delivery-push:${evidence.remote}:${evidence.branch}:${evidence.commitSha}`,
+    payload: {
+      laneId,
+      ...(segmentId ? { segmentId } : {}),
+      evidence,
+    },
+    now: new Date().toISOString(),
+  });
+  broadcastWorkflowProjection(projectRoot, sessionId, store);
+
+  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "pushed", event, evidence };
+}));
+
+ipcMain.handle("workflow:pullRequest:create", workflowHandler(async (projectRoot: string, input: WorkflowPullRequestCreateInput) => {
+  assertKnownProjectRoot(projectRoot);
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Pull request input must be an object.");
+  const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, sessionId);
+  const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
+  const commitLaneId = requireText(readField(input, "commitLaneId"), "workflow commit laneId");
+  assertWorkflowPullRequestLane(store, sessionId, laneId, commitLaneId);
+  assertWorkflowDeliveryCommitLane(store, sessionId, commitLaneId);
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const rawWorktreePath = optionalText(readField(input, "worktreePath"));
+  const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, commitLaneId, rawWorktreePath, realProjectRoot);
+  const segmentId = optionalText(readField(input, "segmentId"));
+  const commitEvidence = await findDeliveryCommitEvidence(store, sessionId, commitLaneId, null, worktreePath);
+  assertDeliveryEvidenceInputMatches(input, commitEvidence);
+  const remote = optionalText(readField(input, "remote"));
+  const baseBranch = await validatePullRequestBaseBranch(
+    store,
+    sessionId,
+    realProjectRoot,
+    requireText(readField(input, "baseBranch"), "pull request base branch"),
+    commitEvidence.branch,
+    remote ?? "origin",
+  );
+  const title = requireText(readField(input, "title"), "pull request title");
+  const { createDeliveryPullRequest } = await import("@skyturn/git-worktree/node");
+  let evidence: Awaited<ReturnType<typeof createDeliveryPullRequest>>;
+  try {
+    evidence = await createDeliveryPullRequest({
+      projectRoot: realProjectRoot,
+      worktreePath,
+      commitSha: commitEvidence.commitSha,
+      baseBranch,
+      headBranch: commitEvidence.branch,
+      title,
+      ...(remote ? { remote } : {}),
+      ...(optionalText(readField(input, "body")) ? { body: optionalText(readField(input, "body"))! } : {}),
+      ...(optionalText(readField(input, "whatChanged")) ? { whatChanged: optionalText(readField(input, "whatChanged"))! } : {}),
+      ...(optionalText(readField(input, "why")) ? { why: optionalText(readField(input, "why"))! } : {}),
+      ...(optionalText(readField(input, "breakingChanges")) ? { breakingChanges: optionalText(readField(input, "breakingChanges"))! } : {}),
+      ...(optionalText(readField(input, "serverPr")) ? { serverPr: optionalText(readField(input, "serverPr"))! } : {}),
+    });
+  } catch (error) {
+    throw normalizeDeliveryRemoteIpcError(error);
+  }
+
+  const event = store.appendWorkflowEvent({
+    sessionId,
+    kind: "workflow.pull_request.created",
+    source: "electron-main",
+    laneId,
+    segmentId,
+    idempotencyKey: `pull-request:${evidence.url}`,
+    payload: {
+      laneId,
+      commitLaneId,
+      ...(segmentId ? { segmentId } : {}),
+      evidence,
+    },
+    now: new Date().toISOString(),
+  });
+  broadcastWorkflowProjection(projectRoot, sessionId, store);
+
+  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "created", event, evidence };
+}));
+
 ipcMain.handle("workflow:changeset", workflowHandler(async (projectRoot: string, input: unknown) => {
   assertKnownProjectRoot(projectRoot);
   const nodeId = requireText(readField(input, "nodeId"), "node id");
@@ -1030,6 +1183,10 @@ function workflowEventSummary(kind: string): string {
       return "Run evidence recorded.";
     case "workflow.commit.created":
       return "Commit created.";
+    case "workflow.delivery.pushed":
+      return "Delivery branch pushed.";
+    case "workflow.pull_request.created":
+      return "Pull request created.";
     case "workflow.user_decision.requested":
       return "User decision requested.";
     case "workflow.user_decision.answered":
@@ -1229,6 +1386,8 @@ function summarizeWorkflowEvent(kind: unknown, payload: Record<string, unknown>)
   if (kind === "workflow.worktree.clean_requested") return "worktree cleanup requested";
   if (kind === "workflow.variant.adopt_requested") return "variant adoption requested";
   if (kind === "workflow.commit.created" && isRecord(payload.evidence)) return `commit created: ${sanitizeSnippet(payload.evidence.commitSha)}`;
+  if (kind === "workflow.delivery.pushed" && isRecord(payload.evidence)) return `delivery pushed: ${sanitizeSnippet(payload.evidence.branch)}`;
+  if (kind === "workflow.pull_request.created" && isRecord(payload.evidence)) return `pull request created: ${sanitizeSnippet(payload.evidence.url)}`;
   return typeof kind === "string" ? kind.replace(/^workflow\./, "").replaceAll("_", " ") : "workflow event recorded";
 }
 
@@ -1585,6 +1744,22 @@ function assertWorkflowDeliveryCommitLane(store: WorkflowStoreHost, sessionId: s
   if (lane.laneKind !== "commit") throw workflowIpcError("INVALID_INPUT", `Workflow lane is not a commit lane: ${laneId}.`);
 }
 
+function assertWorkflowPullRequestLane(store: WorkflowStoreHost, sessionId: string, laneId: string, commitLaneId: string): void {
+  const projection = store.materializeFlowProjection(sessionId) as WorkflowDeliveryFlowProjectionLike;
+  if (!isRecord(projection) || !Array.isArray(projection.lanes)) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow projection is unavailable.");
+  }
+  const lane = projection.lanes.find((candidate) => isRecord(candidate) && candidate.id === laneId);
+  if (!lane) throw workflowIpcError("INVALID_INPUT", `Workflow lane is not known: ${laneId}.`);
+  if (lane.laneKind !== "pull_request") {
+    throw workflowIpcError("INVALID_INPUT", `Workflow lane is not a pull_request lane: ${laneId}.`);
+  }
+  const linked = Array.isArray(projection.edges) && projection.edges.some((edge) =>
+    edge.sourceLaneId === commitLaneId && edge.targetLaneId === laneId
+  );
+  if (!linked) throw workflowIpcError("INVALID_INPUT", "Pull request lane must depend on the delivery commit lane.");
+}
+
 async function resolveDeliveryCommitWorktreePath(
   store: WorkflowStoreHost,
   sessionId: string,
@@ -1621,6 +1796,129 @@ async function resolveDeliveryCommitWorktreePath(
     throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Delivery worktree path does not match the commit lane worktree.");
   }
   return realExpectedWorktreePath;
+}
+
+async function findDeliveryCommitEvidence(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  laneId: string,
+  segmentId: string | null,
+  worktreePath: string,
+): Promise<DeliveryCommitEvidenceLike> {
+  const events = store.listEvents(sessionId);
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!isRecord(event) || event.kind !== "workflow.commit.created") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const eventLaneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+    if (eventLaneId !== laneId) continue;
+    const eventSegmentId = optionalText(event.segmentId) ?? optionalText(payload.segmentId);
+    if (segmentId && eventSegmentId !== segmentId) continue;
+    if (!isRecord(payload.evidence)) continue;
+    const evidence = {
+      commitSha: requireText(payload.evidence.commitSha, "delivery commit sha"),
+      branch: requireText(payload.evidence.branch, "delivery branch"),
+      worktreePath: requireText(payload.evidence.worktreePath, "delivery worktree path"),
+    };
+    const realEvidenceWorktree = await fs.realpath(evidence.worktreePath).catch(() => path.resolve(evidence.worktreePath));
+    const realWorktreePath = await fs.realpath(worktreePath).catch(() => path.resolve(worktreePath));
+    if (realEvidenceWorktree !== realWorktreePath) {
+      throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Recorded delivery commit worktree does not match the lane worktree.");
+    }
+    return evidence;
+  }
+  throw workflowIpcError("INVALID_INPUT", `No delivery commit evidence is recorded for lane ${laneId}.`);
+}
+
+function assertDeliveryEvidenceInputMatches(
+  input: Record<string, unknown>,
+  evidence: DeliveryCommitEvidenceLike,
+): void {
+  const commitSha = optionalText(readField(input, "commitSha"));
+  if (commitSha && commitSha !== evidence.commitSha) {
+    throw workflowIpcError("INVALID_INPUT", "Requested commitSha does not match recorded delivery commit evidence.");
+  }
+  const branch = optionalText(readField(input, "branch")) ?? optionalText(readField(input, "headBranch"));
+  if (branch && branch !== evidence.branch) {
+    throw workflowIpcError("INVALID_INPUT", "Requested delivery branch does not match recorded delivery commit evidence.");
+  }
+}
+
+async function validatePullRequestBaseBranch(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  realProjectRoot: string,
+  rawBaseBranch: string,
+  headBranch: string,
+  rawRemote: string,
+): Promise<string> {
+  const remote = normalizeRemoteNameForIpc(rawRemote);
+  const baseBranch = await normalizePullRequestBranchName(realProjectRoot, rawBaseBranch, remote, "pull request base branch");
+  const normalizedHead = await normalizePullRequestBranchName(realProjectRoot, headBranch, remote, "pull request head branch");
+  if (baseBranch === normalizedHead) {
+    throw workflowIpcError("INVALID_INPUT", "Pull request base and head branches must differ.");
+  }
+  const targetBase = await pullRequestBaseFromSessionTarget(store, sessionId, realProjectRoot, remote);
+  if (targetBase && targetBase !== baseBranch) {
+    throw workflowIpcError("INVALID_INPUT", `Pull request base must match the session base branch: ${targetBase}.`);
+  }
+  const local = await gitExitCode(realProjectRoot, ["rev-parse", "--verify", `refs/heads/${baseBranch}^{commit}`]);
+  if (local === 0) return baseBranch;
+  const remoteTracking = await gitExitCode(realProjectRoot, ["rev-parse", "--verify", `refs/remotes/${remote}/${baseBranch}^{commit}`]);
+  if (remoteTracking === 0) return baseBranch;
+  const remoteHead = await gitExitCode(realProjectRoot, ["ls-remote", "--exit-code", "--heads", remote, baseBranch]);
+  if (remoteHead === 0) return baseBranch;
+  throw workflowIpcError("INVALID_INPUT", `Pull request base branch does not resolve: ${baseBranch}.`);
+}
+
+async function pullRequestBaseFromSessionTarget(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  realProjectRoot: string,
+  remote: string,
+): Promise<string | null> {
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  if (!isRecord(canvasSession) || !isRecord(canvasSession.target)) return null;
+  const target = normalizeFinalSessionTarget(canvasSession.target);
+  if (target.executionTarget !== "new_worktree") return null;
+  const value = target.baseRef ?? target.selectedBranch;
+  if (!value || value === "HEAD") return null;
+  return normalizePullRequestBranchName(realProjectRoot, value, remote, "session base branch");
+}
+
+function normalizeRemoteNameForIpc(value: string): string {
+  const remote = value.trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(remote)) throw workflowIpcError("INVALID_INPUT", "Git remote name is invalid.");
+  return remote;
+}
+
+async function normalizePullRequestBranchName(
+  repoRoot: string,
+  value: string,
+  remote: string,
+  field: string,
+): Promise<string> {
+  let branch = value.trim();
+  if (branch.startsWith("refs/heads/")) branch = branch.slice("refs/heads/".length);
+  if (branch.startsWith(`${remote}/`)) branch = branch.slice(remote.length + 1);
+  validateGitRefText(branch);
+  const valid = await gitExitCode(repoRoot, ["check-ref-format", "--branch", branch]);
+  if (valid !== 0) throw workflowIpcError("INVALID_INPUT", `${field} is invalid.`);
+  return branch;
+}
+
+async function gitExitCode(repoRoot: string, args: string[]): Promise<number> {
+  try {
+    await execFileAsync("git", ["-C", repoRoot, ...args], {
+      encoding: "utf8",
+      maxBuffer: 2_000_000,
+      shell: false,
+    });
+    return 0;
+  } catch (error) {
+    const failure = error as { code?: number | string };
+    return typeof failure.code === "number" ? failure.code : 1;
+  }
 }
 
 async function collectChangesetEvidenceForWorktree(
@@ -1816,8 +2114,31 @@ function normalizeDeliveryCommitIpcError(error: unknown): Error {
   return normalizeWorkflowIpcError(error);
 }
 
+function normalizeDeliveryRemoteIpcError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (isRecord(error)) {
+    const code = deliveryRemoteIpcErrorCode(error.code);
+    if (code) return workflowIpcError(code, message);
+  }
+  return normalizeWorkflowIpcError(error);
+}
+
 function deliveryCommitIpcErrorCode(value: unknown): WorkflowIpcErrorCode | null {
   if (value === "INVALID_INPUT" || value === "UNSAFE_WORKTREE_PATH" || value === "DELIVERY_REJECTED") return value;
+  return null;
+}
+
+function deliveryRemoteIpcErrorCode(value: unknown): WorkflowIpcErrorCode | null {
+  if (
+    value === "INVALID_INPUT" ||
+    value === "UNSAFE_WORKTREE_PATH" ||
+    value === "DELIVERY_REJECTED" ||
+    value === "GH_UNAVAILABLE" ||
+    value === "AUTH_REQUIRED" ||
+    value === "REMOTE_HEAD_MISMATCH"
+  ) {
+    return value;
+  }
   return null;
 }
 
