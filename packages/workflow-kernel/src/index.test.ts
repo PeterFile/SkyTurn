@@ -471,6 +471,19 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(withEvidence.lanes.find((item) => item.id === "lane-implementation")?.status).toBe("completed");
   });
 
+  it("completes only commit lanes from workflow.commit.created events", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-implementation", "implementation"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-commit", "commit"), status: "running" } }),
+      event("workflow.commit.created", { laneId: "lane-implementation" }),
+      event("workflow.commit.created", { laneId: "unknown-lane" }),
+      event("workflow.commit.created", { laneId: "lane-commit" }),
+    ]);
+
+    expect(projection.lanes.find((item) => item.id === "lane-implementation")?.status).toBe("running");
+    expect(projection.lanes.find((item) => item.id === "lane-commit")?.status).toBe("completed");
+  });
+
   it("normalizes lane semantics and trusted runtime policy in the projection", () => {
     const projection = reduceWorkflowEvents([
       event("workflow.lane.declared", {

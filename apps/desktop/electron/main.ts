@@ -15,6 +15,7 @@ import {
   rejectMissingWorkflowProjectionNode,
   workflowIpcError,
   workflowStartInputError,
+  type WorkflowIpcErrorCode,
 } from "./workflowIpcContracts";
 
 const execFileAsync = promisify(execFile);
@@ -74,6 +75,17 @@ interface WorkflowFinalChangesetInput {
   runEvents?: unknown;
 }
 
+interface WorkflowDeliveryCommitInput {
+  sessionId?: unknown;
+  laneId?: unknown;
+  segmentId?: unknown;
+  worktreePath?: unknown;
+  files?: unknown;
+  subject?: unknown;
+  body?: unknown;
+  acceptMismatch?: unknown;
+}
+
 interface FinalSessionTarget {
   executionTarget: "current_branch" | "new_worktree";
   selectedBranch: string;
@@ -103,6 +115,13 @@ interface FlowProjectionLike {
     laneId?: string;
     decisionId?: string;
     executable: boolean;
+  }>;
+}
+
+interface WorkflowDeliveryFlowProjectionLike {
+  lanes: Array<{
+    id: string;
+    laneKind?: string;
   }>;
 }
 
@@ -717,6 +736,58 @@ ipcMain.handle("workflow:worktree:clean", workflowHandler(async (projectRoot: st
   }
 }));
 
+ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: string, input: WorkflowDeliveryCommitInput) => {
+  assertKnownProjectRoot(projectRoot);
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Delivery commit input must be an object.");
+  const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, sessionId);
+  const laneId = requireText(readField(input, "laneId"), "workflow commit laneId");
+  assertWorkflowDeliveryCommitLane(store, sessionId, laneId);
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const rawWorktreePath = optionalText(readField(input, "worktreePath"));
+  const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, laneId, rawWorktreePath, realProjectRoot);
+  const files = deliveryFilesFromInput(readField(input, "files"));
+  const subject = requireText(readField(input, "subject"), "commit subject");
+  const body = optionalText(readField(input, "body")) ?? undefined;
+  const reconciliationStatus = deliveryReconciliationStatus(input);
+  const acceptMismatch = readField(input, "acceptMismatch") === true;
+  const { createDeliveryCommit } = await import("@skyturn/git-worktree/node");
+  let evidence: Awaited<ReturnType<typeof createDeliveryCommit>>;
+  try {
+    evidence = await createDeliveryCommit({
+      projectRoot: realProjectRoot,
+      worktreePath,
+      files,
+      subject,
+      ...(body ? { body } : {}),
+      ...(reconciliationStatus ? { reconciliationStatus } : {}),
+      ...(acceptMismatch ? { acceptMismatch } : {}),
+    });
+  } catch (error) {
+    throw normalizeDeliveryCommitIpcError(error);
+  }
+
+  const segmentId = optionalText(readField(input, "segmentId"));
+  const event = store.appendWorkflowEvent({
+    sessionId,
+    kind: "workflow.commit.created",
+    source: "electron-main",
+    laneId,
+    segmentId,
+    idempotencyKey: `delivery-commit:${evidence.commitSha}`,
+    payload: {
+      laneId,
+      ...(segmentId ? { segmentId } : {}),
+      evidence,
+    },
+    now: new Date().toISOString(),
+  });
+  broadcastWorkflowProjection(projectRoot, sessionId, store);
+
+  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "committed", event, evidence };
+}));
+
 ipcMain.handle("workflow:changeset", workflowHandler(async (projectRoot: string, input: unknown) => {
   assertKnownProjectRoot(projectRoot);
   const nodeId = requireText(readField(input, "nodeId"), "node id");
@@ -957,6 +1028,8 @@ function workflowEventSummary(kind: string): string {
       return "Run segment finished.";
     case "workflow.evidence.recorded":
       return "Run evidence recorded.";
+    case "workflow.commit.created":
+      return "Commit created.";
     case "workflow.user_decision.requested":
       return "User decision requested.";
     case "workflow.user_decision.answered":
@@ -1155,6 +1228,7 @@ function summarizeWorkflowEvent(kind: unknown, payload: Record<string, unknown>)
   if (kind === "workflow.worktree.create_requested") return "worktree creation requested";
   if (kind === "workflow.worktree.clean_requested") return "worktree cleanup requested";
   if (kind === "workflow.variant.adopt_requested") return "variant adoption requested";
+  if (kind === "workflow.commit.created" && isRecord(payload.evidence)) return `commit created: ${sanitizeSnippet(payload.evidence.commitSha)}`;
   return typeof kind === "string" ? kind.replace(/^workflow\./, "").replaceAll("_", " ") : "workflow event recorded";
 }
 
@@ -1494,6 +1568,61 @@ function hasRunningTasksForWorktree(
   return false;
 }
 
+function assertKnownWorkflowCanvasSession(store: WorkflowStoreHost, sessionId: string): void {
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  if (!isRecord(canvasSession) || canvasSession.id !== sessionId) {
+    throw workflowIpcError("UNKNOWN_SESSION", `Workflow session is not known: ${sessionId}.`);
+  }
+}
+
+function assertWorkflowDeliveryCommitLane(store: WorkflowStoreHost, sessionId: string, laneId: string): void {
+  const projection = store.materializeFlowProjection(sessionId) as WorkflowDeliveryFlowProjectionLike;
+  if (!isRecord(projection) || !Array.isArray(projection.lanes)) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow projection is unavailable.");
+  }
+  const lane = projection.lanes.find((candidate) => isRecord(candidate) && candidate.id === laneId);
+  if (!lane) throw workflowIpcError("INVALID_INPUT", `Workflow lane is not known: ${laneId}.`);
+  if (lane.laneKind !== "commit") throw workflowIpcError("INVALID_INPUT", `Workflow lane is not a commit lane: ${laneId}.`);
+}
+
+async function resolveDeliveryCommitWorktreePath(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  laneId: string,
+  rawWorktreePath: string | null,
+  realProjectRoot: string,
+): Promise<string> {
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  if (!isRecord(canvasSession) || !Array.isArray(canvasSession.nodes)) {
+    throw workflowIpcError("UNKNOWN_SESSION", `Workflow session is not known: ${sessionId}.`);
+  }
+  const node = canvasSession.nodes.find((node) => isRecord(node) && node.id === laneId);
+  if (!isRecord(node)) throw workflowIpcError("INVALID_INPUT", `Workflow commit lane node is not known: ${laneId}.`);
+  if (!isRecord(node.worktree)) throw workflowIpcError("INVALID_INPUT", `Workflow commit lane has no worktree: ${laneId}.`);
+
+  const storedWorktreePath = optionalText(node.worktree.realPath) ?? optionalText(node.worktree.path);
+  if (!storedWorktreePath) throw workflowIpcError("INVALID_INPUT", `Workflow commit lane has no worktree path: ${laneId}.`);
+  const expectedWorktreePath = path.isAbsolute(storedWorktreePath)
+    ? storedWorktreePath
+    : path.resolve(realProjectRoot, storedWorktreePath);
+  const suppliedWorktreePath = rawWorktreePath
+    ? path.isAbsolute(rawWorktreePath) ? rawWorktreePath : path.resolve(realProjectRoot, rawWorktreePath)
+    : expectedWorktreePath;
+
+  let realExpectedWorktreePath: string;
+  let realSuppliedWorktreePath: string;
+  try {
+    realExpectedWorktreePath = await fs.realpath(expectedWorktreePath);
+    realSuppliedWorktreePath = await fs.realpath(suppliedWorktreePath);
+  } catch {
+    throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Delivery worktree path is not readable.");
+  }
+  if (realSuppliedWorktreePath !== realExpectedWorktreePath) {
+    throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Delivery worktree path does not match the commit lane worktree.");
+  }
+  return realExpectedWorktreePath;
+}
+
 async function collectChangesetEvidenceForWorktree(
   projectRoot: string,
   worktree: Record<string, unknown>,
@@ -1644,6 +1773,22 @@ function requireRecord(value: unknown, field: string): Record<string, unknown> {
   return value;
 }
 
+function deliveryFilesFromInput(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw workflowIpcError("INVALID_INPUT", "Delivery file list must be non-empty.");
+  }
+  return value.map((file) => requireText(file, "delivery file path"));
+}
+
+function deliveryReconciliationStatus(input: Record<string, unknown>): "available" | "empty" | "failed" | "mismatch" | null {
+  const reconciliation = readField(input, "reconciliation");
+  const status = optionalText(readField(input, "reconciliationStatus")) ??
+    (isRecord(reconciliation) ? optionalText(readField(reconciliation, "status")) : null);
+  if (!status) return null;
+  if (status === "available" || status === "empty" || status === "failed" || status === "mismatch") return status;
+  throw workflowIpcError("INVALID_INPUT", "Delivery reconciliation status is invalid.");
+}
+
 function requireText(value: unknown, field: string): string {
   const text = optionalText(value);
   if (!text) throw workflowIpcError("INVALID_INPUT", `${field} is required.`);
@@ -1660,6 +1805,20 @@ function requireWorktreeToken(value: unknown, field: string): string {
 
 function optionalText(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function normalizeDeliveryCommitIpcError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (isRecord(error)) {
+    const code = deliveryCommitIpcErrorCode(error.code);
+    if (code) return workflowIpcError(code, message);
+  }
+  return normalizeWorkflowIpcError(error);
+}
+
+function deliveryCommitIpcErrorCode(value: unknown): WorkflowIpcErrorCode | null {
+  if (value === "INVALID_INPUT" || value === "UNSAFE_WORKTREE_PATH" || value === "DELIVERY_REJECTED") return value;
+  return null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

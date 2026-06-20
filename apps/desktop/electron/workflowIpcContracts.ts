@@ -14,6 +14,7 @@ export const WORKFLOW_IPC_CHANNELS = {
   worktreeCompare: "workflow:worktree:compare",
   worktreeAdopt: "workflow:worktree:adopt",
   worktreeClean: "workflow:worktree:clean",
+  deliveryCommit: "workflow:delivery:commit",
   changeset: "workflow:changeset",
   changesetReconcileFinal: "workflow:changeset:reconcileFinal",
 } as const;
@@ -23,7 +24,8 @@ export type WorkflowIpcErrorCode =
   | "UNKNOWN_PROJECT"
   | "UNKNOWN_SESSION"
   | "NON_EXECUTABLE_NODE"
-  | "UNSAFE_WORKTREE_PATH";
+  | "UNSAFE_WORKTREE_PATH"
+  | "DELIVERY_REJECTED";
 
 export function formatWorkflowIpcError(code: WorkflowIpcErrorCode, message: string): string {
   return `${WORKFLOW_IPC_ERROR_PREFIX}:${code}: ${message}`;

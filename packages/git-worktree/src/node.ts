@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
 import type {
@@ -20,6 +20,10 @@ import {
   type ChangesetReconciliationInput,
   type ChangesetReconciliationService,
   type ChangesetService,
+  type DeliveryCommandResult,
+  type DeliveryCommitErrorCode,
+  type DeliveryCommitEvidence,
+  type DeliveryCommitInput,
   type GitBranchFacts,
   type ManagedWorktreeCleanupInput,
   type ManagedWorktreeCleanupResult,
@@ -125,6 +129,16 @@ export class GitCommandError extends Error {
     super(message);
     this.name = "GitCommandError";
     this.stderr = stderr;
+  }
+}
+
+export class DeliveryCommitError extends Error {
+  readonly code: DeliveryCommitErrorCode;
+
+  constructor(code: DeliveryCommitErrorCode, message: string) {
+    super(message);
+    this.name = "DeliveryCommitError";
+    this.code = code;
   }
 }
 
@@ -542,6 +556,171 @@ export async function getGitBranchFacts(repoRoot: string): Promise<GitBranchFact
     currentBranch,
     branches: branches.length > 0 ? branches : ["HEAD"],
   };
+}
+
+export async function createDeliveryCommit(input: DeliveryCommitInput): Promise<DeliveryCommitEvidence> {
+  assertDeliveryReconciliationStatus(input.reconciliationStatus, input.acceptMismatch === true);
+  const subject = normalizeCommitSubject(input.subject);
+  const body = typeof input.body === "string" && input.body.trim().length > 0 ? input.body.trim() : undefined;
+  const worktreePath = await resolveDeliveryWorktreePath(input.projectRoot, input.worktreePath);
+  const files = await normalizeDeliveryFileList(worktreePath, input.files);
+  const statusLines = parseStatusLines((await git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all", "--"])).stdout);
+  const changedFiles = new Set(filesFromStatus(statusLines));
+  const missingFromChangeset = files.filter((file) => !changedFiles.has(file));
+  if (missingFromChangeset.length > 0) {
+    throwDelivery("DELIVERY_REJECTED", `Requested files are not in the reconciled changeset: ${missingFromChangeset.join(", ")}.`);
+  }
+
+  await runGit(worktreePath, ["add", "--", ...files]);
+  const stagedFiles = stringLines((await git(worktreePath, ["diff", "--cached", "--name-only", "--", ...files])).stdout).sort();
+  if (stagedFiles.length === 0) {
+    throwDelivery("DELIVERY_REJECTED", "Refusing to create an empty delivery commit.");
+  }
+  if (!sameStringSet(stagedFiles, files)) {
+    throwDelivery("DELIVERY_REJECTED", `Staged files do not match requested files: ${stagedFiles.join(", ")}.`);
+  }
+
+  const commitArgs = ["commit", "--only", "-m", subject, ...(body ? ["-m", body] : []), "--", ...files];
+  const command = await runDeliveryGitCommand(worktreePath, commitArgs);
+  const commitSha = await currentHead(worktreePath);
+  const committedFiles = stringLines((await git(worktreePath, [
+    "diff-tree",
+    "--no-commit-id",
+    "--name-only",
+    "-r",
+    commitSha,
+    "--",
+  ])).stdout).sort();
+  if (!sameStringSet(committedFiles, files)) {
+    throwDelivery("DELIVERY_REJECTED", `Committed files do not match requested files: ${committedFiles.join(", ")}.`);
+  }
+  const branch = await currentBranch(worktreePath);
+  return {
+    status: "committed",
+    commitSha,
+    branch,
+    stagedFiles,
+    worktreePath,
+    command,
+    check: {
+      name: "delivery-commit-preflight",
+      ok: true,
+      detail: "Requested files matched git status, the staged index, and the committed file set.",
+      files: committedFiles,
+    },
+  };
+}
+
+function assertDeliveryReconciliationStatus(status: DeliveryCommitInput["reconciliationStatus"], acceptMismatch: boolean): void {
+  if (!status) return;
+  if (status === "available") return;
+  if (status === "mismatch" && acceptMismatch) return;
+  throwDelivery("DELIVERY_REJECTED", `Delivery commit requires an available reconciliation; got ${status}.`);
+}
+
+function normalizeCommitSubject(value: string): string {
+  const subject = typeof value === "string" ? value.trim() : "";
+  if (!subject) throwDelivery("INVALID_INPUT", "Commit subject is required.");
+  if (!/^[a-z][a-z0-9-]*(?:\([a-z0-9._/-]+\))?!?: .+$/.test(subject)) {
+    throwDelivery("INVALID_INPUT", "Commit subject must use Conventional Commits format.");
+  }
+  return subject;
+}
+
+async function resolveDeliveryWorktreePath(projectRoot: string, worktreePath: string): Promise<string> {
+  const repoRoot = await assertGitRepo(projectRoot);
+  const candidate = await realpath(worktreePath);
+  let topLevel: string;
+  try {
+    topLevel = await realpath((await runGit(candidate, ["rev-parse", "--show-toplevel"])).stdout);
+    await findListedWorktree(repoRoot, topLevel);
+  } catch {
+    throwDelivery("UNSAFE_WORKTREE_PATH", "Delivery worktree path must stay inside the opened project or SkyTurn managed worktree boundary.");
+  }
+  if (topLevel === repoRoot) return topLevel;
+
+  const managedRoot = await realpath(resolve(dirname(repoRoot), `${basename(repoRoot)}.worktrees`)).catch(() => null);
+  if (managedRoot && isPathWithin(topLevel, managedRoot)) return topLevel;
+  throwDelivery("UNSAFE_WORKTREE_PATH", "Delivery worktree path must stay inside the opened project or SkyTurn managed worktree boundary.");
+}
+
+async function normalizeDeliveryFileList(worktreePath: string, files: string[]): Promise<string[]> {
+  if (!Array.isArray(files) || files.length === 0) {
+    throwDelivery("INVALID_INPUT", "Delivery file list must be non-empty.");
+  }
+  const normalized = new Set<string>();
+  for (const file of files) {
+    if (typeof file !== "string") throwDelivery("INVALID_INPUT", "Delivery file paths must be strings.");
+    const value = file.trim();
+    if (!value) throwDelivery("INVALID_INPUT", "Delivery file paths must be non-empty.");
+    if (isAbsolute(value)) throwDelivery("INVALID_INPUT", "Delivery file paths must be relative to the worktree.");
+    if (/[\0\r\n]/.test(value) || value.startsWith(":") || /[*?\[]/.test(value)) {
+      throwDelivery("INVALID_INPUT", `Delivery file path is ambiguous: ${value}.`);
+    }
+    const absolutePath = resolve(worktreePath, value);
+    if (!isPathWithinOrSame(absolutePath, worktreePath)) {
+      throwDelivery("UNSAFE_WORKTREE_PATH", `Delivery file path must stay inside the worktree: ${value}.`);
+    }
+    const realFilePath = await realpath(absolutePath).catch(() => null);
+    if (realFilePath && !isPathWithinOrSame(realFilePath, worktreePath)) {
+      throwDelivery("UNSAFE_WORKTREE_PATH", `Delivery file path must stay inside the worktree: ${value}.`);
+    }
+    const relativePath = relativePathFromWorktree(worktreePath, absolutePath);
+    if (!relativePath) throwDelivery("INVALID_INPUT", "Delivery file path must point to a file inside the worktree.");
+    if (normalized.has(relativePath)) throwDelivery("INVALID_INPUT", `Delivery file list has a duplicate or ambiguous entry: ${file}.`);
+    normalized.add(relativePath);
+  }
+  return [...normalized].sort();
+}
+
+function relativePathFromWorktree(worktreePath: string, absolutePath: string): string {
+  const relativePath = relative(worktreePath, absolutePath);
+  return relativePath.split(sep).join("/");
+}
+
+function isPathWithinOrSame(candidate: string, parent: string): boolean {
+  const resolvedCandidate = resolve(candidate);
+  const resolvedParent = resolve(parent);
+  return resolvedCandidate === resolvedParent || isPathWithin(resolvedCandidate, resolvedParent);
+}
+
+function isPathWithin(candidate: string, parent: string): boolean {
+  const resolvedCandidate = resolve(candidate);
+  const resolvedParent = resolve(parent);
+  return resolvedCandidate.startsWith(`${resolvedParent}${sep}`);
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every((value) => rightSet.has(value));
+}
+
+async function runDeliveryGitCommand(cwd: string, args: string[]): Promise<DeliveryCommandResult> {
+  try {
+    const result = await execFileAsync("git", args, {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: gitOutputLimit,
+      shell: false,
+    });
+    return {
+      command: "git",
+      args,
+      ok: true,
+      exitCode: 0,
+      stdout: String(result.stdout).trim(),
+      stderr: String(result.stderr).trim(),
+    };
+  } catch (error) {
+    const failure = error as { code?: number | string; stderr?: string; stdout?: string; message?: string };
+    const stderr = String(failure.stderr || failure.message || "").trim();
+    throwDelivery("DELIVERY_REJECTED", `git ${args[0]} failed: ${stderr}`);
+  }
+}
+
+function throwDelivery(code: DeliveryCommitErrorCode, message: string): never {
+  throw new DeliveryCommitError(code, message);
 }
 
 class GitChangesetService implements ChangesetService, ChangesetEvidenceService, ChangesetReconciliationService {

@@ -1,4 +1,4 @@
-import type { EditorAdapter, EditorKind, GitBranchFacts, ManagedWorktreeCleanupResult } from "@skyturn/git-worktree";
+import type { DeliveryCommitEvidence, EditorAdapter, EditorKind, GitBranchFacts, ManagedWorktreeCleanupResult } from "@skyturn/git-worktree";
 import {
   makeHermesPlannerSessionId,
   normalizeSessionTarget,
@@ -59,6 +59,7 @@ export interface WorkflowApi {
   compareWorktrees: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; comparison: unknown }>;
   adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "adopted" | "failed"; event: unknown | null; adoption: WorkflowVariantAdoption & { status: "adopted" | "failed" } }>;
   cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "cleaned"; event: unknown | null; result: ManagedWorktreeCleanupResult }>;
+  createDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
   getChangeset: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
 }
@@ -89,6 +90,7 @@ export interface DevflowApi {
   getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   workflow: WorkflowApi;
   getWorkflowEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
+  createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
   onRunEvent: (listener: (event: RunEvent) => void) => () => void;
   onWorkflowEvent: (listener: (event: unknown) => void) => () => void;
 }
