@@ -57,7 +57,7 @@ Agent text such as `done`, `completed`, or `success` is plain output.
 - `experimental-run`: real run path exists but depends on unstable CLI/API behavior.
 - `supported-run`: real run path is covered by tests and treated as supported.
 
-Current discovery keeps unverified CLIs at `detected-only`. Codex CLI also has an explicit `experimental-run` adapter that can be registered by bridge callers after they opt in to real local execution.
+Current discovery keeps unavailable or unverified CLIs at `detected-only`. The desktop main process now registers Hermes and Codex real adapters for the real workflow path, but they remain `experimental-run` because they depend on local CLI behavior, credentials, and output stability.
 
 ## Codex CLI Adapter
 
@@ -84,6 +84,6 @@ For code-change display, the adapter should prefer structured Codex change event
 
 ## Roadmap
 
-- P0: contracts, bridge skeleton, mock runs, discovery with `supportLevel`, durable event log, docs.
-- P1: one real Agent adapter behind `experimental-run` and explicit opt-in wiring.
-- P2: independent lightweight bridge process, multi-window sharing, resume, approval workflow.
+- Done: contracts, bridge skeleton, mock runs, discovery with `supportLevel`, durable event log, docs.
+- Done: Hermes and Codex CLI real adapters behind `experimental-run` for the desktop workflow path.
+- Next: harden adapters toward `supported-run`, improve resume/continuation behavior, and move multi-window/shared process concerns behind an independent lightweight bridge process.

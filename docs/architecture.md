@@ -29,10 +29,11 @@ Electron main process owns:
 
 - folder import dialog
 - `.devflow` filesystem creation
-- future git commands
-- future worktree commands
+- git branch facts and git-backed changeset reconciliation
+- workflow SQLite access through Node-only persistence APIs
+- managed worktree side effects when they are wired; the current desktop IPC records create/adopt/clean requests but does not yet execute them
 - Agent bridge IPC, local process execution, and run event persistence
-- future editor launching
+- editor launching through explicit preload methods
 
 Renderer owns:
 
@@ -42,21 +43,22 @@ Renderer owns:
 - canvas session tabs
 - `@xyflow/react` canvas
 - node modal
-- local interaction state
+- local interaction state and browser/mock fallback paths
 
 Renderer does not directly run shell commands.
+
+Renderer must not import `better-sqlite3`, Node git/worktree implementations, `fs`, `child_process`, or other local side-effect modules. It consumes workflow projections and changeset results through the preload API.
 
 `agent-bridge` does not schedule DAGs, confirm Hermes plans, consolidate shared memory, or decide UI policy. It only connects SkyTurn to local Agents and records run events/evidence.
 
 ## Persistence
 
-The MVP uses a typed workspace store in `packages/persistence`.
+SkyTurn currently has two persistence layers with different jobs:
 
-In Electron, the store is file-backed through preload IPC and writes JSON under Electron `userData`. In browser-only verification, the same interface falls back to `localStorage`.
+- Workspace shell state: a typed store in `packages/persistence` persists opened projects, tabs, and renderer workspace state. Electron writes JSON under Electron `userData`; browser-only verification falls back to `localStorage`.
+- Workflow facts: `@skyturn/persistence/workflow-store` is Node-only and stores workflow sessions, events, lanes, segments, evidence, and projections in `.devflow/skyturn-workflow.sqlite`.
 
-The persisted state includes projects, canvas session tabs, graph nodes, graph edges, run/status data embedded in nodes, and mocked changesets.
-
-SQLite can replace this later behind the same repository boundary. Do not wire UI code directly to SQLite.
+The SQLite workflow store is already used by Electron workflow IPC and by the real Hermes-to-Codex path. The renderer still has legacy/browser fallback paths for local canvas behavior, so SQLite is the workflow fact source for the real desktop path but not the only state object in the application.
 
 ## Security Boundary
 
