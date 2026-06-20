@@ -36,6 +36,7 @@ export type ManagedWorktreeWorkflowEventKind =
   | "workflow.worktree.create_failed"
   | "workflow.worktree.clean_requested"
   | "workflow.worktree.cleaned"
+  | "workflow.worktree.clean_failed"
   | "workflow.variant.adopt_requested"
   | "workflow.variant.adopted"
   | "workflow.variant.adopt_failed"
@@ -124,6 +125,13 @@ export class GitCommandError extends Error {
     super(message);
     this.name = "GitCommandError";
     this.stderr = stderr;
+  }
+}
+
+class AdoptionTargetBaseMismatchError extends Error {
+  constructor(branchName: string, expectedHead: string, actualHead: string) {
+    super(`Target branch HEAD mismatch for ${branchName}: expected ${expectedHead}, got ${actualHead}.`);
+    this.name = "AdoptionTargetBaseMismatchError";
   }
 }
 
@@ -306,6 +314,7 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
       await validateTargetBranch(worktree.repoRoot, input.targetBranchName);
       await checkoutTargetBranch(worktree.repoRoot, input.targetBranchName);
       await assertCleanWorktree(worktree.repoRoot, "target worktree");
+      await assertTargetHeadMatchesBase(worktree.repoRoot, input);
       await previewAdoption(worktree.repoRoot, input);
       await applyAdoption(worktree.repoRoot, input);
       const adoptedCommit = await currentHead(worktree.repoRoot);
@@ -324,45 +333,57 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
       await this.record("workflow.variant.adopt_failed", {
         adoption: failed,
       }, `variant:${input.adoptionId}:adopt-failed`);
+      if (error instanceof AdoptionTargetBaseMismatchError) throw error;
       return failed;
     }
   }
 
   async cleanManagedWorktree(input: ManagedWorktreeCleanupInput): Promise<ManagedWorktreeCleanupResult> {
-    if (input.deleteBranch) {
-      validateBranchName(input.worktree.branchName, { requireSkyTurnPrefix: true });
-    }
-    if (await this.runState.hasRunningTasks(input.worktree)) {
-      throw new Error(`Cannot clean ${input.worktree.worktreeId}: running tasks still target this worktree.`);
-    }
-    const eventWorktree = this.findCreatedWorktree(input.worktree.worktreeId);
-    if (!eventWorktree) throw new Error(`No created worktree event for ${input.worktree.worktreeId}.`);
-    verifyCleanupRecord(input.worktree, eventWorktree);
-    const worktree = await this.reconcileManagedWorktree(eventWorktree, { expectedHeadCommit: input.worktree.headCommit });
-    await this.record("workflow.worktree.clean_requested", {
-      worktree,
-      deleteBranch: input.deleteBranch === true,
-    }, `worktree:${worktree.worktreeId}:clean-requested`);
+    let failureWorktree = input.worktree;
+    try {
+      if (input.deleteBranch) {
+        validateBranchName(input.worktree.branchName, { requireSkyTurnPrefix: true });
+      }
+      if (await this.runState.hasRunningTasks(input.worktree)) {
+        throw new Error(`Cannot clean ${input.worktree.worktreeId}: running tasks still target this worktree.`);
+      }
+      const eventWorktree = this.findCreatedWorktree(input.worktree.worktreeId);
+      if (!eventWorktree) throw new Error(`No created worktree event for ${input.worktree.worktreeId}.`);
+      failureWorktree = eventWorktree;
+      verifyCleanupRecord(input.worktree, eventWorktree);
+      const worktree = await this.reconcileManagedWorktree(eventWorktree, { expectedHeadCommit: input.worktree.headCommit });
+      failureWorktree = worktree;
+      if (input.deleteBranch === true) {
+        await assertBranchDeleteSafe(worktree.repoRoot, worktree.branchName);
+      }
+      await this.record("workflow.worktree.clean_requested", {
+        worktree,
+        deleteBranch: input.deleteBranch === true,
+      }, `worktree:${worktree.worktreeId}:clean-requested`);
 
-    await runGit(worktree.repoRoot, ["worktree", "remove", "--", worktree.realPath]);
-    let branchDeleted = false;
-    if (input.deleteBranch === true) {
-      await runGit(worktree.repoRoot, ["branch", "-d", "--", worktree.branchName]);
-      branchDeleted = true;
-    }
+      await runGit(worktree.repoRoot, ["worktree", "remove", "--", worktree.realPath]);
+      let branchDeleted = false;
+      if (input.deleteBranch === true) {
+        await runGit(worktree.repoRoot, ["branch", "-d", "--", worktree.branchName]);
+        branchDeleted = true;
+      }
 
-    const cleanedAt = this.now();
-    const result: ManagedWorktreeCleanupResult = {
-      ok: true,
-      worktreeId: worktree.worktreeId,
-      cleanedAt,
-      branchDeleted,
-    };
-    await this.record("workflow.worktree.cleaned", {
-      worktree,
-      result,
-    }, `worktree:${worktree.worktreeId}:cleaned`);
-    return result;
+      const cleanedAt = this.now();
+      const result: ManagedWorktreeCleanupResult = {
+        ok: true,
+        worktreeId: worktree.worktreeId,
+        cleanedAt,
+        branchDeleted,
+      };
+      await this.record("workflow.worktree.cleaned", {
+        worktree,
+        result,
+      }, `worktree:${worktree.worktreeId}:cleaned`);
+      return result;
+    } catch (error) {
+      await this.recordCleanFailure(failureWorktree, error);
+      throw error;
+    }
   }
 
   async collectChangesetEvidence(input: ChangesetEvidenceInput): Promise<ChangesetEvidence> {
@@ -442,6 +463,20 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
       status: "failed",
       reason: errorMessage(error),
     }, `worktree:${facts.worktreeId}:create-failed`, facts.sessionId);
+  }
+
+  private recordCleanFailure(worktree: WorkflowWorktreeIdentity, error: unknown): Promise<void> {
+    const result: ManagedWorktreeCleanupResult = {
+      ok: false,
+      worktreeId: worktree.worktreeId,
+      cleanedAt: this.now(),
+      branchDeleted: false,
+      reason: errorMessage(error),
+    };
+    return this.record("workflow.worktree.clean_failed", {
+      worktree,
+      result,
+    }, `worktree:${worktree.worktreeId}:clean-failed`);
   }
 
   private findCreatedWorktree(worktreeId: string): WorkflowWorktreeIdentity | null {
@@ -822,6 +857,16 @@ async function validateTargetBranch(repoRoot: string, branchName: string): Promi
   await runGit(repoRoot, ["rev-parse", "--verify", `refs/heads/${branchName}^{commit}`]);
 }
 
+async function assertBranchDeleteSafe(repoRoot: string, branchName: string): Promise<void> {
+  await validateSkyTurnBranch(repoRoot, branchName);
+  const branchRef = `refs/heads/${branchName}`;
+  await runGit(repoRoot, ["rev-parse", "--verify", `${branchRef}^{commit}`]);
+  const merged = await runGit(repoRoot, ["merge-base", "--is-ancestor", branchRef, "HEAD"], { allowFailure: true });
+  if (merged.exitCode !== 0) {
+    throw new Error(`Cannot delete branch ${branchName}: branch is not fully merged into HEAD.`);
+  }
+}
+
 function validateBranchName(branchName: string, input: { requireSkyTurnPrefix: boolean }): void {
   if (!branchName || branchName.startsWith("-") || branchName.includes("\\") || /[\s\0-\x1f]/.test(branchName)) {
     throw new Error(`Unsafe branch name: ${branchName}.`);
@@ -900,7 +945,7 @@ async function ensureAncestor(repoRoot: string, baseCommit: string, headCommit: 
 }
 
 async function assertCleanWorktree(cwd: string, label: string): Promise<void> {
-  const status = (await runGit(cwd, ["status", "--porcelain=v1", "--"])).stdout;
+  const status = (await runGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "--"])).stdout;
   if (status.trim()) throw new Error(`${label} has uncommitted changes.`);
 }
 
@@ -911,13 +956,25 @@ async function checkoutTargetBranch(repoRoot: string, branchName: string): Promi
 }
 
 async function previewAdoption(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
-  if (adoption.strategy === "merge") {
-    await runGit(repoRoot, ["merge", "--no-commit", "--no-ff", adoption.headCommit]);
-    await abortAdoption(repoRoot);
-    return;
+  const previewHead = await currentHead(repoRoot);
+  await assertCleanWorktree(repoRoot, "target worktree");
+  let previewFailed = false;
+  try {
+    if (adoption.strategy === "merge") {
+      await runGit(repoRoot, ["merge", "--no-commit", "--no-ff", adoption.headCommit]);
+      return;
+    }
+    await runGit(repoRoot, ["cherry-pick", "--no-commit", adoption.headCommit]);
+  } catch (error) {
+    previewFailed = true;
+    throw error;
+  } finally {
+    try {
+      await restoreAdoptionPreview(repoRoot, previewHead);
+    } catch (error) {
+      if (!previewFailed) throw error;
+    }
   }
-  await runGit(repoRoot, ["cherry-pick", "--no-commit", adoption.headCommit]);
-  await abortAdoption(repoRoot);
 }
 
 async function applyAdoption(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
@@ -926,6 +983,18 @@ async function applyAdoption(repoRoot: string, adoption: WorkflowVariantAdoption
     return;
   }
   await runGit(repoRoot, ["cherry-pick", adoption.headCommit]);
+}
+
+async function assertTargetHeadMatchesBase(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
+  const targetHead = await currentHead(repoRoot);
+  if (targetHead !== adoption.baseCommit) {
+    throw new AdoptionTargetBaseMismatchError(adoption.targetBranchName, adoption.baseCommit, targetHead);
+  }
+}
+
+async function restoreAdoptionPreview(repoRoot: string, headCommit: string): Promise<void> {
+  await abortAdoption(repoRoot);
+  await runGit(repoRoot, ["reset", "--hard", headCommit]);
 }
 
 async function abortAdoption(repoRoot: string): Promise<void> {

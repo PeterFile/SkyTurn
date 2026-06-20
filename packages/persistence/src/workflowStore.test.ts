@@ -557,6 +557,30 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("replays worktree cleanup failures through the Flow Kernel projection", async () => {
+    const store = await makeSeededStore();
+    const event = store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.worktree.clean_failed",
+      source: "git-worktree",
+      idempotencyKey: "worktree:cleanup-failed",
+      payload: {
+        worktreeId: "worktree-session-1-lane-implementation",
+        reason: "dirty worktree",
+      },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+
+    const projection = store.materializeFlowProjection("session-1");
+
+    expect(event.kind).toBe("workflow.worktree.clean_failed");
+    expect(projection.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "workflow.worktree.clean_failed" }),
+    ]));
+    expect(projection.worktrees).toEqual([]);
+    store.close();
+  });
+
   it("builds a redacted ledger summary from persisted user inputs and recent events", async () => {
     const store = await makeSeededStore();
 

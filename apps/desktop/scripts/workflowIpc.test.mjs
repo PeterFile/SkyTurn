@@ -68,6 +68,38 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(worktreeCreateHandler, /resolveGitCommit/);
   assert.match(worktreeCreateHandler, /createManagedWorktree/);
   assert.doesNotMatch(worktreeCreateHandler, /status:\s*"requested"/);
+
+  const worktreeAdoptHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+  );
+  assert.match(worktreeAdoptHandler, /createNodeGitWorktreeService/);
+  assert.match(worktreeAdoptHandler, /eventSink/);
+  assert.match(worktreeAdoptHandler, /appendWorkflowEvent/);
+  const adoptBoundaryIndex = worktreeAdoptHandler.indexOf("assertAdoptedWorktreeBelongsToProject");
+  const adoptVariantIndex = worktreeAdoptHandler.indexOf("service.adoptVariant");
+  assert.ok(adoptBoundaryIndex >= 0, "adopt IPC must validate the created worktree project boundary");
+  assert.ok(adoptBoundaryIndex < adoptVariantIndex, "adopt IPC must validate the boundary before adoptVariant");
+  assert.match(worktreeAdoptHandler, /findCreatedWorktreeIdentity\(existingEvents,\s*adoption\.worktreeId\)/);
+  assert.match(worktreeAdoptHandler, /recordVariantAdoptFailure/);
+  assert.match(worktreeAdoptHandler, /adoptVariant/);
+  assert.match(worktreeAdoptHandler, /findVariantAdoptionEvent/);
+  assert.match(worktreeAdoptHandler, /catch\s*\(error\)\s*\{[\s\S]*broadcastWorkflowProjection\(projectRoot,\s*sessionId,\s*store\);[\s\S]*throw normalizeWorkflowIpcError\(error\);[\s\S]*\}/);
+  assert.doesNotMatch(worktreeAdoptHandler, /status:\s*"requested"/);
+
+  const worktreeCleanHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  assert.match(worktreeCleanHandler, /createNodeGitWorktreeService/);
+  assert.match(worktreeCleanHandler, /eventSink/);
+  assert.match(worktreeCleanHandler, /appendWorkflowEvent/);
+  assert.match(worktreeCleanHandler, /runState/);
+  assert.match(worktreeCleanHandler, /hasRunningTasksForWorktree/);
+  assert.match(worktreeCleanHandler, /cleanManagedWorktree/);
+  assert.match(worktreeCleanHandler, /deleteBranch:\s*readField\(input,\s*"deleteBranch"\)\s*===\s*true/);
+  assert.match(worktreeCleanHandler, /findWorktreeCleanedEvent/);
+  assert.doesNotMatch(worktreeCleanHandler, /status:\s*"requested"/);
 });
 
 test("workflow createSession persists a normalized session target", async () => {
@@ -143,6 +175,115 @@ test("workflow createWorktree public type contract returns created status", asyn
 
   assert.match(createWorktreeContract, /status:\s*"created"/);
   assert.doesNotMatch(createWorktreeContract, /status:\s*"requested"/);
+});
+
+test("workflow adopt and clean public type contracts return terminal statuses", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const adoptWorktreeContract = persistence.slice(
+    persistence.indexOf("adoptWorktree:"),
+    persistence.indexOf("cleanWorktree:"),
+  );
+  const cleanWorktreeContract = persistence.slice(
+    persistence.indexOf("cleanWorktree:"),
+    persistence.indexOf("getChangeset:"),
+  );
+
+  assert.match(adoptWorktreeContract, /status:\s*"adopted"\s*\|\s*"failed"/);
+  assert.match(adoptWorktreeContract, /adoption:/);
+  assert.doesNotMatch(adoptWorktreeContract, /status:\s*"requested"/);
+  assert.match(cleanWorktreeContract, /status:\s*"cleaned"/);
+  assert.match(cleanWorktreeContract, /result:/);
+  assert.doesNotMatch(cleanWorktreeContract, /status:\s*"requested"/);
+});
+
+test("workflow adopt IPC records a failed adoption before rejecting boundary violations", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const worktreeAdoptHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+  );
+  const helperSource = main.slice(
+    main.indexOf("async function assertAdoptedWorktreeBelongsToProject"),
+    main.indexOf("function findVariantAdoptionEvent"),
+  );
+
+  assert.match(helperSource, /await fs\.realpath\(projectRoot\)/);
+  assert.match(helperSource, /await fs\.realpath\(worktree\.repoRoot\)/);
+  assert.match(helperSource, /repoRoot !== realProjectRoot/);
+  assert.match(helperSource, /await fs\.realpath\(`\$\{realProjectRoot\}\.worktrees`\)/);
+  assert.match(helperSource, /await fs\.realpath\(worktree\.realPath \|\| worktree\.path\)/);
+  assert.match(helperSource, /isInsidePath\(realManagedRoot,\s*realWorktreePath\)/);
+  assert.match(helperSource, /workflow\.variant\.adopt_failed/);
+
+  const failureIndex = worktreeAdoptHandler.indexOf("recordVariantAdoptFailure");
+  const throwIndex = worktreeAdoptHandler.indexOf("throw normalizeWorkflowIpcError");
+  assert.ok(failureIndex >= 0, "boundary rejection must append workflow.variant.adopt_failed");
+  assert.ok(failureIndex < throwIndex, "adopt_failed must be recorded before the normalized IPC error is thrown");
+});
+
+test("workflow adopt IPC audits missing created worktree identity before rejecting", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const worktreeAdoptHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+  );
+  const preService = worktreeAdoptHandler.slice(
+    worktreeAdoptHandler.indexOf("const existingEvents"),
+    worktreeAdoptHandler.indexOf("const appendedEvents"),
+  );
+
+  const tryIndex = preService.indexOf("try {");
+  const lookupIndex = preService.indexOf("findCreatedWorktreeIdentity");
+  const boundaryIndex = preService.indexOf("assertAdoptedWorktreeBelongsToProject");
+  const catchIndex = preService.indexOf("catch (error)");
+  const failureIndex = preService.indexOf("recordVariantAdoptFailure");
+  const broadcastIndex = preService.indexOf("broadcastWorkflowProjection");
+  const throwIndex = preService.indexOf("throw normalizeWorkflowIpcError");
+
+  assert.ok(tryIndex >= 0, "adopt identity lookup must be inside an audited try/catch");
+  assert.ok(lookupIndex > tryIndex, "missing/non-created worktree identity must be caught and audited");
+  assert.ok(lookupIndex < boundaryIndex, "identity lookup must happen before boundary validation");
+  assert.ok(boundaryIndex < catchIndex, "boundary validation must share the audited catch path");
+  assert.ok(failureIndex > catchIndex, "adopt_failed must be recorded in the preflight catch path");
+  assert.ok(failureIndex < broadcastIndex, "adopt_failed must be appended before broadcast");
+  assert.ok(broadcastIndex < throwIndex, "projection must be broadcast before rejecting");
+  assert.ok(
+    worktreeAdoptHandler.indexOf("findCreatedWorktreeIdentity") < worktreeAdoptHandler.indexOf("service.adoptVariant"),
+    "unknown worktree identity must reject before checkout or merge adoption",
+  );
+});
+
+test("workflow clean IPC audits boundary rejection before service removal", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const worktreeCleanHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  const preService = worktreeCleanHandler.slice(
+    worktreeCleanHandler.indexOf("const store = await getWorkflowStore"),
+    worktreeCleanHandler.indexOf('await import("@skyturn/git-worktree/node")'),
+  );
+
+  const storeIndex = preService.indexOf("const store = await getWorkflowStore");
+  const tryIndex = preService.indexOf("try {");
+  const boundaryIndex = preService.indexOf("assertCleanWorktreeBelongsToProject");
+  const catchIndex = preService.indexOf("catch (error)");
+  const failureIndex = preService.indexOf("recordWorktreeCleanFailure");
+  const broadcastIndex = preService.indexOf("broadcastWorkflowProjection");
+  const throwIndex = preService.indexOf("throw normalizeWorkflowIpcError");
+
+  assert.ok(storeIndex >= 0, "clean IPC must open the workflow store before auditable boundary preflight");
+  assert.ok(tryIndex > storeIndex, "clean boundary preflight must run inside an audited try/catch");
+  assert.ok(boundaryIndex > tryIndex, "repoRoot and managed-path checks must be in the audited preflight");
+  assert.ok(boundaryIndex < catchIndex, "boundary rejection must enter the audit catch path");
+  assert.ok(failureIndex > catchIndex, "clean_failed must be recorded for boundary rejection");
+  assert.ok(failureIndex < broadcastIndex, "clean_failed must be appended before broadcast");
+  assert.ok(broadcastIndex < throwIndex, "projection must be broadcast before rejecting");
+  assert.doesNotMatch(preService, /cleanManagedWorktree|service\.cleanManagedWorktree/);
+  assert.ok(
+    boundaryIndex < worktreeCleanHandler.indexOf("service.cleanManagedWorktree"),
+    "boundary checks must remain before git worktree removal",
+  );
 });
 
 test("changeset IPC resolves real paths before project boundary checks", async () => {
