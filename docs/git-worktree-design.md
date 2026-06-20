@@ -21,12 +21,14 @@ Preferred managed worktree location:
 
 ## Interfaces
 
-MVP service contracts live in `packages/git-worktree/src/index.ts`.
+Browser-safe service contracts and mocks live in `packages/git-worktree/src/index.ts`. Node-only implementations live in `packages/git-worktree/src/node.ts` and are exported through the `@skyturn/git-worktree/node` subpath.
 
 - `GitService`
 - `WorktreeService`
 - `ChangesetService`
 - `EditorAdapter`
+
+Current desktop code uses the Node subpath for branch facts and git-backed changeset reconciliation. Managed worktree create/adopt/clean still is not fully wired through Electron: the desktop IPC handlers currently record requested events, while `NodeGitWorktreeService` contains the real filesystem/git implementation and recovery logic.
 
 ## Changesets
 
@@ -42,7 +44,7 @@ SkyTurn should use the same separation:
 
 For the current project branch path, the diff baseline is the branch state at session start. For the managed worktree path, the diff baseline is the selected base branch/ref used to create the candidate worktree.
 
-The MVP may still return deterministic mocked diff data. Real implementation should collect changed files, diff stat, bounded diff preview, and review notes from the actual execution target, then tag the result with its source.
+The real Node changeset implementation now collects changed files, diff stat, bounded diff preview, and reconciliation metadata from the selected execution target. Deterministic mocked diff data remains only for browser/mock paths and contract tests.
 
 Codex reference points inspected in `openai/codex`:
 
@@ -71,4 +73,4 @@ Required editor launch targets:
 - Cursor
 - Zed
 
-The MVP exposes buttons and adapter calls, but external launches are mocked unless Electron main process implements the specific editor command safely.
+The UI exposes buttons and adapter calls. Electron main owns external launches; renderer code must not launch editors directly.

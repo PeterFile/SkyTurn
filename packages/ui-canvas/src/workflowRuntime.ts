@@ -21,6 +21,7 @@ import {
   type RunEvidence,
   type UserDecisionProjection,
   type WorkflowLedgerSummary,
+  type WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
 import {
   compileWorkflowIntent,
@@ -55,6 +56,15 @@ export interface CompletedBridgeRunPersistenceClaim {
   runId: string;
 }
 
+export interface WorkflowSchedulingPolicy {
+  allowedParallelism: number;
+  runningScopes: Array<{ fileScopes: string[]; packageScopes: string[] }>;
+}
+
+const SERIAL_WORKFLOW_PARALLELISM = 1;
+const MAX_WORKFLOW_PARALLELISM = 4;
+const CURRENT_BRANCH_WORKTREE_KEY = "current_branch";
+
 export async function startBridgeRun(
   project: ImportedProject,
   session: CanvasSession,
@@ -63,7 +73,7 @@ export async function startBridgeRun(
   if (!canStartNodeRun(node)) return null;
   const sandbox = sandboxForNodeRun(node);
   const ledger = node.agent === "hermes" ? await loadWorkflowLedger(project, session.id) : undefined;
-  const worktreePath = resolveRunWorktreePath(project, session, node);
+  const worktreePath = await ensureRunWorktreePath(project, session, node);
   if (!worktreePath) return null;
   const result = await window.devflow?.startAgentRun({
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
@@ -198,8 +208,9 @@ async function persistWorkflowRunResult(
     if (!intent.ok) return null;
     if (intent.intent.sessionId !== session.id) return null;
     const applied = await window.devflow.applyWorkflowIntent(project.rootPath, intent.intent);
+    const schedulingPolicy = workflowSchedulingPolicyForSession(applied.canvasSession ?? session);
     const scheduled = await window.devflow.scheduleWorkflowReadyLanes(project.rootPath, session.id, {
-      allowedParallelism: 1,
+      allowedParallelism: schedulingPolicy.allowedParallelism,
       now,
     });
     return scheduled.canvasSession ?? applied.canvasSession ?? null;
@@ -220,11 +231,26 @@ async function persistWorkflowRunResult(
     agentKind: node.agent,
     now,
   });
+  const schedulingSession = applyTerminalEvidenceToSessionNode(recorded.canvasSession ?? session, node.id, evidence);
+  const schedulingPolicy = workflowSchedulingPolicyForSession(schedulingSession);
   const scheduled = await window.devflow.scheduleWorkflowReadyLanes(project.rootPath, session.id, {
-    allowedParallelism: 1,
+    allowedParallelism: schedulingPolicy.allowedParallelism,
     now,
   });
   return scheduled.canvasSession ?? recorded.canvasSession ?? null;
+}
+
+function applyTerminalEvidenceToSessionNode(
+  session: CanvasSession,
+  nodeId: string,
+  evidence: RunEvidence,
+): CanvasSession {
+  if (!isFinalRunStatus(evidence.status)) return session;
+  const status: CanvasNode["status"] = evidence.status === "succeeded" ? "completed" : "failed";
+  return {
+    ...session,
+    nodes: session.nodes.map((node) => (node.id === nodeId ? { ...node, status } : node)),
+  };
 }
 
 function isPlannerRootNode(session: CanvasSession, node: CanvasNode): boolean {
@@ -399,10 +425,8 @@ function scheduleFlowKernelLanes(session: CanvasSession): CanvasSession {
   if (planner && planner.status !== "completed") return session;
 
   const projection = flowProjectionFromSession(session);
-  const runningScopes = projection.lanes
-    .filter((lane) => lane.status === "running")
-    .map((lane) => ({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes }));
-  const ready = scheduleReadyLanes(projection, { allowedParallelism: 1, runningScopes });
+  const schedulingPolicy = workflowSchedulingPolicyForSession(session);
+  const ready = scheduleReadyLanes(projection, schedulingPolicy);
   if (ready.length === 0) return session;
 
   const readyIds = new Set(ready.map((lane) => lane.id));
@@ -422,6 +446,97 @@ function scheduleFlowKernelLanes(session: CanvasSession): CanvasSession {
       };
     }),
   };
+}
+
+export function workflowSchedulingPolicyForSession(session: CanvasSession): WorkflowSchedulingPolicy {
+  const projection = flowProjectionFromSession(session);
+  const nodesById = new Map(session.nodes.map((node) => [node.id, node]));
+  const entries = projection.lanes.map((lane) => ({ lane, node: nodesById.get(lane.id) }));
+  const running = entries.filter(isSchedulingRunningLane);
+  const candidates = entries.filter(isSchedulingCandidateLane);
+  const runningScopes = running.map(({ lane }) => ({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes }));
+  const remainingSlots = Math.max(0, MAX_WORKFLOW_PARALLELISM - running.length);
+
+  if (remainingSlots === 0 || hasUnsafeSharedRunningWrite(session, running)) {
+    return { allowedParallelism: 0, runningScopes };
+  }
+  if (candidates.length === 0) {
+    return { allowedParallelism: SERIAL_WORKFLOW_PARALLELISM, runningScopes };
+  }
+
+  const sharedWriteCandidates = candidates.filter((entry) =>
+    laneHasWriteRisk(entry) && !isKnownManagedWorktreeKey(schedulingWorktreeKey(session, entry.node)),
+  );
+  if (sharedWriteCandidates.length > 0) {
+    return { allowedParallelism: running.length > 0 ? 0 : SERIAL_WORKFLOW_PARALLELISM, runningScopes };
+  }
+
+  const runningWorktreeKeys = new Set(
+    running
+      .map((entry) => schedulingWorktreeKey(session, entry.node))
+      .filter((key): key is string => Boolean(key)),
+  );
+  const candidateWriteKeys: string[] = [];
+  for (const entry of candidates) {
+    if (!laneHasWriteRisk(entry)) continue;
+    const key = schedulingWorktreeKey(session, entry.node);
+    if (!isKnownManagedWorktreeKey(key)) {
+      return { allowedParallelism: SERIAL_WORKFLOW_PARALLELISM, runningScopes };
+    }
+    if (runningWorktreeKeys.has(key)) {
+      return { allowedParallelism: 0, runningScopes };
+    }
+    candidateWriteKeys.push(key);
+  }
+
+  if (new Set(candidateWriteKeys).size !== candidateWriteKeys.length) {
+    return { allowedParallelism: SERIAL_WORKFLOW_PARALLELISM, runningScopes };
+  }
+
+  return {
+    allowedParallelism: Math.min(MAX_WORKFLOW_PARALLELISM, remainingSlots, candidates.length),
+    runningScopes,
+  };
+}
+
+function isSchedulingRunningLane(entry: { lane: FlowLane; node?: CanvasNode }): boolean {
+  return entry.lane.status === "running" || entry.node?.status === "running" || entry.node?.status === "retrying";
+}
+
+function isSchedulingCandidateLane(entry: { lane: FlowLane; node?: CanvasNode }): boolean {
+  if (!entry.lane.executable || entry.node?.nodeKind === "user_decision") return false;
+  if (entry.node && entry.node.status !== "pending") return false;
+  return entry.lane.status === "pending" || entry.lane.status === "ready";
+}
+
+function hasUnsafeSharedRunningWrite(
+  session: CanvasSession,
+  entries: Array<{ lane: FlowLane; node?: CanvasNode }>,
+): boolean {
+  return entries.some((entry) =>
+    laneHasWriteRisk(entry) && !isKnownManagedWorktreeKey(schedulingWorktreeKey(session, entry.node)),
+  );
+}
+
+function laneHasWriteRisk(entry: { lane: FlowLane; node?: CanvasNode }): boolean {
+  const policy = entry.node?.runtimePolicy;
+  if (!policy || policy.source !== "workflow_projection" || !policy.trusted || !policy.executable) return true;
+  if (policy.sandbox !== "read-only") return true;
+  return policy.sideEffects.some((effect) => effect === "filesystem" || effect === "git");
+}
+
+function schedulingWorktreeKey(session: CanvasSession, node?: CanvasNode): string | null {
+  const executionTarget = node?.worktree.executionTarget ?? session.target.executionTarget;
+  if (executionTarget === "current_branch") return CURRENT_BRANCH_WORKTREE_KEY;
+  if (executionTarget !== "new_worktree") return null;
+  const worktree = node?.worktree;
+  if (!worktree?.worktreeId || !worktree.realPath || !worktree.gitdir) return null;
+  if (!isAbsoluteLocalPath(worktree.realPath)) return null;
+  return `worktree:${worktree.realPath.replace(/[/\\]+$/, "")}`;
+}
+
+function isKnownManagedWorktreeKey(key: string | null): key is string {
+  return Boolean(key && key !== CURRENT_BRANCH_WORKTREE_KEY);
 }
 
 function dependenciesFromFlowEdges(projection: FlowProjection): Map<string, string[]> {
@@ -837,11 +952,38 @@ function isWorkflowLedgerSummary(value: unknown): value is WorkflowLedgerSummary
   );
 }
 
+async function ensureRunWorktreePath(project: ImportedProject, session: CanvasSession, node: CanvasNode): Promise<string | null> {
+  const existing = resolveRunWorktreePath(project, session, node);
+  if (existing) return existing;
+  if (!requiresManagedRunWorktree(session, node)) return null;
+  if (typeof window.devflow?.workflow?.createWorktree !== "function") return null;
+
+  const result = await window.devflow.workflow.createWorktree(project.rootPath, {
+    sessionId: session.id,
+    variantId: node.id,
+    repoRoot: project.rootPath,
+    baseRef: node.worktree.baseRef ?? session.target.baseRef ?? node.worktree.baseCommit,
+    baseCommit: node.worktree.baseCommit,
+    parentLaneId: node.id,
+  });
+  return absolutePathFromWorktree(result.worktree);
+}
+
 function resolveRunWorktreePath(project: ImportedProject, session: CanvasSession, node: CanvasNode): string | null {
-  if (node.agent === "hermes") return project.rootPath;
+  if (isPlannerRootNode(session, node)) return project.rootPath;
   const executionTarget = node.worktree.executionTarget ?? session.target.executionTarget;
   if (executionTarget === "current_branch") return project.rootPath;
   const candidate = node.worktree.realPath ?? node.worktree.path;
+  return isAbsoluteLocalPath(candidate) ? candidate : null;
+}
+
+function requiresManagedRunWorktree(session: CanvasSession, node: CanvasNode): boolean {
+  if (isPlannerRootNode(session, node)) return false;
+  return (node.worktree.executionTarget ?? session.target.executionTarget) === "new_worktree";
+}
+
+function absolutePathFromWorktree(worktree: WorkflowWorktreeIdentity): string | null {
+  const candidate = worktree.realPath || worktree.path;
   return isAbsoluteLocalPath(candidate) ? candidate : null;
 }
 

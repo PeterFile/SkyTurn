@@ -9,7 +9,7 @@ import {
   type WorkflowCardCreateInput,
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
-import type { RunEvidence } from "@skyturn/project-core";
+import type { RunEvidence, WorkflowWorktreeIdentity } from "@skyturn/project-core";
 import type { WorkflowIntent } from "@skyturn/workflow-kernel";
 
 const roots: string[] = [];
@@ -143,10 +143,87 @@ describe("SQLite workflow store", () => {
       selectedBranch: "main",
       baseRef: "origin/main",
       worktreeId: "worktree-session-1-node-1",
-      variantId: "variant-session-1-node-1",
+      variantId: "node-1",
     });
     expect(planner?.worktree.realPath).toBeUndefined();
     expect(planner?.worktree.gitdir).toBeUndefined();
+  });
+
+  it("materializes created managed worktree identities after replay and restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: "session-1",
+      projectId: "project-1",
+      title: "Persisted workflow",
+      goal: "Implement in candidate worktree",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Hermes live chat handle was not available during test setup.",
+      target: {
+        executionTarget: "new_worktree",
+        selectedBranch: "main",
+        baseRef: "origin/main",
+      },
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    store.applyWorkflowIntent({
+      intentId: "intent-audit-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Add audit logging" },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
+        { type: "ProposeLanes" },
+      ],
+    }, "2026-06-14T00:00:01.000Z");
+    const worktree: WorkflowWorktreeIdentity = {
+      worktreeId: "worktree-session-1-lane-implementation",
+      variantId: "lane-implementation",
+      path: "/tmp/project.worktrees/session-session-1-variant-lane-implementation",
+      realPath: "/tmp/project.worktrees/session-session-1-variant-lane-implementation",
+      gitdir: "/tmp/project/.git/worktrees/session-session-1-variant-lane-implementation",
+      repoRoot: "/tmp/project",
+      branchName: "skyturn/session-1/lane-implementation",
+      baseCommit: "abc123",
+      headCommit: "abc123",
+      parentLaneId: "lane-implementation",
+    };
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.worktree.created",
+      source: "git-worktree",
+      idempotencyKey: "worktree:lane-implementation:created",
+      payload: { worktree },
+      now: "2026-06-14T00:00:02.000Z",
+    });
+
+    const first = store.materializeCanvasSession("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const afterRestart = reopened.materializeCanvasSession("session-1");
+    const implementation = afterRestart?.nodes.find((node) => node.id === "lane-implementation");
+
+    expect(first?.nodes.find((node) => node.id === "lane-implementation")?.worktree).toMatchObject({
+      path: worktree.realPath,
+      realPath: worktree.realPath,
+      gitdir: worktree.gitdir,
+      repoRoot: worktree.repoRoot,
+      worktreeId: worktree.worktreeId,
+      variantId: worktree.variantId,
+      headCommit: worktree.headCommit,
+    });
+    expect(implementation?.worktree).toMatchObject({
+      path: worktree.realPath,
+      realPath: worktree.realPath,
+      gitdir: worktree.gitdir,
+      repoRoot: worktree.repoRoot,
+      worktreeId: worktree.worktreeId,
+      variantId: worktree.variantId,
+      headCommit: worktree.headCommit,
+    });
+    reopened.close();
   });
 
   it("materializes the SQLite planner root before any WorkflowIntent projection nodes exist", async () => {
@@ -478,6 +555,30 @@ describe("SQLite workflow store", () => {
     expect(replayed).toEqual(projection);
     expect(reopened.listEvents("session-1").some((event) => event.kind === "workflow.intent.accepted")).toBe(true);
     reopened.close();
+  });
+
+  it("replays worktree cleanup failures through the Flow Kernel projection", async () => {
+    const store = await makeSeededStore();
+    const event = store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.worktree.clean_failed",
+      source: "git-worktree",
+      idempotencyKey: "worktree:cleanup-failed",
+      payload: {
+        worktreeId: "worktree-session-1-lane-implementation",
+        reason: "dirty worktree",
+      },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+
+    const projection = store.materializeFlowProjection("session-1");
+
+    expect(event.kind).toBe("workflow.worktree.clean_failed");
+    expect(projection.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "workflow.worktree.clean_failed" }),
+    ]));
+    expect(projection.worktrees).toEqual([]);
+    store.close();
   });
 
   it("builds a redacted ledger summary from persisted user inputs and recent events", async () => {

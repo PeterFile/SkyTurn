@@ -54,6 +54,44 @@ export interface GitBranchFacts {
   branches: string[];
 }
 
+export type DeliveryCommitErrorCode = "INVALID_INPUT" | "UNSAFE_WORKTREE_PATH" | "DELIVERY_REJECTED";
+
+export interface DeliveryCommitInput {
+  projectRoot: string;
+  worktreePath: string;
+  files: string[];
+  subject: string;
+  body?: string;
+  reconciliationStatus?: FinalChangesetReconciliation["status"];
+  acceptMismatch?: boolean;
+}
+
+export interface DeliveryCommandResult {
+  command: "git";
+  args: string[];
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+export interface DeliveryCommitCheckResult {
+  name: "delivery-commit-preflight";
+  ok: boolean;
+  detail: string;
+  files: string[];
+}
+
+export interface DeliveryCommitEvidence {
+  status: "committed";
+  commitSha: string;
+  branch: string;
+  stagedFiles: string[];
+  worktreePath: string;
+  command: DeliveryCommandResult;
+  check: DeliveryCommitCheckResult;
+}
+
 export interface ManagedWorktreeCreateInput {
   sessionId: string;
   variantId: string;

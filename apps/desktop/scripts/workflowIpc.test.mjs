@@ -27,6 +27,7 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:worktree:compare",
     "workflow:worktree:adopt",
     "workflow:worktree:clean",
+    "workflow:delivery:commit",
     "workflow:changeset",
     "workflow:changeset:reconcileFinal",
     "changeset:get",
@@ -57,6 +58,170 @@ test("Electron main owns natural workflow IPC channels", async () => {
   );
   assert.match(workflowEventsHandler, /redactWorkflowEventForRenderer/);
   assert.doesNotMatch(workflowEventsHandler, /events:\s*store\.listEvents\(sessionId\)\.filter/);
+
+  const worktreeCreateHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:create"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:compare"'),
+  );
+  assert.match(worktreeCreateHandler, /createNodeGitWorktreeService/);
+  assert.match(worktreeCreateHandler, /eventSink/);
+  assert.match(worktreeCreateHandler, /appendWorkflowEvent/);
+  assert.match(worktreeCreateHandler, /resolveGitCommit/);
+  assert.match(worktreeCreateHandler, /createManagedWorktree/);
+  assert.doesNotMatch(worktreeCreateHandler, /status:\s*"requested"/);
+
+  const worktreeAdoptHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+  );
+  assert.match(worktreeAdoptHandler, /createNodeGitWorktreeService/);
+  assert.match(worktreeAdoptHandler, /eventSink/);
+  assert.match(worktreeAdoptHandler, /appendWorkflowEvent/);
+  const adoptBoundaryIndex = worktreeAdoptHandler.indexOf("assertAdoptedWorktreeBelongsToProject");
+  const adoptVariantIndex = worktreeAdoptHandler.indexOf("service.adoptVariant");
+  assert.ok(adoptBoundaryIndex >= 0, "adopt IPC must validate the created worktree project boundary");
+  assert.ok(adoptBoundaryIndex < adoptVariantIndex, "adopt IPC must validate the boundary before adoptVariant");
+  assert.match(worktreeAdoptHandler, /findCreatedWorktreeIdentity\(existingEvents,\s*adoption\.worktreeId\)/);
+  assert.match(worktreeAdoptHandler, /recordVariantAdoptFailure/);
+  assert.match(worktreeAdoptHandler, /adoptVariant/);
+  assert.match(worktreeAdoptHandler, /findVariantAdoptionEvent/);
+  assert.match(worktreeAdoptHandler, /catch\s*\(error\)\s*\{[\s\S]*broadcastWorkflowProjection\(projectRoot,\s*sessionId,\s*store\);[\s\S]*throw normalizeWorkflowIpcError\(error\);[\s\S]*\}/);
+  assert.doesNotMatch(worktreeAdoptHandler, /status:\s*"requested"/);
+
+  const worktreeCleanHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  assert.match(worktreeCleanHandler, /createNodeGitWorktreeService/);
+  assert.match(worktreeCleanHandler, /eventSink/);
+  assert.match(worktreeCleanHandler, /appendWorkflowEvent/);
+  assert.match(worktreeCleanHandler, /runState/);
+  assert.match(worktreeCleanHandler, /hasRunningTasksForWorktree/);
+  assert.match(worktreeCleanHandler, /cleanManagedWorktree/);
+  assert.match(worktreeCleanHandler, /deleteBranch:\s*readField\(input,\s*"deleteBranch"\)\s*===\s*true/);
+  assert.match(worktreeCleanHandler, /findWorktreeCleanedEvent/);
+  assert.doesNotMatch(worktreeCleanHandler, /status:\s*"requested"/);
+
+  const deliveryCommitHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  assert.match(deliveryCommitHandler, /createDeliveryCommit/);
+  assert.match(deliveryCommitHandler, /normalizeDeliveryCommitIpcError/);
+  assert.match(deliveryCommitHandler, /deliveryReconciliationStatus/);
+  assert.match(deliveryCommitHandler, /workflow\.commit\.created/);
+  assert.match(deliveryCommitHandler, /appendWorkflowEvent/);
+  assert.match(deliveryCommitHandler, /status:\s*"committed"/);
+  assert.doesNotMatch(deliveryCommitHandler, /status:\s*"requested"/);
+});
+
+test("workflow delivery commit validates known sessions before creating git commits", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const deliveryCommitHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  const helperSource = main.slice(
+    main.indexOf("function assertKnownWorkflowCanvasSession"),
+    main.indexOf("async function collectChangesetEvidenceForWorktree"),
+  );
+
+  const sessionIndex = deliveryCommitHandler.indexOf("const sessionId = assertWorkflowSessionId");
+  const storeIndex = deliveryCommitHandler.indexOf("const store = await getWorkflowStore");
+  const canvasIndex = deliveryCommitHandler.indexOf("assertKnownWorkflowCanvasSession");
+  const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const commitIndex = deliveryCommitHandler.indexOf("createDeliveryCommit({");
+
+  assert.ok(sessionIndex >= 0, "delivery commit IPC must require a workflow sessionId");
+  assert.ok(storeIndex > sessionIndex, "delivery commit IPC must open the workflow store after resolving sessionId");
+  assert.ok(canvasIndex > storeIndex, "delivery commit IPC must validate the CanvasSession before git commit");
+  assert.ok(importIndex > canvasIndex, "delivery commit IPC must validate stale sessions before importing commit implementation");
+  assert.ok(commitIndex > importIndex, "git commit creation must stay after session validation");
+  assert.match(helperSource, /store\.materializeCanvasSession\(sessionId\)/);
+  assert.match(helperSource, /workflowIpcError\("UNKNOWN_SESSION"/);
+});
+
+test("workflow delivery commit validates a commit lane before creating git commits", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const deliveryCommitHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  const helperSource = main.slice(
+    main.indexOf("function assertWorkflowDeliveryCommitLane"),
+    main.indexOf("async function collectChangesetEvidenceForWorktree"),
+  );
+
+  const canvasIndex = deliveryCommitHandler.indexOf("assertKnownWorkflowCanvasSession");
+  const laneIdIndex = deliveryCommitHandler.indexOf('const laneId = requireText(readField(input, "laneId"), "workflow commit laneId")');
+  const laneGuardIndex = deliveryCommitHandler.indexOf("assertWorkflowDeliveryCommitLane(store, sessionId, laneId)");
+  const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const commitIndex = deliveryCommitHandler.indexOf("createDeliveryCommit({");
+
+  assert.ok(laneIdIndex > canvasIndex, "delivery commit IPC must require laneId after validating the session");
+  assert.ok(laneGuardIndex > laneIdIndex, "delivery commit IPC must resolve laneId through the Flow projection");
+  assert.ok(laneGuardIndex < importIndex, "unknown or non-commit laneIds must reject before importing commit implementation");
+  assert.ok(commitIndex > laneGuardIndex, "git commit creation must stay after commit-lane validation");
+  assert.match(helperSource, /store\.materializeFlowProjection\(sessionId\)/);
+  assert.match(helperSource, /\.id === laneId/);
+  assert.match(helperSource, /lane\.laneKind !== "commit"/);
+});
+
+test("workflow delivery commit resolves commit worktree from CanvasSession before creating git commits", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const deliveryCommitHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  const helperSource = main.slice(
+    main.indexOf("async function resolveDeliveryCommitWorktreePath"),
+    main.indexOf("async function collectChangesetEvidenceForWorktree"),
+  );
+
+  const laneGuardIndex = deliveryCommitHandler.indexOf("assertWorkflowDeliveryCommitLane(store, sessionId, laneId)");
+  const resolveIndex = deliveryCommitHandler.indexOf("resolveDeliveryCommitWorktreePath(");
+  const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const commitIndex = deliveryCommitHandler.indexOf("createDeliveryCommit({");
+
+  assert.ok(resolveIndex > laneGuardIndex, "delivery commit IPC must resolve the worktree after commit-lane validation");
+  assert.ok(resolveIndex < importIndex, "renderer worktreePath must be validated before importing git commit implementation");
+  assert.ok(commitIndex > resolveIndex, "git commit creation must use the server-resolved worktree path");
+  assert.match(deliveryCommitHandler, /const worktreePath = await resolveDeliveryCommitWorktreePath\(store,\s*sessionId,\s*laneId,\s*rawWorktreePath,\s*realProjectRoot\)/);
+  assert.match(helperSource, /store\.materializeCanvasSession\(sessionId\)/);
+  assert.match(helperSource, /node\.id === laneId/);
+  assert.match(helperSource, /node\.worktree/);
+  assert.match(helperSource, /await fs\.realpath\(expectedWorktreePath\)/);
+  assert.match(helperSource, /await fs\.realpath\(suppliedWorktreePath\)/);
+  assert.match(helperSource, /realSuppliedWorktreePath !== realExpectedWorktreePath/);
+  assert.match(helperSource, /UNSAFE_WORKTREE_PATH/);
+});
+
+test("workflow delivery commit passes explicit mismatch acceptance to git service", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const deliveryCommitHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+
+  assert.match(deliveryCommitHandler, /const acceptMismatch = readField\(input,\s*"acceptMismatch"\) === true/);
+  assert.match(deliveryCommitHandler, /\.\.\.\(acceptMismatch \? \{ acceptMismatch \} : \{\}\)/);
+});
+
+test("workflow createSession persists a normalized session target", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const createInput = main.slice(
+    main.indexOf("interface WorkflowSessionCreateInput"),
+    main.indexOf("interface WorkflowAppendUserInput"),
+  );
+  const createSessionHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:createSession"'),
+    main.indexOf('ipcMain.handle("workflow:appendUserInput"'),
+  );
+
+  assert.match(createInput, /target\?:\s*unknown/);
+  assert.match(createSessionHandler, /target:\s*normalizeWorkflowSessionTarget\(input\.target\)/);
+  assert.match(main, /function normalizeWorkflowSessionTarget\(value: unknown\): FinalSessionTarget/);
+  assert.match(main, /return \{ executionTarget: "current_branch", selectedBranch: "HEAD" \};/);
 });
 
 test("Electron project memory IPC does not register arbitrary renderer paths", async () => {
@@ -96,14 +261,153 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "compareWorktrees",
     "adoptWorktree",
     "cleanWorktree",
+    "createDeliveryCommit",
     "reconcileFinalChangeset",
     "getProjectBranchFacts",
+    "createWorkflowDeliveryCommit",
   ]) {
     assert.match(preload, new RegExp(`${wrapper}\\s*:`));
   }
   assert.doesNotMatch(preload, /ipcRenderer\s*:/);
   assert.doesNotMatch(preload, /return\s+ipcRenderer/);
   assert.doesNotMatch(preload, /execFile|spawn|shell|fs\./);
+});
+
+test("workflow createWorktree public type contract returns created status", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const createWorktreeContract = persistence.slice(
+    persistence.indexOf("createWorktree:"),
+    persistence.indexOf("compareWorktrees:"),
+  );
+
+  assert.match(createWorktreeContract, /status:\s*"created"/);
+  assert.doesNotMatch(createWorktreeContract, /status:\s*"requested"/);
+});
+
+test("workflow adopt and clean public type contracts return terminal statuses", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const adoptWorktreeContract = persistence.slice(
+    persistence.indexOf("adoptWorktree:"),
+    persistence.indexOf("cleanWorktree:"),
+  );
+  const cleanWorktreeContract = persistence.slice(
+    persistence.indexOf("cleanWorktree:"),
+    persistence.indexOf("getChangeset:"),
+  );
+
+  assert.match(adoptWorktreeContract, /status:\s*"adopted"\s*\|\s*"failed"/);
+  assert.match(adoptWorktreeContract, /adoption:/);
+  assert.doesNotMatch(adoptWorktreeContract, /status:\s*"requested"/);
+  assert.match(cleanWorktreeContract, /status:\s*"cleaned"/);
+  assert.match(cleanWorktreeContract, /result:/);
+  assert.doesNotMatch(cleanWorktreeContract, /status:\s*"requested"/);
+});
+
+test("workflow delivery commit public type contract returns committed evidence", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const workflowContract = persistence.slice(
+    persistence.indexOf("createDeliveryCommit:"),
+    persistence.indexOf("getChangeset:"),
+  );
+  const devflowContract = persistence.slice(
+    persistence.lastIndexOf("createWorkflowDeliveryCommit:"),
+    persistence.indexOf("onRunEvent:"),
+  );
+
+  assert.match(workflowContract, /status:\s*"committed"/);
+  assert.match(workflowContract, /evidence:\s*DeliveryCommitEvidence/);
+  assert.match(devflowContract, /status:\s*"committed"/);
+  assert.match(devflowContract, /evidence:\s*DeliveryCommitEvidence/);
+});
+
+test("workflow adopt IPC records a failed adoption before rejecting boundary violations", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const worktreeAdoptHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+  );
+  const helperSource = main.slice(
+    main.indexOf("async function assertAdoptedWorktreeBelongsToProject"),
+    main.indexOf("function findVariantAdoptionEvent"),
+  );
+
+  assert.match(helperSource, /await fs\.realpath\(projectRoot\)/);
+  assert.match(helperSource, /await fs\.realpath\(worktree\.repoRoot\)/);
+  assert.match(helperSource, /repoRoot !== realProjectRoot/);
+  assert.match(helperSource, /await fs\.realpath\(`\$\{realProjectRoot\}\.worktrees`\)/);
+  assert.match(helperSource, /await fs\.realpath\(worktree\.realPath \|\| worktree\.path\)/);
+  assert.match(helperSource, /isInsidePath\(realManagedRoot,\s*realWorktreePath\)/);
+  assert.match(helperSource, /workflow\.variant\.adopt_failed/);
+
+  const failureIndex = worktreeAdoptHandler.indexOf("recordVariantAdoptFailure");
+  const throwIndex = worktreeAdoptHandler.indexOf("throw normalizeWorkflowIpcError");
+  assert.ok(failureIndex >= 0, "boundary rejection must append workflow.variant.adopt_failed");
+  assert.ok(failureIndex < throwIndex, "adopt_failed must be recorded before the normalized IPC error is thrown");
+});
+
+test("workflow adopt IPC audits missing created worktree identity before rejecting", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const worktreeAdoptHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+  );
+  const preService = worktreeAdoptHandler.slice(
+    worktreeAdoptHandler.indexOf("const existingEvents"),
+    worktreeAdoptHandler.indexOf("const appendedEvents"),
+  );
+
+  const tryIndex = preService.indexOf("try {");
+  const lookupIndex = preService.indexOf("findCreatedWorktreeIdentity");
+  const boundaryIndex = preService.indexOf("assertAdoptedWorktreeBelongsToProject");
+  const catchIndex = preService.indexOf("catch (error)");
+  const failureIndex = preService.indexOf("recordVariantAdoptFailure");
+  const broadcastIndex = preService.indexOf("broadcastWorkflowProjection");
+  const throwIndex = preService.indexOf("throw normalizeWorkflowIpcError");
+
+  assert.ok(tryIndex >= 0, "adopt identity lookup must be inside an audited try/catch");
+  assert.ok(lookupIndex > tryIndex, "missing/non-created worktree identity must be caught and audited");
+  assert.ok(lookupIndex < boundaryIndex, "identity lookup must happen before boundary validation");
+  assert.ok(boundaryIndex < catchIndex, "boundary validation must share the audited catch path");
+  assert.ok(failureIndex > catchIndex, "adopt_failed must be recorded in the preflight catch path");
+  assert.ok(failureIndex < broadcastIndex, "adopt_failed must be appended before broadcast");
+  assert.ok(broadcastIndex < throwIndex, "projection must be broadcast before rejecting");
+  assert.ok(
+    worktreeAdoptHandler.indexOf("findCreatedWorktreeIdentity") < worktreeAdoptHandler.indexOf("service.adoptVariant"),
+    "unknown worktree identity must reject before checkout or merge adoption",
+  );
+});
+
+test("workflow clean IPC audits boundary rejection before service removal", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const worktreeCleanHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  const preService = worktreeCleanHandler.slice(
+    worktreeCleanHandler.indexOf("const store = await getWorkflowStore"),
+    worktreeCleanHandler.indexOf('await import("@skyturn/git-worktree/node")'),
+  );
+
+  const storeIndex = preService.indexOf("const store = await getWorkflowStore");
+  const tryIndex = preService.indexOf("try {");
+  const boundaryIndex = preService.indexOf("assertCleanWorktreeBelongsToProject");
+  const catchIndex = preService.indexOf("catch (error)");
+  const failureIndex = preService.indexOf("recordWorktreeCleanFailure");
+  const broadcastIndex = preService.indexOf("broadcastWorkflowProjection");
+  const throwIndex = preService.indexOf("throw normalizeWorkflowIpcError");
+
+  assert.ok(storeIndex >= 0, "clean IPC must open the workflow store before auditable boundary preflight");
+  assert.ok(tryIndex > storeIndex, "clean boundary preflight must run inside an audited try/catch");
+  assert.ok(boundaryIndex > tryIndex, "repoRoot and managed-path checks must be in the audited preflight");
+  assert.ok(boundaryIndex < catchIndex, "boundary rejection must enter the audit catch path");
+  assert.ok(failureIndex > catchIndex, "clean_failed must be recorded for boundary rejection");
+  assert.ok(failureIndex < broadcastIndex, "clean_failed must be appended before broadcast");
+  assert.ok(broadcastIndex < throwIndex, "projection must be broadcast before rejecting");
+  assert.doesNotMatch(preService, /cleanManagedWorktree|service\.cleanManagedWorktree/);
+  assert.ok(
+    boundaryIndex < worktreeCleanHandler.indexOf("service.cleanManagedWorktree"),
+    "boundary checks must remain before git worktree removal",
+  );
 });
 
 test("changeset IPC resolves real paths before project boundary checks", async () => {
@@ -163,6 +467,11 @@ test("workflow IPC contract errors are recognizable and block decision nodes", a
     false,
   );
   assert.equal(contracts.WORKFLOW_IPC_CHANNELS.worktreeCreate, "workflow:worktree:create");
+  assert.equal(contracts.WORKFLOW_IPC_CHANNELS.deliveryCommit, "workflow:delivery:commit");
+  assert.equal(
+    contracts.formatWorkflowIpcError("DELIVERY_REJECTED", "Commit rejected."),
+    "SKYTURN_WORKFLOW_IPC_ERROR:DELIVERY_REJECTED: Commit rejected.",
+  );
 });
 
 test("run start guard trusts only the SQLite planner root CanvasSession fallback", async () => {

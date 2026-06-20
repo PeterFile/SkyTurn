@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink as fsSymlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption } from "@skyturn/project-core";
 import {
+  createDeliveryCommit,
   createGitChangesetService,
   createNodeGitWorktreeService,
   getGitBranchFacts,
@@ -74,6 +75,29 @@ function requestedEventFor(input: {
     createdAt: "2026-06-16T00:00:00.000Z",
     idempotencyKey: `worktree:${worktreeId}:create-requested`,
     sessionId: input.sessionId,
+  };
+}
+
+function createdEventFor(worktree: {
+  worktreeId: string;
+  variantId: string;
+  path: string;
+  realPath: string;
+  gitdir: string;
+  repoRoot: string;
+  branchName: string;
+  baseCommit: string;
+  headCommit: string;
+  parentLaneId: string;
+  parentSegmentId?: string;
+}, sessionId: string): ManagedWorktreeWorkflowEvent {
+  return {
+    kind: "workflow.worktree.created",
+    source: "git-worktree",
+    payload: { worktree },
+    createdAt: "2026-06-16T00:00:00.000Z",
+    idempotencyKey: `worktree:${worktree.worktreeId}:created`,
+    sessionId,
   };
 }
 
@@ -156,8 +180,21 @@ describe("node git worktree service", () => {
       eventSink: { append: async (event) => events.push(event) },
       runState: { hasRunningTasks: async () => true },
     });
+    const beforeBusyClean = events.length;
     await expect(busyService.cleanManagedWorktree({ worktree: refreshedRight })).rejects.toThrow(/running tasks/i);
     expect(existsSync(refreshedRight.realPath)).toBe(true);
+    expect(events.slice(beforeBusyClean).map((event) => event.kind)).toEqual(["workflow.worktree.clean_failed"]);
+    expect(events.at(-1)).toMatchObject({
+      kind: "workflow.worktree.clean_failed",
+      payload: {
+        worktree: refreshedRight,
+        result: {
+          ok: false,
+          worktreeId: refreshedRight.worktreeId,
+          branchDeleted: false,
+        },
+      },
+    });
 
     const statelessService = createNodeGitWorktreeService({
       runState: { hasRunningTasks: async () => false },
@@ -175,6 +212,135 @@ describe("node git worktree service", () => {
     expect(git(repo.repoRoot, ["rev-parse", "--verify", "refs/heads/skyturn/session-1/right"])).toBe(rightHead);
     expect(events.map((event) => event.kind)).toContain("workflow.worktree.clean_requested");
     expect(events.map((event) => event.kind)).toContain("workflow.worktree.cleaned");
+  });
+
+  it("keeps the target checkout clean after a successful cherry-pick adoption preview", async () => {
+    const repo = await createTestRepo("skyturn-worktree-cherry-preview-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const worktree = await service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "cherry",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/cherry",
+      parentLaneId: "lane-decision",
+    });
+    const headCommit = commitVariant(worktree.realPath, "cherry");
+    const refreshed = await service.reconcileManagedWorktree(worktree, { expectedHeadCommit: headCommit });
+
+    await expect(service.adoptVariant({
+      adoptionId: "adopt-cherry",
+      variantId: refreshed.variantId,
+      worktreeId: refreshed.worktreeId,
+      strategy: "cherry-pick",
+      status: "requested",
+      baseCommit: refreshed.baseCommit,
+      headCommit: refreshed.headCommit,
+      targetBranchName: "main",
+    })).resolves.toMatchObject({
+      adoptionId: "adopt-cherry",
+      status: "adopted",
+    });
+
+    expect(git(repo.repoRoot, ["branch", "--show-current"])).toBe("main");
+    expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--"])).toBe("");
+    expect(readFileSync(join(repo.repoRoot, "cherry.txt"), "utf8")).toBe("cherry\n");
+    expect(events.map((event) => event.kind)).toContain("workflow.variant.adopted");
+  });
+
+  it("rejects target untracked files hidden by git config before adoption preview", async () => {
+    const repo = await createTestRepo("skyturn-worktree-adopt-untracked-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const worktree = await service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "untracked",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/untracked",
+      parentLaneId: "lane-decision",
+    });
+    const headCommit = commitVariant(worktree.realPath, "untracked");
+    const refreshed = await service.reconcileManagedWorktree(worktree, { expectedHeadCommit: headCommit });
+    const targetHead = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const sentinelPath = join(repo.repoRoot, "scratch", "keep.txt");
+    git(repo.repoRoot, ["config", "status.showUntrackedFiles", "no"]);
+    await mkdir(dirname(sentinelPath), { recursive: true });
+    writeFileSync(sentinelPath, "do not delete\n");
+
+    await expect(service.adoptVariant({
+      adoptionId: "adopt-untracked",
+      variantId: refreshed.variantId,
+      worktreeId: refreshed.worktreeId,
+      strategy: "cherry-pick",
+      status: "requested",
+      baseCommit: refreshed.baseCommit,
+      headCommit: refreshed.headCommit,
+      targetBranchName: "main",
+    })).resolves.toMatchObject({
+      adoptionId: "adopt-untracked",
+      status: "failed",
+      failureReason: expect.stringMatching(/target worktree has uncommitted changes/i),
+    });
+
+    expect(existsSync(sentinelPath)).toBe(true);
+    expect(git(repo.repoRoot, ["rev-parse", "HEAD"])).toBe(targetHead);
+    expect(existsSync(join(repo.repoRoot, "untracked.txt"))).toBe(false);
+    expect(events.map((event) => event.kind)).not.toContain("workflow.variant.adopted");
+  });
+
+  it("records adopt_failed and rejects when the target branch drifted from the declared base", async () => {
+    const repo = await createTestRepo("skyturn-worktree-adopt-drift-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const worktree = await service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "drift",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/drift",
+      parentLaneId: "lane-decision",
+    });
+    const headCommit = commitVariant(worktree.realPath, "drift");
+    const refreshed = await service.reconcileManagedWorktree(worktree, { expectedHeadCommit: headCommit });
+    writeFileSync(join(repo.repoRoot, "target.txt"), "target\n");
+    git(repo.repoRoot, ["add", "target.txt"]);
+    git(repo.repoRoot, ["commit", "-m", "advance target"]);
+    const targetHead = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+
+    await expect(service.adoptVariant({
+      adoptionId: "adopt-drift",
+      variantId: refreshed.variantId,
+      worktreeId: refreshed.worktreeId,
+      strategy: "cherry-pick",
+      status: "requested",
+      baseCommit: refreshed.baseCommit,
+      headCommit: refreshed.headCommit,
+      targetBranchName: "main",
+    })).rejects.toThrow(/target branch HEAD/i);
+
+    expect(git(repo.repoRoot, ["rev-parse", "HEAD"])).toBe(targetHead);
+    expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--"])).toBe("");
+    expect(events.at(-1)).toMatchObject({
+      kind: "workflow.variant.adopt_failed",
+      payload: {
+        adoption: {
+          adoptionId: "adopt-drift",
+          status: "failed",
+          failureReason: expect.stringMatching(/target branch HEAD/i),
+        },
+      },
+    });
   });
 
   it("records create_failed when git cannot create the requested worktree", async () => {
@@ -204,6 +370,167 @@ describe("node git worktree service", () => {
     });
   });
 
+  it("returns an existing created worktree for duplicate create requests without new events", async () => {
+    const repo = await createTestRepo("skyturn-worktree-create-idempotent-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const input = {
+      sessionId: "session-1",
+      variantId: "duplicate",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/duplicate",
+      parentLaneId: "lane-decision",
+    };
+
+    const first = await service.createManagedWorktree(input);
+    const eventCount = events.length;
+    const second = await service.createManagedWorktree(input);
+
+    expect(second).toEqual(first);
+    expect(events).toHaveLength(eventCount);
+    expect(events.map((event) => event.kind)).toEqual([
+      "workflow.worktree.create_requested",
+      "workflow.worktree.created",
+    ]);
+  });
+
+  it("refreshes an existing created worktree when duplicate create sees an advanced HEAD without new events", async () => {
+    const repo = await createTestRepo("skyturn-worktree-create-advanced-head-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const input = {
+      sessionId: "session-1",
+      variantId: "duplicate",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/duplicate",
+      parentLaneId: "lane-decision",
+    };
+
+    const first = await service.createManagedWorktree(input);
+    const eventCount = events.length;
+    const advancedHead = commitVariant(first.realPath, "advanced");
+    const second = await service.createManagedWorktree(input);
+
+    expect(second).toEqual({
+      ...first,
+      headCommit: advancedHead,
+    });
+    expect(second.baseCommit).toBe(repo.baseCommit);
+    expect(events).toHaveLength(eventCount);
+    expect(events.map((event) => event.kind)).toEqual([
+      "workflow.worktree.create_requested",
+      "workflow.worktree.created",
+    ]);
+  });
+
+  it("records create_failed instead of reusing a created event when immutable input facts conflict", async () => {
+    const repo = await createTestRepo("skyturn-worktree-create-conflict-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const input = {
+      sessionId: "session-1",
+      variantId: "duplicate",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/duplicate",
+      parentLaneId: "lane-decision",
+    };
+
+    await service.createManagedWorktree(input);
+    writeFileSync(join(repo.repoRoot, "second.txt"), "second\n");
+    git(repo.repoRoot, ["add", "second.txt"]);
+    git(repo.repoRoot, ["commit", "-m", "second"]);
+    const changedBaseCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+
+    await expect(service.createManagedWorktree({
+      ...input,
+      baseCommit: changedBaseCommit,
+      parentLaneId: "lane-other",
+    })).rejects.toThrow(/conflict|mismatch/i);
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "workflow.worktree.create_requested",
+      "workflow.worktree.created",
+      "workflow.worktree.create_failed",
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      kind: "workflow.worktree.create_failed",
+      payload: {
+        worktreeId: "worktree-session-1-duplicate",
+        baseCommit: changedBaseCommit,
+        parentLaneId: "lane-other",
+        status: "failed",
+      },
+    });
+  });
+
+  it("records create_failed when a stale created event points to a missing worktree", async () => {
+    const repo = await createTestRepo("skyturn-worktree-stale-created-");
+    tempRoots.push(repo.tempRoot);
+    const seedService = createNodeGitWorktreeService();
+    const input = {
+      sessionId: "session-1",
+      variantId: "stale",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/stale",
+      parentLaneId: "lane-decision",
+    };
+    const worktree = await seedService.createManagedWorktree(input);
+    rmSync(worktree.realPath, { recursive: true, force: true });
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      initialEvents: [createdEventFor(worktree, input.sessionId)],
+      eventSink: { append: async (event) => events.push(event) },
+    });
+
+    await expect(service.createManagedWorktree(input)).rejects.toThrow(/worktree|no such file|ENOENT/i);
+
+    expect(events.map((event) => event.kind)).toEqual(["workflow.worktree.create_failed"]);
+    expect(events[0]?.payload).toMatchObject({
+      worktreeId: worktree.worktreeId,
+      status: "failed",
+    });
+  });
+
+  it("records create_failed when planning rejects a non top-level repo root", async () => {
+    const repo = await createTestRepo("skyturn-worktree-plan-failure-");
+    tempRoots.push(repo.tempRoot);
+    const nestedRepoPath = join(repo.repoRoot, "nested");
+    await mkdir(nestedRepoPath);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+
+    await expect(service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "nested",
+      repoRoot: nestedRepoPath,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/nested",
+      parentLaneId: "lane-decision",
+    })).rejects.toThrow(/Repo root mismatch/i);
+
+    expect(events.map((event) => event.kind)).toEqual(["workflow.worktree.create_failed"]);
+    expect(events[0]?.payload).toMatchObject({
+      worktreeId: "worktree-session-1-nested",
+      variantId: "nested",
+      status: "failed",
+    });
+  });
+
   it("rejects worktree identity when the recorded base is not an ancestor of HEAD", async () => {
     const repo = await createTestRepo("skyturn-worktree-identity-");
     tempRoots.push(repo.tempRoot);
@@ -229,6 +556,163 @@ describe("node git worktree service", () => {
       ...worktree,
       baseCommit: nonAncestorBase,
     })).rejects.toThrow(/ancestor/i);
+  });
+
+  it("records clean_failed when a stale created event points to a missing cleanup worktree", async () => {
+    const repo = await createTestRepo("skyturn-worktree-clean-stale-");
+    tempRoots.push(repo.tempRoot);
+    const seedService = createNodeGitWorktreeService();
+    const input = {
+      sessionId: "session-1",
+      variantId: "stale-clean",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/stale-clean",
+      parentLaneId: "lane-decision",
+    };
+    const worktree = await seedService.createManagedWorktree(input);
+    rmSync(worktree.realPath, { recursive: true, force: true });
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      initialEvents: [createdEventFor(worktree, input.sessionId)],
+      eventSink: { append: async (event) => events.push(event) },
+    });
+
+    await expect(service.cleanManagedWorktree({ worktree })).rejects.toThrow(/worktree|no such file|ENOENT/i);
+
+    expect(events.map((event) => event.kind)).toEqual(["workflow.worktree.clean_failed"]);
+    expect(events.at(-1)).toMatchObject({
+      kind: "workflow.worktree.clean_failed",
+      payload: {
+        worktree,
+        result: {
+          ok: false,
+          worktreeId: worktree.worktreeId,
+          branchDeleted: false,
+        },
+      },
+    });
+  });
+
+  it("records clean_failed when git refuses to remove a dirty managed worktree", async () => {
+    const repo = await createTestRepo("skyturn-worktree-clean-failure-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const worktree = await service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "dirty",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/dirty",
+      parentLaneId: "lane-decision",
+    });
+    writeFileSync(join(worktree.realPath, "dirty.txt"), "dirty\n");
+
+    await expect(service.cleanManagedWorktree({ worktree })).rejects.toThrow(/remove|uncommitted|dirty|not clean/i);
+
+    expect(existsSync(worktree.realPath)).toBe(true);
+    expect(events.map((event) => event.kind)).toEqual([
+      "workflow.worktree.create_requested",
+      "workflow.worktree.created",
+      "workflow.worktree.clean_requested",
+      "workflow.worktree.clean_failed",
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      kind: "workflow.worktree.clean_failed",
+      payload: {
+        worktree,
+        result: {
+          ok: false,
+          worktreeId: worktree.worktreeId,
+          branchDeleted: false,
+        },
+      },
+    });
+  });
+
+  it("records clean_failed when deleteBranch rejects an unsafe branch name", async () => {
+    const repo = await createTestRepo("skyturn-worktree-clean-unsafe-branch-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+      runState: { hasRunningTasks: async () => false },
+    });
+    const worktree = await service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "unsafe-branch",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/unsafe-branch",
+      parentLaneId: "lane-decision",
+    });
+    const unsafeWorktree = { ...worktree, branchName: "skyturn/session-1/unsafe branch" };
+    const beforeClean = events.length;
+
+    await expect(service.cleanManagedWorktree({
+      worktree: unsafeWorktree,
+      deleteBranch: true,
+    })).rejects.toThrow(/Unsafe branch name/i);
+
+    expect(existsSync(worktree.realPath)).toBe(true);
+    expect(events.slice(beforeClean).map((event) => event.kind)).toEqual(["workflow.worktree.clean_failed"]);
+    expect(events.at(-1)).toMatchObject({
+      kind: "workflow.worktree.clean_failed",
+      payload: {
+        worktree: unsafeWorktree,
+        result: {
+          ok: false,
+          worktreeId: worktree.worktreeId,
+          branchDeleted: false,
+          reason: expect.stringMatching(/Unsafe branch name/i),
+        },
+      },
+    });
+  });
+
+  it("preflights deleteBranch safety before removing an unmerged managed worktree", async () => {
+    const repo = await createTestRepo("skyturn-worktree-clean-unmerged-branch-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+      runState: { hasRunningTasks: async () => false },
+    });
+    const worktree = await service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "unmerged-clean",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/unmerged-clean",
+      parentLaneId: "lane-decision",
+    });
+    const headCommit = commitVariant(worktree.realPath, "unmerged-clean");
+    const refreshed = await service.reconcileManagedWorktree(worktree, { expectedHeadCommit: headCommit });
+    const beforeClean = events.length;
+
+    await expect(service.cleanManagedWorktree({
+      worktree: refreshed,
+      deleteBranch: true,
+    })).rejects.toThrow(/branch/i);
+
+    expect(existsSync(refreshed.realPath)).toBe(true);
+    expect(git(repo.repoRoot, ["rev-parse", "--verify", `refs/heads/${refreshed.branchName}`])).toBe(headCommit);
+    expect(events.slice(beforeClean).map((event) => event.kind)).toEqual(["workflow.worktree.clean_failed"]);
+    expect(events.at(-1)).toMatchObject({
+      kind: "workflow.worktree.clean_failed",
+      payload: {
+        worktree: refreshed,
+        result: {
+          ok: false,
+          worktreeId: refreshed.worktreeId,
+          branchDeleted: false,
+          reason: expect.stringMatching(/branch/i),
+        },
+      },
+    });
   });
 
   it("recovers requested worktree creates from disk state or records an anomalous failure", async () => {
@@ -323,6 +807,208 @@ describe("node git worktree service", () => {
 
     await expect(service.recoverRequestedWorktreeCreates()).resolves.toEqual([]);
     expect(events.map((event) => event.kind)).toEqual(["workflow.worktree.created"]);
+  });
+});
+
+describe("delivery commits", () => {
+  const tempRoots: string[] = [];
+
+  afterEach(() => {
+    for (const root of tempRoots.splice(0)) {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("stages only verified changed files and returns commit evidence", async () => {
+    const repo = await createTestRepo("skyturn-delivery-commit-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    await writeFile(join(repo.repoRoot, "scratch.txt"), "scratch\n");
+
+    const evidence = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+      body: "Commit only the reconciled file.",
+    });
+
+    expect(evidence).toMatchObject({
+      branch: "main",
+      stagedFiles: ["feature.txt"],
+      worktreePath: realpathSync(repo.repoRoot),
+      command: {
+        ok: true,
+        exitCode: 0,
+      },
+    });
+    expect(evidence.commitSha).toMatch(/^[0-9a-f]{40}$/);
+    expect(git(repo.repoRoot, ["show", "--name-only", "--format=%s", "--no-renames", evidence.commitSha])).toContain("feature.txt");
+    expect(git(repo.repoRoot, ["show", "--name-only", "--format=", "--no-renames", evidence.commitSha])).not.toContain("scratch.txt");
+    expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all", "--"])).toBe("?? scratch.txt");
+  });
+
+  it("commits only requested files when unrelated files are already staged", async () => {
+    const repo = await createTestRepo("skyturn-delivery-only-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    await writeFile(join(repo.repoRoot, "extra.txt"), "extra\n");
+    git(repo.repoRoot, ["add", "extra.txt"]);
+
+    const evidence = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    });
+
+    expect(git(repo.repoRoot, ["diff-tree", "--no-commit-id", "--name-only", "-r", evidence.commitSha])).toBe("feature.txt");
+    expect(git(repo.repoRoot, ["diff", "--cached", "--name-only", "--"])).toBe("extra.txt");
+  });
+
+  it("allows mismatch reconciliation only with explicit mismatch acceptance", async () => {
+    const repo = await createTestRepo("skyturn-delivery-mismatch-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+      reconciliationStatus: "mismatch",
+    })).rejects.toThrow(/reconciliation|mismatch/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+      reconciliationStatus: "mismatch",
+      acceptMismatch: true,
+    })).resolves.toMatchObject({
+      branch: "main",
+      stagedFiles: ["feature.txt"],
+    });
+  });
+
+  it("rejects git pathspec magic before staging any files", async () => {
+    for (const magicPath of [":!feature.txt", ":^feature.txt"]) {
+      const repo = await createTestRepo("skyturn-delivery-pathspec-");
+      tempRoots.push(repo.tempRoot);
+      await writeFile(join(repo.repoRoot, magicPath), "pathspec magic\n");
+      await writeFile(join(repo.repoRoot, "unrelated.txt"), "unrelated\n");
+      const cachedBefore = git(repo.repoRoot, ["diff", "--cached", "--name-only", "--"]);
+
+      await expect(createDeliveryCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        files: [magicPath],
+        subject: "feat(delivery): add verified commit action",
+      })).rejects.toThrow(/ambiguous/i);
+
+      expect(git(repo.repoRoot, ["diff", "--cached", "--name-only", "--"])).toBe(cachedBefore);
+    }
+  });
+
+  it("rejects empty file lists, missing subjects, unmanaged paths, ambiguous files, and unchanged files", async () => {
+    const repo = await createTestRepo("skyturn-delivery-guard-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    const outsideRoot = await mkdtemp(join(tmpdir(), "skyturn-delivery-outside-"));
+    tempRoots.push(outsideRoot);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: [],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/non-empty/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "   ",
+    })).rejects.toThrow(/subject/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: outsideRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/managed.*boundary|project boundary/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt", "./feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/ambiguous|duplicate/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["missing.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/reconciled|changed/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+      reconciliationStatus: "failed",
+    })).rejects.toThrow(/reconciliation/i);
+  });
+
+  it("allows managed project worktrees and rejects file paths outside that worktree", async () => {
+    const repo = await createTestRepo("skyturn-delivery-managed-");
+    tempRoots.push(repo.tempRoot);
+    const service = createNodeGitWorktreeService();
+    const worktree = await service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "delivery",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/delivery",
+      parentLaneId: "lane-commit",
+    });
+    await writeFile(join(worktree.realPath, "feature.txt"), "managed change\n");
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      files: ["../project/feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/inside the worktree/i);
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).resolves.toMatchObject({
+      branch: "skyturn/session-1/delivery",
+      stagedFiles: ["feature.txt"],
+      worktreePath: worktree.realPath,
+    });
+  });
+
+  it("rejects requested file paths traversing through symlinked directories outside the worktree", async () => {
+    const repo = await createTestRepo("skyturn-delivery-symlink-");
+    tempRoots.push(repo.tempRoot);
+    const outsideRoot = await mkdtemp(join(tmpdir(), "skyturn-delivery-outside-"));
+    tempRoots.push(outsideRoot);
+    await writeFile(join(outsideRoot, "secret.txt"), "outside\n");
+    await fsSymlink(outsideRoot, join(repo.repoRoot, "outside-link"), "dir");
+
+    await expect(createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["outside-link/secret.txt"],
+      subject: "feat(delivery): add verified commit action",
+    })).rejects.toThrow(/inside the worktree|symlink/i);
   });
 });
 

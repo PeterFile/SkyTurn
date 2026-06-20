@@ -224,4 +224,66 @@ describe("UI source validation", () => {
     expect(changesTab).toContain('typeof devflow.getChangeset === "function"');
     expect(changesTab.indexOf("devflow.reconcileFinalChangeset")).toBeLessThan(changesTab.indexOf("devflow.getChangeset"));
   });
+
+  it("implements answerUserDecision with write-through to desktop and browser fallback", async () => {
+    const appSource = await readSource("./App.tsx");
+    const fnBody = appSource.slice(appSource.indexOf("function answerUserDecision"), appSource.indexOf("function reassignNode"));
+
+    expect(fnBody).toContain("window.devflow.workflow.answerUserDecision(");
+    expect(fnBody).toContain("sessionId: activeSession.id");
+    expect(fnBody).toContain("decisionId: nodeId");
+    expect(fnBody).toContain("selectedOption");
+    expect(fnBody).toContain("action");
+
+    expect(fnBody).toContain("const { canvasSession } = result");
+    expect(fnBody).toContain("if (canvasSession)");
+    expect(fnBody).toContain("setWorkspace((current) =>");
+
+    const devflowCheck = fnBody.indexOf("if (window.devflow");
+    const fallbackUpdate = fnBody.indexOf("updateCanvasSession(activeSession.id");
+    expect(fallbackUpdate).toBeGreaterThan(devflowCheck);
+    expect(fnBody.slice(devflowCheck, fallbackUpdate)).toContain("return;");
+  });
+
+  it("ChangesTab calls createDeliveryCommit without renderer shell imports", async () => {
+    const appSource = await readSource("./App.tsx");
+    const handleCommit = appSource.slice(appSource.indexOf("async function handleCommit()"), appSource.indexOf("if (!changeset) return <p>Loading changes...</p>;"));
+    expect(handleCommit).toContain("window.devflow");
+    expect(handleCommit).toContain("devflow.workflow.createDeliveryCommit");
+    expect(appSource).not.toContain("import fs from ");
+    expect(appSource).not.toContain("import child_process");
+  });
+
+  it("ChangesTab commit action is gated on laneKind and evidence", async () => {
+    const appSource = await readSource("./App.tsx");
+    const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
+    expect(changesTab).toContain("node.laneKind === \"commit\"");
+    expect(changesTab).toContain("hasFinalGitEvidence");
+  });
+
+  it("ChangesTab requires window.confirm when reconciliation status is mismatch", async () => {
+    const appSource = await readSource("./App.tsx");
+    const handleCommit = appSource.slice(appSource.indexOf("async function handleCommit()"), appSource.indexOf("if (!changeset) return <p>Loading changes...</p>;"));
+    expect(handleCommit).toContain('reconciliation?.status === "mismatch"');
+    expect(handleCommit).toContain("window.confirm");
+  });
+
+  it("ChangesTab sends explicit mismatch acceptance only after mismatch confirmation", async () => {
+    const appSource = await readSource("./App.tsx");
+    const handleCommit = appSource.slice(appSource.indexOf("async function handleCommit()"), appSource.indexOf("if (!changeset) return <p>Loading changes...</p>;"));
+    const confirmIndex = handleCommit.indexOf("window.confirm");
+    const commitIndex = handleCommit.indexOf("devflow.workflow.createDeliveryCommit");
+    const acceptIndex = handleCommit.indexOf("acceptMismatch: true");
+
+    expect(confirmIndex).toBeGreaterThanOrEqual(0);
+    expect(acceptIndex).toBeGreaterThan(confirmIndex);
+    expect(acceptIndex).toBeGreaterThan(commitIndex);
+  });
+
+  it("ChangesTab requires window.prompt for subject and checks devflow availability", async () => {
+    const appSource = await readSource("./App.tsx");
+    const handleCommit = appSource.slice(appSource.indexOf("async function handleCommit()"), appSource.indexOf("if (!changeset) return <p>Loading changes...</p>;"));
+    expect(handleCommit).toContain("window.prompt");
+    expect(handleCommit).toContain("if (!devflow?.workflow?.createDeliveryCommit)");
+  });
 });
