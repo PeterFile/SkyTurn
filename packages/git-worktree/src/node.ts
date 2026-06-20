@@ -82,6 +82,13 @@ interface ManagedWorktreePlan {
   parentSegmentId?: string;
 }
 
+type ManagedWorktreeEventFacts = Omit<ManagedWorktreePlan, "managedRoot">;
+
+interface CreatedWorktreeEvent {
+  event: ManagedWorktreeWorkflowEvent;
+  worktree: WorkflowWorktreeIdentity;
+}
+
 interface GitWorktreeListEntry {
   worktree: string;
   head: string | null;
@@ -101,6 +108,7 @@ interface GitRunOptions {
 
 interface ReconcileOptions {
   expectedHeadCommit?: string;
+  allowHeadAdvance?: boolean;
 }
 
 const execFileAsync = promisify(execFile);
@@ -133,7 +141,25 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
   }
 
   async createManagedWorktree(input: ManagedWorktreeCreateInput): Promise<WorkflowWorktreeIdentity> {
-    const plan = await this.planCreate(input);
+    let plan: ManagedWorktreePlan;
+    try {
+      plan = await this.planCreate(input);
+    } catch (error) {
+      await this.recordCreateFailure(createFailureFactsFromInput(input), error);
+      throw error;
+    }
+
+    const existing = this.findCreatedWorktreeEvent(plan.worktreeId);
+    if (existing) {
+      try {
+        verifyCreateRequestMatchesCreatedEvent(plan, existing);
+        return await this.reconcileManagedWorktree(existing.worktree, { allowHeadAdvance: true });
+      } catch (error) {
+        await this.recordCreateFailure(plan, error);
+        throw error;
+      }
+    }
+
     await this.record("workflow.worktree.create_requested", {
       ...eventPlan(plan),
       status: "requested",
@@ -149,11 +175,7 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
       }, `worktree:${plan.worktreeId}:created`, plan.sessionId);
       return worktree;
     } catch (error) {
-      await this.record("workflow.worktree.create_failed", {
-        ...eventPlan(plan),
-        status: "failed",
-        reason: errorMessage(error),
-      }, `worktree:${plan.worktreeId}:create-failed`, plan.sessionId);
+      await this.recordCreateFailure(plan, error);
       throw error;
     }
   }
@@ -217,7 +239,7 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
     }
 
     const headCommit = await currentHead(realPath);
-    const expectedHead = options.expectedHeadCommit ?? worktree.headCommit;
+    const expectedHead = options.allowHeadAdvance ? null : (options.expectedHeadCommit ?? worktree.headCommit);
     if (expectedHead && headCommit !== expectedHead) {
       throw new Error(`Worktree HEAD mismatch: expected ${expectedHead}, got ${headCommit}.`);
     }
@@ -414,12 +436,24 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
     this.eventLog.push(event);
   }
 
+  private recordCreateFailure(facts: ManagedWorktreeEventFacts, error: unknown): Promise<void> {
+    return this.record("workflow.worktree.create_failed", {
+      ...eventPlan(facts),
+      status: "failed",
+      reason: errorMessage(error),
+    }, `worktree:${facts.worktreeId}:create-failed`, facts.sessionId);
+  }
+
   private findCreatedWorktree(worktreeId: string): WorkflowWorktreeIdentity | null {
+    return this.findCreatedWorktreeEvent(worktreeId)?.worktree ?? null;
+  }
+
+  private findCreatedWorktreeEvent(worktreeId: string): CreatedWorktreeEvent | null {
     for (let index = this.eventLog.length - 1; index >= 0; index -= 1) {
       const event = this.eventLog[index];
       if (event?.kind !== "workflow.worktree.created") continue;
       const worktree = event.payload.worktree;
-      if (isWorktreeIdentity(worktree) && worktree.worktreeId === worktreeId) return worktree;
+      if (isWorktreeIdentity(worktree) && worktree.worktreeId === worktreeId) return { event, worktree };
     }
     return null;
   }
@@ -950,7 +984,7 @@ async function runGit(cwd: string, args: string[], options: GitRunOptions = {}):
   }
 }
 
-function eventPlan(plan: ManagedWorktreePlan): Record<string, unknown> {
+function eventPlan(plan: ManagedWorktreeEventFacts): Record<string, unknown> {
   return {
     sessionId: plan.sessionId,
     worktreeId: plan.worktreeId,
@@ -964,11 +998,66 @@ function eventPlan(plan: ManagedWorktreePlan): Record<string, unknown> {
   };
 }
 
+function createFailureFactsFromInput(input: ManagedWorktreeCreateInput): ManagedWorktreeEventFacts {
+  const sessionId = safeEventId(input.sessionId);
+  const variantId = safeEventId(input.variantId);
+  const repoRoot = resolve(input.repoRoot);
+  const managedRoot = resolve(dirname(repoRoot), `${basename(repoRoot)}.worktrees`);
+  return {
+    sessionId: input.sessionId,
+    worktreeId: `worktree-${sessionId}-${variantId}`,
+    variantId: input.variantId,
+    repoRoot,
+    path: resolve(managedRoot, `session-${sessionId}-variant-${variantId}`),
+    baseCommit: input.baseCommit,
+    branchName: input.branchName,
+    parentLaneId: input.parentLaneId,
+    ...(input.parentSegmentId ? { parentSegmentId: input.parentSegmentId } : {}),
+  };
+}
+
+function verifyCreateRequestMatchesCreatedEvent(plan: ManagedWorktreePlan, created: CreatedWorktreeEvent): void {
+  const mismatches: string[] = [];
+  const worktree = created.worktree;
+  const eventSessionId = created.event.sessionId ?? stringField(created.event.payload, "sessionId");
+
+  if (eventSessionId && eventSessionId !== plan.sessionId) {
+    mismatches.push(`sessionId expected ${plan.sessionId}, got ${eventSessionId}`);
+  }
+  if (worktree.variantId !== plan.variantId) {
+    mismatches.push(`variantId expected ${plan.variantId}, got ${worktree.variantId}`);
+  }
+  if (!samePath(worktree.repoRoot, plan.repoRoot)) {
+    mismatches.push(`repoRoot expected ${plan.repoRoot}, got ${worktree.repoRoot}`);
+  }
+  if (worktree.baseCommit !== plan.baseCommit) {
+    mismatches.push(`baseCommit expected ${plan.baseCommit}, got ${worktree.baseCommit}`);
+  }
+  if (worktree.branchName !== plan.branchName) {
+    mismatches.push(`branchName expected ${plan.branchName}, got ${worktree.branchName}`);
+  }
+  if (worktree.parentLaneId !== plan.parentLaneId) {
+    mismatches.push(`parentLaneId expected ${plan.parentLaneId}, got ${worktree.parentLaneId}`);
+  }
+  if ((worktree.parentSegmentId ?? null) !== (plan.parentSegmentId ?? null)) {
+    mismatches.push(`parentSegmentId expected ${plan.parentSegmentId ?? "none"}, got ${worktree.parentSegmentId ?? "none"}`);
+  }
+
+  if (mismatches.length > 0) {
+    throw new Error(`Managed worktree create conflict for ${plan.worktreeId}: ${mismatches.join("; ")}.`);
+  }
+}
+
 function safeId(value: string, field: string): string {
   if (!/^[A-Za-z0-9._-]+$/.test(value)) {
     throw new Error(`${field} must contain only letters, numbers, dot, underscore, or dash.`);
   }
   return value;
+}
+
+function safeEventId(value: string): string {
+  const normalized = value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return normalized || "invalid";
 }
 
 function assertPathInside(path: string, root: string, label: string): void {
@@ -978,7 +1067,11 @@ function assertPathInside(path: string, root: string, label: string): void {
 }
 
 function assertSamePath(left: string, right: string, label: string): void {
-  if (resolve(left) !== resolve(right)) throw new Error(`${label} mismatch: expected ${right}, got ${left}.`);
+  if (!samePath(left, right)) throw new Error(`${label} mismatch: expected ${right}, got ${left}.`);
+}
+
+function samePath(left: string, right: string): boolean {
+  return resolve(left) === resolve(right);
 }
 
 function isWorktreeIdentity(value: unknown): value is WorkflowWorktreeIdentity {

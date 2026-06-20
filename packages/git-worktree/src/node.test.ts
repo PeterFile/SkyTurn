@@ -77,6 +77,29 @@ function requestedEventFor(input: {
   };
 }
 
+function createdEventFor(worktree: {
+  worktreeId: string;
+  variantId: string;
+  path: string;
+  realPath: string;
+  gitdir: string;
+  repoRoot: string;
+  branchName: string;
+  baseCommit: string;
+  headCommit: string;
+  parentLaneId: string;
+  parentSegmentId?: string;
+}, sessionId: string): ManagedWorktreeWorkflowEvent {
+  return {
+    kind: "workflow.worktree.created",
+    source: "git-worktree",
+    payload: { worktree },
+    createdAt: "2026-06-16T00:00:00.000Z",
+    idempotencyKey: `worktree:${worktree.worktreeId}:created`,
+    sessionId,
+  };
+}
+
 describe("node git worktree service", () => {
   const tempRoots: string[] = [];
 
@@ -201,6 +224,167 @@ describe("node git worktree service", () => {
     expect(events[1]?.payload).toMatchObject({
       worktreeId: "worktree-session-1-broken",
       variantId: "broken",
+    });
+  });
+
+  it("returns an existing created worktree for duplicate create requests without new events", async () => {
+    const repo = await createTestRepo("skyturn-worktree-create-idempotent-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const input = {
+      sessionId: "session-1",
+      variantId: "duplicate",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/duplicate",
+      parentLaneId: "lane-decision",
+    };
+
+    const first = await service.createManagedWorktree(input);
+    const eventCount = events.length;
+    const second = await service.createManagedWorktree(input);
+
+    expect(second).toEqual(first);
+    expect(events).toHaveLength(eventCount);
+    expect(events.map((event) => event.kind)).toEqual([
+      "workflow.worktree.create_requested",
+      "workflow.worktree.created",
+    ]);
+  });
+
+  it("refreshes an existing created worktree when duplicate create sees an advanced HEAD without new events", async () => {
+    const repo = await createTestRepo("skyturn-worktree-create-advanced-head-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const input = {
+      sessionId: "session-1",
+      variantId: "duplicate",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/duplicate",
+      parentLaneId: "lane-decision",
+    };
+
+    const first = await service.createManagedWorktree(input);
+    const eventCount = events.length;
+    const advancedHead = commitVariant(first.realPath, "advanced");
+    const second = await service.createManagedWorktree(input);
+
+    expect(second).toEqual({
+      ...first,
+      headCommit: advancedHead,
+    });
+    expect(second.baseCommit).toBe(repo.baseCommit);
+    expect(events).toHaveLength(eventCount);
+    expect(events.map((event) => event.kind)).toEqual([
+      "workflow.worktree.create_requested",
+      "workflow.worktree.created",
+    ]);
+  });
+
+  it("records create_failed instead of reusing a created event when immutable input facts conflict", async () => {
+    const repo = await createTestRepo("skyturn-worktree-create-conflict-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+    const input = {
+      sessionId: "session-1",
+      variantId: "duplicate",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/duplicate",
+      parentLaneId: "lane-decision",
+    };
+
+    await service.createManagedWorktree(input);
+    writeFileSync(join(repo.repoRoot, "second.txt"), "second\n");
+    git(repo.repoRoot, ["add", "second.txt"]);
+    git(repo.repoRoot, ["commit", "-m", "second"]);
+    const changedBaseCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+
+    await expect(service.createManagedWorktree({
+      ...input,
+      baseCommit: changedBaseCommit,
+      parentLaneId: "lane-other",
+    })).rejects.toThrow(/conflict|mismatch/i);
+
+    expect(events.map((event) => event.kind)).toEqual([
+      "workflow.worktree.create_requested",
+      "workflow.worktree.created",
+      "workflow.worktree.create_failed",
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      kind: "workflow.worktree.create_failed",
+      payload: {
+        worktreeId: "worktree-session-1-duplicate",
+        baseCommit: changedBaseCommit,
+        parentLaneId: "lane-other",
+        status: "failed",
+      },
+    });
+  });
+
+  it("records create_failed when a stale created event points to a missing worktree", async () => {
+    const repo = await createTestRepo("skyturn-worktree-stale-created-");
+    tempRoots.push(repo.tempRoot);
+    const seedService = createNodeGitWorktreeService();
+    const input = {
+      sessionId: "session-1",
+      variantId: "stale",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/stale",
+      parentLaneId: "lane-decision",
+    };
+    const worktree = await seedService.createManagedWorktree(input);
+    rmSync(worktree.realPath, { recursive: true, force: true });
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      initialEvents: [createdEventFor(worktree, input.sessionId)],
+      eventSink: { append: async (event) => events.push(event) },
+    });
+
+    await expect(service.createManagedWorktree(input)).rejects.toThrow(/worktree|no such file|ENOENT/i);
+
+    expect(events.map((event) => event.kind)).toEqual(["workflow.worktree.create_failed"]);
+    expect(events[0]?.payload).toMatchObject({
+      worktreeId: worktree.worktreeId,
+      status: "failed",
+    });
+  });
+
+  it("records create_failed when planning rejects a non top-level repo root", async () => {
+    const repo = await createTestRepo("skyturn-worktree-plan-failure-");
+    tempRoots.push(repo.tempRoot);
+    const nestedRepoPath = join(repo.repoRoot, "nested");
+    await mkdir(nestedRepoPath);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => events.push(event) },
+    });
+
+    await expect(service.createManagedWorktree({
+      sessionId: "session-1",
+      variantId: "nested",
+      repoRoot: nestedRepoPath,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-1/nested",
+      parentLaneId: "lane-decision",
+    })).rejects.toThrow(/Repo root mismatch/i);
+
+    expect(events.map((event) => event.kind)).toEqual(["workflow.worktree.create_failed"]);
+    expect(events[0]?.payload).toMatchObject({
+      worktreeId: "worktree-session-1-nested",
+      variantId: "nested",
+      status: "failed",
     });
   });
 
