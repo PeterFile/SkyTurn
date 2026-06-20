@@ -70,6 +70,23 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.doesNotMatch(worktreeCreateHandler, /status:\s*"requested"/);
 });
 
+test("workflow createSession persists a normalized session target", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const createInput = main.slice(
+    main.indexOf("interface WorkflowSessionCreateInput"),
+    main.indexOf("interface WorkflowAppendUserInput"),
+  );
+  const createSessionHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:createSession"'),
+    main.indexOf('ipcMain.handle("workflow:appendUserInput"'),
+  );
+
+  assert.match(createInput, /target\?:\s*unknown/);
+  assert.match(createSessionHandler, /target:\s*normalizeWorkflowSessionTarget\(input\.target\)/);
+  assert.match(main, /function normalizeWorkflowSessionTarget\(value: unknown\): FinalSessionTarget/);
+  assert.match(main, /return \{ executionTarget: "current_branch", selectedBranch: "HEAD" \};/);
+});
+
 test("Electron project memory IPC does not register arbitrary renderer paths", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const initHandler = main.match(/ipcMain\.handle\("project:initDevflow"[\s\S]*?\n\}\);/)?.[0] ?? "";

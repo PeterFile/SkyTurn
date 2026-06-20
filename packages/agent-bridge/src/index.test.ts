@@ -1126,6 +1126,61 @@ describe("agent bridge", () => {
     });
   });
 
+  it("runs Hermes from the canonical worktree path when provided", async () => {
+    const root = await makeTempRoot();
+    const projectRoot = join(root, "project");
+    const worktreeRoot = join(root, "managed-worktree");
+    const worktreeLink = join(root, "managed-worktree-link");
+    await mkdir(projectRoot);
+    await mkdir(worktreeRoot);
+    await symlink(worktreeRoot, worktreeLink);
+    const binRoot = await makeTempRoot();
+    const argsPath = join(binRoot, "args.json");
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.SKYTURN_HERMES_ARGS_PATH, JSON.stringify({",
+        "  argv: process.argv.slice(2),",
+        "  cwd: process.cwd(),",
+        "}));",
+        "process.stdout.write('{\"toolCalls\":[]}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createHermesCliAdapter({
+          executablePath: hermesPath,
+          env: { SKYTURN_HERMES_ARGS_PATH: argsPath },
+        }),
+      ],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes-worktree",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: worktreeLink,
+      agentKind: "hermes",
+      prompt: "Implement in the managed worktree",
+    });
+    await completed;
+
+    const args = JSON.parse(await readFile(argsPath, "utf8")) as { argv: string[]; cwd: string };
+    const canonicalWorktree = await realpath(worktreeRoot);
+
+    expect(args.cwd).toBe(canonicalWorktree);
+    expect(args.cwd).not.toBe(await realpath(projectRoot));
+  });
+
   it("emits non-terminal stalled telemetry before the Hermes CLI hard timeout", async () => {
     const projectRoot = await makeTempRoot();
     const binRoot = await makeTempRoot();
