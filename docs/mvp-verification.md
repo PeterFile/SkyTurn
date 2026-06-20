@@ -133,6 +133,7 @@ Status: historical scaffold verification. This file records the original MVP bui
 
 ## Known Risk
 
-- Real Hermes-agent, Gemini, ClaudeCode, and OpenClaw CLI integrations are `detected-only` until their local APIs are verified.
-- Codex CLI has an explicit `experimental-run` adapter, but it is not wired as the default desktop run path.
-- Real git worktree creation is modeled behind interfaces first; destructive operations are not part of the MVP shell.
+- Hermes and Codex CLI are wired into the real desktop workflow path, but both remain `experimental-run`; local credentials, CLI behavior, output shape, and exit semantics are not yet supported-run stable.
+- Gemini, ClaudeCode, and OpenClaw remain unverified local integrations unless a future adapter explicitly promotes them beyond `detected-only`.
+- Managed worktree create/adopt/clean now call real Node git-worktree services through desktop IPC, so those paths have filesystem/git side effects. The full UI product flow for compare/adopt/clean is still incomplete.
+- Delivery commit can create a controlled local commit for an eligible commit lane. Push, create PR, and merge UI are not implemented.
