@@ -516,8 +516,28 @@ export default function App() {
 
   function answerUserDecision(nodeId: string, selectedOption: string) {
     if (!activeSession || activeSession.kind !== "canvas") return;
-    const now = new Date().toISOString();
     const action = actionForDecisionOption(selectedOption);
+
+    if (window.devflow && activeProject) {
+      void window.devflow.workflow.answerUserDecision(activeProject.rootPath, {
+        sessionId: activeSession.id,
+        decisionId: nodeId,
+        selectedOption,
+        action,
+      }).then((result) => {
+        const { canvasSession } = result;
+        if (canvasSession) {
+          const updatedSession = canvasSession;
+          setWorkspace((current) => ({
+            ...current,
+            sessions: current.sessions.map((session) => (session.id === updatedSession.id ? updatedSession : session)),
+          }));
+        }
+      });
+      return;
+    }
+
+    const now = new Date().toISOString();
     updateCanvasSession(activeSession.id, (session) => ({
       ...session,
       updatedAt: now,
