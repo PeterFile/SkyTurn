@@ -622,7 +622,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       };
     },
     async startRun(input, sink) {
-      const workdir = await realpath(input.projectRoot);
+      const workdir = await realpath(input.worktreePath || input.projectRoot);
       const executablePath = options.executablePath ?? "hermes";
       const args = makeHermesChatArgs({
         prompt: input.prompt,

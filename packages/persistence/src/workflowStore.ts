@@ -19,6 +19,7 @@ import type {
   WorkflowLedgerSummary,
   WorkflowLedgerSummaryEvent,
   WorkflowMode,
+  WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
 import {
   compileWorkflowIntent,
@@ -931,7 +932,10 @@ export class WorkflowStore {
       source: row.source_lane_id,
       target: row.target_lane_id,
     }));
-    const nodes = lanes.map((lane, index) => this.materializeNode(session, lane, index));
+    const worktreesByLaneId = worktreesByParentLaneId(flowProjection.worktrees);
+    const nodes = lanes.map((lane, index) =>
+      this.materializeNode(session, lane, index, worktreesByLaneId.get(lane.id) ?? worktreesByLaneId.get(lane.nodeId)),
+    );
     return {
       id: session.id,
       projectId: session.projectId,
@@ -1144,7 +1148,12 @@ export class WorkflowStore {
     return { tool: call.tool, nodeId: id, status: "applied", message: call.tool === "deleteWorkflowCard" ? "Card archived." : "Card updated." };
   }
 
-  private materializeNode(session: WorkflowSessionRecord, lane: WorkflowLaneRecord, index: number): CanvasNode {
+  private materializeNode(
+    session: WorkflowSessionRecord,
+    lane: WorkflowLaneRecord,
+    index: number,
+    createdWorktree?: WorkflowWorktreeIdentity | null,
+  ): CanvasNode {
     const segments = this.listSegments(session.id, lane.id);
     const latestSegment = segments.at(-1) ?? null;
     const evidence = latestSegment?.evidence ?? null;
@@ -1177,7 +1186,7 @@ export class WorkflowStore {
       runId: latestSegment?.runId ?? `run-${session.id}-${lane.nodeId}`,
       changesetId,
       output: output.length > 0 ? output : [`Workflow lane ${lane.status}.`],
-      worktree: worktreeForSessionTarget(session, lane.nodeId, latestSegment?.worktreePath),
+      worktree: worktreeForSessionTarget(session, lane.nodeId, latestSegment?.worktreePath, createdWorktree),
       context: {
         brief: lane.brief,
         sessionGoal: session.goal,
@@ -1550,6 +1559,7 @@ function flowLaneToCanvasNode(
   changesetId: string | undefined,
 ): CanvasNode {
   const latestSegment = [...projection.segments].reverse().find((segment) => segment.laneId === lane.id);
+  const createdWorktree = worktreeForParentLane(projection, lane.id);
   const status = flowLaneStatusToNodeStatus(lane.status);
   return {
     id: lane.id,
@@ -1577,7 +1587,7 @@ function flowLaneToCanvasNode(
     runId: latestSegment?.runId ?? runIdForLane(session.id, lane.id),
     changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
     output: lane.output.length > 0 ? lane.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
-    worktree: worktreeForSessionTarget(session, lane.id),
+    worktree: worktreeForSessionTarget(session, lane.id, undefined, createdWorktree),
     context: {
       brief: lane.title,
       sessionGoal: session.goal,
@@ -1651,8 +1661,26 @@ function worktreeForSessionTarget(
   session: WorkflowSessionRecord,
   nodeId: string,
   worktreePath?: string,
+  createdWorktree?: WorkflowWorktreeIdentity | null,
 ): WorktreeMetadata {
   if (session.target.executionTarget === "new_worktree") {
+    if (createdWorktree) {
+      return {
+        path: createdWorktree.realPath || createdWorktree.path,
+        branchName: createdWorktree.branchName,
+        baseCommit: createdWorktree.baseCommit,
+        executionTarget: session.target.executionTarget,
+        selectedBranch: session.target.selectedBranch,
+        ...(session.target.baseRef ? { baseRef: session.target.baseRef } : {}),
+        baselineRef: session.target.baseRef ?? session.target.selectedBranch,
+        worktreeId: createdWorktree.worktreeId,
+        variantId: createdWorktree.variantId,
+        realPath: createdWorktree.realPath,
+        gitdir: createdWorktree.gitdir,
+        repoRoot: createdWorktree.repoRoot,
+        headCommit: createdWorktree.headCommit,
+      };
+    }
     return {
       path: worktreePath ?? ".",
       branchName: session.target.selectedBranch,
@@ -1662,7 +1690,7 @@ function worktreeForSessionTarget(
       ...(session.target.baseRef ? { baseRef: session.target.baseRef } : {}),
       baselineRef: session.target.baseRef ?? session.target.selectedBranch,
       worktreeId: `worktree-${session.id}-${nodeId}`,
-      variantId: `variant-${session.id}-${nodeId}`,
+      variantId: nodeId,
     };
   }
   return {
@@ -1673,6 +1701,16 @@ function worktreeForSessionTarget(
     selectedBranch: session.target.selectedBranch,
     baselineRef: session.target.selectedBranch,
   };
+}
+
+function worktreeForParentLane(projection: FlowProjection, laneId: string): WorkflowWorktreeIdentity | null {
+  return projection.worktrees.find((worktree) => worktree.parentLaneId === laneId) ?? null;
+}
+
+function worktreesByParentLaneId(worktrees: WorkflowWorktreeIdentity[]): Map<string, WorkflowWorktreeIdentity> {
+  const byLaneId = new Map<string, WorkflowWorktreeIdentity>();
+  for (const worktree of worktrees) byLaneId.set(worktree.parentLaneId, worktree);
+  return byLaneId;
 }
 
 function dependenciesFromFlowProjection(projection: FlowProjection): Map<string, string[]> {

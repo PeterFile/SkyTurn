@@ -224,4 +224,24 @@ describe("UI source validation", () => {
     expect(changesTab).toContain('typeof devflow.getChangeset === "function"');
     expect(changesTab.indexOf("devflow.reconcileFinalChangeset")).toBeLessThan(changesTab.indexOf("devflow.getChangeset"));
   });
+
+  it("implements answerUserDecision with write-through to desktop and browser fallback", async () => {
+    const appSource = await readSource("./App.tsx");
+    const fnBody = appSource.slice(appSource.indexOf("function answerUserDecision"), appSource.indexOf("function reassignNode"));
+
+    expect(fnBody).toContain("window.devflow.workflow.answerUserDecision(");
+    expect(fnBody).toContain("sessionId: activeSession.id");
+    expect(fnBody).toContain("decisionId: nodeId");
+    expect(fnBody).toContain("selectedOption");
+    expect(fnBody).toContain("action");
+
+    expect(fnBody).toContain("const { canvasSession } = result");
+    expect(fnBody).toContain("if (canvasSession)");
+    expect(fnBody).toContain("setWorkspace((current) =>");
+
+    const devflowCheck = fnBody.indexOf("if (window.devflow");
+    const fallbackUpdate = fnBody.indexOf("updateCanvasSession(activeSession.id");
+    expect(fallbackUpdate).toBeGreaterThan(devflowCheck);
+    expect(fnBody.slice(devflowCheck, fallbackUpdate)).toContain("return;");
+  });
 });

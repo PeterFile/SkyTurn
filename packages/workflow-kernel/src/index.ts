@@ -194,6 +194,7 @@ export type FlowEventKind =
   | "workflow.worktree.create_failed"
   | "workflow.worktree.clean_requested"
   | "workflow.worktree.cleaned"
+  | "workflow.worktree.clean_failed"
   | "workflow.variant.adopt_requested"
   | "workflow.variant.adopted"
   | "workflow.variant.adopt_failed"
@@ -650,6 +651,7 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
     if (event.kind === "workflow.worktree.created" && isRecord(event.payload.worktree)) {
       upsertWorktree(projection, event.payload.worktree as unknown as WorkflowWorktreeIdentity);
     }
+    if (event.kind === "workflow.worktree.clean_failed") continue;
     if (
       (event.kind === "workflow.variant.adopt_requested" ||
         event.kind === "workflow.variant.adopted" ||

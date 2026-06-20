@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { WorkspaceState } from "@skyturn/persistence";
 import type { AgentRun, CanvasNode, CanvasSession, ImportedProject, RunEvent, RunEvidence, StartAgentRunInput } from "@skyturn/project-core";
 
+import * as WorkflowRuntime from "./workflowRuntime.js";
 import {
   buildPromptForNodeRun,
   claimCompletedBridgeRunPersistence,
@@ -1110,7 +1111,7 @@ describe("workflow runtime event merging", () => {
     }));
   });
 
-  it("does not start new-worktree Codex runs until a real worktree path exists", async () => {
+  it("creates and binds a managed worktree before starting new-worktree Codex runs", async () => {
     const project = makeWorkspace().projects[0] as ImportedProject;
     const session = {
       ...makeSession([
@@ -1139,16 +1140,182 @@ describe("workflow runtime event merging", () => {
         baseRef: "origin/main",
         baselineRef: "origin/main",
         worktreeId: "worktree-session-1-lane-implementation",
-        variantId: "variant-session-1-lane-implementation",
+        variantId: "lane-implementation",
       },
     };
-    const startAgentRun = vi.fn();
-    vi.stubGlobal("window", { devflow: { startAgentRun } });
+    const createdWorktreePath = "/tmp/project.worktrees/session-session-1-variant-lane-implementation";
+    const createWorktree = vi.fn(async () => ({
+      protocolVersion: 1,
+      status: "created" as const,
+      event: {},
+      worktree: {
+        worktreeId: "worktree-session-1-lane-implementation",
+        variantId: "lane-implementation",
+        path: createdWorktreePath,
+        realPath: createdWorktreePath,
+        gitdir: "/tmp/project/.git/worktrees/session-session-1-variant-lane-implementation",
+        repoRoot: project.rootPath,
+        branchName: "skyturn/session-1/lane-implementation",
+        baseCommit: "abc123",
+        headCommit: "abc123",
+        parentLaneId: "lane-implementation",
+      },
+    }));
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "running",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({ protocolVersion: 1, events: [] }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: node.runId,
+        status: "running",
+        exitCode: null,
+        changesetId: null,
+        checks: [],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: null,
+      } satisfies RunEvidence,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        workflow: { createWorktree },
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+      },
+    });
 
     try {
       const result = await startBridgeRun(project, session, node);
-      expect(result).toBeNull();
-      expect(startAgentRun).not.toHaveBeenCalled();
+      expect(result?.run.worktreePath).toBe(createdWorktreePath);
+      expect(createWorktree).toHaveBeenCalledWith(project.rootPath, expect.objectContaining({
+        sessionId: session.id,
+        variantId: "lane-implementation",
+        baseRef: "origin/main",
+        parentLaneId: "lane-implementation",
+        repoRoot: project.rootPath,
+      }));
+      expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
+        projectRoot: project.rootPath,
+        worktreePath: createdWorktreePath,
+      }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("creates and binds a managed worktree before starting non-planner Hermes runs", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const session = {
+      ...makeSession([
+        makeNode({
+          id: "lane-review",
+          agent: "hermes",
+          status: "running",
+          runId: "run-session-1-lane-review",
+          meta: ["review", "lane-review", "flow-kernel"],
+        }),
+      ]),
+      target: {
+        executionTarget: "new_worktree" as const,
+        selectedBranch: "main",
+        baseRef: "origin/main",
+      },
+    };
+    const node = {
+      ...(session.nodes.find((item) => item.id === "lane-review") as CanvasNode),
+      worktree: {
+        path: ".",
+        branchName: "main",
+        baseCommit: "origin/main",
+        executionTarget: "new_worktree" as const,
+        selectedBranch: "main",
+        baseRef: "origin/main",
+        baselineRef: "origin/main",
+        worktreeId: "worktree-session-1-lane-review",
+        variantId: "lane-review",
+      },
+    };
+    const createdWorktreePath = "/tmp/project.worktrees/session-session-1-variant-lane-review";
+    const createWorktree = vi.fn(async () => ({
+      protocolVersion: 1,
+      status: "created" as const,
+      event: {},
+      worktree: {
+        worktreeId: "worktree-session-1-lane-review",
+        variantId: "lane-review",
+        path: createdWorktreePath,
+        realPath: createdWorktreePath,
+        gitdir: "/tmp/project/.git/worktrees/session-session-1-variant-lane-review",
+        repoRoot: project.rootPath,
+        branchName: "skyturn/session-1/lane-review",
+        baseCommit: "abc123",
+        headCommit: "abc123",
+        parentLaneId: "lane-review",
+      },
+    }));
+    const startAgentRun = vi.fn(async (input: StartAgentRunInput) => ({
+      protocolVersion: 1,
+      run: {
+        id: input.runId ?? "run-generated",
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        projectRoot: input.projectRoot,
+        worktreePath: input.worktreePath,
+        agentKind: input.agentKind,
+        status: "running",
+        startedAt: "2026-06-10T00:00:00.000Z",
+      } satisfies AgentRun,
+    }));
+    const getRunEvents = vi.fn(async () => ({ protocolVersion: 1, events: [] }));
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence: {
+        runId: node.runId,
+        status: "running",
+        exitCode: null,
+        changesetId: null,
+        checks: [],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: null,
+      } satisfies RunEvidence,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        workflow: { createWorktree },
+        startAgentRun,
+        getRunEvents,
+        getRunEvidence,
+      },
+    });
+
+    try {
+      await startBridgeRun(project, session, node);
+      expect(createWorktree).toHaveBeenCalledWith(project.rootPath, expect.objectContaining({
+        variantId: "lane-review",
+        parentLaneId: "lane-review",
+      }));
+      expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
+        agentKind: "hermes",
+        worktreePath: createdWorktreePath,
+      }));
     } finally {
       vi.unstubAllGlobals();
     }
@@ -1677,6 +1844,93 @@ describe("workflow runtime event merging", () => {
   });
 });
 
+describe("workflow scheduling policy", () => {
+  it("keeps current-branch write lanes serial", () => {
+    const session = completePlanner(makeSession([
+      withRuntimePolicy(makeNode({
+        id: "lane-implementation-a",
+        agent: "codex",
+        status: "pending",
+        runId: "run-session-1-lane-implementation-a",
+        meta: ["implementation", "lane-implementation-a", "flow-kernel"],
+      }), "workspace-write", ["filesystem", "process"]),
+      withRuntimePolicy(makeNode({
+        id: "lane-implementation-b",
+        agent: "codex",
+        status: "pending",
+        runId: "run-session-1-lane-implementation-b",
+        meta: ["implementation", "lane-implementation-b", "flow-kernel"],
+      }), "workspace-write", ["filesystem", "process"]),
+    ]));
+
+    expect(policyForSession(session).allowedParallelism).toBe(1);
+  });
+
+  it("allows current-branch read-only lanes to run concurrently through Flow Kernel scope gates", () => {
+    const session = completePlanner(makeSession([
+      withRuntimePolicy(makeNode({
+        id: "lane-validation",
+        agent: "codex",
+        status: "pending",
+        runId: "run-session-1-lane-validation",
+        meta: ["validation", "lane-validation", "flow-kernel"],
+      }), "read-only", ["process", "artifact"]),
+      withRuntimePolicy(makeNode({
+        id: "lane-review",
+        agent: "hermes",
+        status: "pending",
+        runId: "run-session-1-lane-review",
+        meta: ["review", "lane-review", "flow-kernel"],
+      }), "read-only", ["process", "artifact"]),
+    ]));
+
+    expect(policyForSession(session).allowedParallelism).toBe(2);
+  });
+
+  it("allows write lanes in distinct real managed worktrees to run concurrently", () => {
+    const session = {
+      ...completePlanner(makeSession([
+        managedWorktreeNode(withRuntimePolicy(makeNode({
+          id: "lane-implementation-a",
+          agent: "codex",
+          status: "pending",
+          runId: "run-session-1-lane-implementation-a",
+          meta: ["implementation", "lane-implementation-a", "flow-kernel"],
+        }), "workspace-write", ["filesystem", "process"]), "worktree-a", "/tmp/project.worktrees/session-1-a"),
+        managedWorktreeNode(withRuntimePolicy(makeNode({
+          id: "lane-implementation-b",
+          agent: "codex",
+          status: "pending",
+          runId: "run-session-1-lane-implementation-b",
+          meta: ["implementation", "lane-implementation-b", "flow-kernel"],
+        }), "workspace-write", ["filesystem", "process"]), "worktree-b", "/tmp/project.worktrees/session-1-b"),
+      ])),
+      target: {
+        executionTarget: "new_worktree" as const,
+        selectedBranch: "main",
+        baseRef: "origin/main",
+      },
+    };
+
+    expect(policyForSession(session).allowedParallelism).toBe(2);
+  });
+});
+
+type WorkflowSchedulingPolicy = {
+  allowedParallelism: number;
+  runningScopes: Array<{ fileScopes: string[]; packageScopes: string[] }>;
+};
+
+type WorkflowSchedulingPolicyForSession = (session: CanvasSession) => WorkflowSchedulingPolicy;
+
+function policyForSession(session: CanvasSession): WorkflowSchedulingPolicy {
+  const policy = (WorkflowRuntime as typeof WorkflowRuntime & {
+    workflowSchedulingPolicyForSession?: WorkflowSchedulingPolicyForSession;
+  }).workflowSchedulingPolicyForSession;
+  expect(policy).toBeTypeOf("function");
+  return policy!(session);
+}
+
 function makeWorkspace(extraNodes: CanvasNode[] = []): WorkspaceState {
   return {
     projects: [
@@ -1698,6 +1952,55 @@ function makeWorkspace(extraNodes: CanvasNode[] = []): WorkspaceState {
     activeSessionId: "session-1",
     sidebarCollapsed: false,
     collapsedProjectIds: [],
+  };
+}
+
+function completePlanner(session: CanvasSession): CanvasSession {
+  return {
+    ...session,
+    nodes: session.nodes.map((node) =>
+      node.id === session.plannerNodeId ? { ...node, status: "completed" } : node,
+    ),
+  };
+}
+
+function withRuntimePolicy(
+  node: CanvasNode,
+  sandbox: NonNullable<CanvasNode["runtimePolicy"]>["sandbox"],
+  sideEffects: NonNullable<CanvasNode["runtimePolicy"]>["sideEffects"],
+): CanvasNode {
+  return {
+    ...node,
+    runtimePolicy: {
+      source: "workflow_projection",
+      trusted: true,
+      executable: true,
+      sandbox,
+      sideEffects,
+      reason: "Test runtime policy.",
+    },
+  };
+}
+
+function managedWorktreeNode(node: CanvasNode, worktreeId: string, realPath: string): CanvasNode {
+  return {
+    ...node,
+    worktree: {
+      ...node.worktree,
+      path: realPath,
+      branchName: `skyturn/session-1/${node.id}`,
+      baseCommit: "origin/main",
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+      baselineRef: "origin/main",
+      worktreeId,
+      variantId: node.id,
+      realPath,
+      gitdir: `/tmp/project/.git/worktrees/${worktreeId}`,
+      repoRoot: "/tmp/project",
+      headCommit: "abc123",
+    },
   };
 }
 

@@ -36,6 +36,7 @@ export type ManagedWorktreeWorkflowEventKind =
   | "workflow.worktree.create_failed"
   | "workflow.worktree.clean_requested"
   | "workflow.worktree.cleaned"
+  | "workflow.worktree.clean_failed"
   | "workflow.variant.adopt_requested"
   | "workflow.variant.adopted"
   | "workflow.variant.adopt_failed"
@@ -82,6 +83,13 @@ interface ManagedWorktreePlan {
   parentSegmentId?: string;
 }
 
+type ManagedWorktreeEventFacts = Omit<ManagedWorktreePlan, "managedRoot">;
+
+interface CreatedWorktreeEvent {
+  event: ManagedWorktreeWorkflowEvent;
+  worktree: WorkflowWorktreeIdentity;
+}
+
 interface GitWorktreeListEntry {
   worktree: string;
   head: string | null;
@@ -101,6 +109,7 @@ interface GitRunOptions {
 
 interface ReconcileOptions {
   expectedHeadCommit?: string;
+  allowHeadAdvance?: boolean;
 }
 
 const execFileAsync = promisify(execFile);
@@ -119,6 +128,13 @@ export class GitCommandError extends Error {
   }
 }
 
+class AdoptionTargetBaseMismatchError extends Error {
+  constructor(branchName: string, expectedHead: string, actualHead: string) {
+    super(`Target branch HEAD mismatch for ${branchName}: expected ${expectedHead}, got ${actualHead}.`);
+    this.name = "AdoptionTargetBaseMismatchError";
+  }
+}
+
 export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAdoptionService, ChangesetEvidenceService, ChangesetService {
   private readonly eventLog: ManagedWorktreeWorkflowEvent[];
   private readonly eventSink?: ManagedWorktreeEventSink;
@@ -133,7 +149,25 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
   }
 
   async createManagedWorktree(input: ManagedWorktreeCreateInput): Promise<WorkflowWorktreeIdentity> {
-    const plan = await this.planCreate(input);
+    let plan: ManagedWorktreePlan;
+    try {
+      plan = await this.planCreate(input);
+    } catch (error) {
+      await this.recordCreateFailure(createFailureFactsFromInput(input), error);
+      throw error;
+    }
+
+    const existing = this.findCreatedWorktreeEvent(plan.worktreeId);
+    if (existing) {
+      try {
+        verifyCreateRequestMatchesCreatedEvent(plan, existing);
+        return await this.reconcileManagedWorktree(existing.worktree, { allowHeadAdvance: true });
+      } catch (error) {
+        await this.recordCreateFailure(plan, error);
+        throw error;
+      }
+    }
+
     await this.record("workflow.worktree.create_requested", {
       ...eventPlan(plan),
       status: "requested",
@@ -149,11 +183,7 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
       }, `worktree:${plan.worktreeId}:created`, plan.sessionId);
       return worktree;
     } catch (error) {
-      await this.record("workflow.worktree.create_failed", {
-        ...eventPlan(plan),
-        status: "failed",
-        reason: errorMessage(error),
-      }, `worktree:${plan.worktreeId}:create-failed`, plan.sessionId);
+      await this.recordCreateFailure(plan, error);
       throw error;
     }
   }
@@ -217,7 +247,7 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
     }
 
     const headCommit = await currentHead(realPath);
-    const expectedHead = options.expectedHeadCommit ?? worktree.headCommit;
+    const expectedHead = options.allowHeadAdvance ? null : (options.expectedHeadCommit ?? worktree.headCommit);
     if (expectedHead && headCommit !== expectedHead) {
       throw new Error(`Worktree HEAD mismatch: expected ${expectedHead}, got ${headCommit}.`);
     }
@@ -284,6 +314,7 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
       await validateTargetBranch(worktree.repoRoot, input.targetBranchName);
       await checkoutTargetBranch(worktree.repoRoot, input.targetBranchName);
       await assertCleanWorktree(worktree.repoRoot, "target worktree");
+      await assertTargetHeadMatchesBase(worktree.repoRoot, input);
       await previewAdoption(worktree.repoRoot, input);
       await applyAdoption(worktree.repoRoot, input);
       const adoptedCommit = await currentHead(worktree.repoRoot);
@@ -302,45 +333,57 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
       await this.record("workflow.variant.adopt_failed", {
         adoption: failed,
       }, `variant:${input.adoptionId}:adopt-failed`);
+      if (error instanceof AdoptionTargetBaseMismatchError) throw error;
       return failed;
     }
   }
 
   async cleanManagedWorktree(input: ManagedWorktreeCleanupInput): Promise<ManagedWorktreeCleanupResult> {
-    if (input.deleteBranch) {
-      validateBranchName(input.worktree.branchName, { requireSkyTurnPrefix: true });
-    }
-    if (await this.runState.hasRunningTasks(input.worktree)) {
-      throw new Error(`Cannot clean ${input.worktree.worktreeId}: running tasks still target this worktree.`);
-    }
-    const eventWorktree = this.findCreatedWorktree(input.worktree.worktreeId);
-    if (!eventWorktree) throw new Error(`No created worktree event for ${input.worktree.worktreeId}.`);
-    verifyCleanupRecord(input.worktree, eventWorktree);
-    const worktree = await this.reconcileManagedWorktree(eventWorktree, { expectedHeadCommit: input.worktree.headCommit });
-    await this.record("workflow.worktree.clean_requested", {
-      worktree,
-      deleteBranch: input.deleteBranch === true,
-    }, `worktree:${worktree.worktreeId}:clean-requested`);
+    let failureWorktree = input.worktree;
+    try {
+      if (input.deleteBranch) {
+        validateBranchName(input.worktree.branchName, { requireSkyTurnPrefix: true });
+      }
+      if (await this.runState.hasRunningTasks(input.worktree)) {
+        throw new Error(`Cannot clean ${input.worktree.worktreeId}: running tasks still target this worktree.`);
+      }
+      const eventWorktree = this.findCreatedWorktree(input.worktree.worktreeId);
+      if (!eventWorktree) throw new Error(`No created worktree event for ${input.worktree.worktreeId}.`);
+      failureWorktree = eventWorktree;
+      verifyCleanupRecord(input.worktree, eventWorktree);
+      const worktree = await this.reconcileManagedWorktree(eventWorktree, { expectedHeadCommit: input.worktree.headCommit });
+      failureWorktree = worktree;
+      if (input.deleteBranch === true) {
+        await assertBranchDeleteSafe(worktree.repoRoot, worktree.branchName);
+      }
+      await this.record("workflow.worktree.clean_requested", {
+        worktree,
+        deleteBranch: input.deleteBranch === true,
+      }, `worktree:${worktree.worktreeId}:clean-requested`);
 
-    await runGit(worktree.repoRoot, ["worktree", "remove", "--", worktree.realPath]);
-    let branchDeleted = false;
-    if (input.deleteBranch === true) {
-      await runGit(worktree.repoRoot, ["branch", "-d", "--", worktree.branchName]);
-      branchDeleted = true;
-    }
+      await runGit(worktree.repoRoot, ["worktree", "remove", "--", worktree.realPath]);
+      let branchDeleted = false;
+      if (input.deleteBranch === true) {
+        await runGit(worktree.repoRoot, ["branch", "-d", "--", worktree.branchName]);
+        branchDeleted = true;
+      }
 
-    const cleanedAt = this.now();
-    const result: ManagedWorktreeCleanupResult = {
-      ok: true,
-      worktreeId: worktree.worktreeId,
-      cleanedAt,
-      branchDeleted,
-    };
-    await this.record("workflow.worktree.cleaned", {
-      worktree,
-      result,
-    }, `worktree:${worktree.worktreeId}:cleaned`);
-    return result;
+      const cleanedAt = this.now();
+      const result: ManagedWorktreeCleanupResult = {
+        ok: true,
+        worktreeId: worktree.worktreeId,
+        cleanedAt,
+        branchDeleted,
+      };
+      await this.record("workflow.worktree.cleaned", {
+        worktree,
+        result,
+      }, `worktree:${worktree.worktreeId}:cleaned`);
+      return result;
+    } catch (error) {
+      await this.recordCleanFailure(failureWorktree, error);
+      throw error;
+    }
   }
 
   async collectChangesetEvidence(input: ChangesetEvidenceInput): Promise<ChangesetEvidence> {
@@ -414,12 +457,38 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
     this.eventLog.push(event);
   }
 
+  private recordCreateFailure(facts: ManagedWorktreeEventFacts, error: unknown): Promise<void> {
+    return this.record("workflow.worktree.create_failed", {
+      ...eventPlan(facts),
+      status: "failed",
+      reason: errorMessage(error),
+    }, `worktree:${facts.worktreeId}:create-failed`, facts.sessionId);
+  }
+
+  private recordCleanFailure(worktree: WorkflowWorktreeIdentity, error: unknown): Promise<void> {
+    const result: ManagedWorktreeCleanupResult = {
+      ok: false,
+      worktreeId: worktree.worktreeId,
+      cleanedAt: this.now(),
+      branchDeleted: false,
+      reason: errorMessage(error),
+    };
+    return this.record("workflow.worktree.clean_failed", {
+      worktree,
+      result,
+    }, `worktree:${worktree.worktreeId}:clean-failed`);
+  }
+
   private findCreatedWorktree(worktreeId: string): WorkflowWorktreeIdentity | null {
+    return this.findCreatedWorktreeEvent(worktreeId)?.worktree ?? null;
+  }
+
+  private findCreatedWorktreeEvent(worktreeId: string): CreatedWorktreeEvent | null {
     for (let index = this.eventLog.length - 1; index >= 0; index -= 1) {
       const event = this.eventLog[index];
       if (event?.kind !== "workflow.worktree.created") continue;
       const worktree = event.payload.worktree;
-      if (isWorktreeIdentity(worktree) && worktree.worktreeId === worktreeId) return worktree;
+      if (isWorktreeIdentity(worktree) && worktree.worktreeId === worktreeId) return { event, worktree };
     }
     return null;
   }
@@ -788,6 +857,16 @@ async function validateTargetBranch(repoRoot: string, branchName: string): Promi
   await runGit(repoRoot, ["rev-parse", "--verify", `refs/heads/${branchName}^{commit}`]);
 }
 
+async function assertBranchDeleteSafe(repoRoot: string, branchName: string): Promise<void> {
+  await validateSkyTurnBranch(repoRoot, branchName);
+  const branchRef = `refs/heads/${branchName}`;
+  await runGit(repoRoot, ["rev-parse", "--verify", `${branchRef}^{commit}`]);
+  const merged = await runGit(repoRoot, ["merge-base", "--is-ancestor", branchRef, "HEAD"], { allowFailure: true });
+  if (merged.exitCode !== 0) {
+    throw new Error(`Cannot delete branch ${branchName}: branch is not fully merged into HEAD.`);
+  }
+}
+
 function validateBranchName(branchName: string, input: { requireSkyTurnPrefix: boolean }): void {
   if (!branchName || branchName.startsWith("-") || branchName.includes("\\") || /[\s\0-\x1f]/.test(branchName)) {
     throw new Error(`Unsafe branch name: ${branchName}.`);
@@ -866,7 +945,7 @@ async function ensureAncestor(repoRoot: string, baseCommit: string, headCommit: 
 }
 
 async function assertCleanWorktree(cwd: string, label: string): Promise<void> {
-  const status = (await runGit(cwd, ["status", "--porcelain=v1", "--"])).stdout;
+  const status = (await runGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "--"])).stdout;
   if (status.trim()) throw new Error(`${label} has uncommitted changes.`);
 }
 
@@ -877,13 +956,25 @@ async function checkoutTargetBranch(repoRoot: string, branchName: string): Promi
 }
 
 async function previewAdoption(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
-  if (adoption.strategy === "merge") {
-    await runGit(repoRoot, ["merge", "--no-commit", "--no-ff", adoption.headCommit]);
-    await abortAdoption(repoRoot);
-    return;
+  const previewHead = await currentHead(repoRoot);
+  await assertCleanWorktree(repoRoot, "target worktree");
+  let previewFailed = false;
+  try {
+    if (adoption.strategy === "merge") {
+      await runGit(repoRoot, ["merge", "--no-commit", "--no-ff", adoption.headCommit]);
+      return;
+    }
+    await runGit(repoRoot, ["cherry-pick", "--no-commit", adoption.headCommit]);
+  } catch (error) {
+    previewFailed = true;
+    throw error;
+  } finally {
+    try {
+      await restoreAdoptionPreview(repoRoot, previewHead);
+    } catch (error) {
+      if (!previewFailed) throw error;
+    }
   }
-  await runGit(repoRoot, ["cherry-pick", "--no-commit", adoption.headCommit]);
-  await abortAdoption(repoRoot);
 }
 
 async function applyAdoption(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
@@ -892,6 +983,18 @@ async function applyAdoption(repoRoot: string, adoption: WorkflowVariantAdoption
     return;
   }
   await runGit(repoRoot, ["cherry-pick", adoption.headCommit]);
+}
+
+async function assertTargetHeadMatchesBase(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
+  const targetHead = await currentHead(repoRoot);
+  if (targetHead !== adoption.baseCommit) {
+    throw new AdoptionTargetBaseMismatchError(adoption.targetBranchName, adoption.baseCommit, targetHead);
+  }
+}
+
+async function restoreAdoptionPreview(repoRoot: string, headCommit: string): Promise<void> {
+  await abortAdoption(repoRoot);
+  await runGit(repoRoot, ["reset", "--hard", headCommit]);
 }
 
 async function abortAdoption(repoRoot: string): Promise<void> {
@@ -950,7 +1053,7 @@ async function runGit(cwd: string, args: string[], options: GitRunOptions = {}):
   }
 }
 
-function eventPlan(plan: ManagedWorktreePlan): Record<string, unknown> {
+function eventPlan(plan: ManagedWorktreeEventFacts): Record<string, unknown> {
   return {
     sessionId: plan.sessionId,
     worktreeId: plan.worktreeId,
@@ -964,11 +1067,66 @@ function eventPlan(plan: ManagedWorktreePlan): Record<string, unknown> {
   };
 }
 
+function createFailureFactsFromInput(input: ManagedWorktreeCreateInput): ManagedWorktreeEventFacts {
+  const sessionId = safeEventId(input.sessionId);
+  const variantId = safeEventId(input.variantId);
+  const repoRoot = resolve(input.repoRoot);
+  const managedRoot = resolve(dirname(repoRoot), `${basename(repoRoot)}.worktrees`);
+  return {
+    sessionId: input.sessionId,
+    worktreeId: `worktree-${sessionId}-${variantId}`,
+    variantId: input.variantId,
+    repoRoot,
+    path: resolve(managedRoot, `session-${sessionId}-variant-${variantId}`),
+    baseCommit: input.baseCommit,
+    branchName: input.branchName,
+    parentLaneId: input.parentLaneId,
+    ...(input.parentSegmentId ? { parentSegmentId: input.parentSegmentId } : {}),
+  };
+}
+
+function verifyCreateRequestMatchesCreatedEvent(plan: ManagedWorktreePlan, created: CreatedWorktreeEvent): void {
+  const mismatches: string[] = [];
+  const worktree = created.worktree;
+  const eventSessionId = created.event.sessionId ?? stringField(created.event.payload, "sessionId");
+
+  if (eventSessionId && eventSessionId !== plan.sessionId) {
+    mismatches.push(`sessionId expected ${plan.sessionId}, got ${eventSessionId}`);
+  }
+  if (worktree.variantId !== plan.variantId) {
+    mismatches.push(`variantId expected ${plan.variantId}, got ${worktree.variantId}`);
+  }
+  if (!samePath(worktree.repoRoot, plan.repoRoot)) {
+    mismatches.push(`repoRoot expected ${plan.repoRoot}, got ${worktree.repoRoot}`);
+  }
+  if (worktree.baseCommit !== plan.baseCommit) {
+    mismatches.push(`baseCommit expected ${plan.baseCommit}, got ${worktree.baseCommit}`);
+  }
+  if (worktree.branchName !== plan.branchName) {
+    mismatches.push(`branchName expected ${plan.branchName}, got ${worktree.branchName}`);
+  }
+  if (worktree.parentLaneId !== plan.parentLaneId) {
+    mismatches.push(`parentLaneId expected ${plan.parentLaneId}, got ${worktree.parentLaneId}`);
+  }
+  if ((worktree.parentSegmentId ?? null) !== (plan.parentSegmentId ?? null)) {
+    mismatches.push(`parentSegmentId expected ${plan.parentSegmentId ?? "none"}, got ${worktree.parentSegmentId ?? "none"}`);
+  }
+
+  if (mismatches.length > 0) {
+    throw new Error(`Managed worktree create conflict for ${plan.worktreeId}: ${mismatches.join("; ")}.`);
+  }
+}
+
 function safeId(value: string, field: string): string {
   if (!/^[A-Za-z0-9._-]+$/.test(value)) {
     throw new Error(`${field} must contain only letters, numbers, dot, underscore, or dash.`);
   }
   return value;
+}
+
+function safeEventId(value: string): string {
+  const normalized = value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return normalized || "invalid";
 }
 
 function assertPathInside(path: string, root: string, label: string): void {
@@ -978,7 +1136,11 @@ function assertPathInside(path: string, root: string, label: string): void {
 }
 
 function assertSamePath(left: string, right: string, label: string): void {
-  if (resolve(left) !== resolve(right)) throw new Error(`${label} mismatch: expected ${right}, got ${left}.`);
+  if (!samePath(left, right)) throw new Error(`${label} mismatch: expected ${right}, got ${left}.`);
+}
+
+function samePath(left: string, right: string): boolean {
+  return resolve(left) === resolve(right);
 }
 
 function isWorktreeIdentity(value: unknown): value is WorkflowWorktreeIdentity {
