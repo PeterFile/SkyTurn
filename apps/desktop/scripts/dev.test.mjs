@@ -38,6 +38,12 @@ test("rendererDevCommand starts Vite with an exact strict port", () => {
   ]);
 });
 
+test("desktop Electron build script force-rebuilds stale incremental output", async () => {
+  const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+
+  assert.equal(packageJson.scripts["build:electron"], "tsc -b tsconfig.electron.json --force");
+});
+
 test("desktop dev HTML initializes Vite React refresh before the renderer entry", async () => {
   const html = await readFile(join(root, "index.html"), "utf8");
   const server = await createServer({
