@@ -8,6 +8,7 @@ import {
   reduceWorkflowEvents,
   scheduleReadyLanes,
   type FlowEvent,
+  type FlowEventKind,
   type FlowProjection,
   type WorkflowIntent,
   type WorkflowRuntimePolicy,
@@ -372,6 +373,20 @@ describe("Flow Kernel intent compiler", () => {
 });
 
 describe("Flow Kernel gate engine and scheduler", () => {
+  it("keeps worktree cleanup failure events as explicit projection no-ops", () => {
+    const cleanFailedKind: FlowEventKind = "workflow.worktree.clean_failed";
+    const projection = reduceWorkflowEvents([
+      event(cleanFailedKind, {
+        worktreeId: "worktree-session-1-lane-implementation",
+        reason: "dirty worktree",
+      }),
+    ]);
+
+    expect(projection.events.map((item) => item.kind)).toEqual(["workflow.worktree.clean_failed"]);
+    expect(projection.worktrees).toEqual([]);
+    expect(projection.variantAdoptions).toEqual([]);
+  });
+
   it("emits rejected gate events for invalid transitions instead of silently mutating projection", () => {
     const projection = reduceWorkflowEvents([
       event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation", ["src/App.ts"]) }),

@@ -1,4 +1,4 @@
-import type { EditorAdapter, EditorKind, GitBranchFacts } from "@skyturn/git-worktree";
+import type { EditorAdapter, EditorKind, GitBranchFacts, ManagedWorktreeCleanupResult } from "@skyturn/git-worktree";
 import {
   makeHermesPlannerSessionId,
   normalizeSessionTarget,
@@ -16,6 +16,7 @@ import {
   type SessionTarget,
   type StartAgentRunInput,
   type WorkflowLedgerSummary,
+  type WorkflowVariantAdoption,
   type WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
 
@@ -56,8 +57,8 @@ export interface WorkflowApi {
   answerUserDecision: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; projection: unknown }>;
   createWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown; worktree: WorkflowWorktreeIdentity }>;
   compareWorktrees: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; comparison: unknown }>;
-  adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown }>;
-  cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "requested"; event: unknown }>;
+  adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "adopted" | "failed"; event: unknown | null; adoption: WorkflowVariantAdoption & { status: "adopted" | "failed" } }>;
+  cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "cleaned"; event: unknown | null; result: ManagedWorktreeCleanupResult }>;
   getChangeset: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
 }
