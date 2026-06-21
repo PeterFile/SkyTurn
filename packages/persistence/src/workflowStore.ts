@@ -32,6 +32,7 @@ import {
   type FlowEventKind,
   type FlowLane,
   type FlowProjection,
+  type WorkflowIntent,
 } from "@skyturn/workflow-kernel";
 
 export type WorkflowLaneKind =
@@ -677,6 +678,7 @@ export class WorkflowStore {
     const outputSummary = sanitizeWorkflowStoredText(input.outputSummary ?? resultSummaryFromEvidence(safeEvidence));
     const status = flowStatusFromRunEvidence(input.evidence);
     const evidenceStatus = status === "succeeded" ? "passed" : input.evidence.status === "cancelled" ? "skipped" : "failed";
+    const evidenceId = `evidence-${input.segmentId}`;
     const tx = this.db.transaction(() => {
       this.insertFlowEventInTransaction({
         id: `${input.sessionId}:flow-output:${input.segmentId}`,
@@ -702,7 +704,7 @@ export class WorkflowStore {
           laneId: input.laneId,
           segmentId: input.segmentId,
           evidence: {
-            id: `evidence-${input.segmentId}`,
+            id: evidenceId,
             kind: "run-exit",
             status: evidenceStatus,
             changesetId: safeEvidence.changesetId,
@@ -731,6 +733,9 @@ export class WorkflowStore {
         createdAt: input.now,
         idempotencyKey: `segment:${input.segmentId}:finished`,
       }, input.now);
+      if (evidenceStatus === "failed") {
+        this.requestRepairForFailedRunInTransaction(input.sessionId, input.laneId, evidenceId, input.now);
+      }
     });
     tx();
     return this.materializeFlowProjection(input.sessionId);
@@ -1299,6 +1304,27 @@ export class WorkflowStore {
     });
   }
 
+  private requestRepairForFailedRunInTransaction(
+    sessionId: string,
+    laneId: string,
+    evidenceId: string,
+    now: string,
+  ): void {
+    const projection = this.materializeFlowProjection(sessionId);
+    const lane = projection.lanes.find((item) => item.id === laneId);
+    const evidence = projection.evidence.find((item) => item.id === evidenceId && item.laneId === laneId);
+    if (!lane || lane.status !== "failed" || !shouldAutoRepairFailedLane(lane) || evidence?.status !== "failed") return;
+
+    const intent: WorkflowIntent = {
+      intentId: `auto-repair:${laneId}:${evidenceId}`,
+      sessionId,
+      operations: [{ type: "ReplanFromEvidence", laneId, evidenceId }],
+    };
+    const compiled = compileWorkflowIntent(intent, projection, createDefaultFlowPolicy(), now);
+    if (!compiled.ok) return;
+    for (const event of compiled.events) this.insertFlowEventInTransaction(event, now);
+  }
+
   private projectEventInTransaction(event: WorkflowEventRecord): void {
     if (event.kind !== "edge_declared") return;
     const sourceLaneId = requirePayloadText(event.payload, "sourceLaneId");
@@ -1774,6 +1800,11 @@ function flowStatusFromRunEvidence(evidence: RunEvidence): "succeeded" | "failed
   if (evidence.status === "cancelled") return "cancelled";
   if (evidence.status === "timed-out") return "timed-out";
   return evidence.exitCode === 0 || evidence.status === "succeeded" ? "succeeded" : "failed";
+}
+
+function shouldAutoRepairFailedLane(lane: FlowLane): boolean {
+  if (lane.laneKind !== "implementation" && lane.laneKind !== "validation" && lane.laneKind !== "review") return false;
+  return lane.semanticSubtype !== "repair" && !lane.semanticKey.startsWith("repair:");
 }
 
 function resultSummaryFromEvidence(evidence: RunEvidence): string {
