@@ -965,6 +965,10 @@ h2 {
   color: var(--sk-muted);
 }
 
+.changes-tool-pr-link {
+  text-decoration: none;
+}
+
 .changes-menu {
   position: relative;
 }
