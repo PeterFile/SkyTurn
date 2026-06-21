@@ -45,6 +45,7 @@ import {
   Square,
   WrapText,
   Users,
+  Upload,
   X,
 } from "lucide-react";
 import {
@@ -2287,13 +2288,75 @@ function UserDecisionPanel({
 function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNode; projectRoot: string; session: CanvasSession; runEvents: RunEvent[] }) {
   const [reconciliation, setReconciliation] = useState<FinalChangesetReconciliation | null>(null);
   const [changeset, setChangeset] = useState<Changeset | null>(null);
-  const [diffHtml, setDiffHtml] = useState("");
-  const [diffError, setDiffError] = useState<string | null>(null);
+  const [diffHtml, setDiffHtml] = useState<string>("");
   const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [diffCollapsed, setDiffCollapsed] = useState(false);
   const [options, setOptions] = useState<ChangesDiffViewOptions>(DEFAULT_CHANGES_DIFF_OPTIONS);
   const [deliveryStatus, setDeliveryStatus] = useState<"idle" | "committing" | string>("idle");
+  const [commitEvidence, setCommitEvidence] = useState<{ commitSha?: string; branch?: string; worktreePath?: string; subject?: string } | null>(null);
+  const [pushStatus, setPushStatus] = useState<"idle" | "pushing" | string>("idle");
+  const [prStatus, setPrStatus] = useState<"idle" | "creating" | string>("idle");
+  const [prUrl, setPrUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    setCommitEvidence(null);
+    setPushStatus("idle");
+    setPrStatus("idle");
+    setPrUrl(null);
+    setDeliveryStatus("idle");
+  }, [node.id, session.id, projectRoot]);
+
+  function isPullRequestLane(n: CanvasNode | undefined): boolean {
+    return !!n && typeof (n as unknown as Record<string, unknown>).laneKind === "string" && (n as unknown as Record<string, unknown>).laneKind === "pull_request";
+  }
+
+  const dependentPrLaneId = session.edges
+    .filter((e) => e.source === node.id)
+    .map((e) => session.nodes.find((n) => n.id === e.target))
+    .find(isPullRequestLane)?.id;
+
+  const prBaseBranch = node.worktree.baseRef || session.target.baseRef;
+
+  useEffect(() => {
+    if (!window.devflow?.workflow?.getEvents) {
+      setCommitEvidence(null);
+      return;
+    }
+    let active = true;
+    void window.devflow.workflow.getEvents(projectRoot, session.id).then((result) => {
+      if (!active) return;
+      const eventsList = (result.events || []) as Record<string, unknown>[];
+      const latestCommitEvent = [...eventsList]
+        .reverse()
+        .find(
+          (e) =>
+            e &&
+            e.kind === "workflow.commit.created" &&
+            (e.laneId === node.id ||
+              (e.payload &&
+                typeof e.payload === "object" &&
+                (e.payload as Record<string, unknown>).laneId === node.id)),
+        );
+
+      if (latestCommitEvent && latestCommitEvent.payload && typeof latestCommitEvent.payload === "object") {
+        const payload = latestCommitEvent.payload as Record<string, unknown>;
+        const evidence = payload.evidence as Record<string, unknown> | undefined;
+        setCommitEvidence({
+          commitSha: typeof evidence?.commitSha === "string" ? evidence.commitSha : undefined,
+          branch: typeof evidence?.branch === "string" ? evidence.branch : undefined,
+          worktreePath: typeof evidence?.worktreePath === "string" ? evidence.worktreePath : undefined,
+          subject: typeof evidence?.subject === "string" ? evidence.subject : undefined,
+        });
+      } else {
+        setCommitEvidence(null);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [projectRoot, session.id, node.id]);
 
   useEffect(() => {
     let active = true;
@@ -2408,6 +2471,15 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       });
       if (result.status === "committed") {
         setDeliveryStatus(`committed: ${result.evidence.commitSha.substring(0, 7)}`);
+        setCommitEvidence({
+          commitSha: result.evidence.commitSha,
+          branch: result.evidence.branch,
+          worktreePath: result.evidence.worktreePath,
+          subject: subject.trim(),
+        });
+        setPushStatus("idle");
+        setPrStatus("idle");
+        setPrUrl(null);
         setRefreshVersion(v => v + 1);
       } else {
         setDeliveryStatus("error");
@@ -2419,6 +2491,124 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     }
   }
 
+  async function handlePush() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.pushDeliveryBranch) return;
+    if (!commitEvidence) return;
+
+    setPushStatus("pushing");
+    try {
+      const result = await devflow.workflow.pushDeliveryBranch(projectRoot, {
+        sessionId: session.id,
+        laneId: node.id,
+        ...(commitEvidence.worktreePath ? { worktreePath: commitEvidence.worktreePath } : {}),
+        ...(commitEvidence.commitSha ? { commitSha: commitEvidence.commitSha } : {}),
+        ...(commitEvidence.branch ? { branch: commitEvidence.branch } : {}),
+      });
+      if (result.status === "pushed") {
+        setPushStatus(`pushed: ${result.evidence.remote}/${result.evidence.branch}`);
+        setCommitEvidence((prev) => prev ? {
+          ...prev,
+          ...(result.evidence.commitSha ? { commitSha: result.evidence.commitSha } : {}),
+          ...(result.evidence.branch ? { branch: result.evidence.branch } : {}),
+          ...(result.evidence.worktreePath ? { worktreePath: result.evidence.worktreePath } : {}),
+        } : null);
+      } else {
+        setPushStatus("error");
+        setDiffError("Unexpected push status.");
+      }
+    } catch (e) {
+      setPushStatus("error");
+      setDiffError(e instanceof Error ? e.message : "Failed to push branch.");
+    }
+  }
+
+  async function handleCreatePr() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.createPullRequest) return;
+    if (!commitEvidence) return;
+
+    if (!commitEvidence.branch) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Delivery branch is missing from commit evidence.");
+      return;
+    }
+
+    if (!dependentPrLaneId) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: No dependent pull_request lane found.");
+      return;
+    }
+
+    const defaultTitle = window.prompt("PR Title", commitEvidence.subject || "feat(workflow): pull request from SkyTurn");
+    if (!defaultTitle || defaultTitle.trim() === "") return;
+
+    if (!/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9\-]+\))?:\s.+/.test(defaultTitle.trim())) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Title must follow Conventional Commits format.");
+      return;
+    }
+
+    const whatChanged = window.prompt("What changed?", "Implement requested features");
+    if (whatChanged === null) return;
+    const why = window.prompt("Why?", "As requested");
+    if (why === null) return;
+    const breakingChanges = window.prompt("Breaking changes?", "None.");
+    if (breakingChanges === null) return;
+    const serverPr = window.prompt("Server PR?", "None.");
+    if (serverPr === null) return;
+
+    if (!prBaseBranch) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Base branch could not be derived.");
+      return;
+    }
+
+    if (prBaseBranch === commitEvidence.branch) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Base branch cannot be the same as the delivery branch.");
+      return;
+    }
+
+    const confirmedBaseBranch = window.prompt("Base branch", prBaseBranch);
+    if (!confirmedBaseBranch) return;
+
+    const trimmedBaseBranch = confirmedBaseBranch.trim();
+    if (!trimmedBaseBranch || trimmedBaseBranch === commitEvidence.branch) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Base branch cannot be empty or the same as the delivery branch.");
+      return;
+    }
+
+    setPrStatus("creating");
+    try {
+      const result = await devflow.workflow.createPullRequest(projectRoot, {
+        sessionId: session.id,
+        laneId: dependentPrLaneId,
+        commitLaneId: node.id,
+        ...(commitEvidence.worktreePath ? { worktreePath: commitEvidence.worktreePath } : {}),
+        baseBranch: trimmedBaseBranch,
+        headBranch: commitEvidence.branch,
+        ...(commitEvidence.commitSha ? { commitSha: commitEvidence.commitSha } : {}),
+        title: defaultTitle.trim(),
+        whatChanged,
+        why,
+        breakingChanges,
+        serverPr,
+      });
+      if (result.status === "created") {
+        setPrStatus(`pr-created: #${result.evidence.number}`);
+        setPrUrl(result.evidence.url);
+      } else {
+        setPrStatus("error");
+        setDiffError("Unexpected PR status.");
+      }
+    } catch (e) {
+      setPrStatus("error");
+      setDiffError(e instanceof Error ? e.message : "Failed to create PR.");
+    }
+  }
+
   if (!changeset) return <p>Loading changes...</p>;
 
   const hasGitEvidence = hasFinalGitEvidence(reconciliation, changeset);
@@ -2426,7 +2616,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
   const isCommitLane = node.laneKind === "commit";
   const canCommit = devflowAvailable && isCommitLane && hasGitEvidence && changeset.source === "git" && changeset.files.length > 0;
 
-  if (!hasGitEvidence && !reconciliation?.liveChanges) {
+  if (!hasGitEvidence && !reconciliation?.liveChanges && !commitEvidence) {
     return (
       <section className="changes-review" aria-label="Code changes review">
         <header className="changes-summary">
@@ -2522,6 +2712,31 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
           : deliveryStatus.startsWith("committed:") ? `Committed ${deliveryStatus.split(":")[1]}`
           : "Commit changes"
         }
+        onPush={handlePush}
+        pushDisabled={!devflowAvailable || !window.devflow?.workflow?.pushDeliveryBranch || !commitEvidence || pushStatus === "pushing"}
+        pushStatusLabel={
+          pushStatus === "pushing" ? "Pushing..."
+          : pushStatus.startsWith("pushed:") ? `Pushed ${pushStatus.split(":")[1]}`
+          : "Push branch"
+        }
+        onPr={handleCreatePr}
+        prDisabled={!devflowAvailable || !window.devflow?.workflow?.createPullRequest || !pushStatus.startsWith("pushed:") || prStatus === "creating" || !dependentPrLaneId || !prBaseBranch || !commitEvidence?.branch || prBaseBranch === commitEvidence.branch}
+        prDisabledTitle={
+          !devflowAvailable || !window.devflow?.workflow?.createPullRequest ? "PR creation API unavailable"
+          : !pushStatus.startsWith("pushed:") ? "Must push branch before creating PR"
+          : !dependentPrLaneId ? "No dependent pull_request lane found"
+          : !prBaseBranch ? "Base branch could not be derived"
+          : !commitEvidence?.branch ? "Delivery branch not available"
+          : (prBaseBranch === commitEvidence.branch) ? "Base branch cannot be the same as the delivery branch"
+          : "PR creation unavailable"
+        }
+        prStatusLabel={
+          prStatus === "creating" ? "Creating PR..."
+          : prStatus.startsWith("pr-created:") ? `PR Created (${prStatus.split(": ")[1] || prStatus.split(":")[1]})`
+          : prStatus.startsWith("pr-created") ? "PR Created"
+          : "Create PR"
+        }
+        prUrl={prUrl}
       />
 
       {diffError ? (
@@ -2530,6 +2745,14 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         <div className="changes-empty">Rendering diff preview...</div>
       ) : diffHtml ? (
         <div className={diffShellClassName} dangerouslySetInnerHTML={{ __html: diffHtml }} />
+      ) : (!hasGitEvidence && !reconciliation?.liveChanges) ? (
+        <div className="changes-empty" role={changeset.evidence?.status === "failed" || reconciliation?.status === "failed" ? "alert" : undefined}>
+          {reconciliation?.status === "failed"
+            ? reconciliation.errorReason ?? "Unable to reconcile git changeset."
+            : changeset.evidence?.status === "failed"
+            ? changeset.evidence.errorReason ?? "Unable to collect git changeset evidence."
+            : "No available change evidence."}
+        </div>
       ) : (
         <div className="changes-empty">No structured diff was available for this changeset.</div>
       )}
@@ -2585,6 +2808,14 @@ function ChangesDiffToolbar({
   onCommit,
   commitDisabled,
   commitStatusLabel,
+  onPush,
+  pushDisabled,
+  pushStatusLabel,
+  onPr,
+  prDisabled,
+  prDisabledTitle,
+  prStatusLabel,
+  prUrl,
 }: {
   collapsed: boolean;
   options: ChangesDiffViewOptions;
@@ -2595,6 +2826,14 @@ function ChangesDiffToolbar({
   onCommit?: () => void;
   commitDisabled?: boolean;
   commitStatusLabel?: string;
+  onPush?: () => void;
+  pushDisabled?: boolean;
+  pushStatusLabel?: string;
+  onPr?: () => void;
+  prDisabled?: boolean;
+  prDisabledTitle?: string;
+  prStatusLabel?: string;
+  prUrl?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -2653,6 +2892,36 @@ function ChangesDiffToolbar({
         <GitPullRequest size={15} aria-hidden="true" />
         <span>{commitStatusLabel || "Commit changes"}</span>
       </button>
+      {onPush && (
+        <button
+          className="changes-tool-button"
+          type="button"
+          disabled={pushDisabled}
+          title={pushDisabled ? "Push unavailable or no commit evidence" : "Push delivery branch"}
+          onClick={onPush}
+        >
+          <Upload size={15} aria-hidden="true" />
+          <span>{pushStatusLabel || "Push"}</span>
+        </button>
+      )}
+      {onPr && (
+        <button
+          className="changes-tool-button"
+          type="button"
+          disabled={prDisabled}
+          title={prDisabled ? (prDisabledTitle || "PR creation unavailable or not pushed") : "Create Pull Request"}
+          onClick={onPr}
+        >
+          <GitBranch size={15} aria-hidden="true" />
+          <span>{prStatusLabel || "Create PR"}</span>
+        </button>
+      )}
+      {prUrl && (
+        <a href={prUrl} target="_blank" rel="noreferrer" className="changes-tool-button changes-tool-pr-link">
+          <GitPullRequest size={15} aria-hidden="true" />
+          <span>Open PR</span>
+        </a>
+      )}
       <div ref={rootRef} className="changes-menu">
         <button
           className="changes-tool-button icon-only"
