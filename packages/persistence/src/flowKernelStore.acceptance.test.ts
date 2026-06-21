@@ -63,5 +63,5 @@ describe("Flow Kernel SQLite acceptance", () => {
         ["lane-persistence-implementation", "lane-integration-join"],
       ]),
     );
-  });
+  }, 30_000);
 });

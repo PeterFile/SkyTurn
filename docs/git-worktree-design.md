@@ -28,7 +28,9 @@ Browser-safe service contracts and mocks live in `packages/git-worktree/src/inde
 - `ChangesetService`
 - `EditorAdapter`
 
-Current desktop code uses the Node subpath for branch facts and git-backed changeset reconciliation. Managed worktree create/adopt/clean still is not fully wired through Electron: the desktop IPC handlers currently record requested events, while `NodeGitWorktreeService` contains the real filesystem/git implementation and recovery logic.
+Current desktop code uses the Node subpath for branch facts, git-backed changeset reconciliation, managed worktree create/adopt/clean, and controlled local delivery commits. Managed worktree compare is handled in Electron main with Node-side git evidence collection. The Electron IPC handlers call `NodeGitWorktreeService` or adjacent Node-only helpers and record requested, terminal, or failure workflow events from real side effects.
+
+The backend capability is ahead of the product UI. The full UI flow for comparing candidates, choosing adoption strategy, adopting a candidate, and cleaning rejected managed worktrees is still incomplete.
 
 ## Changesets
 

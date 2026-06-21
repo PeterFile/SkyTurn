@@ -28,6 +28,8 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:worktree:adopt",
     "workflow:worktree:clean",
     "workflow:delivery:commit",
+    "workflow:delivery:push",
+    "workflow:pullRequest:create",
     "workflow:changeset",
     "workflow:changeset:reconcileFinal",
     "changeset:get",
@@ -113,6 +115,30 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(deliveryCommitHandler, /appendWorkflowEvent/);
   assert.match(deliveryCommitHandler, /status:\s*"committed"/);
   assert.doesNotMatch(deliveryCommitHandler, /status:\s*"requested"/);
+
+  const deliveryPushHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+    main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+  );
+  assert.match(deliveryPushHandler, /pushDeliveryBranch/);
+  assert.match(deliveryPushHandler, /findDeliveryCommitEvidence/);
+  assert.match(deliveryPushHandler, /workflow\.delivery\.pushed/);
+  assert.match(deliveryPushHandler, /appendWorkflowEvent/);
+  assert.match(deliveryPushHandler, /status:\s*"pushed"/);
+  assert.doesNotMatch(deliveryPushHandler, /status:\s*"requested"/);
+
+  const pullRequestHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  assert.match(pullRequestHandler, /createDeliveryPullRequest/);
+  assert.match(pullRequestHandler, /assertWorkflowPullRequestLane/);
+  assert.match(pullRequestHandler, /findDeliveryCommitEvidence/);
+  assert.match(pullRequestHandler, /validatePullRequestBaseBranch/);
+  assert.match(pullRequestHandler, /workflow\.pull_request\.created/);
+  assert.match(pullRequestHandler, /appendWorkflowEvent/);
+  assert.match(pullRequestHandler, /status:\s*"created"/);
+  assert.doesNotMatch(pullRequestHandler, /status:\s*"requested"/);
 });
 
 test("workflow delivery commit validates known sessions before creating git commits", async () => {
@@ -139,6 +165,56 @@ test("workflow delivery commit validates known sessions before creating git comm
   assert.ok(commitIndex > importIndex, "git commit creation must stay after session validation");
   assert.match(helperSource, /store\.materializeCanvasSession\(sessionId\)/);
   assert.match(helperSource, /workflowIpcError\("UNKNOWN_SESSION"/);
+});
+
+test("workflow delivery push validates session, commit lane, worktree, and commit evidence before git push", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const deliveryPushHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+    main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+  );
+
+  const sessionIndex = deliveryPushHandler.indexOf("const sessionId = assertWorkflowSessionId");
+  const canvasIndex = deliveryPushHandler.indexOf("assertKnownWorkflowCanvasSession");
+  const laneGuardIndex = deliveryPushHandler.indexOf("assertWorkflowDeliveryCommitLane");
+  const resolveIndex = deliveryPushHandler.indexOf("resolveDeliveryCommitWorktreePath");
+  const evidenceIndex = deliveryPushHandler.indexOf("findDeliveryCommitEvidence");
+  const importIndex = deliveryPushHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const pushIndex = deliveryPushHandler.indexOf("pushDeliveryBranch({");
+
+  assert.ok(sessionIndex >= 0, "delivery push IPC must require a workflow sessionId");
+  assert.ok(canvasIndex > sessionIndex, "delivery push IPC must validate the CanvasSession");
+  assert.ok(laneGuardIndex > canvasIndex, "delivery push IPC must validate a commit lane");
+  assert.ok(resolveIndex > laneGuardIndex, "delivery push IPC must resolve the trusted lane worktree");
+  assert.ok(evidenceIndex > resolveIndex, "delivery push IPC must load recorded commit evidence before git push");
+  assert.ok(importIndex > evidenceIndex, "delivery push IPC must validate evidence before importing push implementation");
+  assert.ok(pushIndex > importIndex, "git push must stay after server-side guards");
+});
+
+test("workflow pull request creation validates PR lane, commit evidence, and base branch before gh create", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const pullRequestHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+
+  const sessionIndex = pullRequestHandler.indexOf("const sessionId = assertWorkflowSessionId");
+  const canvasIndex = pullRequestHandler.indexOf("assertKnownWorkflowCanvasSession");
+  const prLaneIndex = pullRequestHandler.indexOf("assertWorkflowPullRequestLane");
+  const commitLaneIndex = pullRequestHandler.indexOf("assertWorkflowDeliveryCommitLane");
+  const evidenceIndex = pullRequestHandler.indexOf("findDeliveryCommitEvidence");
+  const baseIndex = pullRequestHandler.indexOf("validatePullRequestBaseBranch");
+  const importIndex = pullRequestHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const createIndex = pullRequestHandler.indexOf("createDeliveryPullRequest({");
+
+  assert.ok(sessionIndex >= 0, "pull request IPC must require a workflow sessionId");
+  assert.ok(canvasIndex > sessionIndex, "pull request IPC must validate the CanvasSession");
+  assert.ok(prLaneIndex > canvasIndex, "pull request IPC must validate a pull_request lane");
+  assert.ok(commitLaneIndex > prLaneIndex, "pull request IPC must validate the source commit lane");
+  assert.ok(evidenceIndex > commitLaneIndex, "pull request IPC must load recorded commit evidence");
+  assert.ok(baseIndex > evidenceIndex, "pull request IPC must validate base/head before gh create");
+  assert.ok(importIndex > baseIndex, "pull request IPC must validate inputs before importing gh implementation");
+  assert.ok(createIndex > importIndex, "gh pr create must stay after server-side guards");
 });
 
 test("workflow delivery commit validates a commit lane before creating git commits", async () => {
@@ -262,6 +338,8 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "adoptWorktree",
     "cleanWorktree",
     "createDeliveryCommit",
+    "pushDeliveryBranch",
+    "createPullRequest",
     "reconcileFinalChangeset",
     "getProjectBranchFacts",
     "createWorkflowDeliveryCommit",
@@ -318,6 +396,25 @@ test("workflow delivery commit public type contract returns committed evidence",
   assert.match(workflowContract, /evidence:\s*DeliveryCommitEvidence/);
   assert.match(devflowContract, /status:\s*"committed"/);
   assert.match(devflowContract, /evidence:\s*DeliveryCommitEvidence/);
+});
+
+test("workflow delivery remote public type contracts return push and PR evidence", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const workflowContract = persistence.slice(
+    persistence.indexOf("pushDeliveryBranch:"),
+    persistence.indexOf("getChangeset:"),
+  );
+  const devflowContract = persistence.slice(
+    persistence.indexOf("createWorkflowDeliveryCommit:"),
+    persistence.indexOf("onRunEvent:"),
+  );
+
+  assert.match(workflowContract, /status:\s*"pushed"/);
+  assert.match(workflowContract, /evidence:\s*DeliveryPushEvidence/);
+  assert.match(workflowContract, /status:\s*"created"/);
+  assert.match(workflowContract, /evidence:\s*DeliveryPullRequestEvidence/);
+  assert.match(devflowContract, /status:\s*"pushed"/);
+  assert.match(devflowContract, /status:\s*"created"/);
 });
 
 test("workflow adopt IPC records a failed adoption before rejecting boundary violations", async () => {

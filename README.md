@@ -38,10 +38,14 @@ packages/
 - Agent bridge: Hermes and Codex CLI have real `experimental-run` adapters; run status is derived from `RunEvidence`, not agent prose.
 - Changes: the node modal `Changes` tab can use structured live Codex change events plus git-backed final reconciliation.
 - Session target: New Session exposes Current branch by default and New worktree as explicit opt-in.
+- Managed worktrees: desktop IPC calls `NodeGitWorktreeService` for create, adopt, and clean operations, and uses Node-side git evidence for compare.
+- Delivery commits: `workflow:delivery:commit` can create a controlled local commit for an eligible commit lane and records `workflow.commit.created`.
 - Project memory: `.devflow` under the imported project root.
 
 ## Current Verification
 
 The real Hermes-to-Codex path has passed `pnpm --filter @skyturn/desktop run demo:mvp` on this machine, and the Electron UI has run a real workflow against a temporary git project. These paths depend on local Hermes/Codex credentials and remain `experimental-run`, not `supported-run`.
 
-Browser-only and mock paths still exist for development and tests. Managed worktree create/adopt/clean is not yet fully wired through the desktop IPC path: the Node-side implementation exists in `@skyturn/git-worktree/node`, but desktop `workflow:worktree:create`, `workflow:worktree:adopt`, and `workflow:worktree:clean` currently record requested events rather than performing the filesystem/git operation.
+Browser-only and mock paths still exist for development and tests. Desktop `workflow:worktree:create`, `workflow:worktree:adopt`, and `workflow:worktree:clean` now call `@skyturn/git-worktree/node` and record terminal workflow events from real git/filesystem side effects. The full product UI for comparing, adopting, and cleaning managed worktrees is still not complete.
+
+Delivery stops at a controlled local commit today. Push, pull request creation, and merge UI are not implemented.

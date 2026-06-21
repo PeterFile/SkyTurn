@@ -45,6 +45,7 @@ import {
   Square,
   WrapText,
   Users,
+  Upload,
   X,
 } from "lucide-react";
 import {
@@ -2142,7 +2143,7 @@ function NodeModal({
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
-          {tab === "Context" && <ContextTab node={node} />}
+          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} />}
         </div>
       </section>
     </div>
@@ -2287,13 +2288,75 @@ function UserDecisionPanel({
 function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNode; projectRoot: string; session: CanvasSession; runEvents: RunEvent[] }) {
   const [reconciliation, setReconciliation] = useState<FinalChangesetReconciliation | null>(null);
   const [changeset, setChangeset] = useState<Changeset | null>(null);
-  const [diffHtml, setDiffHtml] = useState("");
-  const [diffError, setDiffError] = useState<string | null>(null);
+  const [diffHtml, setDiffHtml] = useState<string>("");
   const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [diffCollapsed, setDiffCollapsed] = useState(false);
   const [options, setOptions] = useState<ChangesDiffViewOptions>(DEFAULT_CHANGES_DIFF_OPTIONS);
   const [deliveryStatus, setDeliveryStatus] = useState<"idle" | "committing" | string>("idle");
+  const [commitEvidence, setCommitEvidence] = useState<{ commitSha?: string; branch?: string; worktreePath?: string; subject?: string } | null>(null);
+  const [pushStatus, setPushStatus] = useState<"idle" | "pushing" | string>("idle");
+  const [prStatus, setPrStatus] = useState<"idle" | "creating" | string>("idle");
+  const [prUrl, setPrUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    setCommitEvidence(null);
+    setPushStatus("idle");
+    setPrStatus("idle");
+    setPrUrl(null);
+    setDeliveryStatus("idle");
+  }, [node.id, session.id, projectRoot]);
+
+  function isPullRequestLane(n: CanvasNode | undefined): boolean {
+    return !!n && typeof (n as unknown as Record<string, unknown>).laneKind === "string" && (n as unknown as Record<string, unknown>).laneKind === "pull_request";
+  }
+
+  const dependentPrLaneId = session.edges
+    .filter((e) => e.source === node.id)
+    .map((e) => session.nodes.find((n) => n.id === e.target))
+    .find(isPullRequestLane)?.id;
+
+  const prBaseBranch = node.worktree.baseRef || session.target.baseRef;
+
+  useEffect(() => {
+    if (!window.devflow?.workflow?.getEvents) {
+      setCommitEvidence(null);
+      return;
+    }
+    let active = true;
+    void window.devflow.workflow.getEvents(projectRoot, session.id).then((result) => {
+      if (!active) return;
+      const eventsList = (result.events || []) as Record<string, unknown>[];
+      const latestCommitEvent = [...eventsList]
+        .reverse()
+        .find(
+          (e) =>
+            e &&
+            e.kind === "workflow.commit.created" &&
+            (e.laneId === node.id ||
+              (e.payload &&
+                typeof e.payload === "object" &&
+                (e.payload as Record<string, unknown>).laneId === node.id)),
+        );
+
+      if (latestCommitEvent && latestCommitEvent.payload && typeof latestCommitEvent.payload === "object") {
+        const payload = latestCommitEvent.payload as Record<string, unknown>;
+        const evidence = payload.evidence as Record<string, unknown> | undefined;
+        setCommitEvidence({
+          commitSha: typeof evidence?.commitSha === "string" ? evidence.commitSha : undefined,
+          branch: typeof evidence?.branch === "string" ? evidence.branch : undefined,
+          worktreePath: typeof evidence?.worktreePath === "string" ? evidence.worktreePath : undefined,
+          subject: typeof evidence?.subject === "string" ? evidence.subject : undefined,
+        });
+      } else {
+        setCommitEvidence(null);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [projectRoot, session.id, node.id]);
 
   useEffect(() => {
     let active = true;
@@ -2408,6 +2471,15 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       });
       if (result.status === "committed") {
         setDeliveryStatus(`committed: ${result.evidence.commitSha.substring(0, 7)}`);
+        setCommitEvidence({
+          commitSha: result.evidence.commitSha,
+          branch: result.evidence.branch,
+          worktreePath: result.evidence.worktreePath,
+          subject: subject.trim(),
+        });
+        setPushStatus("idle");
+        setPrStatus("idle");
+        setPrUrl(null);
         setRefreshVersion(v => v + 1);
       } else {
         setDeliveryStatus("error");
@@ -2419,6 +2491,124 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     }
   }
 
+  async function handlePush() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.pushDeliveryBranch) return;
+    if (!commitEvidence) return;
+
+    setPushStatus("pushing");
+    try {
+      const result = await devflow.workflow.pushDeliveryBranch(projectRoot, {
+        sessionId: session.id,
+        laneId: node.id,
+        ...(commitEvidence.worktreePath ? { worktreePath: commitEvidence.worktreePath } : {}),
+        ...(commitEvidence.commitSha ? { commitSha: commitEvidence.commitSha } : {}),
+        ...(commitEvidence.branch ? { branch: commitEvidence.branch } : {}),
+      });
+      if (result.status === "pushed") {
+        setPushStatus(`pushed: ${result.evidence.remote}/${result.evidence.branch}`);
+        setCommitEvidence((prev) => prev ? {
+          ...prev,
+          ...(result.evidence.commitSha ? { commitSha: result.evidence.commitSha } : {}),
+          ...(result.evidence.branch ? { branch: result.evidence.branch } : {}),
+          ...(result.evidence.worktreePath ? { worktreePath: result.evidence.worktreePath } : {}),
+        } : null);
+      } else {
+        setPushStatus("error");
+        setDiffError("Unexpected push status.");
+      }
+    } catch (e) {
+      setPushStatus("error");
+      setDiffError(e instanceof Error ? e.message : "Failed to push branch.");
+    }
+  }
+
+  async function handleCreatePr() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.createPullRequest) return;
+    if (!commitEvidence) return;
+
+    if (!commitEvidence.branch) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Delivery branch is missing from commit evidence.");
+      return;
+    }
+
+    if (!dependentPrLaneId) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: No dependent pull_request lane found.");
+      return;
+    }
+
+    const defaultTitle = window.prompt("PR Title", commitEvidence.subject || "feat(workflow): pull request from SkyTurn");
+    if (!defaultTitle || defaultTitle.trim() === "") return;
+
+    if (!/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9\-]+\))?:\s.+/.test(defaultTitle.trim())) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Title must follow Conventional Commits format.");
+      return;
+    }
+
+    const whatChanged = window.prompt("What changed?", "Implement requested features");
+    if (whatChanged === null) return;
+    const why = window.prompt("Why?", "As requested");
+    if (why === null) return;
+    const breakingChanges = window.prompt("Breaking changes?", "None.");
+    if (breakingChanges === null) return;
+    const serverPr = window.prompt("Server PR?", "None.");
+    if (serverPr === null) return;
+
+    if (!prBaseBranch) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Base branch could not be derived.");
+      return;
+    }
+
+    if (prBaseBranch === commitEvidence.branch) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Base branch cannot be the same as the delivery branch.");
+      return;
+    }
+
+    const confirmedBaseBranch = window.prompt("Base branch", prBaseBranch);
+    if (!confirmedBaseBranch) return;
+
+    const trimmedBaseBranch = confirmedBaseBranch.trim();
+    if (!trimmedBaseBranch || trimmedBaseBranch === commitEvidence.branch) {
+      setPrStatus("error");
+      setDiffError("Cannot create PR: Base branch cannot be empty or the same as the delivery branch.");
+      return;
+    }
+
+    setPrStatus("creating");
+    try {
+      const result = await devflow.workflow.createPullRequest(projectRoot, {
+        sessionId: session.id,
+        laneId: dependentPrLaneId,
+        commitLaneId: node.id,
+        ...(commitEvidence.worktreePath ? { worktreePath: commitEvidence.worktreePath } : {}),
+        baseBranch: trimmedBaseBranch,
+        headBranch: commitEvidence.branch,
+        ...(commitEvidence.commitSha ? { commitSha: commitEvidence.commitSha } : {}),
+        title: defaultTitle.trim(),
+        whatChanged,
+        why,
+        breakingChanges,
+        serverPr,
+      });
+      if (result.status === "created") {
+        setPrStatus(`pr-created: #${result.evidence.number}`);
+        setPrUrl(result.evidence.url);
+      } else {
+        setPrStatus("error");
+        setDiffError("Unexpected PR status.");
+      }
+    } catch (e) {
+      setPrStatus("error");
+      setDiffError(e instanceof Error ? e.message : "Failed to create PR.");
+    }
+  }
+
   if (!changeset) return <p>Loading changes...</p>;
 
   const hasGitEvidence = hasFinalGitEvidence(reconciliation, changeset);
@@ -2426,7 +2616,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
   const isCommitLane = node.laneKind === "commit";
   const canCommit = devflowAvailable && isCommitLane && hasGitEvidence && changeset.source === "git" && changeset.files.length > 0;
 
-  if (!hasGitEvidence && !reconciliation?.liveChanges) {
+  if (!hasGitEvidence && !reconciliation?.liveChanges && !commitEvidence) {
     return (
       <section className="changes-review" aria-label="Code changes review">
         <header className="changes-summary">
@@ -2522,6 +2712,31 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
           : deliveryStatus.startsWith("committed:") ? `Committed ${deliveryStatus.split(":")[1]}`
           : "Commit changes"
         }
+        onPush={handlePush}
+        pushDisabled={!devflowAvailable || !window.devflow?.workflow?.pushDeliveryBranch || !commitEvidence || pushStatus === "pushing"}
+        pushStatusLabel={
+          pushStatus === "pushing" ? "Pushing..."
+          : pushStatus.startsWith("pushed:") ? `Pushed ${pushStatus.split(":")[1]}`
+          : "Push branch"
+        }
+        onPr={handleCreatePr}
+        prDisabled={!devflowAvailable || !window.devflow?.workflow?.createPullRequest || !pushStatus.startsWith("pushed:") || prStatus === "creating" || !dependentPrLaneId || !prBaseBranch || !commitEvidence?.branch || prBaseBranch === commitEvidence.branch}
+        prDisabledTitle={
+          !devflowAvailable || !window.devflow?.workflow?.createPullRequest ? "PR creation API unavailable"
+          : !pushStatus.startsWith("pushed:") ? "Must push branch before creating PR"
+          : !dependentPrLaneId ? "No dependent pull_request lane found"
+          : !prBaseBranch ? "Base branch could not be derived"
+          : !commitEvidence?.branch ? "Delivery branch not available"
+          : (prBaseBranch === commitEvidence.branch) ? "Base branch cannot be the same as the delivery branch"
+          : "PR creation unavailable"
+        }
+        prStatusLabel={
+          prStatus === "creating" ? "Creating PR..."
+          : prStatus.startsWith("pr-created:") ? `PR Created (${prStatus.split(": ")[1] || prStatus.split(":")[1]})`
+          : prStatus.startsWith("pr-created") ? "PR Created"
+          : "Create PR"
+        }
+        prUrl={prUrl}
       />
 
       {diffError ? (
@@ -2530,6 +2745,14 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         <div className="changes-empty">Rendering diff preview...</div>
       ) : diffHtml ? (
         <div className={diffShellClassName} dangerouslySetInnerHTML={{ __html: diffHtml }} />
+      ) : (!hasGitEvidence && !reconciliation?.liveChanges) ? (
+        <div className="changes-empty" role={changeset.evidence?.status === "failed" || reconciliation?.status === "failed" ? "alert" : undefined}>
+          {reconciliation?.status === "failed"
+            ? reconciliation.errorReason ?? "Unable to reconcile git changeset."
+            : changeset.evidence?.status === "failed"
+            ? changeset.evidence.errorReason ?? "Unable to collect git changeset evidence."
+            : "No available change evidence."}
+        </div>
       ) : (
         <div className="changes-empty">No structured diff was available for this changeset.</div>
       )}
@@ -2585,6 +2808,14 @@ function ChangesDiffToolbar({
   onCommit,
   commitDisabled,
   commitStatusLabel,
+  onPush,
+  pushDisabled,
+  pushStatusLabel,
+  onPr,
+  prDisabled,
+  prDisabledTitle,
+  prStatusLabel,
+  prUrl,
 }: {
   collapsed: boolean;
   options: ChangesDiffViewOptions;
@@ -2595,6 +2826,14 @@ function ChangesDiffToolbar({
   onCommit?: () => void;
   commitDisabled?: boolean;
   commitStatusLabel?: string;
+  onPush?: () => void;
+  pushDisabled?: boolean;
+  pushStatusLabel?: string;
+  onPr?: () => void;
+  prDisabled?: boolean;
+  prDisabledTitle?: string;
+  prStatusLabel?: string;
+  prUrl?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -2653,6 +2892,36 @@ function ChangesDiffToolbar({
         <GitPullRequest size={15} aria-hidden="true" />
         <span>{commitStatusLabel || "Commit changes"}</span>
       </button>
+      {onPush && (
+        <button
+          className="changes-tool-button"
+          type="button"
+          disabled={pushDisabled}
+          title={pushDisabled ? "Push unavailable or no commit evidence" : "Push delivery branch"}
+          onClick={onPush}
+        >
+          <Upload size={15} aria-hidden="true" />
+          <span>{pushStatusLabel || "Push"}</span>
+        </button>
+      )}
+      {onPr && (
+        <button
+          className="changes-tool-button"
+          type="button"
+          disabled={prDisabled}
+          title={prDisabled ? (prDisabledTitle || "PR creation unavailable or not pushed") : "Create Pull Request"}
+          onClick={onPr}
+        >
+          <GitBranch size={15} aria-hidden="true" />
+          <span>{prStatusLabel || "Create PR"}</span>
+        </button>
+      )}
+      {prUrl && (
+        <a href={prUrl} target="_blank" rel="noreferrer" className="changes-tool-button changes-tool-pr-link">
+          <GitPullRequest size={15} aria-hidden="true" />
+          <span>Open PR</span>
+        </a>
+      )}
       <div ref={rootRef} className="changes-menu">
         <button
           className="changes-tool-button icon-only"
@@ -2742,32 +3011,216 @@ function ChangesMenuItem({
   );
 }
 
-function ContextTab({ node }: { node: CanvasNode }) {
+function ContextTab({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
+  const isNewWorktree = node.worktree.executionTarget === "new_worktree" || !!node.worktree.worktreeId;
+
   return (
-    <dl className="context-grid">
-      <dt>Brief</dt>
-      <dd>{node.context.brief}</dd>
-      <dt>Session goal</dt>
-      <dd>{node.context.sessionGoal}</dd>
-      <dt>Dependencies</dt>
-      <dd>{node.context.dependencies.length ? node.context.dependencies.join(", ") : "None"}</dd>
-      <dt>Assigned agent</dt>
-      <dd>{node.agent}</dd>
-      <dt>Worktree path</dt>
-      <dd>{node.worktree.path}</dd>
-      <dt>Branch name</dt>
-      <dd>{node.worktree.branchName}</dd>
-      <dt>Base commit</dt>
-      <dd>{node.worktree.baseCommit}</dd>
-      <dt>Requirements source</dt>
-      <dd>{node.context.relatedRequirements}</dd>
-      <dt>Design source</dt>
-      <dd>{node.context.relatedDesign}</dd>
-      <dt>Tasks source</dt>
-      <dd>{node.context.relatedTasks}</dd>
-      <dt>Constraints</dt>
-      <dd>{node.context.constraints.join("; ")}</dd>
-    </dl>
+    <div className="context-tab">
+      <dl className="context-grid">
+        <dt>Brief</dt>
+        <dd>{node.context.brief}</dd>
+        <dt>Session goal</dt>
+        <dd>{node.context.sessionGoal}</dd>
+        <dt>Dependencies</dt>
+        <dd>{node.context.dependencies.length ? node.context.dependencies.join(", ") : "None"}</dd>
+        <dt>Assigned agent</dt>
+        <dd>{node.agent}</dd>
+        {isNewWorktree && node.status && (
+          <>
+            <dt>Status</dt>
+            <dd>{node.status}</dd>
+          </>
+        )}
+        <dt>Worktree path</dt>
+        <dd>{node.worktree.path}</dd>
+        <dt>Branch name</dt>
+        <dd>{node.worktree.branchName}</dd>
+        <dt>Base commit</dt>
+        <dd>{node.worktree.baseCommit}</dd>
+        {isNewWorktree && node.worktree.headCommit && (
+          <>
+            <dt>Head commit</dt>
+            <dd>{node.worktree.headCommit}</dd>
+          </>
+        )}
+        <dt>Requirements source</dt>
+        <dd>{node.context.relatedRequirements}</dd>
+        <dt>Design source</dt>
+        <dd>{node.context.relatedDesign}</dd>
+        <dt>Tasks source</dt>
+        <dd>{node.context.relatedTasks}</dd>
+        <dt>Constraints</dt>
+        <dd>{node.context.constraints.join("; ")}</dd>
+      </dl>
+      <WorktreeActions node={node} session={session} projectRoot={projectRoot} />
+    </div>
+  );
+}
+
+function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
+  const [comparing, setComparing] = useState(false);
+  const [compareResult, setCompareResult] = useState<unknown>(null);
+  const [compareError, setCompareError] = useState<string | null>(null);
+
+  const [adopting, setAdopting] = useState(false);
+  const [adoptStatus, setAdoptStatus] = useState<string | null>(null);
+  const [adoptError, setAdoptError] = useState<string | null>(null);
+
+  const [cleaning, setCleaning] = useState(false);
+  const [cleanStatus, setCleanStatus] = useState<string | null>(null);
+  const [cleanError, setCleanError] = useState<string | null>(null);
+
+  const devflow = window.devflow;
+  const devflowAvailable = !!devflow?.workflow?.compareWorktrees;
+
+  const isNewWorktree = node.worktree.executionTarget === "new_worktree" && !!node.worktree.worktreeId;
+
+  if (!isNewWorktree) {
+    return null;
+  }
+
+  const missingMetadata =
+    !node.worktree.worktreeId ||
+    !node.worktree.variantId ||
+    !node.worktree.baseCommit ||
+    !node.worktree.headCommit ||
+    !node.worktree.selectedBranch;
+  const canAdopt = devflowAvailable && !missingMetadata;
+
+  const missingCleanMetadata =
+    !node.worktree.worktreeId ||
+    !node.worktree.variantId ||
+    !node.worktree.realPath ||
+    !node.worktree.gitdir ||
+    !node.worktree.repoRoot ||
+    !node.worktree.branchName ||
+    !node.worktree.baseCommit ||
+    !node.worktree.headCommit;
+  const canClean = devflowAvailable && !missingCleanMetadata;
+
+  const candidateNodes = session.nodes.filter((n) => !!n.worktree.worktreeId && n.id !== node.id);
+
+  const handleCompare = async (otherNode: CanvasNode) => {
+    if (!devflow?.workflow?.compareWorktrees) return;
+    setComparing(true);
+    setCompareError(null);
+    try {
+      const result = await devflow.workflow.compareWorktrees(projectRoot, {
+        left: node.worktree,
+        right: otherNode.worktree,
+      });
+      setCompareResult(result.comparison);
+    } catch (e: any) {
+      setCompareError(e.message || "Failed to compare");
+    } finally {
+      setComparing(false);
+    }
+  };
+
+  const handleAdopt = async () => {
+    if (!devflow?.workflow?.adoptWorktree || missingMetadata) return;
+    if (!window.confirm("Are you sure you want to adopt this worktree? This will update the target branch.")) {
+      return;
+    }
+    setAdopting(true);
+    setAdoptError(null);
+    setAdoptStatus(null);
+    try {
+      const result = await devflow.workflow.adoptWorktree(projectRoot, {
+        sessionId: session.id,
+        adoption: {
+          adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}`,
+          variantId: node.worktree.variantId!,
+          worktreeId: node.worktree.worktreeId!,
+          strategy: "merge",
+          status: "requested",
+          baseCommit: node.worktree.baseCommit!,
+          headCommit: node.worktree.headCommit!,
+          targetBranchName: node.worktree.selectedBranch!,
+        }
+      });
+      if (result.status === "adopted") {
+        setAdoptStatus(`Adopted as commit ${result.adoption.adoptedCommit}`);
+      } else {
+        setAdoptError(result.adoption.failureReason || "Adoption failed");
+      }
+    } catch (e: any) {
+      setAdoptError(e.message || "Failed to adopt worktree");
+    } finally {
+      setAdopting(false);
+    }
+  };
+
+  const handleClean = async () => {
+    if (!devflow?.workflow?.cleanWorktree || missingCleanMetadata) return;
+    if (!window.confirm("Are you sure you want to clean this worktree?")) {
+      return;
+    }
+    const deleteBranch = window.confirm("Also delete the associated branch? (Only confirm if it is a SkyTurn-managed branch)");
+
+    setCleaning(true);
+    setCleanError(null);
+    setCleanStatus(null);
+    try {
+      await devflow.workflow.cleanWorktree(projectRoot, {
+        sessionId: session.id,
+        worktree: {
+          worktreeId: node.worktree.worktreeId!,
+          variantId: node.worktree.variantId!,
+          parentLaneId: node.id,
+          realPath: node.worktree.realPath!,
+          gitdir: node.worktree.gitdir!,
+          repoRoot: node.worktree.repoRoot!,
+          branchName: node.worktree.branchName!,
+          baseCommit: node.worktree.baseCommit!,
+          headCommit: node.worktree.headCommit!,
+        },
+        deleteBranch
+      });
+      setCleanStatus("Worktree cleaned successfully.");
+    } catch (e: any) {
+      setCleanError(e.message || "Failed to clean worktree");
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  return (
+    <div className="worktree-actions">
+      <h3>Worktree Lifecycle</h3>
+      {!devflowAvailable && <p className="eyebrow notice error">Desktop backend unavailable</p>}
+      {missingMetadata && devflowAvailable && <p className="eyebrow notice error">Missing required metadata for adoption.</p>}
+
+      <div className="modal-actions">
+        <button disabled={!canAdopt || adopting} onClick={handleAdopt}>
+          {adopting ? "Adopting..." : "Adopt Worktree"}
+        </button>
+        <button disabled={!canClean || cleaning} onClick={handleClean}>
+          {cleaning ? "Cleaning..." : "Clean Worktree"}
+        </button>
+        {candidateNodes.length > 0 && candidateNodes.map(other => (
+          <button key={other.id} disabled={!devflowAvailable || comparing} onClick={() => handleCompare(other)}>
+            Compare with {other.title}
+          </button>
+        ))}
+      </div>
+
+      {adoptStatus && <div className="notice success">{adoptStatus}</div>}
+      {adoptError && <div className="notice error">{adoptError}</div>}
+
+      {cleanStatus && <div className="notice success">{cleanStatus}</div>}
+      {cleanError && <div className="notice error">{cleanError}</div>}
+
+      {!!compareResult && (
+        <div className="worktree-compare-evidence">
+          <h4>Comparison Evidence</h4>
+          <pre>
+            {JSON.stringify(compareResult, null, 2)}
+          </pre>
+        </div>
+      )}
+      {compareError && <div className="notice error">{compareError}</div>}
+    </div>
   );
 }
 

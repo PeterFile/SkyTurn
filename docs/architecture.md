@@ -19,9 +19,9 @@
 - `packages/orchestrator`: Hermes orchestration contracts and DAG scheduling.
 - `packages/agent-runtime`: contract-only Agent adapter interfaces and support metadata.
 - `packages/agent-bridge`: local Agent discovery, connection, run lifecycle, event stream, and run evidence persistence.
-- `packages/git-worktree`: git/worktree/changeset/editor contracts and MVP mocks.
+- `packages/git-worktree`: browser-safe git/worktree/changeset/editor contracts and Node-only git/worktree implementations.
 - `packages/project-memory`: `.devflow` directory/file helpers.
-- `packages/persistence`: workspace state and renderer host adapters.
+- `packages/persistence`: workspace state adapters and the Node-only SQLite workflow store.
 
 ## Process Boundary
 
@@ -31,7 +31,9 @@ Electron main process owns:
 - `.devflow` filesystem creation
 - git branch facts and git-backed changeset reconciliation
 - workflow SQLite access through Node-only persistence APIs
-- managed worktree side effects when they are wired; the current desktop IPC records create/adopt/clean requests but does not yet execute them
+- managed worktree create, adopt, and clean side effects through `NodeGitWorktreeService`
+- managed worktree comparison through Node-side git evidence collection
+- controlled local delivery commit creation for eligible workflow commit lanes
 - Agent bridge IPC, local process execution, and run event persistence
 - editor launching through explicit preload methods
 
