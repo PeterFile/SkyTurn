@@ -5562,3 +5562,48 @@ select:focus-visible,
     height: calc(100vh - 24px);
   }
 }
+
+/* Worktree Lifecycle Actions */
+.worktree-actions {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--sk-border);
+}
+.worktree-actions h3 {
+  font-size: 12px;
+  margin: 0 0 8px 0;
+}
+.worktree-actions .eyebrow {
+  margin-bottom: 8px;
+}
+.worktree-actions .modal-actions {
+  margin-bottom: 12px;
+  border-top: none;
+  padding: 0;
+}
+.worktree-actions .notice {
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+.worktree-actions .notice.success {
+  color: var(--sk-status-completed-text);
+}
+.worktree-actions .notice.error {
+  color: var(--sk-status-failed-text);
+}
+.worktree-compare-evidence {
+  margin-top: 8px;
+}
+.worktree-compare-evidence h4 {
+  font-size: 11px;
+  margin: 0 0 4px 0;
+}
+.worktree-compare-evidence pre {
+  font-size: 10px;
+  overflow-x: auto;
+  padding: 8px;
+  background: var(--sk-surface-muted);
+  border-radius: var(--sk-radius-xs);
+  max-height: 200px;
+  margin: 0;
+}

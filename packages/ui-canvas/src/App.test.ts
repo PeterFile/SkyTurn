@@ -373,4 +373,69 @@ describe("UI source validation", () => {
     expect(changesTab).toMatch(/if \(!window\.devflow\?\.workflow\?\.getEvents\) \{\s*setCommitEvidence\(null\);\s*return;\s*\}/);
     expect(changesTab).toMatch(/else \{\s*setCommitEvidence\(null\);\s*\}/);
   });
+
+  it("WorktreeActions adopt is disabled and shows error when metadata is missing", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    expect(worktreeActions).toContain("const missingMetadata =");
+    expect(worktreeActions).toContain("!node.worktree.worktreeId");
+    expect(worktreeActions).toContain("const canAdopt = devflowAvailable && !missingMetadata;");
+    expect(worktreeActions).toContain("disabled={!canAdopt || adopting}");
+    expect(worktreeActions).toContain("Missing required metadata for adoption.");
+  });
+
+  it("WorktreeActions adopt does not fallback to HEAD and main", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    expect(worktreeActions).not.toContain("|| \"HEAD\"");
+    expect(worktreeActions).not.toContain("|| \"main\"");
+  });
+
+  it("WorktreeActions uses stable adoptionId, not Date.now()", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    expect(worktreeActions).not.toContain("Date.now()");
+    expect(worktreeActions).toContain("adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}`");
+  });
+
+  it("WorktreeActions requires real managed worktree to show lifecycle", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    expect(worktreeActions).toContain("const isNewWorktree = node.worktree.executionTarget === \"new_worktree\" && !!node.worktree.worktreeId;");
+  });
+
+  it("WorktreeActions cleanWorktree constructs complete identity payload with parentLaneId", async () => {
+    const appSource = await readSource("./App.tsx");
+    const handleClean = appSource.slice(appSource.indexOf("const handleClean = async () => {"), appSource.indexOf("setCleanStatus(\"Worktree cleaned successfully.\");"));
+
+    expect(handleClean).toContain("parentLaneId: node.id");
+    expect(handleClean).toContain("worktreeId: node.worktree.worktreeId");
+    expect(handleClean).toContain("variantId: node.worktree.variantId");
+    expect(handleClean).toContain("realPath: node.worktree.realPath");
+    expect(handleClean).toContain("gitdir: node.worktree.gitdir");
+    expect(handleClean).toContain("repoRoot: node.worktree.repoRoot");
+    expect(handleClean).toContain("branchName: node.worktree.branchName");
+    expect(handleClean).toContain("baseCommit: node.worktree.baseCommit");
+    expect(handleClean).toContain("headCommit: node.worktree.headCommit");
+  });
+
+  it("WorktreeActions disables clean unless all identity fields exist", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    expect(worktreeActions).toContain("const missingCleanMetadata =");
+    expect(worktreeActions).toContain("!node.worktree.realPath");
+    expect(worktreeActions).toContain("!node.worktree.gitdir");
+    expect(worktreeActions).toContain("!node.worktree.repoRoot");
+    expect(worktreeActions).toContain("const canClean = devflowAvailable && !missingCleanMetadata;");
+    expect(worktreeActions).toContain("disabled={!canClean || cleaning}");
+  });
+
+  it("WorktreeActions Clean defaults to deleteBranch false if second confirmation is cancelled", async () => {
+    const appSource = await readSource("./App.tsx");
+    const handleClean = appSource.slice(appSource.indexOf("const handleClean = async () => {"), appSource.indexOf("setCleaning(true);"));
+
+    expect(handleClean).toContain("const deleteBranch = window.confirm");
+    expect(handleClean).not.toMatch(/if\s*\(!deleteBranch\)\s*return/);
+  });
+
 });

@@ -2143,7 +2143,7 @@ function NodeModal({
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
-          {tab === "Context" && <ContextTab node={node} />}
+          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} />}
         </div>
       </section>
     </div>
@@ -3011,32 +3011,216 @@ function ChangesMenuItem({
   );
 }
 
-function ContextTab({ node }: { node: CanvasNode }) {
+function ContextTab({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
+  const isNewWorktree = node.worktree.executionTarget === "new_worktree" || !!node.worktree.worktreeId;
+
   return (
-    <dl className="context-grid">
-      <dt>Brief</dt>
-      <dd>{node.context.brief}</dd>
-      <dt>Session goal</dt>
-      <dd>{node.context.sessionGoal}</dd>
-      <dt>Dependencies</dt>
-      <dd>{node.context.dependencies.length ? node.context.dependencies.join(", ") : "None"}</dd>
-      <dt>Assigned agent</dt>
-      <dd>{node.agent}</dd>
-      <dt>Worktree path</dt>
-      <dd>{node.worktree.path}</dd>
-      <dt>Branch name</dt>
-      <dd>{node.worktree.branchName}</dd>
-      <dt>Base commit</dt>
-      <dd>{node.worktree.baseCommit}</dd>
-      <dt>Requirements source</dt>
-      <dd>{node.context.relatedRequirements}</dd>
-      <dt>Design source</dt>
-      <dd>{node.context.relatedDesign}</dd>
-      <dt>Tasks source</dt>
-      <dd>{node.context.relatedTasks}</dd>
-      <dt>Constraints</dt>
-      <dd>{node.context.constraints.join("; ")}</dd>
-    </dl>
+    <div className="context-tab">
+      <dl className="context-grid">
+        <dt>Brief</dt>
+        <dd>{node.context.brief}</dd>
+        <dt>Session goal</dt>
+        <dd>{node.context.sessionGoal}</dd>
+        <dt>Dependencies</dt>
+        <dd>{node.context.dependencies.length ? node.context.dependencies.join(", ") : "None"}</dd>
+        <dt>Assigned agent</dt>
+        <dd>{node.agent}</dd>
+        {isNewWorktree && node.status && (
+          <>
+            <dt>Status</dt>
+            <dd>{node.status}</dd>
+          </>
+        )}
+        <dt>Worktree path</dt>
+        <dd>{node.worktree.path}</dd>
+        <dt>Branch name</dt>
+        <dd>{node.worktree.branchName}</dd>
+        <dt>Base commit</dt>
+        <dd>{node.worktree.baseCommit}</dd>
+        {isNewWorktree && node.worktree.headCommit && (
+          <>
+            <dt>Head commit</dt>
+            <dd>{node.worktree.headCommit}</dd>
+          </>
+        )}
+        <dt>Requirements source</dt>
+        <dd>{node.context.relatedRequirements}</dd>
+        <dt>Design source</dt>
+        <dd>{node.context.relatedDesign}</dd>
+        <dt>Tasks source</dt>
+        <dd>{node.context.relatedTasks}</dd>
+        <dt>Constraints</dt>
+        <dd>{node.context.constraints.join("; ")}</dd>
+      </dl>
+      <WorktreeActions node={node} session={session} projectRoot={projectRoot} />
+    </div>
+  );
+}
+
+function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
+  const [comparing, setComparing] = useState(false);
+  const [compareResult, setCompareResult] = useState<unknown>(null);
+  const [compareError, setCompareError] = useState<string | null>(null);
+
+  const [adopting, setAdopting] = useState(false);
+  const [adoptStatus, setAdoptStatus] = useState<string | null>(null);
+  const [adoptError, setAdoptError] = useState<string | null>(null);
+
+  const [cleaning, setCleaning] = useState(false);
+  const [cleanStatus, setCleanStatus] = useState<string | null>(null);
+  const [cleanError, setCleanError] = useState<string | null>(null);
+
+  const devflow = window.devflow;
+  const devflowAvailable = !!devflow?.workflow?.compareWorktrees;
+
+  const isNewWorktree = node.worktree.executionTarget === "new_worktree" && !!node.worktree.worktreeId;
+
+  if (!isNewWorktree) {
+    return null;
+  }
+
+  const missingMetadata =
+    !node.worktree.worktreeId ||
+    !node.worktree.variantId ||
+    !node.worktree.baseCommit ||
+    !node.worktree.headCommit ||
+    !node.worktree.selectedBranch;
+  const canAdopt = devflowAvailable && !missingMetadata;
+
+  const missingCleanMetadata =
+    !node.worktree.worktreeId ||
+    !node.worktree.variantId ||
+    !node.worktree.realPath ||
+    !node.worktree.gitdir ||
+    !node.worktree.repoRoot ||
+    !node.worktree.branchName ||
+    !node.worktree.baseCommit ||
+    !node.worktree.headCommit;
+  const canClean = devflowAvailable && !missingCleanMetadata;
+
+  const candidateNodes = session.nodes.filter((n) => !!n.worktree.worktreeId && n.id !== node.id);
+
+  const handleCompare = async (otherNode: CanvasNode) => {
+    if (!devflow?.workflow?.compareWorktrees) return;
+    setComparing(true);
+    setCompareError(null);
+    try {
+      const result = await devflow.workflow.compareWorktrees(projectRoot, {
+        left: node.worktree,
+        right: otherNode.worktree,
+      });
+      setCompareResult(result.comparison);
+    } catch (e: any) {
+      setCompareError(e.message || "Failed to compare");
+    } finally {
+      setComparing(false);
+    }
+  };
+
+  const handleAdopt = async () => {
+    if (!devflow?.workflow?.adoptWorktree || missingMetadata) return;
+    if (!window.confirm("Are you sure you want to adopt this worktree? This will update the target branch.")) {
+      return;
+    }
+    setAdopting(true);
+    setAdoptError(null);
+    setAdoptStatus(null);
+    try {
+      const result = await devflow.workflow.adoptWorktree(projectRoot, {
+        sessionId: session.id,
+        adoption: {
+          adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}`,
+          variantId: node.worktree.variantId!,
+          worktreeId: node.worktree.worktreeId!,
+          strategy: "merge",
+          status: "requested",
+          baseCommit: node.worktree.baseCommit!,
+          headCommit: node.worktree.headCommit!,
+          targetBranchName: node.worktree.selectedBranch!,
+        }
+      });
+      if (result.status === "adopted") {
+        setAdoptStatus(`Adopted as commit ${result.adoption.adoptedCommit}`);
+      } else {
+        setAdoptError(result.adoption.failureReason || "Adoption failed");
+      }
+    } catch (e: any) {
+      setAdoptError(e.message || "Failed to adopt worktree");
+    } finally {
+      setAdopting(false);
+    }
+  };
+
+  const handleClean = async () => {
+    if (!devflow?.workflow?.cleanWorktree || missingCleanMetadata) return;
+    if (!window.confirm("Are you sure you want to clean this worktree?")) {
+      return;
+    }
+    const deleteBranch = window.confirm("Also delete the associated branch? (Only confirm if it is a SkyTurn-managed branch)");
+
+    setCleaning(true);
+    setCleanError(null);
+    setCleanStatus(null);
+    try {
+      await devflow.workflow.cleanWorktree(projectRoot, {
+        sessionId: session.id,
+        worktree: {
+          worktreeId: node.worktree.worktreeId!,
+          variantId: node.worktree.variantId!,
+          parentLaneId: node.id,
+          realPath: node.worktree.realPath!,
+          gitdir: node.worktree.gitdir!,
+          repoRoot: node.worktree.repoRoot!,
+          branchName: node.worktree.branchName!,
+          baseCommit: node.worktree.baseCommit!,
+          headCommit: node.worktree.headCommit!,
+        },
+        deleteBranch
+      });
+      setCleanStatus("Worktree cleaned successfully.");
+    } catch (e: any) {
+      setCleanError(e.message || "Failed to clean worktree");
+    } finally {
+      setCleaning(false);
+    }
+  };
+
+  return (
+    <div className="worktree-actions">
+      <h3>Worktree Lifecycle</h3>
+      {!devflowAvailable && <p className="eyebrow notice error">Desktop backend unavailable</p>}
+      {missingMetadata && devflowAvailable && <p className="eyebrow notice error">Missing required metadata for adoption.</p>}
+
+      <div className="modal-actions">
+        <button disabled={!canAdopt || adopting} onClick={handleAdopt}>
+          {adopting ? "Adopting..." : "Adopt Worktree"}
+        </button>
+        <button disabled={!canClean || cleaning} onClick={handleClean}>
+          {cleaning ? "Cleaning..." : "Clean Worktree"}
+        </button>
+        {candidateNodes.length > 0 && candidateNodes.map(other => (
+          <button key={other.id} disabled={!devflowAvailable || comparing} onClick={() => handleCompare(other)}>
+            Compare with {other.title}
+          </button>
+        ))}
+      </div>
+
+      {adoptStatus && <div className="notice success">{adoptStatus}</div>}
+      {adoptError && <div className="notice error">{adoptError}</div>}
+
+      {cleanStatus && <div className="notice success">{cleanStatus}</div>}
+      {cleanError && <div className="notice error">{cleanError}</div>}
+
+      {!!compareResult && (
+        <div className="worktree-compare-evidence">
+          <h4>Comparison Evidence</h4>
+          <pre>
+            {JSON.stringify(compareResult, null, 2)}
+          </pre>
+        </div>
+      )}
+      {compareError && <div className="notice error">{compareError}</div>}
+    </div>
   );
 }
 
