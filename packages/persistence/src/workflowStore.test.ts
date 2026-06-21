@@ -644,24 +644,7 @@ describe("SQLite workflow store", () => {
 
   it("schedules runnable lanes and records RunEvidence through the Flow Kernel event stream", async () => {
     const store = await makeSeededStore();
-    store.appendUserInput({
-      sessionId: "session-1",
-      inputId: "input-1",
-      text: "In this git repository, update src/tasks.ts and add tests.",
-      now: "2026-06-14T00:00:01.000Z",
-    });
-    store.applyWorkflowIntent({
-      intentId: "intent-code-change-1",
-      sessionId: "session-1",
-      operations: [
-        {
-          type: "AnalyzeRequirement",
-          requirement: "In this git repository, update src/tasks.ts and add tests.",
-        },
-        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
-        { type: "ProposeLanes" },
-      ],
-    }, "2026-06-14T00:00:02.000Z");
+    declareCodeChangeWorkflow(store);
 
     const scheduled = store.scheduleReadyLanes("session-1", {
       allowedParallelism: 1,
@@ -718,6 +701,97 @@ describe("SQLite workflow store", () => {
       changesetId: "changeset-implementation-1",
       output: expect.arrayContaining(["Implemented status filtering with tests."]),
     });
+  });
+
+  it.each(["lane-implementation", "lane-validation", "lane-review"] as const)(
+    "records failed %s RunEvidence into one durable repair and regression chain",
+    async (failedLaneId) => {
+      const store = await makeSeededStore();
+      declareCodeChangeWorkflow(store);
+      advanceCodeChangeWorkflowToLane(store, failedLaneId);
+      const failedInput = runResultInput(store, failedLaneId, "failed", "2026-06-14T00:00:10.000Z");
+
+      store.recordRunResult(failedInput);
+      store.recordRunResult(failedInput);
+
+      const projection = store.materializeFlowProjection("session-1");
+      const evidenceId = `evidence-segment-session-1-${failedLaneId}`;
+      const fix = projection.lanes.find((lane) => lane.semanticKey === `repair:${failedLaneId}:${evidenceId}`);
+      const regression = projection.lanes.find((lane) => lane.semanticKey === `regression:${failedLaneId}:${evidenceId}`);
+      const replanEvents = store
+        .listEvents("session-1")
+        .filter((event) => event.kind === "workflow.replan.requested" && event.payload.laneId === failedLaneId);
+
+      expect(projection.lanes.find((lane) => lane.id === failedLaneId)?.status).toBe("failed");
+      expect(replanEvents).toHaveLength(1);
+      expect(fix).toMatchObject({
+        laneKind: "fix",
+        semanticSubtype: "repair",
+        runtimePolicy: {
+          source: "workflow_projection",
+          trusted: true,
+          sandbox: "workspace-write",
+        },
+      });
+      expect(regression).toMatchObject({
+        laneKind: "regression",
+        semanticSubtype: "regression_check",
+        runtimePolicy: {
+          source: "workflow_projection",
+          trusted: true,
+          sandbox: "read-only",
+        },
+      });
+      expect(projection.edges).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ sourceLaneId: failedLaneId, targetLaneId: fix?.id }),
+          expect.objectContaining({ sourceLaneId: fix?.id, targetLaneId: regression?.id }),
+        ]),
+      );
+
+      const scheduled = store.scheduleReadyLanes("session-1", {
+        allowedParallelism: 3,
+        now: "2026-06-14T00:00:11.000Z",
+      });
+
+      expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual([fix?.id]);
+    },
+  );
+
+  it("does not auto-repair cancelled runs or failed repair lanes", async () => {
+    const cancelledStore = await makeSeededStore();
+    declareCodeChangeWorkflow(cancelledStore);
+    advanceCodeChangeWorkflowToLane(cancelledStore, "lane-implementation");
+
+    cancelledStore.recordRunResult(
+      runResultInput(cancelledStore, "lane-implementation", "cancelled", "2026-06-14T00:00:10.000Z"),
+    );
+
+    expect(cancelledStore.listEvents("session-1").filter((event) => event.kind === "workflow.replan.requested")).toEqual([]);
+    expect(cancelledStore.materializeFlowProjection("session-1").lanes.some((lane) => lane.semanticKey.startsWith("repair:"))).toBe(false);
+
+    const repairStore = await makeSeededStore();
+    declareCodeChangeWorkflow(repairStore);
+    advanceCodeChangeWorkflowToLane(repairStore, "lane-implementation");
+    repairStore.recordRunResult(
+      runResultInput(repairStore, "lane-implementation", "failed", "2026-06-14T00:00:10.000Z"),
+    );
+    const firstRepair = repairStore
+      .materializeFlowProjection("session-1")
+      .lanes.find((lane) => lane.semanticKey.startsWith("repair:"));
+    expect(firstRepair).toBeDefined();
+    repairStore.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:11.000Z",
+    });
+
+    repairStore.recordRunResult(
+      runResultInput(repairStore, firstRepair!.id, "failed", "2026-06-14T00:00:12.000Z"),
+    );
+
+    const afterRepairFailure = repairStore.materializeFlowProjection("session-1");
+    expect(repairStore.listEvents("session-1").filter((event) => event.kind === "workflow.replan.requested")).toHaveLength(1);
+    expect(afterRepairFailure.lanes.filter((lane) => lane.semanticKey.startsWith(`repair:${firstRepair!.id}:`))).toEqual([]);
   });
 
   it("redacts run output and evidence before persisting event-stream projection data", async () => {
@@ -865,6 +939,89 @@ function seedStore(store: ReturnType<typeof createWorkflowStore>): void {
     }),
     workflowContext("run-planner"),
   );
+}
+
+function declareCodeChangeWorkflow(store: ReturnType<typeof createWorkflowStore>): void {
+  store.appendUserInput({
+    sessionId: "session-1",
+    inputId: "input-1",
+    text: "In this git repository, update src/tasks.ts and add tests.",
+    now: "2026-06-14T00:00:01.000Z",
+  });
+  store.applyWorkflowIntent({
+    intentId: "intent-code-change-1",
+    sessionId: "session-1",
+    operations: [
+      {
+        type: "AnalyzeRequirement",
+        requirement: "In this git repository, update src/tasks.ts and add tests.",
+      },
+      { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
+      { type: "ProposeLanes" },
+    ],
+  }, "2026-06-14T00:00:02.000Z");
+}
+
+function advanceCodeChangeWorkflowToLane(
+  store: ReturnType<typeof createWorkflowStore>,
+  targetLaneId: "lane-implementation" | "lane-validation" | "lane-review",
+): void {
+  store.scheduleReadyLanes("session-1", {
+    allowedParallelism: 1,
+    now: "2026-06-14T00:00:03.000Z",
+  });
+  if (targetLaneId === "lane-implementation") return;
+  store.recordRunResult(runResultInput(store, "lane-implementation", "succeeded", "2026-06-14T00:00:04.000Z"));
+  store.scheduleReadyLanes("session-1", {
+    allowedParallelism: 1,
+    now: "2026-06-14T00:00:05.000Z",
+  });
+  if (targetLaneId === "lane-validation") return;
+  store.recordRunResult(runResultInput(store, "lane-validation", "succeeded", "2026-06-14T00:00:06.000Z"));
+  store.scheduleReadyLanes("session-1", {
+    allowedParallelism: 1,
+    now: "2026-06-14T00:00:07.000Z",
+  });
+}
+
+function runResultInput(
+  store: ReturnType<typeof createWorkflowStore>,
+  laneId: string,
+  status: RunEvidence["status"],
+  now: string,
+) {
+  const lane = store.materializeFlowProjection("session-1").lanes.find((item) => item.id === laneId);
+  if (!lane) throw new Error(`Unknown test lane ${laneId}.`);
+  const passed = status === "succeeded";
+  const cancelled = status === "cancelled";
+  return {
+    sessionId: "session-1",
+    laneId,
+    segmentId: `segment-session-1-${laneId}`,
+    runId: `run-session-1-${laneId}`,
+    agentKind: lane.agentKind,
+    outputSummary: passed ? `Completed ${laneId}.` : `Stopped ${laneId}.`,
+    evidence: {
+      runId: `run-session-1-${laneId}`,
+      status,
+      exitCode: passed ? 0 : cancelled ? null : 1,
+      changesetId: passed ? `changeset-${laneId}` : null,
+      checks: [
+        {
+          kind: passed ? "test" : "run-exit",
+          name: passed ? "pnpm test" : "Agent run exit",
+          status: passed ? "passed" : cancelled ? "skipped" : "failed",
+          detail: passed ? "passed" : cancelled ? "User cancelled the run." : "exit 1",
+        },
+      ],
+      artifacts: [],
+      review: null,
+      errorReason: passed || cancelled ? null : `${laneId} failed.`,
+      cancelReason: cancelled ? "User cancelled the run." : null,
+      completedAt: now,
+    } satisfies RunEvidence,
+    now,
+  };
 }
 
 function declareCompletedPlanningLane(store: ReturnType<typeof createWorkflowStore>): void {
