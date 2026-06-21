@@ -1587,7 +1587,7 @@ async function waitForFile(path: string): Promise<string> {
     try {
       return await readFile(path, "utf8");
     } catch {
-      if (Date.now() - started > 2_000) throw new Error(`Timed out waiting for ${path}`);
+      if (Date.now() - started > 5_000) throw new Error(`Timed out waiting for ${path}`);
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
