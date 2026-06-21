@@ -15,6 +15,8 @@ const workflow = {
   adoptWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:adopt", projectRoot, input),
   cleanWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:clean", projectRoot, input),
   createDeliveryCommit: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:commit", projectRoot, input),
+  pushDeliveryBranch: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:push", projectRoot, input),
+  createPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:create", projectRoot, input),
   getChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset", projectRoot, input),
   reconcileFinalChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset:reconcileFinal", projectRoot, input),
 };
@@ -46,6 +48,8 @@ contextBridge.exposeInMainWorld("devflow", {
   getWorkflowProjection: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:projection", projectRoot, sessionId),
   getWorkflowEvents: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:events", projectRoot, sessionId),
   createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:commit", projectRoot, input),
+  pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:push", projectRoot, input),
+  createWorkflowPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:create", projectRoot, input),
   workflow,
   onRunEvent: (listener: (event: unknown) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value);

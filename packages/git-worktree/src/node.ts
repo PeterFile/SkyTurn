@@ -24,6 +24,11 @@ import {
   type DeliveryCommitErrorCode,
   type DeliveryCommitEvidence,
   type DeliveryCommitInput,
+  type DeliveryPullRequestEvidence,
+  type DeliveryPullRequestInput,
+  type DeliveryPushEvidence,
+  type DeliveryPushInput,
+  type DeliveryRemoteActionErrorCode,
   type GitBranchFacts,
   type ManagedWorktreeCleanupInput,
   type ManagedWorktreeCleanupResult,
@@ -138,6 +143,16 @@ export class DeliveryCommitError extends Error {
   constructor(code: DeliveryCommitErrorCode, message: string) {
     super(message);
     this.name = "DeliveryCommitError";
+    this.code = code;
+  }
+}
+
+export class DeliveryRemoteActionError extends Error {
+  readonly code: DeliveryRemoteActionErrorCode;
+
+  constructor(code: DeliveryRemoteActionErrorCode, message: string) {
+    super(message);
+    this.name = "DeliveryRemoteActionError";
     this.code = code;
   }
 }
@@ -609,6 +624,243 @@ export async function createDeliveryCommit(input: DeliveryCommitInput): Promise<
       files: committedFiles,
     },
   };
+}
+
+export async function pushDeliveryBranch(input: DeliveryPushInput): Promise<DeliveryPushEvidence> {
+  const remote = normalizeRemoteName(input.remote ?? "origin");
+  const facts = await resolveDeliveryActionFacts(input);
+  await assertRemoteExists(facts.worktreePath, remote);
+  const command = await runDeliveryCommand("git", facts.worktreePath, ["push", remote, `HEAD:refs/heads/${facts.branch}`]);
+  return {
+    status: "pushed",
+    remote,
+    branch: facts.branch,
+    commitSha: facts.commitSha,
+    worktreePath: facts.worktreePath,
+    command,
+  };
+}
+
+export async function createDeliveryPullRequest(input: DeliveryPullRequestInput): Promise<DeliveryPullRequestEvidence> {
+  const remote = normalizeRemoteName(input.remote ?? "origin");
+  const facts = await resolveDeliveryActionFacts({
+    projectRoot: input.projectRoot,
+    worktreePath: input.worktreePath,
+    commitSha: input.commitSha,
+    branch: input.headBranch,
+  });
+  const base = await normalizeExistingBaseBranch(facts.worktreePath, remote, input.baseBranch);
+  if (base === facts.branch) {
+    throwRemote("DELIVERY_REJECTED", "Pull request base and head branches must differ.");
+  }
+  const title = normalizeCommitSubject(input.title);
+  const body = normalizePullRequestBody(input, facts);
+  await assertRemoteExists(facts.worktreePath, remote);
+  await assertRemoteBranchHeadMatchesCommit(facts.worktreePath, remote, facts.branch, facts.commitSha);
+  await ensureGhAvailable(facts.worktreePath);
+  await ensureGhAuthenticated(facts.worktreePath);
+  const command = await runDeliveryCommand("gh", facts.worktreePath, [
+    "pr",
+    "create",
+    "--base",
+    base,
+    "--head",
+    facts.branch,
+    "--title",
+    title,
+    "--body",
+    body,
+  ]);
+  const url = pullRequestUrlFromOutput(command.stdout);
+  const number = pullRequestNumberFromUrl(url);
+  return {
+    status: "created",
+    url,
+    number,
+    head: facts.branch,
+    base,
+    remote,
+    commitSha: facts.commitSha,
+    title,
+    command,
+  };
+}
+
+interface DeliveryActionFacts {
+  worktreePath: string;
+  commitSha: string;
+  branch: string;
+}
+
+async function resolveDeliveryActionFacts(input: DeliveryPushInput): Promise<DeliveryActionFacts> {
+  const worktreePath = await resolveDeliveryWorktreePath(input.projectRoot, input.worktreePath);
+  const commitSha = await verifyCommit(worktreePath, input.commitSha, "delivery commit");
+  const headCommit = await currentHead(worktreePath);
+  if (headCommit !== commitSha) {
+    throwRemote("DELIVERY_REJECTED", `Delivery commit must match worktree HEAD: expected ${commitSha}, got ${headCommit}.`);
+  }
+  const current = await currentBranch(worktreePath);
+  const branch = input.branch ? await normalizeDeliveryBranch(worktreePath, input.branch, "delivery branch") : current;
+  if (branch !== current) {
+    throwRemote("DELIVERY_REJECTED", `Delivery branch must match the current worktree branch: expected ${current}, got ${branch}.`);
+  }
+  return { worktreePath, commitSha, branch };
+}
+
+function normalizeRemoteName(value: string): string {
+  const remote = typeof value === "string" ? value.trim() : "";
+  if (!/^[A-Za-z0-9._-]+$/.test(remote)) {
+    throwRemote("INVALID_INPUT", "Git remote name is invalid.");
+  }
+  return remote;
+}
+
+async function normalizeDeliveryBranch(cwd: string, value: string, label: string): Promise<string> {
+  const branch = typeof value === "string" ? value.trim() : "";
+  try {
+    validateBranchName(branch, { requireSkyTurnPrefix: false });
+    await runGit(cwd, ["check-ref-format", "--branch", branch]);
+  } catch {
+    throwRemote("INVALID_INPUT", `${label} is invalid.`);
+  }
+  return branch;
+}
+
+async function normalizeExistingBaseBranch(cwd: string, remote: string, value: string): Promise<string> {
+  const branch = await normalizeDeliveryBranch(cwd, value, "pull request base branch");
+  const local = await runGit(cwd, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`], { allowFailure: true });
+  if (local.exitCode === 0) return branch;
+  const remoteRef = await runGit(cwd, ["rev-parse", "--verify", `refs/remotes/${remote}/${branch}^{commit}`], { allowFailure: true });
+  if (remoteRef.exitCode === 0) return branch;
+  const remoteHead = await runGit(cwd, ["ls-remote", "--exit-code", "--heads", remote, branch], { allowFailure: true });
+  if (remoteHead.exitCode === 0) return branch;
+  throwRemote("INVALID_INPUT", `Pull request base branch does not resolve locally or on ${remote}: ${branch}.`);
+}
+
+async function assertRemoteExists(cwd: string, remote: string): Promise<void> {
+  const result = await runGit(cwd, ["remote", "get-url", "--push", remote], { allowFailure: true });
+  if (result.exitCode !== 0) throwRemote("INVALID_INPUT", `Git remote is not configured: ${remote}.`);
+}
+
+async function assertRemoteBranchHeadMatchesCommit(cwd: string, remote: string, branch: string, expectedCommitSha: string): Promise<void> {
+  const result = await runGit(cwd, ["ls-remote", "--exit-code", "--heads", remote, branch], { allowFailure: true });
+  if (result.exitCode !== 0) {
+    throwRemote("DELIVERY_REJECTED", `Remote branch was not found after push: ${remote}/${branch}.`);
+  }
+  const remoteSha = remoteHeadShaFromLsRemote(result.stdout, branch);
+  if (!remoteSha) {
+    throwRemote("DELIVERY_REJECTED", `Remote branch was not found after push: ${remote}/${branch}.`);
+  }
+  if (remoteSha !== expectedCommitSha) {
+    throwRemote(
+      "REMOTE_HEAD_MISMATCH",
+      `Remote branch head does not match delivery commit for ${remote}/${branch}: expected ${shortSha(expectedCommitSha)}, got ${shortSha(remoteSha)}.`,
+    );
+  }
+}
+
+function remoteHeadShaFromLsRemote(output: string, branch: string): string | null {
+  const expectedRef = `refs/heads/${branch}`;
+  for (const line of output.split(/\r?\n/)) {
+    const [sha, ref] = line.trim().split(/\s+/);
+    if (sha && ref === expectedRef && /^[0-9a-fA-F]{7,64}$/.test(sha)) return sha;
+  }
+  return null;
+}
+
+function shortSha(sha: string): string {
+  return sha.slice(0, 12);
+}
+
+async function ensureGhAvailable(cwd: string): Promise<void> {
+  await runDeliveryCommand("gh", cwd, ["--version"], "GH_UNAVAILABLE");
+}
+
+async function ensureGhAuthenticated(cwd: string): Promise<void> {
+  await runDeliveryCommand("gh", cwd, ["auth", "status"], "AUTH_REQUIRED");
+}
+
+function normalizePullRequestBody(input: DeliveryPullRequestInput, facts: DeliveryActionFacts): string {
+  if (typeof input.body === "string" && input.body.trim()) {
+    const body = input.body.trim();
+    for (const section of ["What changed?", "Why?", "Breaking changes?", "Server PR"]) {
+      if (!body.includes(section)) throwRemote("INVALID_INPUT", `Pull request body must include ${section}.`);
+    }
+    return body;
+  }
+  return [
+    "**What changed?**",
+    input.whatChanged?.trim() || `Pushed delivery commit ${facts.commitSha.slice(0, 12)} from ${facts.branch}.`,
+    "",
+    "**Why?**",
+    input.why?.trim() || "Prepare the verified delivery branch for review.",
+    "",
+    "**Breaking changes?**",
+    input.breakingChanges?.trim() || "None.",
+    "",
+    "**Server PR**",
+    input.serverPr?.trim() || "None.",
+  ].join("\n");
+}
+
+async function runDeliveryCommand(
+  command: "git" | "gh",
+  cwd: string,
+  args: string[],
+  failureCode: DeliveryRemoteActionErrorCode = "DELIVERY_REJECTED",
+): Promise<DeliveryCommandResult> {
+  try {
+    const result = await execFileAsync(command, args, {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: gitOutputLimit,
+      shell: false,
+    });
+    return {
+      command,
+      args: command === "gh" ? redactGhArgs(args) : args,
+      ok: true,
+      exitCode: 0,
+      stdout: sanitizeCommandOutput(String(result.stdout).trim()),
+      stderr: sanitizeCommandOutput(String(result.stderr).trim()),
+    };
+  } catch (error) {
+    const failure = error as { code?: number | string; stderr?: string; stdout?: string; message?: string };
+    const code = command === "gh" && failure.code === "ENOENT" ? "GH_UNAVAILABLE" : failureCode;
+    const detail = sanitizeCommandOutput(String(failure.stderr || failure.stdout || failure.message || "").trim());
+    throwRemote(code, `${command} ${args[0]} failed: ${detail || "command failed"}.`);
+  }
+}
+
+function redactGhArgs(args: string[]): string[] {
+  return args.map((arg, index) => (args[index - 1] === "--body" ? sanitizeCommandOutput(arg) : arg));
+}
+
+function sanitizeCommandOutput(value: string): string {
+  return value
+    .replace(/-----BEGIN [^-]+PRIVATE KEY-----[\s\S]*?-----END [^-]+PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]")
+    .replace(/\b(token|secret|password|api[_-]?key|authorization|cookie)\b\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@[^\s]+/g, "[REDACTED_URL]")
+    .replace(/\s+$/g, "");
+}
+
+function pullRequestUrlFromOutput(output: string): string {
+  const match = output.match(/https?:\/\/[A-Za-z0-9.-]+\/[^/\s]+\/[^/\s]+\/pull\/\d+/);
+  if (!match) throwRemote("DELIVERY_REJECTED", "GitHub CLI did not return a pull request URL.");
+  return match[0];
+}
+
+function pullRequestNumberFromUrl(url: string): number {
+  const match = url.match(/\/pull\/(\d+)$/);
+  const number = match ? Number(match[1]) : NaN;
+  if (!Number.isSafeInteger(number) || number <= 0) {
+    throwRemote("DELIVERY_REJECTED", "GitHub CLI returned an invalid pull request URL.");
+  }
+  return number;
+}
+
+function throwRemote(code: DeliveryRemoteActionErrorCode, message: string): never {
+  throw new DeliveryRemoteActionError(code, message);
 }
 
 function assertDeliveryReconciliationStatus(status: DeliveryCommitInput["reconciliationStatus"], acceptMismatch: boolean): void {

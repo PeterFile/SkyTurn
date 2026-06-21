@@ -1,4 +1,12 @@
-import type { DeliveryCommitEvidence, EditorAdapter, EditorKind, GitBranchFacts, ManagedWorktreeCleanupResult } from "@skyturn/git-worktree";
+import type {
+  DeliveryCommitEvidence,
+  DeliveryPullRequestEvidence,
+  DeliveryPushEvidence,
+  EditorAdapter,
+  EditorKind,
+  GitBranchFacts,
+  ManagedWorktreeCleanupResult,
+} from "@skyturn/git-worktree";
 import {
   makeHermesPlannerSessionId,
   normalizeSessionTarget,
@@ -60,6 +68,8 @@ export interface WorkflowApi {
   adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "adopted" | "failed"; event: unknown | null; adoption: WorkflowVariantAdoption & { status: "adopted" | "failed" } }>;
   cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "cleaned"; event: unknown | null; result: ManagedWorktreeCleanupResult }>;
   createDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
+  pushDeliveryBranch: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "pushed"; event: unknown | null; evidence: DeliveryPushEvidence }>;
+  createPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown | null; evidence: DeliveryPullRequestEvidence }>;
   getChangeset: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
 }
@@ -91,6 +101,8 @@ export interface DevflowApi {
   workflow: WorkflowApi;
   getWorkflowEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
+  pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "pushed"; event: unknown | null; evidence: DeliveryPushEvidence }>;
+  createWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown | null; evidence: DeliveryPullRequestEvidence }>;
   onRunEvent: (listener: (event: RunEvent) => void) => () => void;
   onWorkflowEvent: (listener: (event: unknown) => void) => () => void;
 }

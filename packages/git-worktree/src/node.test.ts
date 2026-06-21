@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink as fsSymlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink as fsSymlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -10,8 +10,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption } from "@skyturn/project-core";
 import {
   createDeliveryCommit,
+  createDeliveryPullRequest,
   createGitChangesetService,
   createNodeGitWorktreeService,
+  pushDeliveryBranch,
   getGitBranchFacts,
   type ManagedWorktreeWorkflowEvent,
   worktreeMetadataForVariant,
@@ -1012,6 +1014,198 @@ describe("delivery commits", () => {
   });
 });
 
+describe("delivery remote actions", () => {
+  const tempRoots: string[] = [];
+
+  afterEach(() => {
+    for (const root of tempRoots.splice(0)) {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("pushes the current delivery HEAD to the configured remote branch", async () => {
+    const repo = await createTestRepo("skyturn-delivery-push-");
+    tempRoots.push(repo.tempRoot);
+    const remotePath = join(repo.tempRoot, "remote.git");
+    git(repo.tempRoot, ["init", "--bare", "remote.git"]);
+    git(repo.repoRoot, ["remote", "add", "origin", remotePath]);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    const commit = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add remote push",
+    });
+
+    const pushed = await pushDeliveryBranch({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      commitSha: commit.commitSha,
+    });
+
+    expect(pushed).toMatchObject({
+      status: "pushed",
+      remote: "origin",
+      branch: "main",
+      commitSha: commit.commitSha,
+      command: {
+        command: "git",
+        ok: true,
+        exitCode: 0,
+      },
+    });
+    expect(git(remotePath, ["rev-parse", "refs/heads/main"])).toBe(commit.commitSha);
+  });
+
+  it("rejects push requests when the requested commit is not the delivery HEAD", async () => {
+    const repo = await createTestRepo("skyturn-delivery-push-head-");
+    tempRoots.push(repo.tempRoot);
+    const remotePath = join(repo.tempRoot, "remote.git");
+    git(repo.tempRoot, ["init", "--bare", "remote.git"]);
+    git(repo.repoRoot, ["remote", "add", "origin", remotePath]);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add remote push",
+    });
+
+    await expect(pushDeliveryBranch({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      commitSha: repo.baseCommit,
+    })).rejects.toThrow(/HEAD/i);
+  });
+
+  it("creates a pull request through authenticated GitHub CLI and returns the real PR URL", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-");
+    tempRoots.push(repo.tempRoot);
+    const remotePath = join(repo.tempRoot, "remote.git");
+    git(repo.tempRoot, ["init", "--bare", "remote.git"]);
+    git(repo.repoRoot, ["remote", "add", "origin", remotePath]);
+    git(repo.repoRoot, ["checkout", "-b", "feature/delivery"]);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    const commit = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add remote pr",
+    });
+    await pushDeliveryBranch({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      commitSha: commit.commitSha,
+      branch: "feature/delivery",
+    });
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prUrl: "https://github.com/acme/skyturn/pull/42",
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      const pr = await createDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        commitSha: commit.commitSha,
+        baseBranch: "main",
+        headBranch: "feature/delivery",
+        title: "feat(delivery): add remote pr",
+      });
+
+      expect(pr).toMatchObject({
+        status: "created",
+        url: "https://github.com/acme/skyturn/pull/42",
+        number: 42,
+        head: "feature/delivery",
+        base: "main",
+        commitSha: commit.commitSha,
+      });
+      const ghArgs = readFileSync(fakeGh.argsPath, "utf8");
+      expect(ghArgs).toContain("--base\nmain");
+      expect(ghArgs).toContain("--head\nfeature/delivery");
+      expect(ghArgs).toContain("--title\nfeat(delivery): add remote pr");
+      expect(ghArgs).toContain("**What changed?**");
+      expect(ghArgs).toContain("**Why?**");
+      expect(ghArgs).toContain("**Breaking changes?**");
+      expect(ghArgs).toContain("**Server PR**");
+    });
+  });
+
+  it("rejects pull request creation when the remote head does not match the delivery commit", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-stale-head-");
+    tempRoots.push(repo.tempRoot);
+    const remotePath = join(repo.tempRoot, "remote.git");
+    git(repo.tempRoot, ["init", "--bare", "remote.git"]);
+    git(repo.repoRoot, ["remote", "add", "origin", remotePath]);
+    git(repo.repoRoot, ["checkout", "-b", "feature/delivery"]);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    const commit = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add remote pr",
+    });
+    git(repo.repoRoot, ["push", "origin", `${repo.baseCommit}:refs/heads/feature/delivery`]);
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prUrl: "https://github.com/acme/skyturn/pull/42",
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      await expect(createDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        commitSha: commit.commitSha,
+        baseBranch: "main",
+        headBranch: "feature/delivery",
+        title: "feat(delivery): add remote pr",
+      })).rejects.toMatchObject({
+        code: "REMOTE_HEAD_MISMATCH",
+        message: expect.stringContaining("Remote branch head does not match delivery commit"),
+      });
+      expect(existsSync(fakeGh.argsPath)).toBe(false);
+    });
+  });
+
+  it("returns AUTH_REQUIRED when GitHub CLI is installed but not authenticated", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-auth-");
+    tempRoots.push(repo.tempRoot);
+    const remotePath = join(repo.tempRoot, "remote.git");
+    git(repo.tempRoot, ["init", "--bare", "remote.git"]);
+    git(repo.repoRoot, ["remote", "add", "origin", remotePath]);
+    git(repo.repoRoot, ["checkout", "-b", "feature/delivery"]);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    const commit = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add remote pr",
+    });
+    await pushDeliveryBranch({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      commitSha: commit.commitSha,
+      branch: "feature/delivery",
+    });
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      authStatus: 1,
+      authStderr: "not logged in; token=secret-value",
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      await expect(createDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        commitSha: commit.commitSha,
+        baseBranch: "main",
+        headBranch: "feature/delivery",
+        title: "feat(delivery): add remote pr",
+      })).rejects.toMatchObject({
+        code: "AUTH_REQUIRED",
+      });
+    });
+  });
+});
+
 describe("GitChangesetService", () => {
   afterEach(async () => {
     await Promise.all(changesetTempRoots.splice(0).map((root) => rm(root, { force: true, recursive: true })));
@@ -1214,6 +1408,49 @@ async function createRepo(): Promise<string> {
 
 async function gitAsync(cwd: string, ...args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
+}
+
+async function installFakeGh(
+  tempRoot: string,
+  options: { prUrl?: string; authStatus?: number; authStderr?: string },
+): Promise<{ binDir: string; argsPath: string }> {
+  const binDir = join(tempRoot, "fake-bin");
+  const argsPath = join(tempRoot, "gh-args.txt");
+  await mkdir(binDir, { recursive: true });
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"--version\" ]; then echo \"gh version 2.0.0\"; exit 0; fi",
+    "if [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then",
+    `  echo "${options.authStderr ?? "Logged in"}" >&2`,
+    `  exit ${options.authStatus ?? 0}`,
+    "fi",
+    "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then",
+    "  printf '%s\\n' \"$@\" > \"$SKYTURN_FAKE_GH_ARGS\"",
+    `  echo "${options.prUrl ?? "https://github.com/acme/skyturn/pull/1"}"`,
+    "  exit 0",
+    "fi",
+    "exit 2",
+    "",
+  ].join("\n");
+  const ghPath = join(binDir, "gh");
+  await writeFile(ghPath, script, "utf8");
+  await chmod(ghPath, 0o755);
+  return { binDir, argsPath };
+}
+
+async function withFakeGh<T>(binDir: string, argsPath: string, callback: () => Promise<T>): Promise<T> {
+  const previousPath = process.env.PATH;
+  const previousArgs = process.env.SKYTURN_FAKE_GH_ARGS;
+  process.env.PATH = `${binDir}${process.env.PATH ? `:${process.env.PATH}` : ""}`;
+  process.env.SKYTURN_FAKE_GH_ARGS = argsPath;
+  try {
+    return await callback();
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousArgs === undefined) delete process.env.SKYTURN_FAKE_GH_ARGS;
+    else process.env.SKYTURN_FAKE_GH_ARGS = previousArgs;
+  }
 }
 
 function nodeForRepo(repoRoot: string): CanvasNode {

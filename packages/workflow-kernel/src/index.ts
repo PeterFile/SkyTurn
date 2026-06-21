@@ -189,6 +189,8 @@ export type FlowEventKind =
   | "workflow.user_decision.requested"
   | "workflow.user_decision.answered"
   | "workflow.commit.created"
+  | "workflow.delivery.pushed"
+  | "workflow.pull_request.created"
   | "workflow.worktree.create_requested"
   | "workflow.worktree.created"
   | "workflow.worktree.create_failed"
