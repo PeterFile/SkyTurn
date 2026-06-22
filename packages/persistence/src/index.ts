@@ -72,6 +72,9 @@ export interface WorkflowApi {
   createPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown | null; evidence: DeliveryPullRequestEvidence }>;
   getChangeset: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
+  checkPullRequestStatus?: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: string; checkStatus: "passing" | "failing" | "pending"; expectedHeadSha: string; mergeable: boolean; evidence?: unknown }>;
+  mergePullRequest?: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "merged"; event: unknown | null; evidence?: unknown }>;
+  syncPostMerge?: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "synced"; event: unknown | null }>;
 }
 
 export interface DevflowApi {
