@@ -1,10 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
+  buildWorktreeAdoptionConfirmation,
+  buildWorktreeCleanConfirmation,
+  buildWorktreeDeleteBranchConfirmation,
   changeReviewSummary,
   deriveSessionTarget,
   hasAvailableChangeEvidence,
   hasFinalGitEvidence,
+  summarizeWorktreeComparisonEvidence,
 } from "./App.js";
 import type { CanvasNode, Changeset, FinalChangesetReconciliation } from "@skyturn/project-core";
 
@@ -436,6 +440,80 @@ describe("UI source validation", () => {
 
     expect(handleClean).toContain("const deleteBranch = window.confirm");
     expect(handleClean).not.toMatch(/if\s*\(!deleteBranch\)\s*return/);
+  });
+
+  it("formats worktree comparison evidence without rendering raw JSON", async () => {
+    const summary = summarizeWorktreeComparisonEvidence({
+      comparisonId: "comparison-a-b",
+      collectedAt: "2026-06-22T07:20:00.000Z",
+      variants: [
+        {
+          variantId: "variant-a",
+          worktreeId: "wt-a",
+          changeset: {
+            status: "available",
+            files: ["src/a.ts", "src/b.ts"],
+            diffStat: { added: 12, changed: 2, deleted: 3 },
+            patchPreviewTruncated: false,
+          },
+          metrics: [
+            { kind: "test", label: "Tests", status: "passed", detail: "vitest --run" },
+            { kind: "build", label: "Build", status: "failed", detail: "tsc failed" },
+            { kind: "diff-summary", label: "Diff summary", status: "recorded", detail: "+12 / -3 across 2 files" },
+            { kind: "conflict-check", label: "Conflict check", status: "passed", detail: "No conflicts detected." },
+          ],
+        },
+      ],
+    });
+
+    expect(summary.variants).toEqual([
+      expect.objectContaining({
+        variantId: "variant-a",
+        worktreeId: "wt-a",
+        changedFileCount: "2",
+        diffSummary: "+12 / -3 across 2 files",
+        conflictStatus: "passed",
+        checks: [
+          { label: "Tests", status: "passed", detail: "vitest --run" },
+          { label: "Build", status: "failed", detail: "tsc failed" },
+        ],
+      }),
+    ]);
+
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    expect(worktreeActions).not.toContain("JSON.stringify(compareResult");
+    expect(worktreeActions).toContain("worktree-comparison-grid");
+  });
+
+  it("builds explicit merge-only adoption confirmation copy", () => {
+    const message = buildWorktreeAdoptionConfirmation({
+      targetBranchName: "main",
+      worktreeBranchName: "skyturn/session-1",
+      baseCommit: "abc123",
+      headCommit: "def456",
+    });
+
+    expect(message).toContain("Target branch: main");
+    expect(message).toContain("Worktree branch: skyturn/session-1");
+    expect(message).toContain("Base commit: abc123");
+    expect(message).toContain("Head commit: def456");
+    expect(message).toContain("Strategy: merge");
+    expect(message).not.toContain("cherry-pick");
+  });
+
+  it("builds clean confirmation copy with delete branch defaulting to false", () => {
+    const cleanMessage = buildWorktreeCleanConfirmation({
+      path: "/repo.worktrees/wt-a",
+      branchName: "skyturn/session-1",
+    });
+    const deleteBranchMessage = buildWorktreeDeleteBranchConfirmation("skyturn/session-1");
+
+    expect(cleanMessage).toContain("Path to remove: /repo.worktrees/wt-a");
+    expect(cleanMessage).toContain("Branch name: skyturn/session-1");
+    expect(cleanMessage).toContain("Delete branch requested: false");
+    expect(deleteBranchMessage).toContain("Second confirmation");
+    expect(deleteBranchMessage).toContain("Delete branch: skyturn/session-1");
   });
 
 });

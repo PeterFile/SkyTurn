@@ -3011,6 +3011,184 @@ function ChangesMenuItem({
   );
 }
 
+interface WorktreeComparisonCheckSummary {
+  label: string;
+  status: string;
+  detail?: string;
+}
+
+interface WorktreeComparisonVariantSummary {
+  variantId: string;
+  worktreeId: string;
+  changeStatus: string;
+  changedFileCount: string;
+  diffSummary: string;
+  conflictStatus: string;
+  conflictDetail?: string;
+  checks: WorktreeComparisonCheckSummary[];
+  files: string[];
+  hiddenFileCount: number;
+}
+
+interface WorktreeComparisonEvidenceSummary {
+  comparisonId: string;
+  collectedAt?: string;
+  variants: WorktreeComparisonVariantSummary[];
+}
+
+interface WorktreeAdoptionConfirmationInput {
+  targetBranchName?: string;
+  worktreeBranchName?: string;
+  baseCommit?: string;
+  headCommit?: string;
+}
+
+interface WorktreeCleanConfirmationInput {
+  path?: string;
+  branchName?: string;
+}
+
+const WORKTREE_PRIMARY_CHECK_KINDS = new Set(["test", "build", "typecheck"]);
+const MAX_COMPARE_FILES = 3;
+
+export function summarizeWorktreeComparisonEvidence(comparison: unknown): WorktreeComparisonEvidenceSummary {
+  const source = asRecord(comparison);
+  const rawVariants = Array.isArray(source?.variants) ? source.variants : [];
+  const variants = rawVariants.filter(isRecord).map(summarizeWorktreeComparisonVariant);
+
+  return {
+    comparisonId: textValue(source?.comparisonId, "Comparison"),
+    collectedAt: optionalText(source?.collectedAt),
+    variants,
+  };
+}
+
+export function buildWorktreeAdoptionConfirmation(input: WorktreeAdoptionConfirmationInput): string {
+  return [
+    "Adopt this worktree into the target branch?",
+    "",
+    `Target branch: ${textValue(input.targetBranchName, "Unknown")}`,
+    `Worktree branch: ${textValue(input.worktreeBranchName, "Unknown")}`,
+    `Base commit: ${textValue(input.baseCommit, "Unknown")}`,
+    `Head commit: ${textValue(input.headCommit, "Unknown")}`,
+    "Strategy: merge",
+    "",
+    "This updates the target branch.",
+  ].join("\n");
+}
+
+export function buildWorktreeCleanConfirmation(input: WorktreeCleanConfirmationInput): string {
+  return [
+    "Clean this worktree?",
+    "",
+    `Path to remove: ${textValue(input.path, "Unknown")}`,
+    `Branch name: ${textValue(input.branchName, "Unknown")}`,
+    "Delete branch requested: false",
+    "",
+    "Branch deletion is off by default.",
+  ].join("\n");
+}
+
+export function buildWorktreeDeleteBranchConfirmation(branchName?: string): string {
+  return [
+    "Second confirmation required.",
+    `Delete branch: ${textValue(branchName, "Unknown")}`,
+    "Cancel keeps the branch and only removes the worktree.",
+  ].join("\n");
+}
+
+function summarizeWorktreeComparisonVariant(variant: Record<string, unknown>): WorktreeComparisonVariantSummary {
+  const changeset = asRecord(variant.changeset);
+  const files = stringArray(changeset?.files);
+  const filePreview = files.slice(0, MAX_COMPARE_FILES);
+  const metrics = Array.isArray(variant.metrics)
+    ? variant.metrics.filter(isRecord).map(summarizeWorktreeMetric)
+    : [];
+  const changedFileMetric = metrics.find((metric) => metric.kind === "changed-file-count");
+  const diffMetric = metrics.find((metric) => metric.kind === "diff-summary");
+  const conflictMetric = metrics.find((metric) => metric.kind === "conflict-check");
+  const changeStatus = textValue(changeset?.status, "unknown");
+
+  return {
+    variantId: textValue(variant.variantId, "Unknown variant"),
+    worktreeId: textValue(variant.worktreeId, "Unknown worktree"),
+    changeStatus,
+    changedFileCount: metricValueText(changedFileMetric) ?? changedFileCountText(changeStatus, files),
+    diffSummary: diffMetric?.detail
+      ?? diffSummaryText(changeStatus, files, asRecord(changeset?.diffStat), optionalText(changeset?.errorReason)),
+    conflictStatus: conflictMetric?.status === "unknown" || !conflictMetric ? "not recorded" : conflictMetric.status,
+    conflictDetail: conflictMetric?.status === "unknown" ? undefined : conflictMetric?.detail,
+    checks: metrics
+      .filter((metric) => WORKTREE_PRIMARY_CHECK_KINDS.has(metric.kind) && metric.status !== "unknown")
+      .map(({ label, status, detail }) => ({ label, status, detail })),
+    files: filePreview,
+    hiddenFileCount: Math.max(0, files.length - filePreview.length),
+  };
+}
+
+function summarizeWorktreeMetric(metric: Record<string, unknown>) {
+  return {
+    kind: textValue(metric.kind, "unknown"),
+    label: textValue(metric.label, "Metric"),
+    status: textValue(metric.status, "unknown"),
+    value: typeof metric.value === "number" || typeof metric.value === "string" ? metric.value : undefined,
+    detail: optionalText(metric.detail),
+  };
+}
+
+function changedFileCountText(status: string, files: string[]): string {
+  if (status === "failed") return "Failed";
+  if (status === "empty") return "0";
+  if (status === "available") return String(files.length);
+  return "Not recorded";
+}
+
+function diffSummaryText(
+  status: string,
+  files: string[],
+  diffStat: Record<string, unknown> | null,
+  errorReason?: string,
+): string {
+  if (status === "failed") return errorReason ?? "Diff collection failed.";
+  if (status === "empty") return "No git diff recorded.";
+  if (status !== "available") return "Not recorded";
+
+  const added = numberValue(diffStat?.added) ?? 0;
+  const deleted = numberValue(diffStat?.deleted) ?? 0;
+  const fileLabel = files.length === 1 ? "file" : "files";
+  return `+${added} / -${deleted} across ${files.length} ${fileLabel}`;
+}
+
+function metricValueText(metric: { value?: number | string } | undefined): string | undefined {
+  if (metric?.value === undefined) return undefined;
+  return String(metric.value);
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function textValue(value: unknown, fallback: string): string {
+  return optionalText(value) ?? fallback;
+}
+
+function optionalText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return isRecord(value) ? value : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function ContextTab({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
   const isNewWorktree = node.worktree.executionTarget === "new_worktree" || !!node.worktree.worktreeId;
 
@@ -3099,6 +3277,7 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
   const canClean = devflowAvailable && !missingCleanMetadata;
 
   const candidateNodes = session.nodes.filter((n) => !!n.worktree.worktreeId && n.id !== node.id);
+  const comparisonSummary = compareResult ? summarizeWorktreeComparisonEvidence(compareResult) : null;
 
   const handleCompare = async (otherNode: CanvasNode) => {
     if (!devflow?.workflow?.compareWorktrees) return;
@@ -3119,7 +3298,13 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
 
   const handleAdopt = async () => {
     if (!devflow?.workflow?.adoptWorktree || missingMetadata) return;
-    if (!window.confirm("Are you sure you want to adopt this worktree? This will update the target branch.")) {
+    const confirmation = buildWorktreeAdoptionConfirmation({
+      targetBranchName: node.worktree.selectedBranch,
+      worktreeBranchName: node.worktree.branchName,
+      baseCommit: node.worktree.baseCommit,
+      headCommit: node.worktree.headCommit,
+    });
+    if (!window.confirm(confirmation)) {
       return;
     }
     setAdopting(true);
@@ -3137,7 +3322,7 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
           baseCommit: node.worktree.baseCommit!,
           headCommit: node.worktree.headCommit!,
           targetBranchName: node.worktree.selectedBranch!,
-        }
+        },
       });
       if (result.status === "adopted") {
         setAdoptStatus(`Adopted as commit ${result.adoption.adoptedCommit}`);
@@ -3153,10 +3338,14 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
 
   const handleClean = async () => {
     if (!devflow?.workflow?.cleanWorktree || missingCleanMetadata) return;
-    if (!window.confirm("Are you sure you want to clean this worktree?")) {
+    const confirmation = buildWorktreeCleanConfirmation({
+      path: node.worktree.realPath ?? node.worktree.path,
+      branchName: node.worktree.branchName,
+    });
+    if (!window.confirm(confirmation)) {
       return;
     }
-    const deleteBranch = window.confirm("Also delete the associated branch? (Only confirm if it is a SkyTurn-managed branch)");
+    const deleteBranch = window.confirm(buildWorktreeDeleteBranchConfirmation(node.worktree.branchName));
 
     setCleaning(true);
     setCleanError(null);
@@ -3175,7 +3364,7 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
           baseCommit: node.worktree.baseCommit!,
           headCommit: node.worktree.headCommit!,
         },
-        deleteBranch
+        deleteBranch,
       });
       setCleanStatus("Worktree cleaned successfully.");
     } catch (e: any) {
@@ -3211,12 +3400,64 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
       {cleanStatus && <div className="notice success">{cleanStatus}</div>}
       {cleanError && <div className="notice error">{cleanError}</div>}
 
-      {!!compareResult && (
+      {comparisonSummary && (
         <div className="worktree-compare-evidence">
-          <h4>Comparison Evidence</h4>
-          <pre>
-            {JSON.stringify(compareResult, null, 2)}
-          </pre>
+          <div className="worktree-compare-header">
+            <h4>Comparison Evidence</h4>
+            {comparisonSummary.collectedAt && <span>{comparisonSummary.collectedAt}</span>}
+          </div>
+          {comparisonSummary.variants.length === 0 ? (
+            <p className="worktree-empty-evidence">No comparison variants recorded.</p>
+          ) : (
+            <div className="worktree-comparison-grid">
+              {comparisonSummary.variants.map((variant) => (
+                <section className="worktree-comparison-card" key={`${variant.variantId}-${variant.worktreeId}`}>
+                  <div className="worktree-comparison-card-header">
+                    <strong>{variant.variantId}</strong>
+                    <span>{variant.worktreeId}</span>
+                  </div>
+                  <dl className="worktree-evidence-list">
+                    <div>
+                      <dt>Changed files</dt>
+                      <dd>{variant.changedFileCount}</dd>
+                    </div>
+                    <div>
+                      <dt>Diff summary</dt>
+                      <dd>{variant.diffSummary}</dd>
+                    </div>
+                    <div>
+                      <dt>Change status</dt>
+                      <dd>{variant.changeStatus}</dd>
+                    </div>
+                    <div>
+                      <dt>Conflict check</dt>
+                      <dd>{variant.conflictStatus}</dd>
+                    </div>
+                  </dl>
+                  {variant.conflictDetail && <p className="worktree-evidence-detail">{variant.conflictDetail}</p>}
+                  {variant.checks.length > 0 ? (
+                    <ul className="worktree-check-list" aria-label="Recorded check metrics">
+                      {variant.checks.map((check) => (
+                        <li key={`${variant.variantId}-${check.label}`}>
+                          <span>{check.label}</span>
+                          <strong>{check.status}</strong>
+                          {check.detail && <em>{check.detail}</em>}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="worktree-empty-evidence">No test/build/check metrics recorded.</p>
+                  )}
+                  {variant.files.length > 0 && (
+                    <p className="worktree-file-preview">
+                      Files: {variant.files.join(", ")}
+                      {variant.hiddenFileCount > 0 ? `, +${variant.hiddenFileCount} more` : ""}
+                    </p>
+                  )}
+                </section>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {compareError && <div className="notice error">{compareError}</div>}
