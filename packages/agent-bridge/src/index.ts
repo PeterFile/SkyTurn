@@ -18,6 +18,8 @@ import {
   type AgentRun,
   type AgentRunSandbox,
   type AgentRunStatus,
+  type AgentSupportLevel,
+  type AgentReadinessCategory,
   type RunEvent,
   type RunEvidence,
   type StartAgentRunInput,
@@ -37,7 +39,18 @@ const commandCandidates: Record<AgentKind, string[]> = {
 const defaultKillTimeoutMs = 5_000;
 const defaultStallTelemetryMs = 60_000;
 const defaultRunWatchdogTimeoutMs = 30 * 60_000;
+const cliProbeTimeoutMs = 1_500;
 const maxStructuredChangeDiffBytes = 64_000;
+const codexAuthEnvNames = ["OPENAI_API_KEY"];
+const hermesAuthEnvNames = ["HERMES_API_KEY"];
+
+type CliFailureCategory =
+  | "cli-missing"
+  | "auth-missing"
+  | "invalid-cwd"
+  | "process-timeout"
+  | "non-zero-exit"
+  | "output-parse-error";
 
 interface AgentRunWatchdogPolicy {
   source: AgentKind;
@@ -93,17 +106,17 @@ export function createDiscoveryService(options: DiscoveryOptions = {}): Discover
       const pathValue = options.pathValue ?? process.env.PATH ?? "";
       return Promise.all(
         agentAdapterContracts.map(async (contract) => {
-          const executablePath = await findExecutable(commandCandidates[contract.kind], pathValue);
-          return {
+          return detectCliDescriptor({
             kind: contract.kind,
             label: contract.label,
-            executablePath,
-            version: null,
-            status: executablePath ? "available" : "missing",
+            candidates: commandCandidates[contract.kind],
+            pathValue,
             supportLevel: contract.supportLevel,
             capabilities: contract.capabilities,
             configFiles: contract.nativeConfigFiles,
-          } satisfies AgentDescriptor;
+            env: process.env,
+            authEnvNames: authEnvNamesForAgent(contract.kind),
+          });
         }),
       );
     },
@@ -402,6 +415,7 @@ class AgentRunWatchdog {
       kind: "status",
       payload: {
         status: "timed-out",
+        category: "process-timeout",
         reason: `${this.policy.commandLabel} timed out after ${this.policy.timeoutMs}ms`,
       },
     });
@@ -456,35 +470,34 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
     supportLevel: "experimental-run",
     capabilities: ["chat", "file-read", "file-write", "shell", "mcp", "worktree"],
     async detect() {
-      const executablePath =
-        options.executablePath ?? (await findExecutable(commandCandidates.codex, options.pathValue ?? process.env.PATH ?? ""));
-      return {
+      return detectCliDescriptor({
         kind: "codex",
         label: "Codex CLI",
-        executablePath,
-        version: null,
-        status: executablePath ? "available" : "missing",
-        supportLevel: executablePath ? "experimental-run" : "detected-only",
+        executablePath: options.executablePath,
+        candidates: commandCandidates.codex,
+        pathValue: options.pathValue ?? process.env.PATH ?? "",
+        supportLevel: "experimental-run",
         capabilities: ["chat", "file-read", "file-write", "shell", "mcp", "worktree"],
         configFiles: ["AGENTS.md", "skills"],
-      };
+        env: options.env ?? process.env,
+        authEnvNames: codexAuthEnvNames,
+      });
     },
     async startRun(input, sink) {
-      const workdir = await realpath(input.worktreePath || input.projectRoot);
+      const workdir = await resolveRunWorkdir(input, sink, "codex", "Codex CLI");
+      if (!workdir) return noopRunHandle();
       if (!(await hasGitMetadata(workdir))) {
-        await sink.emit({
-          kind: "error",
-          payload: {
-            source: "codex",
-            code: "missing-git-repository",
-            message: "Codex CLI requires a git repository.",
-          },
-        });
-        await sink.emit({ kind: "status", payload: { status: "failed", reason: "missing-git-repository" } });
-        return { async cancel() {} };
+        return failRunPreflight(sink, "codex", "Codex CLI", "invalid-cwd", "Codex CLI requires a git repository.");
+      }
+      const executablePath = await resolveCliExecutable(
+        options.executablePath,
+        commandCandidates.codex,
+        options.pathValue ?? process.env.PATH ?? "",
+      );
+      if (!executablePath) {
+        return failRunPreflight(sink, "codex", "Codex CLI", "cli-missing", "Codex CLI executable was not found.");
       }
 
-      const executablePath = options.executablePath ?? "codex";
       const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : defaultSandbox;
       const args = makeCodexExecArgs({
         prompt: input.prompt,
@@ -502,6 +515,8 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
       const outputReaders: Interface[] = [];
+      const stderrLines: string[] = [];
+      let stdoutFailureCategory: CliFailureCategory | null = null;
       const watchdog = new AgentRunWatchdog(
         child,
         {
@@ -529,7 +544,9 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         stdout.on("line", (line) => {
           if (watchdog.isFinalized()) return;
           watchdog.markActivity();
-          for (const draft of codexStdoutLineToDrafts(line)) {
+          const drafts = codexStdoutLineToDrafts(line);
+          stdoutFailureCategory ??= specificCliFailureCategoryFromDrafts(drafts);
+          for (const draft of drafts) {
             if (watchdog.isFinalized()) return;
             void emit(draft);
           }
@@ -543,6 +560,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
           watchdog.markActivity();
+          stderrLines.push(line);
           void emit({
             kind: "progress",
             payload: { source: "codex", stream: "stderr", format: "text", text: line },
@@ -553,11 +571,26 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       child.once("error", (error) => {
         spawnFailed = true;
         if (!watchdog.tryFinalize()) return;
+        const category = errorCategoryFromSpawnError(error);
         void emit({
           kind: "error",
-          payload: { source: "codex", message: error.message, code: error.name },
+          payload: { source: "codex", message: error.message, code: error.name, category },
         });
-        void emit({ kind: "status", payload: { status: "failed", reason: error.message } });
+        void emit({
+          kind: "evidence",
+          payload: {
+            exitCode: null,
+            checks: [
+              {
+                kind: "run-exit",
+                name: "Codex CLI spawn",
+                status: "failed",
+                detail: `${category}: ${error.message}`,
+              },
+            ],
+          },
+        });
+        void emit({ kind: "status", payload: { status: "failed", reason: category } });
       });
 
       child.once("close", (code, signal) => {
@@ -566,6 +599,17 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           if (spawnFailed) return;
           const exitCode = typeof code === "number" ? code : null;
           const checkStatus = exitCode === 0 ? "passed" : "failed";
+          const failureCategory = exitCode === 0 ? null : stdoutFailureCategory ?? processFailureCategory(stderrLines);
+          if (failureCategory && !stdoutFailureCategory) {
+            await emit({
+              kind: "error",
+              payload: {
+                source: "codex",
+                category: failureCategory,
+                message: formatProcessFailureMessage("Codex CLI", exitCode, signal, stderrLines),
+              },
+            });
+          }
           await emit({
             kind: "evidence",
             payload: {
@@ -586,6 +630,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
               status: exitCode === 0 ? "succeeded" : "failed",
               exitCode,
               signal,
+              ...(failureCategory ? { reason: failureCategory } : {}),
             },
           });
         })();
@@ -608,22 +653,30 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
     supportLevel: "experimental-run",
     capabilities: ["chat", "file-read", "file-write", "shell", "worktree", "resume"],
     async detect() {
-      const executablePath =
-        options.executablePath ?? (await findExecutable(commandCandidates.hermes, options.pathValue ?? process.env.PATH ?? ""));
-      return {
+      return detectCliDescriptor({
         kind: "hermes",
         label: "Hermes CLI",
-        executablePath,
-        version: null,
-        status: executablePath ? "available" : "missing",
-        supportLevel: executablePath ? "experimental-run" : "detected-only",
+        executablePath: options.executablePath,
+        candidates: commandCandidates.hermes,
+        pathValue: options.pathValue ?? process.env.PATH ?? "",
+        supportLevel: "experimental-run",
         capabilities: ["chat", "file-read", "file-write", "shell", "worktree", "resume"],
         configFiles: ["AGENTS.md"],
-      };
+        env: options.env ?? process.env,
+        authEnvNames: hermesAuthEnvNames,
+      });
     },
     async startRun(input, sink) {
-      const workdir = await realpath(input.worktreePath || input.projectRoot);
-      const executablePath = options.executablePath ?? "hermes";
+      const workdir = await resolveRunWorkdir(input, sink, "hermes", "Hermes CLI");
+      if (!workdir) return noopRunHandle();
+      const executablePath = await resolveCliExecutable(
+        options.executablePath,
+        commandCandidates.hermes,
+        options.pathValue ?? process.env.PATH ?? "",
+      );
+      if (!executablePath) {
+        return failRunPreflight(sink, "hermes", "Hermes CLI", "cli-missing", "Hermes CLI executable was not found.");
+      }
       const args = makeHermesChatArgs({
         prompt: input.prompt,
         opaqueHandle: input.hermesSessionHandle,
@@ -641,6 +694,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
       const outputReaders: Interface[] = [];
+      const stderrLines: string[] = [];
       const watchdog = new AgentRunWatchdog(
         child,
         {
@@ -697,6 +751,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
           watchdog.markActivity();
+          stderrLines.push(line);
           void emit({
             kind: "progress",
             payload: { source: "hermes", stream: "stderr", format: "text", text: line },
@@ -707,11 +762,26 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       child.once("error", (error) => {
         spawnFailed = true;
         if (!watchdog.tryFinalize()) return;
+        const category = errorCategoryFromSpawnError(error);
         void emit({
           kind: "error",
-          payload: { source: "hermes", message: error.message, code: error.name },
+          payload: { source: "hermes", message: error.message, code: error.name, category },
         });
-        void emit({ kind: "status", payload: { status: "failed", reason: error.message } });
+        void emit({
+          kind: "evidence",
+          payload: {
+            exitCode: null,
+            checks: [
+              {
+                kind: "run-exit",
+                name: "Hermes CLI spawn",
+                status: "failed",
+                detail: `${category}: ${error.message}`,
+              },
+            ],
+          },
+        });
+        void emit({ kind: "status", payload: { status: "failed", reason: category } });
       });
 
       child.once("close", (code, signal) => {
@@ -720,6 +790,17 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           if (spawnFailed) return;
           const exitCode = typeof code === "number" ? code : null;
           const checkStatus = exitCode === 0 ? "passed" : "failed";
+          const failureCategory = exitCode === 0 ? null : processFailureCategory(stderrLines);
+          if (failureCategory) {
+            await emit({
+              kind: "error",
+              payload: {
+                source: "hermes",
+                category: failureCategory,
+                message: formatProcessFailureMessage("Hermes CLI", exitCode, signal, stderrLines),
+              },
+            });
+          }
           await emit({
             kind: "evidence",
             payload: {
@@ -740,6 +821,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
               status: exitCode === 0 ? "succeeded" : "failed",
               exitCode,
               signal,
+              ...(failureCategory ? { reason: failureCategory } : {}),
             },
           });
         })();
@@ -915,6 +997,79 @@ function flowSegmentStatusFromRunEvidence(evidence: RunEvidence): "succeeded" | 
   return "failed";
 }
 
+async function detectCliDescriptor(input: {
+  kind: AgentKind;
+  label: string;
+  executablePath?: string;
+  candidates: string[];
+  pathValue: string;
+  supportLevel: AgentSupportLevel;
+  capabilities: AgentDescriptor["capabilities"];
+  configFiles: string[];
+  env: NodeJS.ProcessEnv;
+  authEnvNames: string[];
+}): Promise<AgentDescriptor> {
+  const executablePath = await resolveCliExecutable(input.executablePath, input.candidates, input.pathValue);
+  if (!executablePath) {
+    return {
+      kind: input.kind,
+      label: input.label,
+      executablePath: null,
+      version: null,
+      status: "missing",
+      supportLevel: "detected-only",
+      capabilities: input.capabilities,
+      configFiles: input.configFiles,
+      readiness: {
+        level: "unavailable",
+        cli: { available: false, path: null, version: null },
+        auth: { status: "unknown" },
+        categories: ["cli-missing"],
+      },
+    };
+  }
+
+  const versionProbe = await probeCliVersion(executablePath, input.env);
+  const auth = authReadiness(input.env, input.authEnvNames);
+  const categories: AgentReadinessCategory[] = [];
+  if (versionProbe.error) categories.push("version-probe-failed");
+  return {
+    kind: input.kind,
+    label: input.label,
+    executablePath,
+    version: versionProbe.version,
+    status: "available",
+    supportLevel: runnableSupportLevel(input.supportLevel),
+    capabilities: input.capabilities,
+    configFiles: input.configFiles,
+    readiness: {
+      level: readinessLevel(input.supportLevel),
+      cli: { available: true, path: executablePath, version: versionProbe.version },
+      auth,
+      categories,
+    },
+  };
+}
+
+async function resolveCliExecutable(
+  executablePath: string | undefined,
+  candidates: string[],
+  pathValue: string,
+): Promise<string | null> {
+  if (!executablePath) return findExecutable(candidates, pathValue);
+  if (!isPathLikeCommand(executablePath)) return findExecutable([executablePath], pathValue);
+  try {
+    await access(executablePath, fsConstants.X_OK);
+    return executablePath;
+  } catch {
+    return null;
+  }
+}
+
+function isPathLikeCommand(value: string): boolean {
+  return value.includes("/") || value.includes("\\");
+}
+
 async function findExecutable(commands: string[], pathValue: string): Promise<string | null> {
   for (const directory of pathValue.split(delimiter).filter(Boolean)) {
     for (const command of commands) {
@@ -926,6 +1081,198 @@ async function findExecutable(commands: string[], pathValue: string): Promise<st
         // Try the next candidate.
       }
     }
+  }
+  return null;
+}
+
+function runnableSupportLevel(supportLevel: AgentSupportLevel): AgentSupportLevel {
+  return supportLevel === "experimental-run" ? "experimental-run" : "detected-only";
+}
+
+function readinessLevel(supportLevel: AgentSupportLevel): "detected-only" | "experimental-run" {
+  return supportLevel === "experimental-run" ? "experimental-run" : "detected-only";
+}
+
+function authEnvNamesForAgent(kind: AgentKind): string[] {
+  if (kind === "codex") return codexAuthEnvNames;
+  if (kind === "hermes") return hermesAuthEnvNames;
+  return [];
+}
+
+function authReadiness(
+  env: NodeJS.ProcessEnv,
+  names: string[],
+): NonNullable<AgentDescriptor["readiness"]>["auth"] {
+  const hasEnvAuth = names.some((name) => typeof env[name] === "string" && env[name]?.trim().length);
+  return hasEnvAuth ? { status: "available", source: "environment" } : { status: "unknown" };
+}
+
+function probeCliVersion(executablePath: string, env: NodeJS.ProcessEnv): Promise<{ version: string | null; error: string | null }> {
+  return new Promise((resolve) => {
+    let done = false;
+    let stdout = "";
+    let stderr = "";
+    const child = spawn(executablePath, ["--version"], {
+      env: versionProbeEnv(env),
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const finish = (result: { version: string | null; error: string | null }) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      terminateProcessTree(child, "SIGKILL");
+      finish({ version: null, error: "version probe timed out" });
+    }, cliProbeTimeoutMs);
+    timer.unref();
+    child.stdout?.on("data", (chunk: Buffer) => {
+      stdout = boundProbeOutput(`${stdout}${chunk.toString("utf8")}`);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr = boundProbeOutput(`${stderr}${chunk.toString("utf8")}`);
+    });
+    child.once("error", (error) => {
+      finish({ version: null, error: error.message });
+    });
+    child.once("close", (code) => {
+      if (code === 0) finish({ version: firstOutputLine(stdout || stderr), error: null });
+      else finish({ version: null, error: firstOutputLine(stderr || stdout) ?? `exit ${code ?? "unknown"}` });
+    });
+  });
+}
+
+function versionProbeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const output: NodeJS.ProcessEnv = {};
+  const pathValue = env.PATH ?? env.Path ?? process.env.PATH ?? process.env.Path;
+  if (pathValue) output.PATH = pathValue;
+
+  if (process.platform === "win32") {
+    for (const name of ["Path", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"]) {
+      const value = env[name] ?? process.env[name];
+      if (value) output[name] = value;
+    }
+  }
+
+  return output;
+}
+
+function boundProbeOutput(value: string): string {
+  return value.length > 8_192 ? value.slice(0, 8_192) : value;
+}
+
+function firstOutputLine(value: string): string | null {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? null;
+}
+
+async function resolveRunWorkdir(
+  input: StartAgentRunInput,
+  sink: RunEventSink,
+  source: AgentKind,
+  commandLabel: string,
+): Promise<string | null> {
+  try {
+    return await realpath(input.worktreePath || input.projectRoot);
+  } catch (error) {
+    await failRunPreflight(
+      sink,
+      source,
+      commandLabel,
+      "invalid-cwd",
+      `Invalid worktreePath or projectRoot: ${errorMessage(error)}`,
+    );
+    return null;
+  }
+}
+
+async function failRunPreflight(
+  sink: RunEventSink,
+  source: AgentKind,
+  commandLabel: string,
+  category: CliFailureCategory,
+  message: string,
+): Promise<AgentRunHandle> {
+  await sink.emit({
+    kind: "error",
+    payload: { source, category, message },
+  });
+  await sink.emit({
+    kind: "evidence",
+    payload: {
+      exitCode: null,
+      checks: [
+        {
+          kind: "run-exit",
+          name: `${commandLabel} preflight`,
+          status: "failed",
+          detail: `${category}: ${message}`,
+        },
+      ],
+    },
+  });
+  await sink.emit({ kind: "status", payload: { status: "failed", reason: category } });
+  return noopRunHandle();
+}
+
+function noopRunHandle(): AgentRunHandle {
+  return { async cancel() {} };
+}
+
+function errorCategoryFromSpawnError(error: Error): CliFailureCategory {
+  const code = "code" in error && typeof error.code === "string" ? error.code : "";
+  return code === "ENOENT" ? "cli-missing" : "non-zero-exit";
+}
+
+function processFailureCategory(stderrLines: string[]): CliFailureCategory {
+  return isAuthMissingMessage(stderrLines.join("\n")) ? "auth-missing" : "non-zero-exit";
+}
+
+function isAuthMissingMessage(message: string): boolean {
+  return /not logged in|authentication required|login required|unauthorized|missing api key|api key (missing|required|not found)/i.test(
+    message,
+  );
+}
+
+function formatProcessFailureMessage(
+  commandLabel: string,
+  exitCode: number | null,
+  signal: NodeJS.Signals | null,
+  stderrLines: string[],
+): string {
+  const stderr = firstOutputLine(stderrLines.join("\n"));
+  const exitDetail = formatExitDetail(exitCode, signal);
+  return stderr ? `${commandLabel} failed: ${stderr}` : `${commandLabel} failed: ${exitDetail}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function specificCliFailureCategoryFromDrafts(drafts: RunEventDraft[]): CliFailureCategory | null {
+  for (const draft of drafts) {
+    if (draft.kind !== "error") continue;
+    const category = cliFailureCategory(draft.payload.category);
+    if (!category || category === "non-zero-exit") continue;
+    return category;
+  }
+  return null;
+}
+
+function cliFailureCategory(value: unknown): CliFailureCategory | null {
+  if (
+    value === "cli-missing" ||
+    value === "auth-missing" ||
+    value === "invalid-cwd" ||
+    value === "process-timeout" ||
+    value === "non-zero-exit" ||
+    value === "output-parse-error"
+  ) {
+    return value;
   }
   return null;
 }
@@ -1070,7 +1417,12 @@ function codexStdoutLineToDrafts(line: string): RunEventDraft[] {
   if (!line.trim()) return [];
   const event = parseJsonObject(line);
   if (!event) {
-    return [{ kind: "progress", payload: { source: "codex", stream: "stdout", format: "text", text: line } }];
+    return [
+      {
+        kind: "progress",
+        payload: { source: "codex", stream: "stdout", format: "text", text: line, category: "output-parse-error" },
+      },
+    ];
   }
 
   const eventType = typeof event.type === "string" ? event.type : "unknown";
@@ -1103,10 +1455,16 @@ function codexStdoutLineToDrafts(line: string): RunEventDraft[] {
     return [{ kind: "progress", payload: { source: "codex", eventType, itemType: getNestedString(event, "item", "type") } }];
   }
   if (eventType === "error" || eventType === "turn.failed") {
+    const message = getCodexErrorMessage(event);
     return [
       {
         kind: "error",
-        payload: { source: "codex", eventType, message: getCodexErrorMessage(event) },
+        payload: {
+          source: "codex",
+          eventType,
+          message,
+          ...(isAuthMissingMessage(message) ? { category: "auth-missing" } : {}),
+        },
       },
     ];
   }

@@ -25,6 +25,14 @@ Every descriptor includes `supportLevel`:
 
 Unverified CLIs must stay `detected-only`.
 
+Descriptors may also include `readiness`:
+
+- `readiness.level: "unavailable"` means the CLI executable was not found or was not executable.
+- `readiness.level: "detected-only"` means SkyTurn found the executable but has not registered an execution adapter for it.
+- `readiness.level: "experimental-run"` means SkyTurn registered a runnable adapter. This is still not `supported-run`.
+- `readiness.cli.version` comes from a bounded `--version` probe.
+- `readiness.auth.status` is `available` only when a credential is safely detectable from environment presence. SkyTurn does not read secrets or user config to prove auth.
+
 Each adapter is responsible for loading its own native context, for example:
 
 - `AGENTS.md`
@@ -44,7 +52,7 @@ Hermes creates or confirms task graphs. Individual agents may write task-local o
 
 | Agent | Support level | Notes |
 | --- | --- | --- |
-| Hermes | `detected-only` | Orchestrator contract only in the MVP. |
+| Hermes CLI | `detected-only` by discovery; `experimental-run` when `createHermesCliAdapter` is registered | Uses `hermes chat -q` from the resolved project/worktree path. |
 | Codex CLI | `detected-only` by discovery; `experimental-run` when `createCodexCliAdapter` is registered | Uses `codex exec --json` inside a git repository. Default sandbox is read-only. |
 | Gemini | `detected-only` | Executable discovery only. |
 | Claude Code | `detected-only` | Executable discovery only. |
@@ -55,3 +63,12 @@ Hermes creates or confirms task graphs. Individual agents may write task-local o
 The MVP uses planner mocks for Fast/Plan sessions and `agent-bridge` mock runs for durable run events.
 
 Real CLI calls belong inside `agent-bridge` adapters only. They must stay `experimental-run` until the CLI contract, event parsing, cancellation, persistence, and evidence mapping are covered by tests.
+
+Runtime failure events use stable categories where possible:
+
+- `cli-missing`
+- `auth-missing`
+- `invalid-cwd`
+- `process-timeout`
+- `non-zero-exit`
+- `output-parse-error`

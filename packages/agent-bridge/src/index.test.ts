@@ -75,6 +75,147 @@ describe("agent bridge", () => {
     expect(hermes?.executablePath).toBe(hermesPath);
   });
 
+  it("reports Codex CLI version and env-auth readiness without promoting stable support", async () => {
+    const root = await makeTempRoot();
+    const codexPath = join(root, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then echo \"codex 1.2.3\"; exit 0; fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: { OPENAI_API_KEY: "test-token" },
+          pathValue: "",
+        }),
+      ],
+      pathValue: "",
+    });
+
+    const agents = await bridge.discoverAgents();
+    const codex = agents.find((agent) => agent.kind === "codex");
+
+    expect(codex).toMatchObject({
+      status: "available",
+      supportLevel: "experimental-run",
+      version: "codex 1.2.3",
+      readiness: {
+        level: "experimental-run",
+        cli: { available: true, path: codexPath, version: "codex 1.2.3" },
+        auth: { status: "available", source: "environment" },
+      },
+    });
+    expect(codex?.supportLevel).not.toBe("supported-run");
+  });
+
+  it("does not expose provider secrets to CLI version probes", async () => {
+    const root = await makeTempRoot();
+    const codexPath = join(root, "codex");
+    const probeEnvPath = join(root, "probe-env.json");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        `fs.writeFileSync(${JSON.stringify(probeEnvPath)}, JSON.stringify({`,
+        "  OPENAI_API_KEY: process.env.OPENAI_API_KEY ?? null,",
+        "  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? null,",
+        "  HERMES_API_KEY: process.env.HERMES_API_KEY ?? null,",
+        "  PATH: process.env.PATH ?? null,",
+        "}));",
+        "process.stdout.write('codex 1.2.3\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {
+            OPENAI_API_KEY: "openai-secret",
+            ANTHROPIC_API_KEY: "anthropic-secret",
+            HERMES_API_KEY: "hermes-secret",
+            PATH: process.env.PATH ?? "",
+          },
+          pathValue: "",
+        }),
+      ],
+      pathValue: "",
+    });
+
+    await bridge.discoverAgents();
+
+    const probeEnv = JSON.parse(await readFile(probeEnvPath, "utf8")) as Record<string, string | null>;
+    expect(probeEnv).toMatchObject({
+      OPENAI_API_KEY: null,
+      ANTHROPIC_API_KEY: null,
+      HERMES_API_KEY: null,
+    });
+    expect(probeEnv.PATH).toBeTruthy();
+  });
+
+  it("reports registered CLI adapters as unavailable readiness when the executable is missing", async () => {
+    const root = await makeTempRoot();
+    const missingCodex = join(root, "missing-codex");
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: missingCodex, pathValue: "" })],
+      pathValue: "",
+    });
+
+    const agents = await bridge.discoverAgents();
+    const codex = agents.find((agent) => agent.kind === "codex");
+
+    expect(codex).toMatchObject({
+      status: "missing",
+      supportLevel: "detected-only",
+      executablePath: null,
+      version: null,
+      readiness: {
+        level: "unavailable",
+        categories: ["cli-missing"],
+        cli: { available: false, path: null, version: null },
+      },
+    });
+  });
+
+  it("reports Hermes CLI version with unknown auth readiness when auth cannot be detected safely", async () => {
+    const root = await makeTempRoot();
+    const hermesPath = join(root, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then echo \"hermes 0.9.0\"; exit 0; fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createHermesCliAdapter({ executablePath: hermesPath, env: {}, pathValue: "" })],
+      pathValue: "",
+    });
+
+    const agents = await bridge.discoverAgents();
+    const hermes = agents.find((agent) => agent.kind === "hermes");
+
+    expect(hermes).toMatchObject({
+      status: "available",
+      supportLevel: "experimental-run",
+      version: "hermes 0.9.0",
+      readiness: {
+        level: "experimental-run",
+        cli: { available: true, path: hermesPath, version: "hermes 0.9.0" },
+        auth: { status: "unknown" },
+      },
+    });
+  });
+
   it("streams mock run events to durable NDJSON and task output", async () => {
     const projectRoot = await makeTempRoot();
     const bridge = new AgentBridge({
@@ -296,6 +437,262 @@ describe("agent bridge", () => {
     expect(events.some((event) => event.kind === "progress" && event.payload.format === "text")).toBe(true);
     expect(evidence.status).toBe("succeeded");
     expect(evidence.exitCode).toBe(0);
+  });
+
+  it("fails Codex runs with cli-missing category when the executable is unavailable", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const missingCodex = join(projectRoot, "missing-codex");
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: missingCodex, pathValue: "" })],
+    });
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-missing",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        payload: expect.objectContaining({ source: "codex", category: "cli-missing" }),
+      }),
+    );
+    expect(evidence.status).toBe("failed");
+    expect(evidence.checks).toContainEqual(
+      expect.objectContaining({ kind: "run-exit", name: "Codex CLI preflight", status: "failed" }),
+    );
+  });
+
+  it("fails Codex runs with invalid-cwd category for an invalid worktreePath", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-invalid-cwd",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: join(projectRoot, "missing-worktree"),
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        payload: expect.objectContaining({ source: "codex", category: "invalid-cwd" }),
+      }),
+    );
+    expect(evidence.status).toBe("failed");
+    expect(evidence.checks).toContainEqual(
+      expect.objectContaining({ kind: "run-exit", name: "Codex CLI preflight", status: "failed" }),
+    );
+  });
+
+  it("classifies Codex auth failures from non-zero CLI exits", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stderr.write('not logged in; authentication required\\n');",
+        "process.exit(1);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const failed = waitForEvent(bridge, (event) => event.kind === "status" && event.payload.status === "failed");
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-auth",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+    await failed;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        payload: expect.objectContaining({ source: "codex", category: "auth-missing" }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "status",
+        payload: expect.objectContaining({ status: "failed", reason: "auth-missing" }),
+      }),
+    );
+    expect(evidence.status).toBe("failed");
+    expect(evidence.exitCode).toBe(1);
+  });
+
+  it("preserves Codex JSON stdout auth failures after non-zero close", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write(JSON.stringify({",
+        "  type: 'turn.failed',",
+        "  error: { message: 'not logged in; authentication required' },",
+        "}) + '\\n');",
+        "process.exit(1);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const failed = waitForEvent(bridge, (event) => event.kind === "status" && event.payload.status === "failed");
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-json-auth",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+    await failed;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        payload: expect.objectContaining({ source: "codex", category: "auth-missing" }),
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        payload: expect.objectContaining({ source: "codex", category: "non-zero-exit" }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "status",
+        payload: expect.objectContaining({ status: "failed", reason: "auth-missing" }),
+      }),
+    );
+    expect(evidence.status).toBe("failed");
+    expect(evidence.exitCode).toBe(1);
+    expect(evidence.errorReason).toContain("not logged in");
+  });
+
+  it("classifies Codex non-zero exits separately from auth failures", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      ["#!/usr/bin/env node", "process.stderr.write('syntax error\\n');", "process.exit(2);"].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const failed = waitForEvent(bridge, (event) => event.kind === "status" && event.payload.status === "failed");
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-nonzero",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+    await failed;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        payload: expect.objectContaining({ source: "codex", category: "non-zero-exit" }),
+      }),
+    );
+    expect(deriveEvidenceFromEvents(run, events).exitCode).toBe(2);
+  });
+
+  it("marks invalid Codex JSON stdout as an output-parse-error progress category", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "process.stdout.write('not-json\\n');",
+        "process.stdout.write('{\"type\":\"turn.completed\"}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-parse",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+    await completed;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "progress",
+        payload: expect.objectContaining({ source: "codex", category: "output-parse-error" }),
+      }),
+    );
   });
 
   it("maps Codex structured file changes to change events without treating agent prose as truth", async () => {
@@ -1179,6 +1576,50 @@ describe("agent bridge", () => {
 
     expect(args.cwd).toBe(canonicalWorktree);
     expect(args.cwd).not.toBe(await realpath(projectRoot));
+  });
+
+  it("classifies Hermes non-zero exits with terminal evidence", async () => {
+    const projectRoot = await makeTempRoot();
+    const binRoot = await makeTempRoot();
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      ["#!/usr/bin/env node", "process.stderr.write('planner crashed\\n');", "process.exit(3);"].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createHermesCliAdapter({ executablePath: hermesPath })],
+    });
+    const failed = waitForEvent(bridge, (event) => event.kind === "status" && event.payload.status === "failed");
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes-nonzero",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "hermes",
+      prompt: "Plan a workflow",
+    });
+    await failed;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        payload: expect.objectContaining({ source: "hermes", category: "non-zero-exit" }),
+      }),
+    );
+    expect(evidence.status).toBe("failed");
+    expect(evidence.exitCode).toBe(3);
+    expect(evidence.checks).toContainEqual({
+      kind: "run-exit",
+      name: "Hermes CLI exit",
+      status: "failed",
+      detail: "exit 3",
+    });
   });
 
   it("emits non-terminal stalled telemetry before the Hermes CLI hard timeout", async () => {
