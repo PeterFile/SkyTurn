@@ -365,10 +365,22 @@ describe("UI source validation", () => {
     const appSource = await readSource("./App.tsx");
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
     expect(changesTab).toContain("window.devflow.workflow.getEvents(");
-    expect(changesTab).toContain('e.kind === "workflow.commit.created"');
-    expect(changesTab).toContain('e.laneId === node.id ||');
-    expect(changesTab).toContain('(e.payload as Record<string, unknown>).laneId === node.id');
+    expect(changesTab).toContain("hydrateDeliveryLifecycleFromWorkflowEvents(eventsList");
+    expect(changesTab).toContain("commitLaneId: node.id");
+    expect(changesTab).toContain("pullRequestLaneId: dependentPrLaneId");
+    expect(changesTab).toContain("setCommitEvidence(restored.commitEvidence)");
     expect(changesTab).not.toContain('typeof evidence.commitSha === "string"');
+  });
+
+  it("ChangesTab hydrates delivery lifecycle state from workflow events", async () => {
+    const appSource = await readSource("./App.tsx");
+    const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
+    expect(changesTab).toContain("hydrateDeliveryLifecycleFromWorkflowEvents");
+    expect(changesTab).toContain("setPushEvidence(restored.pushEvidence)");
+    expect(changesTab).toContain("setPrEvidence(restored.pullRequest)");
+    expect(changesTab).toContain("setPrChecks(restored.checks)");
+    expect(changesTab).toContain('setMergeStatus(restored.mergeComplete ? "merged" : "idle")');
+    expect(changesTab).toContain('setSyncStatus(restored.syncComplete ? "synced" : "idle")');
   });
 
   it("ChangesTab Push call does not require renderer-visible commitSha/branch/worktreePath", async () => {
@@ -394,11 +406,21 @@ describe("UI source validation", () => {
     expect(changesTab).toMatch(/useEffect\(\(\) => \{[\s\S]*setCommitEvidence\(null\);[\s\S]*\}, \[node\.id, session\.id, projectRoot, prBaseBranch\]\);/);
   });
 
-  it("ChangesTab clears commitEvidence if getEvents is unavailable or unmatched", async () => {
+  it("ChangesTab clears restored delivery state if getEvents is unavailable", async () => {
     const appSource = await readSource("./App.tsx");
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
-    expect(changesTab).toMatch(/if \(!window\.devflow\?\.workflow\?\.getEvents\) \{\s*setCommitEvidence\(null\);\s*return;\s*\}/);
-    expect(changesTab).toMatch(/else \{\s*setCommitEvidence\(null\);\s*\}/);
+    const unavailableBranch = changesTab.slice(
+      changesTab.indexOf("if (!window.devflow?.workflow?.getEvents)"),
+      changesTab.indexOf("let active = true;"),
+    );
+    expect(unavailableBranch).toContain("setCommitEvidence(null);");
+    expect(unavailableBranch).toContain("setPushEvidence(null);");
+    expect(unavailableBranch).toContain('setPushStatus("idle");');
+    expect(unavailableBranch).toContain("setPrEvidence(null);");
+    expect(unavailableBranch).toContain("setPrChecks(null);");
+    expect(unavailableBranch).toContain('setMergeStatus("idle");');
+    expect(unavailableBranch).toContain('setSyncStatus("idle");');
+    expect(unavailableBranch).toContain("return;");
   });
 
   it("WorktreeActions adopt is disabled and shows error when metadata is missing", async () => {

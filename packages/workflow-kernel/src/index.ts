@@ -1394,13 +1394,14 @@ function normalizePullRequestCreatedEvidence(event: FlowEvent): FlowEvidence | n
 }
 
 function normalizePullRequestChecksRecorded(event: FlowEvent): { payload: PullRequestChecksRecordedPayload; evidence: FlowEvidence } | null {
+  const evidencePayload = isRecord(event.payload.evidence) ? event.payload.evidence : {};
   const laneId = stringValue(event.payload.laneId);
-  const headSha = stringValue(event.payload.headSha);
-  const url = stringValue(event.payload.url);
-  const prNumber = numberValue(event.payload.prNumber);
+  const headSha = stringValue(event.payload.headSha) ?? stringValue(evidencePayload.headSha);
+  const url = stringValue(event.payload.url) ?? stringValue(evidencePayload.url);
+  const prNumber = numberValue(event.payload.prNumber) ?? numberValue(evidencePayload.number);
   if (!laneId || !headSha || !url || typeof prNumber !== "number") return null;
-  const status = normalizePullRequestCheckStatus(event.payload.status);
-  const checks = normalizePullRequestChecks(event.payload.checks);
+  const status = normalizePullRequestCheckStatus(event.payload.status ?? evidencePayload.status);
+  const checks = normalizePullRequestChecks(event.payload.checks ?? evidencePayload.checks);
   const payload: PullRequestChecksRecordedPayload = {
     laneId,
     prNumber,
@@ -1473,7 +1474,7 @@ function normalizePullRequestChecks(value: unknown): PullRequestCheckResult[] {
 function normalizePullRequestCheck(value: unknown, index: number): PullRequestCheckResult {
   const record = isRecord(value) ? value : {};
   const name = stringValue(record.name) ?? stringValue(record.context) ?? `check-${index + 1}`;
-  const url = stringValue(record.url) ?? stringValue(record.detailsUrl);
+  const url = stringValue(record.url) ?? stringValue(record.detailsUrl) ?? stringValue(record.link);
   const detail = stringValue(record.detail);
   return {
     name,
@@ -1494,6 +1495,7 @@ function normalizeFlowEvidenceStatus(value: unknown): FlowEvidenceStatus {
 }
 
 function isPullRequestCheckGateLane(lane: FlowLane): boolean {
+  if (lane.laneKind === "pull_request") return true;
   if (lane.laneKind === "validation" || lane.laneKind === "regression") return true;
   return /check|validation|ci/.test(`${lane.kind} ${lane.semanticSubtype} ${lane.semanticKey}`.toLowerCase());
 }
@@ -1679,6 +1681,7 @@ function isWorkflowLaneKind(value: unknown): value is WorkflowLaneKind {
     value === "regression" ||
     value === "review" ||
     value === "commit" ||
+    value === "pull_request" ||
     value === "join" ||
     value === "decision"
   );

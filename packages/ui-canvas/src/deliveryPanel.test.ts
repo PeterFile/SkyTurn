@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildDeliveryPanelState, type DeliveryPanelInput } from "./deliveryPanel.js";
+import {
+  buildDeliveryPanelState,
+  hydrateDeliveryLifecycleFromWorkflowEvents,
+  type DeliveryPanelInput,
+} from "./deliveryPanel.js";
 
 function input(overrides: Partial<DeliveryPanelInput> = {}): DeliveryPanelInput {
   return {
@@ -128,5 +132,178 @@ describe("buildDeliveryPanelState", () => {
       cleanupExplicitlyAllowed: true,
       cleanupConfirmed: true,
     })).canCleanup).toBe(true);
+  });
+});
+
+describe("hydrateDeliveryLifecycleFromWorkflowEvents", () => {
+  it("restores delivery lifecycle state from renderer-safe Electron workflow events", () => {
+    const restored = hydrateDeliveryLifecycleFromWorkflowEvents([
+      {
+        kind: "workflow.commit.created",
+        laneId: "lane-commit",
+        payload: {
+          redacted: true,
+          summary: "Commit created.",
+          delivery: {
+            kind: "commit",
+            laneId: "lane-commit",
+            commitSha: "sha-b",
+            branch: "feature/slice-c",
+            subject: "feat(workflow): ship slice c",
+          },
+        },
+      },
+      {
+        kind: "workflow.delivery.pushed",
+        laneId: "lane-commit",
+        payload: {
+          redacted: true,
+          summary: "Delivery branch pushed.",
+          delivery: {
+            kind: "push",
+            laneId: "lane-commit",
+            status: "pushed",
+            remote: "origin",
+            branch: "feature/slice-c",
+            commitSha: "sha-b",
+          },
+        },
+      },
+      {
+        kind: "workflow.pull_request.created",
+        laneId: "lane-pr",
+        payload: {
+          redacted: true,
+          summary: "Pull request created.",
+          delivery: {
+            kind: "pull_request",
+            laneId: "lane-pr",
+            commitLaneId: "lane-commit",
+            prNumber: 42,
+            url: "https://example.test/pull/42",
+            headSha: "sha-b",
+            title: "feat(workflow): ship slice c",
+          },
+        },
+      },
+      {
+        kind: "workflow.pull_request.checks_recorded",
+        laneId: "lane-pr",
+        payload: {
+          redacted: true,
+          summary: "Pull request checks recorded.",
+          delivery: {
+            kind: "checks",
+            laneId: "lane-pr",
+            status: "passed",
+            prNumber: 42,
+            url: "https://example.test/pull/42",
+            headSha: "sha-b",
+            checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/1" }],
+          },
+        },
+      },
+      {
+        kind: "workflow.pull_request.merged",
+        laneId: "lane-pr",
+        payload: {
+          redacted: true,
+          summary: "Pull request merged.",
+          delivery: {
+            kind: "merge",
+            laneId: "lane-pr",
+            status: "merged",
+            prNumber: 42,
+            url: "https://example.test/pull/42",
+            headSha: "sha-b",
+            subject: "feat(workflow): ship slice c",
+          },
+        },
+      },
+      {
+        kind: "workflow.delivery.main_synced",
+        laneId: "lane-pr",
+        payload: {
+          redacted: true,
+          summary: "Main branch synced.",
+          delivery: {
+            kind: "main_synced",
+            laneId: "lane-pr",
+            status: "synced",
+            prNumber: 42,
+            headSha: "sha-b",
+            mainBranch: "main",
+            remote: "origin",
+          },
+        },
+      },
+    ], { commitLaneId: "lane-commit", pullRequestLaneId: "lane-pr" });
+
+    expect(restored.commitEvidence).toEqual({
+      commitSha: "sha-b",
+      branch: "feature/slice-c",
+      subject: "feat(workflow): ship slice c",
+    });
+    expect(restored.pushEvidence).toEqual({
+      remote: "origin",
+      branch: "feature/slice-c",
+      commitSha: "sha-b",
+    });
+    expect(restored.pullRequest).toEqual({
+      number: 42,
+      url: "https://example.test/pull/42",
+      headSha: "sha-b",
+      title: "feat(workflow): ship slice c",
+    });
+    expect(restored.checks).toEqual({
+      checkStatus: "passing",
+      expectedHeadSha: "sha-b",
+      mergeable: true,
+    });
+    expect(restored.mergeComplete).toBe(true);
+    expect(restored.syncComplete).toBe(true);
+  });
+
+  it("does not treat PR creation or stale checks as merge readiness", () => {
+    const restored = hydrateDeliveryLifecycleFromWorkflowEvents([
+      {
+        kind: "workflow.commit.created",
+        payload: {
+          laneId: "lane-commit",
+          evidence: { commitSha: "sha-new", branch: "feature/slice-c" },
+        },
+      },
+      {
+        kind: "workflow.pull_request.created",
+        payload: {
+          laneId: "lane-pr",
+          commitLaneId: "lane-commit",
+          evidence: { number: 42, url: "https://example.test/pull/42", commitSha: "sha-new" },
+        },
+      },
+      {
+        kind: "workflow.pull_request.checks_recorded",
+        payload: {
+          laneId: "lane-pr",
+          evidence: { status: "passed", number: 42, url: "https://example.test/pull/42", headSha: "sha-old", checks: [] },
+        },
+      },
+    ], { commitLaneId: "lane-commit", pullRequestLaneId: "lane-pr" });
+
+    const panelState = buildDeliveryPanelState(input({
+      commitEvidence: restored.commitEvidence,
+      pushEvidence: restored.pushEvidence,
+      pullRequest: restored.pullRequest,
+      checks: restored.checks,
+      mergeTitle: "feat(workflow): ship slice c",
+      mergeConfirmed: true,
+      mergeComplete: restored.mergeComplete,
+      syncComplete: restored.syncComplete,
+    }));
+
+    expect(restored.pullRequest).not.toBeNull();
+    expect(panelState.prCreatedCompletesTask).toBe(false);
+    expect(panelState.mergeReady).toBe(false);
+    expect(panelState.canMerge).toBe(false);
   });
 });

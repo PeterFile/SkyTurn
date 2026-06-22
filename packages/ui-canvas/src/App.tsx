@@ -131,6 +131,7 @@ import {
 } from "./diffViewer.js";
 import {
   buildDeliveryPanelState,
+  hydrateDeliveryLifecycleFromWorkflowEvents,
   type DeliveryBusyAction,
   type DeliveryCommitSummary,
   type DeliveryPanelState,
@@ -2369,41 +2370,39 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
   useEffect(() => {
     if (!window.devflow?.workflow?.getEvents) {
       setCommitEvidence(null);
+      setPushEvidence(null);
+      setPushStatus("idle");
+      setPrStatus("idle");
+      setPrEvidence(null);
+      setPrCheckStatus("idle");
+      setPrChecks(null);
+      setMergeStatus("idle");
+      setSyncStatus("idle");
       return;
     }
     let active = true;
     void window.devflow.workflow.getEvents(projectRoot, session.id).then((result) => {
       if (!active) return;
       const eventsList = (result.events || []) as Record<string, unknown>[];
-      const latestCommitEvent = [...eventsList]
-        .reverse()
-        .find(
-          (e) =>
-            e &&
-            e.kind === "workflow.commit.created" &&
-            (e.laneId === node.id ||
-              (e.payload &&
-                typeof e.payload === "object" &&
-                (e.payload as Record<string, unknown>).laneId === node.id)),
-        );
-
-      if (latestCommitEvent && latestCommitEvent.payload && typeof latestCommitEvent.payload === "object") {
-        const payload = latestCommitEvent.payload as Record<string, unknown>;
-        const evidence = payload.evidence as Record<string, unknown> | undefined;
-        setCommitEvidence({
-          commitSha: typeof evidence?.commitSha === "string" ? evidence.commitSha : undefined,
-          branch: typeof evidence?.branch === "string" ? evidence.branch : undefined,
-          worktreePath: typeof evidence?.worktreePath === "string" ? evidence.worktreePath : undefined,
-          subject: typeof evidence?.subject === "string" ? evidence.subject : undefined,
-        });
-      } else {
-        setCommitEvidence(null);
-      }
+      const restored = hydrateDeliveryLifecycleFromWorkflowEvents(eventsList, {
+        commitLaneId: node.id,
+        ...(dependentPrLaneId ? { pullRequestLaneId: dependentPrLaneId } : {}),
+      });
+      setCommitEvidence(restored.commitEvidence);
+      setPushEvidence(restored.pushEvidence);
+      setPushStatus(restored.pushEvidence ? `pushed: ${restored.pushEvidence.remote ?? "remote"}/${restored.pushEvidence.branch ?? "branch"}` : "idle");
+      setPrEvidence(restored.pullRequest);
+      setPrStatus(restored.pullRequest ? `pr-created: #${restored.pullRequest.number}` : "idle");
+      setPrChecks(restored.checks);
+      setPrCheckStatus(restored.checks ? `checks: ${restored.checks.checkStatus}` : "idle");
+      setMergeStatus(restored.mergeComplete ? "merged" : "idle");
+      setSyncStatus(restored.syncComplete ? "synced" : "idle");
+      setMergeTitle(restored.pullRequest?.title ?? "");
     });
     return () => {
       active = false;
     };
-  }, [projectRoot, session.id, node.id]);
+  }, [projectRoot, session.id, node.id, dependentPrLaneId]);
 
   useEffect(() => {
     let active = true;
@@ -2675,24 +2674,25 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
 
   async function handleCheckPrStatus() {
     const devflow = window.devflow;
-    if (!devflow?.workflow?.checkPullRequestStatus || !prEvidence) return;
+    if (!devflow?.workflow?.checkPullRequest || !prEvidence) return;
 
     setPrCheckStatus("checking");
     setPrChecks(null);
     setDeliveryError(null);
     try {
-      const result = await devflow.workflow.checkPullRequestStatus(projectRoot, {
+      const result = await devflow.workflow.checkPullRequest(projectRoot, {
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
-        pullRequestNumber: prEvidence.number,
+        prNumber: prEvidence.number,
         expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
       });
+      const checkStatus = deliveryCheckStatusForEvidence(result.evidence.status);
       setPrChecks({
-        checkStatus: result.checkStatus,
-        expectedHeadSha: result.expectedHeadSha,
-        mergeable: result.mergeable,
+        checkStatus,
+        expectedHeadSha: result.evidence.headSha,
+        mergeable: checkStatus === "passing",
       });
-      setPrCheckStatus(`checks: ${result.checkStatus}`);
+      setPrCheckStatus(`checks: ${checkStatus}`);
     } catch (e) {
       setPrCheckStatus("error");
       setPrChecks(null);
@@ -2724,7 +2724,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       const result = await devflow.workflow.mergePullRequest(projectRoot, {
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
-        pullRequestNumber: prEvidence.number,
+        prNumber: prEvidence.number,
         expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
         title: trimmedTitle,
         method: "squash",
@@ -2744,7 +2744,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
 
   async function handlePostMergeSync() {
     const devflow = window.devflow;
-    if (!devflow?.workflow?.syncPostMerge || !prEvidence) return;
+    if (!devflow?.workflow?.syncMain || !prEvidence) return;
     if (mergeStatus !== "merged") {
       setDeliveryError("Cannot sync: merge has not completed.");
       return;
@@ -2753,10 +2753,10 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     setSyncStatus("syncing");
     setDeliveryError(null);
     try {
-      const result = await devflow.workflow.syncPostMerge(projectRoot, {
+      const result = await devflow.workflow.syncMain(projectRoot, {
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
-        pullRequestNumber: prEvidence.number,
+        prNumber: prEvidence.number,
         expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
       });
       if (result.status === "synced") {
@@ -2844,9 +2844,9 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       commit: !!devflow?.workflow?.createDeliveryCommit,
       push: !!devflow?.workflow?.pushDeliveryBranch,
       createPr: !!devflow?.workflow?.createPullRequest,
-      checkPr: !!devflow?.workflow?.checkPullRequestStatus,
+      checkPr: !!devflow?.workflow?.checkPullRequest,
       merge: !!devflow?.workflow?.mergePullRequest,
-      sync: !!devflow?.workflow?.syncPostMerge,
+      sync: !!devflow?.workflow?.syncMain,
       cleanup: !!devflow?.workflow?.cleanWorktree,
     },
     commitEvidence,
@@ -3387,6 +3387,12 @@ function DeliveryLifecyclePanel({
 
 function shortSha(value?: string): string {
   return value ? value.slice(0, 7) : "None";
+}
+
+function deliveryCheckStatusForEvidence(status: string): DeliveryPullRequestChecks["checkStatus"] {
+  if (status === "passed") return "passing";
+  if (status === "failed") return "failing";
+  return "pending";
 }
 
 export function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {

@@ -502,6 +502,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
 
     expect(projection.lanes.find((item) => item.id === "lane-commit")?.status).toBe("running");
     expect(projection.lanes.find((item) => item.id === "lane-pr")?.status).toBe("running");
+    expect(projection.lanes.find((item) => item.id === "lane-pr")?.laneKind).toBe("pull_request");
     expect(projection.events.map((item) => item.kind)).toContain("workflow.pull_request.created");
     expect(projection.events.map((item) => item.kind)).toContain("workflow.delivery.pushed");
     expect(projection.evidence.map((item) => [item.laneId, item.kind, item.status])).toEqual([
@@ -549,6 +550,17 @@ describe("Flow Kernel gate engine and scheduler", () => {
         checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/2" }],
       }),
     ]);
+    const prGate = reduceWorkflowEvents([
+      ...base,
+      event(checksRecordedKind, {
+        laneId: "lane-pr",
+        prNumber: 15,
+        url: "https://example.test/pr/15/checks",
+        headSha: "sha-b",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/3" }],
+      }),
+    ]);
 
     expect(stale.lanes.find((item) => item.id === "lane-ci")?.status).toBe("running");
     expect(stale.lanes.find((item) => item.id === "lane-commit")?.status).toBe("running");
@@ -556,11 +568,52 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(exact.lanes.find((item) => item.id === "lane-ci")?.status).toBe("completed");
     expect(exact.lanes.find((item) => item.id === "lane-commit")?.status).toBe("running");
     expect(exact.lanes.find((item) => item.id === "lane-pr")?.status).toBe("running");
+    expect(prGate.lanes.find((item) => item.id === "lane-pr")?.status).toBe("completed");
+    expect(prGate.lanes.find((item) => item.id === "lane-commit")?.status).toBe("running");
     expect(exact.evidence.at(-1)).toMatchObject({
       laneId: "lane-ci",
       kind: "pull-request-checks",
       status: "passed",
       checks: ["Build and test:passed"],
+    });
+  });
+
+  it("replays Electron checks events with nested evidence for exact-head gates", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-commit", "commit"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-pr", "pull_request"), status: "running" } }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 17, url: "https://example.test/pr/17", head: "feature/slice-c", commitSha: "sha-c" },
+      }),
+      event("workflow.delivery.pushed", {
+        laneId: "lane-commit",
+        evidence: { remote: "origin", branch: "feature/slice-c", commitSha: "sha-c" },
+      }),
+      event(checksRecordedKind, {
+        laneId: "lane-ci",
+        evidence: {
+          status: "passed",
+          number: 17,
+          url: "https://example.test/pr/17",
+          headSha: "sha-c",
+          checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/current" }],
+        },
+      }),
+    ]);
+
+    expect(projection.lanes.find((item) => item.id === "lane-ci")?.status).toBe("completed");
+    expect(projection.lanes.find((item) => item.id === "lane-commit")?.status).toBe("running");
+    expect(projection.lanes.find((item) => item.id === "lane-pr")?.status).toBe("running");
+    expect(projection.evidence.at(-1)).toMatchObject({
+      laneId: "lane-ci",
+      kind: "pull-request-checks",
+      status: "passed",
+      checks: ["Build and test:passed"],
+      artifacts: ["https://example.test/pr/17", "https://example.test/checks/current"],
     });
   });
 

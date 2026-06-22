@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createServer } from "vite";
@@ -21,7 +21,6 @@ import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace, sandboxForNodeRun }
 
 const require = createRequire(import.meta.url);
 const desktopRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const repoRoot = resolve(desktopRoot, "../..");
 const waitTimeoutMs = Number(process.env.SKYTURN_DEMO_WAIT_TIMEOUT_MS ?? 20 * 60 * 1_000);
 const maxWorkflowRuns = Number(process.env.SKYTURN_DEMO_MAX_RUNS ?? 12);
 const root = await mkdtemp(join(tmpdir(), "skyturn-react-demo-"));
@@ -368,7 +367,7 @@ async function seedBlankReactProject(projectRoot) {
 
 async function linkWorkspaceNodeModules(projectRoot) {
   try {
-    await symlink(join(repoRoot, "node_modules"), join(projectRoot, "node_modules"), "dir");
+    await symlink(join(desktopRoot, "node_modules"), join(projectRoot, "node_modules"), "dir");
   } catch {
     // The project can still be edited and tested with node scripts.
   }

@@ -52,6 +52,7 @@ export type WorkflowLaneKind =
   | "regression"
   | "review"
   | "commit"
+  | "pull_request"
   | "join"
   | "decision";
 export type WorkflowLaneSemanticSubtype =
@@ -94,6 +95,7 @@ export const WORKFLOW_LANE_KINDS: WorkflowLaneKind[] = [
   "regression",
   "review",
   "commit",
+  "pull_request",
   "join",
   "decision",
 ];

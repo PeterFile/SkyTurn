@@ -701,6 +701,89 @@ describe("SQLite workflow store", () => {
     store.close();
   });
 
+  it("replays Electron nested pull request checks evidence from the SQLite ledger", async () => {
+    const store = await makeSeededStore();
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:commit:nested-checks",
+      payload: { lane: { id: "lane-commit", semanticKey: "lane-commit", kind: "commit", title: "Commit", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:ci:nested-checks",
+      payload: { lane: { id: "lane-ci", semanticKey: "lane-ci", kind: "ci_check", title: "CI check", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:pr:nested-checks",
+      payload: { lane: { id: "lane-pr", semanticKey: "lane-pr", kind: "pull_request", title: "Create PR", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.pull_request.created",
+      source: "test",
+      idempotencyKey: "pr:created:nested-checks",
+      payload: {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 22, url: "https://example.test/pr/22", head: "feature/slice-c", commitSha: "sha-c" },
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.delivery.pushed",
+      source: "test",
+      idempotencyKey: "delivery:pushed:nested-checks",
+      payload: {
+        laneId: "lane-commit",
+        evidence: { remote: "origin", branch: "feature/slice-c", commitSha: "sha-c" },
+      },
+      now: "2026-06-14T00:00:05.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: checksRecordedKind,
+      source: "electron-main",
+      idempotencyKey: "pr:checks:nested-passed",
+      payload: {
+        laneId: "lane-ci",
+        evidence: {
+          status: "passed",
+          number: 22,
+          url: "https://example.test/pr/22",
+          headSha: "sha-c",
+          checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/current" }],
+        },
+      },
+      now: "2026-06-14T00:00:06.000Z",
+    });
+
+    const projection = store.materializeFlowProjection("session-1");
+    expect(projection.lanes.find((lane) => lane.id === "lane-ci")?.status).toBe("completed");
+    expect(projection.lanes.find((lane) => lane.id === "lane-commit")?.status).toBe("running");
+    expect(projection.lanes.find((lane) => lane.id === "lane-pr")?.status).toBe("running");
+    expect(projection.evidence.at(-1)).toMatchObject({
+      laneId: "lane-ci",
+      kind: "pull-request-checks",
+      status: "passed",
+      checks: ["Build and test:passed"],
+      artifacts: ["https://example.test/pr/22", "https://example.test/checks/current"],
+    });
+    store.close();
+  });
+
   it("builds a redacted ledger summary from persisted user inputs and recent events", async () => {
     const store = await makeSeededStore();
 

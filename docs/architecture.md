@@ -53,7 +53,7 @@ Renderer must not import `better-sqlite3`, Node git/worktree implementations, `f
 
 `agent-bridge` does not schedule DAGs, confirm Hermes plans, consolidate shared memory, or decide UI policy. It only connects SkyTurn to local Agents and records run events/evidence.
 
-Delivery push and pull request creation are explicit user actions through the renderer toolbar, preload IPC, Electron main, and Node-only git/GitHub helpers. PR creation does not complete a task by itself: `workflow.delivery.pushed` and `workflow.pull_request.created` are recorded events today, but Flow Kernel lane completion is not derived from them. CI exact-head gating, merge, post-merge sync, and delivery cleanup are still outside the current delivery loop, and merge/cleanup must be later user-confirmed actions.
+Delivery push, pull request creation, exact-head check polling, squash merge request, post-merge main sync, and cleanup request are explicit user actions through the renderer toolbar, preload IPC, Electron main, and Node-only git/GitHub helpers. PR creation does not complete a task by itself: `workflow.delivery.pushed` and `workflow.pull_request.created` are recorded events, but Flow Kernel lane completion is not derived from them. `workflow.pull_request.checks_recorded` records exact-head check evidence, and only passed checks for the current head can satisfy check/gate lanes. Merge, sync, and cleanup must be later user-confirmed actions; branch deletion is default-off and separately confirmed.
 
 ## Persistence
 

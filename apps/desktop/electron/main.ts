@@ -136,6 +136,9 @@ interface WorkflowPullRequestMergeInput {
 interface WorkflowDeliverySyncMainInput {
   sessionId?: unknown;
   laneId?: unknown;
+  prNumber?: unknown;
+  prUrl?: unknown;
+  expectedHeadSha?: unknown;
   mainBranch?: unknown;
   remote?: unknown;
 }
@@ -197,6 +200,12 @@ interface DeliveryPullRequestEvidenceLike {
 
 interface DeliveryPullRequestChecksEvidenceLike {
   status: string;
+  headSha: string;
+}
+
+interface DeliveryPullRequestMergeEvidenceLike {
+  status: "merged";
+  number: number;
   headSha: string;
 }
 
@@ -1009,6 +1018,11 @@ ipcMain.handle("workflow:pullRequest:checks", workflowHandler(async (projectRoot
     idempotencyKey: `pull-request-checks:${evidence.number}:${evidence.headSha}:${evidence.status}`,
     payload: {
       laneId,
+      prNumber: evidence.number,
+      url: evidence.url ?? prEvidence.url,
+      headSha: evidence.headSha,
+      status: evidence.status,
+      checks: evidence.checks,
       evidence,
     },
     now: new Date().toISOString(),
@@ -1072,7 +1086,11 @@ ipcMain.handle("workflow:delivery:syncMain", workflowHandler(async (projectRoot:
   const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
   const store = await getWorkflowStore(projectRoot);
   assertKnownWorkflowCanvasSession(store, sessionId);
-  const laneId = optionalText(readField(input, "laneId")) ?? undefined;
+  const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
+  assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
+  const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
+  const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+  const mergeEvidence = findDeliveryPullRequestMergeEvidence(store, sessionId, laneId, prEvidence, expectedHeadSha);
   const realProjectRoot = await fs.realpath(projectRoot);
   const remote = optionalText(readField(input, "remote"));
   const { syncDeliveryMain } = await import("@skyturn/git-worktree/node");
@@ -1091,9 +1109,11 @@ ipcMain.handle("workflow:delivery:syncMain", workflowHandler(async (projectRoot:
     sessionId,
     kind: "workflow.delivery.main_synced",
     source: "electron-main",
-    ...(laneId ? { laneId } : {}),
+    laneId,
     payload: {
-      ...(laneId ? { laneId } : {}),
+      laneId,
+      prNumber: mergeEvidence.number,
+      headSha: mergeEvidence.headSha,
       evidence,
     },
     now: new Date().toISOString(),
@@ -1305,6 +1325,7 @@ function isWorkflowEventRecord(event: unknown): event is Record<string, unknown>
 }
 
 function redactWorkflowEventForRenderer(event: Record<string, unknown> & { kind: string }): Record<string, unknown> {
+  const delivery = deliveryLifecycleFactsForRenderer(event);
   return {
     id: event.id,
     sessionId: event.sessionId,
@@ -1319,8 +1340,91 @@ function redactWorkflowEventForRenderer(event: Record<string, unknown> & { kind:
     payload: {
       redacted: true,
       summary: workflowEventSummary(event.kind),
+      ...(delivery ? { delivery } : {}),
     },
   };
+}
+
+function deliveryLifecycleFactsForRenderer(event: Record<string, unknown> & { kind: string }): Record<string, unknown> | null {
+  const payload = isRecord(event.payload) ? event.payload : {};
+  const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+  const laneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+
+  switch (event.kind) {
+    case "workflow.commit.created":
+      return {
+        kind: "commit",
+        ...(laneId ? { laneId } : {}),
+        ...(optionalText(evidence.commitSha) ? { commitSha: optionalText(evidence.commitSha)! } : {}),
+        ...(optionalText(evidence.branch) ? { branch: optionalText(evidence.branch)! } : {}),
+        ...(optionalText(evidence.subject) ? { subject: optionalText(evidence.subject)! } : {}),
+      };
+    case "workflow.delivery.pushed":
+      return {
+        kind: "push",
+        ...(laneId ? { laneId } : {}),
+        ...(optionalText(evidence.status) ? { status: optionalText(evidence.status)! } : {}),
+        ...(optionalText(evidence.remote) ? { remote: optionalText(evidence.remote)! } : {}),
+        ...(optionalText(evidence.branch) ? { branch: optionalText(evidence.branch)! } : {}),
+        ...(optionalText(evidence.commitSha) ? { commitSha: optionalText(evidence.commitSha)! } : {}),
+      };
+    case "workflow.pull_request.created":
+      return {
+        kind: "pull_request",
+        ...(laneId ? { laneId } : {}),
+        ...(optionalText(payload.commitLaneId) ? { commitLaneId: optionalText(payload.commitLaneId)! } : {}),
+        ...(positiveInteger(payload.prNumber) ?? positiveInteger(evidence.number) ? { prNumber: (positiveInteger(payload.prNumber) ?? positiveInteger(evidence.number))! } : {}),
+        ...(optionalText(payload.url) ?? optionalText(evidence.url) ? { url: (optionalText(payload.url) ?? optionalText(evidence.url))! } : {}),
+        ...(optionalText(payload.headSha) ?? optionalText(evidence.headSha) ?? optionalText(evidence.commitSha) ? { headSha: (optionalText(payload.headSha) ?? optionalText(evidence.headSha) ?? optionalText(evidence.commitSha))! } : {}),
+        ...(optionalText(evidence.title) ? { title: optionalText(evidence.title)! } : {}),
+      };
+    case "workflow.pull_request.checks_recorded":
+      return {
+        kind: "checks",
+        ...(laneId ? { laneId } : {}),
+        ...(positiveInteger(payload.prNumber) ?? positiveInteger(evidence.number) ? { prNumber: (positiveInteger(payload.prNumber) ?? positiveInteger(evidence.number))! } : {}),
+        ...(optionalText(payload.url) ?? optionalText(evidence.url) ? { url: (optionalText(payload.url) ?? optionalText(evidence.url))! } : {}),
+        ...(optionalText(payload.headSha) ?? optionalText(evidence.headSha) ? { headSha: (optionalText(payload.headSha) ?? optionalText(evidence.headSha))! } : {}),
+        ...(optionalText(payload.status) ?? optionalText(evidence.status) ? { status: (optionalText(payload.status) ?? optionalText(evidence.status))! } : {}),
+        checks: rendererSafePullRequestChecks(payload.checks ?? evidence.checks),
+      };
+    case "workflow.pull_request.merged":
+      return {
+        kind: "merge",
+        ...(laneId ? { laneId } : {}),
+        ...(positiveInteger(payload.prNumber) ?? positiveInteger(evidence.number) ? { prNumber: (positiveInteger(payload.prNumber) ?? positiveInteger(evidence.number))! } : {}),
+        ...(optionalText(payload.url) ?? optionalText(evidence.url) ? { url: (optionalText(payload.url) ?? optionalText(evidence.url))! } : {}),
+        ...(optionalText(payload.headSha) ?? optionalText(evidence.headSha) ? { headSha: (optionalText(payload.headSha) ?? optionalText(evidence.headSha))! } : {}),
+        ...(optionalText(payload.status) ?? optionalText(evidence.status) ? { status: (optionalText(payload.status) ?? optionalText(evidence.status))! } : {}),
+        ...(optionalText(evidence.subject) ? { subject: optionalText(evidence.subject)! } : {}),
+      };
+    case "workflow.delivery.main_synced":
+      return {
+        kind: "main_synced",
+        ...(laneId ? { laneId } : {}),
+        ...(positiveInteger(payload.prNumber) ? { prNumber: positiveInteger(payload.prNumber)! } : {}),
+        ...(optionalText(payload.headSha) ? { headSha: optionalText(payload.headSha)! } : {}),
+        ...(optionalText(evidence.status) ? { status: optionalText(evidence.status)! } : {}),
+        ...(optionalText(evidence.mainBranch) ? { mainBranch: optionalText(evidence.mainBranch)! } : {}),
+        ...(optionalText(evidence.remote) ? { remote: optionalText(evidence.remote)! } : {}),
+      };
+    default:
+      return null;
+  }
+}
+
+function rendererSafePullRequestChecks(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((check) => {
+      if (!isRecord(check)) return null;
+      return {
+        ...(optionalText(check.name) ? { name: optionalText(check.name)! } : {}),
+        ...(optionalText(check.status) ? { status: optionalText(check.status)! } : {}),
+        ...(optionalText(check.link) ? { link: optionalText(check.link)! } : {}),
+      };
+    })
+    .filter((check): check is Record<string, unknown> => check !== null);
 }
 
 function workflowEventSummary(kind: string): string {
@@ -2060,6 +2164,37 @@ function findDeliveryPullRequestChecksEvidence(
     return evidence;
   }
   throw workflowIpcError("DELIVERY_REJECTED", "No passed pull request checks are recorded for this head SHA.");
+}
+
+function findDeliveryPullRequestMergeEvidence(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  laneId: string,
+  prEvidence: DeliveryPullRequestEvidenceLike,
+  expectedHeadSha: string,
+): DeliveryPullRequestMergeEvidenceLike {
+  const events = store.listEvents(sessionId);
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!isRecord(event) || event.kind !== "workflow.pull_request.merged") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const eventLaneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+    if (eventLaneId !== laneId) continue;
+    if (!isRecord(payload.evidence)) continue;
+    const prNumber = positiveInteger(payload.prNumber) ?? positiveInteger(payload.evidence.number);
+    const headSha = optionalText(payload.headSha) ?? optionalText(payload.evidence.headSha);
+    const status = optionalText(payload.status) ?? optionalText(payload.evidence.status);
+    if (prNumber !== prEvidence.number || headSha !== expectedHeadSha) continue;
+    if (status !== "merged") {
+      throw workflowIpcError("DELIVERY_REJECTED", `Pull request merge evidence must be merged; got ${status ?? "unknown"}.`);
+    }
+    return {
+      status: "merged",
+      number: prNumber,
+      headSha,
+    };
+  }
+  throw workflowIpcError("DELIVERY_REJECTED", "No pull request merge evidence is recorded for this PR head.");
 }
 
 function assertDeliveryEvidenceInputMatches(

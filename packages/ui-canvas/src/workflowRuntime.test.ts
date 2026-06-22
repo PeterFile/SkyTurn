@@ -1030,7 +1030,7 @@ describe("workflow runtime event merging", () => {
     expect(startAgentRun.mock.calls.map(([input]) => input.sandbox)).toEqual([
       "workspace-write",
       undefined,
-      "workspace-write",
+      "danger-full-access",
       "danger-full-access",
     ]);
   });
@@ -1550,6 +1550,14 @@ describe("workflow runtime event merging", () => {
       runId: "run-session-1-decision-architecture-risk",
       title: "Commit to parallel worktree?",
     });
+    const screenshotNode = makeNode({
+      id: "lane-browser-screenshot",
+      agent: "codex",
+      status: "pending",
+      runId: "run-session-1-lane-browser-screenshot",
+      title: "Capture browser screenshot evidence",
+      meta: ["validation", "lane-browser-screenshot", "flow-kernel"],
+    });
 
     commitTitledNode.runtimePolicy = {
       source: "workflow_projection",
@@ -1569,8 +1577,17 @@ describe("workflow runtime event merging", () => {
       sideEffects: ["git"],
       reason: "Decision node is not executable.",
     };
+    screenshotNode.runtimePolicy = {
+      source: "workflow_projection",
+      trusted: true,
+      executable: true,
+      sandbox: "read-only",
+      sideEffects: [],
+      reason: "Policy is projected by workflow kernel.",
+    };
 
     expect(sandboxForNodeRun(commitTitledNode)).toBe("workspace-write");
+    expect(sandboxForNodeRun(screenshotNode)).toBe("danger-full-access");
     expect(sandboxForNodeRun(decisionNode)).toBeUndefined();
   });
 

@@ -42,7 +42,7 @@ The node modal **Changes** tab exposes explicit commit, push, and create PR acti
 
 Only `workflow.commit.created` currently completes a Flow Kernel commit lane. `workflow.delivery.pushed` and `workflow.pull_request.created` are recorded events only; they do not complete Flow Kernel lanes. Creating a PR is delivery evidence, not task completion.
 
-CI exact-head gating, merge, post-merge sync, and delivery cleanup remain next steps. Merge and cleanup must be separate user-confirmed actions. Real GitHub disposable PR smoke belongs to acceptance/test coverage for the delivery remote path, not the default user project flow.
+`workflow.pull_request.checks_recorded` records exact-head PR check evidence; only passed checks for the current head can satisfy check/gate lanes. Merge, post-merge main sync, and cleanup are explicit user-confirmed actions and are never triggered automatically by PR creation or green checks. Branch deletion is default-off and requires separate confirmation. Real GitHub disposable PR smoke belongs to acceptance/test coverage for the delivery remote path, not the default user project flow.
 
 ## Changesets
 
