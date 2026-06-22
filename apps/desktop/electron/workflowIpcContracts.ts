@@ -17,6 +17,9 @@ export const WORKFLOW_IPC_CHANNELS = {
   deliveryCommit: "workflow:delivery:commit",
   deliveryPush: "workflow:delivery:push",
   pullRequestCreate: "workflow:pullRequest:create",
+  pullRequestChecks: "workflow:pullRequest:checks",
+  pullRequestMerge: "workflow:pullRequest:merge",
+  deliverySyncMain: "workflow:delivery:syncMain",
   changeset: "workflow:changeset",
   changesetReconcileFinal: "workflow:changeset:reconcileFinal",
 } as const;

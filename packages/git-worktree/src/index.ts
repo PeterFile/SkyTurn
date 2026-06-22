@@ -288,6 +288,66 @@ export interface DeliveryPullRequestEvidence {
   command: DeliveryCommandResult;
 }
 
+export interface DeliveryPullRequestChecksInput {
+  projectRoot: string;
+  prNumber?: number;
+  prUrl?: string;
+  expectedHeadSha: string;
+}
+
+export type DeliveryPullRequestCheckStatus = "passed" | "failed" | "pending";
+
+export interface DeliveryPullRequestCheck {
+  name: string;
+  status: DeliveryPullRequestCheckStatus;
+  state: string;
+  workflow?: string;
+  link?: string;
+  detail?: string;
+}
+
+export interface DeliveryPullRequestChecksEvidence {
+  status: DeliveryPullRequestCheckStatus;
+  number: number;
+  url?: string;
+  headSha: string;
+  checks: DeliveryPullRequestCheck[];
+  command: DeliveryCommandResult;
+  summary: string;
+}
+
+export interface DeliveryPullRequestMergeInput {
+  projectRoot: string;
+  prNumber?: number;
+  prUrl?: string;
+  expectedHeadSha: string;
+  subject: string;
+  body?: string;
+}
+
+export interface DeliveryPullRequestMergeEvidence {
+  status: "merged";
+  number: number;
+  url?: string;
+  headSha: string;
+  subject: string;
+  checks: DeliveryPullRequestCheck[];
+  command: DeliveryCommandResult;
+}
+
+export interface DeliveryMainSyncInput {
+  projectRoot: string;
+  mainBranch?: string;
+  remote?: string;
+}
+
+export interface DeliveryMainSyncEvidence {
+  status: "synced";
+  mainBranch: string;
+  remote: string;
+  commands: DeliveryCommandResult[];
+}
+
 export function buildAdjudicationMetrics(recorded: RecordedAdjudicationEvidence): AdjudicationMetric[] {
   const checks = recorded.runEvidence?.checks ?? [];
   const artifactPaths = [
