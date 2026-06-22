@@ -223,6 +223,8 @@ export type FlowEventKind =
   | "workflow.delivery.pushed"
   | "workflow.pull_request.created"
   | "workflow.pull_request.checks_recorded"
+  | "workflow.pull_request.merged"
+  | "workflow.delivery.main_synced"
   | "workflow.worktree.create_requested"
   | "workflow.worktree.created"
   | "workflow.worktree.create_failed"

@@ -82,6 +82,7 @@
 - Before real desktop workflow testing, rebuild Electron native dependencies with `pnpm --filter @skyturn/desktop run rebuild:native` so `better-sqlite3` matches the Electron ABI.
 - Desktop dev must get renderer host/port values from `apps/desktop/scripts/devServer.mjs`; do not hard-code `5173` in launcher code because Vite may need another local port.
 - `apps/desktop/electron/main.ts` compiles as CommonJS; dynamically import ESM workspace packages from Electron main instead of static value imports.
+- Pull request checks, squash merge, and local main sync are separate explicit delivery IPC actions; checks success must not trigger merge, merge must not trigger cleanup, and sync-main evidence remains session-scoped.
 - A `CanvasSession` owns `hermesPlannerSessionId` and `plannerNodeId`; bottom workflow input must update that planner root card instead of appending a second Hermes root, and the planner root must remain dependency-free.
 - When merging Hermes run events, preserve source run evidence without overwriting graph hygiene; source-node restoration must not reintroduce planner dependencies or incoming planner edges.
 - Keep Flow Kernel lane sandbox policy centralized in `packages/ui-canvas/src/workflowRuntime.ts` through `sandboxForNodeRun`; demo scripts must reuse it instead of copying looser permissions.

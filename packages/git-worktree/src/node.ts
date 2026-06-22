@@ -24,8 +24,15 @@ import {
   type DeliveryCommitErrorCode,
   type DeliveryCommitEvidence,
   type DeliveryCommitInput,
+  type DeliveryMainSyncEvidence,
+  type DeliveryMainSyncInput,
+  type DeliveryPullRequestCheck,
+  type DeliveryPullRequestChecksEvidence,
+  type DeliveryPullRequestChecksInput,
   type DeliveryPullRequestEvidence,
   type DeliveryPullRequestInput,
+  type DeliveryPullRequestMergeEvidence,
+  type DeliveryPullRequestMergeInput,
   type DeliveryPushEvidence,
   type DeliveryPushInput,
   type DeliveryRemoteActionErrorCode,
@@ -686,6 +693,92 @@ export async function createDeliveryPullRequest(input: DeliveryPullRequestInput)
   };
 }
 
+export async function checkDeliveryPullRequest(input: DeliveryPullRequestChecksInput): Promise<DeliveryPullRequestChecksEvidence> {
+  const repoRoot = await assertGitRepo(input.projectRoot);
+  const expectedHeadSha = normalizeExpectedHeadSha(input.expectedHeadSha);
+  await ensureGhAvailable(repoRoot);
+  await ensureGhAuthenticated(repoRoot);
+  const pr = await fetchPullRequestState(repoRoot, input, expectedHeadSha);
+  const execution = await runDeliveryCommandWithRawOutput("gh", repoRoot, [
+    "pr",
+    "checks",
+    String(pr.number),
+    "--json",
+    "name,state,bucket,workflow,link,description",
+  ], "DELIVERY_REJECTED", { allowFailure: true });
+  const checks = parsePullRequestChecks(execution.rawStdout);
+  const status = aggregatePullRequestChecks(checks);
+  const verifiedPr = await fetchPullRequestState(repoRoot, { prNumber: pr.number }, expectedHeadSha);
+  return {
+    status,
+    number: verifiedPr.number,
+    ...(verifiedPr.url ? { url: verifiedPr.url } : {}),
+    headSha: verifiedPr.headSha,
+    checks,
+    command: execution.result,
+    summary: pullRequestChecksSummary(checks, status),
+  };
+}
+
+export async function mergeDeliveryPullRequest(input: DeliveryPullRequestMergeInput): Promise<DeliveryPullRequestMergeEvidence> {
+  const repoRoot = await assertGitRepo(input.projectRoot);
+  const expectedHeadSha = normalizeExpectedHeadSha(input.expectedHeadSha);
+  const subject = normalizeCommitSubject(input.subject);
+  const body = typeof input.body === "string" && input.body.trim().length > 0 ? input.body.trim() : undefined;
+  await ensureGhAvailable(repoRoot);
+  await ensureGhAuthenticated(repoRoot);
+  const pr = await fetchPullRequestState(repoRoot, input, expectedHeadSha);
+  if (pr.state !== "OPEN") throwRemote("DELIVERY_REJECTED", `Pull request must be open before merge; got ${pr.state}.`);
+  if (!pr.mergeable) throwRemote("DELIVERY_REJECTED", "Pull request is not mergeable.");
+  const checksEvidence = await checkDeliveryPullRequest({
+    projectRoot: repoRoot,
+    prNumber: pr.number,
+    expectedHeadSha,
+  });
+  if (checksEvidence.status !== "passed") {
+    throwRemote("DELIVERY_REJECTED", `Pull request checks must be passed before merge; got ${checksEvidence.status}.`);
+  }
+  const command = await runDeliveryCommand("gh", repoRoot, [
+    "pr",
+    "merge",
+    String(pr.number),
+    "--match-head-commit",
+    expectedHeadSha,
+    "--squash",
+    "--subject",
+    subject,
+    ...(body ? ["--body", body] : []),
+  ]);
+  return {
+    status: "merged",
+    number: pr.number,
+    ...(pr.url ? { url: pr.url } : {}),
+    headSha: pr.headSha,
+    subject,
+    checks: checksEvidence.checks,
+    command,
+  };
+}
+
+export async function syncDeliveryMain(input: DeliveryMainSyncInput): Promise<DeliveryMainSyncEvidence> {
+  const repoRoot = await assertGitRepo(input.projectRoot);
+  const remote = normalizeRemoteName(input.remote ?? "origin");
+  const mainBranch = await normalizeDeliveryBranch(repoRoot, input.mainBranch ?? "main", "main branch");
+  const current = await currentBranch(repoRoot);
+  if (current !== mainBranch) {
+    throwRemote("DELIVERY_REJECTED", `Refusing to sync ${mainBranch} while current branch is ${current}.`);
+  }
+  await assertRemoteExists(repoRoot, remote);
+  const fetch = await runDeliveryCommand("git", repoRoot, ["fetch", remote, mainBranch]);
+  const pull = await runDeliveryCommand("git", repoRoot, ["pull", "--ff-only", remote, mainBranch]);
+  return {
+    status: "synced",
+    mainBranch,
+    remote,
+    commands: [fetch, pull],
+  };
+}
+
 interface DeliveryActionFacts {
   worktreePath: string;
   commitSha: string;
@@ -803,12 +896,174 @@ function normalizePullRequestBody(input: DeliveryPullRequestInput, facts: Delive
   ].join("\n");
 }
 
+interface PullRequestState {
+  number: number;
+  url?: string;
+  headSha: string;
+  state: string;
+  mergeable: boolean;
+}
+
+async function fetchPullRequestState(
+  cwd: string,
+  input: Pick<DeliveryPullRequestChecksInput, "prNumber" | "prUrl">,
+  expectedHeadSha: string,
+): Promise<PullRequestState> {
+  const selector = pullRequestSelector(input);
+  const execution = await runDeliveryCommandWithRawOutput("gh", cwd, [
+    "pr",
+    "view",
+    selector,
+    "--json",
+    "number,url,headRefOid,state,mergeable",
+  ]);
+  const value = parseJsonObject(execution.rawStdout, "GitHub CLI did not return pull request JSON.");
+  const number = normalizePullRequestNumber(value.number ?? input.prNumber ?? numberFromPullRequestUrl(input.prUrl));
+  const headSha = normalizeExpectedHeadSha(value.headRefOid);
+  if (headSha !== expectedHeadSha) {
+    throwRemote(
+      "REMOTE_HEAD_MISMATCH",
+      `Pull request head does not match expected delivery commit: expected ${shortSha(expectedHeadSha)}, got ${shortSha(headSha)}.`,
+    );
+  }
+  const state = typeof value.state === "string" && value.state.trim() ? value.state.trim().toUpperCase() : "UNKNOWN";
+  return {
+    number,
+    ...(typeof value.url === "string" && value.url.trim() ? { url: value.url.trim() } : {}),
+    headSha,
+    state,
+    mergeable: normalizePullRequestMergeable(value.mergeable),
+  };
+}
+
+function pullRequestSelector(input: Pick<DeliveryPullRequestChecksInput, "prNumber" | "prUrl">): string {
+  if (typeof input.prNumber === "number" && Number.isSafeInteger(input.prNumber) && input.prNumber > 0) {
+    return String(input.prNumber);
+  }
+  if (typeof input.prUrl === "string" && input.prUrl.trim()) {
+    numberFromPullRequestUrl(input.prUrl);
+    return input.prUrl.trim();
+  }
+  throwRemote("INVALID_INPUT", "Pull request number or URL is required.");
+}
+
+function normalizePullRequestNumber(value: unknown): number {
+  const number = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isSafeInteger(number) || number <= 0) throwRemote("INVALID_INPUT", "Pull request number is invalid.");
+  return number;
+}
+
+function numberFromPullRequestUrl(value: unknown): number | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const match = value.trim().match(/\/pull\/(\d+)$/);
+  if (!match) throwRemote("INVALID_INPUT", "Pull request URL is invalid.");
+  return normalizePullRequestNumber(match[1]);
+}
+
+function normalizeExpectedHeadSha(value: unknown): string {
+  const sha = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (!/^[0-9a-f]{40}$/.test(sha)) throwRemote("INVALID_INPUT", "Expected pull request head SHA must be a full commit SHA.");
+  return sha;
+}
+
+function normalizePullRequestMergeable(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value !== "string") return false;
+  return value.trim().toUpperCase() === "MERGEABLE";
+}
+
+function parsePullRequestChecks(output: string): DeliveryPullRequestCheck[] {
+  const value = parseJsonArray(output, "GitHub CLI did not return pull request checks JSON.");
+  return value.map((item) => normalizePullRequestCheck(item)).filter((item): item is DeliveryPullRequestCheck => item !== null);
+}
+
+function normalizePullRequestCheck(value: unknown): DeliveryPullRequestCheck | null {
+  if (!isRecord(value)) return null;
+  const name = textFromUnknown(value.name) ?? textFromUnknown(value.workflow);
+  if (!name) return null;
+  const rawState = textFromUnknown(value.state) ?? textFromUnknown(value.bucket) ?? "UNKNOWN";
+  const status = pullRequestCheckStatus(rawState);
+  const workflow = textFromUnknown(value.workflow);
+  const link = textFromUnknown(value.link);
+  const detail = textFromUnknown(value.description);
+  return {
+    name: sanitizeCommandOutput(name),
+    status,
+    state: sanitizeCommandOutput(rawState),
+    ...(workflow ? { workflow: sanitizeCommandOutput(workflow) } : {}),
+    ...(link ? { link: sanitizeCommandOutput(link) } : {}),
+    ...(detail ? { detail: sanitizeCommandOutput(detail) } : {}),
+  };
+}
+
+function pullRequestCheckStatus(value: string): DeliveryPullRequestCheck["status"] {
+  const state = value.trim().toLowerCase();
+  if (["success", "successful", "passed", "pass"].includes(state)) return "passed";
+  if (["failure", "failed", "fail", "error", "cancelled", "canceled", "timed_out", "action_required", "startup_failure"].includes(state)) {
+    return "failed";
+  }
+  return "pending";
+}
+
+function aggregatePullRequestChecks(checks: DeliveryPullRequestCheck[]): DeliveryPullRequestChecksEvidence["status"] {
+  if (checks.some((check) => check.status === "failed")) return "failed";
+  if (checks.length > 0 && checks.every((check) => check.status === "passed")) return "passed";
+  return "pending";
+}
+
+function pullRequestChecksSummary(checks: DeliveryPullRequestCheck[], status: DeliveryPullRequestChecksEvidence["status"]): string {
+  const passed = checks.filter((check) => check.status === "passed").length;
+  const failed = checks.filter((check) => check.status === "failed").length;
+  const pending = checks.filter((check) => check.status === "pending").length;
+  return `${checks.length} checks: ${passed} passed, ${failed} failed, ${pending} pending; overall ${status}.`;
+}
+
+function parseJsonObject(output: string, message: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(output);
+    if (isRecord(parsed)) return parsed;
+  } catch {
+    // Fall through to normalized delivery error.
+  }
+  throwRemote("DELIVERY_REJECTED", message);
+}
+
+function parseJsonArray(output: string, message: string): unknown[] {
+  try {
+    const parsed = JSON.parse(output);
+    if (Array.isArray(parsed)) return parsed;
+  } catch {
+    // Fall through to normalized delivery error.
+  }
+  throwRemote("DELIVERY_REJECTED", message);
+}
+
+function textFromUnknown(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
 async function runDeliveryCommand(
   command: "git" | "gh",
   cwd: string,
   args: string[],
   failureCode: DeliveryRemoteActionErrorCode = "DELIVERY_REJECTED",
+  options: { allowFailure?: boolean } = {},
 ): Promise<DeliveryCommandResult> {
+  return (await runDeliveryCommandWithRawOutput(command, cwd, args, failureCode, options)).result;
+}
+
+interface DeliveryCommandExecution {
+  result: DeliveryCommandResult;
+  rawStdout: string;
+}
+
+async function runDeliveryCommandWithRawOutput(
+  command: "git" | "gh",
+  cwd: string,
+  args: string[],
+  failureCode: DeliveryRemoteActionErrorCode = "DELIVERY_REJECTED",
+  options: { allowFailure?: boolean } = {},
+): Promise<DeliveryCommandExecution> {
   try {
     const result = await execFileAsync(command, args, {
       cwd,
@@ -816,30 +1071,58 @@ async function runDeliveryCommand(
       maxBuffer: gitOutputLimit,
       shell: false,
     });
+    const rawStdout = String(result.stdout).trim();
+    const rawStderr = String(result.stderr).trim();
     return {
-      command,
-      args: command === "gh" ? redactGhArgs(args) : args,
-      ok: true,
-      exitCode: 0,
-      stdout: sanitizeCommandOutput(String(result.stdout).trim()),
-      stderr: sanitizeCommandOutput(String(result.stderr).trim()),
+      result: {
+        command,
+        args: command === "gh" ? redactGhArgs(args) : args,
+        ok: true,
+        exitCode: 0,
+        stdout: sanitizeCommandOutput(rawStdout),
+        stderr: sanitizeCommandOutput(rawStderr),
+      },
+      rawStdout,
     };
   } catch (error) {
     const failure = error as { code?: number | string; stderr?: string; stdout?: string; message?: string };
     const code = command === "gh" && failure.code === "ENOENT" ? "GH_UNAVAILABLE" : failureCode;
+    const rawStdout = String(failure.stdout || "").trim();
+    const rawStderr = String(failure.stderr || "").trim();
+    const stdout = sanitizeCommandOutput(rawStdout);
+    const stderr = sanitizeCommandOutput(rawStderr);
+    if (options.allowFailure) {
+      return {
+        result: {
+          command,
+          args: command === "gh" ? redactGhArgs(args) : args,
+          ok: false,
+          exitCode: typeof failure.code === "number" ? failure.code : 1,
+          stdout,
+          stderr,
+        },
+        rawStdout,
+      };
+    }
     const detail = sanitizeCommandOutput(String(failure.stderr || failure.stdout || failure.message || "").trim());
     throwRemote(code, `${command} ${args[0]} failed: ${detail || "command failed"}.`);
   }
 }
 
 function redactGhArgs(args: string[]): string[] {
-  return args.map((arg, index) => (args[index - 1] === "--body" ? sanitizeCommandOutput(arg) : arg));
+  return args.map((arg, index) => (
+    args[index - 1] === "--body" || args[index - 1] === "--subject" || args[index - 1] === "--title"
+      ? sanitizeCommandOutput(arg)
+      : arg
+  ));
 }
 
 function sanitizeCommandOutput(value: string): string {
   return value
     .replace(/-----BEGIN [^-]+PRIVATE KEY-----[\s\S]*?-----END [^-]+PRIVATE KEY-----/g, "[REDACTED_PRIVATE_KEY]")
-    .replace(/\b(token|secret|password|api[_-]?key|authorization|cookie)\b\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .replace(/\b(authorization)\b\s*[:=]\s*bearer\s+[^\s"',;}\]]+/gi, "$1: Bearer [REDACTED]")
+    .replace(/\b(authorization)\b\s*[:=]\s*(?!bearer\b)[^\s"',;}\]]+/gi, "$1=[REDACTED]")
+    .replace(/\b(token|secret|password|api[_-]?key|cookie)\b\s*[:=]\s*[^\s"',;}\]]+/gi, "$1=[REDACTED]")
     .replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@[^\s]+/g, "[REDACTED_URL]")
     .replace(/\s+$/g, "");
 }

@@ -17,6 +17,9 @@ const workflow = {
   createDeliveryCommit: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:commit", projectRoot, input),
   pushDeliveryBranch: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:push", projectRoot, input),
   createPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:create", projectRoot, input),
+  checkPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:checks", projectRoot, input),
+  mergePullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:merge", projectRoot, input),
+  syncMain: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:syncMain", projectRoot, input),
   getChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset", projectRoot, input),
   reconcileFinalChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset:reconcileFinal", projectRoot, input),
 };
@@ -50,6 +53,9 @@ contextBridge.exposeInMainWorld("devflow", {
   createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:commit", projectRoot, input),
   pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:push", projectRoot, input),
   createWorkflowPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:create", projectRoot, input),
+  checkWorkflowPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:checks", projectRoot, input),
+  mergeWorkflowPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:merge", projectRoot, input),
+  syncWorkflowMain: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:syncMain", projectRoot, input),
   workflow,
   onRunEvent: (listener: (event: unknown) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value);
