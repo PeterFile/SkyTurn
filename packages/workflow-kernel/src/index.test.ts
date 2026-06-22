@@ -488,15 +488,135 @@ describe("Flow Kernel gate engine and scheduler", () => {
     const projection = reduceWorkflowEvents([
       event("workflow.lane.declared", { lane: { ...lane("lane-commit", "commit"), status: "running" } }),
       event("workflow.lane.declared", { lane: { ...lane("lane-pr", "pull_request"), status: "running" } }),
-      event("workflow.pull_request.created", { laneId: "lane-commit" }),
-      event("workflow.delivery.pushed", { laneId: "lane-pr" }),
-      event("workflow.pull_request.created", { laneId: "lane-pr" }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 12, url: "https://example.test/pr/12", head: "feature/slice-b", commitSha: "sha-a" },
+      }),
+      event("workflow.delivery.pushed", {
+        laneId: "lane-commit",
+        url: "https://example.test/compare",
+        evidence: { remote: "origin", branch: "feature/slice-b", commitSha: "sha-b" },
+      }),
     ]);
 
     expect(projection.lanes.find((item) => item.id === "lane-commit")?.status).toBe("running");
     expect(projection.lanes.find((item) => item.id === "lane-pr")?.status).toBe("running");
     expect(projection.events.map((item) => item.kind)).toContain("workflow.pull_request.created");
     expect(projection.events.map((item) => item.kind)).toContain("workflow.delivery.pushed");
+    expect(projection.evidence.map((item) => [item.laneId, item.kind, item.status])).toEqual([
+      ["lane-pr", "pull-request", "passed"],
+      ["lane-commit", "delivery-push", "passed"],
+    ]);
+  });
+
+  it("uses a later delivery push as the current pull request head for check gates", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+    const base = [
+      event("workflow.lane.declared", { lane: { ...lane("lane-commit", "commit"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-pr", "pull_request"), status: "running" } }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 15, url: "https://example.test/pr/15", head: "feature/slice-b", commitSha: "sha-a" },
+      }),
+      event("workflow.delivery.pushed", {
+        laneId: "lane-commit",
+        url: "https://example.test/compare",
+        evidence: { remote: "origin", branch: "feature/slice-b", commitSha: "sha-b" },
+      }),
+    ];
+    const stale = reduceWorkflowEvents([
+      ...base,
+      event(checksRecordedKind, {
+        laneId: "lane-ci",
+        prNumber: 15,
+        url: "https://example.test/pr/15/checks",
+        headSha: "sha-a",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/1" }],
+      }),
+    ]);
+    const exact = reduceWorkflowEvents([
+      ...base,
+      event(checksRecordedKind, {
+        laneId: "lane-ci",
+        prNumber: 15,
+        url: "https://example.test/pr/15/checks",
+        headSha: "sha-b",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/2" }],
+      }),
+    ]);
+
+    expect(stale.lanes.find((item) => item.id === "lane-ci")?.status).toBe("running");
+    expect(stale.lanes.find((item) => item.id === "lane-commit")?.status).toBe("running");
+    expect(stale.lanes.find((item) => item.id === "lane-pr")?.status).toBe("running");
+    expect(exact.lanes.find((item) => item.id === "lane-ci")?.status).toBe("completed");
+    expect(exact.lanes.find((item) => item.id === "lane-commit")?.status).toBe("running");
+    expect(exact.lanes.find((item) => item.id === "lane-pr")?.status).toBe("running");
+    expect(exact.evidence.at(-1)).toMatchObject({
+      laneId: "lane-ci",
+      kind: "pull-request-checks",
+      status: "passed",
+      checks: ["Build and test:passed"],
+    });
+  });
+
+  it("does not complete validation gates for failed or pending pull request checks", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+
+    for (const status of ["failed", "pending"] as const) {
+      const projection = reduceWorkflowEvents([
+        event("workflow.lane.declared", { lane: { ...lane(`lane-ci-${status}`, "ci_check"), status: "running" } }),
+        event("workflow.pull_request.created", {
+          laneId: `lane-ci-${status}`,
+          prNumber: 16,
+          url: "https://example.test/pr/16",
+          headSha: "sha-current",
+        }),
+        event(checksRecordedKind, {
+          laneId: `lane-ci-${status}`,
+          prNumber: 16,
+          url: "https://example.test/pr/16/checks",
+          headSha: "sha-current",
+          status,
+          checks: [{ name: "Build and test", status, url: "https://example.test/checks/3" }],
+        }),
+      ]);
+
+      expect(projection.lanes.find((item) => item.id === `lane-ci-${status}`)?.status).toBe("running");
+      expect(projection.evidence.at(-1)).toMatchObject({
+        laneId: `lane-ci-${status}`,
+        kind: "pull-request-checks",
+        status,
+      });
+    }
+  });
+
+  it("records merge and cleanup requests without completing unrelated lanes", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-merge", "merge"), status: "running" } }),
+      event("workflow.variant.adopt_requested", {
+        adoption: {
+          adoptionId: "adoption-1",
+          variantId: "variant-1",
+          worktreeId: "worktree-1",
+          strategy: "merge",
+          status: "requested",
+          baseCommit: "base",
+          headCommit: "head",
+          targetBranchName: "main",
+        },
+      }),
+      event("workflow.worktree.clean_requested", { worktreeId: "worktree-1", laneId: "lane-merge" }),
+    ]);
+
+    expect(projection.lanes.find((item) => item.id === "lane-ci")?.status).toBe("running");
+    expect(projection.lanes.find((item) => item.id === "lane-merge")?.status).toBe("running");
+    expect(projection.variantAdoptions).toMatchObject([{ adoptionId: "adoption-1", strategy: "merge", status: "requested" }]);
   });
 
   it("normalizes lane semantics and trusted runtime policy in the projection", () => {
