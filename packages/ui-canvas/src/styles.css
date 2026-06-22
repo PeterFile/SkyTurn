@@ -5804,16 +5804,98 @@ select:focus-visible,
 .worktree-compare-evidence {
   margin-top: 8px;
 }
-.worktree-compare-evidence h4 {
-  font-size: 11px;
-  margin: 0 0 4px 0;
+.worktree-compare-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
 }
-.worktree-compare-evidence pre {
-  font-size: 10px;
-  overflow-x: auto;
-  padding: 8px;
-  background: var(--sk-surface-muted);
-  border-radius: var(--sk-radius-xs);
-  max-height: 200px;
+.worktree-compare-header h4 {
+  font-size: 11px;
   margin: 0;
+}
+.worktree-compare-header span {
+  color: var(--sk-muted);
+  font-size: 10px;
+}
+.worktree-comparison-grid {
+  display: grid;
+  gap: 8px;
+}
+.worktree-comparison-card {
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-surface-muted);
+  padding: 10px;
+}
+.worktree-comparison-card-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.worktree-comparison-card-header strong {
+  font-size: 11px;
+}
+.worktree-comparison-card-header span {
+  color: var(--sk-muted);
+  font-size: 10px;
+}
+.worktree-evidence-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+.worktree-evidence-list div {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.4fr) 1fr;
+  gap: 8px;
+}
+.worktree-evidence-list dt,
+.worktree-evidence-list dd {
+  font-size: 10px;
+  line-height: 1.35;
+  margin: 0;
+}
+.worktree-evidence-list dt {
+  color: var(--sk-muted);
+}
+.worktree-evidence-list dd {
+  color: var(--sk-ink);
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.worktree-check-list {
+  display: grid;
+  gap: 6px;
+  list-style: none;
+  margin: 8px 0 0 0;
+  padding: 0;
+}
+.worktree-check-list li {
+  display: grid;
+  grid-template-columns: minmax(72px, 0.35fr) minmax(52px, 0.25fr) 1fr;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 10px;
+}
+.worktree-check-list span,
+.worktree-check-list em {
+  color: var(--sk-muted);
+  font-style: normal;
+  overflow-wrap: anywhere;
+}
+.worktree-check-list strong {
+  color: var(--sk-ink);
+}
+.worktree-empty-evidence,
+.worktree-evidence-detail,
+.worktree-file-preview {
+  color: var(--sk-muted);
+  font-size: 10px;
+  line-height: 1.35;
+  margin: 8px 0 0 0;
+  overflow-wrap: anywhere;
 }
