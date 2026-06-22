@@ -129,6 +129,16 @@ import {
   renderChangesetDiffHtml,
   type ChangesDiffViewOptions,
 } from "./diffViewer.js";
+import {
+  buildDeliveryPanelState,
+  hydrateDeliveryLifecycleFromWorkflowEvents,
+  type DeliveryBusyAction,
+  type DeliveryCommitSummary,
+  type DeliveryPanelState,
+  type DeliveryPullRequestChecks,
+  type DeliveryPullRequestSummary,
+  type DeliveryPushSummary,
+} from "./deliveryPanel.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
 import { agentIdentityForNode, canUseAgentNodeActions, nodeFooterForNode } from "./nodeDisplay.js";
 import {
@@ -2295,18 +2305,32 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
   const [diffCollapsed, setDiffCollapsed] = useState(false);
   const [options, setOptions] = useState<ChangesDiffViewOptions>(DEFAULT_CHANGES_DIFF_OPTIONS);
   const [deliveryStatus, setDeliveryStatus] = useState<"idle" | "committing" | string>("idle");
-  const [commitEvidence, setCommitEvidence] = useState<{ commitSha?: string; branch?: string; worktreePath?: string; subject?: string } | null>(null);
+  const [deliveryError, setDeliveryError] = useState<string | null>(null);
+  const [commitSubject, setCommitSubject] = useState("feat(workflow): commit verified changes");
+  const [acceptMismatch, setAcceptMismatch] = useState(false);
+  const [commitEvidence, setCommitEvidence] = useState<DeliveryCommitSummary | null>(null);
   const [pushStatus, setPushStatus] = useState<"idle" | "pushing" | string>("idle");
+  const [pushEvidence, setPushEvidence] = useState<DeliveryPushSummary | null>(null);
   const [prStatus, setPrStatus] = useState<"idle" | "creating" | string>("idle");
-  const [prUrl, setPrUrl] = useState<string | null>(null);
-
-  useEffect(() => {
-    setCommitEvidence(null);
-    setPushStatus("idle");
-    setPrStatus("idle");
-    setPrUrl(null);
-    setDeliveryStatus("idle");
-  }, [node.id, session.id, projectRoot]);
+  const [prEvidence, setPrEvidence] = useState<DeliveryPullRequestSummary | null>(null);
+  const [prTitle, setPrTitle] = useState("feat(workflow): pull request from SkyTurn");
+  const [prWhatChanged, setPrWhatChanged] = useState("Implement requested features");
+  const [prWhy, setPrWhy] = useState("As requested");
+  const [prBreakingChanges, setPrBreakingChanges] = useState("None.");
+  const [prServerPr, setPrServerPr] = useState("None.");
+  const [prBaseBranchInput, setPrBaseBranchInput] = useState("");
+  const [prCheckStatus, setPrCheckStatus] = useState<"idle" | "checking" | string>("idle");
+  const [prChecks, setPrChecks] = useState<DeliveryPullRequestChecks | null>(null);
+  const [mergeStatus, setMergeStatus] = useState<"idle" | "merging" | "merged" | string>("idle");
+  const [mergeConfirmOpen, setMergeConfirmOpen] = useState(false);
+  const [mergeTitle, setMergeTitle] = useState("");
+  const [mergeConfirmed, setMergeConfirmed] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "synced" | string>("idle");
+  const [cleanupStatus, setCleanupStatus] = useState<"idle" | "cleaning" | "cleaned" | string>("idle");
+  const [cleanupExplicitlyAllowed, setCleanupExplicitlyAllowed] = useState(false);
+  const [cleanupConfirmed, setCleanupConfirmed] = useState(false);
+  const [deleteBranch, setDeleteBranch] = useState(false);
+  const [deleteBranchConfirmed, setDeleteBranchConfirmed] = useState(false);
 
   function isPullRequestLane(n: CanvasNode | undefined): boolean {
     return !!n && typeof (n as unknown as Record<string, unknown>).laneKind === "string" && (n as unknown as Record<string, unknown>).laneKind === "pull_request";
@@ -2320,43 +2344,65 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
   const prBaseBranch = node.worktree.baseRef || session.target.baseRef;
 
   useEffect(() => {
+    setCommitEvidence(null);
+    setPushEvidence(null);
+    setPushStatus("idle");
+    setPrStatus("idle");
+    setPrEvidence(null);
+    setPrCheckStatus("idle");
+    setPrChecks(null);
+    setMergeStatus("idle");
+    setMergeConfirmOpen(false);
+    setMergeTitle("");
+    setMergeConfirmed(false);
+    setSyncStatus("idle");
+    setCleanupStatus("idle");
+    setCleanupExplicitlyAllowed(false);
+    setCleanupConfirmed(false);
+    setDeleteBranch(false);
+    setDeleteBranchConfirmed(false);
+    setAcceptMismatch(false);
+    setPrBaseBranchInput(prBaseBranch ?? "");
+    setDeliveryError(null);
+    setDeliveryStatus("idle");
+  }, [node.id, session.id, projectRoot, prBaseBranch]);
+
+  useEffect(() => {
     if (!window.devflow?.workflow?.getEvents) {
       setCommitEvidence(null);
+      setPushEvidence(null);
+      setPushStatus("idle");
+      setPrStatus("idle");
+      setPrEvidence(null);
+      setPrCheckStatus("idle");
+      setPrChecks(null);
+      setMergeStatus("idle");
+      setSyncStatus("idle");
       return;
     }
     let active = true;
     void window.devflow.workflow.getEvents(projectRoot, session.id).then((result) => {
       if (!active) return;
       const eventsList = (result.events || []) as Record<string, unknown>[];
-      const latestCommitEvent = [...eventsList]
-        .reverse()
-        .find(
-          (e) =>
-            e &&
-            e.kind === "workflow.commit.created" &&
-            (e.laneId === node.id ||
-              (e.payload &&
-                typeof e.payload === "object" &&
-                (e.payload as Record<string, unknown>).laneId === node.id)),
-        );
-
-      if (latestCommitEvent && latestCommitEvent.payload && typeof latestCommitEvent.payload === "object") {
-        const payload = latestCommitEvent.payload as Record<string, unknown>;
-        const evidence = payload.evidence as Record<string, unknown> | undefined;
-        setCommitEvidence({
-          commitSha: typeof evidence?.commitSha === "string" ? evidence.commitSha : undefined,
-          branch: typeof evidence?.branch === "string" ? evidence.branch : undefined,
-          worktreePath: typeof evidence?.worktreePath === "string" ? evidence.worktreePath : undefined,
-          subject: typeof evidence?.subject === "string" ? evidence.subject : undefined,
-        });
-      } else {
-        setCommitEvidence(null);
-      }
+      const restored = hydrateDeliveryLifecycleFromWorkflowEvents(eventsList, {
+        commitLaneId: node.id,
+        ...(dependentPrLaneId ? { pullRequestLaneId: dependentPrLaneId } : {}),
+      });
+      setCommitEvidence(restored.commitEvidence);
+      setPushEvidence(restored.pushEvidence);
+      setPushStatus(restored.pushEvidence ? `pushed: ${restored.pushEvidence.remote ?? "remote"}/${restored.pushEvidence.branch ?? "branch"}` : "idle");
+      setPrEvidence(restored.pullRequest);
+      setPrStatus(restored.pullRequest ? `pr-created: #${restored.pullRequest.number}` : "idle");
+      setPrChecks(restored.checks);
+      setPrCheckStatus(restored.checks ? `checks: ${restored.checks.checkStatus}` : "idle");
+      setMergeStatus(restored.mergeComplete ? "merged" : "idle");
+      setSyncStatus(restored.syncComplete ? "synced" : "idle");
+      setMergeTitle(restored.pullRequest?.title ?? "");
     });
     return () => {
       active = false;
     };
-  }, [projectRoot, session.id, node.id]);
+  }, [projectRoot, session.id, node.id, dependentPrLaneId]);
 
   useEffect(() => {
     let active = true;
@@ -2448,16 +2494,20 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     if (!devflow?.workflow?.createDeliveryCommit) return;
     if (!changeset || changeset.source !== "git" || changeset.files.length === 0) return;
 
-    const acceptMismatch = reconciliation?.status === "mismatch";
-    if (acceptMismatch) {
-      const proceed = window.confirm("Live output files differ from git changeset. Are you sure you want to commit these git changes?");
-      if (!proceed) return;
+    const subject = commitSubject.trim();
+    if (subject === "") {
+      setDeliveryError("Commit subject is required.");
+      return;
     }
 
-    const subject = window.prompt("Commit subject", "feat(workflow): commit verified changes");
-    if (!subject || subject.trim() === "") return;
+    const mismatchRequiresAcceptance = reconciliation?.status === "mismatch";
+    if (mismatchRequiresAcceptance && !acceptMismatch) {
+      setDeliveryError("Mismatch must be accepted before committing.");
+      return;
+    }
 
     setDeliveryStatus("committing");
+    setDeliveryError(null);
     try {
       const worktreePath = node.worktree.realPath ?? node.worktree.path ?? projectRoot;
       const result = await devflow.workflow.createDeliveryCommit(projectRoot, {
@@ -2465,9 +2515,9 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         laneId: node.id,
         worktreePath,
         files: changeset.files,
-        subject: subject.trim(),
+        subject,
         reconciliationStatus: reconciliation?.status,
-        ...(acceptMismatch ? { acceptMismatch: true } : {}),
+        ...(mismatchRequiresAcceptance ? { acceptMismatch: true } : {}),
       });
       if (result.status === "committed") {
         setDeliveryStatus(`committed: ${result.evidence.commitSha.substring(0, 7)}`);
@@ -2475,19 +2525,25 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
           commitSha: result.evidence.commitSha,
           branch: result.evidence.branch,
           worktreePath: result.evidence.worktreePath,
-          subject: subject.trim(),
+          subject,
         });
         setPushStatus("idle");
+        setPushEvidence(null);
         setPrStatus("idle");
-        setPrUrl(null);
+        setPrEvidence(null);
+        setPrChecks(null);
+        setMergeStatus("idle");
+        setSyncStatus("idle");
+        setCleanupStatus("idle");
+        setPrTitle(subject);
         setRefreshVersion(v => v + 1);
       } else {
         setDeliveryStatus("error");
-        setDiffError("Unexpected delivery status.");
+        setDeliveryError("Unexpected delivery status.");
       }
     } catch (e) {
       setDeliveryStatus("error");
-      setDiffError(e instanceof Error ? e.message : "Failed to commit changes.");
+      setDeliveryError(e instanceof Error ? e.message : "Failed to commit changes.");
     }
   }
 
@@ -2497,6 +2553,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     if (!commitEvidence) return;
 
     setPushStatus("pushing");
+    setDeliveryError(null);
     try {
       const result = await devflow.workflow.pushDeliveryBranch(projectRoot, {
         sessionId: session.id,
@@ -2507,80 +2564,78 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       });
       if (result.status === "pushed") {
         setPushStatus(`pushed: ${result.evidence.remote}/${result.evidence.branch}`);
+        setPushEvidence({
+          remote: result.evidence.remote,
+          branch: result.evidence.branch,
+          commitSha: result.evidence.commitSha,
+        });
         setCommitEvidence((prev) => prev ? {
           ...prev,
           ...(result.evidence.commitSha ? { commitSha: result.evidence.commitSha } : {}),
           ...(result.evidence.branch ? { branch: result.evidence.branch } : {}),
           ...(result.evidence.worktreePath ? { worktreePath: result.evidence.worktreePath } : {}),
         } : null);
+        setPrStatus("idle");
+        setPrEvidence(null);
+        setPrChecks(null);
       } else {
         setPushStatus("error");
-        setDiffError("Unexpected push status.");
+        setDeliveryError("Unexpected push status.");
       }
     } catch (e) {
       setPushStatus("error");
-      setDiffError(e instanceof Error ? e.message : "Failed to push branch.");
+      setDeliveryError(e instanceof Error ? e.message : "Failed to push branch.");
     }
   }
 
   async function handleCreatePr() {
     const devflow = window.devflow;
     if (!devflow?.workflow?.createPullRequest) return;
+    if (prEvidence) return;
     if (!commitEvidence) return;
 
     if (!commitEvidence.branch) {
       setPrStatus("error");
-      setDiffError("Cannot create PR: Delivery branch is missing from commit evidence.");
+      setDeliveryError("Cannot create PR: Delivery branch is missing from commit evidence.");
       return;
     }
 
     if (!dependentPrLaneId) {
       setPrStatus("error");
-      setDiffError("Cannot create PR: No dependent pull_request lane found.");
+      setDeliveryError("Cannot create PR: No dependent pull_request lane found.");
       return;
     }
 
-    const defaultTitle = window.prompt("PR Title", commitEvidence.subject || "feat(workflow): pull request from SkyTurn");
-    if (!defaultTitle || defaultTitle.trim() === "") return;
+    const title = prTitle.trim();
+    if (title === "") return;
 
-    if (!/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9\-]+\))?:\s.+/.test(defaultTitle.trim())) {
+    if (!/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9\-]+\))?:\s.+/.test(title)) {
       setPrStatus("error");
-      setDiffError("Cannot create PR: Title must follow Conventional Commits format.");
+      setDeliveryError("Cannot create PR: Title must follow Conventional Commits format.");
       return;
     }
-
-    const whatChanged = window.prompt("What changed?", "Implement requested features");
-    if (whatChanged === null) return;
-    const why = window.prompt("Why?", "As requested");
-    if (why === null) return;
-    const breakingChanges = window.prompt("Breaking changes?", "None.");
-    if (breakingChanges === null) return;
-    const serverPr = window.prompt("Server PR?", "None.");
-    if (serverPr === null) return;
 
     if (!prBaseBranch) {
       setPrStatus("error");
-      setDiffError("Cannot create PR: Base branch could not be derived.");
+      setDeliveryError("Cannot create PR: Base branch could not be derived.");
       return;
     }
 
     if (prBaseBranch === commitEvidence.branch) {
       setPrStatus("error");
-      setDiffError("Cannot create PR: Base branch cannot be the same as the delivery branch.");
+      setDeliveryError("Cannot create PR: Base branch cannot be the same as the delivery branch.");
       return;
     }
 
-    const confirmedBaseBranch = window.prompt("Base branch", prBaseBranch);
-    if (!confirmedBaseBranch) return;
-
-    const trimmedBaseBranch = confirmedBaseBranch.trim();
+    const trimmedBaseBranch = prBaseBranchInput.trim();
     if (!trimmedBaseBranch || trimmedBaseBranch === commitEvidence.branch) {
       setPrStatus("error");
-      setDiffError("Cannot create PR: Base branch cannot be empty or the same as the delivery branch.");
+      setDeliveryError("Cannot create PR: Base branch cannot be empty or the same as the delivery branch.");
       return;
     }
 
     setPrStatus("creating");
+    setDeliveryError(null);
     try {
       const result = await devflow.workflow.createPullRequest(projectRoot, {
         sessionId: session.id,
@@ -2590,31 +2645,233 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         baseBranch: trimmedBaseBranch,
         headBranch: commitEvidence.branch,
         ...(commitEvidence.commitSha ? { commitSha: commitEvidence.commitSha } : {}),
-        title: defaultTitle.trim(),
-        whatChanged,
-        why,
-        breakingChanges,
-        serverPr,
+        title,
+        whatChanged: prWhatChanged,
+        why: prWhy,
+        breakingChanges: prBreakingChanges,
+        serverPr: prServerPr,
       });
       if (result.status === "created") {
         setPrStatus(`pr-created: #${result.evidence.number}`);
-        setPrUrl(result.evidence.url);
+        setPrEvidence({
+          number: result.evidence.number,
+          url: result.evidence.url,
+          headSha: result.evidence.commitSha,
+          title: result.evidence.title,
+        });
+        setMergeTitle(result.evidence.title);
+        setPrChecks(null);
+        setMergeStatus("idle");
       } else {
         setPrStatus("error");
-        setDiffError("Unexpected PR status.");
+        setDeliveryError("Unexpected PR status.");
       }
     } catch (e) {
       setPrStatus("error");
-      setDiffError(e instanceof Error ? e.message : "Failed to create PR.");
+      setDeliveryError(e instanceof Error ? e.message : "Failed to create PR.");
+    }
+  }
+
+  async function handleCheckPrStatus() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.checkPullRequest || !prEvidence) return;
+
+    setPrCheckStatus("checking");
+    setPrChecks(null);
+    setDeliveryError(null);
+    try {
+      const result = await devflow.workflow.checkPullRequest(projectRoot, {
+        sessionId: session.id,
+        laneId: dependentPrLaneId ?? node.id,
+        prNumber: prEvidence.number,
+        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+      });
+      const checkStatus = deliveryCheckStatusForEvidence(result.evidence.status);
+      setPrChecks({
+        checkStatus,
+        expectedHeadSha: result.evidence.headSha,
+        mergeable: checkStatus === "passing",
+      });
+      setPrCheckStatus(`checks: ${checkStatus}`);
+    } catch (e) {
+      setPrCheckStatus("error");
+      setPrChecks(null);
+      setDeliveryError(e instanceof Error ? e.message : "Failed to check PR status.");
+    }
+  }
+
+  async function handleMergePullRequest() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.mergePullRequest || !prEvidence) return;
+
+    const trimmedTitle = mergeTitle.trim();
+    if (!mergeConfirmed || trimmedTitle === "") return;
+    const headSha = prEvidence.headSha ?? commitEvidence?.commitSha;
+    if (
+      prChecks?.checkStatus !== "passing" ||
+      !prChecks.mergeable ||
+      !headSha ||
+      !prChecks.expectedHeadSha ||
+      prChecks.expectedHeadSha !== headSha
+    ) {
+      setDeliveryError("Cannot merge: exact-head CI is not green.");
+      return;
+    }
+
+    setMergeStatus("merging");
+    setDeliveryError(null);
+    try {
+      const result = await devflow.workflow.mergePullRequest(projectRoot, {
+        sessionId: session.id,
+        laneId: dependentPrLaneId ?? node.id,
+        prNumber: prEvidence.number,
+        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+        title: trimmedTitle,
+        method: "squash",
+      });
+      if (result.status === "merged") {
+        setMergeStatus("merged");
+        setMergeConfirmOpen(false);
+      } else {
+        setMergeStatus("error");
+        setDeliveryError("Unexpected merge status.");
+      }
+    } catch (e) {
+      setMergeStatus("error");
+      setDeliveryError(e instanceof Error ? e.message : "Failed to request merge.");
+    }
+  }
+
+  async function handlePostMergeSync() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.syncMain || !prEvidence) return;
+    if (mergeStatus !== "merged") {
+      setDeliveryError("Cannot sync: merge has not completed.");
+      return;
+    }
+
+    setSyncStatus("syncing");
+    setDeliveryError(null);
+    try {
+      const result = await devflow.workflow.syncMain(projectRoot, {
+        sessionId: session.id,
+        laneId: dependentPrLaneId ?? node.id,
+        prNumber: prEvidence.number,
+        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+      });
+      if (result.status === "synced") {
+        setSyncStatus("synced");
+      } else {
+        setSyncStatus("error");
+        setDeliveryError("Unexpected sync status.");
+      }
+    } catch (e) {
+      setSyncStatus("error");
+      setDeliveryError(e instanceof Error ? e.message : "Failed to request post-merge sync.");
+    }
+  }
+
+  async function handleCleanupWorktree() {
+    const devflow = window.devflow;
+    if (!devflow?.workflow?.cleanWorktree) return;
+    const cleanupAllowed = mergeStatus === "merged" || syncStatus === "synced" || cleanupExplicitlyAllowed;
+    if (!cleanupAllowed || !cleanupConfirmed) {
+      setDeliveryError("Cannot clean worktree: cleanup must be explicitly confirmed after merge or sync.");
+      return;
+    }
+    if (deleteBranch && !deleteBranchConfirmed) {
+      setDeliveryError("Cannot delete branch: branch deletion needs second confirmation.");
+      return;
+    }
+    if (
+      !node.worktree.worktreeId ||
+      !node.worktree.variantId ||
+      !node.worktree.realPath ||
+      !node.worktree.gitdir ||
+      !node.worktree.repoRoot ||
+      !node.worktree.branchName ||
+      !node.worktree.baseCommit ||
+      !node.worktree.headCommit
+    ) {
+      setDeliveryError("Cannot clean worktree: required worktree identity is missing.");
+      return;
+    }
+
+    setCleanupStatus("cleaning");
+    setDeliveryError(null);
+    try {
+      await devflow.workflow.cleanWorktree(projectRoot, {
+        sessionId: session.id,
+        worktree: {
+          worktreeId: node.worktree.worktreeId,
+          variantId: node.worktree.variantId,
+          parentLaneId: node.id,
+          realPath: node.worktree.realPath,
+          gitdir: node.worktree.gitdir,
+          repoRoot: node.worktree.repoRoot,
+          branchName: node.worktree.branchName,
+          baseCommit: node.worktree.baseCommit,
+          headCommit: node.worktree.headCommit,
+        },
+        deleteBranch: deleteBranch && deleteBranchConfirmed,
+      });
+      setCleanupStatus("cleaned");
+    } catch (e) {
+      setCleanupStatus("error");
+      setDeliveryError(e instanceof Error ? e.message : "Failed to request cleanup.");
     }
   }
 
   if (!changeset) return <p>Loading changes...</p>;
 
   const hasGitEvidence = hasFinalGitEvidence(reconciliation, changeset);
-  const devflowAvailable = !!window.devflow?.workflow?.createDeliveryCommit;
+  const devflow = window.devflow;
   const isCommitLane = node.laneKind === "commit";
-  const canCommit = devflowAvailable && isCommitLane && hasGitEvidence && changeset.source === "git" && changeset.files.length > 0;
+  const busyAction: DeliveryBusyAction | null =
+    deliveryStatus === "committing" ? "commit"
+    : pushStatus === "pushing" ? "push"
+    : prStatus === "creating" ? "create-pr"
+    : prCheckStatus === "checking" ? "check-pr"
+    : mergeStatus === "merging" ? "merge"
+    : syncStatus === "syncing" ? "sync"
+    : cleanupStatus === "cleaning" ? "cleanup"
+    : null;
+  const deliveryState = buildDeliveryPanelState({
+    isCommitLane,
+    hasGitEvidence,
+    hasGitChanges: changeset.source === "git" && changeset.files.length > 0,
+    backend: {
+      commit: !!devflow?.workflow?.createDeliveryCommit,
+      push: !!devflow?.workflow?.pushDeliveryBranch,
+      createPr: !!devflow?.workflow?.createPullRequest,
+      checkPr: !!devflow?.workflow?.checkPullRequest,
+      merge: !!devflow?.workflow?.mergePullRequest,
+      sync: !!devflow?.workflow?.syncMain,
+      cleanup: !!devflow?.workflow?.cleanWorktree,
+    },
+    commitEvidence,
+    pushEvidence,
+    pullRequest: prEvidence,
+    checks: prChecks,
+    mergeTitle,
+    mergeConfirmed,
+    mergeComplete: mergeStatus === "merged",
+    syncComplete: syncStatus === "synced",
+    cleanupExplicitlyAllowed,
+    cleanupConfirmed,
+    deleteBranch,
+    deleteBranchConfirmed,
+    busyAction,
+  });
+  const missingDeliveryCleanMetadata =
+    !node.worktree.worktreeId ||
+    !node.worktree.variantId ||
+    !node.worktree.realPath ||
+    !node.worktree.gitdir ||
+    !node.worktree.repoRoot ||
+    !node.worktree.branchName ||
+    !node.worktree.baseCommit ||
+    !node.worktree.headCommit;
 
   if (!hasGitEvidence && !reconciliation?.liveChanges && !commitEvidence) {
     return (
@@ -2705,38 +2962,66 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         onOption={setDiffOption}
         onOutputFormatToggle={toggleOutputFormat}
         onRefresh={() => setRefreshVersion((current) => current + 1)}
+      />
+
+      <DeliveryLifecyclePanel
+        state={deliveryState}
+        error={deliveryError}
+        isMismatch={reconciliation?.status === "mismatch"}
+        acceptMismatch={acceptMismatch}
+        onAcceptMismatchChange={setAcceptMismatch}
+        commitSubject={commitSubject}
+        onCommitSubjectChange={setCommitSubject}
         onCommit={handleCommit}
-        commitDisabled={!canCommit || deliveryStatus === "committing"}
-        commitStatusLabel={
-          deliveryStatus === "committing" ? "Committing..."
-          : deliveryStatus.startsWith("committed:") ? `Committed ${deliveryStatus.split(":")[1]}`
-          : "Commit changes"
-        }
+        deliveryStatus={deliveryStatus}
+        commitEvidence={commitEvidence}
+        pushEvidence={pushEvidence}
+        pushStatus={pushStatus}
         onPush={handlePush}
-        pushDisabled={!devflowAvailable || !window.devflow?.workflow?.pushDeliveryBranch || !commitEvidence || pushStatus === "pushing"}
-        pushStatusLabel={
-          pushStatus === "pushing" ? "Pushing..."
-          : pushStatus.startsWith("pushed:") ? `Pushed ${pushStatus.split(":")[1]}`
-          : "Push branch"
-        }
-        onPr={handleCreatePr}
-        prDisabled={!devflowAvailable || !window.devflow?.workflow?.createPullRequest || !pushStatus.startsWith("pushed:") || prStatus === "creating" || !dependentPrLaneId || !prBaseBranch || !commitEvidence?.branch || prBaseBranch === commitEvidence.branch}
-        prDisabledTitle={
-          !devflowAvailable || !window.devflow?.workflow?.createPullRequest ? "PR creation API unavailable"
-          : !pushStatus.startsWith("pushed:") ? "Must push branch before creating PR"
-          : !dependentPrLaneId ? "No dependent pull_request lane found"
-          : !prBaseBranch ? "Base branch could not be derived"
-          : !commitEvidence?.branch ? "Delivery branch not available"
-          : (prBaseBranch === commitEvidence.branch) ? "Base branch cannot be the same as the delivery branch"
-          : "PR creation unavailable"
-        }
-        prStatusLabel={
-          prStatus === "creating" ? "Creating PR..."
-          : prStatus.startsWith("pr-created:") ? `PR Created (${prStatus.split(": ")[1] || prStatus.split(":")[1]})`
-          : prStatus.startsWith("pr-created") ? "PR Created"
-          : "Create PR"
-        }
-        prUrl={prUrl}
+        pullRequest={prEvidence}
+        prStatus={prStatus}
+        prTitle={prTitle}
+        onPrTitleChange={setPrTitle}
+        prWhatChanged={prWhatChanged}
+        onPrWhatChangedChange={setPrWhatChanged}
+        prWhy={prWhy}
+        onPrWhyChange={setPrWhy}
+        prBreakingChanges={prBreakingChanges}
+        onPrBreakingChangesChange={setPrBreakingChanges}
+        prServerPr={prServerPr}
+        onPrServerPrChange={setPrServerPr}
+        prBaseBranch={prBaseBranch}
+        prBaseBranchInput={prBaseBranchInput}
+        onPrBaseBranchInputChange={setPrBaseBranchInput}
+        dependentPrLaneId={dependentPrLaneId}
+        onCreatePr={handleCreatePr}
+        prCheckStatus={prCheckStatus}
+        prChecks={prChecks}
+        onCheckPrStatus={handleCheckPrStatus}
+        mergeConfirmOpen={mergeConfirmOpen}
+        onMergeConfirmOpenChange={setMergeConfirmOpen}
+        mergeTitle={mergeTitle}
+        onMergeTitleChange={setMergeTitle}
+        mergeConfirmed={mergeConfirmed}
+        onMergeConfirmedChange={setMergeConfirmed}
+        mergeStatus={mergeStatus}
+        onMerge={handleMergePullRequest}
+        syncStatus={syncStatus}
+        onSync={handlePostMergeSync}
+        cleanupStatus={cleanupStatus}
+        cleanupExplicitlyAllowed={cleanupExplicitlyAllowed}
+        onCleanupExplicitlyAllowedChange={setCleanupExplicitlyAllowed}
+        cleanupConfirmed={cleanupConfirmed}
+        onCleanupConfirmedChange={setCleanupConfirmed}
+        deleteBranch={deleteBranch}
+        onDeleteBranchChange={(value) => {
+          setDeleteBranch(value);
+          if (!value) setDeleteBranchConfirmed(false);
+        }}
+        deleteBranchConfirmed={deleteBranchConfirmed}
+        onDeleteBranchConfirmedChange={setDeleteBranchConfirmed}
+        missingCleanMetadata={missingDeliveryCleanMetadata}
+        onCleanup={handleCleanupWorktree}
       />
 
       {diffError ? (
@@ -2758,6 +3043,356 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       )}
     </section>
   );
+}
+
+function DeliveryLifecyclePanel({
+  state,
+  error,
+  isMismatch,
+  acceptMismatch,
+  onAcceptMismatchChange,
+  commitSubject,
+  onCommitSubjectChange,
+  onCommit,
+  deliveryStatus,
+  commitEvidence,
+  pushEvidence,
+  pushStatus,
+  onPush,
+  pullRequest,
+  prStatus,
+  prTitle,
+  onPrTitleChange,
+  prWhatChanged,
+  onPrWhatChangedChange,
+  prWhy,
+  onPrWhyChange,
+  prBreakingChanges,
+  onPrBreakingChangesChange,
+  prServerPr,
+  onPrServerPrChange,
+  prBaseBranch,
+  prBaseBranchInput,
+  onPrBaseBranchInputChange,
+  dependentPrLaneId,
+  onCreatePr,
+  prCheckStatus,
+  prChecks,
+  onCheckPrStatus,
+  mergeConfirmOpen,
+  onMergeConfirmOpenChange,
+  mergeTitle,
+  onMergeTitleChange,
+  mergeConfirmed,
+  onMergeConfirmedChange,
+  mergeStatus,
+  onMerge,
+  syncStatus,
+  onSync,
+  cleanupStatus,
+  cleanupExplicitlyAllowed,
+  onCleanupExplicitlyAllowedChange,
+  cleanupConfirmed,
+  onCleanupConfirmedChange,
+  deleteBranch,
+  onDeleteBranchChange,
+  deleteBranchConfirmed,
+  onDeleteBranchConfirmedChange,
+  missingCleanMetadata,
+  onCleanup,
+}: {
+  state: DeliveryPanelState;
+  error: string | null;
+  isMismatch: boolean;
+  acceptMismatch: boolean;
+  onAcceptMismatchChange: (value: boolean) => void;
+  commitSubject: string;
+  onCommitSubjectChange: (value: string) => void;
+  onCommit: () => void;
+  deliveryStatus: string;
+  commitEvidence: DeliveryCommitSummary | null;
+  pushEvidence: DeliveryPushSummary | null;
+  pushStatus: string;
+  onPush: () => void;
+  pullRequest: DeliveryPullRequestSummary | null;
+  prStatus: string;
+  prTitle: string;
+  onPrTitleChange: (value: string) => void;
+  prWhatChanged: string;
+  onPrWhatChangedChange: (value: string) => void;
+  prWhy: string;
+  onPrWhyChange: (value: string) => void;
+  prBreakingChanges: string;
+  onPrBreakingChangesChange: (value: string) => void;
+  prServerPr: string;
+  onPrServerPrChange: (value: string) => void;
+  prBaseBranch?: string;
+  prBaseBranchInput: string;
+  onPrBaseBranchInputChange: (value: string) => void;
+  dependentPrLaneId?: string;
+  onCreatePr: () => void;
+  prCheckStatus: string;
+  prChecks: DeliveryPullRequestChecks | null;
+  onCheckPrStatus: () => void;
+  mergeConfirmOpen: boolean;
+  onMergeConfirmOpenChange: (value: boolean) => void;
+  mergeTitle: string;
+  onMergeTitleChange: (value: string) => void;
+  mergeConfirmed: boolean;
+  onMergeConfirmedChange: (value: boolean) => void;
+  mergeStatus: string;
+  onMerge: () => void;
+  syncStatus: string;
+  onSync: () => void;
+  cleanupStatus: string;
+  cleanupExplicitlyAllowed: boolean;
+  onCleanupExplicitlyAllowedChange: (value: boolean) => void;
+  cleanupConfirmed: boolean;
+  onCleanupConfirmedChange: (value: boolean) => void;
+  deleteBranch: boolean;
+  onDeleteBranchChange: (value: boolean) => void;
+  deleteBranchConfirmed: boolean;
+  onDeleteBranchConfirmedChange: (value: boolean) => void;
+  missingCleanMetadata: boolean;
+  onCleanup: () => void;
+}) {
+  const conventionalPrTitle = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9\-]+\))?:\s.+/.test(prTitle.trim());
+  const commitDisabled = !state.canCommit || commitSubject.trim() === "" || (isMismatch && !acceptMismatch);
+  const trimmedBaseBranch = prBaseBranchInput.trim();
+  const createPrDisabled =
+    !state.canCreatePr ||
+    !!pullRequest ||
+    !dependentPrLaneId ||
+    !prBaseBranch ||
+    !commitEvidence?.branch ||
+    trimmedBaseBranch === "" ||
+    trimmedBaseBranch === commitEvidence.branch ||
+    !conventionalPrTitle;
+  const mergeRequestDisabled = !state.mergeReady || mergeStatus === "merging";
+  const confirmMergeDisabled = !state.canMerge;
+  const cleanupDisabled = !state.canCleanup || missingCleanMetadata;
+  const headSha = pullRequest?.headSha ?? commitEvidence?.commitSha;
+
+  return (
+    <section className="delivery-panel" aria-label="Delivery lifecycle">
+      <header className="delivery-panel-header">
+        <div>
+          <p className="eyebrow">Delivery</p>
+          <h3>Checks, merge, cleanup</h3>
+        </div>
+        <span className={state.mergeReady ? "delivery-readiness ready" : "delivery-readiness blocked"}>
+          {state.mergeReady ? <CheckCircle2 size={14} aria-hidden="true" /> : <AlertTriangle size={14} aria-hidden="true" />}
+          <span>{state.mergeReady ? "Ready for merge" : "Exact-head CI required"}</span>
+        </span>
+      </header>
+
+      <dl className="delivery-facts">
+        <div>
+          <dt>Commit</dt>
+          <dd>{shortSha(commitEvidence?.commitSha)}</dd>
+        </div>
+        <div>
+          <dt>Branch</dt>
+          <dd>{commitEvidence?.branch ?? pushEvidence?.branch ?? "Not pushed"}</dd>
+        </div>
+        <div>
+          <dt>PR</dt>
+          <dd>
+            {pullRequest?.url ? (
+              <a href={pullRequest.url} target="_blank" rel="noreferrer">#{pullRequest.number}</a>
+            ) : pullRequest ? (
+              `#${pullRequest.number}`
+            ) : "Not created"}
+          </dd>
+        </div>
+        <div>
+          <dt>Head SHA</dt>
+          <dd>{shortSha(headSha)}</dd>
+        </div>
+        <div>
+          <dt>Checks</dt>
+          <dd>{prChecks ? `${prChecks.checkStatus} @ ${shortSha(prChecks.expectedHeadSha)}` : "Not checked"}</dd>
+        </div>
+        <div>
+          <dt>Cleanup</dt>
+          <dd>{cleanupStatus === "cleaned" ? "Cleaned" : cleanupStatus === "cleaning" ? "Cleaning" : "Waiting"}</dd>
+        </div>
+      </dl>
+
+      {pullRequest && (
+        <p className="delivery-note" role="status">
+          PR created is not complete. CI exact-head green is required before ready for merge.
+        </p>
+      )}
+
+      {error && <div className="delivery-alert" role="alert">{error}</div>}
+
+      <div className="delivery-grid">
+        <div className="delivery-step">
+          <label className="delivery-field">
+            <span>Commit subject</span>
+            <input value={commitSubject} onChange={(event) => onCommitSubjectChange(event.target.value)} />
+          </label>
+          {isMismatch && (
+            <label className="delivery-check">
+              <input
+                type="checkbox"
+                checked={acceptMismatch}
+                onChange={(event) => onAcceptMismatchChange(event.target.checked)}
+              />
+              <span>Accept mismatch between live output and git changeset.</span>
+            </label>
+          )}
+          <button className="changes-tool-button" type="button" disabled={commitDisabled} onClick={onCommit}>
+            <GitPullRequest size={15} aria-hidden="true" />
+            <span>{deliveryStatus === "committing" ? "Committing..." : deliveryStatus.startsWith("committed:") ? `Committed ${deliveryStatus.split(":")[1]}` : "Commit changes"}</span>
+          </button>
+        </div>
+
+        <div className="delivery-step">
+          <button className="changes-tool-button" type="button" disabled={!state.canPush} onClick={onPush}>
+            <Upload size={15} aria-hidden="true" />
+            <span>{pushStatus === "pushing" ? "Pushing..." : pushStatus.startsWith("pushed:") ? `Pushed ${pushStatus.split(":")[1]}` : "Push branch"}</span>
+          </button>
+
+          <label className="delivery-field">
+            <span>PR title</span>
+            <input value={prTitle} onChange={(event) => onPrTitleChange(event.target.value)} />
+          </label>
+          <label className="delivery-field">
+            <span>Base branch</span>
+            <input value={prBaseBranchInput} onChange={(event) => onPrBaseBranchInputChange(event.target.value)} />
+          </label>
+          <label className="delivery-field">
+            <span>What changed?</span>
+            <textarea value={prWhatChanged} onChange={(event) => onPrWhatChangedChange(event.target.value)} rows={2} />
+          </label>
+          <label className="delivery-field">
+            <span>Why?</span>
+            <textarea value={prWhy} onChange={(event) => onPrWhyChange(event.target.value)} rows={2} />
+          </label>
+          <div className="delivery-form-grid">
+            <label className="delivery-field">
+              <span>Breaking changes?</span>
+              <input value={prBreakingChanges} onChange={(event) => onPrBreakingChangesChange(event.target.value)} />
+            </label>
+            <label className="delivery-field">
+              <span>Server PR</span>
+              <input value={prServerPr} onChange={(event) => onPrServerPrChange(event.target.value)} />
+            </label>
+          </div>
+          <button className="changes-tool-button" type="button" disabled={createPrDisabled} onClick={onCreatePr}>
+            <GitBranch size={15} aria-hidden="true" />
+            <span>{prStatus === "creating" ? "Creating PR..." : pullRequest ? `PR Created (#${pullRequest.number})` : "Create PR"}</span>
+          </button>
+          <button className="changes-tool-button" type="button" disabled={!state.canCheckPr} onClick={onCheckPrStatus}>
+            <RefreshCw size={15} aria-hidden="true" />
+            <span>{prCheckStatus === "checking" ? "Checking..." : "Check PR status"}</span>
+          </button>
+        </div>
+
+        <div className="delivery-step">
+          <button
+            className="changes-tool-button"
+            type="button"
+            disabled={mergeRequestDisabled}
+            onClick={() => onMergeConfirmOpenChange(true)}
+          >
+            <GitPullRequest size={15} aria-hidden="true" />
+            <span>Request merge</span>
+          </button>
+
+          {mergeConfirmOpen && pullRequest && (
+            <div className="delivery-confirmation" role="group" aria-label="Confirm squash merge">
+              <dl className="delivery-confirm-facts">
+                <div>
+                  <dt>PR number</dt>
+                  <dd>#{pullRequest.number}</dd>
+                </div>
+                <div>
+                  <dt>Head SHA</dt>
+                  <dd>{shortSha(headSha)}</dd>
+                </div>
+              </dl>
+              <label className="delivery-field">
+                <span>Merge title</span>
+                <input value={mergeTitle} onChange={(event) => onMergeTitleChange(event.target.value)} />
+              </label>
+              <label className="delivery-check">
+                <input
+                  type="checkbox"
+                  checked={mergeConfirmed}
+                  onChange={(event) => onMergeConfirmedChange(event.target.checked)}
+                />
+                <span>I confirm this PR number and exact head SHA are correct.</span>
+              </label>
+              <button className="changes-tool-button danger" type="button" disabled={confirmMergeDisabled} onClick={onMerge}>
+                <Check size={15} aria-hidden="true" />
+                <span>{mergeStatus === "merging" ? "Merging..." : "Confirm squash merge"}</span>
+              </button>
+            </div>
+          )}
+
+          <button className="changes-tool-button" type="button" disabled={!state.canSync} onClick={onSync}>
+            <RefreshCw size={15} aria-hidden="true" />
+            <span>{syncStatus === "syncing" ? "Syncing..." : "Request post-merge sync"}</span>
+          </button>
+        </div>
+
+        <div className="delivery-step">
+          <label className="delivery-check">
+            <input
+              type="checkbox"
+              checked={cleanupExplicitlyAllowed}
+              onChange={(event) => onCleanupExplicitlyAllowedChange(event.target.checked)}
+            />
+            <span>Allow cleanup before merge or sync.</span>
+          </label>
+          <label className="delivery-check">
+            <input
+              type="checkbox"
+              checked={cleanupConfirmed}
+              onChange={(event) => onCleanupConfirmedChange(event.target.checked)}
+            />
+            <span>Clean worktree.</span>
+          </label>
+          <label className="delivery-check">
+            <input
+              type="checkbox"
+              checked={deleteBranch}
+              onChange={(event) => onDeleteBranchChange(event.target.checked)}
+            />
+            <span>Delete branch.</span>
+          </label>
+          {deleteBranch && (
+            <label className="delivery-check danger">
+              <input
+                type="checkbox"
+                checked={deleteBranchConfirmed}
+                onChange={(event) => onDeleteBranchConfirmedChange(event.target.checked)}
+              />
+              <span>Confirm Delete branch.</span>
+            </label>
+          )}
+          {missingCleanMetadata && <p className="delivery-note warning">Cleanup needs complete managed worktree metadata.</p>}
+          <button className="changes-tool-button danger" type="button" disabled={cleanupDisabled} onClick={onCleanup}>
+            <X size={15} aria-hidden="true" />
+            <span>{cleanupStatus === "cleaning" ? "Cleaning..." : "Clean worktree"}</span>
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function shortSha(value?: string): string {
+  return value ? value.slice(0, 7) : "None";
+}
+
+function deliveryCheckStatusForEvidence(status: string): DeliveryPullRequestChecks["checkStatus"] {
+  if (status === "passed") return "passing";
+  if (status === "failed") return "failing";
+  return "pending";
 }
 
 export function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
@@ -2805,17 +3440,6 @@ function ChangesDiffToolbar({
   onOption,
   onOutputFormatToggle,
   onRefresh,
-  onCommit,
-  commitDisabled,
-  commitStatusLabel,
-  onPush,
-  pushDisabled,
-  pushStatusLabel,
-  onPr,
-  prDisabled,
-  prDisabledTitle,
-  prStatusLabel,
-  prUrl,
 }: {
   collapsed: boolean;
   options: ChangesDiffViewOptions;
@@ -2823,17 +3447,6 @@ function ChangesDiffToolbar({
   onOption: <K extends keyof ChangesDiffViewOptions>(key: K, value: ChangesDiffViewOptions[K]) => void;
   onOutputFormatToggle: () => void;
   onRefresh: () => void;
-  onCommit?: () => void;
-  commitDisabled?: boolean;
-  commitStatusLabel?: string;
-  onPush?: () => void;
-  pushDisabled?: boolean;
-  pushStatusLabel?: string;
-  onPr?: () => void;
-  prDisabled?: boolean;
-  prDisabledTitle?: string;
-  prStatusLabel?: string;
-  prUrl?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -2882,46 +3495,6 @@ function ChangesDiffToolbar({
       >
         <Columns2 size={16} aria-hidden="true" />
       </button>
-      <button
-        className="changes-tool-button"
-        type="button"
-        disabled={commitDisabled}
-        title={commitDisabled ? "Backend unavailable or changes not eligible for commit" : "Create delivery commit"}
-        onClick={onCommit}
-      >
-        <GitPullRequest size={15} aria-hidden="true" />
-        <span>{commitStatusLabel || "Commit changes"}</span>
-      </button>
-      {onPush && (
-        <button
-          className="changes-tool-button"
-          type="button"
-          disabled={pushDisabled}
-          title={pushDisabled ? "Push unavailable or no commit evidence" : "Push delivery branch"}
-          onClick={onPush}
-        >
-          <Upload size={15} aria-hidden="true" />
-          <span>{pushStatusLabel || "Push"}</span>
-        </button>
-      )}
-      {onPr && (
-        <button
-          className="changes-tool-button"
-          type="button"
-          disabled={prDisabled}
-          title={prDisabled ? (prDisabledTitle || "PR creation unavailable or not pushed") : "Create Pull Request"}
-          onClick={onPr}
-        >
-          <GitBranch size={15} aria-hidden="true" />
-          <span>{prStatusLabel || "Create PR"}</span>
-        </button>
-      )}
-      {prUrl && (
-        <a href={prUrl} target="_blank" rel="noreferrer" className="changes-tool-button changes-tool-pr-link">
-          <GitPullRequest size={15} aria-hidden="true" />
-          <span>Open PR</span>
-        </a>
-      )}
       <div ref={rootRef} className="changes-menu">
         <button
           className="changes-tool-button icon-only"
@@ -3011,6 +3584,184 @@ function ChangesMenuItem({
   );
 }
 
+interface WorktreeComparisonCheckSummary {
+  label: string;
+  status: string;
+  detail?: string;
+}
+
+interface WorktreeComparisonVariantSummary {
+  variantId: string;
+  worktreeId: string;
+  changeStatus: string;
+  changedFileCount: string;
+  diffSummary: string;
+  conflictStatus: string;
+  conflictDetail?: string;
+  checks: WorktreeComparisonCheckSummary[];
+  files: string[];
+  hiddenFileCount: number;
+}
+
+interface WorktreeComparisonEvidenceSummary {
+  comparisonId: string;
+  collectedAt?: string;
+  variants: WorktreeComparisonVariantSummary[];
+}
+
+interface WorktreeAdoptionConfirmationInput {
+  targetBranchName?: string;
+  worktreeBranchName?: string;
+  baseCommit?: string;
+  headCommit?: string;
+}
+
+interface WorktreeCleanConfirmationInput {
+  path?: string;
+  branchName?: string;
+}
+
+const WORKTREE_PRIMARY_CHECK_KINDS = new Set(["test", "build", "typecheck"]);
+const MAX_COMPARE_FILES = 3;
+
+export function summarizeWorktreeComparisonEvidence(comparison: unknown): WorktreeComparisonEvidenceSummary {
+  const source = asRecord(comparison);
+  const rawVariants = Array.isArray(source?.variants) ? source.variants : [];
+  const variants = rawVariants.filter(isRecord).map(summarizeWorktreeComparisonVariant);
+
+  return {
+    comparisonId: textValue(source?.comparisonId, "Comparison"),
+    collectedAt: optionalText(source?.collectedAt),
+    variants,
+  };
+}
+
+export function buildWorktreeAdoptionConfirmation(input: WorktreeAdoptionConfirmationInput): string {
+  return [
+    "Adopt this worktree into the target branch?",
+    "",
+    `Target branch: ${textValue(input.targetBranchName, "Unknown")}`,
+    `Worktree branch: ${textValue(input.worktreeBranchName, "Unknown")}`,
+    `Base commit: ${textValue(input.baseCommit, "Unknown")}`,
+    `Head commit: ${textValue(input.headCommit, "Unknown")}`,
+    "Strategy: merge",
+    "",
+    "This updates the target branch.",
+  ].join("\n");
+}
+
+export function buildWorktreeCleanConfirmation(input: WorktreeCleanConfirmationInput): string {
+  return [
+    "Clean this worktree?",
+    "",
+    `Path to remove: ${textValue(input.path, "Unknown")}`,
+    `Branch name: ${textValue(input.branchName, "Unknown")}`,
+    "Delete branch requested: false",
+    "",
+    "Branch deletion is off by default.",
+  ].join("\n");
+}
+
+export function buildWorktreeDeleteBranchConfirmation(branchName?: string): string {
+  return [
+    "Second confirmation required.",
+    `Delete branch: ${textValue(branchName, "Unknown")}`,
+    "Cancel keeps the branch and only removes the worktree.",
+  ].join("\n");
+}
+
+function summarizeWorktreeComparisonVariant(variant: Record<string, unknown>): WorktreeComparisonVariantSummary {
+  const changeset = asRecord(variant.changeset);
+  const files = stringArray(changeset?.files);
+  const filePreview = files.slice(0, MAX_COMPARE_FILES);
+  const metrics = Array.isArray(variant.metrics)
+    ? variant.metrics.filter(isRecord).map(summarizeWorktreeMetric)
+    : [];
+  const changedFileMetric = metrics.find((metric) => metric.kind === "changed-file-count");
+  const diffMetric = metrics.find((metric) => metric.kind === "diff-summary");
+  const conflictMetric = metrics.find((metric) => metric.kind === "conflict-check");
+  const changeStatus = textValue(changeset?.status, "unknown");
+
+  return {
+    variantId: textValue(variant.variantId, "Unknown variant"),
+    worktreeId: textValue(variant.worktreeId, "Unknown worktree"),
+    changeStatus,
+    changedFileCount: metricValueText(changedFileMetric) ?? changedFileCountText(changeStatus, files),
+    diffSummary: diffMetric?.detail
+      ?? diffSummaryText(changeStatus, files, asRecord(changeset?.diffStat), optionalText(changeset?.errorReason)),
+    conflictStatus: conflictMetric?.status === "unknown" || !conflictMetric ? "not recorded" : conflictMetric.status,
+    conflictDetail: conflictMetric?.status === "unknown" ? undefined : conflictMetric?.detail,
+    checks: metrics
+      .filter((metric) => WORKTREE_PRIMARY_CHECK_KINDS.has(metric.kind) && metric.status !== "unknown")
+      .map(({ label, status, detail }) => ({ label, status, detail })),
+    files: filePreview,
+    hiddenFileCount: Math.max(0, files.length - filePreview.length),
+  };
+}
+
+function summarizeWorktreeMetric(metric: Record<string, unknown>) {
+  return {
+    kind: textValue(metric.kind, "unknown"),
+    label: textValue(metric.label, "Metric"),
+    status: textValue(metric.status, "unknown"),
+    value: typeof metric.value === "number" || typeof metric.value === "string" ? metric.value : undefined,
+    detail: optionalText(metric.detail),
+  };
+}
+
+function changedFileCountText(status: string, files: string[]): string {
+  if (status === "failed") return "Failed";
+  if (status === "empty") return "0";
+  if (status === "available") return String(files.length);
+  return "Not recorded";
+}
+
+function diffSummaryText(
+  status: string,
+  files: string[],
+  diffStat: Record<string, unknown> | null,
+  errorReason?: string,
+): string {
+  if (status === "failed") return errorReason ?? "Diff collection failed.";
+  if (status === "empty") return "No git diff recorded.";
+  if (status !== "available") return "Not recorded";
+
+  const added = numberValue(diffStat?.added) ?? 0;
+  const deleted = numberValue(diffStat?.deleted) ?? 0;
+  const fileLabel = files.length === 1 ? "file" : "files";
+  return `+${added} / -${deleted} across ${files.length} ${fileLabel}`;
+}
+
+function metricValueText(metric: { value?: number | string } | undefined): string | undefined {
+  if (metric?.value === undefined) return undefined;
+  return String(metric.value);
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string");
+}
+
+function textValue(value: unknown, fallback: string): string {
+  return optionalText(value) ?? fallback;
+}
+
+function optionalText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return isRecord(value) ? value : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function ContextTab({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
   const isNewWorktree = node.worktree.executionTarget === "new_worktree" || !!node.worktree.worktreeId;
 
@@ -3065,10 +3816,14 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
   const [adopting, setAdopting] = useState(false);
   const [adoptStatus, setAdoptStatus] = useState<string | null>(null);
   const [adoptError, setAdoptError] = useState<string | null>(null);
+  const [adoptConfirmed, setAdoptConfirmed] = useState(false);
 
   const [cleaning, setCleaning] = useState(false);
   const [cleanStatus, setCleanStatus] = useState<string | null>(null);
   const [cleanError, setCleanError] = useState<string | null>(null);
+  const [cleanConfirmed, setCleanConfirmed] = useState(false);
+  const [deleteBranch, setDeleteBranch] = useState(false);
+  const [deleteBranchConfirmed, setDeleteBranchConfirmed] = useState(false);
 
   const devflow = window.devflow;
   const devflowAvailable = !!devflow?.workflow?.compareWorktrees;
@@ -3099,6 +3854,7 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
   const canClean = devflowAvailable && !missingCleanMetadata;
 
   const candidateNodes = session.nodes.filter((n) => !!n.worktree.worktreeId && n.id !== node.id);
+  const comparisonSummary = compareResult ? summarizeWorktreeComparisonEvidence(compareResult) : null;
 
   const handleCompare = async (otherNode: CanvasNode) => {
     if (!devflow?.workflow?.compareWorktrees) return;
@@ -3119,7 +3875,8 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
 
   const handleAdopt = async () => {
     if (!devflow?.workflow?.adoptWorktree || missingMetadata) return;
-    if (!window.confirm("Are you sure you want to adopt this worktree? This will update the target branch.")) {
+    if (!adoptConfirmed) {
+      setAdoptError("Confirm merge adoption before continuing.");
       return;
     }
     setAdopting(true);
@@ -3137,7 +3894,7 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
           baseCommit: node.worktree.baseCommit!,
           headCommit: node.worktree.headCommit!,
           targetBranchName: node.worktree.selectedBranch!,
-        }
+        },
       });
       if (result.status === "adopted") {
         setAdoptStatus(`Adopted as commit ${result.adoption.adoptedCommit}`);
@@ -3153,10 +3910,14 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
 
   const handleClean = async () => {
     if (!devflow?.workflow?.cleanWorktree || missingCleanMetadata) return;
-    if (!window.confirm("Are you sure you want to clean this worktree?")) {
+    if (!cleanConfirmed) {
+      setCleanError("Confirm cleanup before continuing.");
       return;
     }
-    const deleteBranch = window.confirm("Also delete the associated branch? (Only confirm if it is a SkyTurn-managed branch)");
+    if (deleteBranch && !deleteBranchConfirmed) {
+      setCleanError("Confirm Delete branch before continuing.");
+      return;
+    }
 
     setCleaning(true);
     setCleanError(null);
@@ -3175,7 +3936,7 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
           baseCommit: node.worktree.baseCommit!,
           headCommit: node.worktree.headCommit!,
         },
-        deleteBranch
+        deleteBranch: deleteBranch && deleteBranchConfirmed
       });
       setCleanStatus("Worktree cleaned successfully.");
     } catch (e: any) {
@@ -3191,11 +3952,51 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
       {!devflowAvailable && <p className="eyebrow notice error">Desktop backend unavailable</p>}
       {missingMetadata && devflowAvailable && <p className="eyebrow notice error">Missing required metadata for adoption.</p>}
 
+      <div className="worktree-confirmations">
+        <label className="delivery-check">
+          <input
+            type="checkbox"
+            checked={adoptConfirmed}
+            onChange={(event) => setAdoptConfirmed(event.target.checked)}
+          />
+          <span>Confirm merge adoption.</span>
+        </label>
+        <label className="delivery-check">
+          <input
+            type="checkbox"
+            checked={cleanConfirmed}
+            onChange={(event) => setCleanConfirmed(event.target.checked)}
+          />
+          <span>Clean worktree.</span>
+        </label>
+        <label className="delivery-check">
+          <input
+            type="checkbox"
+            checked={deleteBranch}
+            onChange={(event) => {
+              setDeleteBranch(event.target.checked);
+              if (!event.target.checked) setDeleteBranchConfirmed(false);
+            }}
+          />
+          <span>Delete branch.</span>
+        </label>
+        {deleteBranch && (
+          <label className="delivery-check danger">
+            <input
+              type="checkbox"
+              checked={deleteBranchConfirmed}
+              onChange={(event) => setDeleteBranchConfirmed(event.target.checked)}
+            />
+            <span>Confirm Delete branch.</span>
+          </label>
+        )}
+      </div>
+
       <div className="modal-actions">
-        <button disabled={!canAdopt || adopting} onClick={handleAdopt}>
+        <button disabled={!canAdopt || adopting || !adoptConfirmed} onClick={handleAdopt}>
           {adopting ? "Adopting..." : "Adopt Worktree"}
         </button>
-        <button disabled={!canClean || cleaning} onClick={handleClean}>
+        <button disabled={!canClean || cleaning || !cleanConfirmed || (deleteBranch && !deleteBranchConfirmed)} onClick={handleClean}>
           {cleaning ? "Cleaning..." : "Clean Worktree"}
         </button>
         {candidateNodes.length > 0 && candidateNodes.map(other => (
@@ -3211,12 +4012,64 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
       {cleanStatus && <div className="notice success">{cleanStatus}</div>}
       {cleanError && <div className="notice error">{cleanError}</div>}
 
-      {!!compareResult && (
+      {comparisonSummary && (
         <div className="worktree-compare-evidence">
-          <h4>Comparison Evidence</h4>
-          <pre>
-            {JSON.stringify(compareResult, null, 2)}
-          </pre>
+          <div className="worktree-compare-header">
+            <h4>Comparison Evidence</h4>
+            {comparisonSummary.collectedAt && <span>{comparisonSummary.collectedAt}</span>}
+          </div>
+          {comparisonSummary.variants.length === 0 ? (
+            <p className="worktree-empty-evidence">No comparison variants recorded.</p>
+          ) : (
+            <div className="worktree-comparison-grid">
+              {comparisonSummary.variants.map((variant) => (
+                <section className="worktree-comparison-card" key={`${variant.variantId}-${variant.worktreeId}`}>
+                  <div className="worktree-comparison-card-header">
+                    <strong>{variant.variantId}</strong>
+                    <span>{variant.worktreeId}</span>
+                  </div>
+                  <dl className="worktree-evidence-list">
+                    <div>
+                      <dt>Changed files</dt>
+                      <dd>{variant.changedFileCount}</dd>
+                    </div>
+                    <div>
+                      <dt>Diff summary</dt>
+                      <dd>{variant.diffSummary}</dd>
+                    </div>
+                    <div>
+                      <dt>Change status</dt>
+                      <dd>{variant.changeStatus}</dd>
+                    </div>
+                    <div>
+                      <dt>Conflict check</dt>
+                      <dd>{variant.conflictStatus}</dd>
+                    </div>
+                  </dl>
+                  {variant.conflictDetail && <p className="worktree-evidence-detail">{variant.conflictDetail}</p>}
+                  {variant.checks.length > 0 ? (
+                    <ul className="worktree-check-list" aria-label="Recorded check metrics">
+                      {variant.checks.map((check) => (
+                        <li key={`${variant.variantId}-${check.label}`}>
+                          <span>{check.label}</span>
+                          <strong>{check.status}</strong>
+                          {check.detail && <em>{check.detail}</em>}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="worktree-empty-evidence">No test/build/check metrics recorded.</p>
+                  )}
+                  {variant.files.length > 0 && (
+                    <p className="worktree-file-preview">
+                      Files: {variant.files.join(", ")}
+                      {variant.hiddenFileCount > 0 ? `, +${variant.hiddenFileCount} more` : ""}
+                    </p>
+                  )}
+                </section>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {compareError && <div className="notice error">{compareError}</div>}

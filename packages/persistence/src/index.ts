@@ -1,6 +1,9 @@
 import type {
   DeliveryCommitEvidence,
+  DeliveryMainSyncEvidence,
   DeliveryPullRequestEvidence,
+  DeliveryPullRequestChecksEvidence,
+  DeliveryPullRequestMergeEvidence,
   DeliveryPushEvidence,
   EditorAdapter,
   EditorKind,
@@ -70,6 +73,9 @@ export interface WorkflowApi {
   createDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
   pushDeliveryBranch: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "pushed"; event: unknown | null; evidence: DeliveryPushEvidence }>;
   createPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown | null; evidence: DeliveryPullRequestEvidence }>;
+  checkPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "checks_recorded"; event: unknown | null; evidence: DeliveryPullRequestChecksEvidence }>;
+  mergePullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "merged"; event: unknown | null; evidence: DeliveryPullRequestMergeEvidence }>;
+  syncMain: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "synced"; event: unknown | null; evidence: DeliveryMainSyncEvidence }>;
   getChangeset: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
 }
@@ -103,6 +109,9 @@ export interface DevflowApi {
   createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
   pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "pushed"; event: unknown | null; evidence: DeliveryPushEvidence }>;
   createWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown | null; evidence: DeliveryPullRequestEvidence }>;
+  checkWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "checks_recorded"; event: unknown | null; evidence: DeliveryPullRequestChecksEvidence }>;
+  mergeWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "merged"; event: unknown | null; evidence: DeliveryPullRequestMergeEvidence }>;
+  syncWorkflowMain: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "synced"; event: unknown | null; evidence: DeliveryMainSyncEvidence }>;
   onRunEvent: (listener: (event: RunEvent) => void) => () => void;
   onWorkflowEvent: (listener: (event: unknown) => void) => () => void;
 }

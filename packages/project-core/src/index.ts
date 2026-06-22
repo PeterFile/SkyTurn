@@ -16,6 +16,9 @@ export type NodeLifecyclePhase =
 export type NodeModalTab = "Output" | "Changes" | "Context";
 export type AgentAvailabilityStatus = "available" | "missing" | "needs-auth" | "unhealthy";
 export type AgentSupportLevel = "mock-only" | "detected-only" | "experimental-run" | "supported-run";
+export type AgentReadinessLevel = "unavailable" | "detected-only" | "experimental-run";
+export type AgentAuthReadinessStatus = "available" | "missing" | "unknown";
+export type AgentReadinessCategory = "cli-missing" | "auth-missing" | "auth-unknown" | "version-probe-failed";
 export type AgentCapability =
   | "chat"
   | "file-read"
@@ -49,6 +52,7 @@ export type WorkflowLaneKind =
   | "regression"
   | "review"
   | "commit"
+  | "pull_request"
   | "join"
   | "decision";
 export type WorkflowLaneSemanticSubtype =
@@ -91,6 +95,7 @@ export const WORKFLOW_LANE_KINDS: WorkflowLaneKind[] = [
   "regression",
   "review",
   "commit",
+  "pull_request",
   "join",
   "decision",
 ];
@@ -119,6 +124,19 @@ export interface AgentDescriptor {
   supportLevel: AgentSupportLevel;
   capabilities: AgentCapability[];
   configFiles: string[];
+  readiness?: {
+    level: AgentReadinessLevel;
+    cli: {
+      available: boolean;
+      path: string | null;
+      version: string | null;
+    };
+    auth: {
+      status: AgentAuthReadinessStatus;
+      source?: "environment";
+    };
+    categories: AgentReadinessCategory[];
+  };
 }
 
 export interface AgentRun {

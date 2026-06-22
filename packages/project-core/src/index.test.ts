@@ -166,7 +166,7 @@ describe("agent run contracts", () => {
 
   it("exports canonical workflow lane semantics for natural flow contracts", () => {
     expect(WORKFLOW_LANE_KINDS).toEqual(
-      expect.arrayContaining(["implementation", "fix", "validation", "regression", "review", "commit"]),
+      expect.arrayContaining(["implementation", "fix", "validation", "regression", "review", "commit", "pull_request"]),
     );
   });
 

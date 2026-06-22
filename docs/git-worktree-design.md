@@ -28,9 +28,21 @@ Browser-safe service contracts and mocks live in `packages/git-worktree/src/inde
 - `ChangesetService`
 - `EditorAdapter`
 
-Current desktop code uses the Node subpath for branch facts, git-backed changeset reconciliation, managed worktree create/adopt/clean, and controlled local delivery commits. Managed worktree compare is handled in Electron main with Node-side git evidence collection. The Electron IPC handlers call `NodeGitWorktreeService` or adjacent Node-only helpers and record requested, terminal, or failure workflow events from real side effects.
+Current desktop code uses the Node subpath for branch facts, git-backed changeset reconciliation, managed worktree create/adopt/clean, controlled local delivery commits, delivery branch push, and delivery pull request creation. Managed worktree compare is handled in Electron main with Node-side git evidence collection. The Electron IPC handlers call `NodeGitWorktreeService` or adjacent Node-only helpers and record requested, terminal, or failure workflow events from real side effects.
 
-The backend capability is ahead of the product UI. The full UI flow for comparing candidates, choosing adoption strategy, adopting a candidate, and cleaning rejected managed worktrees is still incomplete.
+The backend capability is ahead of the product UI. The current adopt UI asks for confirmation and sends `strategy: "merge"`; cherry-pick is accepted by backend contracts but is not exposed as a UI choice. The full UI flow for comparing candidates, choosing adoption strategy, adopting a candidate, and cleaning rejected managed worktrees is still incomplete.
+
+## Delivery actions
+
+The node modal **Changes** tab exposes explicit commit, push, and create PR actions for eligible delivery lanes. These are not automatic default behavior for imported user projects.
+
+- `workflow:delivery:commit` creates a controlled local commit and records `workflow.commit.created`.
+- `workflow:delivery:push` pushes the delivery branch after validating recorded commit evidence and records `workflow.delivery.pushed`.
+- `workflow:pullRequest:create` creates a PR after validating the pull request lane, source commit evidence, base branch, remote head, and GitHub CLI state. It records `workflow.pull_request.created`.
+
+Only `workflow.commit.created` currently completes a Flow Kernel commit lane. `workflow.delivery.pushed` and `workflow.pull_request.created` are recorded events only; they do not complete Flow Kernel lanes. Creating a PR is delivery evidence, not task completion.
+
+`workflow.pull_request.checks_recorded` records exact-head PR check evidence; only passed checks for the current head can satisfy check/gate lanes. Merge, post-merge main sync, and cleanup are explicit user-confirmed actions and are never triggered automatically by PR creation or green checks. Branch deletion is default-off and requires separate confirmation. Real GitHub disposable PR smoke belongs to acceptance/test coverage for the delivery remote path, not the default user project flow.
 
 ## Changesets
 

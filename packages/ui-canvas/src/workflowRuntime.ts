@@ -873,11 +873,15 @@ function promptForNodeRun(
 export function sandboxForNodeRun(node: CanvasNode): AgentRunSandbox | undefined {
   if (node.executable === false || node.runtimePolicy?.executable === false) return undefined;
   if (node.agent !== "codex") return undefined;
-  if (node.runtimePolicy?.source === "workflow_projection" && node.runtimePolicy.trusted) return node.runtimePolicy.sandbox;
   const laneKind = node.display?.meta[0] ?? "";
   const laneText = `${laneKind} ${node.title}`.toLowerCase();
+  if (node.runtimePolicy?.source === "workflow_projection" && node.runtimePolicy.trusted) {
+    if (node.runtimePolicy.sandbox === "read-only" && /browser|screenshot/.test(laneText)) return "danger-full-access";
+    return node.runtimePolicy.sandbox;
+  }
   if (laneKind === "commit" || /\bcommit\b/.test(laneText)) return "danger-full-access";
-  if (/implementation|implement|change|update|edit|browser|screenshot/.test(laneText)) return "workspace-write";
+  if (/browser|screenshot/.test(laneText)) return "danger-full-access";
+  if (/implementation|implement|change|update|edit/.test(laneText)) return "workspace-write";
   return undefined;
 }
 

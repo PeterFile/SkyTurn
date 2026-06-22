@@ -9,12 +9,15 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption } from "@skyturn/project-core";
 import {
+  checkDeliveryPullRequest,
   createDeliveryCommit,
   createDeliveryPullRequest,
   createGitChangesetService,
   createNodeGitWorktreeService,
+  mergeDeliveryPullRequest,
   pushDeliveryBranch,
   getGitBranchFacts,
+  syncDeliveryMain,
   type ManagedWorktreeWorkflowEvent,
   worktreeMetadataForVariant,
 } from "./node.js";
@@ -1204,6 +1207,343 @@ describe("delivery remote actions", () => {
       });
     });
   });
+
+  it("records passed pull request checks only for the exact expected head sha", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-checks-pass-");
+    tempRoots.push(repo.tempRoot);
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prUrl: "https://github.com/acme/skyturn/pull/42",
+      prHeadSha: repo.baseCommit,
+      checksJson: [
+        { name: "unit", state: "SUCCESS", workflow: "ci", link: "https://github.com/acme/skyturn/actions/runs/1" },
+        { name: "typecheck", bucket: "pass", workflow: "ci" },
+      ],
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      const evidence = await checkDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 42,
+        expectedHeadSha: repo.baseCommit,
+      });
+
+      expect(evidence).toMatchObject({
+        status: "passed",
+        number: 42,
+        headSha: repo.baseCommit,
+        checks: [
+          { name: "unit", status: "passed" },
+          { name: "typecheck", status: "passed" },
+        ],
+        command: { command: "gh", ok: true, exitCode: 0 },
+      });
+      expect(evidence.summary).toContain("2 passed");
+    });
+  });
+
+  it("reports failed and pending pull request checks without merging", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-checks-status-");
+    tempRoots.push(repo.tempRoot);
+    const failedGh = await installFakeGh(join(repo.tempRoot, "failed"), {
+      prHeadSha: repo.baseCommit,
+      checksJson: [
+        { name: "unit", state: "FAILURE", workflow: "ci" },
+        { name: "typecheck", state: "SUCCESS", workflow: "ci" },
+      ],
+      checksExitCode: 1,
+    });
+    const pendingGh = await installFakeGh(join(repo.tempRoot, "pending"), {
+      prHeadSha: repo.baseCommit,
+      checksJson: [
+        { name: "unit", state: "PENDING", workflow: "ci" },
+      ],
+      checksExitCode: 8,
+    });
+
+    await withFakeGh(failedGh.binDir, failedGh.argsPath, async () => {
+      await expect(checkDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: repo.baseCommit,
+      })).resolves.toMatchObject({
+        status: "failed",
+        checks: expect.arrayContaining([{ name: "unit", status: "failed", state: "FAILURE", workflow: "ci" }]),
+        command: { ok: false, exitCode: 1 },
+      });
+      expect(existsSync(failedGh.argsPath)).toBe(false);
+    });
+
+    await withFakeGh(pendingGh.binDir, pendingGh.argsPath, async () => {
+      await expect(checkDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: repo.baseCommit,
+      })).resolves.toMatchObject({
+        status: "pending",
+        checks: [{ name: "unit", status: "pending" }],
+        command: { ok: false, exitCode: 8 },
+      });
+      expect(existsSync(pendingGh.argsPath)).toBe(false);
+    });
+  });
+
+  it("rejects pull request checks when GitHub reports a stale head sha", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-checks-stale-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    const commit = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add exact head check",
+    });
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prHeadSha: repo.baseCommit,
+      checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      await expect(checkDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: commit.commitSha,
+      })).rejects.toMatchObject({
+        code: "REMOTE_HEAD_MISMATCH",
+      });
+      expect(existsSync(fakeGh.argsPath)).toBe(false);
+    });
+  });
+
+  it("rejects pull request checks when the PR head changes after checks are read", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-checks-race-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "force pushed\n");
+    const forcePushCommit = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): force push after checks",
+    });
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prHeadShas: [repo.baseCommit, forcePushCommit.commitSha],
+      checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      await expect(checkDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: repo.baseCommit,
+      })).rejects.toMatchObject({
+        code: "REMOTE_HEAD_MISMATCH",
+      });
+      expect(existsSync(fakeGh.argsPath)).toBe(false);
+    });
+  });
+
+  it("parses raw checks JSON before redacting secret-like descriptions and stderr", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-checks-secrets-");
+    tempRoots.push(repo.tempRoot);
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prHeadSha: repo.baseCommit,
+      checksJson: [
+        {
+          name: "unit",
+          state: "SUCCESS",
+          workflow: "ci",
+          description: "Token line: token=secret-value",
+        },
+      ],
+      checksStderr: "Authorization: Bearer ghp_checks_secret",
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      const evidence = await checkDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: repo.baseCommit,
+      });
+
+      expect(evidence.checks).toMatchObject([
+        { name: "unit", status: "passed", detail: "Token line: token=[REDACTED]" },
+      ]);
+      expect(evidence.command.stderr).toContain("Authorization: Bearer [REDACTED]");
+      expect(JSON.stringify(evidence)).not.toContain("secret-value");
+      expect(JSON.stringify(evidence)).not.toContain("ghp_checks_secret");
+    });
+  });
+
+  it("rejects squash merge when pull request checks are not passed", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-merge-checks-");
+    tempRoots.push(repo.tempRoot);
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prHeadSha: repo.baseCommit,
+      checksJson: [{ name: "unit", state: "PENDING", workflow: "ci" }],
+      checksExitCode: 8,
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      await expect(mergeDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: repo.baseCommit,
+        subject: "feat(delivery): merge exact checked pr",
+        body: "Merge after checks pass.",
+      })).rejects.toMatchObject({
+        code: "DELIVERY_REJECTED",
+        message: expect.stringContaining("checks"),
+      });
+      expect(existsSync(fakeGh.argsPath)).toBe(false);
+    });
+  });
+
+  it("rejects squash merge when the expected head sha does not match the PR", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-merge-stale-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed\n");
+    const commit = await createDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      files: ["feature.txt"],
+      subject: "feat(delivery): add exact merge head",
+    });
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prHeadSha: repo.baseCommit,
+      checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      await expect(mergeDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: commit.commitSha,
+        subject: "feat(delivery): merge exact checked pr",
+      })).rejects.toMatchObject({
+        code: "REMOTE_HEAD_MISMATCH",
+      });
+      expect(existsSync(fakeGh.argsPath)).toBe(false);
+    });
+  });
+
+  it("squash merges with a Conventional Commit subject and redacted command evidence", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-merge-");
+    tempRoots.push(repo.tempRoot);
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prHeadSha: repo.baseCommit,
+      checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      await expect(mergeDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: repo.baseCommit,
+        subject: "merge this",
+      })).rejects.toMatchObject({
+        code: "INVALID_INPUT",
+      });
+
+      const evidence = await mergeDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prUrl: "https://github.com/acme/skyturn/pull/1",
+        expectedHeadSha: repo.baseCommit,
+        subject: "feat(delivery): merge exact checked pr",
+        body: "Token line: token=secret-value",
+      });
+
+      expect(evidence).toMatchObject({
+        status: "merged",
+        number: 1,
+        headSha: repo.baseCommit,
+        subject: "feat(delivery): merge exact checked pr",
+        checks: [{ name: "unit", status: "passed" }],
+        command: { command: "gh", ok: true, exitCode: 0 },
+      });
+      expect(evidence.command.args).toContain("--squash");
+      expect(evidence.command.args).not.toContain("--delete-branch");
+      expect(evidence.command.args.join("\n")).not.toContain("secret-value");
+      expect(evidence.command.args.join("\n")).toContain("token=[REDACTED]");
+    });
+  });
+
+  it("passes the expected head sha to gh merge's native match guard", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-merge-match-head-");
+    tempRoots.push(repo.tempRoot);
+    const fakeGh = await installFakeGh(repo.tempRoot, {
+      prHeadSha: repo.baseCommit,
+      checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+      mergeRequiresMatchHead: repo.baseCommit,
+    });
+
+    await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+      const evidence = await mergeDeliveryPullRequest({
+        projectRoot: repo.repoRoot,
+        prNumber: 1,
+        expectedHeadSha: repo.baseCommit,
+        subject: "feat(delivery): merge exact checked pr",
+      });
+
+      const matchIndex = evidence.command.args.indexOf("--match-head-commit");
+      expect(matchIndex).toBeGreaterThan(-1);
+      expect(evidence.command.args[matchIndex + 1]).toBe(repo.baseCommit);
+    });
+  });
+
+  it("syncs local main with fetch and pull --ff-only", async () => {
+    const repo = await createTestRepo("skyturn-delivery-sync-main-");
+    tempRoots.push(repo.tempRoot);
+    const remotePath = join(repo.tempRoot, "remote.git");
+    const upstreamPath = join(repo.tempRoot, "upstream");
+    git(repo.tempRoot, ["init", "--bare", "remote.git"]);
+    git(repo.repoRoot, ["remote", "add", "origin", remotePath]);
+    git(repo.repoRoot, ["push", "origin", "main"]);
+    git(repo.tempRoot, ["clone", remotePath, upstreamPath]);
+    git(upstreamPath, ["checkout", "-b", "main", "origin/main"]);
+    git(upstreamPath, ["config", "user.email", "skyturn@example.test"]);
+    git(upstreamPath, ["config", "user.name", "SkyTurn Test"]);
+    writeFileSync(join(upstreamPath, "remote.txt"), "remote\n");
+    git(upstreamPath, ["add", "remote.txt"]);
+    git(upstreamPath, ["commit", "-m", "feat(delivery): update remote main"]);
+    git(upstreamPath, ["push", "origin", "main"]);
+
+    const evidence = await syncDeliveryMain({ projectRoot: repo.repoRoot });
+
+    expect(evidence).toMatchObject({
+      status: "synced",
+      mainBranch: "main",
+      commands: [
+        { command: "git", args: ["fetch", "origin", "main"], ok: true },
+        { command: "git", args: ["pull", "--ff-only", "origin", "main"], ok: true },
+      ],
+    });
+    expect(readFileSync(join(repo.repoRoot, "remote.txt"), "utf8")).toBe("remote\n");
+  });
+
+  it("reports sync main ff-only failures cleanly", async () => {
+    const repo = await createTestRepo("skyturn-delivery-sync-main-fail-");
+    tempRoots.push(repo.tempRoot);
+    const remotePath = join(repo.tempRoot, "remote.git");
+    const upstreamPath = join(repo.tempRoot, "upstream");
+    git(repo.tempRoot, ["init", "--bare", "remote.git"]);
+    git(repo.repoRoot, ["remote", "add", "origin", remotePath]);
+    git(repo.repoRoot, ["push", "origin", "main"]);
+    git(repo.tempRoot, ["clone", remotePath, upstreamPath]);
+    git(upstreamPath, ["checkout", "-b", "main", "origin/main"]);
+    git(upstreamPath, ["config", "user.email", "skyturn@example.test"]);
+    git(upstreamPath, ["config", "user.name", "SkyTurn Test"]);
+    writeFileSync(join(upstreamPath, "remote.txt"), "remote\n");
+    git(upstreamPath, ["add", "remote.txt"]);
+    git(upstreamPath, ["commit", "-m", "feat(delivery): update remote main"]);
+    git(upstreamPath, ["push", "origin", "main"]);
+    writeFileSync(join(repo.repoRoot, "local.txt"), "local\n");
+    git(repo.repoRoot, ["add", "local.txt"]);
+    git(repo.repoRoot, ["commit", "-m", "feat(delivery): update local main"]);
+
+    await expect(syncDeliveryMain({ projectRoot: repo.repoRoot })).rejects.toMatchObject({
+      code: "DELIVERY_REJECTED",
+      message: expect.stringContaining("pull"),
+    });
+  });
 });
 
 describe("GitChangesetService", () => {
@@ -1412,11 +1752,48 @@ async function gitAsync(cwd: string, ...args: string[]): Promise<void> {
 
 async function installFakeGh(
   tempRoot: string,
-  options: { prUrl?: string; authStatus?: number; authStderr?: string },
+  options: {
+    prUrl?: string;
+    authStatus?: number;
+    authStderr?: string;
+    prHeadSha?: string;
+    prState?: string;
+    prMergeable?: string | boolean;
+    prHeadShas?: string[];
+    checksJson?: unknown;
+    checksExitCode?: number;
+    checksStderr?: string;
+    mergeExitCode?: number;
+    mergeStderr?: string;
+    mergeRequiresMatchHead?: string;
+  },
 ): Promise<{ binDir: string; argsPath: string }> {
   const binDir = join(tempRoot, "fake-bin");
   const argsPath = join(tempRoot, "gh-args.txt");
+  const viewCountPath = join(tempRoot, "gh-view-count.txt");
   await mkdir(binDir, { recursive: true });
+  const prUrl = options.prUrl ?? "https://github.com/acme/skyturn/pull/1";
+  const prNumber = Number(prUrl.match(/\/pull\/(\d+)$/)?.[1] ?? "1");
+  const prHeadShas = options.prHeadShas && options.prHeadShas.length > 0
+    ? options.prHeadShas
+    : [options.prHeadSha ?? "0000000000000000000000000000000000000000"];
+  const prViewJsons = prHeadShas.map((headSha) => JSON.stringify({
+    number: prNumber,
+    url: prUrl,
+    headRefOid: headSha,
+    state: options.prState ?? "OPEN",
+    mergeable: options.prMergeable ?? "MERGEABLE",
+  }));
+  const checksJson = JSON.stringify(options.checksJson ?? [
+    { name: "unit", state: "SUCCESS", workflow: "ci", link: "https://github.com/acme/skyturn/actions/runs/1" },
+  ]);
+  const viewCases = prViewJsons.map((json, index) => [
+    `    ${index + 1}) cat <<'JSON'`,
+    json,
+    "JSON",
+    "      ;;",
+  ].join("\n"));
+  const lastViewJson = prViewJsons[prViewJsons.length - 1];
   const script = [
     "#!/bin/sh",
     "if [ \"$1\" = \"--version\" ]; then echo \"gh version 2.0.0\"; exit 0; fi",
@@ -1425,9 +1802,41 @@ async function installFakeGh(
     `  exit ${options.authStatus ?? 0}`,
     "fi",
     "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then",
-    "  printf '%s\\n' \"$@\" > \"$SKYTURN_FAKE_GH_ARGS\"",
-    `  echo "${options.prUrl ?? "https://github.com/acme/skyturn/pull/1"}"`,
+      "  printf '%s\\n' \"$@\" > \"$SKYTURN_FAKE_GH_ARGS\"",
+    `  echo "${prUrl}"`,
     "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then",
+    `  count="$(cat "${viewCountPath}" 2>/dev/null || echo 0)"`,
+    "  count=$((count + 1))",
+    `  echo "$count" > "${viewCountPath}"`,
+    "  case \"$count\" in",
+    ...viewCases,
+    "    *) cat <<'JSON'",
+    lastViewJson,
+    "JSON",
+    "      ;;",
+    "  esac",
+    "  exit 0",
+    "fi",
+    "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then",
+    `  cat <<'JSON'\n${checksJson}\nJSON`,
+    `  echo "${options.checksStderr ?? ""}" >&2`,
+    `  exit ${options.checksExitCode ?? 0}`,
+    "fi",
+    "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then",
+    "  printf '%s\\n' \"$@\" > \"$SKYTURN_FAKE_GH_ARGS\"",
+    ...(options.mergeRequiresMatchHead ? [
+      "  found_match_head=0",
+      "  previous_arg=",
+      "  for arg in \"$@\"; do",
+      `    if [ "$previous_arg" = "--match-head-commit" ] && [ "$arg" = "${options.mergeRequiresMatchHead}" ]; then found_match_head=1; fi`,
+      "    previous_arg=\"$arg\"",
+      "  done",
+      "  if [ \"$found_match_head\" -ne 1 ]; then echo \"missing --match-head-commit\" >&2; exit 7; fi",
+    ] : []),
+    `  echo "${options.mergeStderr ?? ""}" >&2`,
+    `  exit ${options.mergeExitCode ?? 0}`,
     "fi",
     "exit 2",
     "",

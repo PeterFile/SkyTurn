@@ -30,6 +30,9 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:delivery:commit",
     "workflow:delivery:push",
     "workflow:pullRequest:create",
+    "workflow:pullRequest:checks",
+    "workflow:pullRequest:merge",
+    "workflow:delivery:syncMain",
     "workflow:changeset",
     "workflow:changeset:reconcileFinal",
     "changeset:get",
@@ -139,6 +142,49 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(pullRequestHandler, /appendWorkflowEvent/);
   assert.match(pullRequestHandler, /status:\s*"created"/);
   assert.doesNotMatch(pullRequestHandler, /status:\s*"requested"/);
+
+  const pullRequestChecksHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+    main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+  );
+  assert.match(pullRequestChecksHandler, /checkDeliveryPullRequest/);
+  assert.match(pullRequestChecksHandler, /findDeliveryPullRequestEvidence/);
+  assert.match(pullRequestChecksHandler, /workflow\.pull_request\.checks_recorded/);
+  assert.match(pullRequestChecksHandler, /appendWorkflowEvent/);
+  assert.match(pullRequestChecksHandler, /status:\s*"checks_recorded"/);
+  assert.doesNotMatch(pullRequestChecksHandler, /mergeDeliveryPullRequest/);
+  assert.doesNotMatch(pullRequestChecksHandler, /cleanManagedWorktree/);
+
+  const pullRequestMergeHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+    main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+  );
+  assert.match(pullRequestMergeHandler, /mergeDeliveryPullRequest/);
+  assert.match(pullRequestMergeHandler, /findDeliveryPullRequestEvidence/);
+  assert.match(pullRequestMergeHandler, /findDeliveryPullRequestChecksEvidence/);
+  assert.match(pullRequestMergeHandler, /workflow\.pull_request\.merged/);
+  assert.match(pullRequestMergeHandler, /appendWorkflowEvent/);
+  assert.match(pullRequestMergeHandler, /status:\s*"merged"/);
+  assert.doesNotMatch(pullRequestMergeHandler, /cleanManagedWorktree/);
+  assert.doesNotMatch(pullRequestMergeHandler, /deleteBranch/);
+
+  const deliverySyncMainHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  assert.match(deliverySyncMainHandler, /syncDeliveryMain/);
+  assert.match(deliverySyncMainHandler, /workflow\.delivery\.main_synced/);
+  assert.match(deliverySyncMainHandler, /appendWorkflowEvent/);
+  assert.match(deliverySyncMainHandler, /status:\s*"synced"/);
+  assert.doesNotMatch(deliverySyncMainHandler, /cleanManagedWorktree/);
+  assert.doesNotMatch(deliverySyncMainHandler, /deleteBranch/);
+});
+
+test("MVP demo links the temporary React app to desktop package dependencies", async () => {
+  const demo = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
+  assert.match(demo, /const desktopRoot = dirname\(dirname\(fileURLToPath\(import\.meta\.url\)\)\)/);
+  assert.match(demo, /symlink\(join\(desktopRoot,\s*"node_modules"\),\s*join\(projectRoot,\s*"node_modules"\),\s*"dir"\)/);
+  assert.doesNotMatch(demo, /symlink\(join\(repoRoot,\s*"node_modules"\),\s*join\(projectRoot,\s*"node_modules"\),\s*"dir"\)/);
 });
 
 test("workflow delivery commit validates known sessions before creating git commits", async () => {
@@ -165,6 +211,43 @@ test("workflow delivery commit validates known sessions before creating git comm
   assert.ok(commitIndex > importIndex, "git commit creation must stay after session validation");
   assert.match(helperSource, /store\.materializeCanvasSession\(sessionId\)/);
   assert.match(helperSource, /workflowIpcError\("UNKNOWN_SESSION"/);
+});
+
+test("workflow events expose renderer-safe delivery lifecycle facts without raw payloads", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const workflowEventsHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:events"'),
+    main.indexOf('ipcMain.handle("workflow:userDecision:answer"'),
+  );
+  const redactor = main.slice(
+    main.indexOf("function redactWorkflowEventForRenderer"),
+    main.indexOf("function workflowEventSummary"),
+  );
+  const deliveryFactsHelper = main.slice(
+    main.indexOf("function deliveryLifecycleFactsForRenderer"),
+    main.indexOf("function workflowEventSummary"),
+  );
+
+  assert.match(workflowEventsHandler, /redactWorkflowEventForRenderer/);
+  assert.match(redactor, /deliveryLifecycleFactsForRenderer\(event\)/);
+  assert.match(redactor, /payload:\s*\{[\s\S]*redacted:\s*true[\s\S]*summary:\s*workflowEventSummary\(event\.kind\)[\s\S]*\.\.\.\(delivery \? \{ delivery \} : \{\}\)/);
+  for (const eventKind of [
+    "workflow.commit.created",
+    "workflow.delivery.pushed",
+    "workflow.pull_request.created",
+    "workflow.pull_request.checks_recorded",
+    "workflow.pull_request.merged",
+    "workflow.delivery.main_synced",
+  ]) {
+    assert.match(deliveryFactsHelper, new RegExp(`case "${escapeRegExp(eventKind)}"`));
+  }
+  assert.match(deliveryFactsHelper, /kind:\s*"commit"/);
+  assert.match(deliveryFactsHelper, /kind:\s*"push"/);
+  assert.match(deliveryFactsHelper, /kind:\s*"pull_request"/);
+  assert.match(deliveryFactsHelper, /kind:\s*"checks"/);
+  assert.match(deliveryFactsHelper, /kind:\s*"merge"/);
+  assert.match(deliveryFactsHelper, /kind:\s*"main_synced"/);
+  assert.doesNotMatch(deliveryFactsHelper, /worktreePath|command|commands|stdout|stderr|rawStdout/);
 });
 
 test("workflow delivery push validates session, commit lane, worktree, and commit evidence before git push", async () => {
@@ -215,6 +298,116 @@ test("workflow pull request creation validates PR lane, commit evidence, and bas
   assert.ok(baseIndex > evidenceIndex, "pull request IPC must validate base/head before gh create");
   assert.ok(importIndex > baseIndex, "pull request IPC must validate inputs before importing gh implementation");
   assert.ok(createIndex > importIndex, "gh pr create must stay after server-side guards");
+});
+
+test("workflow pull request checks validates recorded PR evidence before polling gh checks", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const checksHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+    main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+  );
+
+  const sessionIndex = checksHandler.indexOf("const sessionId = assertWorkflowSessionId");
+  const canvasIndex = checksHandler.indexOf("assertKnownWorkflowCanvasSession");
+  const laneIndex = checksHandler.indexOf("assertWorkflowPullRequestLaneKind");
+  const evidenceIndex = checksHandler.indexOf("findDeliveryPullRequestEvidence");
+  const matchIndex = checksHandler.indexOf("assertDeliveryPullRequestEvidenceInputMatches");
+  const importIndex = checksHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const checksIndex = checksHandler.indexOf("checkDeliveryPullRequest({");
+
+  assert.ok(sessionIndex >= 0, "checks IPC must require a workflow sessionId");
+  assert.ok(canvasIndex > sessionIndex, "checks IPC must validate the CanvasSession");
+  assert.ok(laneIndex > canvasIndex, "checks IPC must validate a pull_request lane");
+  assert.ok(evidenceIndex > laneIndex, "checks IPC must load recorded PR evidence");
+  assert.ok(matchIndex > evidenceIndex, "checks IPC must reject stale expectedHeadSha before gh checks");
+  assert.ok(importIndex > matchIndex, "checks IPC must validate PR evidence before importing gh implementation");
+  assert.ok(checksIndex > importIndex, "gh checks must stay after server-side guards");
+});
+
+test("workflow pull request merge stays explicit and separate from cleanup", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const mergeHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+    main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+  );
+
+  const sessionIndex = mergeHandler.indexOf("const sessionId = assertWorkflowSessionId");
+  const laneIndex = mergeHandler.indexOf("assertWorkflowPullRequestLaneKind");
+  const evidenceIndex = mergeHandler.indexOf("findDeliveryPullRequestEvidence");
+  const checksEvidenceIndex = mergeHandler.indexOf("findDeliveryPullRequestChecksEvidence");
+  const matchIndex = mergeHandler.indexOf("assertDeliveryPullRequestEvidenceInputMatches");
+  const importIndex = mergeHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const mergeIndex = mergeHandler.indexOf("mergeDeliveryPullRequest({");
+  const eventIndex = mergeHandler.indexOf("workflow.pull_request.merged");
+
+  assert.ok(sessionIndex >= 0, "merge IPC must require a workflow sessionId");
+  assert.ok(laneIndex > sessionIndex, "merge IPC must validate an explicit pull_request lane");
+  assert.ok(evidenceIndex > laneIndex, "merge IPC must load recorded PR evidence");
+  assert.ok(checksEvidenceIndex > evidenceIndex, "merge IPC must require previously recorded passed checks");
+  assert.ok(matchIndex > checksEvidenceIndex, "merge IPC must reject stale expectedHeadSha before gh merge");
+  assert.ok(importIndex > matchIndex, "merge IPC must validate recorded evidence before importing gh implementation");
+  assert.ok(mergeIndex > importIndex, "gh merge must only happen inside the explicit merge IPC");
+  assert.ok(eventIndex > mergeIndex, "merged event must be appended only after gh merge returns");
+  assert.doesNotMatch(mergeHandler, /workflow:worktree:clean/);
+  assert.doesNotMatch(mergeHandler, /cleanManagedWorktree/);
+  assert.doesNotMatch(mergeHandler, /deleteBranch:\s*true/);
+});
+
+test("workflow delivery sync main requires recorded PR merge evidence for the requested head", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const syncHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  const helperSource = main.slice(
+    main.indexOf("function findDeliveryPullRequestMergeEvidence"),
+    main.indexOf("function assertDeliveryEvidenceInputMatches"),
+  );
+
+  const sessionIndex = syncHandler.indexOf("const sessionId = assertWorkflowSessionId");
+  const canvasIndex = syncHandler.indexOf("assertKnownWorkflowCanvasSession");
+  const laneIndex = syncHandler.indexOf('const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId")');
+  const laneGuardIndex = syncHandler.indexOf("assertWorkflowPullRequestLaneKind");
+  const prEvidenceIndex = syncHandler.indexOf("findDeliveryPullRequestEvidence");
+  const matchIndex = syncHandler.indexOf("assertDeliveryPullRequestEvidenceInputMatches");
+  const mergeEvidenceIndex = syncHandler.indexOf("findDeliveryPullRequestMergeEvidence");
+  const importIndex = syncHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const syncIndex = syncHandler.indexOf("syncDeliveryMain({");
+
+  assert.ok(laneIndex > canvasIndex, "sync main IPC must require an explicit pull_request lane after session validation");
+  assert.ok(laneGuardIndex > laneIndex, "sync main IPC must validate the lane is a pull_request lane");
+  assert.ok(prEvidenceIndex > laneGuardIndex, "sync main IPC must load recorded PR evidence");
+  assert.ok(matchIndex > prEvidenceIndex, "sync main IPC must reject stale expectedHeadSha before sync");
+  assert.ok(mergeEvidenceIndex > matchIndex, "sync main IPC must require recorded merge evidence for that PR/head");
+  assert.ok(importIndex > mergeEvidenceIndex, "ff-only sync must stay after post-merge evidence validation");
+  assert.ok(syncIndex > importIndex, "git sync must stay after server-side guards");
+  assert.match(helperSource, /workflow\.pull_request\.merged/);
+  assert.match(helperSource, /prNumber/);
+  assert.match(helperSource, /headSha/);
+  assert.match(helperSource, /status[^\n]+merged/);
+});
+
+test("workflow delivery sync main uses an explicit ff-only IPC and records main_synced", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const syncHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+
+  const sessionIndex = syncHandler.indexOf("const sessionId = assertWorkflowSessionId");
+  const canvasIndex = syncHandler.indexOf("assertKnownWorkflowCanvasSession");
+  const importIndex = syncHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const syncIndex = syncHandler.indexOf("syncDeliveryMain({");
+  const eventIndex = syncHandler.indexOf("workflow.delivery.main_synced");
+
+  assert.ok(sessionIndex >= 0, "sync main IPC must require a workflow sessionId to append evidence");
+  assert.ok(canvasIndex > sessionIndex, "sync main IPC must validate the CanvasSession");
+  assert.ok(importIndex > canvasIndex, "sync main IPC must validate session before importing git implementation");
+  assert.ok(syncIndex > importIndex, "git sync must stay after server-side guards");
+  assert.ok(eventIndex > syncIndex, "main_synced event must be appended after ff-only sync");
+  assert.match(syncHandler, /mainBranch:\s*optionalText\(readField\(input,\s*"mainBranch"\)\)\s*\?\?\s*"main"/);
+  assert.doesNotMatch(syncHandler, /cleanManagedWorktree/);
+  assert.doesNotMatch(syncHandler, /deleteBranch/);
 });
 
 test("workflow delivery commit validates a commit lane before creating git commits", async () => {
@@ -340,9 +533,17 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "createDeliveryCommit",
     "pushDeliveryBranch",
     "createPullRequest",
+    "checkPullRequest",
+    "mergePullRequest",
+    "syncMain",
     "reconcileFinalChangeset",
     "getProjectBranchFacts",
     "createWorkflowDeliveryCommit",
+    "pushWorkflowDeliveryBranch",
+    "createWorkflowPullRequest",
+    "checkWorkflowPullRequest",
+    "mergeWorkflowPullRequest",
+    "syncWorkflowMain",
   ]) {
     assert.match(preload, new RegExp(`${wrapper}\\s*:`));
   }
@@ -415,6 +616,40 @@ test("workflow delivery remote public type contracts return push and PR evidence
   assert.match(workflowContract, /evidence:\s*DeliveryPullRequestEvidence/);
   assert.match(devflowContract, /status:\s*"pushed"/);
   assert.match(devflowContract, /status:\s*"created"/);
+});
+
+test("workflow delivery remote public type contracts return checks, merge, and sync evidence", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const workflowContract = persistence.slice(
+    persistence.indexOf("pushDeliveryBranch:"),
+    persistence.indexOf("getChangeset:"),
+  );
+  const devflowContract = persistence.slice(
+    persistence.indexOf("createWorkflowDeliveryCommit:"),
+    persistence.indexOf("onRunEvent:"),
+  );
+
+  assert.match(workflowContract, /status:\s*"checks_recorded"/);
+  assert.match(workflowContract, /evidence:\s*DeliveryPullRequestChecksEvidence/);
+  assert.match(workflowContract, /status:\s*"merged"/);
+  assert.match(workflowContract, /evidence:\s*DeliveryPullRequestMergeEvidence/);
+  assert.match(workflowContract, /status:\s*"synced"/);
+  assert.match(workflowContract, /evidence:\s*DeliveryMainSyncEvidence/);
+  assert.match(devflowContract, /status:\s*"checks_recorded"/);
+  assert.match(devflowContract, /status:\s*"merged"/);
+  assert.match(devflowContract, /status:\s*"synced"/);
+});
+
+test("workflow kernel knows delivery checks, merge, and main sync event names", async () => {
+  const kernel = await readFile(join(root, "..", "..", "packages", "workflow-kernel", "src", "index.ts"), "utf8");
+  const eventKinds = kernel.slice(
+    kernel.indexOf("export type FlowEventKind"),
+    kernel.indexOf("export interface FlowEvent"),
+  );
+
+  assert.match(eventKinds, /"workflow\.pull_request\.checks_recorded"/);
+  assert.match(eventKinds, /"workflow\.pull_request\.merged"/);
+  assert.match(eventKinds, /"workflow\.delivery\.main_synced"/);
 });
 
 test("workflow adopt IPC records a failed adoption before rejecting boundary violations", async () => {

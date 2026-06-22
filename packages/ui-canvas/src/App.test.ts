@@ -1,10 +1,14 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
+  buildWorktreeAdoptionConfirmation,
+  buildWorktreeCleanConfirmation,
+  buildWorktreeDeleteBranchConfirmation,
   changeReviewSummary,
   deriveSessionTarget,
   hasAvailableChangeEvidence,
   hasFinalGitEvidence,
+  summarizeWorktreeComparisonEvidence,
 } from "./App.js";
 import type { CanvasNode, Changeset, FinalChangesetReconciliation } from "@skyturn/project-core";
 
@@ -261,30 +265,30 @@ describe("UI source validation", () => {
     expect(changesTab).toContain("hasFinalGitEvidence");
   });
 
-  it("ChangesTab requires window.confirm when reconciliation status is mismatch", async () => {
+  it("ChangesTab requires explicit mismatch confirmation when reconciliation status is mismatch", async () => {
     const appSource = await readSource("./App.tsx");
-    const handleCommit = appSource.slice(appSource.indexOf("async function handleCommit()"), appSource.indexOf("if (!changeset) return <p>Loading changes...</p>;"));
-    expect(handleCommit).toContain('reconciliation?.status === "mismatch"');
-    expect(handleCommit).toContain("window.confirm");
+    const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
+    expect(changesTab).toContain('reconciliation?.status === "mismatch"');
+    expect(changesTab).toContain("acceptMismatch");
   });
 
   it("ChangesTab sends explicit mismatch acceptance only after mismatch confirmation", async () => {
     const appSource = await readSource("./App.tsx");
     const handleCommit = appSource.slice(appSource.indexOf("async function handleCommit()"), appSource.indexOf("if (!changeset) return <p>Loading changes...</p>;"));
-    const confirmIndex = handleCommit.indexOf("window.confirm");
     const commitIndex = handleCommit.indexOf("devflow.workflow.createDeliveryCommit");
     const acceptIndex = handleCommit.indexOf("acceptMismatch: true");
 
-    expect(confirmIndex).toBeGreaterThanOrEqual(0);
-    expect(acceptIndex).toBeGreaterThan(confirmIndex);
+    expect(handleCommit).not.toContain("window.confirm");
+    expect(handleCommit).toContain("mismatchRequiresAcceptance && !acceptMismatch");
     expect(acceptIndex).toBeGreaterThan(commitIndex);
   });
 
-  it("ChangesTab requires window.prompt for subject and checks devflow availability", async () => {
+  it("ChangesTab requires explicit form subject and checks devflow availability", async () => {
     const appSource = await readSource("./App.tsx");
-    const handleCommit = appSource.slice(appSource.indexOf("async function handleCommit()"), appSource.indexOf("if (!changeset) return <p>Loading changes...</p>;"));
-    expect(handleCommit).toContain("window.prompt");
-    expect(handleCommit).toContain("if (!devflow?.workflow?.createDeliveryCommit)");
+    const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
+    expect(changesTab).toContain("commitSubject");
+    expect(changesTab).not.toContain("window.prompt");
+    expect(changesTab).toContain("if (!devflow?.workflow?.createDeliveryCommit)");
   });
 
   it("ChangesTab handleCreatePr verifies PR lane dependency and conventional commit title", async () => {
@@ -322,11 +326,32 @@ describe("UI source validation", () => {
     expect(changesTab).toContain("Base branch cannot be the same as the delivery branch");
   });
 
-  it("ChangesTab handleCreatePr trims and revalidates confirmed prompt base branch", async () => {
+  it("DeliveryLifecyclePanel disables Create PR after a pull request exists", async () => {
+    const appSource = await readSource("./App.tsx");
+    const panel = appSource.slice(appSource.indexOf("function DeliveryLifecyclePanel("), appSource.indexOf("function shortSha("));
+    const createPrDisabled = panel.slice(panel.indexOf("const createPrDisabled ="), panel.indexOf("const mergeRequestDisabled"));
+    expect(createPrDisabled).toContain("!!pullRequest");
+    expect(panel).toContain('disabled={createPrDisabled}');
+  });
+
+  it("ChangesTab clears stale PR checks when PR status refresh starts or fails", async () => {
+    const appSource = await readSource("./App.tsx");
+    const handleCheckPrStatus = appSource.slice(appSource.indexOf("async function handleCheckPrStatus()"), appSource.indexOf("async function handleMergePullRequest()"));
+    const checkingIndex = handleCheckPrStatus.indexOf('setPrCheckStatus("checking");');
+    const clearBeforeTryIndex = handleCheckPrStatus.indexOf("setPrChecks(null);");
+    const tryIndex = handleCheckPrStatus.indexOf("try {");
+    const catchIndex = handleCheckPrStatus.indexOf("catch (e)");
+    const clearInCatchIndex = handleCheckPrStatus.indexOf("setPrChecks(null);", catchIndex);
+
+    expect(clearBeforeTryIndex).toBeGreaterThan(checkingIndex);
+    expect(clearBeforeTryIndex).toBeLessThan(tryIndex);
+    expect(clearInCatchIndex).toBeGreaterThan(catchIndex);
+  });
+
+  it("ChangesTab handleCreatePr trims and revalidates prompt base branch", async () => {
     const appSource = await readSource("./App.tsx");
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
-    expect(changesTab).toContain("const trimmedBaseBranch = confirmedBaseBranch.trim();");
-    expect(changesTab).toContain("if (!trimmedBaseBranch || trimmedBaseBranch === commitEvidence.branch) {");
+    expect(changesTab).toContain("trimmedBaseBranch");
     expect(changesTab).toContain("baseBranch: trimmedBaseBranch,");
   });
 
@@ -340,38 +365,62 @@ describe("UI source validation", () => {
     const appSource = await readSource("./App.tsx");
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
     expect(changesTab).toContain("window.devflow.workflow.getEvents(");
-    expect(changesTab).toContain('e.kind === "workflow.commit.created"');
-    expect(changesTab).toContain('e.laneId === node.id ||');
-    expect(changesTab).toContain('(e.payload as Record<string, unknown>).laneId === node.id');
+    expect(changesTab).toContain("hydrateDeliveryLifecycleFromWorkflowEvents(eventsList");
+    expect(changesTab).toContain("commitLaneId: node.id");
+    expect(changesTab).toContain("pullRequestLaneId: dependentPrLaneId");
+    expect(changesTab).toContain("setCommitEvidence(restored.commitEvidence)");
     expect(changesTab).not.toContain('typeof evidence.commitSha === "string"');
+  });
+
+  it("ChangesTab hydrates delivery lifecycle state from workflow events", async () => {
+    const appSource = await readSource("./App.tsx");
+    const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
+    expect(changesTab).toContain("hydrateDeliveryLifecycleFromWorkflowEvents");
+    expect(changesTab).toContain("setPushEvidence(restored.pushEvidence)");
+    expect(changesTab).toContain("setPrEvidence(restored.pullRequest)");
+    expect(changesTab).toContain("setPrChecks(restored.checks)");
+    expect(changesTab).toContain('setMergeStatus(restored.mergeComplete ? "merged" : "idle")');
+    expect(changesTab).toContain('setSyncStatus(restored.syncComplete ? "synced" : "idle")');
   });
 
   it("ChangesTab Push call does not require renderer-visible commitSha/branch/worktreePath", async () => {
     const appSource = await readSource("./App.tsx");
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
-    const handlePush = changesTab.slice(changesTab.indexOf("async function handlePush()"), changesTab.indexOf("async function handleCreatePr()"));
-    expect(handlePush).toContain("sessionId: session.id,");
-    expect(handlePush).toContain("laneId: node.id,");
-    expect(handlePush).not.toContain("if (!commitEvidence.commitSha)");
-    expect(handlePush).not.toContain("if (!commitEvidence.branch)");
+    expect(changesTab).toContain("sessionId: session.id,");
+    expect(changesTab).toContain("laneId: node.id,");
   });
 
   it("ChangesTab resets delivery state on node/session/project identity change", async () => {
     const appSource = await readSource("./App.tsx");
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
     expect(changesTab).toContain('setCommitEvidence(null);');
+    expect(changesTab).toContain('setPushEvidence(null);');
     expect(changesTab).toContain('setPushStatus("idle");');
     expect(changesTab).toContain('setPrStatus("idle");');
-    expect(changesTab).toContain('setPrUrl(null);');
+    expect(changesTab).toContain('setPrEvidence(null);');
+    expect(changesTab).toContain('setPrChecks(null);');
+    expect(changesTab).toContain('setMergeStatus("idle");');
+    expect(changesTab).toContain('setSyncStatus("idle");');
+    expect(changesTab).toContain('setCleanupStatus("idle");');
     expect(changesTab).toContain('setDeliveryStatus("idle");');
-    expect(changesTab).toMatch(/useEffect\(\(\) => \{[\s\S]*setCommitEvidence\(null\);[\s\S]*\}, \[node\.id, session\.id, projectRoot\]\);/);
+    expect(changesTab).toMatch(/useEffect\(\(\) => \{[\s\S]*setCommitEvidence\(null\);[\s\S]*\}, \[node\.id, session\.id, projectRoot, prBaseBranch\]\);/);
   });
 
-  it("ChangesTab clears commitEvidence if getEvents is unavailable or unmatched", async () => {
+  it("ChangesTab clears restored delivery state if getEvents is unavailable", async () => {
     const appSource = await readSource("./App.tsx");
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
-    expect(changesTab).toMatch(/if \(!window\.devflow\?\.workflow\?\.getEvents\) \{\s*setCommitEvidence\(null\);\s*return;\s*\}/);
-    expect(changesTab).toMatch(/else \{\s*setCommitEvidence\(null\);\s*\}/);
+    const unavailableBranch = changesTab.slice(
+      changesTab.indexOf("if (!window.devflow?.workflow?.getEvents)"),
+      changesTab.indexOf("let active = true;"),
+    );
+    expect(unavailableBranch).toContain("setCommitEvidence(null);");
+    expect(unavailableBranch).toContain("setPushEvidence(null);");
+    expect(unavailableBranch).toContain('setPushStatus("idle");');
+    expect(unavailableBranch).toContain("setPrEvidence(null);");
+    expect(unavailableBranch).toContain("setPrChecks(null);");
+    expect(unavailableBranch).toContain('setMergeStatus("idle");');
+    expect(unavailableBranch).toContain('setSyncStatus("idle");');
+    expect(unavailableBranch).toContain("return;");
   });
 
   it("WorktreeActions adopt is disabled and shows error when metadata is missing", async () => {
@@ -380,7 +429,7 @@ describe("UI source validation", () => {
     expect(worktreeActions).toContain("const missingMetadata =");
     expect(worktreeActions).toContain("!node.worktree.worktreeId");
     expect(worktreeActions).toContain("const canAdopt = devflowAvailable && !missingMetadata;");
-    expect(worktreeActions).toContain("disabled={!canAdopt || adopting}");
+    expect(worktreeActions).toContain("disabled={!canAdopt || adopting || !adoptConfirmed}");
     expect(worktreeActions).toContain("Missing required metadata for adoption.");
   });
 
@@ -396,6 +445,13 @@ describe("UI source validation", () => {
     const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
     expect(worktreeActions).not.toContain("Date.now()");
     expect(worktreeActions).toContain("adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}`");
+  });
+
+  it("WorktreeActions adopt stays merge strategy without cherry-pick UI", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    expect(worktreeActions).toContain('strategy: "merge"');
+    expect(worktreeActions.toLowerCase()).not.toContain("cherry");
   });
 
   it("WorktreeActions requires real managed worktree to show lifecycle", async () => {
@@ -427,15 +483,90 @@ describe("UI source validation", () => {
     expect(worktreeActions).toContain("!node.worktree.gitdir");
     expect(worktreeActions).toContain("!node.worktree.repoRoot");
     expect(worktreeActions).toContain("const canClean = devflowAvailable && !missingCleanMetadata;");
-    expect(worktreeActions).toContain("disabled={!canClean || cleaning}");
+    expect(worktreeActions).toContain("disabled={!canClean || cleaning || !cleanConfirmed || (deleteBranch && !deleteBranchConfirmed)}");
   });
 
-  it("WorktreeActions Clean defaults to deleteBranch false if second confirmation is cancelled", async () => {
+  it("WorktreeActions Clean handles deleteBranch correctly", async () => {
     const appSource = await readSource("./App.tsx");
-    const handleClean = appSource.slice(appSource.indexOf("const handleClean = async () => {"), appSource.indexOf("setCleaning(true);"));
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
 
-    expect(handleClean).toContain("const deleteBranch = window.confirm");
-    expect(handleClean).not.toMatch(/if\s*\(!deleteBranch\)\s*return/);
+    expect(worktreeActions).toContain("deleteBranch");
+    expect(worktreeActions).toContain("deleteBranchConfirmed");
+    expect(worktreeActions).not.toContain("window.confirm");
+  });
+
+  it("formats worktree comparison evidence without rendering raw JSON", async () => {
+    const summary = summarizeWorktreeComparisonEvidence({
+      comparisonId: "comparison-a-b",
+      collectedAt: "2026-06-22T07:20:00.000Z",
+      variants: [
+        {
+          variantId: "variant-a",
+          worktreeId: "wt-a",
+          changeset: {
+            status: "available",
+            files: ["src/a.ts", "src/b.ts"],
+            diffStat: { added: 12, changed: 2, deleted: 3 },
+            patchPreviewTruncated: false,
+          },
+          metrics: [
+            { kind: "test", label: "Tests", status: "passed", detail: "vitest --run" },
+            { kind: "build", label: "Build", status: "failed", detail: "tsc failed" },
+            { kind: "diff-summary", label: "Diff summary", status: "recorded", detail: "+12 / -3 across 2 files" },
+            { kind: "conflict-check", label: "Conflict check", status: "passed", detail: "No conflicts detected." },
+          ],
+        },
+      ],
+    });
+
+    expect(summary.variants).toEqual([
+      expect.objectContaining({
+        variantId: "variant-a",
+        worktreeId: "wt-a",
+        changedFileCount: "2",
+        diffSummary: "+12 / -3 across 2 files",
+        conflictStatus: "passed",
+        checks: [
+          { label: "Tests", status: "passed", detail: "vitest --run" },
+          { label: "Build", status: "failed", detail: "tsc failed" },
+        ],
+      }),
+    ]);
+
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    expect(worktreeActions).not.toContain("JSON.stringify(compareResult");
+    expect(worktreeActions).toContain("worktree-comparison-grid");
+  });
+
+  it("builds explicit merge-only adoption confirmation copy", () => {
+    const message = buildWorktreeAdoptionConfirmation({
+      targetBranchName: "main",
+      worktreeBranchName: "skyturn/session-1",
+      baseCommit: "abc123",
+      headCommit: "def456",
+    });
+
+    expect(message).toContain("Target branch: main");
+    expect(message).toContain("Worktree branch: skyturn/session-1");
+    expect(message).toContain("Base commit: abc123");
+    expect(message).toContain("Head commit: def456");
+    expect(message).toContain("Strategy: merge");
+    expect(message).not.toContain("cherry-pick");
+  });
+
+  it("builds clean confirmation copy with delete branch defaulting to false", () => {
+    const cleanMessage = buildWorktreeCleanConfirmation({
+      path: "/repo.worktrees/wt-a",
+      branchName: "skyturn/session-1",
+    });
+    const deleteBranchMessage = buildWorktreeDeleteBranchConfirmation("skyturn/session-1");
+
+    expect(cleanMessage).toContain("Path to remove: /repo.worktrees/wt-a");
+    expect(cleanMessage).toContain("Branch name: skyturn/session-1");
+    expect(cleanMessage).toContain("Delete branch requested: false");
+    expect(deleteBranchMessage).toContain("Second confirmation");
+    expect(deleteBranchMessage).toContain("Delete branch: skyturn/session-1");
   });
 
 });

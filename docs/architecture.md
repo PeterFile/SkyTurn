@@ -33,7 +33,7 @@ Electron main process owns:
 - workflow SQLite access through Node-only persistence APIs
 - managed worktree create, adopt, and clean side effects through `NodeGitWorktreeService`
 - managed worktree comparison through Node-side git evidence collection
-- controlled local delivery commit creation for eligible workflow commit lanes
+- controlled local delivery commit, push, and pull request creation for eligible workflow lanes
 - Agent bridge IPC, local process execution, and run event persistence
 - editor launching through explicit preload methods
 
@@ -52,6 +52,8 @@ Renderer does not directly run shell commands.
 Renderer must not import `better-sqlite3`, Node git/worktree implementations, `fs`, `child_process`, or other local side-effect modules. It consumes workflow projections and changeset results through the preload API.
 
 `agent-bridge` does not schedule DAGs, confirm Hermes plans, consolidate shared memory, or decide UI policy. It only connects SkyTurn to local Agents and records run events/evidence.
+
+Delivery push, pull request creation, exact-head check polling, squash merge request, post-merge main sync, and cleanup request are explicit user actions through the renderer toolbar, preload IPC, Electron main, and Node-only git/GitHub helpers. PR creation does not complete a task by itself: `workflow.delivery.pushed` and `workflow.pull_request.created` are recorded events, but Flow Kernel lane completion is not derived from them. `workflow.pull_request.checks_recorded` records exact-head check evidence, and only passed checks for the current head can satisfy check/gate lanes. Merge, sync, and cleanup must be later user-confirmed actions; branch deletion is default-off and separately confirmed.
 
 ## Persistence
 

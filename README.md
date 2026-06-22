@@ -39,13 +39,15 @@ packages/
 - Changes: the node modal `Changes` tab can use structured live Codex change events plus git-backed final reconciliation.
 - Session target: New Session exposes Current branch by default and New worktree as explicit opt-in.
 - Managed worktrees: desktop IPC calls `NodeGitWorktreeService` for create, adopt, and clean operations, and uses Node-side git evidence for compare.
-- Delivery commits: `workflow:delivery:commit` can create a controlled local commit for an eligible commit lane and records `workflow.commit.created`.
+- Delivery actions: the node modal **Changes** tab exposes explicit commit, push, and create PR actions. The preload IPC and Electron main handlers call Node-only git/GitHub helpers. Commit records `workflow.commit.created`; push records `workflow.delivery.pushed`; PR creation records `workflow.pull_request.created`.
 - Project memory: `.devflow` under the imported project root.
 
 ## Current Verification
 
 The real Hermes-to-Codex path has passed `pnpm --filter @skyturn/desktop run demo:mvp` on this machine, and the Electron UI has run a real workflow against a temporary git project. These paths depend on local Hermes/Codex credentials and remain `experimental-run`, not `supported-run`.
 
-Browser-only and mock paths still exist for development and tests. Desktop `workflow:worktree:create`, `workflow:worktree:adopt`, and `workflow:worktree:clean` now call `@skyturn/git-worktree/node` and record terminal workflow events from real git/filesystem side effects. The full product UI for comparing, adopting, and cleaning managed worktrees is still not complete.
+Browser-only and mock paths still exist for development and tests. Desktop `workflow:worktree:create`, `workflow:worktree:adopt`, and `workflow:worktree:clean` now call `@skyturn/git-worktree/node` and record terminal workflow events from real git/filesystem side effects. The current worktree adopt UI asks for confirmation and sends `strategy: "merge"`; cherry-pick exists in backend contracts but is not exposed in the UI. The full product UI for comparing, adopting, and cleaning managed worktrees is still not complete.
 
-Delivery stops at a controlled local commit today. Push, pull request creation, and merge UI are not implemented.
+Delivery can create a controlled local commit, push the delivery branch, create a pull request, poll exact-head PR checks, request squash merge, request post-merge main sync, and request cleanup through explicit user actions. PR creation is delivery evidence, not task completion. `workflow.delivery.pushed` and `workflow.pull_request.created` are recorded in the event stream, but the Flow Kernel reducer does not complete lanes from those events. `workflow.pull_request.checks_recorded` records exact-head status; only passed checks for the current PR head can satisfy check/gate lanes. Merge, sync, and cleanup remain user-confirmed follow-up actions, and branch deletion is default-off with separate confirmation.
+
+Real GitHub disposable PR smoke belongs to acceptance/test coverage for the delivery remote path. It is not default behavior for an imported user project.

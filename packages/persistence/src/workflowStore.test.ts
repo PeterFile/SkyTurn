@@ -10,7 +10,7 @@ import {
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
 import type { RunEvidence, WorkflowWorktreeIdentity } from "@skyturn/project-core";
-import type { WorkflowIntent } from "@skyturn/workflow-kernel";
+import type { FlowEventKind, WorkflowIntent } from "@skyturn/workflow-kernel";
 
 const roots: string[] = [];
 
@@ -578,6 +578,209 @@ describe("SQLite workflow store", () => {
       expect.objectContaining({ kind: "workflow.worktree.clean_failed" }),
     ]));
     expect(projection.worktrees).toEqual([]);
+    store.close();
+  });
+
+  it("replays a later delivery push as the current pull request head for check gates", async () => {
+    const store = await makeSeededStore();
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:commit",
+      payload: { lane: { id: "lane-commit", semanticKey: "lane-commit", kind: "commit", title: "Commit", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:ci",
+      payload: { lane: { id: "lane-ci", semanticKey: "lane-ci", kind: "ci_check", title: "CI check", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:pr",
+      payload: { lane: { id: "lane-pr", semanticKey: "lane-pr", kind: "pull_request", title: "Create PR", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.pull_request.created",
+      source: "test",
+      idempotencyKey: "pr:created",
+      payload: {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 21, url: "https://example.test/pr/21", head: "feature/slice-b", commitSha: "sha-a" },
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.delivery.pushed",
+      source: "test",
+      idempotencyKey: "delivery:pushed",
+      payload: {
+        laneId: "lane-commit",
+        url: "https://example.test/compare",
+        evidence: { remote: "origin", branch: "feature/slice-b", commitSha: "sha-b" },
+      },
+      now: "2026-06-14T00:00:05.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: checksRecordedKind,
+      source: "test",
+      idempotencyKey: "pr:checks:stale",
+      payload: {
+        laneId: "lane-ci",
+        prNumber: 21,
+        url: "https://example.test/pr/21/checks",
+        headSha: "sha-a",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/old" }],
+      },
+      now: "2026-06-14T00:00:06.000Z",
+    });
+
+    const stale = store.materializeFlowProjection("session-1");
+    expect(stale.lanes.find((lane) => lane.id === "lane-ci")?.status).toBe("running");
+    expect(stale.lanes.find((lane) => lane.id === "lane-commit")?.status).toBe("running");
+    expect(stale.lanes.find((lane) => lane.id === "lane-pr")?.status).toBe("running");
+    expect(stale.evidence.map((item) => [item.kind, item.status])).toContainEqual(["pull-request-checks", "passed"]);
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: checksRecordedKind,
+      source: "test",
+      idempotencyKey: "pr:checks:pending",
+      payload: {
+        laneId: "lane-ci",
+        prNumber: 21,
+        url: "https://example.test/pr/21/checks",
+        headSha: "sha-b",
+        status: "pending",
+        checks: [{ name: "Build and test", status: "pending", url: "https://example.test/checks/pending" }],
+      },
+      now: "2026-06-14T00:00:07.000Z",
+    });
+    expect(store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-ci")?.status).toBe("running");
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: checksRecordedKind,
+      source: "test",
+      idempotencyKey: "pr:checks:passed",
+      payload: {
+        laneId: "lane-ci",
+        prNumber: 21,
+        url: "https://example.test/pr/21/checks",
+        headSha: "sha-b",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/current" }],
+      },
+      now: "2026-06-14T00:00:08.000Z",
+    });
+
+    const exact = store.materializeFlowProjection("session-1");
+    expect(exact.lanes.find((lane) => lane.id === "lane-ci")?.status).toBe("completed");
+    expect(exact.lanes.find((lane) => lane.id === "lane-commit")?.status).toBe("running");
+    expect(exact.lanes.find((lane) => lane.id === "lane-pr")?.status).toBe("running");
+    expect(exact.evidence.at(-1)).toMatchObject({
+      laneId: "lane-ci",
+      kind: "pull-request-checks",
+      status: "passed",
+      checks: ["Build and test:passed"],
+    });
+    store.close();
+  });
+
+  it("replays Electron nested pull request checks evidence from the SQLite ledger", async () => {
+    const store = await makeSeededStore();
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:commit:nested-checks",
+      payload: { lane: { id: "lane-commit", semanticKey: "lane-commit", kind: "commit", title: "Commit", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:ci:nested-checks",
+      payload: { lane: { id: "lane-ci", semanticKey: "lane-ci", kind: "ci_check", title: "CI check", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:pr:nested-checks",
+      payload: { lane: { id: "lane-pr", semanticKey: "lane-pr", kind: "pull_request", title: "Create PR", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.pull_request.created",
+      source: "test",
+      idempotencyKey: "pr:created:nested-checks",
+      payload: {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 22, url: "https://example.test/pr/22", head: "feature/slice-c", commitSha: "sha-c" },
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.delivery.pushed",
+      source: "test",
+      idempotencyKey: "delivery:pushed:nested-checks",
+      payload: {
+        laneId: "lane-commit",
+        evidence: { remote: "origin", branch: "feature/slice-c", commitSha: "sha-c" },
+      },
+      now: "2026-06-14T00:00:05.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: checksRecordedKind,
+      source: "electron-main",
+      idempotencyKey: "pr:checks:nested-passed",
+      payload: {
+        laneId: "lane-ci",
+        evidence: {
+          status: "passed",
+          number: 22,
+          url: "https://example.test/pr/22",
+          headSha: "sha-c",
+          checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/current" }],
+        },
+      },
+      now: "2026-06-14T00:00:06.000Z",
+    });
+
+    const projection = store.materializeFlowProjection("session-1");
+    expect(projection.lanes.find((lane) => lane.id === "lane-ci")?.status).toBe("completed");
+    expect(projection.lanes.find((lane) => lane.id === "lane-commit")?.status).toBe("running");
+    expect(projection.lanes.find((lane) => lane.id === "lane-pr")?.status).toBe("running");
+    expect(projection.evidence.at(-1)).toMatchObject({
+      laneId: "lane-ci",
+      kind: "pull-request-checks",
+      status: "passed",
+      checks: ["Build and test:passed"],
+      artifacts: ["https://example.test/pr/22", "https://example.test/checks/current"],
+    });
     store.close();
   });
 
