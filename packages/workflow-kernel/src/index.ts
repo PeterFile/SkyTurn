@@ -157,10 +157,41 @@ export interface FlowEvidence {
   laneId: string;
   segmentId: string;
   kind: string;
-  status: "passed" | "failed" | "skipped";
+  status: FlowEvidenceStatus;
   checks: string[];
   artifacts: string[];
   detail?: string;
+}
+
+export type FlowEvidenceStatus = "passed" | "failed" | "skipped" | "pending";
+
+export type PullRequestCheckStatus = "passed" | "failed" | "pending";
+
+export interface PullRequestCheckResult {
+  name: string;
+  status: PullRequestCheckStatus;
+  url?: string;
+  detail?: string;
+}
+
+export interface PullRequestChecksRecordedPayload {
+  laneId: string;
+  prNumber: number;
+  url: string;
+  headSha: string;
+  status: PullRequestCheckStatus;
+  checks: PullRequestCheckResult[];
+}
+
+interface PullRequestHeadSnapshot {
+  prNumber: number;
+  headSha?: string;
+  headBranch?: string;
+}
+
+interface PullRequestHeadState {
+  byLaneId: Map<string, PullRequestHeadSnapshot>;
+  currentByPrNumber: Map<number, PullRequestHeadSnapshot>;
 }
 
 export interface FlowProjectionNode {
@@ -191,6 +222,7 @@ export type FlowEventKind =
   | "workflow.commit.created"
   | "workflow.delivery.pushed"
   | "workflow.pull_request.created"
+  | "workflow.pull_request.checks_recorded"
   | "workflow.worktree.create_requested"
   | "workflow.worktree.created"
   | "workflow.worktree.create_failed"
@@ -595,6 +627,10 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
   const unique = dedupeEvents(events);
   const projection = emptyFlowProjection(unique[0]?.sessionId ?? "session-1");
   projection.events = unique;
+  const pullRequestHeadState: PullRequestHeadState = {
+    byLaneId: new Map(),
+    currentByPrNumber: new Map(),
+  };
 
   for (const event of unique) {
     if (event.kind === "workflow.profile") {
@@ -649,6 +685,31 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
     }
     if (event.kind === "workflow.user_decision.answered") {
       answerUserDecision(projection, normalizeUserDecisionAnswered(event.payload));
+    }
+    if (event.kind === "workflow.delivery.pushed") {
+      const evidence = normalizeDeliveryPushEvidence(event);
+      if (evidence) projection.evidence.push(evidence);
+      rememberPullRequestHead(pullRequestHeadState, event.payload);
+    }
+    if (event.kind === "workflow.pull_request.created") {
+      const evidence = normalizePullRequestCreatedEvidence(event);
+      if (evidence) projection.evidence.push(evidence);
+      rememberPullRequestHead(pullRequestHeadState, event.payload);
+    }
+    if (event.kind === "workflow.pull_request.checks_recorded") {
+      const checks = normalizePullRequestChecksRecorded(event);
+      if (checks) {
+        projection.evidence.push(checks.evidence);
+        const lane = projection.lanes.find((item) => item.id === checks.payload.laneId);
+        if (
+          lane &&
+          isPullRequestCheckGateLane(lane) &&
+          checks.payload.status === "passed" &&
+          matchesCurrentPullRequestHead(pullRequestHeadState, checks.payload)
+        ) {
+          setLaneStatus(projection, lane.id, "completed");
+        }
+      }
     }
     if (event.kind === "workflow.worktree.created" && isRecord(event.payload.worktree)) {
       upsertWorktree(projection, event.payload.worktree as unknown as WorkflowWorktreeIdentity);
@@ -1280,11 +1341,175 @@ function normalizeEvidence(value: Record<string, unknown>, laneId: string, segme
     laneId,
     segmentId,
     kind: typeof value.kind === "string" ? value.kind : "run-exit",
-    status: value.status === "failed" || value.status === "skipped" ? value.status : "passed",
+    status: normalizeFlowEvidenceStatus(value.status),
     checks: stringArray(value.checks),
     artifacts: stringArray(value.artifacts),
     ...(typeof value.detail === "string" ? { detail: value.detail } : {}),
   };
+}
+
+function normalizeDeliveryPushEvidence(event: FlowEvent): FlowEvidence | null {
+  const laneId = stringValue(event.payload.laneId);
+  if (!laneId) return null;
+  const evidence = isRecord(event.payload.evidence) ? event.payload.evidence : {};
+  const headSha = pullRequestHeadSha(event.payload);
+  const url = stringValue(event.payload.url) ?? stringValue(evidence.url);
+  return {
+    id: `delivery-push:${event.id}`,
+    laneId,
+    segmentId: stringValue(event.payload.segmentId) ?? "",
+    kind: "delivery-push",
+    status: "passed",
+    checks: compactStrings([
+      stringValue(evidence.remote) ? `remote:${stringValue(evidence.remote)}` : null,
+      stringValue(evidence.branch) ? `branch:${stringValue(evidence.branch)}` : null,
+      headSha ? `head:${headSha}` : null,
+    ]),
+    artifacts: compactStrings([url]),
+  };
+}
+
+function normalizePullRequestCreatedEvidence(event: FlowEvent): FlowEvidence | null {
+  const laneId = stringValue(event.payload.laneId);
+  if (!laneId) return null;
+  const evidence = isRecord(event.payload.evidence) ? event.payload.evidence : {};
+  const prNumber = numberValue(event.payload.prNumber) ?? numberValue(evidence.number);
+  const headSha = pullRequestHeadSha(event.payload);
+  const url = stringValue(event.payload.url) ?? stringValue(evidence.url);
+  return {
+    id: `pull-request:${event.id}`,
+    laneId,
+    segmentId: stringValue(event.payload.segmentId) ?? "",
+    kind: "pull-request",
+    status: "passed",
+    checks: compactStrings([
+      typeof prNumber === "number" ? `PR #${prNumber}` : null,
+      stringValue(evidence.head) ? `head-branch:${stringValue(evidence.head)}` : null,
+      headSha ? `head:${headSha}` : null,
+    ]),
+    artifacts: compactStrings([url]),
+  };
+}
+
+function normalizePullRequestChecksRecorded(event: FlowEvent): { payload: PullRequestChecksRecordedPayload; evidence: FlowEvidence } | null {
+  const laneId = stringValue(event.payload.laneId);
+  const headSha = stringValue(event.payload.headSha);
+  const url = stringValue(event.payload.url);
+  const prNumber = numberValue(event.payload.prNumber);
+  if (!laneId || !headSha || !url || typeof prNumber !== "number") return null;
+  const status = normalizePullRequestCheckStatus(event.payload.status);
+  const checks = normalizePullRequestChecks(event.payload.checks);
+  const payload: PullRequestChecksRecordedPayload = {
+    laneId,
+    prNumber,
+    url,
+    headSha,
+    status,
+    checks,
+  };
+  return {
+    payload,
+    evidence: {
+      id: `pull-request-checks:${event.id}`,
+      laneId,
+      segmentId: stringValue(event.payload.segmentId) ?? "",
+      kind: "pull-request-checks",
+      status,
+      checks: checks.map((check) => `${check.name}:${check.status}`),
+      artifacts: compactStrings([url, ...checks.map((check) => check.url ?? null)]),
+    },
+  };
+}
+
+function rememberPullRequestHead(state: PullRequestHeadState, payload: Record<string, unknown>): void {
+  const laneId = stringValue(payload.laneId);
+  const commitLaneId = stringValue(payload.commitLaneId);
+  const laneIds = uniqueStrings(compactStrings([laneId, commitLaneId]));
+  const headSha = pullRequestHeadSha(payload);
+  const headBranch = pullRequestHeadBranch(payload);
+  const prNumber = numberValue(payload.prNumber) ?? (isRecord(payload.evidence) ? numberValue(payload.evidence.number) : null);
+  const associatedPrNumber =
+    typeof prNumber === "number"
+      ? prNumber
+      : laneIds.map((id) => state.byLaneId.get(id)?.prNumber).find((value): value is number => typeof value === "number");
+  if (typeof associatedPrNumber !== "number") return;
+
+  const current = state.currentByPrNumber.get(associatedPrNumber);
+  const snapshotHeadSha = headSha ?? current?.headSha;
+  const snapshotHeadBranch = headBranch ?? current?.headBranch;
+  const snapshot: PullRequestHeadSnapshot = {
+    prNumber: associatedPrNumber,
+    ...(snapshotHeadSha ? { headSha: snapshotHeadSha } : {}),
+    ...(snapshotHeadBranch ? { headBranch: snapshotHeadBranch } : {}),
+  };
+  for (const id of laneIds) {
+    state.byLaneId.set(id, snapshot);
+  }
+  state.currentByPrNumber.set(associatedPrNumber, snapshot);
+}
+
+function matchesCurrentPullRequestHead(state: PullRequestHeadState, payload: PullRequestChecksRecordedPayload): boolean {
+  const currentHead = state.currentByPrNumber.get(payload.prNumber) ?? state.byLaneId.get(payload.laneId);
+  return currentHead?.headSha === payload.headSha;
+}
+
+function pullRequestHeadSha(payload: Record<string, unknown>): string | null {
+  const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+  return stringValue(payload.headSha) ?? stringValue(payload.commitSha) ?? stringValue(evidence.headSha) ?? stringValue(evidence.commitSha);
+}
+
+function pullRequestHeadBranch(payload: Record<string, unknown>): string | null {
+  const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+  return stringValue(payload.headBranch) ?? stringValue(payload.branch) ?? stringValue(evidence.head) ?? stringValue(evidence.headBranch) ?? stringValue(evidence.branch);
+}
+
+function normalizePullRequestChecks(value: unknown): PullRequestCheckResult[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item, index) => normalizePullRequestCheck(item, index));
+}
+
+function normalizePullRequestCheck(value: unknown, index: number): PullRequestCheckResult {
+  const record = isRecord(value) ? value : {};
+  const name = stringValue(record.name) ?? stringValue(record.context) ?? `check-${index + 1}`;
+  const url = stringValue(record.url) ?? stringValue(record.detailsUrl);
+  const detail = stringValue(record.detail);
+  return {
+    name,
+    status: normalizePullRequestCheckStatus(record.status),
+    ...(url ? { url } : {}),
+    ...(detail ? { detail } : {}),
+  };
+}
+
+function normalizePullRequestCheckStatus(value: unknown): PullRequestCheckStatus {
+  if (value === "passed" || value === "failed" || value === "pending") return value;
+  return "pending";
+}
+
+function normalizeFlowEvidenceStatus(value: unknown): FlowEvidenceStatus {
+  if (value === "failed" || value === "skipped" || value === "pending") return value;
+  return "passed";
+}
+
+function isPullRequestCheckGateLane(lane: FlowLane): boolean {
+  if (lane.laneKind === "validation" || lane.laneKind === "regression") return true;
+  return /check|validation|ci/.test(`${lane.kind} ${lane.semanticSubtype} ${lane.semanticKey}`.toLowerCase());
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+function compactStrings(values: Array<string | null | undefined>): string[] {
+  return values.filter((value): value is string => Boolean(value));
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
 }
 
 function upsertLane(projection: FlowProjection, lane: FlowLane): void {
