@@ -248,6 +248,8 @@ export type FlowEventKind =
   | "workflow.user_decision.requested"
   | "workflow.user_decision.answered"
   | "workflow.commit.created"
+  | "workflow.remote_side_effect.requested"
+  | "workflow.remote_side_effect.completed"
   | "workflow.delivery.pushed"
   | "workflow.pull_request.created"
   | "workflow.pull_request.checks_recorded"
@@ -360,7 +362,17 @@ const remoteSideEffectEventKinds: WorkflowRemoteSideEffectEventKind[] = [
 type RollbackRemoteSideEffectRef = WorkflowRemoteSideEffectRef & {
   affectedLaneIds?: string[];
   sessionWide?: boolean;
+  operationId?: string;
 };
+
+interface PendingRemoteSideEffectRequest {
+  operationId: string;
+  eventKind: WorkflowRemoteSideEffectEventKind;
+  eventId: string;
+  laneIds: string[];
+  sessionWide: boolean;
+  createdAt: string;
+}
 
 type WorkflowCheckpointIntentSuccessorFields = {
   successorLaneId?: string;
@@ -719,7 +731,8 @@ export function evaluateRollbackEligibility(
     ? undefined
     : checkpointRestoreCommitRef(checkpointValidation.checkpoint);
   const blockingRemoteSideEffects = remoteSideEffectsForLanes(projection, new Set(affectedLaneIds), input.throughSeq);
-  const localRollbackSafe = input.localRollbackSafe ?? latestRequest?.localRollbackSafe;
+  const inheritedLocalRollbackSafe = latestRequest?.status === "rejected" ? undefined : latestRequest?.localRollbackSafe;
+  const localRollbackSafe = input.localRollbackSafe ?? inheritedLocalRollbackSafe;
   const localRollbackBlocked = localRollbackSafe === false;
   const reason =
     affectedLaneIds.length === 0
@@ -2057,9 +2070,30 @@ function remoteSideEffectsForLanes(
   throughSeq?: number,
 ): RollbackRemoteSideEffectRef[] {
   const refs: RollbackRemoteSideEffectRef[] = [];
+  const pendingRequests = new Map<string, PendingRemoteSideEffectRequest>();
   for (const event of projection.events) {
     if (typeof throughSeq === "number" && event.seq > throughSeq) continue;
+    if (event.kind === "workflow.remote_side_effect.requested") {
+      const request = normalizeRemoteSideEffectRequest(event);
+      if (request) pendingRequests.set(request.operationId, request);
+      continue;
+    }
+    if (event.kind === "workflow.remote_side_effect.completed") {
+      const operationId = stringValue(event.payload.operationId);
+      if (operationId && remoteSideEffectCompletionClearsRollbackBlock(event)) pendingRequests.delete(operationId);
+      continue;
+    }
     if (!isRemoteSideEffectEventKind(event.kind)) continue;
+    if (remoteSideEffectIsSessionWide(event)) {
+      refs.push({
+        eventKind: event.kind,
+        eventId: event.id,
+        affectedLaneIds: [...affectedLaneIds],
+        sessionWide: true,
+        createdAt: event.createdAt,
+      });
+      continue;
+    }
     const laneIds = remoteSideEffectLaneIds(event);
     if (laneIds.length === 0) {
       refs.push({
@@ -2081,7 +2115,55 @@ function remoteSideEffectsForLanes(
       createdAt: event.createdAt,
     });
   }
+  for (const request of pendingRequests.values()) {
+    if (request.sessionWide) {
+      refs.push({
+        eventKind: request.eventKind,
+        eventId: request.eventId,
+        affectedLaneIds: [...affectedLaneIds],
+        sessionWide: true,
+        operationId: request.operationId,
+        createdAt: request.createdAt,
+      });
+      continue;
+    }
+    const matchingLaneIds = request.laneIds.filter((id) => affectedLaneIds.has(id));
+    if (matchingLaneIds.length === 0) continue;
+    refs.push({
+      eventKind: request.eventKind,
+      eventId: request.eventId,
+      laneId: matchingLaneIds[0],
+      affectedLaneIds: matchingLaneIds,
+      operationId: request.operationId,
+      createdAt: request.createdAt,
+    });
+  }
   return refs;
+}
+
+function remoteSideEffectCompletionClearsRollbackBlock(event: FlowEvent): boolean {
+  const status = stringValue(event.payload.status);
+  return status === "succeeded" || (status === "failed" && event.payload.remoteMutationAttempted === false);
+}
+
+function normalizeRemoteSideEffectRequest(event: FlowEvent): PendingRemoteSideEffectRequest | null {
+  const eventKind = isRemoteSideEffectEventKind(event.payload.eventKind) ? event.payload.eventKind : null;
+  if (!eventKind) return null;
+  const operationId = stringValue(event.payload.operationId) ?? event.id;
+  const laneIds = remoteSideEffectLaneIds(event);
+  return {
+    operationId,
+    eventKind,
+    eventId: event.id,
+    laneIds,
+    sessionWide: remoteSideEffectIsSessionWide(event) || laneIds.length === 0,
+    createdAt: event.createdAt,
+  };
+}
+
+function remoteSideEffectIsSessionWide(event: FlowEvent): boolean {
+  const evidence = isRecord(event.payload.evidence) ? event.payload.evidence : {};
+  return event.payload.sessionWide === true || evidence.sessionWide === true;
 }
 
 function remoteSideEffectLaneIds(event: FlowEvent): string[] {
@@ -2650,7 +2732,7 @@ function isCompletedLane(lane: FlowLane): boolean {
   return lane.status === "completed" && !isTerminalRollbackLane(lane);
 }
 
-function isRemoteSideEffectEventKind(value: FlowEventKind): value is WorkflowRemoteSideEffectEventKind {
+function isRemoteSideEffectEventKind(value: unknown): value is WorkflowRemoteSideEffectEventKind {
   return remoteSideEffectEventKinds.includes(value as WorkflowRemoteSideEffectEventKind);
 }
 
