@@ -1859,7 +1859,7 @@ function upsertCheckpointIntent(intents: WorkflowCheckpointIntent[], intent: Wor
     intents.push(intent);
     return;
   }
-  intents[index] = { ...intents[index], ...intent };
+  intents[index] = intent;
 }
 
 function validateRollbackCheckpoint(
