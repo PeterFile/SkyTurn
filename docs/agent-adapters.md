@@ -48,6 +48,14 @@ Adapter contracts expose discovery, health, start, send, cancel, and event sink 
 
 Hermes creates or confirms task graphs. Individual agents may write task-local outputs, but Hermes/orchestrator owns consolidation into shared memory files under `.devflow`.
 
+## Rollback Boundary
+
+Adapters may expose native recovery capabilities, but SkyTurn owns product rollback semantics.
+
+Codex rollback is thread/history-only. It can help rewind or fork Codex conversation context, but it is not a repository rollback, a graph rollback, or proof that files are safe. SkyTurn must coordinate graph state, adapter thread/history state, and filesystem/worktree state through workflow events and Electron main side effects.
+
+Hermes-style tool-level filesystem checkpoints can exist as a lower-level safety net for adapter execution. They are not the user-visible checkpoint model. The product model exposes before/after checkpoints at the node/run boundary.
+
 ## Current Support
 
 | Agent | Support level | Notes |
