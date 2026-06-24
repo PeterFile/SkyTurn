@@ -157,7 +157,8 @@ gsap.registerPlugin(useGSAP);
 
 type AgentFlowNode = FlowNode<{
   node: CanvasNode;
-  onOpen: (nodeId: string) => void;
+  onInspect: (nodeId: string) => void;
+  onSelect: (nodeId: string) => void;
 }, "agent">;
 
 interface AgentEdgeData extends Record<string, unknown> {
@@ -190,6 +191,7 @@ export default function App() {
   const [newTaskProjectId, setNewTaskProjectId] = useState<string | null>(null);
   const [bottomGoal, setBottomGoal] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
   const startedBridgeRuns = useRef(new Set<string>());
   const completedBridgeRunPersistenceClaims = useRef(new Set<string>());
@@ -203,6 +205,10 @@ export default function App() {
   const selectedNode =
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
+      : null;
+  const inspectedNode =
+    activeSession?.kind === "canvas"
+      ? activeSession.nodes.find((node: CanvasNode) => node.id === inspectedNodeId) ?? null
       : null;
   const resolvedNewTaskProjectId = resolveSessionProjectId(
     workspace.projects,
@@ -331,10 +337,7 @@ export default function App() {
     };
   }, [activeProject, selectedNode?.runId]);
 
-  const openSelectedNode = useCallback((nodeId: string) => {
-    setSelectedNodeId(nodeId);
-    setModalTab("Output");
-  }, []);
+
 
   const activeCanvasSessionId = activeSession?.kind === "canvas" ? activeSession.id : null;
   const updateActiveNodePositions = useCallback(
@@ -502,7 +505,7 @@ export default function App() {
     }));
   }
 
-  async function appendRequirementNode() {
+  async function appendRequirementNode(_action?: ComposerAction) {
     if (!activeSession || activeSession.kind !== "canvas" || !bottomGoal.trim()) return;
     if (window.devflow && activeProject) {
       await window.devflow.appendWorkflowUserInput(activeProject.rootPath, {
@@ -708,11 +711,20 @@ export default function App() {
               session={activeSession}
               composerValue={bottomGoal}
               composerDisabled={false}
+              selectedNode={selectedNode}
               onComposerChange={setBottomGoal}
               onComposerSubmit={appendRequirementNode}
               onComposerStop={stopActiveRun}
               onNodePositionsChange={updateActiveNodePositions}
-              onOpenNode={openSelectedNode}
+              onSelectNode={(nodeId) => {
+                setSelectedNodeId(nodeId);
+                setInspectedNodeId((current) => (current === nodeId ? current : null));
+              }}
+              onInspectNode={(nodeId) => {
+                setSelectedNodeId(nodeId);
+                setInspectedNodeId(nodeId);
+                setModalTab("Output");
+              }}
             />
           )}
           {!activeSession && (
@@ -730,23 +742,21 @@ export default function App() {
         </main>
       </div>
 
-      {selectedNode && activeSession?.kind === "canvas" && (
+      {inspectedNode && activeSession?.kind === "canvas" && (
         <NodeModal
-          node={selectedNode}
+          node={inspectedNode}
           projectRoot={activeProject.rootPath}
           session={activeSession}
-          runEvents={workspace.runEvents?.[selectedNode.runId] ?? []}
+          runEvents={workspace.runEvents?.[inspectedNode.runId] ?? []}
           tab={modalTab}
           onTab={setModalTab}
-          onClose={() => setSelectedNodeId(null)}
-	          onStop={() =>
-	            stopNodeRun(selectedNode)
-	          }
-          onRetry={() => retryNode(selectedNode.id)}
-          onReassign={() => reassignNode(selectedNode.id)}
-          onInsertBefore={() => insertBefore(selectedNode.id)}
-          onOpenEditor={(editor) => openEditor(editor, selectedNode)}
-          onDecisionAnswer={(option) => answerUserDecision(selectedNode.id, option)}
+          onClose={() => setInspectedNodeId(null)}
+          onStop={() => stopNodeRun(inspectedNode)}
+          onRetry={() => retryNode(inspectedNode.id)}
+          onReassign={() => reassignNode(inspectedNode.id)}
+          onInsertBefore={() => insertBefore(inspectedNode.id)}
+          onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
+          onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
         />
       )}
     </div>
@@ -994,6 +1004,8 @@ function ProjectStartPage({
     </section>
   );
 }
+
+export type ComposerAction = "repair" | "variant" | "rollback" | null;
 
 export function deriveSessionTarget(executionTarget: "current_branch" | "new_worktree", selectedBranch: string): SessionTarget {
   return executionTarget === "current_branch"
@@ -1251,20 +1263,24 @@ function CanvasView({
   session,
   composerValue,
   composerDisabled,
+  selectedNode,
   onComposerChange,
   onComposerSubmit,
   onComposerStop,
   onNodePositionsChange,
-  onOpenNode,
+  onInspectNode,
+  onSelectNode,
 }: {
   session: CanvasSession;
   composerValue: string;
   composerDisabled: boolean;
+  selectedNode: CanvasNode | null;
   onComposerChange: (value: string) => void;
-  onComposerSubmit: () => void;
+  onComposerSubmit: (action?: ComposerAction) => void;
   onComposerStop: () => void;
   onNodePositionsChange: (updates: CanvasNodePositionUpdate[]) => void;
-  onOpenNode: (nodeId: string) => void;
+  onInspectNode: (nodeId: string) => void;
+  onSelectNode: (nodeId: string | null) => void;
 }) {
   const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
   const autoFitCanvas = shouldAutoFitCanvas(session.nodes);
@@ -1277,12 +1293,13 @@ function CanvasView({
         type: "agent",
         position: node.position,
         draggable: true,
+        selected: node.id === selectedNode?.id,
         initialWidth: ENERGY_FRAME.width,
         initialHeight: ENERGY_FRAME.height,
         handles: agentNodeHandles(),
-        data: { node, onOpen: onOpenNode },
+        data: { node, onInspect: onInspectNode, onSelect: onSelectNode },
       })),
-    [onOpenNode, session.nodes],
+    [onInspectNode, onSelectNode, selectedNode?.id, session.nodes],
   );
   const edges = useMemo<AgentFlowEdge[]>(
     () =>
@@ -1330,6 +1347,10 @@ function CanvasView({
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         onNodesChange={handleNodesChange}
+        onSelectionChange={useCallback(({ nodes }: { nodes: FlowNode[] }) => {
+          const selected = nodes.find((n) => n.selected);
+          onSelectNode(selected ? selected.id : null);
+        }, [onSelectNode])}
         defaultViewport={{ x: 0, y: 0, zoom: CANVAS_NODE_LAYOUT.singleNodeZoom }}
         minZoom={0.22}
         maxZoom={1.35}
@@ -1345,6 +1366,7 @@ function CanvasView({
       <CanvasComposer
         value={composerValue}
         disabled={composerDisabled}
+        selectedNode={selectedNode}
         onChange={onComposerChange}
         onSubmit={onComposerSubmit}
         onStop={onComposerStop}
@@ -1410,7 +1432,7 @@ function mergeFlowNodeState(current: AgentFlowNode[], next: AgentFlowNode[]): Ag
       dragging: existing.dragging,
       height: existing.height,
       measured: existing.measured,
-      selected: existing.selected,
+      selected: node.selected,
       width: existing.width,
     };
   });
@@ -1843,11 +1865,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
     { dependencies: [selected], scope: rootRef, revertOnUpdate: true },
   );
 
-  function openFromKeyboard(event: KeyboardEvent<HTMLDivElement>) {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    data.onOpen(node.id);
-  }
+
 
   return (
     <div
@@ -1862,54 +1880,63 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
         <Handle id="source-right" type="source" position={Position.Right} className="node-handle source-right" />
         <Handle id="source-bottom" type="source" position={Position.Bottom} className="node-handle source-bottom" />
       </div>
-      <div
-        ref={cardRef}
-        className="agent-card"
-        role="button"
-        tabIndex={0}
-        aria-label={`${node.title}: ${agentIdentityForNode(node)}. ${footer.primary}${footer.secondary ? ` ${footer.secondary}` : ""}. ${summary}`}
-        title={nodeTooltipForNode(node, runtime)}
-        onClick={() => data.onOpen(node.id)}
-        onKeyDown={openFromKeyboard}
-      >
-        <span ref={markerRef} className="evidence-marker" aria-hidden="true">
-          {node.status === "completed" && <Eye size={19} strokeWidth={2.6} />}
-          {node.status === "failed" && <X size={20} strokeWidth={3} />}
-        </span>
-        <div className="agent-node-header">
-          <span className="agent-node-eyebrow">{eyebrow}</span>
-          <button
-            ref={menuRef}
-            className="agent-node-menu nodrag"
-            type="button"
-            aria-label={`Open actions for ${node.title}`}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <MoreHorizontal size={16} aria-hidden="true" />
-          </button>
-        </div>
-        <span className="agent-node-title">{node.title}</span>
-        <div className="agent-node-meta-row">
-          <div className="agent-identity-pill">
-            <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
-            <span>{agentIdentityForNode(node)}</span>
+      <div ref={cardRef} className="agent-card" title={nodeTooltipForNode(node, runtime)}>
+        <div
+          className="agent-card-select"
+          role="button"
+          tabIndex={0}
+          aria-pressed={selected}
+          aria-label={`Select ${node.title}: ${agentIdentityForNode(node)}. ${footer.primary}${footer.secondary ? ` ${footer.secondary}` : ""}. ${summary}`}
+          onClick={() => data.onSelect(node.id)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              data.onSelect(node.id);
+            }
+          }}
+        >
+          <span ref={markerRef} className="evidence-marker" aria-hidden="true">
+            {node.status === "completed" && <Eye size={19} strokeWidth={2.6} />}
+            {node.status === "failed" && <X size={20} strokeWidth={3} />}
+          </span>
+          <div className="agent-node-header">
+            <span className="agent-node-eyebrow">{eyebrow}</span>
           </div>
-          <div className={`agent-status-chip ${node.status}`} aria-label="Node status summary">
-            {node.status === "completed" && <CheckCircle2 size={13} aria-hidden="true" />}
-            {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
-            <span>{footer.primary}</span>
+          <span className="agent-node-title">{node.title}</span>
+          <div className="agent-node-meta-row">
+            <div className="agent-identity-pill">
+              <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
+              <span>{agentIdentityForNode(node)}</span>
+            </div>
+            <div className={`agent-status-chip ${node.status}`} aria-label="Node status summary">
+              {node.status === "completed" && <CheckCircle2 size={13} aria-hidden="true" />}
+              {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
+              <span>{footer.primary}</span>
+            </div>
+          </div>
+          <AgentStreamPreview line={streamLine} nodeId={node.id} />
+          <div className={`agent-footer ${node.status}`} aria-label="Node metadata">
+            <span>{metadata}</span>
+            {footer.secondary && (
+              <>
+                <span className="footer-separator" aria-hidden="true">·</span>
+                <span>{footer.secondary}</span>
+              </>
+            )}
           </div>
         </div>
-        <AgentStreamPreview line={streamLine} nodeId={node.id} />
-        <div className={`agent-footer ${node.status}`} aria-label="Node metadata">
-          <span>{metadata}</span>
-          {footer.secondary && (
-            <>
-              <span className="footer-separator" aria-hidden="true">·</span>
-              <span>{footer.secondary}</span>
-            </>
-          )}
-        </div>
+        <button
+          ref={menuRef}
+          className="agent-node-menu nodrag"
+          type="button"
+          aria-label={`More details for ${node.title}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            data.onInspect(node.id);
+          }}
+        >
+          <MoreHorizontal size={16} aria-hidden="true" />
+        </button>
       </div>
     </div>
   );
@@ -4080,21 +4107,43 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
 function CanvasComposer({
   value,
   disabled,
+  selectedNode,
   onChange,
   onSubmit,
   onStop,
 }: {
   value: string;
   disabled: boolean;
+  selectedNode: CanvasNode | null;
   onChange: (value: string) => void;
-  onSubmit: () => void;
+  onSubmit: (action?: ComposerAction) => void;
   onStop: () => void;
 }) {
+  const [action, setAction] = useState<ComposerAction>(null);
+
+  useEffect(() => {
+    setAction(null);
+  }, [selectedNode?.id]);
+
+  let placeholder = "Insert requirement or node";
+  if (selectedNode) {
+    if (action === "repair") placeholder = "Tell the agent how to fix this node result…";
+    else if (action === "variant") placeholder = "Describe another attempt from the previous checkpoint…";
+    else if (action === "rollback") placeholder = "Confirm or explain why to rollback this node and downstream…";
+    else placeholder = "Choose an action to continue…";
+  }
+
+  const nodeActionPendingBackend = selectedNode !== null;
+  const displayedValue = nodeActionPendingBackend ? "" : value;
+  const hasValue = displayedValue.trim().length > 0;
+  const canSubmit = hasValue && !nodeActionPendingBackend;
+  const submitTitle = nodeActionPendingBackend ? "Node action submission is not available yet" : "Submit";
+
   const inputRef = useRef<HTMLInputElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
-  const hasValue = value.trim().length > 0;
+
   const handleSubmit = useCallback(() => {
-    if (disabled || !hasValue) return;
+    if (disabled || !canSubmit) return;
 
     const composer = composerRef.current;
     if (composer && !userPrefersReducedMotion()) {
@@ -4105,8 +4154,8 @@ function CanvasComposer({
         .to(composer, { "--intake-scale-x": 1, "--intake-scale-y": 1, duration: 0.16, ease: "power2.out" }, 0.08);
     }
 
-    onSubmit();
-  }, [disabled, hasValue, onSubmit]);
+    onSubmit(action);
+  }, [disabled, canSubmit, action, onSubmit]);
 
   useGSAP(
     () => {
@@ -4129,17 +4178,53 @@ function CanvasComposer({
       className={hasValue ? "canvas-composer-shell nodrag nopan has-content" : "canvas-composer-shell nodrag nopan"}
       onPointerDown={(event) => event.stopPropagation()}
     >
+      {selectedNode && (
+        <div className="composer-context-pill">
+          <span className="pill-title">{selectedNode.title}</span>
+          <span className="pill-meta">{selectedNode.agent} · {selectedNode.status}</span>
+        </div>
+      )}
+      {selectedNode && (
+        <div className="composer-actions">
+          <button
+            type="button"
+            className={`action-chip ${action === "repair" ? "selected" : ""}`}
+            onClick={() => setAction("repair")}
+            aria-pressed={action === "repair"}
+          >
+            Repair this node
+          </button>
+          <button
+            type="button"
+            className={`action-chip ${action === "variant" ? "selected" : ""}`}
+            onClick={() => setAction("variant")}
+            aria-pressed={action === "variant"}
+          >
+            Try another version
+          </button>
+          <button
+            type="button"
+            className={`action-chip ${action === "rollback" ? "selected" : ""}`}
+            onClick={() => setAction("rollback")}
+            aria-pressed={action === "rollback"}
+          >
+            Rollback node and downstream
+          </button>
+        </div>
+      )}
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
         <input
           className="canvas-composer-input"
           ref={inputRef}
-          value={value}
-          disabled={disabled}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder="Insert requirement or node"
-          aria-label="Insert requirement or node"
+          value={displayedValue}
+          disabled={disabled || nodeActionPendingBackend}
+          onChange={(event) => {
+            if (!nodeActionPendingBackend) onChange(event.target.value);
+          }}
+          placeholder={placeholder}
+          aria-label={placeholder}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && hasValue) {
+            if (event.key === "Enter" && canSubmit) {
               event.preventDefault();
               handleSubmit();
             }
@@ -4168,10 +4253,10 @@ function CanvasComposer({
           </button>
           <button
             className="icon-button composer-send"
-            title="Insert requirement"
-            aria-label="Insert requirement"
+            title={submitTitle}
+            aria-label={submitTitle}
             onClick={handleSubmit}
-            disabled={disabled || !hasValue}
+            disabled={disabled || !canSubmit}
           >
             <ArrowUp size={18} />
           </button>

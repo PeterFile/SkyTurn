@@ -36,6 +36,7 @@ function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
       path: "",
       branchName: "branch",
       baselineRef: "base",
+      baseCommit: "base",
     },
   };
 }
@@ -569,4 +570,115 @@ describe("UI source validation", () => {
     expect(deleteBranchMessage).toContain("Delete branch: skyturn/session-1");
   });
 
+});
+
+describe("Slice C UI behavior", () => {
+  it("clicking a node selects it and does not open modal/details", async () => {
+    const appSource = await readSource("./App.tsx");
+    const nodeCard = appSource.slice(appSource.indexOf('className="agent-card-select"'), appSource.indexOf('className="evidence-marker"'));
+    expect(nodeCard).toContain('onClick={() => data.onSelect(node.id)}');
+    expect(nodeCard).not.toContain('data.onInspect');
+    expect(nodeCard).toContain('role="button"');
+    expect(nodeCard).toContain('aria-pressed={selected}');
+  });
+
+  it("clicking the node card More button opens modal/details", async () => {
+    const appSource = await readSource("./App.tsx");
+    const menuButton = appSource.slice(appSource.indexOf('className="agent-node-menu nodrag"'), appSource.indexOf('<MoreHorizontal'));
+    expect(menuButton).toContain('onClick={(event) => {');
+    expect(menuButton).toContain('event.stopPropagation()');
+    expect(menuButton).toContain('data.onInspect(node.id)');
+  });
+
+  it("opening More synchronizes the selected composer node", async () => {
+    const appSource = await readSource("./App.tsx");
+    const canvasView = appSource.slice(appSource.indexOf("<CanvasView"), appSource.indexOf("</main>"));
+    expect(canvasView).toContain("setSelectedNodeId(nodeId)");
+    expect(canvasView).toContain("setInspectedNodeId(nodeId)");
+    expect(canvasView).toContain("setInspectedNodeId((current) => (current === nodeId ? current : null))");
+  });
+
+  it("React Flow visual selection follows the selected composer node", async () => {
+    const appSource = await readSource("./App.tsx");
+    const nodesSource = appSource.slice(appSource.indexOf("const nodesSource"), appSource.indexOf("const edges ="));
+    const mergeNodes = appSource.slice(appSource.indexOf("function mergeFlowNodeState"), appSource.indexOf("const AGENT_HANDLE_SIZE"));
+    const reactFlow = appSource.slice(appSource.indexOf("<ReactFlow"), appSource.indexOf("<CanvasViewportController"));
+    expect(nodesSource).toContain("selected: node.id === selectedNode?.id");
+    expect(nodesSource).toContain("selectedNode?.id");
+    expect(mergeNodes).toContain("selected: node.selected");
+    expect(reactFlow).not.toContain('role="listbox"');
+  });
+
+  it("node-scoped composer actions stay display-only until backend wiring", async () => {
+    const appSource = await readSource("./App.tsx");
+    const submitHandler = appSource.slice(appSource.indexOf("async function appendRequirementNode"), appSource.indexOf("function retryNode"));
+    const composer = appSource.slice(appSource.indexOf("function CanvasComposer("));
+    expect(submitHandler).toContain("async function appendRequirementNode(_action?: ComposerAction)");
+    expect(submitHandler).not.toContain("nodeAction:");
+    expect(submitHandler).not.toContain("nodeId: targetNode");
+    expect(composer).toContain("const nodeActionPendingBackend = selectedNode !== null");
+    expect(composer).toContain('const displayedValue = nodeActionPendingBackend ? "" : value');
+    expect(composer).toContain("const canSubmit = hasValue && !nodeActionPendingBackend");
+    expect(composer).toContain("disabled={disabled || nodeActionPendingBackend}");
+    expect(composer).toContain("Node action submission is not available yet");
+  });
+
+  it("More button remains outside the node selection target", async () => {
+    const appSource = await readSource("./App.tsx");
+    const selectTarget = appSource.slice(appSource.indexOf('className="agent-card-select"'), appSource.indexOf('<AgentStreamPreview'));
+    const menuButton = appSource.slice(appSource.indexOf('className="agent-node-menu nodrag"'), appSource.indexOf('<MoreHorizontal'));
+    expect(selectTarget).not.toContain('className="agent-node-menu nodrag"');
+    expect(menuButton).toContain('type="button"');
+    expect(menuButton).toContain("event.stopPropagation()");
+  });
+
+  it("selected node appears in the bottom composer", async () => {
+    const appSource = await readSource("./App.tsx");
+    const composer = appSource.slice(appSource.indexOf('function CanvasComposer('));
+    expect(composer).toContain('selectedNode && (');
+    expect(composer).toContain('className="composer-context-pill"');
+    expect(composer).toContain('{selectedNode.title}');
+    expect(composer).toContain('{selectedNode.agent}');
+  });
+
+  it("action chips change composer mode/placeholder", async () => {
+    const appSource = await readSource("./App.tsx");
+    const composer = appSource.slice(appSource.indexOf('function CanvasComposer('));
+    expect(composer).toContain('className={`action-chip ${action === "repair" ? "selected" : ""}`}');
+    expect(composer).toContain('onClick={() => setAction("repair")}');
+    expect(composer).toContain('if (action === "repair") placeholder =');
+    expect(composer).toContain('else if (action === "variant") placeholder =');
+  });
+
+  it("no selected node keeps existing global bottom input behavior", async () => {
+    const appSource = await readSource("./App.tsx");
+    const composer = appSource.slice(appSource.indexOf('function CanvasComposer('), appSource.indexOf('const hasValue =', appSource.indexOf('function CanvasComposer(')));
+    expect(composer).toContain('let placeholder = "Insert requirement or node"');
+    expect(composer).toContain('if (selectedNode) {');
+  });
+
+  it("modal still has exactly Output / Changes / Context tabs", async () => {
+    const appSource = await readSource("./App.tsx");
+    const modalTabs = appSource.slice(appSource.indexOf('<nav className="modal-tabs"'), appSource.indexOf('</nav>', appSource.indexOf('<nav className="modal-tabs"')));
+    expect(modalTabs).toContain('NODE_MODAL_TABS.map');
+
+    const modalBodyIndex = appSource.indexOf('<div className="modal-body">');
+    const modalBody = appSource.slice(modalBodyIndex, appSource.indexOf('</section>', modalBodyIndex));
+    expect(modalBody).toContain('tab === "Output"');
+    expect(modalBody).toContain('tab === "Changes"');
+    expect(modalBody).toContain('tab === "Context"');
+    expect(modalBody).not.toContain('tab === "Logs"');
+  });
+
+  it("More button has an accessible label", async () => {
+    const appSource = await readSource("./App.tsx");
+    const menuButton = appSource.slice(appSource.indexOf('className="agent-node-menu nodrag"'), appSource.indexOf('<MoreHorizontal'));
+    expect(menuButton).toContain('aria-label={`More details for ${node.title}`}');
+  });
+
+  it("node selection target keeps a visible keyboard focus style", async () => {
+    const styleSource = await readSource("./styles.css");
+    expect(styleSource).toContain(".agent-card-select:focus-visible");
+    expect(styleSource).toContain("outline: 2px solid var(--sk-cobalt)");
+  });
 });
