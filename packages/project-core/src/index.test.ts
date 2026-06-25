@@ -338,17 +338,24 @@ describe("agent run contracts", () => {
     const eligibility: WorkflowRollbackEligibility = {
       eligible: false,
       targetLaneId: "lane-implementation",
+      targetNodeId: "node-implementation",
       checkpointId: beforeCheckpoint.id,
+      checkpointPhase: "before",
       restoreCommitRef: beforeCheckpoint.headCommit,
       affectedLaneIds: ["lane-implementation", "lane-validation"],
+      affectedNodeIds: ["node-implementation", "lane-validation"],
+      downstreamInactiveLaneIds: ["lane-validation"],
+      downstreamInactiveNodeIds: ["lane-validation"],
       blockingRemoteSideEffects: [
         {
           eventKind: "workflow.pull_request.created",
+          status: "recorded",
           laneId: "lane-validation",
           eventId: "event-pr-created",
         },
       ],
       localRollbackSafe: true,
+      localSafetyStatus: "safe",
       reason: "Remote side effects exist.",
     };
     const remoteSideEffectPayload: WorkflowRemoteSideEffectPayload = {
@@ -376,8 +383,13 @@ describe("agent run contracts", () => {
     expect(beforeCheckpoint.evidenceRefs).toEqual([{ kind: "run", id: "run-implementation-1" }]);
     expect(beforeCheckpoint).not.toHaveProperty("toolCallId");
     expect(eligibility.checkpointId).toBe(beforeCheckpoint.id);
+    expect(eligibility.checkpointPhase).toBe("before");
     expect(eligibility.restoreCommitRef).toBe("head-before-sha");
+    expect(eligibility.affectedNodeIds).toEqual(["node-implementation", "lane-validation"]);
+    expect(eligibility.downstreamInactiveLaneIds).toEqual(["lane-validation"]);
     expect(eligibility.blockingRemoteSideEffects[0]?.eventKind).toBe("workflow.pull_request.created");
+    expect(eligibility.blockingRemoteSideEffects[0]?.status).toBe("recorded");
+    expect(eligibility.localSafetyStatus).toBe("safe");
     expect(remoteSideEffectPayload.affectedLaneIds).toEqual(["lane-implementation", "lane-validation"]);
     expect(repairIntent.successorLaneId).toBe("lane-implementation-repair");
     expect(repairIntent.successorSemanticKey).toBe("successor:lane-implementation-repair");
@@ -500,17 +512,23 @@ describe("agent run contracts", () => {
         phase: "blocked",
         targetLaneId: "lane-implementation",
         checkpointId: "checkpoint-before-lane-implementation",
+        checkpointPhase: "before",
         restoreCommitRef: "head-before-sha",
         affectedLaneIds: ["lane-implementation", "lane-validation"],
+        affectedNodeIds: ["lane-implementation", "lane-validation"],
+        downstreamInactiveLaneIds: ["lane-validation"],
+        downstreamInactiveNodeIds: ["lane-validation"],
         remoteBlockers: [
           {
             eventKind: "workflow.pull_request.created",
+            status: "recorded",
             eventId: "event-pr-created",
             laneId: "lane-implementation",
             affectedLaneIds: ["lane-implementation"],
           },
         ],
         localRollbackSafe: true,
+        localSafetyStatus: "safe",
         blockedReason: {
           code: "remote_side_effect",
           message: "Rollback is blocked by remote side effects.",
