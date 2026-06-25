@@ -41,6 +41,11 @@ import {
   type ManagedWorktreeCleanupResult,
   type ManagedWorktreeCreateInput,
   type ManagedWorktreeService,
+  type RollbackWorktreeInput,
+  type RollbackWorktreeManualRepairState,
+  type RollbackWorktreeManualRepairReasonCode,
+  type RollbackWorktreeResetResult,
+  type RollbackWorktreeState,
   type VariantComparisonEvidence,
   type VariantComparisonInput,
   type VariantAdoptionService,
@@ -577,6 +582,134 @@ export async function getGitBranchFacts(repoRoot: string): Promise<GitBranchFact
   return {
     currentBranch,
     branches: branches.length > 0 ? branches : ["HEAD"],
+  };
+}
+
+export async function evaluateRollbackWorktreeState(input: RollbackWorktreeInput): Promise<RollbackWorktreeState> {
+  const restoreCommitRef = input.restoreCommitRef;
+  const expectedHeadCommit = input.expectedHeadCommit;
+  if (!isFullCommitSha(restoreCommitRef)) {
+    return rollbackManualRepair("invalid_restore_commit", "Rollback restore target must be a recorded full commit SHA.");
+  }
+  if (!isFullCommitSha(expectedHeadCommit)) {
+    return rollbackManualRepair("invalid_recorded_commit", "Rollback recorded HEAD must be a full commit SHA.", {
+      restoreCommitRef,
+    });
+  }
+
+  const context = await resolveRollbackWorktreeContext(input);
+  if (!context.ok) return context.result;
+  const { repoRoot, worktreePath } = context;
+
+  if (!await commitObjectExists(worktreePath, restoreCommitRef)) {
+    return rollbackManualRepair("missing_restore_commit", "Rollback restore commit is not present in the worktree repository.", {
+      worktreePath,
+      restoreCommitRef,
+    });
+  }
+  if (!await commitObjectExists(worktreePath, expectedHeadCommit)) {
+    return rollbackManualRepair("missing_recorded_commit", "Rollback recorded HEAD commit is not present in the worktree repository.", {
+      worktreePath,
+      restoreCommitRef,
+    });
+  }
+
+  const listed = await findListedRollbackWorktree(repoRoot, worktreePath);
+  if (!listed.ok) return listed.result;
+  const expectedBranchRef = `refs/heads/${input.expectedBranchName}`;
+  const branchName = await currentBranch(worktreePath).catch(() => "");
+  if (branchName !== input.expectedBranchName || listed.entry.branch !== expectedBranchRef) {
+    return rollbackManualRepair("branch_mismatch", "Worktree branch does not match the SkyTurn-managed branch.", {
+      worktreePath,
+      branchName: branchName || undefined,
+      restoreCommitRef,
+    });
+  }
+  const headCommit = await currentHead(worktreePath).catch(() => "");
+  if (!isFullCommitSha(headCommit) || listed.entry.head?.toLowerCase() !== headCommit.toLowerCase()) {
+    return rollbackManualRepair("head_mismatch", "Worktree HEAD does not match git worktree list evidence.", {
+      worktreePath,
+      branchName,
+      headCommit: headCommit || undefined,
+      restoreCommitRef,
+    });
+  }
+
+  const dirtyStatus = await runGit(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all", "--"], { allowFailure: true });
+  if (dirtyStatus.exitCode !== 0) {
+    return rollbackManualRepair("dirty_worktree", "Worktree clean status could not be verified.", {
+      worktreePath,
+      branchName,
+      headCommit,
+      restoreCommitRef,
+    });
+  }
+  if (dirtyStatus.stdout.trim()) {
+    return rollbackManualRepair("dirty_worktree", "Worktree has uncommitted changes.", {
+      worktreePath,
+      branchName,
+      headCommit,
+      restoreCommitRef,
+    });
+  }
+  if (headCommit.toLowerCase() === expectedHeadCommit.toLowerCase()) {
+    return {
+      status: "safe",
+      worktreePath,
+      branchName,
+      headCommit,
+      restoreCommitRef,
+    };
+  }
+  if (headCommit.toLowerCase() === restoreCommitRef.toLowerCase()) {
+    return {
+      status: "already_restored",
+      worktreePath,
+      branchName,
+      headCommit,
+      restoreCommitRef,
+    };
+  }
+  return rollbackManualRepair("head_mismatch", "Worktree HEAD does not match the SkyTurn-recorded local commit.", {
+    worktreePath,
+    branchName,
+    headCommit,
+    restoreCommitRef,
+  });
+}
+
+export async function resetRollbackWorktreeToCommit(input: RollbackWorktreeInput): Promise<RollbackWorktreeResetResult> {
+  const before = await evaluateRollbackWorktreeState(input);
+  if (before.status !== "safe") return before;
+
+  const reset = await runGit(before.worktreePath, ["reset", "--hard", input.restoreCommitRef], { allowFailure: true });
+  if (reset.exitCode !== 0) {
+    return rollbackManualRepair("git_reset_failed", `Git reset failed; manual repair is required. ${errorMessage(reset.stderr || reset.stdout)}`.trim(), {
+      worktreePath: before.worktreePath,
+      branchName: before.branchName,
+      headCommit: before.headCommit,
+      restoreCommitRef: before.restoreCommitRef,
+    });
+  }
+
+  const after = await evaluateRollbackWorktreeState({
+    ...input,
+    expectedHeadCommit: input.restoreCommitRef,
+  });
+  if (after.status !== "safe") {
+    return rollbackManualRepair("post_reset_mismatch", "Git reset completed but post-reset worktree evidence is ambiguous.", {
+      worktreePath: "worktreePath" in after ? after.worktreePath : before.worktreePath,
+      branchName: "branchName" in after ? after.branchName : before.branchName,
+      headCommit: "headCommit" in after ? after.headCommit : undefined,
+      restoreCommitRef: input.restoreCommitRef,
+    });
+  }
+  return {
+    status: "applied",
+    worktreePath: after.worktreePath,
+    branchName: after.branchName,
+    headCommit: after.headCommit,
+    restoreCommitRef: after.restoreCommitRef,
   };
 }
 
@@ -1550,6 +1683,68 @@ async function ensureManagedRoot(repoRoot: string): Promise<string> {
 async function verifyCommit(repoRoot: string, commit: string, label: string): Promise<string> {
   validateCommitHash(commit, label);
   return (await runGit(repoRoot, ["rev-parse", "--verify", `${commit}^{commit}`])).stdout;
+}
+
+function isFullCommitSha(value: string): boolean {
+  return /^[0-9a-fA-F]{40}$/.test(value);
+}
+
+async function commitObjectExists(cwd: string, commit: string): Promise<boolean> {
+  const result = await runGit(cwd, ["rev-parse", "--verify", `${commit}^{commit}`], { allowFailure: true });
+  return result.exitCode === 0 && result.stdout.toLowerCase() === commit.toLowerCase();
+}
+
+async function resolveRollbackWorktreeContext(input: RollbackWorktreeInput): Promise<
+  | { ok: true; repoRoot: string; worktreePath: string }
+  | { ok: false; result: RollbackWorktreeManualRepairState }
+> {
+  let repoRoot = "";
+  let worktreePath = "";
+  try {
+    repoRoot = await assertGitRepo(input.projectRoot);
+    worktreePath = await realpath(input.worktreePath);
+    const managedRoot = await realpath(resolve(dirname(repoRoot), `${basename(repoRoot)}.worktrees`));
+    assertPathInside(worktreePath, managedRoot, "rollback worktree path");
+  } catch {
+    return {
+      ok: false,
+      result: rollbackManualRepair("unmanaged_worktree", "Rollback requires a SkyTurn-managed worktree."),
+    };
+  }
+  return { ok: true, repoRoot, worktreePath };
+}
+
+async function findListedRollbackWorktree(repoRoot: string, worktreePath: string): Promise<
+  | { ok: true; entry: GitWorktreeListEntry }
+  | { ok: false; result: RollbackWorktreeManualRepairState }
+> {
+  try {
+    return { ok: true, entry: await findListedWorktree(repoRoot, worktreePath) };
+  } catch {
+    return {
+      ok: false,
+      result: rollbackManualRepair("unmanaged_worktree", "Rollback worktree is not listed by git.", {
+        worktreePath,
+      }),
+    };
+  }
+}
+
+function rollbackManualRepair(
+  reasonCode: RollbackWorktreeManualRepairReasonCode,
+  message: string,
+  facts: Partial<Pick<RollbackWorktreeManualRepairState, "worktreePath" | "branchName" | "headCommit" | "restoreCommitRef">> = {},
+): RollbackWorktreeManualRepairState {
+  return {
+    status: "manual_repair_required",
+    reasonCode,
+    message,
+    manualRepairRequired: true,
+    ...(facts.worktreePath ? { worktreePath: facts.worktreePath } : {}),
+    ...(facts.branchName ? { branchName: facts.branchName } : {}),
+    ...(facts.headCommit ? { headCommit: facts.headCommit } : {}),
+    ...(facts.restoreCommitRef ? { restoreCommitRef: facts.restoreCommitRef } : {}),
+  };
 }
 
 async function verifyGitRef(repoRoot: string, ref: string): Promise<string> {
