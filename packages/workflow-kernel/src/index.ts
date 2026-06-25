@@ -20,6 +20,8 @@ import type {
   WorkflowRollbackEligibility,
   WorkflowDeliveryCheckStatus,
   WorkflowDeliveryLoopState,
+  WorkflowDeliveryReviewStatus,
+  WorkflowDeliveryReviewSummary,
   WorkflowLoopBlockedReason,
   WorkflowLoopEngineeringProjectionInput,
   WorkflowLoopEngineeringState,
@@ -197,6 +199,7 @@ export interface FlowEvidence {
 export type FlowEvidenceStatus = "passed" | "failed" | "skipped" | "pending";
 
 export type PullRequestCheckStatus = WorkflowDeliveryCheckStatus;
+export type PullRequestReviewStatus = WorkflowDeliveryReviewStatus;
 
 export interface PullRequestCheckResult {
   name: string;
@@ -205,6 +208,8 @@ export interface PullRequestCheckResult {
   detail?: string;
 }
 
+export type PullRequestReviewResult = WorkflowDeliveryReviewSummary;
+
 export interface PullRequestChecksRecordedPayload {
   laneId: string;
   prNumber: number;
@@ -212,6 +217,7 @@ export interface PullRequestChecksRecordedPayload {
   headSha: string;
   status: PullRequestCheckStatus;
   checks: PullRequestCheckResult[];
+  review: PullRequestReviewResult;
 }
 
 interface PullRequestHeadSnapshot {
@@ -755,7 +761,7 @@ function stalePullRequestCheckGateLaneIds(projection: FlowProjection): Set<strin
   for (const [laneId, payload] of latestChecksByLaneId) {
     const lane = projection.lanes.find((item) => item.id === laneId);
     if (!lane || !isPullRequestCheckGateLane(lane)) continue;
-    if (payload.status !== "passed" || !matchesCurrentPullRequestHead(headState, payload)) {
+    if (payload.status !== "passed" || payload.review.status === "changes_requested" || !matchesCurrentPullRequestHead(headState, payload)) {
       stale.add(laneId);
     }
   }
@@ -888,6 +894,7 @@ function projectDeliveryLoopState(projection: FlowProjection): WorkflowDeliveryL
   let headBranch: string | undefined;
   let lastCheckedHeadSha: string | undefined;
   let checks: WorkflowDeliveryLoopState["checks"] = [];
+  let review: WorkflowDeliveryReviewSummary = { status: "unknown" };
   let evidenceStale = false;
 
   for (const event of projection.events) {
@@ -917,6 +924,7 @@ function projectDeliveryLoopState(projection: FlowProjection): WorkflowDeliveryL
       prNumber = recorded.payload.prNumber;
       lastCheckedHeadSha = recorded.payload.headSha;
       checks = recorded.payload.checks;
+      review = recorded.payload.review;
       const current = currentPullRequestHead(headState, prNumber, checkLaneId);
       headSha = current?.headSha ?? headSha;
       headBranch = current?.headBranch ?? headBranch;
@@ -926,7 +934,9 @@ function projectDeliveryLoopState(projection: FlowProjection): WorkflowDeliveryL
         phase = "checks_stale";
         continue;
       }
-      phase = recorded.payload.status === "passed"
+      phase = review.status === "changes_requested"
+        ? "changes_requested"
+        : recorded.payload.status === "passed"
         ? "merge_ready"
         : recorded.payload.status === "failed"
           ? "checks_failed"
@@ -963,6 +973,7 @@ function projectDeliveryLoopState(projection: FlowProjection): WorkflowDeliveryL
     ...(headBranch ? { headBranch } : {}),
     ...(lastCheckedHeadSha ? { lastCheckedHeadSha } : {}),
     checks,
+    review,
     ...(blockedReason ? { blockedReason } : {}),
   };
 }
@@ -1370,6 +1381,7 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
           lane &&
           isPullRequestCheckGateLane(lane) &&
           checks.payload.status === "passed" &&
+          checks.payload.review.status !== "changes_requested" &&
           matchesCurrentPullRequestHead(pullRequestHeadState, checks.payload)
         ) {
           setLaneStatus(projection, lane.id, "completed");
@@ -2799,7 +2811,14 @@ function normalizePullRequestChecksRecorded(event: FlowEvent): { payload: PullRe
   if (!laneId || !headSha || !url || typeof prNumber !== "number") return null;
   const status = normalizePullRequestCheckStatus(event.payload.status ?? evidencePayload.status);
   const checks = normalizePullRequestChecks(event.payload.checks ?? evidencePayload.checks);
-  const evidenceStatus: FlowEvidenceStatus = status === "passed" ? "passed" : status === "pending" ? "pending" : "failed";
+  const review = normalizePullRequestReview(event.payload.review ?? evidencePayload.review ?? (isRecord(evidencePayload.gate) ? evidencePayload.gate : null), checks, status);
+  const evidenceStatus: FlowEvidenceStatus = review.status === "changes_requested"
+    ? "failed"
+    : status === "passed"
+      ? "passed"
+      : status === "pending"
+        ? "pending"
+        : "failed";
   const payload: PullRequestChecksRecordedPayload = {
     laneId,
     prNumber,
@@ -2807,6 +2826,7 @@ function normalizePullRequestChecksRecorded(event: FlowEvent): { payload: PullRe
     headSha,
     status,
     checks,
+    review,
   };
   return {
     payload,
@@ -2816,8 +2836,12 @@ function normalizePullRequestChecksRecorded(event: FlowEvent): { payload: PullRe
       segmentId: stringValue(event.payload.segmentId) ?? "",
       kind: "pull-request-checks",
       status: evidenceStatus,
-      checks: checks.map((check) => `${check.name}:${check.status}`),
+      checks: [
+        ...checks.map((check) => `${check.name}:${check.status}`),
+        ...(review.status !== "unknown" ? [`review:${review.status}`] : []),
+      ],
       artifacts: compactStrings([url, ...checks.map((check) => check.url ?? null)]),
+      ...(review.detail ? { detail: review.detail } : {}),
     },
   };
 }
@@ -2885,6 +2909,39 @@ function normalizePullRequestCheck(value: unknown, index: number): PullRequestCh
 function normalizePullRequestCheckStatus(value: unknown): PullRequestCheckStatus {
   if (value === "passed" || value === "failed" || value === "pending" || value === "changes_requested") return value;
   return "pending";
+}
+
+function normalizePullRequestReview(
+  value: unknown,
+  checks: PullRequestCheckResult[],
+  status: PullRequestCheckStatus,
+): PullRequestReviewResult {
+  const record = isRecord(value) ? value : {};
+  const rawStatus = record.status ?? record.reviewStatus ?? record.decision;
+  const normalized = normalizePullRequestReviewStatus(rawStatus);
+  const fallback = status === "changes_requested" || checks.some((check) => check.status === "changes_requested")
+    ? "changes_requested"
+    : "unknown";
+  const detail = stringValue(record.detail) ?? stringValue(record.description) ?? stringValue(record.reason);
+  const reviewer = stringValue(record.reviewer) ?? stringValue(record.author);
+  const url = stringValue(record.url) ?? stringValue(record.link);
+  return {
+    status: normalized ?? fallback,
+    ...(detail ? { detail } : {}),
+    ...(reviewer ? { reviewer } : {}),
+    ...(url ? { url } : {}),
+  };
+}
+
+function normalizePullRequestReviewStatus(value: unknown): PullRequestReviewStatus | null {
+  if (value === "approved" || value === "changes_requested" || value === "pending" || value === "unknown") return value;
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "approved" || normalized === "approve") return "approved";
+  if (normalized === "changes_requested" || normalized === "changes requested") return "changes_requested";
+  if (normalized === "review_required" || normalized === "review required" || normalized === "pending") return "pending";
+  if (normalized === "unknown") return "unknown";
+  return null;
 }
 
 function normalizeFlowEvidenceStatus(value: unknown): FlowEvidenceStatus {

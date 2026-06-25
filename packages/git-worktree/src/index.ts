@@ -296,6 +296,7 @@ export interface DeliveryPullRequestChecksInput {
 }
 
 export type DeliveryPullRequestCheckStatus = "passed" | "failed" | "pending";
+export type DeliveryPullRequestReviewStatus = "approved" | "changes_requested" | "pending" | "unknown";
 
 export interface DeliveryPullRequestCheck {
   name: string;
@@ -306,12 +307,30 @@ export interface DeliveryPullRequestCheck {
   detail?: string;
 }
 
+export interface DeliveryPullRequestReviewGate {
+  status: DeliveryPullRequestReviewStatus;
+  decision: string;
+  detail?: string;
+  reviewer?: string;
+  link?: string;
+}
+
+export interface DeliveryPullRequestGateSummary {
+  headSha: string;
+  checksStatus: DeliveryPullRequestCheckStatus;
+  reviewStatus: DeliveryPullRequestReviewStatus;
+  state: string;
+  mergeable: boolean;
+}
+
 export interface DeliveryPullRequestChecksEvidence {
   status: DeliveryPullRequestCheckStatus;
   number: number;
   url?: string;
   headSha: string;
   checks: DeliveryPullRequestCheck[];
+  review: DeliveryPullRequestReviewGate;
+  gate: DeliveryPullRequestGateSummary;
   command: DeliveryCommandResult;
   summary: string;
 }
@@ -332,6 +351,7 @@ export interface DeliveryPullRequestMergeEvidence {
   headSha: string;
   subject: string;
   checks: DeliveryPullRequestCheck[];
+  review: DeliveryPullRequestReviewGate;
   command: DeliveryCommandResult;
 }
 

@@ -240,11 +240,19 @@ interface DeliveryPullRequestEvidenceLike {
   number: number;
   url: string;
   commitSha: string;
+  commitLaneId?: string;
+  headBranch?: string;
+}
+
+interface DeliveryPullRequestCurrentHeadEvidenceLike {
+  headSha: string;
+  headBranch?: string;
 }
 
 interface DeliveryPullRequestChecksEvidenceLike {
   status: string;
   headSha: string;
+  reviewStatus: string;
 }
 
 interface DeliveryPullRequestMergeEvidenceLike {
@@ -1399,7 +1407,8 @@ ipcMain.handle("workflow:pullRequest:checks", workflowHandler(async (projectRoot
   const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
   assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
   const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
-  const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+  const currentHead = findDeliveryPullRequestCurrentHeadEvidence(store, sessionId, laneId, prEvidence);
+  const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence, currentHead.headSha);
   const realProjectRoot = await fs.realpath(projectRoot);
   const { checkDeliveryPullRequest } = await import("@skyturn/git-worktree/node");
   let evidence: Awaited<ReturnType<typeof checkDeliveryPullRequest>>;
@@ -1418,7 +1427,7 @@ ipcMain.handle("workflow:pullRequest:checks", workflowHandler(async (projectRoot
     kind: "workflow.pull_request.checks_recorded",
     source: "electron-main",
     laneId,
-    idempotencyKey: `pull-request-checks:${evidence.number}:${evidence.headSha}:${evidence.status}`,
+    idempotencyKey: `pull-request-checks:${evidence.number}:${evidence.headSha}:${evidence.status}:${evidence.review.status}`,
     payload: {
       laneId,
       prNumber: evidence.number,
@@ -1426,6 +1435,8 @@ ipcMain.handle("workflow:pullRequest:checks", workflowHandler(async (projectRoot
       headSha: evidence.headSha,
       status: evidence.status,
       checks: evidence.checks,
+      review: evidence.review,
+      gate: evidence.gate,
       evidence,
     },
     now: new Date().toISOString(),
@@ -1447,12 +1458,14 @@ ipcMain.handle("workflow:pullRequest:merge", workflowHandler(async (projectRoot:
     const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
     assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
     const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
-    const checksEvidence = findDeliveryPullRequestChecksEvidence(store, sessionId, laneId, prEvidence.commitSha);
-    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+    const currentHead = findDeliveryPullRequestCurrentHeadEvidence(store, sessionId, laneId, prEvidence);
+    const checksEvidence = findDeliveryPullRequestChecksEvidence(store, sessionId, laneId, currentHead.headSha);
+    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence, currentHead.headSha);
     if (checksEvidence.headSha !== expectedHeadSha) {
       throw workflowIpcError("INVALID_INPUT", "Recorded pull request checks do not match the requested head SHA.");
     }
     const subject = requireText(readField(input, "subject") ?? readField(input, "title"), "pull request merge subject");
+    assertConventionalCommitSubjectForIpc(subject);
     const body = optionalText(readField(input, "body")) ?? undefined;
     const remoteEventKind = "workflow.pull_request.merged";
     const remoteDetails = {
@@ -1525,7 +1538,8 @@ ipcMain.handle("workflow:delivery:syncMain", workflowHandler(async (projectRoot:
     const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
     assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
     const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
-    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+    const currentHead = findDeliveryPullRequestCurrentHeadEvidence(store, sessionId, laneId, prEvidence);
+    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence, currentHead.headSha);
     const mergeEvidence = findDeliveryPullRequestMergeEvidence(store, sessionId, laneId, prEvidence, expectedHeadSha);
     const remote = optionalText(readField(input, "remote"));
     const mainBranch = optionalText(readField(input, "mainBranch")) ?? "main";
@@ -3541,9 +3555,44 @@ function findDeliveryPullRequestEvidence(
       number: normalizePullRequestNumberForIpc(payload.evidence.number),
       url: requireText(payload.evidence.url, "pull request URL"),
       commitSha: requireText(payload.evidence.commitSha, "pull request head SHA"),
+      ...(optionalText(payload.commitLaneId) ? { commitLaneId: optionalText(payload.commitLaneId)! } : {}),
+      ...(optionalText(payload.evidence.head) ? { headBranch: optionalText(payload.evidence.head)! } : {}),
     };
   }
   throw workflowIpcError("INVALID_INPUT", `No pull request evidence is recorded for lane ${laneId}.`);
+}
+
+function findDeliveryPullRequestCurrentHeadEvidence(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  laneId: string,
+  prEvidence: DeliveryPullRequestEvidenceLike,
+): DeliveryPullRequestCurrentHeadEvidenceLike {
+  let current: DeliveryPullRequestCurrentHeadEvidenceLike = {
+    headSha: prEvidence.commitSha,
+    ...(prEvidence.headBranch ? { headBranch: prEvidence.headBranch } : {}),
+  };
+  const events = store.listEvents(sessionId);
+  for (const event of events) {
+    if (!isRecord(event) || event.kind !== "workflow.delivery.pushed") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const eventLaneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+    if (prEvidence.commitLaneId) {
+      if (eventLaneId !== prEvidence.commitLaneId) continue;
+    } else if (eventLaneId !== laneId) {
+      continue;
+    }
+    const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+    const headSha = optionalText(payload.commitSha) ?? optionalText(evidence.commitSha);
+    if (!headSha) continue;
+    const headBranch = optionalText(payload.branch) ?? optionalText(evidence.branch);
+    if (prEvidence.headBranch && headBranch && headBranch !== prEvidence.headBranch) continue;
+    current = {
+      headSha,
+      ...(headBranch ?? current.headBranch ? { headBranch: headBranch ?? current.headBranch } : {}),
+    };
+  }
+  return current;
 }
 
 function findDeliveryPullRequestChecksEvidence(
@@ -3553,6 +3602,7 @@ function findDeliveryPullRequestChecksEvidence(
   expectedHeadSha: string,
 ): DeliveryPullRequestChecksEvidenceLike {
   const events = store.listEvents(sessionId);
+  let latestEvidence: DeliveryPullRequestChecksEvidenceLike | null = null;
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (!isRecord(event) || event.kind !== "workflow.pull_request.checks_recorded") continue;
@@ -3563,14 +3613,22 @@ function findDeliveryPullRequestChecksEvidence(
     const evidence = {
       status: requireText(payload.evidence.status, "pull request checks status"),
       headSha: requireText(payload.evidence.headSha, "pull request checks head SHA"),
+      reviewStatus: pullRequestReviewStatusForIpc(payload, payload.evidence),
     };
+    latestEvidence ??= evidence;
     if (evidence.headSha !== expectedHeadSha) continue;
+    if (evidence.reviewStatus === "changes_requested") {
+      throw workflowIpcError("DELIVERY_REJECTED", "Pull request review requested changes before merge.");
+    }
     if (evidence.status !== "passed") {
       throw workflowIpcError("DELIVERY_REJECTED", `Pull request checks must be passed before merge; got ${evidence.status}.`);
     }
     return evidence;
   }
-  throw workflowIpcError("DELIVERY_REJECTED", "No passed pull request checks are recorded for this head SHA.");
+  if (latestEvidence && latestEvidence.headSha !== expectedHeadSha) {
+    throw workflowIpcError("DELIVERY_REJECTED", "Pull request checks are stale for the current head.");
+  }
+  throw workflowIpcError("DELIVERY_REJECTED", "No pull request checks are recorded for this head SHA.");
 }
 
 function findDeliveryPullRequestMergeEvidence(
@@ -3604,6 +3662,42 @@ function findDeliveryPullRequestMergeEvidence(
   throw workflowIpcError("DELIVERY_REJECTED", "No pull request merge evidence is recorded for this PR head.");
 }
 
+function pullRequestReviewStatusForIpc(
+  payload: Record<string, unknown>,
+  evidence: Record<string, unknown>,
+): string {
+  const payloadReview = isRecord(payload.review) ? payload.review : {};
+  const evidenceReview = isRecord(evidence.review) ? evidence.review : {};
+  const payloadGate = isRecord(payload.gate) ? payload.gate : {};
+  const evidenceGate = isRecord(evidence.gate) ? evidence.gate : {};
+  const explicit = optionalText(payloadReview.status) ??
+    optionalText(evidenceReview.status) ??
+    optionalText(payloadGate.reviewStatus) ??
+    optionalText(evidenceGate.reviewStatus);
+  const normalized = normalizePullRequestReviewStatusForIpc(explicit);
+  if (normalized) return normalized;
+  const checks = Array.isArray(payload.checks) ? payload.checks : Array.isArray(evidence.checks) ? evidence.checks : [];
+  return checks.some((check) => isRecord(check) && normalizePullRequestReviewStatusForIpc(optionalText(check.status)) === "changes_requested")
+    ? "changes_requested"
+    : "unknown";
+}
+
+function normalizePullRequestReviewStatusForIpc(value: string | null | undefined): string | null {
+  const status = value?.trim().toLowerCase();
+  if (!status) return null;
+  if (status === "approved" || status === "approve") return "approved";
+  if (status === "changes_requested" || status === "changes requested") return "changes_requested";
+  if (status === "review_required" || status === "review required" || status === "pending") return "pending";
+  if (status === "unknown") return "unknown";
+  return null;
+}
+
+function assertConventionalCommitSubjectForIpc(subject: string): void {
+  if (!/^[a-z][a-z0-9-]*(?:\([a-z0-9._/-]+\))?!?: .+$/.test(subject)) {
+    throw workflowIpcError("INVALID_INPUT", "Pull request merge subject must use Conventional Commits format.");
+  }
+}
+
 function assertDeliveryEvidenceInputMatches(
   input: Record<string, unknown>,
   evidence: DeliveryCommitEvidenceLike,
@@ -3621,10 +3715,11 @@ function assertDeliveryEvidenceInputMatches(
 function assertDeliveryPullRequestEvidenceInputMatches(
   input: Record<string, unknown>,
   evidence: DeliveryPullRequestEvidenceLike,
+  currentHeadSha: string = evidence.commitSha,
 ): string {
   const expectedHeadSha = requireText(readField(input, "expectedHeadSha"), "expected pull request head SHA");
-  if (expectedHeadSha !== evidence.commitSha) {
-    throw workflowIpcError("REMOTE_HEAD_MISMATCH", "Expected head SHA does not match recorded pull request evidence.");
+  if (expectedHeadSha !== currentHeadSha) {
+    throw workflowIpcError("REMOTE_HEAD_MISMATCH", "Expected head SHA does not match recorded current pull request head evidence.");
   }
   const prNumber = positiveInteger(readField(input, "prNumber"));
   if (prNumber !== null && prNumber !== evidence.number) {

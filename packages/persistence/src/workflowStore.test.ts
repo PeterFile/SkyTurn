@@ -1627,6 +1627,69 @@ describe("SQLite workflow store", () => {
     store.close();
   });
 
+  it("restores delivery review gate state from event replay after restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:ci:review-replay",
+      payload: { lane: { id: "lane-ci", semanticKey: "lane-ci", kind: "ci_check", title: "CI check", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.pull_request.created",
+      source: "test",
+      idempotencyKey: "pr:created:review-replay",
+      payload: {
+        laneId: "lane-ci",
+        prNumber: 23,
+        url: "https://example.test/pr/23",
+        headSha: "sha-review",
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: checksRecordedKind,
+      source: "electron-main",
+      idempotencyKey: "pr:checks:review-replay",
+      payload: {
+        laneId: "lane-ci",
+        evidence: {
+          status: "passed",
+          number: 23,
+          url: "https://example.test/pr/23",
+          headSha: "sha-review",
+          review: { status: "changes_requested", detail: "Reviewer requested changes." },
+          checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/review" }],
+        },
+      },
+      now: "2026-06-14T00:00:06.000Z",
+    });
+    store.close();
+
+    const restarted = createWorkflowStore({ projectRoot });
+    const loopState = restarted.getLoopEngineeringState("session-1");
+
+    expect(loopState.delivery).toMatchObject({
+      phase: "changes_requested",
+      review: { status: "changes_requested", detail: "Reviewer requested changes." },
+    });
+    expect(loopState.blockedReason).toMatchObject({ code: "changes_requested" });
+    expect(restarted.materializeFlowProjection("session-1").evidence.at(-1)).toMatchObject({
+      kind: "pull-request-checks",
+      status: "failed",
+      checks: ["Build and test:passed", "review:changes_requested"],
+    });
+    restarted.close();
+  });
+
   it("builds a redacted ledger summary from persisted user inputs and recent events", async () => {
     const store = await makeSeededStore();
 

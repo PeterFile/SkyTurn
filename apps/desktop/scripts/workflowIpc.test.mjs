@@ -435,8 +435,10 @@ test("workflow pull request merge stays explicit and separate from cleanup", asy
   const sessionIndex = mergeHandler.indexOf("const sessionId = assertWorkflowSessionId");
   const laneIndex = mergeHandler.indexOf("assertWorkflowPullRequestLaneKind");
   const evidenceIndex = mergeHandler.indexOf("findDeliveryPullRequestEvidence");
+  const currentHeadIndex = mergeHandler.indexOf("findDeliveryPullRequestCurrentHeadEvidence");
   const checksEvidenceIndex = mergeHandler.indexOf("findDeliveryPullRequestChecksEvidence");
   const matchIndex = mergeHandler.indexOf("assertDeliveryPullRequestEvidenceInputMatches");
+  const subjectGuardIndex = mergeHandler.indexOf("assertConventionalCommitSubjectForIpc");
   const importIndex = mergeHandler.indexOf('await import("@skyturn/git-worktree/node")');
   const mergeIndex = mergeHandler.indexOf("mergeDeliveryPullRequest({");
   const eventIndex = mergeHandler.indexOf('kind: "workflow.pull_request.merged"');
@@ -444,14 +446,29 @@ test("workflow pull request merge stays explicit and separate from cleanup", asy
   assert.ok(sessionIndex >= 0, "merge IPC must require a workflow sessionId");
   assert.ok(laneIndex > sessionIndex, "merge IPC must validate an explicit pull_request lane");
   assert.ok(evidenceIndex > laneIndex, "merge IPC must load recorded PR evidence");
-  assert.ok(checksEvidenceIndex > evidenceIndex, "merge IPC must require previously recorded passed checks");
+  assert.ok(currentHeadIndex > evidenceIndex, "merge IPC must derive the current PR head from recorded delivery evidence");
+  assert.ok(checksEvidenceIndex > currentHeadIndex, "merge IPC must require previously recorded exact-head checks and review gate");
   assert.ok(matchIndex > checksEvidenceIndex, "merge IPC must reject stale expectedHeadSha before gh merge");
+  assert.ok(subjectGuardIndex > matchIndex, "merge IPC must reject a non-Conventional merge subject before gh merge");
   assert.ok(importIndex > matchIndex, "merge IPC must validate recorded evidence before importing gh implementation");
   assert.ok(mergeIndex > importIndex, "gh merge must only happen inside the explicit merge IPC");
   assert.ok(eventIndex > mergeIndex, "merged event must be appended only after gh merge returns");
   assert.doesNotMatch(mergeHandler, /workflow:worktree:clean/);
   assert.doesNotMatch(mergeHandler, /cleanManagedWorktree/);
   assert.doesNotMatch(mergeHandler, /deleteBranch:\s*true/);
+});
+
+test("workflow pull request merge helper enforces stale, pending, failed, and review gates", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const helperSource = main.slice(
+    main.indexOf("function findDeliveryPullRequestChecksEvidence"),
+    main.indexOf("function findDeliveryPullRequestMergeEvidence"),
+  );
+
+  assert.match(helperSource, /checks are stale/i);
+  assert.match(helperSource, /checks must be passed before merge/i);
+  assert.match(helperSource, /review requested changes/i);
+  assert.match(helperSource, /reviewStatus|review\.status/);
 });
 
 test("workflow delivery sync main requires recorded PR merge evidence for the requested head", async () => {

@@ -687,12 +687,46 @@ describe("Flow Kernel gate engine and scheduler", () => {
         url: "https://example.test/pr/16/checks",
         headSha: "sha-a",
         status: "passed",
+        review: { status: "approved", detail: "One approving review." },
         checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/1" }],
       }),
     ]);
 
-    expect(projectLoopEngineeringState(projection).delivery.phase).toBe("merge_ready");
+    expect(projectLoopEngineeringState(projection).delivery).toMatchObject({
+      phase: "merge_ready",
+      review: { status: "approved", detail: "One approving review." },
+    });
     expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual(["lane-merge"]);
+  });
+
+  it("keeps pending or unknown review non-blocking when exact-head checks pass", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+
+    for (const reviewStatus of ["pending", "unknown"] as const) {
+      const projection = reduceWorkflowEvents([
+        event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+        event("workflow.pull_request.created", {
+          laneId: "lane-ci",
+          prNumber: 19,
+          url: "https://example.test/pr/19",
+          headSha: "sha-current",
+        }),
+        event(checksRecordedKind, {
+          laneId: "lane-ci",
+          prNumber: 19,
+          url: "https://example.test/pr/19/checks",
+          headSha: "sha-current",
+          status: "passed",
+          review: { status: reviewStatus },
+          checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/19" }],
+        }),
+      ]);
+
+      expect(projectLoopEngineeringState(projection).delivery).toMatchObject({
+        phase: "merge_ready",
+        review: { status: reviewStatus },
+      });
+    }
   });
 
   it("replays Electron checks events with nested evidence for exact-head gates", () => {
@@ -780,14 +814,24 @@ describe("Flow Kernel gate engine and scheduler", () => {
         prNumber: 18,
         url: "https://example.test/pr/18/checks",
         headSha: "sha-current",
-        status: "changes_requested",
-        checks: [{ name: "Review", status: "changes_requested", url: "https://example.test/review/18" }],
+        status: "passed",
+        review: { status: "changes_requested", detail: "Reviewer requested changes." },
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/18" }],
       }),
     ]);
 
     const loopState = projectLoopEngineeringState(projection);
     expect(projection.lanes.find((item) => item.id === "lane-ci")?.status).toBe("running");
     expect(loopState.delivery.phase).toBe("changes_requested");
+    expect(loopState.delivery.review).toMatchObject({
+      status: "changes_requested",
+      detail: "Reviewer requested changes.",
+    });
+    expect(projection.evidence.at(-1)).toMatchObject({
+      kind: "pull-request-checks",
+      status: "failed",
+      checks: ["Build and test:passed", "review:changes_requested"],
+    });
     expect(loopState.nextAction).toMatchObject({
       kind: "blocked",
       loop: "delivery",

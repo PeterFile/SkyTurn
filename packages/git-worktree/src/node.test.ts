@@ -1214,6 +1214,7 @@ describe("delivery remote actions", () => {
     const fakeGh = await installFakeGh(repo.tempRoot, {
       prUrl: "https://github.com/acme/skyturn/pull/42",
       prHeadSha: repo.baseCommit,
+      reviewDecision: "APPROVED",
       checksJson: [
         { name: "unit", state: "SUCCESS", workflow: "ci", link: "https://github.com/acme/skyturn/actions/runs/1" },
         { name: "typecheck", bucket: "pass", workflow: "ci" },
@@ -1235,10 +1236,47 @@ describe("delivery remote actions", () => {
           { name: "unit", status: "passed" },
           { name: "typecheck", status: "passed" },
         ],
+        review: { status: "approved" },
         command: { command: "gh", ok: true, exitCode: 0 },
       });
       expect(evidence.summary).toContain("2 passed");
+      expect(evidence.summary).toContain("review approved");
     });
+  });
+
+  it("distinguishes approved, changes requested, pending, and unknown pull request review gates", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-review-gates-");
+    tempRoots.push(repo.tempRoot);
+    const cases = [
+      { label: "approved", reviewDecision: "APPROVED", expected: "approved" },
+      { label: "changes", reviewDecision: "CHANGES_REQUESTED", expected: "changes_requested" },
+      { label: "pending", reviewDecision: "REVIEW_REQUIRED", expected: "pending" },
+      { label: "unknown", reviewDecision: undefined, expected: "unknown" },
+    ] as const;
+
+    for (const item of cases) {
+      const fakeGh = await installFakeGh(join(repo.tempRoot, item.label), {
+        prHeadSha: repo.baseCommit,
+        ...(item.reviewDecision ? { reviewDecision: item.reviewDecision } : {}),
+        checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+      });
+
+      await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+        await expect(checkDeliveryPullRequest({
+          projectRoot: repo.repoRoot,
+          prNumber: 1,
+          expectedHeadSha: repo.baseCommit,
+        })).resolves.toMatchObject({
+          status: "passed",
+          review: { status: item.expected },
+          gate: {
+            checksStatus: "passed",
+            reviewStatus: item.expected,
+            headSha: repo.baseCommit,
+          },
+        });
+      });
+    }
   });
 
   it("reports failed and pending pull request checks without merging", async () => {
@@ -1373,13 +1411,54 @@ describe("delivery remote actions", () => {
     });
   });
 
-  it("rejects squash merge when pull request checks are not passed", async () => {
+  it("rejects squash merge when pull request checks are pending or failing", async () => {
     const repo = await createTestRepo("skyturn-delivery-pr-merge-checks-");
+    tempRoots.push(repo.tempRoot);
+    const cases = [
+      {
+        label: "pending",
+        checksJson: [{ name: "unit", state: "PENDING", workflow: "ci" }],
+        checksExitCode: 8,
+        expectedStatus: "pending",
+      },
+      {
+        label: "failing",
+        checksJson: [{ name: "unit", state: "FAILURE", workflow: "ci" }],
+        checksExitCode: 1,
+        expectedStatus: "failed",
+      },
+    ] as const;
+
+    for (const item of cases) {
+      const fakeGh = await installFakeGh(join(repo.tempRoot, item.label), {
+        prHeadSha: repo.baseCommit,
+        checksJson: item.checksJson,
+        checksExitCode: item.checksExitCode,
+      });
+
+      await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+        await expect(mergeDeliveryPullRequest({
+          projectRoot: repo.repoRoot,
+          prNumber: 1,
+          expectedHeadSha: repo.baseCommit,
+          subject: "feat(delivery): merge exact checked pr",
+          body: "Merge after checks pass.",
+        })).rejects.toMatchObject({
+          code: "DELIVERY_REJECTED",
+          message: expect.stringContaining(item.expectedStatus),
+        });
+        expect(existsSync(fakeGh.argsPath)).toBe(false);
+      });
+    }
+  });
+
+  it("rejects squash merge when review requested changes", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-merge-review-");
     tempRoots.push(repo.tempRoot);
     const fakeGh = await installFakeGh(repo.tempRoot, {
       prHeadSha: repo.baseCommit,
-      checksJson: [{ name: "unit", state: "PENDING", workflow: "ci" }],
-      checksExitCode: 8,
+      reviewDecision: "CHANGES_REQUESTED",
+      checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
     });
 
     await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
@@ -1388,10 +1467,9 @@ describe("delivery remote actions", () => {
         prNumber: 1,
         expectedHeadSha: repo.baseCommit,
         subject: "feat(delivery): merge exact checked pr",
-        body: "Merge after checks pass.",
       })).rejects.toMatchObject({
         code: "DELIVERY_REJECTED",
-        message: expect.stringContaining("checks"),
+        message: expect.stringContaining("review requested changes"),
       });
       expect(existsSync(fakeGh.argsPath)).toBe(false);
     });
@@ -1430,6 +1508,7 @@ describe("delivery remote actions", () => {
     tempRoots.push(repo.tempRoot);
     const fakeGh = await installFakeGh(repo.tempRoot, {
       prHeadSha: repo.baseCommit,
+      reviewDecision: "APPROVED",
       checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
     });
 
@@ -1457,6 +1536,7 @@ describe("delivery remote actions", () => {
         headSha: repo.baseCommit,
         subject: "feat(delivery): merge exact checked pr",
         checks: [{ name: "unit", status: "passed" }],
+        review: { status: "approved" },
         command: { command: "gh", ok: true, exitCode: 0 },
       });
       expect(evidence.command.args).toContain("--squash");
@@ -1759,6 +1839,8 @@ async function installFakeGh(
     prHeadSha?: string;
     prState?: string;
     prMergeable?: string | boolean;
+    reviewDecision?: string;
+    reviewsJson?: unknown;
     prHeadShas?: string[];
     checksJson?: unknown;
     checksExitCode?: number;
@@ -1783,6 +1865,8 @@ async function installFakeGh(
     headRefOid: headSha,
     state: options.prState ?? "OPEN",
     mergeable: options.prMergeable ?? "MERGEABLE",
+    ...(options.reviewDecision !== undefined ? { reviewDecision: options.reviewDecision } : {}),
+    ...(options.reviewsJson !== undefined ? { reviews: options.reviewsJson } : {}),
   }));
   const checksJson = JSON.stringify(options.checksJson ?? [
     { name: "unit", state: "SUCCESS", workflow: "ci", link: "https://github.com/acme/skyturn/actions/runs/1" },

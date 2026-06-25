@@ -422,12 +422,20 @@ export type WorkflowLoopBlockedReasonCode =
   | "invalid_checkpoint"
   | "unknown_target";
 export type WorkflowDeliveryCheckStatus = "passed" | "failed" | "pending" | "changes_requested";
+export type WorkflowDeliveryReviewStatus = "approved" | "changes_requested" | "pending" | "unknown";
 
 export interface WorkflowDeliveryCheckSummary {
   name: string;
   status: WorkflowDeliveryCheckStatus;
   url?: string;
   detail?: string;
+}
+
+export interface WorkflowDeliveryReviewSummary {
+  status: WorkflowDeliveryReviewStatus;
+  detail?: string;
+  reviewer?: string;
+  url?: string;
 }
 
 export interface WorkflowLoopBlockedReason {
@@ -460,6 +468,7 @@ export interface WorkflowDeliveryLoopState {
   headBranch?: string;
   lastCheckedHeadSha?: string;
   checks: WorkflowDeliveryCheckSummary[];
+  review?: WorkflowDeliveryReviewSummary;
   blockedReason?: WorkflowLoopBlockedReason;
 }
 

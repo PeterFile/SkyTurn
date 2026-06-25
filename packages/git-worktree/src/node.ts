@@ -30,6 +30,7 @@ import {
   type DeliveryPullRequestChecksEvidence,
   type DeliveryPullRequestChecksInput,
   type DeliveryPullRequestEvidence,
+  type DeliveryPullRequestReviewGate,
   type DeliveryPullRequestInput,
   type DeliveryPullRequestMergeEvidence,
   type DeliveryPullRequestMergeInput,
@@ -715,8 +716,16 @@ export async function checkDeliveryPullRequest(input: DeliveryPullRequestChecksI
     ...(verifiedPr.url ? { url: verifiedPr.url } : {}),
     headSha: verifiedPr.headSha,
     checks,
+    review: verifiedPr.review,
+    gate: {
+      headSha: verifiedPr.headSha,
+      checksStatus: status,
+      reviewStatus: verifiedPr.review.status,
+      state: verifiedPr.state,
+      mergeable: verifiedPr.mergeable,
+    },
     command: execution.result,
-    summary: pullRequestChecksSummary(checks, status),
+    summary: pullRequestChecksSummary(checks, status, verifiedPr.review),
   };
 }
 
@@ -738,6 +747,9 @@ export async function mergeDeliveryPullRequest(input: DeliveryPullRequestMergeIn
   if (checksEvidence.status !== "passed") {
     throwRemote("DELIVERY_REJECTED", `Pull request checks must be passed before merge; got ${checksEvidence.status}.`);
   }
+  if (checksEvidence.review.status === "changes_requested") {
+    throwRemote("DELIVERY_REJECTED", "Pull request review requested changes before merge.");
+  }
   const command = await runDeliveryCommand("gh", repoRoot, [
     "pr",
     "merge",
@@ -756,6 +768,7 @@ export async function mergeDeliveryPullRequest(input: DeliveryPullRequestMergeIn
     headSha: pr.headSha,
     subject,
     checks: checksEvidence.checks,
+    review: checksEvidence.review,
     command,
   };
 }
@@ -902,6 +915,7 @@ interface PullRequestState {
   headSha: string;
   state: string;
   mergeable: boolean;
+  review: DeliveryPullRequestReviewGate;
 }
 
 async function fetchPullRequestState(
@@ -915,7 +929,7 @@ async function fetchPullRequestState(
     "view",
     selector,
     "--json",
-    "number,url,headRefOid,state,mergeable",
+    "number,url,headRefOid,state,mergeable,reviewDecision,reviews",
   ]);
   const value = parseJsonObject(execution.rawStdout, "GitHub CLI did not return pull request JSON.");
   const number = normalizePullRequestNumber(value.number ?? input.prNumber ?? numberFromPullRequestUrl(input.prUrl));
@@ -933,6 +947,7 @@ async function fetchPullRequestState(
     headSha,
     state,
     mergeable: normalizePullRequestMergeable(value.mergeable),
+    review: normalizePullRequestReviewGate(value),
   };
 }
 
@@ -970,6 +985,51 @@ function normalizePullRequestMergeable(value: unknown): boolean {
   if (value === true) return true;
   if (typeof value !== "string") return false;
   return value.trim().toUpperCase() === "MERGEABLE";
+}
+
+function normalizePullRequestReviewGate(value: Record<string, unknown>): DeliveryPullRequestReviewGate {
+  const decision = textFromUnknown(value.reviewDecision);
+  const latestReview = latestActionableReview(value.reviews);
+  const status = reviewStatusFromDecision(decision) ?? reviewStatusFromDecision(latestReview?.state) ?? "unknown";
+  return {
+    status,
+    decision: sanitizeCommandOutput(decision ?? latestReview?.state ?? "UNKNOWN"),
+    ...(latestReview?.detail ? { detail: sanitizeCommandOutput(latestReview.detail) } : {}),
+    ...(latestReview?.reviewer ? { reviewer: sanitizeCommandOutput(latestReview.reviewer) } : {}),
+    ...(latestReview?.link ? { link: sanitizeCommandOutput(latestReview.link) } : {}),
+  };
+}
+
+function latestActionableReview(value: unknown): { state: string; reviewer?: string; detail?: string; link?: string } | null {
+  if (!Array.isArray(value)) return null;
+  const reviews = value
+    .filter(isRecord)
+    .map((review, index) => ({
+      state: textFromUnknown(review.state) ?? textFromUnknown(review.reviewDecision) ?? "",
+      reviewer: reviewAuthor(review.author),
+      detail: textFromUnknown(review.body) ?? textFromUnknown(review.description) ?? undefined,
+      link: textFromUnknown(review.url) ?? textFromUnknown(review.link) ?? undefined,
+      index,
+    }))
+    .filter((review) => review.state);
+  return reviews.reverse().find((review) => {
+    const status = reviewStatusFromDecision(review.state);
+    return status === "approved" || status === "changes_requested";
+  }) ?? null;
+}
+
+function reviewAuthor(value: unknown): string | undefined {
+  if (isRecord(value)) return textFromUnknown(value.login) ?? undefined;
+  return textFromUnknown(value) ?? undefined;
+}
+
+function reviewStatusFromDecision(value: string | null | undefined): DeliveryPullRequestReviewGate["status"] | null {
+  const decision = value?.trim().toLowerCase();
+  if (!decision) return null;
+  if (decision === "approved" || decision === "approve") return "approved";
+  if (decision === "changes_requested" || decision === "changes requested") return "changes_requested";
+  if (decision === "review_required" || decision === "review required" || decision === "pending") return "pending";
+  return null;
 }
 
 function parsePullRequestChecks(output: string): DeliveryPullRequestCheck[] {
@@ -1011,11 +1071,15 @@ function aggregatePullRequestChecks(checks: DeliveryPullRequestCheck[]): Deliver
   return "pending";
 }
 
-function pullRequestChecksSummary(checks: DeliveryPullRequestCheck[], status: DeliveryPullRequestChecksEvidence["status"]): string {
+function pullRequestChecksSummary(
+  checks: DeliveryPullRequestCheck[],
+  status: DeliveryPullRequestChecksEvidence["status"],
+  review: DeliveryPullRequestReviewGate,
+): string {
   const passed = checks.filter((check) => check.status === "passed").length;
   const failed = checks.filter((check) => check.status === "failed").length;
   const pending = checks.filter((check) => check.status === "pending").length;
-  return `${checks.length} checks: ${passed} passed, ${failed} failed, ${pending} pending; overall ${status}.`;
+  return `${checks.length} checks: ${passed} passed, ${failed} failed, ${pending} pending; overall ${status}; review ${review.status}.`;
 }
 
 function parseJsonObject(output: string, message: string): Record<string, unknown> {
