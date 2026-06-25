@@ -1324,6 +1324,41 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(projection.lanes.find((item) => item.id === "lane-c")?.status).toBe("ready");
   });
 
+  it("does not let rejected local rollback safety poison later eligibility", () => {
+    const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-c", "validation"), status: "ready" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-c", sourceLaneId: "lane-b", targetLaneId: "lane-c" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint(beforeCheckpointId, "lane-b", "before", "base-sha"),
+      }),
+      event("workflow.node.rollback_rejected", {
+        requestId: "rollback-dirty-worktree",
+        laneId: "lane-b",
+        checkpointId: beforeCheckpointId,
+        localRollbackSafe: false,
+        reasonCode: "dirty_worktree",
+        reason: "Worktree has uncommitted changes.",
+        manualRepairRequired: true,
+      }),
+    ]);
+
+    expect(projection.rollbackIntents).toEqual([
+      expect.objectContaining({
+        intentId: "rollback-dirty-worktree",
+        status: "rejected",
+        localRollbackSafe: false,
+      }),
+    ]);
+    expect(evaluateRollbackEligibility(projection, "lane-b", { checkpointId: beforeCheckpointId })).toMatchObject({
+      eligible: true,
+      checkpointId: beforeCheckpointId,
+      affectedLaneIds: ["lane-b", "lane-c"],
+      blockingRemoteSideEffects: [],
+    });
+  });
+
   it("rejects rollback events when the before checkpoint has no restore commit ref", () => {
     const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
     const cases: Array<{ kind: FlowEventKind; requestId: string }> = [
@@ -2190,7 +2225,6 @@ describe("Flow Kernel gate engine and scheduler", () => {
             ...(item.expectedLaneId ? { laneId: item.expectedLaneId } : {}),
           }),
         ],
-        localRollbackSafe: true,
       });
       expect(projection.rollbackIntents).toEqual([
         expect.objectContaining({
@@ -2202,6 +2236,95 @@ describe("Flow Kernel gate engine and scheduler", () => {
       expect(projection.lanes.find((laneItem) => laneItem.id === "lane-b")?.status).toBe("completed");
       expect(projection.lanes.find((laneItem) => laneItem.id === "lane-c")?.status).toBe("running");
     }
+  });
+
+  it("keeps ambiguous failed durable remote side-effect requests as rollback blockers", () => {
+    const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
+    const baseEvents: FlowEvent[] = [
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-c", "pull_request"), status: "running" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-c", sourceLaneId: "lane-b", targetLaneId: "lane-c" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint(beforeCheckpointId, "lane-b", "before", "base-sha"),
+      }),
+      event("workflow.remote_side_effect.requested", {
+        operationId: "remote-push-1",
+        eventKind: "workflow.delivery.pushed",
+        laneId: "lane-b",
+        affectedLaneIds: ["lane-b"],
+      }),
+    ];
+    const requested = reduceWorkflowEvents(baseEvents);
+    const completedFailure = reduceWorkflowEvents([
+      ...baseEvents,
+      event("workflow.remote_side_effect.completed", {
+        operationId: "remote-push-1",
+        eventKind: "workflow.delivery.pushed",
+        status: "failed",
+        error: { message: "remote rejected" },
+      }),
+    ]);
+    const completedKnownPreMutationFailure = reduceWorkflowEvents([
+      ...baseEvents,
+      event("workflow.remote_side_effect.completed", {
+        operationId: "remote-push-1",
+        eventKind: "workflow.delivery.pushed",
+        status: "failed",
+        remoteMutationAttempted: false,
+        error: { message: "remote rejected before mutation" },
+      }),
+    ]);
+
+    expect(evaluateRollbackEligibility(requested, "lane-b", { checkpointId: beforeCheckpointId })).toMatchObject({
+      eligible: false,
+      blockingRemoteSideEffects: [
+        expect.objectContaining({
+          eventKind: "workflow.delivery.pushed",
+          laneId: "lane-b",
+          affectedLaneIds: ["lane-b"],
+        }),
+      ],
+    });
+    expect(evaluateRollbackEligibility(completedFailure, "lane-b", { checkpointId: beforeCheckpointId })).toMatchObject({
+      eligible: false,
+      blockingRemoteSideEffects: [
+        expect.objectContaining({
+          eventKind: "workflow.delivery.pushed",
+          laneId: "lane-b",
+          affectedLaneIds: ["lane-b"],
+        }),
+      ],
+    });
+    expect(evaluateRollbackEligibility(completedKnownPreMutationFailure, "lane-b", { checkpointId: beforeCheckpointId })).toMatchObject({
+      eligible: true,
+      blockingRemoteSideEffects: [],
+    });
+  });
+
+  it("treats explicit sessionWide remote side-effect payloads as session-wide", () => {
+    const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-c", "validation"), status: "ready" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-c", sourceLaneId: "lane-b", targetLaneId: "lane-c" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint(beforeCheckpointId, "lane-b", "before", "base-sha"),
+      }),
+      event("workflow.delivery.main_synced", {
+        sessionWide: true,
+        laneId: "lane-unrelated-pr",
+        prNumber: 42,
+        headSha: "main-sha",
+        evidence: { status: "synced", mainBranch: "main", remote: "origin" },
+      }),
+    ]);
+
+    expect(evaluateRollbackEligibility(projection, "lane-b", { checkpointId: beforeCheckpointId }).blockingRemoteSideEffects).toEqual([
+      expect.objectContaining({
+        eventKind: "workflow.delivery.main_synced",
+        sessionWide: true,
+      }),
+    ]);
   });
 
   it("ignores explicit remote side-effect lane IDs outside the rollback affected set", () => {

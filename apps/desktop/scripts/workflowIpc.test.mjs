@@ -22,6 +22,11 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:recordRunResult",
     "workflow:projection",
     "workflow:events",
+    "workflow:checkpoints",
+    "workflow:rollback:eligibility",
+    "workflow:rollback:apply",
+    "workflow:repair:create",
+    "workflow:variant:create",
     "workflow:userDecision:answer",
     "workflow:worktree:create",
     "workflow:worktree:compare",
@@ -45,6 +50,11 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(main, /scheduleReadyLanes/);
   assert.match(main, /recordRunResult/);
   assert.match(main, /materializeFlowProjection/);
+  assert.match(main, /listNodeCheckpoints/);
+  assert.match(main, /getNodeRollbackEligibility/);
+  assert.match(main, /applyNodeRollback/);
+  assert.match(main, /requestNodeRepair/);
+  assert.match(main, /requestNodeVariant/);
   assert.match(main, /isTrustedPlannerRootStartInput/);
   assert.match(main, /assertExecutableStartInput/);
   assert.match(main, /rejectMissingWorkflowProjectionNode/);
@@ -59,10 +69,61 @@ test("Electron main owns natural workflow IPC channels", async () => {
 
   const workflowEventsHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:events"'),
-    main.indexOf('ipcMain.handle("workflow:userDecision:answer"'),
+    main.indexOf('ipcMain.handle("workflow:checkpoints"'),
   );
   assert.match(workflowEventsHandler, /redactWorkflowEventForRenderer/);
   assert.doesNotMatch(workflowEventsHandler, /events:\s*store\.listEvents\(sessionId\)\.filter/);
+
+  const checkpointHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:checkpoints"'),
+    main.indexOf('ipcMain.handle("workflow:rollback:eligibility"'),
+  );
+  assert.match(checkpointHandler, /assertKnownProjectRoot\(projectRoot\)/);
+  assert.match(checkpointHandler, /assertWorkflowSessionId/);
+  assert.match(checkpointHandler, /assertKnownWorkflowCanvasSession/);
+  assert.match(checkpointHandler, /listNodeCheckpoints/);
+
+  const rollbackEligibilityHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:eligibility"'),
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+  );
+  assert.match(rollbackEligibilityHandler, /getNodeRollbackEligibility/);
+  assert.match(rollbackEligibilityHandler, /evaluateLocalRollbackSafetyForRollback/);
+  assert.match(rollbackEligibilityHandler, /manualRepairRequired/);
+  assert.doesNotMatch(rollbackEligibilityHandler, /appendWorkflowEvent|applyNodeRollback|gitResetHard/);
+
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+  const rollbackRemoteBlockHelper = main.slice(
+    main.indexOf("function evaluateRollbackRemoteBlocksForRollback"),
+    main.indexOf("async function withWorkflowSessionMutationLock"),
+  );
+  assert.match(rollbackApplyHandler, /evaluateRollbackRemoteBlocksForRollback/);
+  assert.match(rollbackRemoteBlockHelper, /getNodeRollbackEligibility/);
+  assert.match(rollbackRemoteBlockHelper, /blockingRemoteSideEffects/);
+  assert.match(rollbackApplyHandler, /evaluateLocalRollbackSafetyForRollback/);
+  assert.match(rollbackApplyHandler, /gitResetHard/);
+  assert.match(rollbackApplyHandler, /applyNodeRollback/);
+  assert.match(rollbackApplyHandler, /broadcastWorkflowProjection/);
+  assert.doesNotMatch(rollbackApplyHandler, /pushDeliveryBranch|createDeliveryPullRequest|mergeDeliveryPullRequest|syncDeliveryMain/);
+
+  const repairHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+    main.indexOf('ipcMain.handle("workflow:variant:create"'),
+  );
+  assert.match(repairHandler, /requestNodeRepair/);
+  assert.match(repairHandler, /workflow\.node\.repair_requested|requestNodeRepair/);
+  assert.match(repairHandler, /broadcastWorkflowProjection/);
+
+  const variantHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:variant:create"'),
+    main.indexOf('ipcMain.handle("workflow:userDecision:answer"'),
+  );
+  assert.match(variantHandler, /requestNodeVariant/);
+  assert.match(variantHandler, /workflow\.node\.variant_requested|requestNodeVariant/);
+  assert.match(variantHandler, /broadcastWorkflowProjection/);
 
   const worktreeCreateHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:worktree:create"'),
@@ -213,6 +274,36 @@ test("workflow delivery commit validates known sessions before creating git comm
   assert.match(helperSource, /workflowIpcError\("UNKNOWN_SESSION"/);
 });
 
+test("workflow delivery commit takes the session mutation lock before local git mutation evidence", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const deliveryCommitHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
+    main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+  );
+
+  const workflowProjectRootIndex = deliveryCommitHandler.indexOf("const workflowProjectRoot = await workflowStoreIdentity(projectRoot)");
+  const lockIndex = deliveryCommitHandler.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, sessionId");
+  const storeIndex = deliveryCommitHandler.indexOf("const store = await getWorkflowStore");
+  const canvasIndex = deliveryCommitHandler.indexOf("assertKnownWorkflowCanvasSession");
+  const laneGuardIndex = deliveryCommitHandler.indexOf("assertWorkflowDeliveryCommitLane");
+  const worktreeIndex = deliveryCommitHandler.indexOf("resolveDeliveryCommitWorktreePath");
+  const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const commitIndex = deliveryCommitHandler.indexOf("createDeliveryCommit({");
+  const eventIndex = deliveryCommitHandler.indexOf('kind: "workflow.commit.created"');
+  const broadcastIndex = deliveryCommitHandler.indexOf("broadcastWorkflowProjection");
+
+  assert.ok(workflowProjectRootIndex >= 0, "delivery commit must use the workflow store identity as the lock key root");
+  assert.ok(lockIndex > workflowProjectRootIndex, "delivery commit must enter the session mutation lock");
+  assert.ok(storeIndex > lockIndex, "delivery commit must re-open/revalidate the workflow store inside the lock");
+  assert.ok(canvasIndex > storeIndex, "delivery commit must validate the CanvasSession inside the lock");
+  assert.ok(laneGuardIndex > canvasIndex, "delivery commit must validate the delivery lane inside the lock");
+  assert.ok(worktreeIndex > laneGuardIndex, "delivery commit must resolve the worktree only after locked lane validation");
+  assert.ok(importIndex > worktreeIndex, "delivery commit must import the git helper inside the lock");
+  assert.ok(commitIndex > importIndex, "delivery commit must call the local git mutation after the lock is held");
+  assert.ok(eventIndex > commitIndex, "workflow.commit.created must be written only after the locked git commit succeeds");
+  assert.ok(broadcastIndex > eventIndex, "delivery commit broadcast must happen after locked event materialization");
+});
+
 test("workflow events expose renderer-safe delivery lifecycle facts without raw payloads", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const workflowEventsHandler = main.slice(
@@ -287,6 +378,7 @@ test("workflow pull request creation validates PR lane, commit evidence, and bas
   const commitLaneIndex = pullRequestHandler.indexOf("assertWorkflowDeliveryCommitLane");
   const evidenceIndex = pullRequestHandler.indexOf("findDeliveryCommitEvidence");
   const baseIndex = pullRequestHandler.indexOf("validatePullRequestBaseBranch");
+  const pushEvidenceIndex = pullRequestHandler.indexOf("findDeliveryPushEvidenceForPullRequest");
   const importIndex = pullRequestHandler.indexOf('await import("@skyturn/git-worktree/node")');
   const createIndex = pullRequestHandler.indexOf("createDeliveryPullRequest({");
 
@@ -296,7 +388,8 @@ test("workflow pull request creation validates PR lane, commit evidence, and bas
   assert.ok(commitLaneIndex > prLaneIndex, "pull request IPC must validate the source commit lane");
   assert.ok(evidenceIndex > commitLaneIndex, "pull request IPC must load recorded commit evidence");
   assert.ok(baseIndex > evidenceIndex, "pull request IPC must validate base/head before gh create");
-  assert.ok(importIndex > baseIndex, "pull request IPC must validate inputs before importing gh implementation");
+  assert.ok(pushEvidenceIndex > baseIndex, "pull request IPC must require recorded push evidence before gh create");
+  assert.ok(importIndex > pushEvidenceIndex, "pull request IPC must validate inputs before importing gh implementation");
   assert.ok(createIndex > importIndex, "gh pr create must stay after server-side guards");
 });
 
@@ -338,7 +431,7 @@ test("workflow pull request merge stays explicit and separate from cleanup", asy
   const matchIndex = mergeHandler.indexOf("assertDeliveryPullRequestEvidenceInputMatches");
   const importIndex = mergeHandler.indexOf('await import("@skyturn/git-worktree/node")');
   const mergeIndex = mergeHandler.indexOf("mergeDeliveryPullRequest({");
-  const eventIndex = mergeHandler.indexOf("workflow.pull_request.merged");
+  const eventIndex = mergeHandler.indexOf('kind: "workflow.pull_request.merged"');
 
   assert.ok(sessionIndex >= 0, "merge IPC must require a workflow sessionId");
   assert.ok(laneIndex > sessionIndex, "merge IPC must validate an explicit pull_request lane");
@@ -398,14 +491,15 @@ test("workflow delivery sync main uses an explicit ff-only IPC and records main_
   const canvasIndex = syncHandler.indexOf("assertKnownWorkflowCanvasSession");
   const importIndex = syncHandler.indexOf('await import("@skyturn/git-worktree/node")');
   const syncIndex = syncHandler.indexOf("syncDeliveryMain({");
-  const eventIndex = syncHandler.indexOf("workflow.delivery.main_synced");
+  const eventIndex = syncHandler.indexOf('kind: "workflow.delivery.main_synced"');
 
   assert.ok(sessionIndex >= 0, "sync main IPC must require a workflow sessionId to append evidence");
   assert.ok(canvasIndex > sessionIndex, "sync main IPC must validate the CanvasSession");
   assert.ok(importIndex > canvasIndex, "sync main IPC must validate session before importing git implementation");
   assert.ok(syncIndex > importIndex, "git sync must stay after server-side guards");
   assert.ok(eventIndex > syncIndex, "main_synced event must be appended after ff-only sync");
-  assert.match(syncHandler, /mainBranch:\s*optionalText\(readField\(input,\s*"mainBranch"\)\)\s*\?\?\s*"main"/);
+  assert.match(syncHandler, /const mainBranch = optionalText\(readField\(input,\s*"mainBranch"\)\)\s*\?\?\s*"main"/);
+  assert.match(syncHandler, /mainBranch,/);
   assert.doesNotMatch(syncHandler, /cleanManagedWorktree/);
   assert.doesNotMatch(syncHandler, /deleteBranch/);
 });
@@ -516,6 +610,11 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "recordWorkflowRunResult",
     "getWorkflowProjection",
     "getWorkflowEvents",
+    "getCheckpoints",
+    "getRollbackEligibility",
+    "applyRollback",
+    "requestRepair",
+    "requestVariant",
     "getChangeset",
     "createSession",
     "appendUserInput",
@@ -525,6 +624,11 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "recordRunResult",
     "getProjection",
     "getEvents",
+    "getCheckpoints",
+    "getRollbackEligibility",
+    "applyRollback",
+    "requestRepair",
+    "requestVariant",
     "answerUserDecision",
     "createWorktree",
     "compareWorktrees",
@@ -610,12 +714,12 @@ test("workflow delivery remote public type contracts return push and PR evidence
     persistence.indexOf("onRunEvent:"),
   );
 
-  assert.match(workflowContract, /status:\s*"pushed"/);
-  assert.match(workflowContract, /evidence:\s*DeliveryPushEvidence/);
-  assert.match(workflowContract, /status:\s*"created"/);
-  assert.match(workflowContract, /evidence:\s*DeliveryPullRequestEvidence/);
-  assert.match(devflowContract, /status:\s*"pushed"/);
-  assert.match(devflowContract, /status:\s*"created"/);
+  assert.match(persistence, /type WorkflowDeliveryPushResult[\s\S]*status:\s*"pushed"[\s\S]*evidence:\s*DeliveryPushEvidence/);
+  assert.match(persistence, /type WorkflowPullRequestCreateResult[\s\S]*status:\s*"created"[\s\S]*evidence:\s*DeliveryPullRequestEvidence/);
+  assert.match(workflowContract, /pushDeliveryBranch:.*Promise<WorkflowDeliveryPushResult>/);
+  assert.match(workflowContract, /createPullRequest:.*Promise<WorkflowPullRequestCreateResult>/);
+  assert.match(devflowContract, /pushWorkflowDeliveryBranch:.*Promise<WorkflowDeliveryPushResult>/);
+  assert.match(devflowContract, /createWorkflowPullRequest:.*Promise<WorkflowPullRequestCreateResult>/);
 });
 
 test("workflow delivery remote public type contracts return checks, merge, and sync evidence", async () => {
@@ -631,13 +735,801 @@ test("workflow delivery remote public type contracts return checks, merge, and s
 
   assert.match(workflowContract, /status:\s*"checks_recorded"/);
   assert.match(workflowContract, /evidence:\s*DeliveryPullRequestChecksEvidence/);
-  assert.match(workflowContract, /status:\s*"merged"/);
-  assert.match(workflowContract, /evidence:\s*DeliveryPullRequestMergeEvidence/);
-  assert.match(workflowContract, /status:\s*"synced"/);
-  assert.match(workflowContract, /evidence:\s*DeliveryMainSyncEvidence/);
+  assert.match(persistence, /type WorkflowPullRequestMergeResult[\s\S]*status:\s*"merged"[\s\S]*evidence:\s*DeliveryPullRequestMergeEvidence/);
+  assert.match(persistence, /type WorkflowDeliveryMainSyncResult[\s\S]*status:\s*"synced"[\s\S]*evidence:\s*DeliveryMainSyncEvidence/);
   assert.match(devflowContract, /status:\s*"checks_recorded"/);
-  assert.match(devflowContract, /status:\s*"merged"/);
-  assert.match(devflowContract, /status:\s*"synced"/);
+  assert.match(workflowContract, /mergePullRequest:.*Promise<WorkflowPullRequestMergeResult>/);
+  assert.match(workflowContract, /syncMain:.*Promise<WorkflowDeliveryMainSyncResult>/);
+  assert.match(devflowContract, /mergeWorkflowPullRequest:.*Promise<WorkflowPullRequestMergeResult>/);
+  assert.match(devflowContract, /syncWorkflowMain:.*Promise<WorkflowDeliveryMainSyncResult>/);
+});
+
+test("workflow delivery remote public type contracts include manual-resolution blocked results", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const workflowContract = persistence.slice(
+    persistence.indexOf("pushDeliveryBranch:"),
+    persistence.indexOf("getChangeset:"),
+  );
+  const devflowContract = persistence.slice(
+    persistence.indexOf("createWorkflowDeliveryCommit:"),
+    persistence.indexOf("onRunEvent:"),
+  );
+
+  assert.match(persistence, /manual_resolution_required/);
+  assert.match(persistence, /interface WorkflowDeliveryBlockedResult[\s\S]*status:\s*"blocked"[\s\S]*event:\s*unknown\s*\|\s*null[\s\S]*blockedReason:\s*WorkflowRollbackBlockReason[\s\S]*manualRepairRequired:\s*true/);
+  for (const resultType of [
+    "WorkflowDeliveryPushResult",
+    "WorkflowPullRequestCreateResult",
+    "WorkflowPullRequestMergeResult",
+    "WorkflowDeliveryMainSyncResult",
+  ]) {
+    assert.match(persistence, new RegExp(`type ${resultType}[\\s\\S]*WorkflowDeliveryBlockedResult`));
+  }
+  for (const method of ["pushDeliveryBranch", "createPullRequest", "mergePullRequest", "syncMain"]) {
+    assert.match(workflowContract, new RegExp(`${method}:.*${methodResultType(method)}`));
+  }
+  for (const method of ["pushWorkflowDeliveryBranch", "createWorkflowPullRequest", "mergeWorkflowPullRequest", "syncWorkflowMain"]) {
+    assert.match(devflowContract, new RegExp(`${method}:.*${legacyMethodResultType(method)}`));
+  }
+});
+
+test("workflow rollback public type contracts expose structured checkpoint results", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const workflowContract = persistence.slice(
+    persistence.indexOf("getCheckpoints:"),
+    persistence.indexOf("answerUserDecision:"),
+  );
+
+  assert.match(workflowContract, /checkpoints:\s*WorkflowNodeCheckpoint\[\]/);
+  assert.match(workflowContract, /eligibility:\s*WorkflowRollbackEligibility/);
+  assert.match(workflowContract, /blockedReason:\s*WorkflowRollbackBlockReason/);
+  assert.match(workflowContract, /manualRepairRequired/);
+  assert.match(workflowContract, /status:\s*"applied"\s*\|\s*"blocked"/);
+  assert.match(workflowContract, /status:\s*"requested"/);
+});
+
+test("workflow rollback IPC keeps local git reset behind exact recorded-head safety", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const helperSource = main.slice(
+    main.indexOf("async function evaluateLocalRollbackSafetyForRollback"),
+    main.indexOf("function localRollbackSafetyResult"),
+  );
+
+  assert.match(helperSource, /assertManagedRollbackWorktree/);
+  assert.match(helperSource, /findRecordedRollbackHead/);
+  assert.match(helperSource, /gitRevParseHead/);
+  assert.match(helperSource, /gitStatusPorcelain/);
+  assert.match(helperSource, /headSha\.toLowerCase\(\) !== recordedHead\.commitSha\.toLowerCase\(\)/);
+  assert.match(helperSource, /statusText\.length > 0/);
+  assert.match(helperSource, /status:\s*"safe"/);
+  assert.match(helperSource, /status:\s*"manual_repair_required"/);
+  assert.match(helperSource, /reasonCode:\s*"head_mismatch"/);
+  assert.match(helperSource, /reasonCode:\s*"dirty_worktree"/);
+  assert.doesNotMatch(helperSource, /ls-remote|push|pull-request|gh\s/);
+});
+
+test("workflow rollback IPC requires full recorded commit SHAs before reset", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const helperSource = main.slice(
+    main.indexOf("async function evaluateLocalRollbackSafetyForRollback"),
+    main.indexOf("function localRollbackSafetyResult"),
+  );
+  const resetHelper = main.slice(
+    main.indexOf("async function gitResetHard"),
+    main.indexOf("async function normalizeChangesetNodeForProject"),
+  );
+
+  assert.match(main, /function isFullCommitSha/);
+  assert.match(helperSource, /!isFullCommitSha\(restoreCommitRef\)/);
+  assert.match(helperSource, /reasonCode:\s*"invalid_restore_commit"/);
+  assert.match(helperSource, /!isFullCommitSha\(recordedHead\.commitSha\)/);
+  assert.match(helperSource, /reasonCode:\s*"invalid_recorded_commit"/);
+  assert.match(resetHelper, /if \(!isFullCommitSha\(restoreCommitRef\)\)/);
+  assert.doesNotMatch(resetHelper, /validateGitRefText\(restoreCommitRef\)/);
+});
+
+test("workflow rollback recorded-head proof requires matching lane and worktree", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const recordedHeadHelper = main.slice(
+    main.indexOf("async function findRecordedRollbackHead"),
+    main.indexOf("function workflowCheckpointById"),
+  );
+
+  assert.match(recordedHeadHelper, /Promise<RecordedRollbackHead \| null>/);
+  assert.match(recordedHeadHelper, /if \(!laneId \|\| !affected\.has\(laneId\)\) continue/);
+  assert.match(recordedHeadHelper, /const evidenceWorktreePath = optionalText\(evidence\.worktreePath\)/);
+  assert.match(recordedHeadHelper, /if \(!evidenceWorktreePath\) continue/);
+  assert.match(recordedHeadHelper, /realPathsEqual\(evidenceWorktreePath,\s*worktreePath\)/);
+  assert.match(recordedHeadHelper, /if \(commitSha && isFullCommitSha\(commitSha\)\) \{/);
+  assert.match(recordedHeadHelper, /return \{[\s\S]*commitSha/);
+  assert.match(recordedHeadHelper, /continue/);
+  assert.doesNotMatch(recordedHeadHelper, /return afterCheckpoint/);
+  assert.doesNotMatch(recordedHeadHelper, /return !laneId/);
+});
+
+test("workflow rollback local safety rejects branch mismatch before reset", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const helperSource = main.slice(
+    main.indexOf("async function evaluateLocalRollbackSafetyForRollback"),
+    main.indexOf("function localRollbackSafetyResult"),
+  );
+  const managedWorktreeHelper = main.slice(
+    main.indexOf("async function assertManagedRollbackWorktree"),
+    main.indexOf("async function findRecordedRollbackHead"),
+  );
+  const currentBranchHelper = main.slice(
+    main.indexOf("async function gitCurrentBranch"),
+    main.indexOf("async function gitRevParseHead"),
+  );
+
+  const expectedBranchIndex = helperSource.indexOf("const expectedBranchName");
+  const currentBranchIndex = helperSource.indexOf("gitCurrentBranch(worktreePath)");
+  const mismatchIndex = helperSource.indexOf('reasonCode: "branch_mismatch"');
+  const headIndex = helperSource.indexOf("gitRevParseHead(worktreePath)");
+  const safeIndex = helperSource.indexOf('status: "safe"');
+
+  assert.match(managedWorktreeHelper, /branchName:\s*optionalText\(worktree\.branchName\)/);
+  assert.match(helperSource, /recordedHead\.branchName/);
+  assert.ok(expectedBranchIndex >= 0, "rollback safety must derive an expected branch from managed or recorded evidence");
+  assert.ok(currentBranchIndex > expectedBranchIndex, "rollback safety must read the current branch before HEAD safety");
+  assert.ok(mismatchIndex > currentBranchIndex, "branch mismatch must return manual repair evidence");
+  assert.ok(headIndex > mismatchIndex, "rollback safety must block branch mismatch before recorded-head checks pass");
+  assert.ok(safeIndex > mismatchIndex, "rollback safety must not return safe before exact branch match");
+  assert.match(currentBranchHelper, /"branch",\s*"--show-current"/);
+  assert.doesNotMatch(helperSource, /gitResetHard/);
+});
+
+test("workflow rollback apply blocks while affected remote delivery operations are in flight", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+  const deliveryPushHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+    main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+  );
+  const pullRequestCreateHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+    main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+  );
+  const pullRequestMergeHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+    main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+  );
+  const syncMainHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+    main.indexOf('ipcMain.handle("workflow:changeset"'),
+  );
+  const inFlightHelperSource = main.slice(
+    main.indexOf("function beginInFlightRemoteSideEffect"),
+    main.indexOf("async function evaluateLocalRollbackSafetyForRollback"),
+  );
+  const rollbackRemoteBlockHelper = main.slice(
+    main.indexOf("function evaluateRollbackRemoteBlocksForRollback"),
+    main.indexOf("async function withWorkflowSessionMutationLock"),
+  );
+
+  assert.match(main, /const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>\(\)/);
+  assert.match(main, /function beginDurableRemoteSideEffect/);
+  assert.match(main, /function beginInFlightRemoteSideEffect/);
+  assert.match(main, /function blockingInFlightRemoteSideEffects/);
+  assert.match(rollbackRemoteBlockHelper, /blockingInFlightRemoteSideEffects\(projectRoot,\s*input\.sessionId,\s*eligibility\)/);
+  assert.match(rollbackApplyHandler, /evaluateRollbackRemoteBlocksForRollback\(workflowProjectRoot,\s*store,\s*normalized\)/);
+  assert.match(inFlightHelperSource, /in_flight_remote_side_effect/);
+  assert.ok(
+    rollbackApplyHandler.indexOf("evaluateRollbackRemoteBlocksForRollback") < rollbackApplyHandler.indexOf("evaluateLocalRollbackSafetyForRollback"),
+    "rollback must block in-flight remotes before local safety checks and git reset",
+  );
+
+  for (const handler of [deliveryPushHandler, pullRequestCreateHandler, pullRequestMergeHandler, syncMainHandler]) {
+    assert.match(handler, /const remoteSideEffect = beginDurableRemoteSideEffect/);
+    assert.match(handler, /finally\s*\{\s*remoteSideEffect\.endInFlight\(\);\s*\}/);
+  }
+  for (const [handler, eventKind] of [
+    [deliveryPushHandler, "workflow.delivery.pushed"],
+    [pullRequestCreateHandler, "workflow.pull_request.created"],
+    [pullRequestMergeHandler, "workflow.pull_request.merged"],
+    [syncMainHandler, "workflow.delivery.main_synced"],
+  ]) {
+    const eventAppendIndex = handler.indexOf(`kind: "${eventKind}"`);
+    const finallyIndex = handler.indexOf("finally");
+    assert.ok(eventAppendIndex >= 0, `${eventKind} must still append durable evidence`);
+    assert.ok(finallyIndex > eventAppendIndex, `${eventKind} in-flight marker must clear after durable evidence append`);
+  }
+});
+
+test("workflow rollback apply rechecks remote blockers under the session mutation lock before git reset", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+  const remoteHandlers = [
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+      ),
+      "pushDeliveryBranch({",
+      "workflow.delivery.pushed",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+      ),
+      "createDeliveryPullRequest({",
+      "workflow.pull_request.created",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+      ),
+      "mergeDeliveryPullRequest({",
+      "workflow.pull_request.merged",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+        main.indexOf('ipcMain.handle("workflow:changeset"'),
+      ),
+      "syncDeliveryMain({",
+      "workflow.delivery.main_synced",
+    ],
+  ];
+
+  assert.match(main, /const workflowSessionMutationLocks = new Map<string, Promise<void>>\(\)/);
+  assert.match(main, /async function withWorkflowSessionMutationLock/);
+  assert.match(main, /function evaluateRollbackRemoteBlocksForRollback/);
+
+  const lockIndex = rollbackApplyHandler.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, normalized.sessionId");
+  const localSafetyIndex = rollbackApplyHandler.indexOf("evaluateLocalRollbackSafetyForRollback");
+  const finalCheckIndex = rollbackApplyHandler.lastIndexOf("evaluateRollbackRemoteBlocksForRollback");
+  const blockReturnIndex = rollbackApplyHandler.indexOf("if (finalRemoteBlock.result) return workflowRollbackResponse");
+  const requestIndex = rollbackApplyHandler.indexOf("appendRollbackRequestedEvent");
+  const resetIndex = rollbackApplyHandler.indexOf("gitResetHard");
+
+  assert.ok(lockIndex >= 0, "rollback apply must enter the same session mutation lock used by remote mutations");
+  assert.ok(localSafetyIndex > lockIndex, "local rollback safety must run inside the session mutation lock");
+  assert.ok(finalCheckIndex > localSafetyIndex, "rollback apply must re-materialize remote blockers after async local safety");
+  assert.ok(blockReturnIndex > finalCheckIndex, "rollback apply must return blocked when a final remote blocker appears");
+  assert.ok(requestIndex > blockReturnIndex, "rollback_requested must not be written until final remote blockers are clear");
+  assert.ok(resetIndex > requestIndex, "git reset must stay after final blocker check and rollback_requested");
+
+  for (const [handler, remoteCall, eventKind] of remoteHandlers) {
+    const remoteLockIndex = handler.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, sessionId");
+    const beginIndex = handler.indexOf("beginDurableRemoteSideEffect");
+    const callIndex = handler.indexOf(remoteCall);
+    assert.ok(remoteLockIndex >= 0, `${eventKind} must share the rollback session mutation lock`);
+    assert.ok(beginIndex > remoteLockIndex, `${eventKind} durable intent must be created inside the lock`);
+    assert.ok(callIndex > beginIndex, `${eventKind} remote mutation must start after the locked durable intent`);
+  }
+});
+
+test("workflow remote delivery handlers revalidate evidence and rollback status under the session lock", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const handlers = [
+    {
+      name: "delivery push",
+      source: main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+      ),
+      validators: [
+        "assertKnownWorkflowCanvasSession",
+        "assertWorkflowDeliveryCommitLane",
+        "resolveDeliveryCommitWorktreePath",
+        "findDeliveryCommitEvidence",
+        "assertDeliveryEvidenceInputMatches",
+      ],
+      remoteCall: "pushDeliveryBranch({",
+      eventKind: "workflow.delivery.pushed",
+    },
+    {
+      name: "pull request create",
+      source: main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+      ),
+      validators: [
+        "assertKnownWorkflowCanvasSession",
+        "assertWorkflowPullRequestLane",
+        "assertWorkflowDeliveryCommitLane",
+        "resolveDeliveryCommitWorktreePath",
+        "findDeliveryCommitEvidence",
+        "assertDeliveryEvidenceInputMatches",
+        "validatePullRequestBaseBranch",
+      ],
+      remoteCall: "createDeliveryPullRequest({",
+      eventKind: "workflow.pull_request.created",
+    },
+    {
+      name: "pull request merge",
+      source: main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+      ),
+      validators: [
+        "assertKnownWorkflowCanvasSession",
+        "assertWorkflowPullRequestLaneKind",
+        "findDeliveryPullRequestEvidence",
+        "findDeliveryPullRequestChecksEvidence",
+        "assertDeliveryPullRequestEvidenceInputMatches",
+      ],
+      remoteCall: "mergeDeliveryPullRequest({",
+      eventKind: "workflow.pull_request.merged",
+    },
+    {
+      name: "main sync",
+      source: main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+        main.indexOf('ipcMain.handle("workflow:changeset"'),
+      ),
+      validators: [
+        "assertKnownWorkflowCanvasSession",
+        "assertWorkflowPullRequestLaneKind",
+        "findDeliveryPullRequestEvidence",
+        "assertDeliveryPullRequestEvidenceInputMatches",
+        "findDeliveryPullRequestMergeEvidence",
+      ],
+      remoteCall: "syncDeliveryMain({",
+      eventKind: "workflow.delivery.main_synced",
+    },
+  ];
+
+  assert.match(main, /function assertWorkflowRemoteMutationLanesActive/);
+  for (const { name, source, validators, remoteCall, eventKind } of handlers) {
+    const lockIndex = source.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, sessionId");
+    assert.ok(lockIndex >= 0, `${name} must enter the workflow session mutation lock`);
+
+    const preLock = source.slice(0, lockIndex);
+    assert.doesNotMatch(preLock, /getWorkflowStore|assertKnownWorkflowCanvasSession/);
+    assert.doesNotMatch(preLock, /assertWorkflow(?:DeliveryCommitLane|PullRequestLane|PullRequestLaneKind)/);
+    assert.doesNotMatch(preLock, /findDelivery(?:CommitEvidence|PullRequestEvidence|PullRequestChecksEvidence|PullRequestMergeEvidence)/);
+    assert.doesNotMatch(preLock, /findDeliveryPushEvidenceForPullRequest|validatePullRequestBaseBranch|const remoteOperation/);
+
+    const locked = source.slice(lockIndex);
+    const validatorIndexes = validators.map((validator) => locked.indexOf(validator));
+    for (const [index, validator] of validatorIndexes.map((value, index) => [value, validators[index]])) {
+      assert.ok(index >= 0, `${eventKind} must validate ${validator} inside the lock`);
+    }
+
+    const lastValidationIndex = Math.max(...validatorIndexes);
+    const operationIndex = locked.indexOf("const remoteOperation: RemoteSideEffectOperation =");
+    const rollbackStatusIndex = locked.indexOf("assertWorkflowRemoteMutationLanesActive(store, remoteOperation)");
+    const retryBlockIndex = locked.indexOf("unresolvedRemoteSideEffectBlockForRetry(store, remoteOperation)");
+    const beginIndex = locked.indexOf("beginDurableRemoteSideEffect(store, remoteOperation)");
+    const remoteCallIndex = locked.indexOf(remoteCall);
+
+    assert.ok(operationIndex > lastValidationIndex, `${eventKind} must construct remote operation from current locked evidence`);
+    assert.ok(rollbackStatusIndex > operationIndex, `${eventKind} must check rollbackStatus after affected lanes are known`);
+    assert.ok(retryBlockIndex > rollbackStatusIndex, `${eventKind} must reject rolled-back lanes before unresolved retry handling`);
+    assert.ok(beginIndex > retryBlockIndex, `${eventKind} must not create durable intent before current rollbackStatus passes`);
+    assert.ok(remoteCallIndex > beginIndex, `${eventKind} remote helper must stay after locked validation and durable intent`);
+  }
+});
+
+test("workflow pull request merge cannot use stale pre-lock evidence after rollback", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const mergeHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+    main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+  );
+  const lockIndex = mergeHandler.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, sessionId");
+  const preLock = mergeHandler.slice(0, lockIndex);
+  const locked = mergeHandler.slice(lockIndex);
+
+  assert.doesNotMatch(preLock, /findDeliveryPullRequestEvidence|findDeliveryPullRequestChecksEvidence|assertDeliveryPullRequestEvidenceInputMatches/);
+  assert.doesNotMatch(preLock, /const remoteOperation: RemoteSideEffectOperation/);
+
+  const prEvidenceIndex = locked.indexOf("findDeliveryPullRequestEvidence");
+  const checksIndex = locked.indexOf("findDeliveryPullRequestChecksEvidence");
+  const operationIndex = locked.indexOf("const remoteOperation: RemoteSideEffectOperation =");
+  const rollbackStatusIndex = locked.indexOf("assertWorkflowRemoteMutationLanesActive(store, remoteOperation)");
+  const helperIndex = locked.indexOf("mergeDeliveryPullRequest({");
+
+  assert.ok(prEvidenceIndex >= 0, "merge must re-read PR evidence inside the lock");
+  assert.ok(checksIndex > prEvidenceIndex, "merge must re-read checks evidence inside the lock");
+  assert.ok(operationIndex > checksIndex, "merge remote operation must be built from locked evidence");
+  assert.ok(rollbackStatusIndex > operationIndex, "merge must reject current rolled_back or inactive lanes before gh pr merge");
+  assert.ok(helperIndex > rollbackStatusIndex, "gh pr merge cannot run before rollbackStatus validation");
+});
+
+test("workflow remote rollback locks and in-flight blockers are scoped by project root", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const rollbackEligibilityHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:eligibility"'),
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+  );
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+  const deliveryPushHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+    main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+  );
+  const inFlightHelperSource = main.slice(
+    main.indexOf("function beginInFlightRemoteSideEffect"),
+    main.indexOf("async function evaluateLocalRollbackSafetyForRollback"),
+  );
+
+  assert.match(main, /interface InFlightRemoteSideEffect[\s\S]*projectRoot:\s*string/);
+  assert.match(main, /async function workflowStoreIdentity\(projectRoot: string\): Promise<string>/);
+  assert.match(rollbackEligibilityHandler, /const workflowProjectRoot = await workflowStoreIdentity\(projectRoot\)/);
+  assert.match(rollbackEligibilityHandler, /blockingInFlightRemoteSideEffects\(workflowProjectRoot,\s*normalized\.sessionId,\s*eligibility\)/);
+  assert.match(rollbackApplyHandler, /withWorkflowSessionMutationLock\(workflowProjectRoot,\s*normalized\.sessionId/);
+  assert.match(rollbackApplyHandler, /evaluateRollbackRemoteBlocksForRollback\(workflowProjectRoot,\s*store,\s*normalized\)/);
+  assert.match(deliveryPushHandler, /withWorkflowSessionMutationLock\(workflowProjectRoot,\s*sessionId/);
+  assert.match(deliveryPushHandler, /const remoteOperation: RemoteSideEffectOperation = \{[\s\S]*projectRoot:\s*workflowProjectRoot/);
+  assert.match(deliveryPushHandler, /beginDurableRemoteSideEffect\(store,\s*remoteOperation\)/);
+  assert.match(inFlightHelperSource, /projectRoot:\s*input\.projectRoot/);
+  assert.match(inFlightHelperSource, /if \(effect\.projectRoot !== projectRoot\) return false/);
+});
+
+test("workflow remote delivery mutations leave attempted failures as durable blockers", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const handlers = [
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+      ),
+      "workflow.delivery.pushed",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+      ),
+      "workflow.pull_request.created",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+      ),
+      "workflow.pull_request.merged",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+        main.indexOf('ipcMain.handle("workflow:changeset"'),
+      ),
+      "workflow.delivery.main_synced",
+    ],
+  ];
+
+  for (const [handler, eventKind] of handlers) {
+    assert.match(handler, /beginDurableRemoteSideEffect/);
+    assert.match(handler, /throw normalizeDeliveryRemoteIpcError\(error\)/);
+    assert.doesNotMatch(handler, /remoteSideEffect\.complete\("failed"/, `${eventKind} must not clear attempted remote failures`);
+  }
+});
+
+test("workflow remote delivery mutations clear known pre-mutation failures durably", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const handlers = [
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+      ),
+      "workflow.delivery.pushed",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+      ),
+      "workflow.pull_request.created",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+      ),
+      "workflow.pull_request.merged",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+        main.indexOf('ipcMain.handle("workflow:changeset"'),
+      ),
+      "workflow.delivery.main_synced",
+    ],
+  ];
+  const clearingHelper = main.slice(
+    main.indexOf("function completeDurableRemoteSideEffectForKnownPreMutationFailure"),
+    main.indexOf("function unresolvedRemoteSideEffectBlockForRetry"),
+  );
+  const knownFailurePredicate = main.slice(
+    main.indexOf("function isKnownPreMutationDeliveryRemoteError"),
+    main.indexOf("function deliveryRemoteIpcErrorCode"),
+  );
+
+  assert.match(clearingHelper, /remoteSideEffect\.complete\("failed"/);
+  assert.match(clearingHelper, /remoteMutationAttempted:\s*false/);
+  assert.match(clearingHelper, /normalizeDeliveryRemoteIpcError\(error\)/);
+  assert.match(knownFailurePredicate, /GH_UNAVAILABLE|AUTH_REQUIRED|REMOTE_HEAD_MISMATCH/);
+  assert.doesNotMatch(knownFailurePredicate, /git push failed|gh pr create failed|gh pr merge failed/);
+
+  for (const [handler, eventKind] of handlers) {
+    const catchIndex = handler.indexOf("catch (error)");
+    const clearIndex = handler.indexOf("completeDurableRemoteSideEffectForKnownPreMutationFailure(remoteSideEffect, error)");
+    const throwIndex = handler.indexOf("throw normalizeDeliveryRemoteIpcError(error)");
+    assert.ok(catchIndex >= 0, `${eventKind} must catch remote helper errors`);
+    assert.ok(clearIndex > catchIndex, `${eventKind} must complete known pre-mutation failures durably`);
+    assert.ok(throwIndex > clearIndex, `${eventKind} must still rethrow normalized IPC errors`);
+  }
+});
+
+test("workflow remote delivery mutations persist durable blocking intent before remote calls", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const handlers = [
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+      ),
+      "pushDeliveryBranch({",
+      "workflow.delivery.pushed",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+      ),
+      "createDeliveryPullRequest({",
+      "workflow.pull_request.created",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+      ),
+      "mergeDeliveryPullRequest({",
+      "workflow.pull_request.merged",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+        main.indexOf('ipcMain.handle("workflow:changeset"'),
+      ),
+      "syncDeliveryMain({",
+      "workflow.delivery.main_synced",
+    ],
+  ];
+
+  assert.match(main, /workflow\.remote_side_effect\.requested/);
+  assert.match(main, /workflow\.remote_side_effect\.completed/);
+  assert.match(main, /function beginDurableRemoteSideEffect/);
+  for (const [handler, remoteCall, eventKind] of handlers) {
+    const requestedIndex = handler.indexOf("beginDurableRemoteSideEffect");
+    const remoteCallIndex = handler.indexOf(remoteCall);
+    const evidenceIndex = handler.indexOf(`kind: "${eventKind}"`);
+    const completedIndex = handler.indexOf('remoteSideEffect.complete("succeeded"');
+    assert.ok(requestedIndex >= 0, `${eventKind} must create a durable remote request`);
+    assert.ok(remoteCallIndex > requestedIndex, `${eventKind} durable request must be persisted before the remote mutation`);
+    assert.ok(evidenceIndex > remoteCallIndex, `${eventKind} evidence must still be recorded after the remote mutation`);
+    assert.ok(completedIndex > evidenceIndex, `${eventKind} durable request must complete after evidence is recorded`);
+  }
+});
+
+test("workflow rollback apply persists rollback request before git reset and rejected evidence on local failure", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+
+  const requestIndex = rollbackApplyHandler.indexOf("appendRollbackRequestedEvent");
+  const resetIndex = rollbackApplyHandler.indexOf("gitResetHard");
+  const appliedIndex = rollbackApplyHandler.lastIndexOf("appendRollbackAppliedEvent");
+  const rejectedIndex = rollbackApplyHandler.indexOf("appendRollbackRejectedEvent");
+  assert.ok(requestIndex >= 0, "rollback apply must persist workflow.node.rollback_requested explicitly");
+  assert.ok(resetIndex > requestIndex, "git reset must run only after rollback_requested is durable");
+  assert.ok(appliedIndex > resetIndex, "rollback_applied must be recorded only after git reset succeeds");
+  assert.ok(rejectedIndex >= 0, "local safety or reset failure must persist workflow.node.rollback_rejected evidence");
+  assert.match(rollbackApplyHandler, /catch\s*\(error\)[\s\S]*appendRollbackRejectedEvent/);
+  assert.doesNotMatch(rollbackApplyHandler, /gitResetHard[\s\S]*applyNodeRollback/);
+});
+
+test("workflow rollback retry recovers crash window when HEAD is already restored", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+  const localSafetyHelper = main.slice(
+    main.indexOf("async function evaluateLocalRollbackSafetyForRollback"),
+    main.indexOf("function localRollbackSafetyResult"),
+  );
+
+  assert.match(main, /status:\s*"already_restored"/);
+  assert.match(main, /function findMatchingRollbackRequestedEvent/);
+  assert.match(rollbackApplyHandler, /localSafety\.status === "already_restored"/);
+  assert.match(rollbackApplyHandler, /appendRollbackAppliedEvent\(store,\s*normalized,\s*finalEligibility,\s*localSafety\.requestId\)/);
+  assert.match(localSafetyHelper, /findMatchingRollbackRequestedEvent/);
+  assert.match(localSafetyHelper, /headSha\.toLowerCase\(\) === restoreCommitRef\.toLowerCase\(\)/);
+  assert.match(localSafetyHelper, /statusText\.length > 0/);
+  assert.doesNotMatch(localSafetyHelper, /already_restored[\s\S]*gitResetHard/);
+});
+
+test("workflow rollback retry reuses unresolved rollback request before reset when HEAD is unchanged", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+
+  const finalBlockIndex = rollbackApplyHandler.indexOf("const finalRemoteBlock = evaluateRollbackRemoteBlocksForRollback");
+  const reuseIndex = rollbackApplyHandler.indexOf("findMatchingRollbackRequestedEvent(store, normalized, finalEligibility, localSafety.restoreCommitRef)");
+  const collisionIndex = rollbackApplyHandler.indexOf("findRollbackRequestedEventByIdempotencyKey");
+  const appendIndex = rollbackApplyHandler.indexOf("appendRollbackRequestedEvent");
+  const validationIndex = rollbackApplyHandler.indexOf("validateRollbackRequestedEventForIpc");
+  const resetIndex = rollbackApplyHandler.indexOf("gitResetHard");
+
+  assert.ok(finalBlockIndex >= 0, "rollback apply must recheck remote blockers before reset");
+  assert.ok(reuseIndex > finalBlockIndex, "rollback apply must look for an existing unresolved rollback request after final eligibility");
+  assert.ok(collisionIndex > reuseIndex, "rollback apply must check rollback_requested idempotency collisions before append");
+  assert.ok(appendIndex > collisionIndex, "rollback apply must only append rollback_requested after reuse and collision lookup miss");
+  assert.ok(validationIndex > appendIndex, "rollback apply must validate reused or appended rollback_requested before reset");
+  assert.ok(resetIndex > validationIndex, "git reset must stay after request reuse, collision lookup, append, and validation");
+  assert.match(rollbackApplyHandler, /const requested = existingRollbackRequest[\s\S]*\?\? findRollbackRequestedEventByIdempotencyKey[\s\S]*\?\? appendRollbackRequestedEvent/);
+  assert.doesNotMatch(rollbackApplyHandler, /const requested = appendRollbackRequestedEvent\(store,\s*normalized,\s*finalEligibility\);/);
+});
+
+test("workflow rollback request id collision is rejected before git reset when requested payload mismatches", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+  const validationHelper = main.slice(
+    main.indexOf("function validateRollbackRequestedEventForIpc"),
+    main.indexOf("function localRollbackSafetyResult"),
+  );
+
+  const reuseIndex = rollbackApplyHandler.indexOf("findMatchingRollbackRequestedEvent");
+  const collisionIndex = rollbackApplyHandler.indexOf("findRollbackRequestedEventByIdempotencyKey");
+  const appendIndex = rollbackApplyHandler.indexOf("appendRollbackRequestedEvent");
+  const validationIndex = rollbackApplyHandler.indexOf("validateRollbackRequestedEventForIpc");
+  const rejectionIndex = rollbackApplyHandler.indexOf('reasonCode: "request_id_conflict"');
+  const resetIndex = rollbackApplyHandler.indexOf("gitResetHard");
+
+  assert.ok(reuseIndex >= 0, "rollback apply must first reuse a matching unresolved request");
+  assert.ok(collisionIndex > reuseIndex, "rollback apply must detect idempotency-key collisions before appending");
+  assert.ok(appendIndex > collisionIndex, "rollback apply must not append a duplicate requested event on collision");
+  assert.ok(validationIndex > appendIndex, "rollback apply must validate the requested event before reset");
+  assert.ok(rejectionIndex > validationIndex, "rollback apply must reject mismatched requested events");
+  assert.ok(resetIndex > rejectionIndex, "git reset must stay unreachable on request-id collision rejection");
+  assert.match(rollbackApplyHandler, /appendRollbackRejectedEvent\(store,\s*normalized,\s*finalEligibility,[\s\S]*requested\.requestId\)/);
+  assert.match(rollbackApplyHandler, /requestedEvent:\s*requested\.event/);
+
+  assert.match(validationHelper, /payloadRequestId !== requested\.requestId/);
+  assert.match(validationHelper, /eventLaneId && eventLaneId !== expectedLaneId/);
+  assert.match(validationHelper, /payloadLaneId !== expectedLaneId/);
+  assert.match(validationHelper, /payloadCheckpointId !== expectedCheckpointId/);
+  assert.match(validationHelper, /payloadNodeId !== expectedNodeId/);
+  assert.match(validationHelper, /payloadRestoreCommitRef !== restoreCommitRef/);
+  assert.match(validationHelper, /payload\.localRollbackSafe !== true/);
+  assert.match(validationHelper, /rollbackRequestHasTerminalEvent/);
+});
+
+test("workflow remote delivery retries block unresolved durable requests before helper calls", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const handlers = [
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+      ),
+      "pushDeliveryBranch",
+      "pushDeliveryBranch({",
+      "workflow.delivery.pushed",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+        main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+      ),
+      "createDeliveryPullRequest",
+      "createDeliveryPullRequest({",
+      "workflow.pull_request.created",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:pullRequest:merge"'),
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+      ),
+      "mergeDeliveryPullRequest",
+      "mergeDeliveryPullRequest({",
+      "workflow.pull_request.merged",
+    ],
+    [
+      main.slice(
+        main.indexOf('ipcMain.handle("workflow:delivery:syncMain"'),
+        main.indexOf('ipcMain.handle("workflow:changeset"'),
+      ),
+      "syncDeliveryMain",
+      "syncDeliveryMain({",
+      "workflow.delivery.main_synced",
+    ],
+  ];
+
+  assert.match(main, /function unresolvedRemoteSideEffectBlockForRetry/);
+  assert.match(main, /function remoteSideEffectManualResolutionResponse/);
+  assert.match(main, /function remoteSideEffectSemanticKey/);
+  for (const [handler, importName, remoteCall, eventKind] of handlers) {
+    const blockIndex = handler.indexOf("unresolvedRemoteSideEffectBlockForRetry");
+    const returnIndex = handler.indexOf("remoteSideEffectManualResolutionResponse");
+    const importIndex = handler.indexOf(`const { ${importName} } = await import("@skyturn/git-worktree/node")`);
+    const beginIndex = handler.indexOf("beginDurableRemoteSideEffect");
+    const callIndex = handler.indexOf(remoteCall);
+    assert.ok(blockIndex >= 0, `${eventKind} must check unresolved durable requests`);
+    assert.ok(returnIndex > blockIndex, `${eventKind} must return manual-resolution for unresolved requests`);
+    assert.ok(importIndex > returnIndex, `${eventKind} must not import the remote helper before the unresolved-request block`);
+    assert.ok(beginIndex > returnIndex, `${eventKind} must not create a fresh durable request when retry is blocked`);
+    assert.ok(callIndex > beginIndex, `${eventKind} remote helper must remain after fresh durable request creation`);
+  }
+});
+
+test("workflow pull request creation blocks unresolved push request for the same commit lane after restart", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const pullRequestHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:pullRequest:create"'),
+    main.indexOf('ipcMain.handle("workflow:pullRequest:checks"'),
+  );
+  const retryMatcher = main.slice(
+    main.indexOf("function remoteSideEffectRequestMatches"),
+    main.indexOf("function remoteSideEffectManualResolutionResponse"),
+  );
+  const pushEvidenceHelper = main.slice(
+    main.indexOf("function findDeliveryPushEvidenceForPullRequest"),
+    main.indexOf("function findDeliveryPullRequestEvidence"),
+  );
+
+  assert.match(main, /function unresolvedRemoteSideEffectBlockForRetry/);
+  assert.match(pushEvidenceHelper, /workflow\.delivery\.pushed/);
+  assert.match(pushEvidenceHelper, /commitEvidence\.commitSha/);
+  assert.match(pushEvidenceHelper, /commitEvidence\.branch/);
+  assert.match(pushEvidenceHelper, /remote/);
+  assert.match(main, /function missingDeliveryPushEvidenceManualResolutionResponse/);
+  assert.match(main, /function missingDeliveryPushEvidenceManualResolutionResponse[\s\S]*event:\s*null/);
+  assert.match(main, /status:\s*"blocked"[\s\S]*manualRepairRequired:\s*true/);
+  assert.match(retryMatcher, /request\.sessionWide === true \|\| input\.sessionWide === true/);
+  assert.doesNotMatch(retryMatcher, /request\.eventKind !== input\.eventKind/);
+
+  const blockIndex = pullRequestHandler.indexOf("unresolvedRemoteSideEffectBlockForRetry");
+  const pushEvidenceIndex = pullRequestHandler.indexOf("findDeliveryPushEvidenceForPullRequest");
+  const importIndex = pullRequestHandler.indexOf('await import("@skyturn/git-worktree/node")');
+  const createIndex = pullRequestHandler.indexOf("createDeliveryPullRequest({");
+
+  assert.ok(blockIndex >= 0, "PR create must check durable remote blockers after restart");
+  assert.ok(pushEvidenceIndex > blockIndex, "PR create must require recorded push evidence after unresolved blocker check");
+  assert.ok(importIndex > pushEvidenceIndex, "PR create must not import gh helper until push evidence exists");
+  assert.ok(createIndex > importIndex, "gh pr create must stay after durable blocker and push-evidence guards");
+});
+
+test("workflow remote delivery retries keep ambiguous failed completions unresolved", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const retryHelper = main.slice(
+    main.indexOf("function unresolvedRemoteSideEffectBlockForRetry"),
+    main.indexOf("function remoteSideEffectRequestFromEvent"),
+  );
+  const completionPredicate = main.slice(
+    main.indexOf("function remoteSideEffectCompletionClearsRetryBlock"),
+    main.indexOf("function remoteSideEffectRequestFromEvent"),
+  );
+
+  assert.match(retryHelper, /workflow\.remote_side_effect\.completed/);
+  assert.match(retryHelper, /remoteSideEffectCompletionClearsRetryBlock\(event\)/);
+  assert.doesNotMatch(retryHelper, /if \(operationId\) unresolved\.delete\(operationId\)/);
+  assert.match(completionPredicate, /status === "succeeded"/);
+  assert.match(completionPredicate, /status === "failed"[\s\S]*remoteMutationAttempted === false/);
 });
 
 test("workflow kernel knows delivery checks, merge, and main sync event names", async () => {
@@ -650,6 +1542,8 @@ test("workflow kernel knows delivery checks, merge, and main sync event names", 
   assert.match(eventKinds, /"workflow\.pull_request\.checks_recorded"/);
   assert.match(eventKinds, /"workflow\.pull_request\.merged"/);
   assert.match(eventKinds, /"workflow\.delivery\.main_synced"/);
+  assert.match(eventKinds, /"workflow\.remote_side_effect\.requested"/);
+  assert.match(eventKinds, /"workflow\.remote_side_effect\.completed"/);
 });
 
 test("workflow adopt IPC records a failed adoption before rejecting boundary violations", async () => {
@@ -899,4 +1793,22 @@ async function loadWorkflowIpcContracts() {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function methodResultType(method) {
+  return {
+    pushDeliveryBranch: "WorkflowDeliveryPushResult",
+    createPullRequest: "WorkflowPullRequestCreateResult",
+    mergePullRequest: "WorkflowPullRequestMergeResult",
+    syncMain: "WorkflowDeliveryMainSyncResult",
+  }[method];
+}
+
+function legacyMethodResultType(method) {
+  return {
+    pushWorkflowDeliveryBranch: "WorkflowDeliveryPushResult",
+    createWorkflowPullRequest: "WorkflowPullRequestCreateResult",
+    mergeWorkflowPullRequest: "WorkflowPullRequestMergeResult",
+    syncWorkflowMain: "WorkflowDeliveryMainSyncResult",
+  }[method];
 }

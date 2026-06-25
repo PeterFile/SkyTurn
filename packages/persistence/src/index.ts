@@ -27,6 +27,8 @@ import {
   type SessionTarget,
   type StartAgentRunInput,
   type WorkflowLedgerSummary,
+  type WorkflowNodeCheckpoint,
+  type WorkflowRollbackEligibility,
   type WorkflowVariantAdoption,
   type WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
@@ -49,6 +51,52 @@ export interface WorkflowRunResultRecordRequest {
   now: string;
 }
 
+export type WorkflowRollbackBlockCode =
+  | "remote_side_effect"
+  | "in_flight_remote_side_effect"
+  | "manual_resolution_required"
+  | "manual_repair_required"
+  | "invalid_checkpoint"
+  | "unknown_target";
+
+export interface WorkflowRollbackBlockReason {
+  code: WorkflowRollbackBlockCode;
+  message: string;
+  eventKind?: string;
+  eventKinds?: string[];
+  operationId?: string;
+  operationKey?: string;
+  remoteSideEffects?: WorkflowRollbackEligibility["blockingRemoteSideEffects"];
+  affectedLaneIds?: string[];
+  manualRepairRequired?: boolean;
+}
+
+export interface WorkflowDeliveryBlockedResult {
+  protocolVersion: number;
+  status: "blocked";
+  event: unknown | null;
+  blockedReason: WorkflowRollbackBlockReason;
+  manualRepairRequired: true;
+  projection: unknown;
+  canvasSession: CanvasSession | null;
+}
+
+export type WorkflowDeliveryPushResult =
+  | { protocolVersion: number; status: "pushed"; event: unknown | null; evidence: DeliveryPushEvidence }
+  | WorkflowDeliveryBlockedResult;
+
+export type WorkflowPullRequestCreateResult =
+  | { protocolVersion: number; status: "created"; event: unknown | null; evidence: DeliveryPullRequestEvidence }
+  | WorkflowDeliveryBlockedResult;
+
+export type WorkflowPullRequestMergeResult =
+  | { protocolVersion: number; status: "merged"; event: unknown | null; evidence: DeliveryPullRequestMergeEvidence }
+  | WorkflowDeliveryBlockedResult;
+
+export type WorkflowDeliveryMainSyncResult =
+  | { protocolVersion: number; status: "synced"; event: unknown | null; evidence: DeliveryMainSyncEvidence }
+  | WorkflowDeliveryBlockedResult;
+
 export interface FinalChangesetReconciliationRequest {
   node: CanvasNode;
   target: SessionTarget;
@@ -65,17 +113,49 @@ export interface WorkflowApi {
   recordRunResult: (projectRoot: string, input: WorkflowRunResultRecordRequest) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
+  getCheckpoints: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; checkpoints: WorkflowNodeCheckpoint[] }>;
+  getRollbackEligibility: (projectRoot: string, input: unknown) => Promise<{
+    protocolVersion: number;
+    eligibility: WorkflowRollbackEligibility;
+    blockedReason: WorkflowRollbackBlockReason | null;
+    manualRepairRequired: boolean;
+  }>;
+  applyRollback: (projectRoot: string, input: unknown) => Promise<{
+    protocolVersion: number;
+    status: "applied" | "blocked";
+    event?: unknown;
+    requestedEvent?: unknown;
+    eligibility: WorkflowRollbackEligibility;
+    blockedReason: WorkflowRollbackBlockReason | null;
+    manualRepairRequired: boolean;
+    projection: unknown;
+    canvasSession: CanvasSession | null;
+  }>;
+  requestRepair: (projectRoot: string, input: unknown) => Promise<{
+    protocolVersion: number;
+    status: "requested";
+    event: unknown;
+    projection: unknown;
+    canvasSession: CanvasSession | null;
+  }>;
+  requestVariant: (projectRoot: string, input: unknown) => Promise<{
+    protocolVersion: number;
+    status: "requested";
+    event: unknown;
+    projection: unknown;
+    canvasSession: CanvasSession | null;
+  }>;
   answerUserDecision: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   createWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown; worktree: WorkflowWorktreeIdentity }>;
   compareWorktrees: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; comparison: unknown }>;
   adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "adopted" | "failed"; event: unknown | null; adoption: WorkflowVariantAdoption & { status: "adopted" | "failed" } }>;
   cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "cleaned"; event: unknown | null; result: ManagedWorktreeCleanupResult }>;
   createDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
-  pushDeliveryBranch: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "pushed"; event: unknown | null; evidence: DeliveryPushEvidence }>;
-  createPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown | null; evidence: DeliveryPullRequestEvidence }>;
+  pushDeliveryBranch: (projectRoot: string, input: unknown) => Promise<WorkflowDeliveryPushResult>;
+  createPullRequest: (projectRoot: string, input: unknown) => Promise<WorkflowPullRequestCreateResult>;
   checkPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "checks_recorded"; event: unknown | null; evidence: DeliveryPullRequestChecksEvidence }>;
-  mergePullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "merged"; event: unknown | null; evidence: DeliveryPullRequestMergeEvidence }>;
-  syncMain: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "synced"; event: unknown | null; evidence: DeliveryMainSyncEvidence }>;
+  mergePullRequest: (projectRoot: string, input: unknown) => Promise<WorkflowPullRequestMergeResult>;
+  syncMain: (projectRoot: string, input: unknown) => Promise<WorkflowDeliveryMainSyncResult>;
   getChangeset: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
 }
@@ -107,11 +187,11 @@ export interface DevflowApi {
   workflow: WorkflowApi;
   getWorkflowEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
-  pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "pushed"; event: unknown | null; evidence: DeliveryPushEvidence }>;
-  createWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown | null; evidence: DeliveryPullRequestEvidence }>;
+  pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => Promise<WorkflowDeliveryPushResult>;
+  createWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<WorkflowPullRequestCreateResult>;
   checkWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "checks_recorded"; event: unknown | null; evidence: DeliveryPullRequestChecksEvidence }>;
-  mergeWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "merged"; event: unknown | null; evidence: DeliveryPullRequestMergeEvidence }>;
-  syncWorkflowMain: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "synced"; event: unknown | null; evidence: DeliveryMainSyncEvidence }>;
+  mergeWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<WorkflowPullRequestMergeResult>;
+  syncWorkflowMain: (projectRoot: string, input: unknown) => Promise<WorkflowDeliveryMainSyncResult>;
   onRunEvent: (listener: (event: RunEvent) => void) => () => void;
   onWorkflowEvent: (listener: (event: unknown) => void) => () => void;
 }
