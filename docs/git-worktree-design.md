@@ -44,6 +44,25 @@ Only `workflow.commit.created` currently completes a Flow Kernel commit lane. `w
 
 `workflow.pull_request.checks_recorded` records exact-head PR check evidence; only passed checks for the current head can satisfy check/gate lanes. Merge, post-merge main sync, and cleanup are explicit user-confirmed actions and are never triggered automatically by PR creation or green checks. Branch deletion is default-off and requires separate confirmation. Real GitHub disposable PR smoke belongs to acceptance/test coverage for the delivery remote path, not the default user project flow.
 
+## Rollback boundaries
+
+Node rollback is local workflow recovery. It can coordinate graph state, adapter thread/history state, and local filesystem/worktree state, but it must not perform remote cleanup.
+
+The rollback checkpoint grain is the node/run boundary. A before checkpoint represents the selected run's pre-run workflow/filesystem boundary. An after checkpoint represents the post-run boundary once run evidence has been captured. Product actions use those names directly: repair from after checkpoint, variant from before checkpoint, and rollback selected node plus downstream.
+
+Rollback cascades through the graph. The selected node and downstream nodes become rolled back or inactive, evidence and history stay visible, and rolled-back or inactive nodes are not schedulable.
+
+Remote side effects block rollback for the affected node range:
+
+- pushing a branch
+- creating a pull request
+- merging
+- syncing main
+
+A local commit is not a remote side effect. It can still be inside the rollback candidate range, but only if SkyTurn has exact commit evidence, the branch/worktree identity still matches, no later unsafe mutation has happened, and the user confirms the recovery operation.
+
+Rollback never automatically closes PRs, deletes remote branches, merges, syncs main, or deletes local branches. Those stay separate explicit delivery actions with their own evidence and confirmations.
+
 ## Changesets
 
 The node modal `Changes` tab must use `ChangesetService`. It must not trust agent self-reported file changes as completion evidence.
