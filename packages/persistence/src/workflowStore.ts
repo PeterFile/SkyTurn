@@ -18,6 +18,8 @@ import type {
   WorktreeMetadata,
   WorkflowLedgerSummary,
   WorkflowLedgerSummaryEvent,
+  WorkflowLoopEngineeringProjectionInput,
+  WorkflowLoopEngineeringState,
   WorkflowMode,
   WorkflowNodeCheckpoint,
   WorkflowRollbackEligibility,
@@ -29,6 +31,7 @@ import {
   evaluateRollbackEligibility,
   nodeStatusProjectionForFlowLane,
   parseWorkflowIntent,
+  projectLoopEngineeringState,
   reduceWorkflowEvents,
   scheduleReadyLanes as scheduleFlowReadyLanes,
   type CompileWorkflowIntentResult,
@@ -841,6 +844,14 @@ export class WorkflowStore {
       .filter((event) => isFlowEventKind(event.kind))
       .map(mapWorkflowRecordToFlowEvent);
     return reduceWorkflowEvents([seedFlowUserInputEvent(sessionId), ...flowEvents]);
+  }
+
+  getLoopEngineeringState(
+    sessionId: string,
+    input: WorkflowLoopEngineeringProjectionInput = {},
+  ): WorkflowLoopEngineeringState {
+    this.requireKnownSession(sessionId);
+    return projectLoopEngineeringState(this.materializeFlowProjection(sessionId), input);
   }
 
   listEvents(sessionId: string): WorkflowEventRecord[] {

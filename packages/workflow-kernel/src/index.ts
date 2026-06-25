@@ -18,9 +18,17 @@ import type {
   WorkflowRemoteSideEffectEventKind,
   WorkflowRemoteSideEffectRef,
   WorkflowRollbackEligibility,
+  WorkflowDeliveryCheckStatus,
+  WorkflowDeliveryLoopState,
+  WorkflowLoopBlockedReason,
+  WorkflowLoopEngineeringProjectionInput,
+  WorkflowLoopEngineeringState,
+  WorkflowLoopNextAction,
   WorkflowProjectionNodeKind,
+  WorkflowRollbackLoopState,
   WorkflowRuntimePolicy,
   WorkflowSideEffectKind,
+  WorkflowSuccessorLoopState,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
@@ -34,6 +42,8 @@ export type {
   WorkflowNodeCheckpoint,
   WorkflowCheckpointIntent,
   WorkflowRollbackEligibility,
+  WorkflowLoopEngineeringProjectionInput,
+  WorkflowLoopEngineeringState,
   WorkflowRuntimePolicy,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
@@ -186,7 +196,7 @@ export interface FlowEvidence {
 
 export type FlowEvidenceStatus = "passed" | "failed" | "skipped" | "pending";
 
-export type PullRequestCheckStatus = "passed" | "failed" | "pending";
+export type PullRequestCheckStatus = WorkflowDeliveryCheckStatus;
 
 export interface PullRequestCheckResult {
   name: string;
@@ -694,7 +704,7 @@ export function evaluateGate(projection: FlowProjection, operation: WorkflowInte
 export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleReadyLanesInput): FlowLane[] {
   const selected: FlowLane[] = [];
   const occupied = [...(input.runningScopes ?? [])];
-  const completed = new Set(projection.lanes.filter(isCompletedLane).map((lane) => lane.id));
+  const completed = completedLaneIdsForScheduling(projection);
   const incoming = new Map<string, string[]>();
   for (const edge of projection.edges) {
     incoming.set(edge.targetLaneId, [...(incoming.get(edge.targetLaneId) ?? []), edge.sourceLaneId]);
@@ -713,6 +723,450 @@ export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleRe
     occupied.push({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes });
   }
   return selected;
+}
+
+function completedLaneIdsForScheduling(projection: FlowProjection): Set<string> {
+  const staleCheckGateLaneIds = stalePullRequestCheckGateLaneIds(projection);
+  return new Set(
+    projection.lanes
+      .filter((lane) => isCompletedLane(lane) && !staleCheckGateLaneIds.has(lane.id))
+      .map((lane) => lane.id),
+  );
+}
+
+function stalePullRequestCheckGateLaneIds(projection: FlowProjection): Set<string> {
+  const headState: PullRequestHeadState = {
+    byLaneId: new Map(),
+    currentByPrNumber: new Map(),
+  };
+  const latestChecksByLaneId = new Map<string, PullRequestChecksRecordedPayload>();
+
+  for (const event of projection.events) {
+    if (event.kind === "workflow.delivery.pushed" || event.kind === "workflow.pull_request.created") {
+      rememberPullRequestHead(headState, event.payload);
+    }
+    if (event.kind === "workflow.pull_request.checks_recorded") {
+      const recorded = normalizePullRequestChecksRecorded(event);
+      if (recorded) latestChecksByLaneId.set(recorded.payload.laneId, recorded.payload);
+    }
+  }
+
+  const stale = new Set<string>();
+  for (const [laneId, payload] of latestChecksByLaneId) {
+    const lane = projection.lanes.find((item) => item.id === laneId);
+    if (!lane || !isPullRequestCheckGateLane(lane)) continue;
+    if (payload.status !== "passed" || !matchesCurrentPullRequestHead(headState, payload)) {
+      stale.add(laneId);
+    }
+  }
+  return stale;
+}
+
+export function projectLoopEngineeringState(
+  projection: FlowProjection,
+  input: WorkflowLoopEngineeringProjectionInput = {},
+): WorkflowLoopEngineeringState {
+  const delivery = projectDeliveryLoopState(projection);
+  const rollback = projectRollbackLoopState(projection, input);
+  const repair = projectSuccessorLoopState(projection, "repair");
+  const variant = projectSuccessorLoopState(projection, "variant");
+  const nextAction = projectNextLoopAction(projection, delivery, rollback, input);
+  const blockedReason = rollback.blockedReason ?? delivery.blockedReason;
+  return {
+    sessionId: projection.sessionId,
+    throughSeq: projection.events.at(-1)?.seq ?? 0,
+    nextAction,
+    ...(blockedReason ? { blockedReason } : {}),
+    evidenceStale: delivery.evidenceStale,
+    delivery,
+    rollback,
+    repair,
+    variant,
+  };
+}
+
+function projectNextLoopAction(
+  projection: FlowProjection,
+  delivery: WorkflowDeliveryLoopState,
+  rollback: WorkflowRollbackLoopState,
+  input: WorkflowLoopEngineeringProjectionInput,
+): WorkflowLoopNextAction {
+  if (rollback.phase === "blocked" && rollback.blockedReason) {
+    return {
+      kind: "blocked",
+      loop: "rollback",
+      laneId: rollback.targetLaneId,
+      checkpointId: rollback.checkpointId,
+      reason: rollback.blockedReason.message,
+    };
+  }
+  if (rollback.phase === "ready") {
+    return {
+      kind: "rollback_node",
+      loop: "rollback",
+      laneId: rollback.targetLaneId,
+      checkpointId: rollback.checkpointId,
+      reason: "Rollback is locally eligible.",
+    };
+  }
+  if (delivery.phase === "merge_ready") {
+    return {
+      kind: "merge_pull_request",
+      loop: "delivery",
+      laneId: delivery.checkLaneId ?? delivery.pullRequestLaneId,
+      reason: "Pull request checks passed for the current head.",
+      ...(delivery.prNumber ? { prNumber: delivery.prNumber } : {}),
+      ...(delivery.headSha ? { headSha: delivery.headSha } : {}),
+    };
+  }
+  if (delivery.blockedReason) {
+    if (delivery.blockedReason.code === "pending_checks") {
+      return {
+        kind: "wait_for_checks",
+        loop: "delivery",
+        laneId: delivery.checkLaneId ?? delivery.pullRequestLaneId,
+        reason: delivery.blockedReason.message,
+        ...(delivery.prNumber ? { prNumber: delivery.prNumber } : {}),
+        ...(delivery.headSha ? { headSha: delivery.headSha } : {}),
+      };
+    }
+    if (delivery.blockedReason.code === "failed_checks") {
+      return {
+        kind: "fix_failed_checks",
+        loop: "delivery",
+        laneId: delivery.checkLaneId ?? delivery.pullRequestLaneId,
+        reason: delivery.blockedReason.message,
+        ...(delivery.prNumber ? { prNumber: delivery.prNumber } : {}),
+        ...(delivery.headSha ? { headSha: delivery.headSha } : {}),
+      };
+    }
+    return {
+      kind: "blocked",
+      loop: "delivery",
+      laneId: delivery.checkLaneId ?? delivery.pullRequestLaneId,
+      reason: delivery.blockedReason.message,
+      ...(delivery.prNumber ? { prNumber: delivery.prNumber } : {}),
+      ...(delivery.headSha ? { headSha: delivery.headSha } : {}),
+    };
+  }
+
+  const readyLane = scheduleReadyLanes(projection, { allowedParallelism: input.allowedParallelism ?? 1 })[0];
+  if (readyLane) {
+    return {
+      kind: "execute_lane",
+      loop: "execution",
+      laneId: readyLane.id,
+      reason: "Lane dependencies are satisfied.",
+    };
+  }
+
+  const failedLane = [...projection.lanes].reverse().find((lane) =>
+    lane.status === "failed" && !isTerminalRollbackLane(lane) && lane.semanticSubtype !== "repair"
+  );
+  if (failedLane) {
+    return {
+      kind: "request_repair",
+      loop: "repair",
+      laneId: failedLane.id,
+      reason: "Failed lane needs a repair successor.",
+    };
+  }
+
+  return { kind: "none", reason: "No safe loop action is currently available." };
+}
+
+function projectDeliveryLoopState(projection: FlowProjection): WorkflowDeliveryLoopState {
+  const headState: PullRequestHeadState = {
+    byLaneId: new Map(),
+    currentByPrNumber: new Map(),
+  };
+  let phase: WorkflowDeliveryLoopState["phase"] = "not_started";
+  let pullRequestLaneId: string | undefined;
+  let checkLaneId: string | undefined;
+  let prNumber: number | undefined;
+  let headSha: string | undefined;
+  let headBranch: string | undefined;
+  let lastCheckedHeadSha: string | undefined;
+  let checks: WorkflowDeliveryLoopState["checks"] = [];
+  let evidenceStale = false;
+
+  for (const event of projection.events) {
+    if (event.kind === "workflow.delivery.pushed") {
+      rememberPullRequestHead(headState, event.payload);
+      phase = phase === "not_started" ? "pushed" : phase;
+      const current = currentPullRequestHead(headState, prNumber, pullRequestLaneId);
+      headSha = current?.headSha ?? headSha;
+      headBranch = current?.headBranch ?? headBranch;
+    }
+    if (event.kind === "workflow.pull_request.created") {
+      rememberPullRequestHead(headState, event.payload);
+      pullRequestLaneId = stringValue(event.payload.laneId) ?? pullRequestLaneId;
+      prNumber = numberValue(event.payload.prNumber) ??
+        (isRecord(event.payload.evidence) ? numberValue(event.payload.evidence.number) : null) ??
+        prNumber;
+      const current = currentPullRequestHead(headState, prNumber, pullRequestLaneId);
+      headSha = current?.headSha ?? pullRequestHeadSha(event.payload) ?? headSha;
+      headBranch = current?.headBranch ?? pullRequestHeadBranch(event.payload) ?? headBranch;
+      phase = "pr_created";
+      evidenceStale = false;
+    }
+    if (event.kind === "workflow.pull_request.checks_recorded") {
+      const recorded = normalizePullRequestChecksRecorded(event);
+      if (!recorded) continue;
+      checkLaneId = recorded.payload.laneId;
+      prNumber = recorded.payload.prNumber;
+      lastCheckedHeadSha = recorded.payload.headSha;
+      checks = recorded.payload.checks;
+      const current = currentPullRequestHead(headState, prNumber, checkLaneId);
+      headSha = current?.headSha ?? headSha;
+      headBranch = current?.headBranch ?? headBranch;
+      const exactHead = matchesCurrentPullRequestHead(headState, recorded.payload);
+      evidenceStale = !exactHead;
+      if (!exactHead) {
+        phase = "checks_stale";
+        continue;
+      }
+      phase = recorded.payload.status === "passed"
+        ? "merge_ready"
+        : recorded.payload.status === "failed"
+          ? "checks_failed"
+          : recorded.payload.status === "changes_requested"
+            ? "changes_requested"
+            : "checks_pending";
+    }
+    if (event.kind === "workflow.pull_request.merged") {
+      phase = "merged";
+      evidenceStale = false;
+    }
+    if (event.kind === "workflow.delivery.main_synced") {
+      phase = "main_synced";
+      evidenceStale = false;
+    }
+  }
+
+  const finalHead = currentPullRequestHead(headState, prNumber, checkLaneId ?? pullRequestLaneId);
+  headSha = finalHead?.headSha ?? headSha;
+  headBranch = finalHead?.headBranch ?? headBranch;
+  if (headShaChangedAfterChecks(phase, headSha, lastCheckedHeadSha)) {
+    phase = "checks_stale";
+    evidenceStale = true;
+  }
+
+  const blockedReason = deliveryBlockedReason(phase, checkLaneId ?? pullRequestLaneId);
+  return {
+    phase,
+    evidenceStale,
+    ...(pullRequestLaneId ? { pullRequestLaneId } : {}),
+    ...(checkLaneId ? { checkLaneId } : {}),
+    ...(prNumber ? { prNumber } : {}),
+    ...(headSha ? { headSha } : {}),
+    ...(headBranch ? { headBranch } : {}),
+    ...(lastCheckedHeadSha ? { lastCheckedHeadSha } : {}),
+    checks,
+    ...(blockedReason ? { blockedReason } : {}),
+  };
+}
+
+function headShaChangedAfterChecks(
+  phase: WorkflowDeliveryLoopState["phase"],
+  headSha: string | undefined,
+  lastCheckedHeadSha: string | undefined,
+): boolean {
+  return Boolean(
+    headSha &&
+    lastCheckedHeadSha &&
+    headSha !== lastCheckedHeadSha &&
+    phase !== "merged" &&
+    phase !== "main_synced",
+  );
+}
+
+function currentPullRequestHead(
+  state: PullRequestHeadState,
+  prNumber: number | undefined,
+  laneId: string | undefined,
+): PullRequestHeadSnapshot | undefined {
+  return (typeof prNumber === "number" ? state.currentByPrNumber.get(prNumber) : undefined) ??
+    (laneId ? state.byLaneId.get(laneId) : undefined);
+}
+
+function deliveryBlockedReason(
+  phase: WorkflowDeliveryLoopState["phase"],
+  laneId: string | undefined,
+): WorkflowLoopBlockedReason | undefined {
+  if (phase === "pr_created" || phase === "checks_pending") {
+    return {
+      code: "pending_checks",
+      message: "Pull request checks are pending for the current head.",
+      ...(laneId ? { laneId } : {}),
+    };
+  }
+  if (phase === "checks_stale") {
+    return {
+      code: "stale_head",
+      message: "Pull request checks are stale for the current head.",
+      ...(laneId ? { laneId } : {}),
+    };
+  }
+  if (phase === "checks_failed") {
+    return {
+      code: "failed_checks",
+      message: "Pull request checks failed for the current head.",
+      ...(laneId ? { laneId } : {}),
+    };
+  }
+  if (phase === "changes_requested") {
+    return {
+      code: "changes_requested",
+      message: "Pull request review requested changes for the current head.",
+      ...(laneId ? { laneId } : {}),
+    };
+  }
+  return undefined;
+}
+
+function projectRollbackLoopState(
+  projection: FlowProjection,
+  input: WorkflowLoopEngineeringProjectionInput,
+): WorkflowRollbackLoopState {
+  const latestIntent = [...projection.rollbackIntents].reverse().find((intent) => intent.laneId);
+  const targetLaneId = input.selectedLaneId ?? latestIntent?.laneId;
+  const targetIntent = targetLaneId
+    ? [...projection.rollbackIntents].reverse().find((intent) => intent.laneId === targetLaneId)
+    : undefined;
+  if (!targetLaneId) {
+    return {
+      phase: "not_requested",
+      affectedLaneIds: [],
+      remoteBlockers: [],
+    };
+  }
+
+  const checkpointId = targetIntent?.checkpointId ?? latestBeforeCheckpointIdForLane(projection, targetLaneId);
+  const eligibility = evaluateRollbackEligibility(projection, targetLaneId, {
+    ...(checkpointId ? { checkpointId } : {}),
+    ...(targetIntent?.nodeId ? { targetNodeId: targetIntent.nodeId } : {}),
+    ...(typeof input.localRollbackSafe === "boolean" ? { localRollbackSafe: input.localRollbackSafe } : {}),
+  });
+  const blockedReason = eligibility.eligible ? undefined : rollbackLoopBlockedReason(eligibility);
+  const phase = targetIntent?.status === "applied"
+    ? "applied"
+    : targetIntent?.status === "rejected"
+      ? "rejected"
+      : blockedReason
+        ? "blocked"
+        : targetIntent?.status === "requested"
+          ? "requested"
+          : "ready";
+
+  return {
+    phase,
+    targetLaneId,
+    ...(eligibility.targetNodeId ? { targetNodeId: eligibility.targetNodeId } : {}),
+    ...(eligibility.checkpointId ? { checkpointId: eligibility.checkpointId } : {}),
+    ...(eligibility.restoreCommitRef ? { restoreCommitRef: eligibility.restoreCommitRef } : {}),
+    affectedLaneIds: eligibility.affectedLaneIds,
+    remoteBlockers: eligibility.blockingRemoteSideEffects,
+    ...(typeof eligibility.localRollbackSafe === "boolean" ? { localRollbackSafe: eligibility.localRollbackSafe } : {}),
+    ...(blockedReason ? { blockedReason } : {}),
+  };
+}
+
+function latestBeforeCheckpointIdForLane(projection: FlowProjection, laneId: string): string | undefined {
+  return [...projection.checkpoints].reverse().find((checkpoint) => checkpoint.laneId === laneId && checkpoint.phase === "before")?.id;
+}
+
+function rollbackLoopBlockedReason(eligibility: WorkflowRollbackEligibility): WorkflowLoopBlockedReason {
+  if (eligibility.blockingRemoteSideEffects.length > 0) {
+    return {
+      code: "remote_side_effect",
+      message: "Rollback is blocked by remote side effects.",
+      affectedLaneIds: eligibility.affectedLaneIds,
+      eventKinds: uniqueWorkflowRemoteSideEffectKinds(eligibility.blockingRemoteSideEffects),
+      remoteSideEffects: eligibility.blockingRemoteSideEffects,
+    };
+  }
+  if (eligibility.localRollbackSafe === false) {
+    return {
+      code: "local_rollback_unsafe",
+      message: eligibility.reason ?? "Local rollback is not safe.",
+      affectedLaneIds: eligibility.affectedLaneIds,
+      localRollbackSafe: false,
+    };
+  }
+  if (eligibility.affectedLaneIds.length === 0) {
+    return {
+      code: "unknown_target",
+      message: eligibility.reason ?? "Rollback target lane does not exist.",
+      affectedLaneIds: [],
+    };
+  }
+  return {
+    code: "invalid_checkpoint",
+    message: eligibility.reason ?? "Rollback checkpoint is invalid.",
+    affectedLaneIds: eligibility.affectedLaneIds,
+  };
+}
+
+function uniqueWorkflowRemoteSideEffectKinds(
+  refs: WorkflowRemoteSideEffectRef[],
+): WorkflowRemoteSideEffectEventKind[] {
+  return [...new Set(refs.map((ref) => ref.eventKind))];
+}
+
+function projectSuccessorLoopState(
+  projection: FlowProjection,
+  kind: "repair" | "variant",
+): WorkflowSuccessorLoopState {
+  const intent = [...projection.checkpointIntents].reverse().find((item) => item.kind === kind);
+  if (!intent) return { phase: "not_requested" };
+  const sourceLaneId = checkpointIntentTargetLaneId(projection, intent) ?? intent.laneId;
+  const successorLane = successorLaneForIntent(projection, intent);
+  if (intent.status === "rejected") {
+    return {
+      phase: "rejected",
+      ...(sourceLaneId ? { sourceLaneId } : {}),
+      ...(intent.checkpointId ? { checkpointId: intent.checkpointId } : {}),
+      ...checkpointSuccessorFields(intent),
+      ...checkpointIntentInstruction(intent),
+    };
+  }
+  const phase = successorLane?.status === "completed"
+    ? "completed"
+    : successorLane?.status === "running" || successorLane?.status === "waiting_input"
+      ? "running"
+      : successorLane && scheduleReadyLanes(projection, { allowedParallelism: Number.MAX_SAFE_INTEGER }).some((lane) => lane.id === successorLane.id)
+        ? "ready"
+        : "requested";
+  return {
+    phase,
+    ...(sourceLaneId ? { sourceLaneId } : {}),
+    ...(intent.checkpointId ? { checkpointId: intent.checkpointId } : {}),
+    ...checkpointSuccessorFields(intent),
+    ...checkpointIntentInstruction(intent),
+  };
+}
+
+function successorLaneForIntent(projection: FlowProjection, intent: WorkflowCheckpointIntent): FlowLane | undefined {
+  const fields = checkpointSuccessorFields(intent);
+  return projection.lanes.find((lane) => {
+    const laneIdMatches = fields.successorLaneId ? lane.id === fields.successorLaneId : true;
+    const semanticKeyMatches = fields.successorSemanticKey ? lane.semanticKey === fields.successorSemanticKey : true;
+    return laneIdMatches && semanticKeyMatches;
+  });
+}
+
+function checkpointSuccessorFields(
+  intent: WorkflowCheckpointIntent,
+): { successorLaneId?: string; successorSemanticKey?: string } {
+  return {
+    ...("successorLaneId" in intent && intent.successorLaneId ? { successorLaneId: intent.successorLaneId } : {}),
+    ...("successorSemanticKey" in intent && intent.successorSemanticKey ? { successorSemanticKey: intent.successorSemanticKey } : {}),
+  };
+}
+
+function checkpointIntentInstruction(intent: WorkflowCheckpointIntent): { instruction?: string } {
+  return "instruction" in intent && intent.instruction ? { instruction: intent.instruction } : {};
 }
 
 export function evaluateRollbackEligibility(
@@ -2345,6 +2799,7 @@ function normalizePullRequestChecksRecorded(event: FlowEvent): { payload: PullRe
   if (!laneId || !headSha || !url || typeof prNumber !== "number") return null;
   const status = normalizePullRequestCheckStatus(event.payload.status ?? evidencePayload.status);
   const checks = normalizePullRequestChecks(event.payload.checks ?? evidencePayload.checks);
+  const evidenceStatus: FlowEvidenceStatus = status === "passed" ? "passed" : status === "pending" ? "pending" : "failed";
   const payload: PullRequestChecksRecordedPayload = {
     laneId,
     prNumber,
@@ -2360,7 +2815,7 @@ function normalizePullRequestChecksRecorded(event: FlowEvent): { payload: PullRe
       laneId,
       segmentId: stringValue(event.payload.segmentId) ?? "",
       kind: "pull-request-checks",
-      status,
+      status: evidenceStatus,
       checks: checks.map((check) => `${check.name}:${check.status}`),
       artifacts: compactStrings([url, ...checks.map((check) => check.url ?? null)]),
     },
@@ -2428,7 +2883,7 @@ function normalizePullRequestCheck(value: unknown, index: number): PullRequestCh
 }
 
 function normalizePullRequestCheckStatus(value: unknown): PullRequestCheckStatus {
-  if (value === "passed" || value === "failed" || value === "pending") return value;
+  if (value === "passed" || value === "failed" || value === "pending" || value === "changes_requested") return value;
   return "pending";
 }
 

@@ -22,6 +22,7 @@ import {
   type WorkflowRuntimePolicy,
   type LiveRunChangesEvidence,
   type WorkflowCheckpointIntent,
+  type WorkflowLoopEngineeringState,
   type WorkflowNodeCheckpoint,
   type WorkflowRequestedCheckpointSuccessorIntent,
   type NodeRollbackStatus,
@@ -462,5 +463,75 @@ describe("agent run contracts", () => {
     expect(repairIntentWithSemanticKey.status).toBe("requested");
     expect(requestedSuccessorIntent.laneId).toBe("lane-implementation");
     expect(rollbackIntentWithoutSuccessor.status).toBe("requested");
+  });
+
+  it("publishes Loop Engineering next-action, blocker, stale-evidence, and phase contracts", () => {
+    const state: WorkflowLoopEngineeringState = {
+      sessionId: "session-1",
+      throughSeq: 42,
+      evidenceStale: true,
+      nextAction: {
+        kind: "blocked",
+        loop: "delivery",
+        reason: "Pull request checks are stale for the current head.",
+        laneId: "lane-ci",
+      },
+      blockedReason: {
+        code: "stale_head",
+        message: "Pull request checks are stale for the current head.",
+        laneId: "lane-ci",
+      },
+      delivery: {
+        phase: "checks_stale",
+        evidenceStale: true,
+        pullRequestLaneId: "lane-pr",
+        checkLaneId: "lane-ci",
+        prNumber: 42,
+        headSha: "head-current",
+        lastCheckedHeadSha: "head-old",
+        checks: [{ name: "Build and test", status: "passed" }],
+        blockedReason: {
+          code: "stale_head",
+          message: "Pull request checks are stale for the current head.",
+          laneId: "lane-ci",
+        },
+      },
+      rollback: {
+        phase: "blocked",
+        targetLaneId: "lane-implementation",
+        checkpointId: "checkpoint-before-lane-implementation",
+        restoreCommitRef: "head-before-sha",
+        affectedLaneIds: ["lane-implementation", "lane-validation"],
+        remoteBlockers: [
+          {
+            eventKind: "workflow.pull_request.created",
+            eventId: "event-pr-created",
+            laneId: "lane-implementation",
+            affectedLaneIds: ["lane-implementation"],
+          },
+        ],
+        localRollbackSafe: true,
+        blockedReason: {
+          code: "remote_side_effect",
+          message: "Rollback is blocked by remote side effects.",
+          affectedLaneIds: ["lane-implementation", "lane-validation"],
+          eventKinds: ["workflow.pull_request.created"],
+        },
+      },
+      repair: {
+        phase: "requested",
+        sourceLaneId: "lane-implementation",
+        checkpointId: "checkpoint-after-lane-implementation",
+        successorLaneId: "lane-implementation-repair",
+      },
+      variant: {
+        phase: "not_requested",
+      },
+    };
+
+    expect(state.nextAction.kind).toBe("blocked");
+    expect(state.delivery.phase).toBe("checks_stale");
+    expect(state.rollback.remoteBlockers[0]?.eventKind).toBe("workflow.pull_request.created");
+    expect(state.repair.successorLaneId).toBe("lane-implementation-repair");
   });
 });

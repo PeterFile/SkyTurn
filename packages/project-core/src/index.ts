@@ -388,6 +388,120 @@ export interface WorkflowRollbackEligibility {
   reason?: string;
 }
 
+export type WorkflowEngineeringLoopKind = "execution" | "delivery" | "rollback" | "repair" | "variant";
+export type WorkflowDeliveryLoopPhase =
+  | "not_started"
+  | "pushed"
+  | "pr_created"
+  | "checks_pending"
+  | "checks_failed"
+  | "changes_requested"
+  | "checks_stale"
+  | "merge_ready"
+  | "merged"
+  | "main_synced";
+export type WorkflowRollbackLoopPhase = "not_requested" | "ready" | "blocked" | "requested" | "applied" | "rejected";
+export type WorkflowSuccessorLoopPhase = "not_requested" | "requested" | "ready" | "running" | "completed" | "rejected";
+export type WorkflowLoopNextActionKind =
+  | "execute_lane"
+  | "wait_for_checks"
+  | "fix_failed_checks"
+  | "merge_pull_request"
+  | "rollback_node"
+  | "request_repair"
+  | "request_variant"
+  | "blocked"
+  | "none";
+export type WorkflowLoopBlockedReasonCode =
+  | "changes_requested"
+  | "stale_head"
+  | "pending_checks"
+  | "failed_checks"
+  | "remote_side_effect"
+  | "local_rollback_unsafe"
+  | "invalid_checkpoint"
+  | "unknown_target";
+export type WorkflowDeliveryCheckStatus = "passed" | "failed" | "pending" | "changes_requested";
+
+export interface WorkflowDeliveryCheckSummary {
+  name: string;
+  status: WorkflowDeliveryCheckStatus;
+  url?: string;
+  detail?: string;
+}
+
+export interface WorkflowLoopBlockedReason {
+  code: WorkflowLoopBlockedReasonCode;
+  message: string;
+  laneId?: string;
+  affectedLaneIds?: string[];
+  eventKinds?: WorkflowRemoteSideEffectEventKind[];
+  remoteSideEffects?: WorkflowRemoteSideEffectRef[];
+  localRollbackSafe?: boolean;
+}
+
+export interface WorkflowLoopNextAction {
+  kind: WorkflowLoopNextActionKind;
+  loop?: WorkflowEngineeringLoopKind;
+  laneId?: string;
+  reason: string;
+  prNumber?: number;
+  headSha?: string;
+  checkpointId?: string;
+}
+
+export interface WorkflowDeliveryLoopState {
+  phase: WorkflowDeliveryLoopPhase;
+  evidenceStale: boolean;
+  pullRequestLaneId?: string;
+  checkLaneId?: string;
+  prNumber?: number;
+  headSha?: string;
+  headBranch?: string;
+  lastCheckedHeadSha?: string;
+  checks: WorkflowDeliveryCheckSummary[];
+  blockedReason?: WorkflowLoopBlockedReason;
+}
+
+export interface WorkflowRollbackLoopState {
+  phase: WorkflowRollbackLoopPhase;
+  targetLaneId?: string;
+  targetNodeId?: string;
+  checkpointId?: string;
+  restoreCommitRef?: string;
+  affectedLaneIds: string[];
+  remoteBlockers: WorkflowRemoteSideEffectRef[];
+  localRollbackSafe?: boolean;
+  blockedReason?: WorkflowLoopBlockedReason;
+}
+
+export interface WorkflowSuccessorLoopState {
+  phase: WorkflowSuccessorLoopPhase;
+  sourceLaneId?: string;
+  checkpointId?: string;
+  successorLaneId?: string;
+  successorSemanticKey?: string;
+  instruction?: string;
+}
+
+export interface WorkflowLoopEngineeringProjectionInput {
+  selectedLaneId?: string;
+  allowedParallelism?: number;
+  localRollbackSafe?: boolean;
+}
+
+export interface WorkflowLoopEngineeringState {
+  sessionId: string;
+  throughSeq: number;
+  nextAction: WorkflowLoopNextAction;
+  blockedReason?: WorkflowLoopBlockedReason;
+  evidenceStale: boolean;
+  delivery: WorkflowDeliveryLoopState;
+  rollback: WorkflowRollbackLoopState;
+  repair: WorkflowSuccessorLoopState;
+  variant: WorkflowSuccessorLoopState;
+}
+
 export interface WorkflowCheckpointIntentBase {
   intentId: string;
   sessionId: string;

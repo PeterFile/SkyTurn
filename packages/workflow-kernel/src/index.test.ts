@@ -7,6 +7,7 @@ import {
   evaluateRollbackEligibility,
   nodeStatusProjectionForFlowLane,
   parseWorkflowIntent,
+  projectLoopEngineeringState,
   reduceWorkflowEvents,
   scheduleReadyLanes,
   type FlowEvent,
@@ -521,6 +522,15 @@ describe("Flow Kernel gate engine and scheduler", () => {
       ["lane-pr", "pull-request", "passed"],
       ["lane-commit", "delivery-push", "passed"],
     ]);
+
+    const loopState = projectLoopEngineeringState(projection);
+    expect(loopState.delivery.phase).toBe("pr_created");
+    expect(loopState.nextAction).toMatchObject({
+      kind: "wait_for_checks",
+      loop: "delivery",
+      laneId: "lane-pr",
+    });
+    expect(loopState.blockedReason).toMatchObject({ code: "pending_checks" });
   });
 
   it("uses a later delivery push as the current pull request head for check gates", () => {
@@ -588,6 +598,101 @@ describe("Flow Kernel gate engine and scheduler", () => {
       status: "passed",
       checks: ["Build and test:passed"],
     });
+
+    const staleLoopState = projectLoopEngineeringState(stale);
+    expect(staleLoopState.delivery.phase).toBe("checks_stale");
+    expect(staleLoopState.evidenceStale).toBe(true);
+    expect(staleLoopState.nextAction).toMatchObject({
+      kind: "blocked",
+      loop: "delivery",
+      laneId: "lane-ci",
+    });
+    expect(staleLoopState.blockedReason).toMatchObject({
+      code: "stale_head",
+      laneId: "lane-ci",
+    });
+
+    const exactLoopState = projectLoopEngineeringState(exact);
+    expect(exactLoopState.delivery.phase).toBe("merge_ready");
+    expect(exactLoopState.nextAction).toMatchObject({
+      kind: "merge_pull_request",
+      loop: "delivery",
+      laneId: "lane-ci",
+    });
+  });
+
+  it("blocks merge when a newer delivery push arrives after exact-head checks passed", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-commit", "commit"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-pr", "pull_request"), status: "running" } }),
+      event("workflow.lane.declared", { lane: lane("lane-merge", "merge") }),
+      event("workflow.edge.declared", { edge: { id: "edge-ci-merge", sourceLaneId: "lane-ci", targetLaneId: "lane-merge" } }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 16, url: "https://example.test/pr/16", head: "feature/slice-c", commitSha: "sha-a" },
+      }),
+      event(checksRecordedKind, {
+        laneId: "lane-ci",
+        prNumber: 16,
+        url: "https://example.test/pr/16/checks",
+        headSha: "sha-a",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/1" }],
+      }),
+      event("workflow.delivery.pushed", {
+        laneId: "lane-commit",
+        url: "https://example.test/compare",
+        evidence: { remote: "origin", branch: "feature/slice-c", commitSha: "sha-b" },
+      }),
+    ]);
+
+    const loopState = projectLoopEngineeringState(projection);
+    expect(projection.lanes.find((item) => item.id === "lane-ci")?.status).toBe("completed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual([]);
+    expect(loopState.delivery.phase).toBe("checks_stale");
+    expect(loopState.delivery.headSha).toBe("sha-b");
+    expect(loopState.delivery.lastCheckedHeadSha).toBe("sha-a");
+    expect(loopState.evidenceStale).toBe(true);
+    expect(loopState.nextAction.kind).not.toBe("merge_pull_request");
+    expect(loopState.nextAction).toMatchObject({
+      kind: "blocked",
+      loop: "delivery",
+      laneId: "lane-ci",
+    });
+    expect(loopState.blockedReason).toMatchObject({
+      code: "stale_head",
+      laneId: "lane-ci",
+    });
+  });
+
+  it("schedules merge when exact-head checks remain current", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-commit", "commit"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-pr", "pull_request"), status: "running" } }),
+      event("workflow.lane.declared", { lane: lane("lane-merge", "merge") }),
+      event("workflow.edge.declared", { edge: { id: "edge-ci-merge", sourceLaneId: "lane-ci", targetLaneId: "lane-merge" } }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 16, url: "https://example.test/pr/16", head: "feature/slice-c", commitSha: "sha-a" },
+      }),
+      event(checksRecordedKind, {
+        laneId: "lane-ci",
+        prNumber: 16,
+        url: "https://example.test/pr/16/checks",
+        headSha: "sha-a",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/1" }],
+      }),
+    ]);
+
+    expect(projectLoopEngineeringState(projection).delivery.phase).toBe("merge_ready");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual(["lane-merge"]);
   });
 
   it("replays Electron checks events with nested evidence for exact-head gates", () => {
@@ -658,6 +763,136 @@ describe("Flow Kernel gate engine and scheduler", () => {
         status,
       });
     }
+  });
+
+  it("projects changes-requested pull request checks as a merge blocker", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-ci",
+        prNumber: 18,
+        url: "https://example.test/pr/18",
+        headSha: "sha-current",
+      }),
+      event(checksRecordedKind, {
+        laneId: "lane-ci",
+        prNumber: 18,
+        url: "https://example.test/pr/18/checks",
+        headSha: "sha-current",
+        status: "changes_requested",
+        checks: [{ name: "Review", status: "changes_requested", url: "https://example.test/review/18" }],
+      }),
+    ]);
+
+    const loopState = projectLoopEngineeringState(projection);
+    expect(projection.lanes.find((item) => item.id === "lane-ci")?.status).toBe("running");
+    expect(loopState.delivery.phase).toBe("changes_requested");
+    expect(loopState.nextAction).toMatchObject({
+      kind: "blocked",
+      loop: "delivery",
+      laneId: "lane-ci",
+    });
+    expect(loopState.blockedReason).toMatchObject({ code: "changes_requested" });
+  });
+
+  it("expresses rollback remote blockers, affected lanes, restore commit, and local safety", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: lane("lane-c", "validation") }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-c", sourceLaneId: "lane-b", targetLaneId: "lane-c" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint("checkpoint-before-lane-b", "lane-b", "before", "restore-sha"),
+      }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-b",
+        evidence: { number: 24, url: "https://example.test/pr/24", commitSha: "restore-sha" },
+      }),
+    ]);
+
+    const loopState = projectLoopEngineeringState(projection, { selectedLaneId: "lane-b", localRollbackSafe: true });
+    expect(loopState.rollback).toMatchObject({
+      phase: "blocked",
+      targetLaneId: "lane-b",
+      checkpointId: "checkpoint-before-lane-b",
+      restoreCommitRef: "restore-sha",
+      affectedLaneIds: ["lane-b", "lane-c"],
+      localRollbackSafe: true,
+    });
+    expect(loopState.rollback.remoteBlockers).toEqual([
+      expect.objectContaining({
+        eventKind: "workflow.pull_request.created",
+        laneId: "lane-b",
+        affectedLaneIds: ["lane-b"],
+      }),
+    ]);
+    expect(loopState.blockedReason).toMatchObject({
+      code: "remote_side_effect",
+      affectedLaneIds: ["lane-b", "lane-c"],
+    });
+  });
+
+  it("scopes prior rollback intent state to the selected lane", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-a", "implementation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "validation"), status: "completed" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint("checkpoint-before-lane-a", "lane-a", "before", "restore-a"),
+      }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint("checkpoint-before-lane-b", "lane-b", "before", "restore-b"),
+      }),
+      event("workflow.node.rollback_requested", {
+        requestId: "rollback-lane-a",
+        laneId: "lane-a",
+        checkpointId: "checkpoint-before-lane-a",
+        localRollbackSafe: true,
+      }),
+    ]);
+
+    const loopState = projectLoopEngineeringState(projection, { selectedLaneId: "lane-b" });
+
+    expect(loopState.rollback).toMatchObject({
+      phase: "ready",
+      targetLaneId: "lane-b",
+      targetNodeId: "lane-b",
+      checkpointId: "checkpoint-before-lane-b",
+      restoreCommitRef: "restore-b",
+      affectedLaneIds: ["lane-b"],
+    });
+    expect(loopState.rollback).not.toMatchObject({
+      phase: "requested",
+      checkpointId: "checkpoint-before-lane-a",
+    });
+    expect(loopState.rollback).not.toHaveProperty("blockedReason");
+    expect(loopState.nextAction).toMatchObject({
+      kind: "rollback_node",
+      loop: "rollback",
+      laneId: "lane-b",
+      checkpointId: "checkpoint-before-lane-b",
+    });
+    expect(loopState.blockedReason).toBeUndefined();
+  });
+
+  it("does not project rolled-back or inactive lanes as the next executable action", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "ready" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-c", "validation"), status: "ready" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-c", sourceLaneId: "lane-b", targetLaneId: "lane-c" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint("checkpoint-before-lane-b", "lane-b", "before", "restore-sha"),
+      }),
+      event("workflow.node.rollback_applied", {
+        requestId: "rollback-lane-b",
+        laneId: "lane-b",
+        checkpointId: "checkpoint-before-lane-b",
+      }),
+    ]);
+
+    expect(projection.lanes.find((item) => item.id === "lane-b")).toMatchObject({ rollbackStatus: "rolled_back" });
+    expect(projection.lanes.find((item) => item.id === "lane-c")).toMatchObject({ rollbackStatus: "inactive" });
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 3 })).toEqual([]);
+    expect(projectLoopEngineeringState(projection, { allowedParallelism: 3 }).nextAction.kind).toBe("none");
   });
 
   it("records merge and cleanup requests without completing unrelated lanes", () => {

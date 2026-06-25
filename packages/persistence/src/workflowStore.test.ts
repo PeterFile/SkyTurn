@@ -1344,6 +1344,10 @@ describe("SQLite workflow store", () => {
     expect(stale.lanes.find((lane) => lane.id === "lane-commit")?.status).toBe("running");
     expect(stale.lanes.find((lane) => lane.id === "lane-pr")?.status).toBe("running");
     expect(stale.evidence.map((item) => [item.kind, item.status])).toContainEqual(["pull-request-checks", "passed"]);
+    const staleLoopState = store.getLoopEngineeringState("session-1");
+    expect(staleLoopState.delivery.phase).toBe("checks_stale");
+    expect(staleLoopState.evidenceStale).toBe(true);
+    expect(staleLoopState.blockedReason).toMatchObject({ code: "stale_head" });
 
     store.appendWorkflowEvent({
       sessionId: "session-1",
@@ -1388,6 +1392,155 @@ describe("SQLite workflow store", () => {
       status: "passed",
       checks: ["Build and test:passed"],
     });
+    expect(store.getLoopEngineeringState("session-1").nextAction).toMatchObject({
+      kind: "merge_pull_request",
+      loop: "delivery",
+      laneId: "lane-ci",
+    });
+    store.close();
+  });
+
+  it("replays stale checks when a newer delivery push arrives after exact-head checks passed", async () => {
+    const store = await makeSeededStore();
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:commit:post-check-push",
+      payload: { lane: { id: "lane-commit", semanticKey: "lane-commit", kind: "commit", title: "Commit", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:ci:post-check-push",
+      payload: { lane: { id: "lane-ci", semanticKey: "lane-ci", kind: "ci_check", title: "CI check", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:pr:post-check-push",
+      payload: { lane: { id: "lane-pr", semanticKey: "lane-pr", kind: "pull_request", title: "Create PR", agentKind: "codex", status: "running" } },
+      now: "2026-06-14T00:00:03.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.pull_request.created",
+      source: "test",
+      idempotencyKey: "pr:created:post-check-push",
+      payload: {
+        laneId: "lane-pr",
+        commitLaneId: "lane-commit",
+        evidence: { number: 22, url: "https://example.test/pr/22", head: "feature/slice-c", commitSha: "sha-a" },
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: checksRecordedKind,
+      source: "test",
+      idempotencyKey: "pr:checks:passed:post-check-push",
+      payload: {
+        laneId: "lane-ci",
+        prNumber: 22,
+        url: "https://example.test/pr/22/checks",
+        headSha: "sha-a",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/current" }],
+      },
+      now: "2026-06-14T00:00:05.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.delivery.pushed",
+      source: "test",
+      idempotencyKey: "delivery:pushed:post-check-push",
+      payload: {
+        laneId: "lane-commit",
+        url: "https://example.test/compare",
+        evidence: { remote: "origin", branch: "feature/slice-c", commitSha: "sha-b" },
+      },
+      now: "2026-06-14T00:00:06.000Z",
+    });
+
+    const loopState = store.getLoopEngineeringState("session-1");
+    expect(loopState.delivery.phase).toBe("checks_stale");
+    expect(loopState.delivery.headSha).toBe("sha-b");
+    expect(loopState.delivery.lastCheckedHeadSha).toBe("sha-a");
+    expect(loopState.evidenceStale).toBe(true);
+    expect(loopState.nextAction.kind).not.toBe("merge_pull_request");
+    expect(loopState.nextAction).toMatchObject({
+      kind: "blocked",
+      loop: "delivery",
+      laneId: "lane-ci",
+    });
+    expect(loopState.blockedReason).toMatchObject({ code: "stale_head" });
+    store.close();
+  });
+
+  it("replays rollback loop state for the selected lane without inheriting another lane intent", async () => {
+    const store = await makeSeededStore();
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:a:rollback-selected-replay",
+      payload: { lane: { id: "lane-a", semanticKey: "lane-a", kind: "implementation", title: "Lane A", agentKind: "codex", status: "completed" } },
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:b:rollback-selected-replay",
+      payload: { lane: { id: "lane-b", semanticKey: "lane-b", kind: "validation", title: "Lane B", agentKind: "codex", status: "completed" } },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    recordCheckpoint(store, "checkpoint-before-lane-a", "lane-a", "before", "restore-a");
+    recordCheckpoint(store, "checkpoint-before-lane-b", "lane-b", "before", "restore-b");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.node.rollback_requested",
+      source: "test",
+      laneId: "lane-a",
+      idempotencyKey: "rollback:lane-a:selected-replay",
+      payload: {
+        requestId: "rollback-lane-a",
+        laneId: "lane-a",
+        checkpointId: "checkpoint-before-lane-a",
+        localRollbackSafe: true,
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+
+    const loopState = store.getLoopEngineeringState("session-1", { selectedLaneId: "lane-b" });
+
+    expect(loopState.rollback).toMatchObject({
+      phase: "ready",
+      targetLaneId: "lane-b",
+      targetNodeId: "lane-b",
+      checkpointId: "checkpoint-before-lane-b",
+      restoreCommitRef: "restore-b",
+      affectedLaneIds: ["lane-b"],
+    });
+    expect(loopState.rollback).not.toMatchObject({
+      phase: "requested",
+      checkpointId: "checkpoint-before-lane-a",
+    });
+    expect(loopState.rollback).not.toHaveProperty("blockedReason");
+    expect(loopState.nextAction).toMatchObject({
+      kind: "rollback_node",
+      loop: "rollback",
+      laneId: "lane-b",
+      checkpointId: "checkpoint-before-lane-b",
+    });
+    expect(loopState.blockedReason).toBeUndefined();
     store.close();
   });
 
