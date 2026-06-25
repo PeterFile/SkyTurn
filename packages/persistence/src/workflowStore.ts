@@ -19,11 +19,15 @@ import type {
   WorkflowLedgerSummary,
   WorkflowLedgerSummaryEvent,
   WorkflowMode,
+  WorkflowNodeCheckpoint,
+  WorkflowRollbackEligibility,
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
 import {
   compileWorkflowIntent,
   createDefaultFlowPolicy,
+  evaluateRollbackEligibility,
+  nodeStatusProjectionForFlowLane,
   parseWorkflowIntent,
   reduceWorkflowEvents,
   scheduleReadyLanes as scheduleFlowReadyLanes,
@@ -283,6 +287,97 @@ export interface RecordRunResultInput {
   outputSummary?: string;
   evidence: RunEvidence;
   now: string;
+}
+
+export interface WorkflowNodeCheckpointQuery {
+  sessionId: string;
+  nodeId?: string;
+  laneId?: string;
+  runId?: string;
+  phase?: WorkflowNodeCheckpoint["phase"];
+}
+
+export interface WorkflowNodeRollbackInput {
+  sessionId: string;
+  nodeId?: string;
+  laneId?: string;
+  checkpointId?: string;
+  requestId?: string;
+  localRollbackSafe?: boolean;
+  manualRepairRequired?: boolean;
+  now: string;
+}
+
+export interface WorkflowNodeRollbackEligibilityInput {
+  sessionId: string;
+  nodeId?: string;
+  laneId?: string;
+  checkpointId?: string;
+  localRollbackSafe?: boolean;
+}
+
+export type WorkflowRollbackBlockCode =
+  | "remote_side_effect"
+  | "in_flight_remote_side_effect"
+  | "manual_repair_required"
+  | "invalid_checkpoint"
+  | "unknown_target";
+
+export interface WorkflowRollbackBlockReason {
+  code: WorkflowRollbackBlockCode;
+  message: string;
+  eventKinds?: string[];
+  remoteSideEffects?: WorkflowRollbackEligibility["blockingRemoteSideEffects"];
+  affectedLaneIds?: string[];
+  manualRepairRequired?: boolean;
+}
+
+export type WorkflowNodeRollbackResult =
+  | {
+      status: "applied";
+      event: WorkflowEventRecord;
+      requestedEvent: WorkflowEventRecord;
+      eligibility: WorkflowRollbackEligibility;
+      projection: FlowProjection;
+    }
+  | {
+      status: "blocked";
+      eligibility: WorkflowRollbackEligibility;
+      blockedReason: WorkflowRollbackBlockReason;
+      manualRepairRequired?: boolean;
+      projection: FlowProjection;
+    };
+
+export interface WorkflowCheckpointSuccessorRequest {
+  sessionId: string;
+  nodeId?: string;
+  laneId?: string;
+  checkpointId: string;
+  intentId?: string;
+  successorLaneId?: string;
+  successorSemanticKey?: string;
+  title?: string;
+  instruction?: string;
+  now: string;
+}
+
+export interface WorkflowCheckpointSuccessorResult {
+  status: "requested";
+  event: WorkflowEventRecord;
+  laneEvent: WorkflowEventRecord;
+  edgeEvents: WorkflowEventRecord[];
+  projection: FlowProjection;
+}
+
+interface PreparedCheckpointSuccessorRequest {
+  projection: FlowProjection;
+  checkpoint: WorkflowNodeCheckpoint;
+  targetLaneId: string;
+  lane: FlowLane;
+  successorLaneId: string;
+  successorSemanticKey: string;
+  intentId: string;
+  edgeSources: string[];
 }
 
 export interface SegmentEvidenceInput {
@@ -752,6 +847,97 @@ export class WorkflowStore {
     return (this.statements.listEvents.all(sessionId) as EventRow[]).map(mapEvent);
   }
 
+  listNodeCheckpoints(input: WorkflowNodeCheckpointQuery): WorkflowNodeCheckpoint[] {
+    this.requireKnownSession(input.sessionId);
+    const projection = this.materializeFlowProjection(input.sessionId);
+    return projection.checkpoints.filter((checkpoint) => {
+      if (input.nodeId && checkpoint.nodeId !== input.nodeId) return false;
+      if (input.laneId && checkpoint.laneId !== input.laneId) return false;
+      if (input.runId && checkpoint.runId !== input.runId) return false;
+      if (input.phase && checkpoint.phase !== input.phase) return false;
+      return true;
+    });
+  }
+
+  getNodeRollbackEligibility(input: WorkflowNodeRollbackEligibilityInput): WorkflowRollbackEligibility {
+    this.requireKnownSession(input.sessionId);
+    const projection = this.materializeFlowProjection(input.sessionId);
+    const targetLaneId = rollbackTargetLaneId(projection, input);
+    if (!targetLaneId) {
+      return {
+        eligible: false,
+        targetLaneId: input.laneId ?? input.nodeId ?? "",
+        affectedLaneIds: [],
+        blockingRemoteSideEffects: [],
+        ...(typeof input.localRollbackSafe === "boolean" ? { localRollbackSafe: input.localRollbackSafe } : {}),
+        reason: "Rollback target lane does not exist.",
+      };
+    }
+    return evaluateRollbackEligibility(projection, targetLaneId, {
+      ...(input.checkpointId ? { checkpointId: input.checkpointId } : {}),
+      ...(input.nodeId ? { targetNodeId: input.nodeId } : {}),
+      ...(typeof input.localRollbackSafe === "boolean" ? { localRollbackSafe: input.localRollbackSafe } : {}),
+    });
+  }
+
+  applyNodeRollback(input: WorkflowNodeRollbackInput): WorkflowNodeRollbackResult {
+    this.requireKnownSession(input.sessionId);
+    const eligibility = this.getNodeRollbackEligibility(input);
+    if (!eligibility.eligible || input.manualRepairRequired === true) {
+      const projection = this.materializeFlowProjection(input.sessionId);
+      return {
+        status: "blocked",
+        eligibility,
+        blockedReason: rollbackBlockReason(eligibility, input.manualRepairRequired === true),
+        ...(input.manualRepairRequired === true ? { manualRepairRequired: true } : {}),
+        projection,
+      };
+    }
+
+    const requestId = input.requestId ?? rollbackRequestId(input, eligibility);
+    const now = input.now;
+    const tx = this.db.transaction(() => {
+      const requestedEvent = this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "workflow.node.rollback_requested",
+        source: "workflow-store",
+        laneId: eligibility.targetLaneId,
+        idempotencyKey: `rollback:${requestId}:requested`,
+        payload: rollbackEventPayload(input, eligibility, requestId),
+        now,
+      });
+      const event = this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "workflow.node.rollback_applied",
+        source: "workflow-store",
+        laneId: eligibility.targetLaneId,
+        idempotencyKey: `rollback:${requestId}:applied`,
+        payload: {
+          ...rollbackEventPayload(input, eligibility, requestId),
+          reason: "Rollback applied.",
+        },
+        now,
+      });
+      return { requestedEvent, event };
+    });
+    const { requestedEvent, event } = tx();
+    return {
+      status: "applied",
+      event,
+      requestedEvent,
+      eligibility,
+      projection: this.materializeFlowProjection(input.sessionId),
+    };
+  }
+
+  requestNodeRepair(input: WorkflowCheckpointSuccessorRequest): WorkflowCheckpointSuccessorResult {
+    return this.requestCheckpointSuccessor("repair", input);
+  }
+
+  requestNodeVariant(input: WorkflowCheckpointSuccessorRequest): WorkflowCheckpointSuccessorResult {
+    return this.requestCheckpointSuccessor("variant", input);
+  }
+
   listLanes(sessionId: string): WorkflowLaneRecord[] {
     return (this.statements.listLanes.all(sessionId) as LaneRow[]).map(mapLane);
   }
@@ -993,6 +1179,170 @@ export class WorkflowStore {
       })),
       activeNodeId: nodes.find((node) => node.status === "running" || node.status === "retrying")?.id ?? plannerNode.id,
     };
+  }
+
+  private requestCheckpointSuccessor(
+    kind: "repair" | "variant",
+    input: WorkflowCheckpointSuccessorRequest,
+  ): WorkflowCheckpointSuccessorResult {
+    this.requireKnownSession(input.sessionId);
+
+    const tx = this.db.transaction(() => {
+      const currentProjection = this.materializeFlowProjection(input.sessionId);
+      const currentPrepared = prepareCheckpointSuccessorRequest(kind, input, currentProjection);
+      const existing = this.checkpointSuccessorIdempotentResult(
+        kind,
+        input,
+        currentPrepared.intentId,
+        currentPrepared.successorLaneId,
+        currentPrepared.successorSemanticKey,
+      );
+      if (existing) return { kind: "existing" as const, existing };
+      this.assertCheckpointSuccessorIdentityAvailable(kind, currentPrepared);
+      const lanePayload = successorLanePayload(
+        kind,
+        currentPrepared.lane,
+        currentPrepared.successorLaneId,
+        currentPrepared.successorSemanticKey,
+        input.title,
+      );
+      const laneEvent = this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "workflow.lane.declared",
+        source: "workflow-store",
+        laneId: currentPrepared.successorLaneId,
+        idempotencyKey: `checkpoint-successor:${currentPrepared.intentId}:lane`,
+        payload: { lane: lanePayload },
+        now: input.now,
+      });
+      const edgeEvents = currentPrepared.edgeSources.map((sourceLaneId) =>
+        this.insertEventInTransaction({
+          sessionId: input.sessionId,
+          kind: "workflow.edge.declared",
+          source: "workflow-store",
+          idempotencyKey: `checkpoint-successor:${currentPrepared.intentId}:edge:${sourceLaneId}:${currentPrepared.successorLaneId}`,
+          payload: {
+            edge: {
+              id: `edge-${sourceLaneId}-${currentPrepared.successorLaneId}`,
+              sourceLaneId,
+              targetLaneId: currentPrepared.successorLaneId,
+            },
+          },
+          now: input.now,
+        })
+      );
+      const event = this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: kind === "repair" ? "workflow.node.repair_requested" : "workflow.node.variant_requested",
+        source: "workflow-store",
+        laneId: currentPrepared.targetLaneId,
+        idempotencyKey: `checkpoint-successor:${currentPrepared.intentId}:intent`,
+        payload: {
+          intentId: currentPrepared.intentId,
+          laneId: currentPrepared.targetLaneId,
+          nodeId: currentPrepared.checkpoint.nodeId,
+          checkpointId: input.checkpointId,
+          successorLaneId: currentPrepared.successorLaneId,
+          successorSemanticKey: currentPrepared.successorSemanticKey,
+          ...(input.instruction ? { instruction: input.instruction } : {}),
+        },
+        now: input.now,
+      });
+      return { kind: "created" as const, laneEvent, edgeEvents, event };
+    });
+    const result = tx();
+    if (result.kind === "existing") return result.existing;
+    const { laneEvent, edgeEvents, event } = result;
+    return {
+      status: "requested",
+      event,
+      laneEvent,
+      edgeEvents,
+      projection: this.materializeFlowProjection(input.sessionId),
+    };
+  }
+
+  private checkpointSuccessorIdempotentResult(
+    kind: "repair" | "variant",
+    input: WorkflowCheckpointSuccessorRequest,
+    intentId: string,
+    successorLaneId: string,
+    successorSemanticKey: string,
+  ): WorkflowCheckpointSuccessorResult | null {
+    const existing = this.getEventByIdempotencyKey(input.sessionId, `checkpoint-successor:${intentId}:intent`);
+    if (!existing) return null;
+    if (
+      (kind === "repair" && existing.kind !== "workflow.node.repair_requested") ||
+      (kind === "variant" && existing.kind !== "workflow.node.variant_requested")
+    ) {
+      throw new Error(`${kind} idempotent retry conflicts with an existing successor intent kind.`);
+    }
+    const existingSuccessorLaneId = optionalText(existing.payload.successorLaneId);
+    const existingSuccessorSemanticKey = optionalText(existing.payload.successorSemanticKey);
+    const existingCheckpointId = optionalText(existing.payload.checkpointId);
+    const existingLaneId = optionalText(existing.payload.laneId);
+    const existingInstruction = optionalText(existing.payload.instruction);
+    if (
+      existingSuccessorLaneId !== successorLaneId ||
+      existingSuccessorSemanticKey !== successorSemanticKey ||
+      existingCheckpointId !== input.checkpointId ||
+      existingLaneId !== (input.laneId ?? existingLaneId) ||
+      existingInstruction !== (input.instruction ?? existingInstruction)
+    ) {
+      throw new Error(`${kind} idempotent retry conflicts with existing successor identity.`);
+    }
+    const laneEvent = this.getEventByIdempotencyKey(input.sessionId, `checkpoint-successor:${intentId}:lane`);
+    if (!laneEvent || laneEvent.kind !== "workflow.lane.declared") {
+      throw new Error(`${kind} idempotent retry conflicts with missing existing successor lane.`);
+    }
+    const edgePrefix = `checkpoint-successor:${intentId}:edge:`;
+    const edgeSuffix = `:${successorLaneId}`;
+    const edgeEvents = this.listEvents(input.sessionId).filter((event) =>
+      event.kind === "workflow.edge.declared" &&
+      typeof event.idempotencyKey === "string" &&
+      event.idempotencyKey.startsWith(edgePrefix) &&
+      event.idempotencyKey.endsWith(edgeSuffix)
+    );
+    return {
+      status: "requested",
+      event: existing,
+      laneEvent,
+      edgeEvents,
+      projection: this.materializeFlowProjection(input.sessionId),
+    };
+  }
+
+  private assertCheckpointSuccessorIdentityAvailable(
+    kind: "repair" | "variant",
+    prepared: PreparedCheckpointSuccessorRequest,
+  ): void {
+    const { projection, lane, targetLaneId, successorLaneId, successorSemanticKey, intentId } = prepared;
+    if (successorLaneId === targetLaneId) {
+      throw new Error(`${kind} successor lane id must not match the source lane.`);
+    }
+    if (successorSemanticKey === lane.semanticKey) {
+      throw new Error(`${kind} successor semantic key must not match the source lane semantic key.`);
+    }
+    const laneIdConflict = projection.lanes.find((item) => item.id === successorLaneId);
+    if (laneIdConflict) throw new Error(`${kind} successor lane id already exists in this session.`);
+    const semanticKeyConflict = projection.lanes.find((item) => item.semanticKey === successorSemanticKey);
+    if (semanticKeyConflict) throw new Error(`${kind} successor semantic key already exists in this session.`);
+    const intentConflict = projection.checkpointIntents.find((item) =>
+      item.intentId !== intentId &&
+      (item.successorLaneId === successorLaneId || item.successorSemanticKey === successorSemanticKey)
+    );
+    if (intentConflict?.successorLaneId === successorLaneId) {
+      throw new Error(`${kind} successor lane id already belongs to another checkpoint intent.`);
+    }
+    if (intentConflict?.successorSemanticKey === successorSemanticKey) {
+      throw new Error(`${kind} successor semantic key already belongs to another checkpoint intent.`);
+    }
+  }
+
+  private requireKnownSession(sessionId: string): WorkflowSessionRecord {
+    const session = this.getWorkflowSession(sessionId);
+    if (!session) throw new Error(`Workflow session is not known: ${sessionId}.`);
+    return session;
   }
 
   private createWorkflowCard(
@@ -1586,7 +1936,8 @@ function flowLaneToCanvasNode(
 ): CanvasNode {
   const latestSegment = [...projection.segments].reverse().find((segment) => segment.laneId === lane.id);
   const createdWorktree = worktreeForParentLane(projection, lane.id);
-  const status = flowLaneStatusToNodeStatus(lane.status);
+  const statusProjection = nodeStatusProjectionForFlowLane(lane);
+  const status = statusProjection.status;
   return {
     id: lane.id,
     title: lane.title,
@@ -1609,6 +1960,7 @@ function flowLaneToCanvasNode(
       semanticKey: lane.semanticKey,
     },
     status,
+    ...(statusProjection.rollbackStatus ? { rollbackStatus: statusProjection.rollbackStatus } : {}),
     position: { x: 460 + ((index - 1) % 3) * 340, y: 140 + Math.floor((index - 1) / 3) * 220 },
     runId: latestSegment?.runId ?? runIdForLane(session.id, lane.id),
     changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
@@ -1733,6 +2085,167 @@ function worktreeForParentLane(projection: FlowProjection, laneId: string): Work
   return projection.worktrees.find((worktree) => worktree.parentLaneId === laneId) ?? null;
 }
 
+function rollbackTargetLaneId(
+  projection: FlowProjection,
+  input: { laneId?: string; nodeId?: string; checkpointId?: string },
+): string | null {
+  if (input.laneId && projection.lanes.some((lane) => lane.id === input.laneId)) return input.laneId;
+  if (input.checkpointId) {
+    const checkpoint = projection.checkpoints.find((item) => item.id === input.checkpointId);
+    if (checkpoint?.laneId && projection.lanes.some((lane) => lane.id === checkpoint.laneId)) return checkpoint.laneId;
+  }
+  if (input.nodeId) {
+    const node = projection.projectionNodes.find((item) => item.id === input.nodeId || item.laneId === input.nodeId);
+    if (node?.laneId && projection.lanes.some((lane) => lane.id === node.laneId)) return node.laneId;
+    if (projection.lanes.some((lane) => lane.id === input.nodeId)) return input.nodeId;
+    const checkpoint = projection.checkpoints.find((item) => item.nodeId === input.nodeId);
+    if (checkpoint?.laneId && projection.lanes.some((lane) => lane.id === checkpoint.laneId)) return checkpoint.laneId;
+  }
+  return null;
+}
+
+function rollbackRequestId(input: WorkflowNodeRollbackInput, eligibility: WorkflowRollbackEligibility): string {
+  return `rollback:${input.sessionId}:${eligibility.targetLaneId}:${eligibility.checkpointId ?? "checkpoint"}:${input.now}`;
+}
+
+function rollbackEventPayload(
+  input: WorkflowNodeRollbackInput,
+  eligibility: WorkflowRollbackEligibility,
+  requestId: string,
+): Record<string, unknown> {
+  return {
+    requestId,
+    laneId: eligibility.targetLaneId,
+    ...(input.nodeId ?? eligibility.targetNodeId ? { nodeId: input.nodeId ?? eligibility.targetNodeId } : {}),
+    ...(eligibility.checkpointId ? { checkpointId: eligibility.checkpointId } : {}),
+    ...(typeof input.localRollbackSafe === "boolean" ? { localRollbackSafe: input.localRollbackSafe } : {}),
+  };
+}
+
+function rollbackBlockReason(
+  eligibility: WorkflowRollbackEligibility,
+  manualRepairRequired: boolean,
+): WorkflowRollbackBlockReason {
+  if (manualRepairRequired) {
+    return {
+      code: "manual_repair_required",
+      message: "Local rollback requires manual repair.",
+      affectedLaneIds: eligibility.affectedLaneIds,
+      manualRepairRequired: true,
+    };
+  }
+  if (eligibility.blockingRemoteSideEffects.length > 0) {
+    return {
+      code: "remote_side_effect",
+      message: "Rollback is blocked by remote side effects.",
+      eventKinds: uniqueStrings(eligibility.blockingRemoteSideEffects.map((effect) => effect.eventKind)),
+      remoteSideEffects: eligibility.blockingRemoteSideEffects,
+      affectedLaneIds: eligibility.affectedLaneIds,
+    };
+  }
+  if (eligibility.localRollbackSafe === false) {
+    return {
+      code: "manual_repair_required",
+      message: eligibility.reason ?? "Local rollback is not safe.",
+      affectedLaneIds: eligibility.affectedLaneIds,
+      manualRepairRequired: true,
+    };
+  }
+  return {
+    code: eligibility.affectedLaneIds.length === 0 ? "unknown_target" : "invalid_checkpoint",
+    message: eligibility.reason ?? "Rollback is not eligible.",
+    affectedLaneIds: eligibility.affectedLaneIds,
+  };
+}
+
+function prepareCheckpointSuccessorRequest(
+  kind: "repair" | "variant",
+  input: WorkflowCheckpointSuccessorRequest,
+  projection: FlowProjection,
+): PreparedCheckpointSuccessorRequest {
+  const checkpoint = projection.checkpoints.find((item) => item.id === input.checkpointId);
+  if (!checkpoint) throw new Error(`${kind} requires an existing checkpoint.`);
+  const targetLaneId = input.laneId ?? checkpoint.laneId;
+  if (!targetLaneId || checkpoint.laneId !== targetLaneId) {
+    throw new Error(`${kind} requires a matching checkpoint for the target lane.`);
+  }
+  if (input.nodeId && checkpoint.nodeId !== input.nodeId) {
+    throw new Error(`${kind} requires a matching checkpoint for the target node.`);
+  }
+  const requiredPhase = kind === "repair" ? "after" : "before";
+  if (!checkpointPhaseIsExplicit(projection, checkpoint)) {
+    throw new Error(`${kind} requires an explicit ${requiredPhase} checkpoint.`);
+  }
+  if (checkpoint.phase !== requiredPhase) throw new Error(`${kind} requires a ${requiredPhase} checkpoint.`);
+  const lane = projection.lanes.find((item) => item.id === targetLaneId);
+  if (!lane) throw new Error(`${kind} requires a known target lane.`);
+  const successorLaneId = input.successorLaneId ?? `${kind}-${targetLaneId}-${input.checkpointId}`;
+  const successorSemanticKey = input.successorSemanticKey ?? `${kind}:${targetLaneId}:${input.checkpointId}`;
+  const intentId = input.intentId ?? `${kind}:${successorLaneId}:${input.checkpointId}`;
+  return {
+    projection,
+    checkpoint,
+    targetLaneId,
+    lane,
+    successorLaneId,
+    successorSemanticKey,
+    intentId,
+    edgeSources: kind === "repair" ? [targetLaneId] : incomingLaneIds(projection, targetLaneId),
+  };
+}
+
+function checkpointPhaseIsExplicit(projection: FlowProjection, checkpoint: WorkflowNodeCheckpoint): boolean {
+  const authority = (checkpoint as { authority?: { phaseExplicit?: unknown } }).authority;
+  if (authority) return authority.phaseExplicit === true;
+  return projection.checkpointAuthorityFields[checkpoint.id]?.phase === true;
+}
+
+function successorLanePayload(
+  kind: "repair" | "variant",
+  lane: FlowLane,
+  successorLaneId: string,
+  successorSemanticKey: string,
+  title?: string,
+): Record<string, unknown> {
+  if (kind === "repair") {
+    return {
+      id: successorLaneId,
+      semanticKey: successorSemanticKey,
+      kind: "fix",
+      laneKind: "fix",
+      semanticSubtype: "repair",
+      title: title ?? `Repair ${lane.title}`,
+      agentKind: lane.agentKind,
+      status: "pending",
+      output: [],
+    };
+  }
+  return {
+    id: successorLaneId,
+    semanticKey: successorSemanticKey,
+    kind: lane.kind,
+    laneKind: lane.laneKind,
+    semanticSubtype: lane.semanticSubtype,
+    title: title ?? `Variant ${lane.title}`,
+    agentKind: lane.agentKind,
+    status: "pending",
+    fileScopes: lane.fileScopes,
+    packageScopes: lane.packageScopes,
+    requiredEvidence: lane.requiredEvidence,
+    output: [],
+  };
+}
+
+function incomingLaneIds(projection: FlowProjection, laneId: string): string[] {
+  return projection.edges
+    .filter((edge) => edge.targetLaneId === laneId)
+    .map((edge) => edge.sourceLaneId);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
 function worktreesByParentLaneId(worktrees: WorkflowWorktreeIdentity[]): Map<string, WorkflowWorktreeIdentity> {
   const byLaneId = new Map<string, WorkflowWorktreeIdentity>();
   for (const worktree of worktrees) byLaneId.set(worktree.parentLaneId, worktree);
@@ -1757,13 +2270,6 @@ function changesetsFromFlowEvents(events: WorkflowEventRecord[]): Map<string, st
     if (laneId && changesetId) changesets.set(laneId, changesetId);
   }
   return changesets;
-}
-
-function flowLaneStatusToNodeStatus(status: FlowLane["status"]): NodeStatus {
-  if (status === "completed") return "completed";
-  if (status === "failed" || status === "blocked") return "failed";
-  if (status === "running" || status === "waiting_input") return "running";
-  return "pending";
 }
 
 function progressForFlowLaneStatus(status: FlowLane["status"]): string {
@@ -2443,6 +2949,10 @@ function requireText(value: unknown, field: string): string {
     throw new Error(`Workflow card ${field} must be a non-empty string.`);
   }
   return value.trim();
+}
+
+function optionalText(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
 function requirePayloadText(value: Record<string, unknown>, field: string): string {

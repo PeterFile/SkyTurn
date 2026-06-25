@@ -557,6 +557,696 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("lists node checkpoints and applies rollback as replayable event cascade", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-review");
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+
+    const checkpoints = store.listNodeCheckpoints({
+      sessionId: "session-1",
+      nodeId: "lane-implementation",
+      runId: "run-session-1-lane-implementation",
+    });
+    const eligibility = store.getNodeRollbackEligibility({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      localRollbackSafe: true,
+    });
+    const applied = store.applyNodeRollback({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      requestId: "rollback-implementation",
+      localRollbackSafe: true,
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+    const canvas = store.materializeCanvasSession("session-1");
+    const rollbackAppliedEvents = store.listEvents("session-1").filter((event) => event.kind === "workflow.node.rollback_applied");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const replayed = reopened.materializeFlowProjection("session-1");
+
+    expect(checkpoints.map((checkpoint) => checkpoint.id)).toEqual(["checkpoint-before-implementation"]);
+    expect(eligibility).toMatchObject({
+      eligible: true,
+      checkpointId: "checkpoint-before-implementation",
+      restoreCommitRef: "base-sha",
+      affectedLaneIds: expect.arrayContaining(["lane-implementation", "lane-validation", "lane-review"]),
+      blockingRemoteSideEffects: [],
+    });
+    expect(applied).toMatchObject({
+      status: "applied",
+      event: expect.objectContaining({ kind: "workflow.node.rollback_applied" }),
+      eligibility: expect.objectContaining({ eligible: true }),
+    });
+    expect(rollbackAppliedEvents).toHaveLength(1);
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({ rollbackStatus: "rolled_back" });
+    expect(projection.lanes.find((lane) => lane.id === "lane-validation")).toMatchObject({ rollbackStatus: "inactive" });
+    expect(projection.lanes.find((lane) => lane.id === "lane-review")).toMatchObject({ rollbackStatus: "inactive" });
+    expect(canvas?.nodes.find((node) => node.id === "lane-implementation")).toMatchObject({ status: "failed", rollbackStatus: "rolled_back" });
+    expect(canvas?.nodes.find((node) => node.id === "lane-validation")).toMatchObject({ status: "failed", rollbackStatus: "inactive" });
+    expect(canvas?.nodes.find((node) => node.id === "lane-review")).toMatchObject({ status: "failed", rollbackStatus: "inactive" });
+    expect(replayed).toEqual(projection);
+    reopened.close();
+  });
+
+  it("replays crash-window rollback recovery from requested to applied", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const restoreCommitRef = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-review");
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", restoreCommitRef);
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.node.rollback_requested",
+      source: "electron-main",
+      laneId: "lane-implementation",
+      idempotencyKey: "rollback:rollback-implementation:requested",
+      payload: {
+        requestId: "rollback-implementation",
+        laneId: "lane-implementation",
+        checkpointId: "checkpoint-before-implementation",
+        localRollbackSafe: true,
+        restoreCommitRef,
+      },
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.node.rollback_applied",
+      source: "electron-main",
+      laneId: "lane-implementation",
+      idempotencyKey: "rollback:rollback-implementation:applied",
+      payload: {
+        requestId: "rollback-implementation",
+        laneId: "lane-implementation",
+        checkpointId: "checkpoint-before-implementation",
+        localRollbackSafe: true,
+        restoreCommitRef,
+        reason: "Rollback applied.",
+      },
+      now: "2026-06-14T00:00:21.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const replayed = reopened.materializeFlowProjection("session-1");
+
+    expect(projection.rollbackIntents).toEqual([
+      expect.objectContaining({
+        intentId: "rollback-implementation",
+        status: "applied",
+        checkpointId: "checkpoint-before-implementation",
+      }),
+    ]);
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({ rollbackStatus: "rolled_back" });
+    expect(projection.lanes.find((lane) => lane.id === "lane-validation")).toMatchObject({ rollbackStatus: "inactive" });
+    expect(projection.lanes.find((lane) => lane.id === "lane-review")).toMatchObject({ rollbackStatus: "inactive" });
+    expect(replayed).toEqual(projection);
+    reopened.close();
+  });
+
+  it("blocks rollback without mutating the ledger after pushed branch evidence", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.delivery.pushed",
+      source: "test",
+      laneId: "lane-implementation",
+      idempotencyKey: "delivery:pushed:rollback-block",
+      payload: {
+        laneId: "lane-implementation",
+        evidence: { remote: "origin", branch: "feature/slice-b", commitSha: "local-sha" },
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    const eventCountBefore = store.listEvents("session-1").length;
+
+    const blocked = store.applyNodeRollback({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      localRollbackSafe: true,
+      now: "2026-06-14T00:00:20.000Z",
+    });
+
+    expect(blocked).toMatchObject({
+      status: "blocked",
+      blockedReason: {
+        code: "remote_side_effect",
+        eventKinds: ["workflow.delivery.pushed"],
+      },
+      eligibility: {
+        eligible: false,
+        blockingRemoteSideEffects: [expect.objectContaining({ eventKind: "workflow.delivery.pushed" })],
+      },
+    });
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
+    expect(store.materializeFlowProjection("session-1").rollbackIntents).toEqual([]);
+    store.close();
+  });
+
+  it("blocks rollback without mutating the ledger after pull request creation evidence", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.pull_request.created",
+      source: "test",
+      laneId: "lane-implementation",
+      idempotencyKey: "pull-request:created:rollback-block",
+      payload: {
+        laneId: "lane-implementation",
+        evidence: { number: 42, url: "https://example.test/pr/42", head: "feature/slice-b", commitSha: "local-sha" },
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    const eventCountBefore = store.listEvents("session-1").length;
+
+    const blocked = store.applyNodeRollback({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      localRollbackSafe: true,
+      now: "2026-06-14T00:00:20.000Z",
+    });
+
+    expect(blocked).toMatchObject({
+      status: "blocked",
+      blockedReason: {
+        code: "remote_side_effect",
+        eventKinds: ["workflow.pull_request.created"],
+      },
+    });
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
+    store.close();
+  });
+
+  it.each([
+    "workflow.pull_request.merged",
+    "workflow.delivery.main_synced",
+  ] as const)("blocks rollback without mutating the ledger after %s evidence", async (kind) => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind,
+      source: "test",
+      laneId: "lane-implementation",
+      idempotencyKey: `${kind}:rollback-block`,
+      payload: {
+        laneId: "lane-implementation",
+        prNumber: 42,
+        headSha: "local-sha",
+        evidence: { number: 42, headSha: "local-sha", status: kind === "workflow.pull_request.merged" ? "merged" : "synced" },
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    const eventCountBefore = store.listEvents("session-1").length;
+
+    const blocked = store.applyNodeRollback({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      localRollbackSafe: true,
+      now: "2026-06-14T00:00:20.000Z",
+    });
+
+    expect(blocked).toMatchObject({
+      status: "blocked",
+      blockedReason: {
+        code: "remote_side_effect",
+        eventKinds: [kind],
+      },
+    });
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
+    store.close();
+  });
+
+  it("blocks rollback after restart while durable remote side-effect intent is unresolved", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.remote_side_effect.requested",
+      source: "electron-main",
+      laneId: "lane-implementation",
+      idempotencyKey: "remote-side-effect:push:requested",
+      payload: {
+        operationId: "remote-push-1",
+        eventKind: "workflow.delivery.pushed",
+        laneId: "lane-implementation",
+        affectedLaneIds: ["lane-implementation"],
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const eligibility = reopened.getNodeRollbackEligibility({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      localRollbackSafe: true,
+    });
+
+    expect(eligibility).toMatchObject({
+      eligible: false,
+      blockingRemoteSideEffects: [
+        expect.objectContaining({
+          eventKind: "workflow.delivery.pushed",
+          laneId: "lane-implementation",
+        }),
+      ],
+    });
+    reopened.close();
+  });
+
+  it.each([
+    ["workflow.delivery.pushed", false],
+    ["workflow.pull_request.created", false],
+    ["workflow.pull_request.merged", false],
+    ["workflow.delivery.main_synced", true],
+  ] as const)("replays ambiguous failed durable %s as a rollback blocker after restart", async (eventKind, sessionWide) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.remote_side_effect.requested",
+      source: "electron-main",
+      laneId: "lane-implementation",
+      idempotencyKey: `remote-side-effect:${eventKind}:requested`,
+      payload: {
+        operationId: `remote-side-effect-${eventKind}`,
+        eventKind,
+        laneId: "lane-implementation",
+        affectedLaneIds: ["lane-implementation"],
+        ...(sessionWide ? { sessionWide: true } : {}),
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.remote_side_effect.completed",
+      source: "electron-main",
+      laneId: "lane-implementation",
+      idempotencyKey: `remote-side-effect:${eventKind}:completed`,
+      payload: {
+        operationId: `remote-side-effect-${eventKind}`,
+        eventKind,
+        laneId: "lane-implementation",
+        affectedLaneIds: ["lane-implementation"],
+        ...(sessionWide ? { sessionWide: true } : {}),
+        status: "failed",
+        error: { message: "command failed after remote mutation was attempted" },
+      },
+      now: "2026-06-14T00:00:10.000Z",
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const eligibility = reopened.getNodeRollbackEligibility({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      localRollbackSafe: true,
+    });
+
+    expect(eligibility).toMatchObject({
+      eligible: false,
+      blockingRemoteSideEffects: [
+        expect.objectContaining({
+          eventKind,
+          ...(sessionWide ? { sessionWide: true } : { laneId: "lane-implementation" }),
+        }),
+      ],
+    });
+    reopened.close();
+  });
+
+  it("replays Electron main sync as a session-wide rollback blocker after restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:independent",
+      payload: {
+        lane: {
+          id: "lane-independent",
+          semanticKey: "lane-independent",
+          kind: "implementation",
+          title: "Independent lane",
+          agentKind: "codex",
+          status: "completed",
+        },
+      },
+      now: "2026-06-14T00:00:08.500Z",
+    });
+    recordCheckpoint(store, "checkpoint-before-independent", "lane-independent", "before", "base-sha");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.delivery.main_synced",
+      source: "electron-main",
+      laneId: "lane-review",
+      idempotencyKey: "delivery-main-synced:session-wide",
+      payload: {
+        sessionWide: true,
+        laneId: "lane-review",
+        prNumber: 42,
+        headSha: "main-sha",
+        evidence: { status: "synced", mainBranch: "main", remote: "origin" },
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const eligibility = reopened.getNodeRollbackEligibility({
+      sessionId: "session-1",
+      laneId: "lane-independent",
+      checkpointId: "checkpoint-before-independent",
+      localRollbackSafe: true,
+    });
+
+    expect(eligibility).toMatchObject({
+      eligible: false,
+      blockingRemoteSideEffects: [
+        expect.objectContaining({
+          eventKind: "workflow.delivery.main_synced",
+          sessionWide: true,
+        }),
+      ],
+    });
+    reopened.close();
+  });
+
+  it("appends durable repair intent and repair lane from an after checkpoint", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
+
+    const repair = store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      successorLaneId: "lane-implementation-repair",
+      successorSemanticKey: "repair:lane-implementation:manual",
+      instruction: "Fix the failing review notes.",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+
+    expect(repair).toMatchObject({
+      status: "requested",
+      event: expect.objectContaining({ kind: "workflow.node.repair_requested" }),
+    });
+    expect(repair.event.payload).toMatchObject({ instruction: "Fix the failing review notes." });
+    expect(projection.checkpointIntents).toContainEqual(expect.objectContaining({
+      kind: "repair",
+      status: "requested",
+      checkpointId: "checkpoint-after-implementation",
+      successorLaneId: "lane-implementation-repair",
+      instruction: "Fix the failing review notes.",
+    }));
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation-repair")).toMatchObject({
+      laneKind: "fix",
+      semanticSubtype: "repair",
+      runtimePolicy: { sandbox: "workspace-write" },
+    });
+    expect(projection.edges).toContainEqual(expect.objectContaining({
+      sourceLaneId: "lane-implementation",
+      targetLaneId: "lane-implementation-repair",
+    }));
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(projection);
+    reopened.close();
+  });
+
+  it("rejects conflicting idempotent repair retries before adding successor edges", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
+    store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "repair-intent-1",
+      successorLaneId: "lane-implementation-repair-a",
+      successorSemanticKey: "repair:lane-implementation:a",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const eventCountBefore = store.listEvents("session-1").length;
+
+    expect(() => store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "repair-intent-1",
+      successorLaneId: "lane-implementation-repair-b",
+      successorSemanticKey: "repair:lane-implementation:b",
+      now: "2026-06-14T00:00:21.000Z",
+    })).toThrow(/idempotent.*successor/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
+    expect(store.materializeFlowProjection("session-1").edges).not.toContainEqual(expect.objectContaining({
+      targetLaneId: "lane-implementation-repair-b",
+    }));
+    store.close();
+  });
+
+  it("rejects conflicting idempotent variant retries before adding successor edges", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      intentId: "variant-intent-1",
+      successorLaneId: "lane-implementation-variant-a",
+      successorSemanticKey: "variant:lane-implementation:a",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const eventCountBefore = store.listEvents("session-1").length;
+
+    expect(() => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      intentId: "variant-intent-1",
+      successorLaneId: "lane-implementation-variant-b",
+      successorSemanticKey: "variant:lane-implementation:b",
+      now: "2026-06-14T00:00:21.000Z",
+    })).toThrow(/idempotent.*successor/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
+    expect(store.materializeFlowProjection("session-1").edges).not.toContainEqual(expect.objectContaining({
+      targetLaneId: "lane-implementation-variant-b",
+    }));
+    store.close();
+  });
+
+  it("rejects implicit checkpoint phases for repair and variant without writing successor events", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordDefaultedCheckpoint(store, "checkpoint-defaulted-implementation", "lane-implementation");
+    const eventCountBeforeRepair = store.listEvents("session-1").length;
+
+    expect(() => store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-defaulted-implementation",
+      successorLaneId: "lane-implementation-repair-defaulted",
+      successorSemanticKey: "repair:lane-implementation:defaulted",
+      now: "2026-06-14T00:00:20.000Z",
+    })).toThrow(/explicit.*after checkpoint/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBeforeRepair);
+
+    const eventCountBeforeVariant = store.listEvents("session-1").length;
+    expect(() => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-defaulted-implementation",
+      successorLaneId: "lane-implementation-variant-defaulted",
+      successorSemanticKey: "variant:lane-implementation:defaulted",
+      now: "2026-06-14T00:00:21.000Z",
+    })).toThrow(/explicit.*before checkpoint/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBeforeVariant);
+    expect(store.materializeFlowProjection("session-1").lanes).not.toContainEqual(expect.objectContaining({
+      id: "lane-implementation-variant-defaulted",
+    }));
+    store.close();
+  });
+
+  it("rejects colliding successor lane identities before writing successor events", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    const validationLane = store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-validation");
+    expect(validationLane).toBeDefined();
+    const eventCountBeforeLaneIdConflict = store.listEvents("session-1").length;
+
+    expect(() => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      successorLaneId: "lane-validation",
+      successorSemanticKey: "variant:lane-implementation:lane-conflict",
+      now: "2026-06-14T00:00:20.000Z",
+    })).toThrow(/successor lane id/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBeforeLaneIdConflict);
+
+    const eventCountBeforeSemanticConflict = store.listEvents("session-1").length;
+    expect(() => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      successorLaneId: "lane-implementation-variant-semantic-conflict",
+      successorSemanticKey: validationLane!.semanticKey,
+      now: "2026-06-14T00:00:21.000Z",
+    })).toThrow(/successor semantic key/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBeforeSemanticConflict);
+
+    const implementationLane = store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation");
+    expect(implementationLane).toBeDefined();
+    const eventCountBeforeSelfLoop = store.listEvents("session-1").length;
+    expect(() => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      successorLaneId: "lane-implementation",
+      successorSemanticKey: implementationLane!.semanticKey,
+      now: "2026-06-14T00:00:22.000Z",
+    })).toThrow(/successor.*source lane/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBeforeSelfLoop);
+    store.close();
+  });
+
+  it("appends durable variant intent and variant lane with the selected node upstream dependencies", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    const upstreamBefore = store
+      .materializeFlowProjection("session-1")
+      .edges.filter((edge) => edge.targetLaneId === "lane-implementation")
+      .map((edge) => edge.sourceLaneId);
+
+    const variant = store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      successorLaneId: "lane-implementation-variant",
+      successorSemanticKey: "variant:lane-implementation:manual",
+      instruction: "Try a simpler implementation path.",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const variantIncoming = projection.edges
+      .filter((edge) => edge.targetLaneId === "lane-implementation-variant")
+      .map((edge) => edge.sourceLaneId);
+
+    expect(variant).toMatchObject({
+      status: "requested",
+      event: expect.objectContaining({ kind: "workflow.node.variant_requested" }),
+    });
+    expect(variant.event.payload).toMatchObject({ instruction: "Try a simpler implementation path." });
+    expect(projection.checkpointIntents).toContainEqual(expect.objectContaining({
+      kind: "variant",
+      status: "requested",
+      checkpointId: "checkpoint-before-implementation",
+      successorLaneId: "lane-implementation-variant",
+      instruction: "Try a simpler implementation path.",
+    }));
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")).toBeDefined();
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation-variant")).toMatchObject({
+      laneKind: "implementation",
+      semanticKey: "variant:lane-implementation:manual",
+    });
+    expect(variantIncoming).toEqual(upstreamBefore);
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(projection);
+    reopened.close();
+  });
+
+  it("does not append successor edges when an idempotent variant retry sees incoming-edge drift", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    const variant = store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      intentId: "variant-intent-1",
+      successorLaneId: "lane-implementation-variant",
+      successorSemanticKey: "variant:lane-implementation:manual",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.edge.declared",
+      source: "test",
+      idempotencyKey: "edge-drift-validation-to-implementation",
+      payload: {
+        edge: {
+          id: "edge-validation-implementation-drift",
+          sourceLaneId: "lane-validation",
+          targetLaneId: "lane-implementation",
+        },
+      },
+      now: "2026-06-14T00:00:21.000Z",
+    });
+    const eventCountBeforeRetry = store.listEvents("session-1").length;
+    const edgesBeforeRetry = store.materializeFlowProjection("session-1").edges;
+
+    const retry = store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      intentId: "variant-intent-1",
+      successorLaneId: "lane-implementation-variant",
+      successorSemanticKey: "variant:lane-implementation:manual",
+      now: "2026-06-14T00:00:22.000Z",
+    });
+
+    expect(retry.event.id).toBe(variant.event.id);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBeforeRetry);
+    expect(store.materializeFlowProjection("session-1").edges).toEqual(edgesBeforeRetry);
+    expect(store.materializeFlowProjection("session-1").edges).not.toContainEqual(expect.objectContaining({
+      sourceLaneId: "lane-validation",
+      targetLaneId: "lane-implementation-variant",
+    }));
+    store.close();
+  });
+
   it("replays worktree cleanup failures through the Flow Kernel projection", async () => {
     const store = await makeSeededStore();
     const event = store.appendWorkflowEvent({
@@ -1225,6 +1915,71 @@ function runResultInput(
     } satisfies RunEvidence,
     now,
   };
+}
+
+function recordCheckpoint(
+  store: ReturnType<typeof createWorkflowStore>,
+  checkpointId: string,
+  laneId: string,
+  phase: "before" | "after",
+  headCommit: string,
+): void {
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.node.checkpoint_recorded",
+    source: "test",
+    laneId,
+    idempotencyKey: `checkpoint:${checkpointId}`,
+    payload: {
+      checkpoint: {
+        id: checkpointId,
+        sessionId: "session-1",
+        nodeId: laneId,
+        laneId,
+        runId: `run-session-1-${laneId}`,
+        segmentId: `segment-session-1-${laneId}`,
+        phase,
+        executionTarget: "current_branch",
+        baseCommit: "base-sha",
+        headCommit,
+        createdAt: "2026-06-14T00:00:08.000Z",
+        source: "backend",
+        evidenceRefs: [{ kind: "run", id: `run-session-1-${laneId}` }],
+      },
+    },
+    now: "2026-06-14T00:00:08.000Z",
+  });
+}
+
+function recordDefaultedCheckpoint(
+  store: ReturnType<typeof createWorkflowStore>,
+  checkpointId: string,
+  laneId: string,
+): void {
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.node.checkpoint_recorded",
+    source: "test",
+    laneId,
+    idempotencyKey: `checkpoint:${checkpointId}`,
+    payload: {
+      checkpoint: {
+        id: checkpointId,
+        sessionId: "session-1",
+        nodeId: laneId,
+        laneId,
+        runId: `run-session-1-${laneId}`,
+        segmentId: `segment-session-1-${laneId}`,
+        executionTarget: "current_branch",
+        baseCommit: "base-sha",
+        headCommit: "head-sha",
+        createdAt: "2026-06-14T00:00:08.000Z",
+        source: "backend",
+        evidenceRefs: [{ kind: "run", id: `run-session-1-${laneId}` }],
+      },
+    },
+    now: "2026-06-14T00:00:08.000Z",
+  });
 }
 
 function declareCompletedPlanningLane(store: ReturnType<typeof createWorkflowStore>): void {

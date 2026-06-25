@@ -83,6 +83,7 @@ import {
   type FinalChangesetReconciliation,
   type ImportedProject,
   type NodeModalTab,
+  type NodeRollbackStatus,
   type NodeRuntimeState,
   type NodeStatus,
   type PlanSession,
@@ -152,12 +153,17 @@ import {
   startBridgeRun,
 } from "./workflowRuntime.js";
 import { addRequirementPlanningNode } from "./composer.js";
+import {
+  buildSelectedNodeActionState,
+  type SelectedNodeActionState,
+} from "./nodeActionState.js";
 
 gsap.registerPlugin(useGSAP);
 
 type AgentFlowNode = FlowNode<{
   node: CanvasNode;
-  onOpen: (nodeId: string) => void;
+  onInspect: (nodeId: string) => void;
+  onSelect: (nodeId: string) => void;
 }, "agent">;
 
 interface AgentEdgeData extends Record<string, unknown> {
@@ -189,8 +195,14 @@ export default function App() {
   const [newTaskMode, setNewTaskMode] = useState<WorkflowMode>("fast");
   const [newTaskProjectId, setNewTaskProjectId] = useState<string | null>(null);
   const [bottomGoal, setBottomGoal] = useState("");
+  const [nodeActionText, setNodeActionText] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
+  const [selectedNodeActionState, setSelectedNodeActionState] = useState<SelectedNodeActionState | null>(null);
+  const [nodeActionBusy, setNodeActionBusy] = useState<Exclude<ComposerAction, null> | null>(null);
+  const [nodeActionError, setNodeActionError] = useState<string | null>(null);
+  const [nodeActionStatus, setNodeActionStatus] = useState<string | null>(null);
   const startedBridgeRuns = useRef(new Set<string>());
   const completedBridgeRunPersistenceClaims = useRef(new Set<string>());
   const workspaceRef = useRef(workspace);
@@ -203,6 +215,10 @@ export default function App() {
   const selectedNode =
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
+      : null;
+  const inspectedNode =
+    activeSession?.kind === "canvas"
+      ? activeSession.nodes.find((node: CanvasNode) => node.id === inspectedNodeId) ?? null
       : null;
   const resolvedNewTaskProjectId = resolveSessionProjectId(
     workspace.projects,
@@ -331,10 +347,68 @@ export default function App() {
     };
   }, [activeProject, selectedNode?.runId]);
 
-  const openSelectedNode = useCallback((nodeId: string) => {
-    setSelectedNodeId(nodeId);
-    setModalTab("Output");
-  }, []);
+  useEffect(() => {
+    setNodeActionText("");
+    setNodeActionError(null);
+    setNodeActionStatus(null);
+  }, [selectedNode?.id]);
+
+  useEffect(() => {
+    if (!activeProject || activeSession?.kind !== "canvas" || !selectedNode) {
+      setSelectedNodeActionState(null);
+      return;
+    }
+
+    const workflow = window.devflow?.workflow;
+    if (!workflow) {
+      setSelectedNodeActionState(buildSelectedNodeActionState({
+        sessionId: activeSession.id,
+        selectedNode,
+        projection: null,
+      }));
+      return;
+    }
+
+    let active = true;
+    const projectRoot = activeProject.rootPath;
+    const sessionId = activeSession.id;
+    void workflow.getProjection(projectRoot, sessionId).then(async (projectionResult) => {
+      const projectionState = buildSelectedNodeActionState({
+        sessionId,
+        selectedNode,
+        projection: projectionResult.projection,
+      });
+      const rollbackPayload = projectionState.rollbackPayload;
+      if (!rollbackPayload) {
+        if (active) setSelectedNodeActionState(projectionState);
+        return;
+      }
+      const eligibilityResult = await workflow.getRollbackEligibility(projectRoot, {
+        sessionId,
+        nodeId: selectedNode.id,
+        laneId: rollbackPayload.laneId,
+        checkpointId: rollbackPayload.checkpointId,
+      });
+      if (!active) return;
+      setSelectedNodeActionState(buildSelectedNodeActionState({
+        sessionId,
+        selectedNode,
+        projection: projectionResult.projection,
+        backendEligibility: eligibilityResult,
+      }));
+    }).catch(() => {
+      if (!active) return;
+      setSelectedNodeActionState(buildSelectedNodeActionState({
+        sessionId,
+        selectedNode,
+        projection: null,
+      }));
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [activeProject?.rootPath, activeSession?.id, activeSession?.kind, activeSession?.updatedAt, selectedNode]);
 
   const activeCanvasSessionId = activeSession?.kind === "canvas" ? activeSession.id : null;
   const updateActiveNodePositions = useCallback(
@@ -502,22 +576,125 @@ export default function App() {
     }));
   }
 
-  async function appendRequirementNode() {
-    if (!activeSession || activeSession.kind !== "canvas" || !bottomGoal.trim()) return;
+  async function appendRequirementNode(action?: ComposerAction) {
+    if (!activeSession || activeSession.kind !== "canvas") return;
+    const text = selectedNode ? nodeActionText.trim() : bottomGoal.trim();
+    if (!text) return;
+    if (selectedNode) {
+      await submitSelectedNodeAction(action, text);
+      return;
+    }
     if (window.devflow && activeProject) {
       await window.devflow.appendWorkflowUserInput(activeProject.rootPath, {
         sessionId: activeSession.id,
         inputId: `bottom-${Date.now()}`,
-        text: bottomGoal.trim(),
+        text,
         now: new Date().toISOString(),
       });
     }
-    const result = addRequirementPlanningNode(activeSession, bottomGoal, {
+    const result = addRequirementPlanningNode(activeSession, text, {
       now: new Date().toISOString(),
       projectName: activeProject?.name ?? "project",
     });
     updateCanvasSession(activeSession.id, () => result.session);
     setBottomGoal("");
+  }
+
+  async function submitSelectedNodeAction(action: ComposerAction | undefined, requestText: string) {
+    if (!activeProject || activeSession?.kind !== "canvas" || !selectedNode) return;
+    if (!action) {
+      setNodeActionError("Choose a node action before submitting.");
+      return;
+    }
+
+    const workflow = window.devflow?.workflow;
+    if (!workflow) {
+      setNodeActionError("Workflow backend unavailable.");
+      return;
+    }
+
+    const actionState = selectedNodeActionState;
+    const projectRoot = activeProject.rootPath;
+    setNodeActionBusy(action);
+    setNodeActionError(null);
+    setNodeActionStatus(null);
+
+    try {
+      if (action === "repair") {
+        if (!actionState?.repairPayload) {
+          setNodeActionError("Repair requires an after checkpoint.");
+          return;
+        }
+        const result = await workflow.requestRepair(projectRoot, {
+          ...actionState.repairPayload,
+          instruction: requestText,
+        });
+        applyWorkflowActionResult(result);
+        setNodeActionStatus("Repair lane requested.");
+        setNodeActionText("");
+        return;
+      }
+
+      if (action === "variant") {
+        if (!actionState?.variantPayload) {
+          setNodeActionError("Variant requires a before checkpoint.");
+          return;
+        }
+        const result = await workflow.requestVariant(projectRoot, {
+          ...actionState.variantPayload,
+          instruction: requestText,
+        });
+        applyWorkflowActionResult(result);
+        setNodeActionStatus("Variant lane requested.");
+        setNodeActionText("");
+        return;
+      }
+
+      if (!actionState?.rollbackPayload) {
+        setNodeActionError(selectedNodeActionAvailability(actionState, true).rollback.reason ?? "Rollback is not eligible.");
+        return;
+      }
+      const result = await workflow.applyRollback(projectRoot, {
+        ...actionState.rollbackPayload,
+        text: requestText,
+      });
+      const blockedMessage = rollbackBlockedMessage(result);
+      if (blockedMessage) {
+        setNodeActionError(blockedMessage);
+        await refreshWorkflowProjection();
+        return;
+      }
+      applyWorkflowActionResult(result);
+      setNodeActionStatus("Rollback affects selected and downstream workflow state, not evidence/history.");
+      setNodeActionText("");
+    } catch (error) {
+      setNodeActionError(actionFailureMessage(error, action));
+    } finally {
+      setNodeActionBusy(null);
+    }
+  }
+
+  function applyWorkflowActionResult(result: unknown) {
+    const canvasSession = canvasSessionFromWorkflowResult(result);
+    if (canvasSession) {
+      setWorkspace((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
+      }));
+      return;
+    }
+    void refreshWorkflowProjection();
+  }
+
+  async function refreshWorkflowProjection() {
+    if (!activeProject || activeSession?.kind !== "canvas" || !window.devflow?.workflow) return;
+    const result = await window.devflow.workflow.getProjection(activeProject.rootPath, activeSession.id);
+    if (!result.canvasSession) return;
+    const canvasSession = result.canvasSession;
+    setWorkspace((current) => ({
+      ...current,
+      sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
+    }));
   }
 
   function retryNode(nodeId: string) {
@@ -706,13 +883,27 @@ export default function App() {
           {activeSession?.kind === "canvas" && (
             <CanvasView
               session={activeSession}
-              composerValue={bottomGoal}
+              composerValue={selectedNode ? nodeActionText : bottomGoal}
               composerDisabled={false}
-              onComposerChange={setBottomGoal}
+              selectedNode={selectedNode}
+              selectedNodeActionState={selectedNodeActionState}
+              nodeActionBusy={nodeActionBusy}
+              nodeActionError={nodeActionError}
+              nodeActionStatus={nodeActionStatus}
+              workflowBackendAvailable={!!window.devflow?.workflow}
+              onComposerChange={selectedNode ? setNodeActionText : setBottomGoal}
               onComposerSubmit={appendRequirementNode}
               onComposerStop={stopActiveRun}
               onNodePositionsChange={updateActiveNodePositions}
-              onOpenNode={openSelectedNode}
+              onSelectNode={(nodeId) => {
+                setSelectedNodeId(nodeId);
+                setInspectedNodeId((current) => (current === nodeId ? current : null));
+              }}
+              onInspectNode={(nodeId) => {
+                setSelectedNodeId(nodeId);
+                setInspectedNodeId(nodeId);
+                setModalTab("Output");
+              }}
             />
           )}
           {!activeSession && (
@@ -730,23 +921,21 @@ export default function App() {
         </main>
       </div>
 
-      {selectedNode && activeSession?.kind === "canvas" && (
+      {inspectedNode && activeSession?.kind === "canvas" && (
         <NodeModal
-          node={selectedNode}
+          node={inspectedNode}
           projectRoot={activeProject.rootPath}
           session={activeSession}
-          runEvents={workspace.runEvents?.[selectedNode.runId] ?? []}
+          runEvents={workspace.runEvents?.[inspectedNode.runId] ?? []}
           tab={modalTab}
           onTab={setModalTab}
-          onClose={() => setSelectedNodeId(null)}
-	          onStop={() =>
-	            stopNodeRun(selectedNode)
-	          }
-          onRetry={() => retryNode(selectedNode.id)}
-          onReassign={() => reassignNode(selectedNode.id)}
-          onInsertBefore={() => insertBefore(selectedNode.id)}
-          onOpenEditor={(editor) => openEditor(editor, selectedNode)}
-          onDecisionAnswer={(option) => answerUserDecision(selectedNode.id, option)}
+          onClose={() => setInspectedNodeId(null)}
+          onStop={() => stopNodeRun(inspectedNode)}
+          onRetry={() => retryNode(inspectedNode.id)}
+          onReassign={() => reassignNode(inspectedNode.id)}
+          onInsertBefore={() => insertBefore(inspectedNode.id)}
+          onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
+          onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
         />
       )}
     </div>
@@ -993,6 +1182,64 @@ function ProjectStartPage({
       </div>
     </section>
   );
+}
+
+export type ComposerAction = "repair" | "variant" | "rollback" | null;
+
+export const REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE =
+  "This node or downstream has already pushed/created PR/merged. Use repair/revert PR flow instead.";
+
+interface NodeActionAvailability {
+  enabled: boolean;
+  reason: string | null;
+}
+
+export function selectedNodeActionAvailability(
+  state: SelectedNodeActionState | null,
+  workflowBackendAvailable: boolean,
+): {
+  repair: NodeActionAvailability;
+  variant: NodeActionAvailability;
+  rollback: NodeActionAvailability;
+} {
+  const unavailable = (reason: string): NodeActionAvailability => ({ enabled: false, reason });
+  if (!workflowBackendAvailable) {
+    const reason = "Workflow backend unavailable.";
+    return { repair: unavailable(reason), variant: unavailable(reason), rollback: unavailable(reason) };
+  }
+  if (!state) {
+    const reason = "Workflow checkpoint state unavailable.";
+    return { repair: unavailable(reason), variant: unavailable(reason), rollback: unavailable(reason) };
+  }
+
+  return {
+    repair: state.canCreateRepair && state.repairPayload
+      ? { enabled: true, reason: null }
+      : unavailable("Repair requires an after checkpoint."),
+    variant: state.canCreateVariant && state.variantPayload
+      ? { enabled: true, reason: null }
+      : unavailable("Variant requires a before checkpoint."),
+    rollback: rollbackActionAvailability(state),
+  };
+}
+
+function rollbackActionAvailability(state: SelectedNodeActionState): NodeActionAvailability {
+  if (state.blockedByRemoteSideEffect) {
+    return { enabled: false, reason: REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE };
+  }
+  if (state.canRollback && state.rollbackPayload) return { enabled: true, reason: null };
+  return { enabled: false, reason: state.blockedReasons[0] ?? "Rollback is not eligible." };
+}
+
+export function rollbackLabelForNode(node: { rollbackStatus?: NodeRollbackStatus | null }): string | null {
+  if (node.rollbackStatus === "rolled_back") return "Rolled back";
+  if (node.rollbackStatus === "inactive") return "Inactive";
+  if (node.rollbackStatus === "rejected") return "Rejected";
+  return null;
+}
+
+function rollbackStatusForNode(node: CanvasNode): NodeRollbackStatus | null {
+  return node.rollbackStatus ?? null;
 }
 
 export function deriveSessionTarget(executionTarget: "current_branch" | "new_worktree", selectedBranch: string): SessionTarget {
@@ -1251,20 +1498,34 @@ function CanvasView({
   session,
   composerValue,
   composerDisabled,
+  selectedNode,
+  selectedNodeActionState,
+  nodeActionBusy,
+  nodeActionError,
+  nodeActionStatus,
+  workflowBackendAvailable,
   onComposerChange,
   onComposerSubmit,
   onComposerStop,
   onNodePositionsChange,
-  onOpenNode,
+  onSelectNode,
+  onInspectNode,
 }: {
   session: CanvasSession;
   composerValue: string;
   composerDisabled: boolean;
+  selectedNode: CanvasNode | null;
+  selectedNodeActionState: SelectedNodeActionState | null;
+  nodeActionBusy: Exclude<ComposerAction, null> | null;
+  nodeActionError: string | null;
+  nodeActionStatus: string | null;
+  workflowBackendAvailable: boolean;
   onComposerChange: (value: string) => void;
-  onComposerSubmit: () => void;
+  onComposerSubmit: (action?: ComposerAction) => void;
   onComposerStop: () => void;
   onNodePositionsChange: (updates: CanvasNodePositionUpdate[]) => void;
-  onOpenNode: (nodeId: string) => void;
+  onSelectNode: (nodeId: string | null) => void;
+  onInspectNode: (nodeId: string) => void;
 }) {
   const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
   const autoFitCanvas = shouldAutoFitCanvas(session.nodes);
@@ -1277,12 +1538,13 @@ function CanvasView({
         type: "agent",
         position: node.position,
         draggable: true,
+        selected: node.id === selectedNode?.id,
         initialWidth: ENERGY_FRAME.width,
         initialHeight: ENERGY_FRAME.height,
         handles: agentNodeHandles(),
-        data: { node, onOpen: onOpenNode },
+        data: { node, onInspect: onInspectNode, onSelect: onSelectNode },
       })),
-    [onOpenNode, session.nodes],
+    [onInspectNode, onSelectNode, selectedNode?.id, session.nodes],
   );
   const edges = useMemo<AgentFlowEdge[]>(
     () =>
@@ -1330,6 +1592,10 @@ function CanvasView({
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         onNodesChange={handleNodesChange}
+        onSelectionChange={useCallback(({ nodes }: { nodes: FlowNode[] }) => {
+          const selected = nodes.find((n) => n.selected);
+          onSelectNode(selected ? selected.id : null);
+        }, [onSelectNode])}
         defaultViewport={{ x: 0, y: 0, zoom: CANVAS_NODE_LAYOUT.singleNodeZoom }}
         minZoom={0.22}
         maxZoom={1.35}
@@ -1345,6 +1611,12 @@ function CanvasView({
       <CanvasComposer
         value={composerValue}
         disabled={composerDisabled}
+        selectedNode={selectedNode}
+        selectedNodeActionState={selectedNodeActionState}
+        nodeActionBusy={nodeActionBusy}
+        nodeActionError={nodeActionError}
+        nodeActionStatus={nodeActionStatus}
+        workflowBackendAvailable={workflowBackendAvailable}
         onChange={onComposerChange}
         onSubmit={onComposerSubmit}
         onStop={onComposerStop}
@@ -1410,7 +1682,7 @@ function mergeFlowNodeState(current: AgentFlowNode[], next: AgentFlowNode[]): Ag
       dragging: existing.dragging,
       height: existing.height,
       measured: existing.measured,
-      selected: existing.selected,
+      selected: node.selected,
       width: existing.width,
     };
   });
@@ -1560,6 +1832,8 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   const footer = nodeFooterForNode(node, runtime);
   const summary = nodeSummaryForNode(node);
   const streamLine = streamingLogLineForNode(node, runtime);
+  const rollbackStatus = rollbackStatusForNode(node);
+  const rollbackLabel = rollbackLabelForNode(node);
   const eyebrow = nodeEyebrowForNode(node);
   const metadata = nodeMetadataForNode(node);
 
@@ -1843,18 +2117,15 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
     { dependencies: [selected], scope: rootRef, revertOnUpdate: true },
   );
 
-  function openFromKeyboard(event: KeyboardEvent<HTMLDivElement>) {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    data.onOpen(node.id);
-  }
+
 
   return (
     <div
       ref={rootRef}
-      className={`agent-node-shell ${node.status}${selected ? " selected" : ""}`}
+      className={`agent-node-shell ${node.status}${selected ? " selected" : ""}${rollbackStatus ? ` rollback-${rollbackStatus}` : ""}`}
       data-state={node.status}
       data-phase={runtime.phase}
+      data-rollback-status={rollbackStatus || undefined}
     >
       <div ref={handlesRef} className="agent-handles">
         <Handle id="target-left" type="target" position={Position.Left} className="node-handle target-left" />
@@ -1862,54 +2133,64 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
         <Handle id="source-right" type="source" position={Position.Right} className="node-handle source-right" />
         <Handle id="source-bottom" type="source" position={Position.Bottom} className="node-handle source-bottom" />
       </div>
-      <div
-        ref={cardRef}
-        className="agent-card"
-        role="button"
-        tabIndex={0}
-        aria-label={`${node.title}: ${agentIdentityForNode(node)}. ${footer.primary}${footer.secondary ? ` ${footer.secondary}` : ""}. ${summary}`}
-        title={nodeTooltipForNode(node, runtime)}
-        onClick={() => data.onOpen(node.id)}
-        onKeyDown={openFromKeyboard}
-      >
-        <span ref={markerRef} className="evidence-marker" aria-hidden="true">
-          {node.status === "completed" && <Eye size={19} strokeWidth={2.6} />}
-          {node.status === "failed" && <X size={20} strokeWidth={3} />}
-        </span>
-        <div className="agent-node-header">
-          <span className="agent-node-eyebrow">{eyebrow}</span>
-          <button
-            ref={menuRef}
-            className="agent-node-menu nodrag"
-            type="button"
-            aria-label={`Open actions for ${node.title}`}
-            onClick={(event) => event.stopPropagation()}
-          >
-            <MoreHorizontal size={16} aria-hidden="true" />
-          </button>
-        </div>
-        <span className="agent-node-title">{node.title}</span>
-        <div className="agent-node-meta-row">
-          <div className="agent-identity-pill">
-            <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
-            <span>{agentIdentityForNode(node)}</span>
+      <div ref={cardRef} className="agent-card" title={nodeTooltipForNode(node, runtime)}>
+        <div
+          className="agent-card-select"
+          role="button"
+          tabIndex={0}
+          aria-pressed={selected}
+          aria-label={`Select ${node.title}: ${agentIdentityForNode(node)}. ${footer.primary}${footer.secondary ? ` ${footer.secondary}` : ""}. ${summary}`}
+          onClick={() => data.onSelect(node.id)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              data.onSelect(node.id);
+            }
+          }}
+        >
+          <span ref={markerRef} className="evidence-marker" aria-hidden="true">
+            {node.status === "completed" && <Eye size={19} strokeWidth={2.6} />}
+            {node.status === "failed" && <X size={20} strokeWidth={3} />}
+          </span>
+          <div className="agent-node-header">
+            <span className="agent-node-eyebrow">{eyebrow}</span>
           </div>
-          <div className={`agent-status-chip ${node.status}`} aria-label="Node status summary">
-            {node.status === "completed" && <CheckCircle2 size={13} aria-hidden="true" />}
-            {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
-            <span>{footer.primary}</span>
+          <span className="agent-node-title">{node.title}</span>
+          <div className="agent-node-meta-row">
+            <div className="agent-identity-pill">
+              <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
+              <span>{agentIdentityForNode(node)}</span>
+            </div>
+            <div className={`agent-status-chip ${node.status}`} aria-label="Node status summary">
+              {node.status === "completed" && <CheckCircle2 size={13} aria-hidden="true" />}
+              {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
+              <span>{footer.primary}</span>
+            </div>
+            {rollbackLabel && <div className="rollback-badge">{rollbackLabel}</div>}
+          </div>
+          <AgentStreamPreview line={streamLine} nodeId={node.id} />
+          <div className={`agent-footer ${node.status}`} aria-label="Node metadata">
+            <span>{metadata}</span>
+            {footer.secondary && (
+              <>
+                <span className="footer-separator" aria-hidden="true">·</span>
+                <span>{footer.secondary}</span>
+              </>
+            )}
           </div>
         </div>
-        <AgentStreamPreview line={streamLine} nodeId={node.id} />
-        <div className={`agent-footer ${node.status}`} aria-label="Node metadata">
-          <span>{metadata}</span>
-          {footer.secondary && (
-            <>
-              <span className="footer-separator" aria-hidden="true">·</span>
-              <span>{footer.secondary}</span>
-            </>
-          )}
-        </div>
+        <button
+          ref={menuRef}
+          className="agent-node-menu nodrag"
+          type="button"
+          aria-label={`More details for ${node.title}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            data.onInspect(node.id);
+          }}
+        >
+          <MoreHorizontal size={16} aria-hidden="true" />
+        </button>
       </div>
     </div>
   );
@@ -4080,21 +4361,58 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
 function CanvasComposer({
   value,
   disabled,
+  selectedNode,
+  selectedNodeActionState,
+  nodeActionBusy,
+  nodeActionError,
+  nodeActionStatus,
+  workflowBackendAvailable,
   onChange,
   onSubmit,
   onStop,
 }: {
   value: string;
   disabled: boolean;
+  selectedNode: CanvasNode | null;
+  selectedNodeActionState: SelectedNodeActionState | null;
+  nodeActionBusy: Exclude<ComposerAction, null> | null;
+  nodeActionError: string | null;
+  nodeActionStatus: string | null;
+  workflowBackendAvailable: boolean;
   onChange: (value: string) => void;
-  onSubmit: () => void;
+  onSubmit: (action?: ComposerAction) => void;
   onStop: () => void;
 }) {
+  const [action, setAction] = useState<ComposerAction>(null);
+
+  useEffect(() => {
+    setAction(null);
+  }, [selectedNode?.id]);
+
+  let placeholder = "Insert requirement or node";
+  if (selectedNode) {
+    if (action === "repair") placeholder = "Tell the agent how to fix this node result…";
+    else if (action === "variant") placeholder = "Describe another attempt from the previous checkpoint…";
+    else if (action === "rollback") placeholder = "Confirm or explain why to rollback this node and downstream…";
+    else placeholder = "Choose an action to continue…";
+  }
+
+  const actionAvailability = selectedNodeActionAvailability(selectedNodeActionState, workflowBackendAvailable);
+  const displayedValue = value;
+  const hasValue = displayedValue.trim().length > 0;
+  const selectedActionAvailability = action ? actionAvailability[action] : null;
+  const canSubmit = selectedNode
+    ? hasValue && !!action && selectedActionAvailability?.enabled === true && nodeActionBusy === null
+    : hasValue;
+  const submitTitle = selectedNode
+    ? selectedActionAvailability?.reason ?? "Submit node action"
+    : "Submit";
+
   const inputRef = useRef<HTMLInputElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
-  const hasValue = value.trim().length > 0;
+
   const handleSubmit = useCallback(() => {
-    if (disabled || !hasValue) return;
+    if (disabled || !canSubmit) return;
 
     const composer = composerRef.current;
     if (composer && !userPrefersReducedMotion()) {
@@ -4105,8 +4423,8 @@ function CanvasComposer({
         .to(composer, { "--intake-scale-x": 1, "--intake-scale-y": 1, duration: 0.16, ease: "power2.out" }, 0.08);
     }
 
-    onSubmit();
-  }, [disabled, hasValue, onSubmit]);
+    onSubmit(action);
+  }, [disabled, canSubmit, action, onSubmit]);
 
   useGSAP(
     () => {
@@ -4129,17 +4447,64 @@ function CanvasComposer({
       className={hasValue ? "canvas-composer-shell nodrag nopan has-content" : "canvas-composer-shell nodrag nopan"}
       onPointerDown={(event) => event.stopPropagation()}
     >
+      {selectedNode && (
+        <div className="composer-context-pill">
+          <span className="pill-title">{selectedNode.title}</span>
+          <span className="pill-meta">{selectedNode.agent} · {selectedNode.status}</span>
+        </div>
+      )}
+      {selectedNode && (
+        <div className="composer-actions">
+          <button
+            type="button"
+            className={`action-chip ${action === "repair" ? "selected" : ""}`}
+            onClick={() => setAction("repair")}
+            aria-pressed={action === "repair"}
+            disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
+            title={actionAvailability.repair.reason ?? "Repair this node"}
+          >
+            Repair this node
+          </button>
+          <button
+            type="button"
+            className={`action-chip ${action === "variant" ? "selected" : ""}`}
+            onClick={() => setAction("variant")}
+            aria-pressed={action === "variant"}
+            disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
+            title={actionAvailability.variant.reason ?? "Try another version"}
+          >
+            Try another version
+          </button>
+          <button
+            type="button"
+            className={`action-chip ${action === "rollback" ? "selected" : ""}`}
+            onClick={() => setAction("rollback")}
+            aria-pressed={action === "rollback"}
+            disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
+            title={actionAvailability.rollback.reason ?? "Rollback node and downstream"}
+          >
+            Rollback node and downstream
+          </button>
+        </div>
+      )}
+      {selectedNode && (
+        <p className={nodeActionError ? "composer-action-message error" : "composer-action-message"}>
+          {nodeActionError ?? nodeActionStatus ?? actionAvailability.rollback.reason ?? "Rollback affects selected and downstream workflow state, not evidence/history."}
+        </p>
+      )}
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
         <input
           className="canvas-composer-input"
           ref={inputRef}
-          value={value}
-          disabled={disabled}
-          onChange={(event) => onChange(event.target.value)}
-          placeholder="Insert requirement or node"
-          aria-label="Insert requirement or node"
+          value={displayedValue}
+          disabled={disabled || nodeActionBusy !== null}
+          onChange={(event) => {
+            onChange(event.target.value);
+          }}
+          placeholder={placeholder}
+          aria-label={placeholder}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && hasValue) {
+            if (event.key === "Enter" && canSubmit) {
               event.preventDefault();
               handleSubmit();
             }
@@ -4168,10 +4533,10 @@ function CanvasComposer({
           </button>
           <button
             className="icon-button composer-send"
-            title="Insert requirement"
-            aria-label="Insert requirement"
+            title={submitTitle}
+            aria-label={submitTitle}
             onClick={handleSubmit}
-            disabled={disabled || !hasValue}
+            disabled={disabled || !canSubmit}
           >
             <ArrowUp size={18} />
           </button>
@@ -4380,6 +4745,28 @@ function canvasSessionFromWorkflowEvent(event: unknown): CanvasSession | null {
   if (!event || typeof event !== "object") return null;
   const canvasSession = (event as { canvasSession?: unknown }).canvasSession;
   return isCanvasSession(canvasSession) ? canvasSession : null;
+}
+
+function canvasSessionFromWorkflowResult(result: unknown): CanvasSession | null {
+  if (!isRecord(result)) return null;
+  return isCanvasSession(result.canvasSession) ? result.canvasSession : null;
+}
+
+function rollbackBlockedMessage(result: unknown): string | null {
+  if (!isRecord(result) || result.status !== "blocked") return null;
+  const blockedReason = isRecord(result.blockedReason) ? result.blockedReason : null;
+  const remoteSideEffects = Array.isArray(blockedReason?.remoteSideEffects)
+    ? blockedReason.remoteSideEffects
+    : [];
+  if (remoteSideEffects.length > 0) return REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE;
+  const message = optionalText(blockedReason?.message) ?? optionalText(result.reason);
+  return message ?? "Rollback was blocked.";
+}
+
+function actionFailureMessage(error: unknown, action: Exclude<ComposerAction, null>): string {
+  const label = action === "rollback" ? "Rollback" : action === "repair" ? "Repair" : "Variant";
+  const message = error instanceof Error ? error.message : String(error);
+  return `${label} request failed: ${message}`;
 }
 
 function isCanvasSession(value: unknown): value is CanvasSession {

@@ -23,7 +23,10 @@
 - Codex cards represent executor tasks.
 - `runId` connects a card to a concrete local agent run.
 - Dependencies define both `@xyflow/react` edges and scheduling order.
+- Selecting a node must not open details. It only binds the bottom composer to node-scoped actions.
+- Node details open through the node card **More** button.
 - The node modal contains exactly three content tabs: `Output`, `Changes`, and `Context`.
+- Node-scoped actions use user-visible before/after checkpoints at node/run boundaries: repair from after checkpoint, variant from before checkpoint, and rollback selected node plus downstream.
 
 ## Canvas Requirements
 
@@ -59,6 +62,9 @@
 - Do not mark a task or node complete only because an agent says it is done.
 - Completion must be tied to run status, git changes, tests, or concrete verification evidence.
 - Node status must be derived from `RunEvidence`; Agent text claiming success is only output.
+- Rollback must retain evidence and history. Rolled-back or inactive nodes are not schedulable.
+- Push, PR creation, merge, and main sync block rollback. A local commit is not a remote side effect, but rollback across it requires exact commit evidence and an explicit safety gate.
+- Rollback must not automatically close PRs, delete remote branches, merge, sync main, or delete local branches.
 - Do not mark tasks complete without concrete verification.
 - Agent CLI adapters must emit terminal `RunEvidence` and `status` for timeout/cancel paths as well as normal process close; never leave a node running just because a child process failed to exit cleanly.
 - Use `pnpm --filter @skyturn/desktop run demo:mvp` to verify the real Hermes-to-Codex MVP loop; it requires local Hermes/Codex credentials and must not be replaced by mock-only evidence.

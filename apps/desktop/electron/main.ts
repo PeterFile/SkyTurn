@@ -143,6 +143,37 @@ interface WorkflowDeliverySyncMainInput {
   remote?: unknown;
 }
 
+interface WorkflowCheckpointInput {
+  sessionId?: unknown;
+  nodeId?: unknown;
+  laneId?: unknown;
+  runId?: unknown;
+  phase?: unknown;
+}
+
+interface WorkflowRollbackInput {
+  sessionId?: unknown;
+  nodeId?: unknown;
+  laneId?: unknown;
+  checkpointId?: unknown;
+  requestId?: unknown;
+  now?: unknown;
+}
+
+interface WorkflowCheckpointSuccessorInput {
+  sessionId?: unknown;
+  nodeId?: unknown;
+  laneId?: unknown;
+  checkpointId?: unknown;
+  intentId?: unknown;
+  successorLaneId?: unknown;
+  successorSemanticKey?: unknown;
+  title?: unknown;
+  instruction?: unknown;
+  text?: unknown;
+  now?: unknown;
+}
+
 interface FinalSessionTarget {
   executionTarget: "current_branch" | "new_worktree";
   selectedBranch: string;
@@ -179,17 +210,30 @@ interface WorkflowDeliveryFlowProjectionLike {
   lanes: Array<{
     id: string;
     laneKind?: string;
+    rollbackStatus?: string;
   }>;
   edges?: Array<{
     sourceLaneId?: string;
     targetLaneId?: string;
   }>;
+  laneRollbackStatuses?: Record<string, unknown>;
 }
 
 interface DeliveryCommitEvidenceLike {
   commitSha: string;
   branch: string;
   worktreePath: string;
+}
+
+interface RecordedRollbackHead {
+  commitSha: string;
+  branchName?: string;
+}
+
+interface DeliveryPushEvidenceLike {
+  remote: string;
+  branch: string;
+  commitSha: string;
 }
 
 interface DeliveryPullRequestEvidenceLike {
@@ -269,10 +313,110 @@ interface WorkflowVariantAdoptionLike {
   failureReason?: string;
 }
 
+interface LocalRollbackSafety {
+  status: "safe" | "manual_repair_required" | "not_required" | "already_restored";
+  reasonCode?: string;
+  message?: string;
+  worktreePath?: string;
+  restoreCommitRef?: string;
+  requestId?: string;
+  requestedEvent?: unknown;
+}
+
+interface WorkflowRollbackEligibilityLike {
+  eligible?: boolean;
+  targetLaneId?: string;
+  targetNodeId?: string;
+  checkpointId?: string;
+  restoreCommitRef?: string;
+  affectedLaneIds?: string[];
+  blockingRemoteSideEffects?: unknown[];
+  localRollbackSafe?: boolean;
+  reason?: string;
+}
+
+interface WorkflowRollbackResultLike {
+  status?: unknown;
+  event?: unknown;
+  requestedEvent?: unknown;
+  eligibility?: WorkflowRollbackEligibilityLike;
+  blockedReason?: unknown;
+  manualRepairRequired?: unknown;
+}
+
+interface WorkflowCheckpointSuccessorResultLike {
+  event?: unknown;
+  projection?: unknown;
+}
+
+type InFlightRemoteSideEffectKind =
+  | "workflow.delivery.pushed"
+  | "workflow.pull_request.created"
+  | "workflow.pull_request.merged"
+  | "workflow.delivery.main_synced";
+
+interface InFlightRemoteSideEffect {
+  eventKind: InFlightRemoteSideEffectKind;
+  eventId: string;
+  projectRoot: string;
+  sessionId: string;
+  laneId?: string;
+  affectedLaneIds?: string[];
+  sessionWide?: boolean;
+  createdAt: string;
+}
+
+interface DurableRemoteSideEffect {
+  operationId: string;
+  requestedEvent: unknown;
+  complete(status: "succeeded" | "failed", details?: Record<string, unknown>): unknown;
+  endInFlight(): void;
+}
+
+interface RemoteSideEffectOperation {
+  projectRoot: string;
+  sessionId: string;
+  eventKind: InFlightRemoteSideEffectKind;
+  operationKey: string;
+  laneId?: string;
+  affectedLaneIds?: string[];
+  sessionWide?: boolean;
+  details?: Record<string, unknown>;
+}
+
+interface UnresolvedRemoteSideEffectBlock {
+  requestedEvent: unknown;
+  operationId: string;
+  operationKey?: string;
+  eventKind: InFlightRemoteSideEffectKind;
+  laneId?: string;
+  affectedLaneIds?: string[];
+  sessionWide?: boolean;
+  createdAt?: string;
+}
+
+interface RollbackRequestedEventMatch {
+  requestId: string;
+  event: unknown;
+}
+
+interface RollbackRequestedEventValidation {
+  valid: boolean;
+  message?: string;
+}
+
+interface ManagedRollbackWorktree {
+  path: string;
+  branchName?: string;
+}
+
 const RUN_PROTOCOL_VERSION = 1;
 const openedProjectRoots = new Set<string>();
 let agentBridge: AgentBridgeHost | null = null;
 const workflowStores = new Map<string, WorkflowStoreHost>();
+const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
+const workflowSessionMutationLocks = new Map<string, Promise<void>>();
+let remoteSideEffectSequence = 0;
 
 interface AgentBridgeHost {
   discoverAgents(): Promise<unknown[]>;
@@ -296,6 +440,11 @@ interface WorkflowStoreHost {
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
+  listNodeCheckpoints(input: unknown): unknown[];
+  getNodeRollbackEligibility(input: unknown): WorkflowRollbackEligibilityLike;
+  applyNodeRollback(input: unknown): WorkflowRollbackResultLike;
+  requestNodeRepair(input: unknown): WorkflowCheckpointSuccessorResultLike;
+  requestNodeVariant(input: unknown): WorkflowCheckpointSuccessorResultLike;
   close(): void;
 }
 
@@ -616,6 +765,190 @@ ipcMain.handle("workflow:events", workflowHandler(async (projectRoot: string, se
   };
 }));
 
+ipcMain.handle("workflow:checkpoints", workflowHandler(async (projectRoot: string, input: WorkflowCheckpointInput) => {
+  assertKnownProjectRoot(projectRoot);
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Workflow checkpoint input must be an object.");
+  const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, sessionId);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    checkpoints: store.listNodeCheckpoints({
+      sessionId,
+      ...(optionalText(readField(input, "nodeId")) ? { nodeId: optionalText(readField(input, "nodeId")) } : {}),
+      ...(optionalText(readField(input, "laneId")) ? { laneId: optionalText(readField(input, "laneId")) } : {}),
+      ...(optionalText(readField(input, "runId")) ? { runId: optionalText(readField(input, "runId")) } : {}),
+      ...(readField(input, "phase") === "before" || readField(input, "phase") === "after" ? { phase: readField(input, "phase") } : {}),
+    }),
+  };
+}));
+
+ipcMain.handle("workflow:rollback:eligibility", workflowHandler(async (projectRoot: string, input: WorkflowRollbackInput) => {
+  assertKnownProjectRoot(projectRoot);
+  const normalized = normalizeWorkflowRollbackInput(input);
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, normalized.sessionId);
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  const eligibility = store.getNodeRollbackEligibility(normalized);
+  const inFlightBlocks = blockingInFlightRemoteSideEffects(workflowProjectRoot, normalized.sessionId, eligibility);
+  if (inFlightBlocks.length > 0) {
+    const blockedEligibility = rollbackEligibilityWithInFlightRemoteBlocks(eligibility, inFlightBlocks);
+    return {
+      protocolVersion: RUN_PROTOCOL_VERSION,
+      eligibility: blockedEligibility,
+      blockedReason: inFlightRemoteSideEffectBlockReason(blockedEligibility, inFlightBlocks),
+      manualRepairRequired: false,
+    };
+  }
+  const localSafety = await evaluateLocalRollbackSafetyForRollback(projectRoot, store, normalized, eligibility);
+  const manualRepairRequired = localSafety.status === "manual_repair_required";
+  const blockedReason = manualRepairRequired
+    ? localRollbackSafetyResult(localSafety)
+    : workflowRollbackBlockReason(eligibility);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    eligibility: manualRepairRequired ? { ...eligibility, eligible: false, localRollbackSafe: false, reason: localSafety.message } : eligibility,
+    blockedReason,
+    manualRepairRequired,
+  };
+}));
+
+ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: string, input: WorkflowRollbackInput) => {
+  assertKnownProjectRoot(projectRoot);
+  const normalized = normalizeWorkflowRollbackInput(input);
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, normalized.sessionId);
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  return await withWorkflowSessionMutationLock(workflowProjectRoot, normalized.sessionId, async () => {
+    const initialRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
+    if (initialRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, initialRemoteBlock.result);
+    const eligibility = initialRemoteBlock.eligibility;
+    const localSafety = await evaluateLocalRollbackSafetyForRollback(projectRoot, store, normalized, eligibility);
+    if (localSafety.status === "already_restored" && localSafety.requestId) {
+      const recoveryRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
+      if (recoveryRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, recoveryRemoteBlock.result);
+      const finalEligibility = recoveryRemoteBlock.eligibility;
+      const event = appendRollbackAppliedEvent(store, normalized, finalEligibility, localSafety.requestId);
+      broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+      return workflowRollbackResponse(store, normalized.sessionId, {
+        status: "applied",
+        event,
+        requestedEvent: localSafety.requestedEvent,
+        eligibility: finalEligibility,
+      });
+    }
+    if (localSafety.status === "manual_repair_required") {
+      const event = appendRollbackRejectedEvent(store, normalized, eligibility, localSafety);
+      broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+      return workflowRollbackResponse(store, normalized.sessionId, {
+        status: "blocked",
+        event,
+        eligibility: { ...eligibility, eligible: false, localRollbackSafe: false, reason: localSafety.message },
+        blockedReason: localRollbackSafetyResult(localSafety),
+        manualRepairRequired: true,
+      });
+    }
+    if (localSafety.status !== "safe" || !localSafety.worktreePath || !localSafety.restoreCommitRef) {
+      const result = store.applyNodeRollback(normalized);
+      return workflowRollbackResponse(store, normalized.sessionId, result);
+    }
+
+    const finalRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
+    if (finalRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, finalRemoteBlock.result);
+    const finalEligibility = finalRemoteBlock.eligibility;
+    const existingRollbackRequest = findMatchingRollbackRequestedEvent(store, normalized, finalEligibility, localSafety.restoreCommitRef);
+    const requested = existingRollbackRequest
+      ?? findRollbackRequestedEventByIdempotencyKey(store, normalized.sessionId, normalized.requestId ?? rollbackRequestIdForIpc(normalized, finalEligibility))
+      ?? appendRollbackRequestedEvent(store, normalized, finalEligibility);
+    const requestedValidation = validateRollbackRequestedEventForIpc(store, normalized, finalEligibility, localSafety.restoreCommitRef, requested);
+    if (!requestedValidation.valid) {
+      const message = requestedValidation.message ?? "Rollback request idempotency collision requires manual repair.";
+      const rejectedEvent = appendRollbackRejectedEvent(store, normalized, finalEligibility, {
+        status: "manual_repair_required",
+        reasonCode: "request_id_conflict",
+        message,
+      }, requested.requestId);
+      broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+      return workflowRollbackResponse(store, normalized.sessionId, {
+        status: "blocked",
+        event: rejectedEvent,
+        requestedEvent: requested.event,
+        eligibility: { ...finalEligibility, eligible: false, localRollbackSafe: false, reason: message },
+        blockedReason: {
+          code: "manual_repair_required",
+          message,
+          reasonCode: "request_id_conflict",
+          manualRepairRequired: true,
+        },
+        manualRepairRequired: true,
+      });
+    }
+    try {
+      await gitResetHard(localSafety.worktreePath, localSafety.restoreCommitRef);
+    } catch (error) {
+      const rejectedEvent = appendRollbackRejectedEvent(store, normalized, finalEligibility, {
+        status: "manual_repair_required",
+        reasonCode: "git_reset_failed",
+        message: sanitizeSnippet(error instanceof Error ? error.message : String(error)),
+      }, requested.requestId);
+      broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+      return workflowRollbackResponse(store, normalized.sessionId, {
+        status: "blocked",
+        event: rejectedEvent,
+        requestedEvent: requested.event,
+        eligibility: { ...finalEligibility, eligible: false, localRollbackSafe: false, reason: "Git reset failed; manual repair is required." },
+        blockedReason: {
+          code: "manual_repair_required",
+          message: "Git reset failed; manual repair is required.",
+          reasonCode: "git_reset_failed",
+          manualRepairRequired: true,
+        },
+        manualRepairRequired: true,
+      });
+    }
+    const event = appendRollbackAppliedEvent(store, normalized, finalEligibility, requested.requestId);
+    broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+    return workflowRollbackResponse(store, normalized.sessionId, {
+      status: "applied",
+      event,
+      requestedEvent: requested.event,
+      eligibility: finalEligibility,
+    });
+  });
+}));
+
+ipcMain.handle("workflow:repair:create", workflowHandler(async (projectRoot: string, input: WorkflowCheckpointSuccessorInput) => {
+  assertKnownProjectRoot(projectRoot);
+  const normalized = normalizeCheckpointSuccessorInput(input);
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, normalized.sessionId);
+  const result = store.requestNodeRepair(normalized);
+  broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    status: "requested",
+    event: result.event,
+    projection: result.projection,
+    canvasSession: store.materializeCanvasSession(normalized.sessionId),
+  };
+}));
+
+ipcMain.handle("workflow:variant:create", workflowHandler(async (projectRoot: string, input: WorkflowCheckpointSuccessorInput) => {
+  assertKnownProjectRoot(projectRoot);
+  const normalized = normalizeCheckpointSuccessorInput(input);
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, normalized.sessionId);
+  const result = store.requestNodeVariant(normalized);
+  broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    status: "requested",
+    event: result.event,
+    projection: result.projection,
+    canvasSession: store.materializeCanvasSession(normalized.sessionId),
+  };
+}));
+
 ipcMain.handle("workflow:userDecision:answer", workflowHandler(async (projectRoot: string, input: unknown) => {
   assertKnownProjectRoot(projectRoot);
   const sessionId = requireText(readField(input, "sessionId"), "workflow session id");
@@ -824,167 +1157,237 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
   assertKnownProjectRoot(projectRoot);
   if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Delivery commit input must be an object.");
   const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
-  const store = await getWorkflowStore(projectRoot);
-  assertKnownWorkflowCanvasSession(store, sessionId);
-  const laneId = requireText(readField(input, "laneId"), "workflow commit laneId");
-  assertWorkflowDeliveryCommitLane(store, sessionId, laneId);
-  const realProjectRoot = await fs.realpath(projectRoot);
-  const rawWorktreePath = optionalText(readField(input, "worktreePath"));
-  const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, laneId, rawWorktreePath, realProjectRoot);
-  const files = deliveryFilesFromInput(readField(input, "files"));
-  const subject = requireText(readField(input, "subject"), "commit subject");
-  const body = optionalText(readField(input, "body")) ?? undefined;
-  const reconciliationStatus = deliveryReconciliationStatus(input);
-  const acceptMismatch = readField(input, "acceptMismatch") === true;
-  const { createDeliveryCommit } = await import("@skyturn/git-worktree/node");
-  let evidence: Awaited<ReturnType<typeof createDeliveryCommit>>;
-  try {
-    evidence = await createDeliveryCommit({
-      projectRoot: realProjectRoot,
-      worktreePath,
-      files,
-      subject,
-      ...(body ? { body } : {}),
-      ...(reconciliationStatus ? { reconciliationStatus } : {}),
-      ...(acceptMismatch ? { acceptMismatch } : {}),
-    });
-  } catch (error) {
-    throw normalizeDeliveryCommitIpcError(error);
-  }
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  return await withWorkflowSessionMutationLock(workflowProjectRoot, sessionId, async () => {
+    const store = await getWorkflowStore(projectRoot);
+    assertKnownWorkflowCanvasSession(store, sessionId);
+    const laneId = requireText(readField(input, "laneId"), "workflow commit laneId");
+    assertWorkflowDeliveryCommitLane(store, sessionId, laneId);
+    const realProjectRoot = await fs.realpath(projectRoot);
+    const rawWorktreePath = optionalText(readField(input, "worktreePath"));
+    const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, laneId, rawWorktreePath, realProjectRoot);
+    const files = deliveryFilesFromInput(readField(input, "files"));
+    const subject = requireText(readField(input, "subject"), "commit subject");
+    const body = optionalText(readField(input, "body")) ?? undefined;
+    const reconciliationStatus = deliveryReconciliationStatus(input);
+    const acceptMismatch = readField(input, "acceptMismatch") === true;
+    const { createDeliveryCommit } = await import("@skyturn/git-worktree/node");
+    let evidence: Awaited<ReturnType<typeof createDeliveryCommit>>;
+    try {
+      evidence = await createDeliveryCommit({
+        projectRoot: realProjectRoot,
+        worktreePath,
+        files,
+        subject,
+        ...(body ? { body } : {}),
+        ...(reconciliationStatus ? { reconciliationStatus } : {}),
+        ...(acceptMismatch ? { acceptMismatch } : {}),
+      });
+    } catch (error) {
+      throw normalizeDeliveryCommitIpcError(error);
+    }
 
-  const segmentId = optionalText(readField(input, "segmentId"));
-  const event = store.appendWorkflowEvent({
-    sessionId,
-    kind: "workflow.commit.created",
-    source: "electron-main",
-    laneId,
-    segmentId,
-    idempotencyKey: `delivery-commit:${evidence.commitSha}`,
-    payload: {
+    const segmentId = optionalText(readField(input, "segmentId"));
+    const event = store.appendWorkflowEvent({
+      sessionId,
+      kind: "workflow.commit.created",
+      source: "electron-main",
       laneId,
-      ...(segmentId ? { segmentId } : {}),
-      evidence,
-    },
-    now: new Date().toISOString(),
-  });
-  broadcastWorkflowProjection(projectRoot, sessionId, store);
+      segmentId,
+      idempotencyKey: `delivery-commit:${evidence.commitSha}`,
+      payload: {
+        laneId,
+        ...(segmentId ? { segmentId } : {}),
+        evidence,
+      },
+      now: new Date().toISOString(),
+    });
+    broadcastWorkflowProjection(projectRoot, sessionId, store);
 
-  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "committed", event, evidence };
+    return { protocolVersion: RUN_PROTOCOL_VERSION, status: "committed", event, evidence };
+  });
 }));
 
 ipcMain.handle("workflow:delivery:push", workflowHandler(async (projectRoot: string, input: WorkflowDeliveryPushInput) => {
   assertKnownProjectRoot(projectRoot);
   if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Delivery push input must be an object.");
   const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
-  const store = await getWorkflowStore(projectRoot);
-  assertKnownWorkflowCanvasSession(store, sessionId);
-  const laneId = requireText(readField(input, "laneId"), "workflow commit laneId");
-  assertWorkflowDeliveryCommitLane(store, sessionId, laneId);
   const realProjectRoot = await fs.realpath(projectRoot);
-  const rawWorktreePath = optionalText(readField(input, "worktreePath"));
-  const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, laneId, rawWorktreePath, realProjectRoot);
-  const segmentId = optionalText(readField(input, "segmentId"));
-  const commitEvidence = await findDeliveryCommitEvidence(store, sessionId, laneId, segmentId, worktreePath);
-  assertDeliveryEvidenceInputMatches(input, commitEvidence);
-  const remote = optionalText(readField(input, "remote"));
-  const { pushDeliveryBranch } = await import("@skyturn/git-worktree/node");
-  let evidence: Awaited<ReturnType<typeof pushDeliveryBranch>>;
-  try {
-    evidence = await pushDeliveryBranch({
-      projectRoot: realProjectRoot,
-      worktreePath,
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  return await withWorkflowSessionMutationLock(workflowProjectRoot, sessionId, async () => {
+    const store = await getWorkflowStore(projectRoot);
+    assertKnownWorkflowCanvasSession(store, sessionId);
+    const laneId = requireText(readField(input, "laneId"), "workflow commit laneId");
+    assertWorkflowDeliveryCommitLane(store, sessionId, laneId);
+    const rawWorktreePath = optionalText(readField(input, "worktreePath"));
+    const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, laneId, rawWorktreePath, realProjectRoot);
+    const segmentId = optionalText(readField(input, "segmentId"));
+    const commitEvidence = await findDeliveryCommitEvidence(store, sessionId, laneId, segmentId, worktreePath);
+    assertDeliveryEvidenceInputMatches(input, commitEvidence);
+    const remote = optionalText(readField(input, "remote"));
+    const remoteEventKind = "workflow.delivery.pushed";
+    const remoteDetails = {
       commitSha: commitEvidence.commitSha,
       branch: commitEvidence.branch,
-      ...(remote ? { remote } : {}),
-    });
-  } catch (error) {
-    throw normalizeDeliveryRemoteIpcError(error);
-  }
-
-  const event = store.appendWorkflowEvent({
-    sessionId,
-    kind: "workflow.delivery.pushed",
-    source: "electron-main",
-    laneId,
-    segmentId,
-    idempotencyKey: `delivery-push:${evidence.remote}:${evidence.branch}:${evidence.commitSha}`,
-    payload: {
+      remote: remote ?? "origin",
+    };
+    const remoteOperation: RemoteSideEffectOperation = {
+      projectRoot: workflowProjectRoot,
+      sessionId,
+      eventKind: remoteEventKind,
       laneId,
-      ...(segmentId ? { segmentId } : {}),
-      evidence,
-    },
-    now: new Date().toISOString(),
-  });
-  broadcastWorkflowProjection(projectRoot, sessionId, store);
+      affectedLaneIds: [laneId],
+      operationKey: remoteSideEffectSemanticKey({ sessionId, eventKind: remoteEventKind, laneId, details: remoteDetails }),
+      details: remoteDetails,
+    };
+    assertWorkflowRemoteMutationLanesActive(store, remoteOperation);
+    const unresolvedRemoteBlock = unresolvedRemoteSideEffectBlockForRetry(store, remoteOperation);
+    if (unresolvedRemoteBlock) return remoteSideEffectManualResolutionResponse(store, sessionId, unresolvedRemoteBlock);
+    const { pushDeliveryBranch } = await import("@skyturn/git-worktree/node");
+    let evidence: Awaited<ReturnType<typeof pushDeliveryBranch>>;
+    const remoteSideEffect = beginDurableRemoteSideEffect(store, remoteOperation);
+    try {
+      try {
+        evidence = await pushDeliveryBranch({
+          projectRoot: realProjectRoot,
+          worktreePath,
+          commitSha: commitEvidence.commitSha,
+          branch: commitEvidence.branch,
+          ...(remote ? { remote } : {}),
+        });
+      } catch (error) {
+        completeDurableRemoteSideEffectForKnownPreMutationFailure(remoteSideEffect, error);
+        throw normalizeDeliveryRemoteIpcError(error);
+      }
 
-  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "pushed", event, evidence };
+      const event = store.appendWorkflowEvent({
+        sessionId,
+        kind: "workflow.delivery.pushed",
+        source: "electron-main",
+        laneId,
+        segmentId,
+        idempotencyKey: `delivery-push:${evidence.remote}:${evidence.branch}:${evidence.commitSha}`,
+        payload: {
+          laneId,
+          ...(segmentId ? { segmentId } : {}),
+          evidence,
+        },
+        now: new Date().toISOString(),
+      });
+      remoteSideEffect.complete("succeeded", {
+        ...(isRecord(event) && optionalText(event.id) ? { eventId: optionalText(event.id)! } : {}),
+        evidence,
+      });
+      broadcastWorkflowProjection(projectRoot, sessionId, store);
+
+      return { protocolVersion: RUN_PROTOCOL_VERSION, status: "pushed", event, evidence };
+    } finally {
+      remoteSideEffect.endInFlight();
+    }
+  });
 }));
 
 ipcMain.handle("workflow:pullRequest:create", workflowHandler(async (projectRoot: string, input: WorkflowPullRequestCreateInput) => {
   assertKnownProjectRoot(projectRoot);
   if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Pull request input must be an object.");
   const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
-  const store = await getWorkflowStore(projectRoot);
-  assertKnownWorkflowCanvasSession(store, sessionId);
-  const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
-  const commitLaneId = requireText(readField(input, "commitLaneId"), "workflow commit laneId");
-  assertWorkflowPullRequestLane(store, sessionId, laneId, commitLaneId);
-  assertWorkflowDeliveryCommitLane(store, sessionId, commitLaneId);
   const realProjectRoot = await fs.realpath(projectRoot);
-  const rawWorktreePath = optionalText(readField(input, "worktreePath"));
-  const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, commitLaneId, rawWorktreePath, realProjectRoot);
-  const segmentId = optionalText(readField(input, "segmentId"));
-  const commitEvidence = await findDeliveryCommitEvidence(store, sessionId, commitLaneId, null, worktreePath);
-  assertDeliveryEvidenceInputMatches(input, commitEvidence);
-  const remote = optionalText(readField(input, "remote"));
-  const baseBranch = await validatePullRequestBaseBranch(
-    store,
-    sessionId,
-    realProjectRoot,
-    requireText(readField(input, "baseBranch"), "pull request base branch"),
-    commitEvidence.branch,
-    remote ?? "origin",
-  );
-  const title = requireText(readField(input, "title"), "pull request title");
-  const { createDeliveryPullRequest } = await import("@skyturn/git-worktree/node");
-  let evidence: Awaited<ReturnType<typeof createDeliveryPullRequest>>;
-  try {
-    evidence = await createDeliveryPullRequest({
-      projectRoot: realProjectRoot,
-      worktreePath,
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  return await withWorkflowSessionMutationLock(workflowProjectRoot, sessionId, async () => {
+    const store = await getWorkflowStore(projectRoot);
+    assertKnownWorkflowCanvasSession(store, sessionId);
+    const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
+    const commitLaneId = requireText(readField(input, "commitLaneId"), "workflow commit laneId");
+    assertWorkflowPullRequestLane(store, sessionId, laneId, commitLaneId);
+    assertWorkflowDeliveryCommitLane(store, sessionId, commitLaneId);
+    const rawWorktreePath = optionalText(readField(input, "worktreePath"));
+    const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, commitLaneId, rawWorktreePath, realProjectRoot);
+    const segmentId = optionalText(readField(input, "segmentId"));
+    const commitEvidence = await findDeliveryCommitEvidence(store, sessionId, commitLaneId, null, worktreePath);
+    assertDeliveryEvidenceInputMatches(input, commitEvidence);
+    const remote = optionalText(readField(input, "remote"));
+    const baseBranch = await validatePullRequestBaseBranch(
+      store,
+      sessionId,
+      realProjectRoot,
+      requireText(readField(input, "baseBranch"), "pull request base branch"),
+      commitEvidence.branch,
+      remote ?? "origin",
+    );
+    const title = requireText(readField(input, "title"), "pull request title");
+    const remoteEventKind = "workflow.pull_request.created";
+    const remoteDetails = {
+      commitLaneId,
       commitSha: commitEvidence.commitSha,
       baseBranch,
       headBranch: commitEvidence.branch,
-      title,
-      ...(remote ? { remote } : {}),
-      ...(optionalText(readField(input, "body")) ? { body: optionalText(readField(input, "body"))! } : {}),
-      ...(optionalText(readField(input, "whatChanged")) ? { whatChanged: optionalText(readField(input, "whatChanged"))! } : {}),
-      ...(optionalText(readField(input, "why")) ? { why: optionalText(readField(input, "why"))! } : {}),
-      ...(optionalText(readField(input, "breakingChanges")) ? { breakingChanges: optionalText(readField(input, "breakingChanges"))! } : {}),
-      ...(optionalText(readField(input, "serverPr")) ? { serverPr: optionalText(readField(input, "serverPr"))! } : {}),
-    });
-  } catch (error) {
-    throw normalizeDeliveryRemoteIpcError(error);
-  }
-
-  const event = store.appendWorkflowEvent({
-    sessionId,
-    kind: "workflow.pull_request.created",
-    source: "electron-main",
-    laneId,
-    segmentId,
-    idempotencyKey: `pull-request:${evidence.url}`,
-    payload: {
+      remote: remote ?? "origin",
+    };
+    const remoteOperation: RemoteSideEffectOperation = {
+      projectRoot: workflowProjectRoot,
+      sessionId,
+      eventKind: remoteEventKind,
       laneId,
-      commitLaneId,
-      ...(segmentId ? { segmentId } : {}),
-      evidence,
-    },
-    now: new Date().toISOString(),
-  });
-  broadcastWorkflowProjection(projectRoot, sessionId, store);
+      affectedLaneIds: [laneId, commitLaneId],
+      operationKey: remoteSideEffectSemanticKey({ sessionId, eventKind: remoteEventKind, laneId, details: remoteDetails }),
+      details: remoteDetails,
+    };
+    assertWorkflowRemoteMutationLanesActive(store, remoteOperation);
+    const unresolvedRemoteBlock = unresolvedRemoteSideEffectBlockForRetry(store, remoteOperation);
+    if (unresolvedRemoteBlock) return remoteSideEffectManualResolutionResponse(store, sessionId, unresolvedRemoteBlock);
+    if (!findDeliveryPushEvidenceForPullRequest(store, sessionId, commitLaneId, commitEvidence, remote ?? "origin")) {
+      return missingDeliveryPushEvidenceManualResolutionResponse(store, sessionId, commitLaneId, commitEvidence, remote ?? "origin");
+    }
+    const { createDeliveryPullRequest } = await import("@skyturn/git-worktree/node");
+    let evidence: Awaited<ReturnType<typeof createDeliveryPullRequest>>;
+    const remoteSideEffect = beginDurableRemoteSideEffect(store, remoteOperation);
+    try {
+      try {
+        evidence = await createDeliveryPullRequest({
+          projectRoot: realProjectRoot,
+          worktreePath,
+          commitSha: commitEvidence.commitSha,
+          baseBranch,
+          headBranch: commitEvidence.branch,
+          title,
+          ...(remote ? { remote } : {}),
+          ...(optionalText(readField(input, "body")) ? { body: optionalText(readField(input, "body"))! } : {}),
+          ...(optionalText(readField(input, "whatChanged")) ? { whatChanged: optionalText(readField(input, "whatChanged"))! } : {}),
+          ...(optionalText(readField(input, "why")) ? { why: optionalText(readField(input, "why"))! } : {}),
+          ...(optionalText(readField(input, "breakingChanges")) ? { breakingChanges: optionalText(readField(input, "breakingChanges"))! } : {}),
+          ...(optionalText(readField(input, "serverPr")) ? { serverPr: optionalText(readField(input, "serverPr"))! } : {}),
+        });
+      } catch (error) {
+        completeDurableRemoteSideEffectForKnownPreMutationFailure(remoteSideEffect, error);
+        throw normalizeDeliveryRemoteIpcError(error);
+      }
 
-  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "created", event, evidence };
+      const event = store.appendWorkflowEvent({
+        sessionId,
+        kind: "workflow.pull_request.created",
+        source: "electron-main",
+        laneId,
+        segmentId,
+        idempotencyKey: `pull-request:${evidence.url}`,
+        payload: {
+          laneId,
+          commitLaneId,
+          ...(segmentId ? { segmentId } : {}),
+          evidence,
+        },
+        now: new Date().toISOString(),
+      });
+      remoteSideEffect.complete("succeeded", {
+        ...(isRecord(event) && optionalText(event.id) ? { eventId: optionalText(event.id)! } : {}),
+        evidence,
+      });
+      broadcastWorkflowProjection(projectRoot, sessionId, store);
+
+      return { protocolVersion: RUN_PROTOCOL_VERSION, status: "created", event, evidence };
+    } finally {
+      remoteSideEffect.endInFlight();
+    }
+  });
 }));
 
 ipcMain.handle("workflow:pullRequest:checks", workflowHandler(async (projectRoot: string, input: WorkflowPullRequestChecksInput) => {
@@ -1036,91 +1439,156 @@ ipcMain.handle("workflow:pullRequest:merge", workflowHandler(async (projectRoot:
   assertKnownProjectRoot(projectRoot);
   if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Pull request merge input must be an object.");
   const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
-  const store = await getWorkflowStore(projectRoot);
-  assertKnownWorkflowCanvasSession(store, sessionId);
-  const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
-  assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
-  const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
-  const checksEvidence = findDeliveryPullRequestChecksEvidence(store, sessionId, laneId, prEvidence.commitSha);
-  const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
-  if (checksEvidence.headSha !== expectedHeadSha) {
-    throw workflowIpcError("INVALID_INPUT", "Recorded pull request checks do not match the requested head SHA.");
-  }
-  const subject = requireText(readField(input, "subject") ?? readField(input, "title"), "pull request merge subject");
-  const body = optionalText(readField(input, "body")) ?? undefined;
   const realProjectRoot = await fs.realpath(projectRoot);
-  const { mergeDeliveryPullRequest } = await import("@skyturn/git-worktree/node");
-  let evidence: Awaited<ReturnType<typeof mergeDeliveryPullRequest>>;
-  try {
-    evidence = await mergeDeliveryPullRequest({
-      projectRoot: realProjectRoot,
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  return await withWorkflowSessionMutationLock(workflowProjectRoot, sessionId, async () => {
+    const store = await getWorkflowStore(projectRoot);
+    assertKnownWorkflowCanvasSession(store, sessionId);
+    const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
+    assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
+    const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
+    const checksEvidence = findDeliveryPullRequestChecksEvidence(store, sessionId, laneId, prEvidence.commitSha);
+    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+    if (checksEvidence.headSha !== expectedHeadSha) {
+      throw workflowIpcError("INVALID_INPUT", "Recorded pull request checks do not match the requested head SHA.");
+    }
+    const subject = requireText(readField(input, "subject") ?? readField(input, "title"), "pull request merge subject");
+    const body = optionalText(readField(input, "body")) ?? undefined;
+    const remoteEventKind = "workflow.pull_request.merged";
+    const remoteDetails = {
       prNumber: prEvidence.number,
-      expectedHeadSha,
-      subject,
-      ...(body ? { body } : {}),
-    });
-  } catch (error) {
-    throw normalizeDeliveryRemoteIpcError(error);
-  }
-
-  const event = store.appendWorkflowEvent({
-    sessionId,
-    kind: "workflow.pull_request.merged",
-    source: "electron-main",
-    laneId,
-    idempotencyKey: `pull-request-merged:${evidence.number}:${evidence.headSha}`,
-    payload: {
+      headSha: expectedHeadSha,
+    };
+    const remoteOperation: RemoteSideEffectOperation = {
+      projectRoot: workflowProjectRoot,
+      sessionId,
+      eventKind: remoteEventKind,
       laneId,
-      evidence,
-    },
-    now: new Date().toISOString(),
-  });
-  broadcastWorkflowProjection(projectRoot, sessionId, store);
+      affectedLaneIds: [laneId],
+      operationKey: remoteSideEffectSemanticKey({ sessionId, eventKind: remoteEventKind, laneId, details: remoteDetails }),
+      details: remoteDetails,
+    };
+    assertWorkflowRemoteMutationLanesActive(store, remoteOperation);
+    const unresolvedRemoteBlock = unresolvedRemoteSideEffectBlockForRetry(store, remoteOperation);
+    if (unresolvedRemoteBlock) return remoteSideEffectManualResolutionResponse(store, sessionId, unresolvedRemoteBlock);
+    const { mergeDeliveryPullRequest } = await import("@skyturn/git-worktree/node");
+    let evidence: Awaited<ReturnType<typeof mergeDeliveryPullRequest>>;
+    const remoteSideEffect = beginDurableRemoteSideEffect(store, remoteOperation);
+    try {
+      try {
+        evidence = await mergeDeliveryPullRequest({
+          projectRoot: realProjectRoot,
+          prNumber: prEvidence.number,
+          expectedHeadSha,
+          subject,
+          ...(body ? { body } : {}),
+        });
+      } catch (error) {
+        completeDurableRemoteSideEffectForKnownPreMutationFailure(remoteSideEffect, error);
+        throw normalizeDeliveryRemoteIpcError(error);
+      }
 
-  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "merged", event, evidence };
+      const event = store.appendWorkflowEvent({
+        sessionId,
+        kind: "workflow.pull_request.merged",
+        source: "electron-main",
+        laneId,
+        idempotencyKey: `pull-request-merged:${evidence.number}:${evidence.headSha}`,
+        payload: {
+          laneId,
+          evidence,
+        },
+        now: new Date().toISOString(),
+      });
+      remoteSideEffect.complete("succeeded", {
+        ...(isRecord(event) && optionalText(event.id) ? { eventId: optionalText(event.id)! } : {}),
+        evidence,
+      });
+      broadcastWorkflowProjection(projectRoot, sessionId, store);
+
+      return { protocolVersion: RUN_PROTOCOL_VERSION, status: "merged", event, evidence };
+    } finally {
+      remoteSideEffect.endInFlight();
+    }
+  });
 }));
 
 ipcMain.handle("workflow:delivery:syncMain", workflowHandler(async (projectRoot: string, input: WorkflowDeliverySyncMainInput) => {
   assertKnownProjectRoot(projectRoot);
   if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Delivery sync main input must be an object.");
   const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
-  const store = await getWorkflowStore(projectRoot);
-  assertKnownWorkflowCanvasSession(store, sessionId);
-  const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
-  assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
-  const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
-  const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
-  const mergeEvidence = findDeliveryPullRequestMergeEvidence(store, sessionId, laneId, prEvidence, expectedHeadSha);
   const realProjectRoot = await fs.realpath(projectRoot);
-  const remote = optionalText(readField(input, "remote"));
-  const { syncDeliveryMain } = await import("@skyturn/git-worktree/node");
-  let evidence: Awaited<ReturnType<typeof syncDeliveryMain>>;
-  try {
-    evidence = await syncDeliveryMain({
-      projectRoot: realProjectRoot,
-      mainBranch: optionalText(readField(input, "mainBranch")) ?? "main",
-      ...(remote ? { remote } : {}),
-    });
-  } catch (error) {
-    throw normalizeDeliveryRemoteIpcError(error);
-  }
-
-  const event = store.appendWorkflowEvent({
-    sessionId,
-    kind: "workflow.delivery.main_synced",
-    source: "electron-main",
-    laneId,
-    payload: {
-      laneId,
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  return await withWorkflowSessionMutationLock(workflowProjectRoot, sessionId, async () => {
+    const store = await getWorkflowStore(projectRoot);
+    assertKnownWorkflowCanvasSession(store, sessionId);
+    const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
+    assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
+    const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
+    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+    const mergeEvidence = findDeliveryPullRequestMergeEvidence(store, sessionId, laneId, prEvidence, expectedHeadSha);
+    const remote = optionalText(readField(input, "remote"));
+    const mainBranch = optionalText(readField(input, "mainBranch")) ?? "main";
+    const remoteEventKind = "workflow.delivery.main_synced";
+    const remoteDetails = {
       prNumber: mergeEvidence.number,
       headSha: mergeEvidence.headSha,
-      evidence,
-    },
-    now: new Date().toISOString(),
-  });
-  broadcastWorkflowProjection(projectRoot, sessionId, store);
+      mainBranch,
+      remote: remote ?? "origin",
+    };
+    const remoteOperation: RemoteSideEffectOperation = {
+      projectRoot: workflowProjectRoot,
+      sessionId,
+      eventKind: remoteEventKind,
+      laneId,
+      affectedLaneIds: [laneId],
+      sessionWide: true,
+      operationKey: remoteSideEffectSemanticKey({ sessionId, eventKind: remoteEventKind, laneId, sessionWide: true, details: remoteDetails }),
+      details: remoteDetails,
+    };
+    assertWorkflowRemoteMutationLanesActive(store, remoteOperation);
+    const unresolvedRemoteBlock = unresolvedRemoteSideEffectBlockForRetry(store, remoteOperation);
+    if (unresolvedRemoteBlock) return remoteSideEffectManualResolutionResponse(store, sessionId, unresolvedRemoteBlock);
+    const { syncDeliveryMain } = await import("@skyturn/git-worktree/node");
+    let evidence: Awaited<ReturnType<typeof syncDeliveryMain>>;
+    const remoteSideEffect = beginDurableRemoteSideEffect(store, remoteOperation);
+    try {
+      try {
+        evidence = await syncDeliveryMain({
+          projectRoot: realProjectRoot,
+          mainBranch,
+          ...(remote ? { remote } : {}),
+        });
+      } catch (error) {
+        completeDurableRemoteSideEffectForKnownPreMutationFailure(remoteSideEffect, error);
+        throw normalizeDeliveryRemoteIpcError(error);
+      }
 
-  return { protocolVersion: RUN_PROTOCOL_VERSION, status: "synced", event, evidence };
+      const event = store.appendWorkflowEvent({
+        sessionId,
+        kind: "workflow.delivery.main_synced",
+        source: "electron-main",
+        laneId,
+        payload: {
+          sessionWide: true,
+          laneId,
+          prNumber: mergeEvidence.number,
+          headSha: mergeEvidence.headSha,
+          evidence,
+        },
+        now: new Date().toISOString(),
+      });
+      remoteSideEffect.complete("succeeded", {
+        ...(isRecord(event) && optionalText(event.id) ? { eventId: optionalText(event.id)! } : {}),
+        evidence,
+      });
+      broadcastWorkflowProjection(projectRoot, sessionId, store);
+
+      return { protocolVersion: RUN_PROTOCOL_VERSION, status: "synced", event, evidence };
+    } finally {
+      remoteSideEffect.endInFlight();
+    }
+  });
 }));
 
 ipcMain.handle("workflow:changeset", workflowHandler(async (projectRoot: string, input: unknown) => {
@@ -1178,12 +1646,17 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
 }
 
 async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost> {
-  const existing = workflowStores.get(projectRoot);
+  const storeIdentity = await workflowStoreIdentity(projectRoot);
+  const existing = workflowStores.get(storeIdentity);
   if (existing) return existing;
   const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
-  const store = createWorkflowStore({ projectRoot }) as WorkflowStoreHost;
-  workflowStores.set(projectRoot, store);
+  const store = createWorkflowStore({ projectRoot: storeIdentity }) as WorkflowStoreHost;
+  workflowStores.set(storeIdentity, store);
   return store;
+}
+
+async function workflowStoreIdentity(projectRoot: string): Promise<string> {
+  return await fs.realpath(projectRoot).catch(() => path.resolve(projectRoot));
 }
 
 function broadcastWorkflowProjection(projectRoot: string, sessionId: string, store: WorkflowStoreHost): void {
@@ -1471,6 +1944,897 @@ function workflowEventSummary(kind: string): string {
 function assertKnownProjectRoot(projectRoot: string): void {
   if (!path.isAbsolute(projectRoot) || !openedProjectRoots.has(projectRoot)) {
     throw new Error("Project root is not open in SkyTurn.");
+  }
+}
+
+function normalizeWorkflowRollbackInput(input: WorkflowRollbackInput): {
+  sessionId: string;
+  nodeId?: string;
+  laneId?: string;
+  checkpointId?: string;
+  requestId?: string;
+  now: string;
+} {
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Workflow rollback input must be an object.");
+  const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
+  return {
+    sessionId,
+    ...(optionalText(readField(input, "nodeId")) ? { nodeId: optionalText(readField(input, "nodeId"))! } : {}),
+    ...(optionalText(readField(input, "laneId")) ? { laneId: optionalText(readField(input, "laneId"))! } : {}),
+    ...(optionalText(readField(input, "checkpointId")) ? { checkpointId: optionalText(readField(input, "checkpointId"))! } : {}),
+    ...(optionalText(readField(input, "requestId")) ? { requestId: optionalText(readField(input, "requestId"))! } : {}),
+    now: optionalText(readField(input, "now")) ?? new Date().toISOString(),
+  };
+}
+
+function normalizeCheckpointSuccessorInput(input: WorkflowCheckpointSuccessorInput): {
+  sessionId: string;
+  nodeId?: string;
+  laneId?: string;
+  checkpointId: string;
+  intentId?: string;
+  successorLaneId?: string;
+  successorSemanticKey?: string;
+  title?: string;
+  instruction?: string;
+  now: string;
+} {
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Workflow checkpoint successor input must be an object.");
+  const sessionId = assertWorkflowSessionId(readField(input, "sessionId"));
+  return {
+    sessionId,
+    checkpointId: requireText(readField(input, "checkpointId"), "checkpoint id"),
+    ...(optionalText(readField(input, "nodeId")) ? { nodeId: optionalText(readField(input, "nodeId"))! } : {}),
+    ...(optionalText(readField(input, "laneId")) ? { laneId: optionalText(readField(input, "laneId"))! } : {}),
+    ...(optionalText(readField(input, "intentId")) ? { intentId: optionalText(readField(input, "intentId"))! } : {}),
+    ...(optionalText(readField(input, "successorLaneId")) ? { successorLaneId: optionalText(readField(input, "successorLaneId"))! } : {}),
+    ...(optionalText(readField(input, "successorSemanticKey")) ? { successorSemanticKey: optionalText(readField(input, "successorSemanticKey"))! } : {}),
+    ...(optionalText(readField(input, "title")) ? { title: optionalText(readField(input, "title"))! } : {}),
+    ...(optionalText(readField(input, "instruction")) ?? optionalText(readField(input, "text"))
+      ? { instruction: (optionalText(readField(input, "instruction")) ?? optionalText(readField(input, "text")))! }
+      : {}),
+    now: optionalText(readField(input, "now")) ?? new Date().toISOString(),
+  };
+}
+
+function appendRollbackRequestedEvent(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string; now: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+): { event: unknown; requestId: string } {
+  const requestId = input.requestId ?? rollbackRequestIdForIpc(input, eligibility);
+  const laneId = rollbackTargetLaneIdForIpc(input, eligibility);
+  const event = store.appendWorkflowEvent({
+    sessionId: input.sessionId,
+    kind: "workflow.node.rollback_requested",
+    source: "electron-main",
+    laneId,
+    idempotencyKey: `rollback:${requestId}:requested`,
+    payload: rollbackEventPayloadForIpc(input, eligibility, requestId, true),
+    now: input.now,
+  });
+  return { event, requestId };
+}
+
+function appendRollbackAppliedEvent(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; now: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  requestId: string,
+): unknown {
+  const laneId = rollbackTargetLaneIdForIpc(input, eligibility);
+  return store.appendWorkflowEvent({
+    sessionId: input.sessionId,
+    kind: "workflow.node.rollback_applied",
+    source: "electron-main",
+    laneId,
+    idempotencyKey: `rollback:${requestId}:applied`,
+    payload: {
+      ...rollbackEventPayloadForIpc(input, eligibility, requestId, true),
+      reason: "Rollback applied.",
+    },
+    now: new Date().toISOString(),
+  });
+}
+
+function appendRollbackRejectedEvent(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string; now: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  localSafety: LocalRollbackSafety,
+  existingRequestId?: string,
+): unknown {
+  const requestId = existingRequestId ?? input.requestId ?? rollbackRequestIdForIpc(input, eligibility);
+  const laneId = rollbackTargetLaneIdForIpc(input, eligibility);
+  return store.appendWorkflowEvent({
+    sessionId: input.sessionId,
+    kind: "workflow.node.rollback_rejected",
+    source: "electron-main",
+    laneId,
+    idempotencyKey: `rollback:${requestId}:rejected`,
+    payload: {
+      ...rollbackEventPayloadForIpc(input, eligibility, requestId),
+      reason: localSafety.message ?? "Local rollback requires manual repair.",
+      reasonCode: localSafety.reasonCode ?? "manual_repair_required",
+      manualRepairRequired: true,
+    },
+    now: new Date().toISOString(),
+  });
+}
+
+function findRollbackRequestedEventByIdempotencyKey(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  requestId: string,
+): RollbackRequestedEventMatch | null {
+  const idempotencyKey = `rollback:${requestId}:requested`;
+  for (const event of [...store.listEvents(sessionId)].reverse()) {
+    if (!isRecord(event)) continue;
+    if (event.kind !== "workflow.node.rollback_requested") continue;
+    if (optionalText(event.idempotencyKey) !== idempotencyKey) continue;
+    return { requestId, event };
+  }
+  return null;
+}
+
+function rollbackRequestIdForIpc(
+  input: { sessionId: string; laneId?: string; nodeId?: string; checkpointId?: string; now: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+): string {
+  return `rollback:${input.sessionId}:${rollbackTargetLaneIdForIpc(input, eligibility)}:${eligibility.checkpointId ?? input.checkpointId ?? "checkpoint"}:${input.now}`;
+}
+
+function rollbackEventPayloadForIpc(
+  input: { nodeId?: string; checkpointId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  requestId: string,
+  localRollbackSafe?: boolean,
+): Record<string, unknown> {
+  const laneId = rollbackTargetLaneIdForIpc(input, eligibility);
+  return {
+    requestId,
+    laneId,
+    ...(input.nodeId ?? eligibility.targetNodeId ? { nodeId: input.nodeId ?? eligibility.targetNodeId } : {}),
+    ...(eligibility.checkpointId ?? input.checkpointId ? { checkpointId: eligibility.checkpointId ?? input.checkpointId } : {}),
+    ...(eligibility.restoreCommitRef ? { restoreCommitRef: eligibility.restoreCommitRef } : {}),
+    ...(typeof localRollbackSafe === "boolean" ? { localRollbackSafe } : {}),
+  };
+}
+
+function rollbackTargetLaneIdForIpc(
+  input: { laneId?: string; nodeId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+): string {
+  return requireText(eligibility.targetLaneId ?? input.laneId ?? input.nodeId, "rollback lane id");
+}
+
+function workflowRollbackResponse(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  result: WorkflowRollbackResultLike,
+): Record<string, unknown> {
+  const eligibility = result.eligibility ?? {};
+  const blockedReason = isRecord(result.blockedReason) ? result.blockedReason : workflowRollbackBlockReason(eligibility);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    status: result.status,
+    ...(isRecord(result.event) ? { event: result.event } : {}),
+    ...(isRecord(result.requestedEvent) ? { requestedEvent: result.requestedEvent } : {}),
+    eligibility,
+    blockedReason,
+    manualRepairRequired: result.manualRepairRequired === true || (isRecord(blockedReason) && blockedReason.manualRepairRequired === true),
+    projection: store.materializeFlowProjection(sessionId),
+    canvasSession: store.materializeCanvasSession(sessionId),
+  };
+}
+
+function workflowRollbackBlockReason(eligibility: WorkflowRollbackEligibilityLike): Record<string, unknown> | null {
+  if (eligibility.eligible === true) return null;
+  const remoteSideEffects = Array.isArray(eligibility.blockingRemoteSideEffects)
+    ? eligibility.blockingRemoteSideEffects.filter(isRecord)
+    : [];
+  const affectedLaneIds = Array.isArray(eligibility.affectedLaneIds)
+    ? eligibility.affectedLaneIds.filter((id): id is string => typeof id === "string")
+    : [];
+  if (remoteSideEffects.length > 0) {
+    return {
+      code: "remote_side_effect",
+      message: "Rollback is blocked by remote side effects.",
+      eventKinds: uniqueStrings(remoteSideEffects.map((effect) => optionalText(effect.eventKind)).filter((kind): kind is string => Boolean(kind))),
+      remoteSideEffects,
+      affectedLaneIds,
+    };
+  }
+  if (eligibility.localRollbackSafe === false) {
+    return {
+      code: "manual_repair_required",
+      message: optionalText(eligibility.reason) ?? "Local rollback is not safe.",
+      affectedLaneIds,
+      manualRepairRequired: true,
+    };
+  }
+  return {
+    code: affectedLaneIds.length === 0 ? "unknown_target" : "invalid_checkpoint",
+    message: optionalText(eligibility.reason) ?? "Rollback is not eligible.",
+    affectedLaneIds,
+  };
+}
+
+function evaluateRollbackRemoteBlocksForRollback(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string; now: string },
+): { eligibility: WorkflowRollbackEligibilityLike; result: WorkflowRollbackResultLike | null } {
+  const eligibility = store.getNodeRollbackEligibility(input);
+  if (Array.isArray(eligibility.blockingRemoteSideEffects) && eligibility.blockingRemoteSideEffects.length > 0) {
+    return { eligibility, result: store.applyNodeRollback(input) };
+  }
+  const inFlightBlocks = blockingInFlightRemoteSideEffects(projectRoot, input.sessionId, eligibility);
+  if (inFlightBlocks.length === 0) return { eligibility, result: null };
+  const blockedEligibility = rollbackEligibilityWithInFlightRemoteBlocks(eligibility, inFlightBlocks);
+  return {
+    eligibility: blockedEligibility,
+    result: {
+      status: "blocked",
+      eligibility: blockedEligibility,
+      blockedReason: inFlightRemoteSideEffectBlockReason(blockedEligibility, inFlightBlocks),
+    },
+  };
+}
+
+async function withWorkflowSessionMutationLock<T>(projectRoot: string, sessionId: string, action: () => Promise<T>): Promise<T> {
+  const lockKey = workflowSessionMutationKey(projectRoot, sessionId);
+  const previous = workflowSessionMutationLocks.get(lockKey) ?? Promise.resolve();
+  let release: () => void = () => undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const next = previous.catch(() => undefined).then(() => current);
+  workflowSessionMutationLocks.set(lockKey, next);
+  await previous.catch(() => undefined);
+  try {
+    return await action();
+  } finally {
+    release();
+    if (workflowSessionMutationLocks.get(lockKey) === next) workflowSessionMutationLocks.delete(lockKey);
+  }
+}
+
+function workflowSessionMutationKey(projectRoot: string, sessionId: string): string {
+  return `${projectRoot}\0${sessionId}`;
+}
+
+function beginDurableRemoteSideEffect(
+  store: WorkflowStoreHost,
+  input: RemoteSideEffectOperation,
+): DurableRemoteSideEffect {
+  const createdAt = new Date().toISOString();
+  const operationId = `remote-side-effect:${input.eventKind}:${input.sessionId}:${input.laneId ?? "session"}:${createdAt}:${remoteSideEffectSequence++}`;
+  const affectedLaneIds = input.affectedLaneIds ? uniqueStrings(input.affectedLaneIds) : undefined;
+  const payload = {
+    operationId,
+    operationKey: input.operationKey,
+    eventKind: input.eventKind,
+    ...(input.laneId ? { laneId: input.laneId } : {}),
+    ...(affectedLaneIds && affectedLaneIds.length > 0 ? { affectedLaneIds } : {}),
+    ...(input.sessionWide ? { sessionWide: true } : {}),
+    ...(input.details ? input.details : {}),
+  };
+  const requestedEvent = store.appendWorkflowEvent({
+    sessionId: input.sessionId,
+    kind: "workflow.remote_side_effect.requested",
+    source: "electron-main",
+    ...(input.laneId ? { laneId: input.laneId } : {}),
+    idempotencyKey: `${operationId}:requested`,
+    payload,
+    now: createdAt,
+  });
+  const endInFlight = beginInFlightRemoteSideEffect(input);
+  let completed = false;
+  let ended = false;
+  return {
+    operationId,
+    requestedEvent,
+    complete(status, details = {}) {
+      if (completed) return null;
+      completed = true;
+      return store.appendWorkflowEvent({
+        sessionId: input.sessionId,
+        kind: "workflow.remote_side_effect.completed",
+        source: "electron-main",
+        ...(input.laneId ? { laneId: input.laneId } : {}),
+        idempotencyKey: `${operationId}:completed`,
+        payload: {
+          ...payload,
+          status,
+          ...details,
+        },
+        now: new Date().toISOString(),
+      });
+    },
+    endInFlight() {
+      if (ended) return;
+      ended = true;
+      endInFlight();
+    },
+  };
+}
+
+function completeDurableRemoteSideEffectForKnownPreMutationFailure(
+  remoteSideEffect: DurableRemoteSideEffect,
+  error: unknown,
+): void {
+  if (!isKnownPreMutationDeliveryRemoteError(error)) return;
+  const normalized = normalizeDeliveryRemoteIpcError(error);
+  const code = isRecord(error) ? deliveryRemoteIpcErrorCode(error.code) : null;
+  remoteSideEffect.complete("failed", {
+    remoteMutationAttempted: false,
+    error: {
+      ...(code ? { code } : {}),
+      message: sanitizeSnippet(normalized.message),
+    },
+  });
+}
+
+function unresolvedRemoteSideEffectBlockForRetry(
+  store: WorkflowStoreHost,
+  input: RemoteSideEffectOperation,
+): UnresolvedRemoteSideEffectBlock | null {
+  const unresolved = new Map<string, UnresolvedRemoteSideEffectBlock>();
+  for (const event of store.listEvents(input.sessionId)) {
+    if (!isRecord(event) || !isRecord(event.payload)) continue;
+    if (event.kind === "workflow.remote_side_effect.completed") {
+      const operationId = optionalText(event.payload.operationId);
+      if (operationId && remoteSideEffectCompletionClearsRetryBlock(event)) unresolved.delete(operationId);
+      continue;
+    }
+    if (event.kind !== "workflow.remote_side_effect.requested") continue;
+    const request = remoteSideEffectRequestFromEvent(event);
+    if (!request || !remoteSideEffectRequestMatches(input, request)) continue;
+    unresolved.set(request.operationId, request);
+  }
+  const first = unresolved.values().next();
+  return first.done ? null : first.value;
+}
+
+function remoteSideEffectCompletionClearsRetryBlock(event: Record<string, unknown>): boolean {
+  const payload = isRecord(event.payload) ? event.payload : {};
+  const status = optionalText(payload.status);
+  return status === "succeeded" || (status === "failed" && payload.remoteMutationAttempted === false);
+}
+
+function remoteSideEffectRequestFromEvent(event: Record<string, unknown>): UnresolvedRemoteSideEffectBlock | null {
+  const payload = isRecord(event.payload) ? event.payload : {};
+  const eventKind = remoteSideEffectKind(payload.eventKind);
+  const operationId = optionalText(payload.operationId) ?? optionalText(event.id);
+  if (!eventKind || !operationId) return null;
+  const operationKey = optionalText(payload.operationKey);
+  const laneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+  const affectedLaneIds = Array.isArray(payload.affectedLaneIds)
+    ? uniqueStrings(payload.affectedLaneIds.filter((id): id is string => typeof id === "string"))
+    : undefined;
+  return {
+    requestedEvent: event,
+    operationId,
+    ...(operationKey ? { operationKey } : {}),
+    eventKind,
+    ...(laneId ? { laneId } : {}),
+    ...(affectedLaneIds && affectedLaneIds.length > 0 ? { affectedLaneIds } : {}),
+    ...(payload.sessionWide === true ? { sessionWide: true } : {}),
+    ...(optionalText(event.createdAt) ? { createdAt: optionalText(event.createdAt)! } : {}),
+  };
+}
+
+function remoteSideEffectRequestMatches(
+  input: RemoteSideEffectOperation,
+  request: UnresolvedRemoteSideEffectBlock,
+): boolean {
+  if (request.operationKey && request.operationKey === input.operationKey) return true;
+  if (request.sessionWide === true || input.sessionWide === true) return true;
+  if (input.laneId && request.laneId && request.laneId !== input.laneId) return false;
+  const inputAffectedLaneIds = input.affectedLaneIds ?? (input.laneId ? [input.laneId] : []);
+  const requestAffectedLaneIds = request.affectedLaneIds ?? (request.laneId ? [request.laneId] : []);
+  if (inputAffectedLaneIds.length === 0 || requestAffectedLaneIds.length === 0) return false;
+  const requestLaneIds = new Set(requestAffectedLaneIds);
+  return inputAffectedLaneIds.some((laneId) => requestLaneIds.has(laneId));
+}
+
+function remoteSideEffectManualResolutionResponse(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  block: UnresolvedRemoteSideEffectBlock,
+): Record<string, unknown> {
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    status: "blocked",
+    event: block.requestedEvent,
+    blockedReason: {
+      code: "manual_resolution_required",
+      message: "A previous remote delivery operation is unresolved; resolve it manually before retrying.",
+      eventKind: block.eventKind,
+      operationId: block.operationId,
+      ...(block.operationKey ? { operationKey: block.operationKey } : {}),
+      manualRepairRequired: true,
+    },
+    manualRepairRequired: true,
+    projection: store.materializeFlowProjection(sessionId),
+    canvasSession: store.materializeCanvasSession(sessionId),
+  };
+}
+
+function missingDeliveryPushEvidenceManualResolutionResponse(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  commitLaneId: string,
+  commitEvidence: DeliveryCommitEvidenceLike,
+  remote: string,
+): Record<string, unknown> {
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    status: "blocked",
+    event: null,
+    blockedReason: {
+      code: "manual_resolution_required",
+      message: "Pull request creation requires recorded push evidence for the delivery commit.",
+      eventKind: "workflow.delivery.pushed",
+      laneId: commitLaneId,
+      commitSha: commitEvidence.commitSha,
+      branch: commitEvidence.branch,
+      remote,
+      manualRepairRequired: true,
+    },
+    manualRepairRequired: true,
+    projection: store.materializeFlowProjection(sessionId),
+    canvasSession: store.materializeCanvasSession(sessionId),
+  };
+}
+
+function remoteSideEffectSemanticKey(input: {
+  sessionId: string;
+  eventKind: InFlightRemoteSideEffectKind;
+  laneId?: string;
+  sessionWide?: boolean;
+  details?: Record<string, unknown>;
+}): string {
+  const details = Object.entries(input.details ?? {})
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim().length > 0)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${key}=${remoteSideEffectKeyPart(value)}`);
+  return [
+    "remote-side-effect",
+    input.eventKind,
+    `session=${remoteSideEffectKeyPart(input.sessionId)}`,
+    ...(input.laneId ? [`lane=${remoteSideEffectKeyPart(input.laneId)}`] : []),
+    ...(input.sessionWide ? ["sessionWide=true"] : []),
+    ...details,
+  ].join("|");
+}
+
+function remoteSideEffectKeyPart(value: unknown): string {
+  return String(value).trim().replace(/\s+/g, "_").slice(0, 200);
+}
+
+function remoteSideEffectKind(value: unknown): InFlightRemoteSideEffectKind | null {
+  if (
+    value === "workflow.delivery.pushed" ||
+    value === "workflow.pull_request.created" ||
+    value === "workflow.pull_request.merged" ||
+    value === "workflow.delivery.main_synced"
+  ) {
+    return value;
+  }
+  return null;
+}
+
+function beginInFlightRemoteSideEffect(input: {
+  projectRoot: string;
+  sessionId: string;
+  eventKind: InFlightRemoteSideEffectKind;
+  laneId?: string;
+  affectedLaneIds?: string[];
+  sessionWide?: boolean;
+}): () => void {
+  const createdAt = new Date().toISOString();
+  const eventId = `in-flight:${input.eventKind}:${input.sessionId}:${input.laneId ?? "session"}:${createdAt}:${inFlightRemoteSideEffects.size}`;
+  const affectedLaneIds = input.affectedLaneIds ? uniqueStrings(input.affectedLaneIds) : undefined;
+  inFlightRemoteSideEffects.set(eventId, {
+    eventKind: input.eventKind,
+    eventId,
+    projectRoot: input.projectRoot,
+    sessionId: input.sessionId,
+    createdAt,
+    ...(input.laneId ? { laneId: input.laneId } : {}),
+    ...(affectedLaneIds && affectedLaneIds.length > 0 ? { affectedLaneIds } : {}),
+    ...(input.sessionWide ? { sessionWide: true } : {}),
+  });
+  return () => {
+    inFlightRemoteSideEffects.delete(eventId);
+  };
+}
+
+function blockingInFlightRemoteSideEffects(
+  projectRoot: string,
+  sessionId: string,
+  eligibility: WorkflowRollbackEligibilityLike,
+): InFlightRemoteSideEffect[] {
+  const affectedLaneIds = new Set(Array.isArray(eligibility.affectedLaneIds)
+    ? eligibility.affectedLaneIds.filter((id): id is string => typeof id === "string")
+    : []);
+  if (affectedLaneIds.size === 0) return [];
+  return [...inFlightRemoteSideEffects.values()].filter((effect) => {
+    if (effect.projectRoot !== projectRoot) return false;
+    if (effect.sessionId !== sessionId) return false;
+    if (effect.sessionWide === true) return true;
+    if (effect.laneId && affectedLaneIds.has(effect.laneId)) return true;
+    return (effect.affectedLaneIds ?? []).some((laneId) => affectedLaneIds.has(laneId));
+  });
+}
+
+function rollbackEligibilityWithInFlightRemoteBlocks(
+  eligibility: WorkflowRollbackEligibilityLike,
+  inFlightBlocks: InFlightRemoteSideEffect[],
+): WorkflowRollbackEligibilityLike {
+  return {
+    ...eligibility,
+    eligible: false,
+    blockingRemoteSideEffects: [
+      ...(Array.isArray(eligibility.blockingRemoteSideEffects) ? eligibility.blockingRemoteSideEffects : []),
+      ...inFlightBlocks,
+    ],
+    reason: "Remote side effects are still in flight.",
+  };
+}
+
+function inFlightRemoteSideEffectBlockReason(
+  eligibility: WorkflowRollbackEligibilityLike,
+  inFlightBlocks: InFlightRemoteSideEffect[],
+): Record<string, unknown> {
+  return {
+    code: "in_flight_remote_side_effect",
+    message: "Rollback is blocked by remote side effects that have not been recorded yet.",
+    eventKinds: uniqueStrings(inFlightBlocks.map((effect) => effect.eventKind)),
+    remoteSideEffects: inFlightBlocks,
+    affectedLaneIds: Array.isArray(eligibility.affectedLaneIds)
+      ? eligibility.affectedLaneIds.filter((id): id is string => typeof id === "string")
+      : [],
+  };
+}
+
+async function evaluateLocalRollbackSafetyForRollback(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+): Promise<LocalRollbackSafety> {
+  if (eligibility.eligible !== true) return { status: "not_required" };
+  const checkpointId = optionalText(eligibility.checkpointId) ?? input.checkpointId;
+  const restoreCommitRef = optionalText(eligibility.restoreCommitRef);
+  if (!checkpointId || !restoreCommitRef) {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "missing_restore_commit",
+      message: "Rollback requires exact checkpoint restore evidence.",
+    };
+  }
+  if (!isFullCommitSha(restoreCommitRef)) {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "invalid_restore_commit",
+      message: "Rollback restore target must be a recorded full commit SHA.",
+    };
+  }
+  const projection = store.materializeFlowProjection(input.sessionId);
+  const checkpoint = workflowCheckpointById(projection, checkpointId);
+  if (!checkpoint) {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "missing_checkpoint",
+      message: "Rollback checkpoint is not recorded in the workflow ledger.",
+    };
+  }
+
+  let rollbackWorktree: ManagedRollbackWorktree;
+  try {
+    rollbackWorktree = await assertManagedRollbackWorktree(projectRoot, projection, checkpoint);
+  } catch {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "unmanaged_worktree",
+      message: "Rollback requires a SkyTurn-managed worktree.",
+    };
+  }
+  const worktreePath = rollbackWorktree.path;
+
+  const affectedLaneIds = Array.isArray(eligibility.affectedLaneIds)
+    ? eligibility.affectedLaneIds.filter((id): id is string => typeof id === "string")
+    : [];
+  const recordedHead = await findRecordedRollbackHead(store, input.sessionId, checkpoint, affectedLaneIds, worktreePath);
+  if (!recordedHead) {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "missing_recorded_commit",
+      message: "Rollback requires a SkyTurn-recorded local commit.",
+    };
+  }
+  if (!isFullCommitSha(recordedHead.commitSha)) {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "invalid_recorded_commit",
+      message: "Rollback recorded HEAD must be a full commit SHA.",
+    };
+  }
+  const expectedBranchName = rollbackWorktree.branchName ?? recordedHead.branchName;
+  if (!expectedBranchName) {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "missing_expected_branch",
+      message: "Rollback requires a recorded managed branch.",
+    };
+  }
+  const currentBranchName = await gitCurrentBranch(worktreePath);
+  if (currentBranchName !== expectedBranchName) {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "branch_mismatch",
+      message: "Worktree branch does not match the SkyTurn-managed branch.",
+    };
+  }
+
+  const headSha = await gitRevParseHead(worktreePath);
+  const statusText = await gitStatusPorcelain(worktreePath);
+  if (headSha.toLowerCase() !== recordedHead.commitSha.toLowerCase()) {
+    if (headSha.toLowerCase() === restoreCommitRef.toLowerCase()) {
+      if (statusText.length > 0) {
+        return {
+          status: "manual_repair_required",
+          reasonCode: "dirty_worktree",
+          message: "Worktree has uncommitted changes.",
+        };
+      }
+      const matchingRequest = findMatchingRollbackRequestedEvent(store, input, eligibility, restoreCommitRef);
+      if (matchingRequest) {
+        return {
+          status: "already_restored",
+          worktreePath,
+          restoreCommitRef,
+          requestId: matchingRequest.requestId,
+          requestedEvent: matchingRequest.event,
+        };
+      }
+    }
+    return {
+      status: "manual_repair_required",
+      reasonCode: "head_mismatch",
+      message: "Worktree HEAD does not match the SkyTurn-recorded local commit.",
+    };
+  }
+  if (statusText.length > 0) {
+    return {
+      status: "manual_repair_required",
+      reasonCode: "dirty_worktree",
+      message: "Worktree has uncommitted changes.",
+    };
+  }
+  return {
+    status: "safe",
+    worktreePath,
+    restoreCommitRef,
+  };
+}
+
+function findMatchingRollbackRequestedEvent(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  restoreCommitRef: string,
+): RollbackRequestedEventMatch | null {
+  const terminalRequestIds = new Set<string>();
+  const requestedEvents: RollbackRequestedEventMatch[] = [];
+  for (const event of store.listEvents(input.sessionId)) {
+    if (!isRecord(event)) continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const requestId = optionalText(payload.requestId);
+    if (!requestId) continue;
+    if (event.kind === "workflow.node.rollback_applied" || event.kind === "workflow.node.rollback_rejected") {
+      terminalRequestIds.add(requestId);
+      continue;
+    }
+    if (event.kind !== "workflow.node.rollback_requested") continue;
+    if (input.requestId && requestId !== input.requestId) continue;
+    const requested = { requestId, event };
+    const validation = validateRollbackRequestedEventForIpc(store, input, eligibility, restoreCommitRef, requested);
+    if (validation.valid) requestedEvents[requestedEvents.length] = requested;
+  }
+  for (let index = requestedEvents.length - 1; index >= 0; index -= 1) {
+    const requested = requestedEvents[index];
+    if (!terminalRequestIds.has(requested.requestId)) return requested;
+  }
+  return null;
+}
+
+function validateRollbackRequestedEventForIpc(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  restoreCommitRef: string,
+  requested: RollbackRequestedEventMatch,
+): RollbackRequestedEventValidation {
+  const event = requested.event;
+  if (!isRecord(event) || event.kind !== "workflow.node.rollback_requested") {
+    return invalidRollbackRequestedEventValidation();
+  }
+  const payload = isRecord(event.payload) ? event.payload : {};
+  if (optionalText(event.idempotencyKey) !== `rollback:${requested.requestId}:requested`) {
+    return invalidRollbackRequestedEventValidation();
+  }
+  const expectedLaneId = rollbackTargetLaneIdForIpc(input, eligibility);
+  const expectedCheckpointId = optionalText(eligibility.checkpointId) ?? optionalText(input.checkpointId);
+  if (!expectedCheckpointId) return invalidRollbackRequestedEventValidation();
+  const expectedNodeId = optionalText(input.nodeId) ?? optionalText(eligibility.targetNodeId);
+  const payloadRequestId = optionalText(payload.requestId);
+  if (payloadRequestId !== requested.requestId) return invalidRollbackRequestedEventValidation();
+  const eventLaneId = optionalText(event.laneId);
+  if (eventLaneId && eventLaneId !== expectedLaneId) return invalidRollbackRequestedEventValidation();
+  const payloadLaneId = optionalText(payload.laneId);
+  if (payloadLaneId !== expectedLaneId) return invalidRollbackRequestedEventValidation();
+  const payloadCheckpointId = optionalText(payload.checkpointId);
+  if (payloadCheckpointId !== expectedCheckpointId) return invalidRollbackRequestedEventValidation();
+  const payloadNodeId = optionalText(payload.nodeId);
+  if (payloadNodeId !== expectedNodeId) return invalidRollbackRequestedEventValidation();
+  const payloadRestoreCommitRef = optionalText(payload.restoreCommitRef);
+  if (payloadRestoreCommitRef !== restoreCommitRef) return invalidRollbackRequestedEventValidation();
+  if (payload.localRollbackSafe !== true) return invalidRollbackRequestedEventValidation();
+  if (rollbackRequestHasTerminalEvent(store, input.sessionId, requested.requestId)) return invalidRollbackRequestedEventValidation();
+  return { valid: true };
+}
+
+function rollbackRequestHasTerminalEvent(store: WorkflowStoreHost, sessionId: string, requestId: string): boolean {
+  return store.listEvents(sessionId).some((event) => {
+    if (!isRecord(event)) return false;
+    if (event.kind !== "workflow.node.rollback_applied" && event.kind !== "workflow.node.rollback_rejected") return false;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    return optionalText(payload.requestId) === requestId;
+  });
+}
+
+function invalidRollbackRequestedEventValidation(): RollbackRequestedEventValidation {
+  return {
+    valid: false,
+    message: "Rollback request idempotency collision requires manual repair.",
+  };
+}
+
+function localRollbackSafetyResult(localSafety: LocalRollbackSafety): Record<string, unknown> | null {
+  if (localSafety.status !== "manual_repair_required") return null;
+  return {
+    code: "manual_repair_required",
+    message: localSafety.message ?? "Local rollback requires manual repair.",
+    reasonCode: localSafety.reasonCode ?? "manual_repair_required",
+    manualRepairRequired: true,
+  };
+}
+
+async function assertManagedRollbackWorktree(
+  projectRoot: string,
+  projection: unknown,
+  checkpoint: Record<string, unknown>,
+): Promise<ManagedRollbackWorktree> {
+  const worktreeId = requireText(checkpoint.worktreeId, "rollback worktree id");
+  const worktrees = isRecord(projection) && Array.isArray(projection.worktrees) ? projection.worktrees.filter(isRecord) : [];
+  const worktree = worktrees.find((candidate) => candidate.worktreeId === worktreeId);
+  if (!worktree) throw workflowIpcError("INVALID_INPUT", "Rollback worktree is not recorded.");
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const repoRoot = await fs.realpath(requireText(worktree.repoRoot, "rollback repo root"));
+  if (repoRoot !== realProjectRoot) throw workflowIpcError("UNKNOWN_PROJECT", "Rollback worktree repoRoot must match the open project root.");
+  const realManagedRoot = await fs.realpath(`${realProjectRoot}.worktrees`);
+  const worktreePath = requireText(worktree.realPath ?? worktree.path, "rollback worktree path");
+  const realWorktreePath = await fs.realpath(worktreePath);
+  if (!isInsidePath(realManagedRoot, realWorktreePath)) {
+    throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Rollback worktree path must stay inside the SkyTurn managed worktree directory.");
+  }
+  const checkpointPath = optionalText(checkpoint.worktreePath);
+  if (checkpointPath) {
+    const realCheckpointPath = await fs.realpath(checkpointPath);
+    if (realCheckpointPath !== realWorktreePath) {
+      throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Rollback checkpoint worktree does not match the recorded worktree.");
+    }
+  }
+  return {
+    path: realWorktreePath,
+    branchName: optionalText(worktree.branchName) ?? undefined,
+  };
+}
+
+async function findRecordedRollbackHead(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  checkpoint: Record<string, unknown>,
+  affectedLaneIds: string[],
+  worktreePath: string,
+): Promise<RecordedRollbackHead | null> {
+  const affected = new Set(affectedLaneIds);
+  const checkpointWorktreeId = optionalText(checkpoint.worktreeId);
+  for (const event of [...store.listEvents(sessionId)].reverse()) {
+    if (!isRecord(event) || event.kind !== "workflow.commit.created") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const laneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+    if (!laneId || !affected.has(laneId)) continue;
+    const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+    const evidenceWorktreeId = optionalText(evidence.worktreeId) ?? optionalText(payload.worktreeId);
+    if (evidenceWorktreeId && checkpointWorktreeId && evidenceWorktreeId !== checkpointWorktreeId) continue;
+    const evidenceWorktreePath = optionalText(evidence.worktreePath);
+    if (!evidenceWorktreePath) continue;
+    if (!await realPathsEqual(evidenceWorktreePath, worktreePath)) continue;
+    const commitSha = optionalText(evidence.commitSha);
+    if (commitSha && isFullCommitSha(commitSha)) {
+      const branchName = optionalText(evidence.branch);
+      return {
+        commitSha,
+        ...(branchName ? { branchName } : {}),
+      };
+    }
+  }
+  return null;
+}
+
+function workflowCheckpointById(projection: unknown, checkpointId: string): Record<string, unknown> | null {
+  if (!isRecord(projection) || !Array.isArray(projection.checkpoints)) return null;
+  return projection.checkpoints.find((checkpoint) => isRecord(checkpoint) && checkpoint.id === checkpointId) as Record<string, unknown> | undefined ?? null;
+}
+
+async function gitCurrentBranch(worktreePath: string): Promise<string | null> {
+  try {
+    const result = await execFileAsync("git", ["-C", worktreePath, "branch", "--show-current"], {
+      encoding: "utf8",
+      maxBuffer: 2_000_000,
+      shell: false,
+    });
+    const branch = String(result.stdout).trim();
+    return branch.length > 0 ? branch : null;
+  } catch {
+    return null;
+  }
+}
+
+async function gitRevParseHead(worktreePath: string): Promise<string> {
+  const result = await execFileAsync("git", ["-C", worktreePath, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+    maxBuffer: 2_000_000,
+    shell: false,
+  });
+  return String(result.stdout).trim();
+}
+
+async function gitStatusPorcelain(worktreePath: string): Promise<string> {
+  const result = await execFileAsync("git", ["-C", worktreePath, "status", "--porcelain"], {
+    encoding: "utf8",
+    maxBuffer: 2_000_000,
+    shell: false,
+  });
+  return String(result.stdout).trim();
+}
+
+async function gitResetHard(worktreePath: string, restoreCommitRef: string): Promise<void> {
+  if (!isFullCommitSha(restoreCommitRef)) {
+    throw workflowIpcError("INVALID_INPUT", "Rollback restore target must be a full commit SHA.");
+  }
+  await execFileAsync("git", ["-C", worktreePath, "reset", "--hard", restoreCommitRef], {
+    encoding: "utf8",
+    maxBuffer: 2_000_000,
+    shell: false,
+  });
+}
+
+function isFullCommitSha(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-fA-F]{40}$/.test(value);
+}
+
+async function realPathsEqual(left: string, right: string): Promise<boolean> {
+  try {
+    const [realLeft, realRight] = await Promise.all([fs.realpath(left), fs.realpath(right)]);
+    return realLeft === realRight;
+  } catch {
+    return false;
   }
 }
 
@@ -2047,6 +3411,25 @@ function assertWorkflowPullRequestLaneKind(store: WorkflowStoreHost, sessionId: 
   }
 }
 
+function assertWorkflowRemoteMutationLanesActive(store: WorkflowStoreHost, input: RemoteSideEffectOperation): void {
+  const projection = store.materializeFlowProjection(input.sessionId) as WorkflowDeliveryFlowProjectionLike;
+  if (!isRecord(projection) || !Array.isArray(projection.lanes)) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow projection is unavailable.");
+  }
+  const affectedLaneIds = uniqueStrings([
+    ...(input.laneId ? [input.laneId] : []),
+    ...(input.affectedLaneIds ?? []),
+  ]);
+  const rollbackStatuses = isRecord(projection.laneRollbackStatuses) ? projection.laneRollbackStatuses : {};
+  for (const laneId of affectedLaneIds) {
+    const lane = projection.lanes.find((candidate) => isRecord(candidate) && candidate.id === laneId);
+    const rollbackStatus = optionalText(lane?.rollbackStatus) ?? optionalText(rollbackStatuses[laneId]);
+    if (rollbackStatus === "rolled_back" || rollbackStatus === "inactive") {
+      throw workflowIpcError("DELIVERY_REJECTED", `Remote delivery operation is blocked because workflow lane ${laneId} is ${rollbackStatus}.`);
+    }
+  }
+}
+
 async function resolveDeliveryCommitWorktreePath(
   store: WorkflowStoreHost,
   sessionId: string,
@@ -2115,6 +3498,30 @@ async function findDeliveryCommitEvidence(
     return evidence;
   }
   throw workflowIpcError("INVALID_INPUT", `No delivery commit evidence is recorded for lane ${laneId}.`);
+}
+
+function findDeliveryPushEvidenceForPullRequest(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  laneId: string,
+  commitEvidence: DeliveryCommitEvidenceLike,
+  remote: string,
+): DeliveryPushEvidenceLike | null {
+  const events = store.listEvents(sessionId);
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!isRecord(event) || event.kind !== "workflow.delivery.pushed") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const eventLaneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+    if (eventLaneId !== laneId) continue;
+    const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+    const commitSha = optionalText(payload.commitSha) ?? optionalText(evidence.commitSha);
+    const branch = optionalText(payload.branch) ?? optionalText(evidence.branch);
+    const eventRemote = optionalText(payload.remote) ?? optionalText(evidence.remote) ?? "origin";
+    if (commitSha !== commitEvidence.commitSha || branch !== commitEvidence.branch || eventRemote !== remote) continue;
+    return { commitSha, branch, remote: eventRemote };
+  }
+  return null;
 }
 
 function findDeliveryPullRequestEvidence(
@@ -2518,6 +3925,32 @@ function normalizeDeliveryRemoteIpcError(error: unknown): Error {
 function deliveryCommitIpcErrorCode(value: unknown): WorkflowIpcErrorCode | null {
   if (value === "INVALID_INPUT" || value === "UNSAFE_WORKTREE_PATH" || value === "DELIVERY_REJECTED") return value;
   return null;
+}
+
+function isKnownPreMutationDeliveryRemoteError(error: unknown): boolean {
+  if (!isRecord(error)) return false;
+  const code = deliveryRemoteIpcErrorCode(error.code);
+  if (!code) return false;
+  if (code === "INVALID_INPUT" || code === "UNSAFE_WORKTREE_PATH") return true;
+  if (code === "GH_UNAVAILABLE" || code === "AUTH_REQUIRED" || code === "REMOTE_HEAD_MISMATCH") return true;
+  if (code !== "DELIVERY_REJECTED") return false;
+  const message = error instanceof Error ? error.message : String(error.message ?? "");
+  return knownPreMutationDeliveryRejectedMessage(message);
+}
+
+function knownPreMutationDeliveryRejectedMessage(message: string): boolean {
+  return [
+    "Delivery commit must match worktree HEAD:",
+    "Delivery branch must match the current worktree branch:",
+    "Pull request base and head branches must differ.",
+    "Remote branch was not found after push:",
+    "Pull request must be open before merge;",
+    "Pull request is not mergeable.",
+    "Pull request checks must be passed before merge;",
+    "Refusing to sync ",
+    "GitHub CLI did not return pull request JSON.",
+    "GitHub CLI did not return pull request checks JSON.",
+  ].some((prefix) => message.includes(prefix));
 }
 
 function deliveryRemoteIpcErrorCode(value: unknown): WorkflowIpcErrorCode | null {
