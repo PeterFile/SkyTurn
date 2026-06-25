@@ -508,6 +508,7 @@ export interface WorkflowCheckpointIntentBase {
   nodeId?: string;
   laneId?: string;
   checkpointId?: string;
+  sourceEvidenceIds?: string[];
   createdAt: string;
   localRollbackSafe?: boolean;
 }

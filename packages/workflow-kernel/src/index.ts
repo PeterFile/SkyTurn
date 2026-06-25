@@ -148,6 +148,7 @@ export interface FlowLane {
   laneKind: WorkflowLaneKind;
   semanticSubtype: WorkflowLaneSemanticSubtype;
   title: string;
+  brief?: string;
   agentKind: AgentKind;
   nodeKind: WorkflowProjectionNodeKind;
   executable: boolean;
@@ -1796,6 +1797,7 @@ function normalizeLane(value: Record<string, unknown> | LaneSuggestion | FlowLan
     laneKind,
     semanticSubtype,
     title: typeof record.title === "string" ? record.title : id,
+    ...(typeof record.brief === "string" && record.brief.trim() ? { brief: record.brief.trim() } : {}),
     agentKind: isAgentKind(record.agentKind) ? record.agentKind : "codex",
     nodeKind: "agent_task",
     executable,
@@ -2264,6 +2266,7 @@ function normalizeCheckpointIntent(
   const successorLaneId = stringValue(event.payload.successorLaneId);
   const successorSemanticKey = stringValue(event.payload.successorSemanticKey);
   const instruction = stringValue(event.payload.instruction) ?? stringValue(event.payload.text);
+  const sourceEvidenceIds = stringArray(event.payload.sourceEvidenceIds);
   const laneId = checkpoint?.laneId ?? payloadLaneId;
   const nodeId = checkpoint?.nodeId ?? payloadNodeId ?? laneId;
   const ownershipMatches =
@@ -2290,6 +2293,7 @@ function normalizeCheckpointIntent(
     ...(laneId ? { laneId } : {}),
     ...(nodeId ? { nodeId } : {}),
     ...(checkpointId ? { checkpointId } : {}),
+    ...(sourceEvidenceIds.length > 0 ? { sourceEvidenceIds } : {}),
     ...(instruction ? { instruction } : {}),
     createdAt: event.createdAt,
     ...(typeof event.payload.localRollbackSafe === "boolean" ? { localRollbackSafe: event.payload.localRollbackSafe } : {}),
@@ -3010,6 +3014,7 @@ function dependencyIsSatisfied(
   dependencyId: string,
   completed: Set<string>,
 ): boolean {
+  if (isTrustedFailedCheckpointRepairDependency(projection, lane, dependencyId)) return true;
   if (isRollbackSuccessorDependency(projection, lane, dependencyId)) return isTrustedRolledBackSuccessorDependency(projection, lane, dependencyId);
   if (completed.has(dependencyId)) return true;
   if (lane.laneKind !== "fix") return false;
@@ -3055,11 +3060,69 @@ function checkpointIntentSuccessorMatches(
 function isCheckpointSuccessorWaitingForRollback(projection: FlowProjection, lane: FlowLane): boolean {
   return projection.checkpointIntents.some((intent) => {
     if (intent.status !== "requested") return false;
-    if (intent.kind !== "repair" && intent.kind !== "variant" && intent.kind !== "fork") return false;
+    if (intent.kind !== "repair") return false;
     if (!checkpointIntentSuccessorMatches(intent, lane)) return false;
     const targetLaneId = checkpointIntentTargetLaneId(projection, intent);
-    return projection.lanes.find((item) => item.id === targetLaneId)?.rollbackStatus !== "rolled_back";
+    if (!targetLaneId) return true;
+    const targetLane = projection.lanes.find((item) => item.id === targetLaneId);
+    if (targetLane?.rollbackStatus === "rolled_back") return false;
+    if (
+      projection.edges.some((edge) => edge.sourceLaneId === targetLaneId && edge.targetLaneId === lane.id) &&
+      isTrustedFailedCheckpointRepairDependency(projection, lane, targetLaneId)
+    ) {
+      return false;
+    }
+    return true;
   });
+}
+
+function isTrustedFailedCheckpointRepairDependency(projection: FlowProjection, lane: FlowLane, dependencyId: string): boolean {
+  const dependency = projection.lanes.find((item) => item.id === dependencyId);
+  if (dependency?.status !== "failed") return false;
+  return projection.checkpointIntents.some((intent) => {
+    if (intent.status !== "requested" || intent.kind !== "repair") return false;
+    if (!checkpointIntentTargetsLane(projection, intent, dependencyId)) return false;
+    if (!checkpointIntentSuccessorMatches(intent, lane)) return false;
+    return checkpointIntentSourceEvidenceHasFailure(projection, intent, dependencyId);
+  });
+}
+
+function checkpointIntentSourceEvidenceHasFailure(
+  projection: FlowProjection,
+  intent: WorkflowCheckpointIntent,
+  dependencyId: string,
+): boolean {
+  const checkpoint = intent.checkpointId ? projection.checkpoints.find((item) => item.id === intent.checkpointId) : undefined;
+  if (!checkpoint) return false;
+  const sourceEvidenceIds = Array.isArray(intent.sourceEvidenceIds)
+    ? intent.sourceEvidenceIds.filter((value): value is string => typeof value === "string")
+    : [];
+  if (sourceEvidenceIds.length === 0) return false;
+  return sourceEvidenceIds.some((evidenceId) =>
+    projection.evidence.some((evidence) =>
+      evidence.id === evidenceId &&
+      evidence.laneId === dependencyId &&
+      evidence.status === "failed" &&
+      evidenceMatchesCheckpoint(projection, checkpoint, evidence)
+    )
+  );
+}
+
+function evidenceMatchesCheckpoint(
+  projection: FlowProjection,
+  checkpoint: WorkflowNodeCheckpoint,
+  evidence: FlowEvidence,
+): boolean {
+  if (checkpoint.runId) {
+    const segment = projection.segments.find((item) => item.id === evidence.segmentId && item.laneId === evidence.laneId);
+    if (!segment || segment.runId !== checkpoint.runId) return false;
+    if (checkpoint.segmentId && evidence.segmentId !== checkpoint.segmentId) return false;
+    return true;
+  }
+  if (checkpoint.segmentId) {
+    return evidence.segmentId === checkpoint.segmentId;
+  }
+  return checkpoint.evidenceRefs.some((ref) => ref.kind === "evidence" && ref.id === evidence.id);
 }
 
 function isTrustedFailedRepairDependency(projection: FlowProjection, lane: FlowLane, dependencyId: string): boolean {
