@@ -1,6 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
+  REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
+  selectedNodeActionAvailability,
+  rollbackLabelForNode,
   buildWorktreeAdoptionConfirmation,
   buildWorktreeCleanConfirmation,
   buildWorktreeDeleteBranchConfirmation,
@@ -11,6 +14,7 @@ import {
   summarizeWorktreeComparisonEvidence,
 } from "./App.js";
 import type { CanvasNode, Changeset, FinalChangesetReconciliation } from "@skyturn/project-core";
+import type { SelectedNodeActionState } from "./nodeActionState.js";
 
 function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
   return {
@@ -36,6 +40,7 @@ function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
       path: "",
       branchName: "branch",
       baselineRef: "base",
+      baseCommit: "base",
     },
   };
 }
@@ -569,4 +574,266 @@ describe("UI source validation", () => {
     expect(deleteBranchMessage).toContain("Delete branch: skyturn/session-1");
   });
 
+});
+
+describe("Slice C UI behavior", () => {
+  it("clicking a node selects it and does not open modal/details", async () => {
+    const appSource = await readSource("./App.tsx");
+    const nodeCard = appSource.slice(appSource.indexOf('className="agent-card-select"'), appSource.indexOf('className="evidence-marker"'));
+    expect(nodeCard).toContain('onClick={() => data.onSelect(node.id)}');
+    expect(nodeCard).not.toContain('data.onInspect');
+    expect(nodeCard).toContain('role="button"');
+    expect(nodeCard).toContain('aria-pressed={selected}');
+  });
+
+  it("clicking the node card More button opens modal/details", async () => {
+    const appSource = await readSource("./App.tsx");
+    const menuButton = appSource.slice(appSource.indexOf('className="agent-node-menu nodrag"'), appSource.indexOf('<MoreHorizontal'));
+    expect(menuButton).toContain('onClick={(event) => {');
+    expect(menuButton).toContain('event.stopPropagation()');
+    expect(menuButton).toContain('data.onInspect(node.id)');
+  });
+
+  it("opening More synchronizes the selected composer node", async () => {
+    const appSource = await readSource("./App.tsx");
+    const canvasView = appSource.slice(appSource.indexOf("<CanvasView"), appSource.indexOf("</main>"));
+    expect(canvasView).toContain("setSelectedNodeId(nodeId)");
+    expect(canvasView).toContain("setInspectedNodeId(nodeId)");
+    expect(canvasView).toContain("setInspectedNodeId((current) => (current === nodeId ? current : null))");
+  });
+
+  it("React Flow visual selection follows the selected composer node", async () => {
+    const appSource = await readSource("./App.tsx");
+    const nodesSource = appSource.slice(appSource.indexOf("const nodesSource"), appSource.indexOf("const edges ="));
+    const mergeNodes = appSource.slice(appSource.indexOf("function mergeFlowNodeState"), appSource.indexOf("const AGENT_HANDLE_SIZE"));
+    const reactFlow = appSource.slice(appSource.indexOf("<ReactFlow"), appSource.indexOf("<CanvasViewportController"));
+    expect(nodesSource).toContain("selected: node.id === selectedNode?.id");
+    expect(nodesSource).toContain("selectedNode?.id");
+    expect(mergeNodes).toContain("selected: node.selected");
+    expect(reactFlow).not.toContain('role="listbox"');
+  });
+
+  it("node-scoped composer actions submit through workflow node-action APIs", async () => {
+    const appSource = await readSource("./App.tsx");
+    const submitHandler = appSource.slice(appSource.indexOf("async function appendRequirementNode"), appSource.indexOf("function retryNode"));
+    const composer = appSource.slice(appSource.indexOf("function CanvasComposer("));
+    expect(submitHandler).toContain("async function appendRequirementNode(action?: ComposerAction)");
+    expect(submitHandler).toContain("await submitSelectedNodeAction(action, text)");
+    expect(appSource).toContain("workflow.requestRepair(projectRoot");
+    expect(appSource).toContain("workflow.requestVariant(projectRoot");
+    expect(appSource).toContain("workflow.applyRollback(projectRoot");
+    expect(appSource).toContain("instruction: requestText");
+    expect(appSource).toContain("activeSession?.updatedAt, selectedNode]");
+    expect(appSource).not.toContain("activeSession?.updatedAt, selectedNode?.id");
+    expect(appSource).toContain("workflow.getProjection(projectRoot, sessionId)");
+    expect(appSource).toContain("const projectionState = buildSelectedNodeActionState");
+    expect(appSource).toContain("const rollbackPayload = projectionState.rollbackPayload");
+    expect(appSource).not.toContain("hydrateSelectedNodeActionStateFromEvents");
+    expect(appSource).toContain("laneId: rollbackPayload.laneId");
+    expect(appSource).toContain("checkpointId: rollbackPayload.checkpointId");
+    expect(composer).toContain("const actionAvailability = selectedNodeActionAvailability");
+    expect(composer).toContain("disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}");
+  });
+
+  it("More button remains outside the node selection target", async () => {
+    const appSource = await readSource("./App.tsx");
+    const selectTarget = appSource.slice(appSource.indexOf('className="agent-card-select"'), appSource.indexOf('<AgentStreamPreview'));
+    const menuButton = appSource.slice(appSource.indexOf('className="agent-node-menu nodrag"'), appSource.indexOf('<MoreHorizontal'));
+    expect(selectTarget).not.toContain('className="agent-node-menu nodrag"');
+    expect(menuButton).toContain('type="button"');
+    expect(menuButton).toContain("event.stopPropagation()");
+  });
+
+  it("selected node appears in the bottom composer", async () => {
+    const appSource = await readSource("./App.tsx");
+    const composer = appSource.slice(appSource.indexOf('function CanvasComposer('));
+    expect(composer).toContain('selectedNode && (');
+    expect(composer).toContain('className="composer-context-pill"');
+    expect(composer).toContain('{selectedNode.title}');
+    expect(composer).toContain('{selectedNode.agent}');
+  });
+
+  it("action chips change composer mode/placeholder", async () => {
+    const appSource = await readSource("./App.tsx");
+    const composer = appSource.slice(appSource.indexOf('function CanvasComposer('));
+    expect(composer).toContain('className={`action-chip ${action === "repair" ? "selected" : ""}`}');
+    expect(composer).toContain('onClick={() => setAction("repair")}');
+    expect(composer).toContain('if (action === "repair") placeholder =');
+    expect(composer).toContain('else if (action === "variant") placeholder =');
+  });
+
+  it("no selected node keeps existing global bottom input behavior", async () => {
+    const appSource = await readSource("./App.tsx");
+    const composer = appSource.slice(appSource.indexOf('function CanvasComposer('), appSource.indexOf('const hasValue =', appSource.indexOf('function CanvasComposer(')));
+    expect(composer).toContain('let placeholder = "Insert requirement or node"');
+    expect(composer).toContain('if (selectedNode) {');
+  });
+
+  it("modal still has exactly Output / Changes / Context tabs", async () => {
+    const appSource = await readSource("./App.tsx");
+    const modalTabs = appSource.slice(appSource.indexOf('<nav className="modal-tabs"'), appSource.indexOf('</nav>', appSource.indexOf('<nav className="modal-tabs"')));
+    expect(modalTabs).toContain('NODE_MODAL_TABS.map');
+
+    const modalBodyIndex = appSource.indexOf('<div className="modal-body">');
+    const modalBody = appSource.slice(modalBodyIndex, appSource.indexOf('</section>', modalBodyIndex));
+    expect(modalBody).toContain('tab === "Output"');
+    expect(modalBody).toContain('tab === "Changes"');
+    expect(modalBody).toContain('tab === "Context"');
+    expect(modalBody).not.toContain('tab === "Logs"');
+  });
+
+  it("More button has an accessible label", async () => {
+    const appSource = await readSource("./App.tsx");
+    const menuButton = appSource.slice(appSource.indexOf('className="agent-node-menu nodrag"'), appSource.indexOf('<MoreHorizontal'));
+    expect(menuButton).toContain('aria-label={`More details for ${node.title}`}');
+  });
+
+  it("node selection target keeps a visible keyboard focus style", async () => {
+    const styleSource = await readSource("./styles.css");
+    expect(styleSource).toContain(".agent-card-select:focus-visible");
+    expect(styleSource).toContain("outline: 2px solid var(--sk-cobalt)");
+  });
+});
+
+describe("Slice E node rollback/repair/variant UI wiring", () => {
+  const actionState = (overrides: Partial<SelectedNodeActionState> = {}): SelectedNodeActionState => ({
+    composerMode: "global",
+    canRollback: true,
+    blockedByRemoteSideEffect: false,
+    needsBackendCheck: false,
+    canCreateRepair: true,
+    canCreateVariant: true,
+    checkpoints: {
+      hasBefore: true,
+      hasAfter: true,
+      beforeCheckpointId: "checkpoint-before-node",
+      afterCheckpointId: "checkpoint-after-node",
+    },
+    remoteSideEffects: [],
+    blockedReasons: [],
+    rollbackPayload: {
+      sessionId: "session-1",
+      nodeId: "node-1",
+      laneId: "lane-1",
+      checkpointId: "checkpoint-before-node",
+    },
+    repairPayload: {
+      sessionId: "session-1",
+      nodeId: "node-1",
+      laneId: "lane-1",
+      checkpointId: "checkpoint-after-node",
+      successorLaneId: "lane-1-repair",
+      successorSemanticKey: "repair:lane-1:manual",
+    },
+    variantPayload: {
+      sessionId: "session-1",
+      nodeId: "node-1",
+      laneId: "lane-1",
+      checkpointId: "checkpoint-before-node",
+      successorLaneId: "lane-1-variant",
+      successorSemanticKey: "variant:lane-1:manual",
+    },
+    rollbackEligibility: null,
+    ...overrides,
+  });
+
+  it("enables repair only with after checkpoint and backend", () => {
+    expect(selectedNodeActionAvailability(actionState(), true).repair).toEqual({ enabled: true, reason: null });
+    expect(selectedNodeActionAvailability(actionState({
+      canCreateRepair: false,
+      checkpoints: {
+        hasBefore: true,
+        hasAfter: false,
+        beforeCheckpointId: "checkpoint-before-node",
+        afterCheckpointId: null,
+      },
+      repairPayload: null,
+    }), true).repair).toEqual({
+      enabled: false,
+      reason: "Repair requires an after checkpoint.",
+    });
+    expect(selectedNodeActionAvailability(actionState(), false).repair).toEqual({
+      enabled: false,
+      reason: "Workflow backend unavailable.",
+    });
+  });
+
+  it("enables variant only with before checkpoint and backend", () => {
+    expect(selectedNodeActionAvailability(actionState(), true).variant).toEqual({ enabled: true, reason: null });
+    expect(selectedNodeActionAvailability(actionState({
+      canCreateVariant: false,
+      canRollback: false,
+      checkpoints: {
+        hasBefore: false,
+        hasAfter: true,
+        beforeCheckpointId: null,
+        afterCheckpointId: "checkpoint-after-node",
+      },
+      variantPayload: null,
+      rollbackPayload: null,
+    }), true).variant).toEqual({
+      enabled: false,
+      reason: "Variant requires a before checkpoint.",
+    });
+    expect(selectedNodeActionAvailability(actionState(), false).variant).toEqual({
+      enabled: false,
+      reason: "Workflow backend unavailable.",
+    });
+  });
+
+  it("disables rollback when helper reports remote side effects", () => {
+    expect(selectedNodeActionAvailability(actionState({
+      canRollback: false,
+      blockedByRemoteSideEffect: true,
+      rollbackPayload: null,
+      blockedReasons: ["Remote side effects exist."],
+    }), true).rollback).toEqual({
+      enabled: false,
+      reason: REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
+    });
+  });
+
+  it("allows rollback only when helper marks it eligible and backend is available", () => {
+    expect(selectedNodeActionAvailability(actionState(), true).rollback).toEqual({ enabled: true, reason: null });
+    expect(selectedNodeActionAvailability(actionState(), false).rollback).toEqual({
+      enabled: false,
+      reason: "Workflow backend unavailable.",
+    });
+    expect(selectedNodeActionAvailability(actionState({
+      canRollback: false,
+      rollbackPayload: null,
+      blockedReasons: ["Rollback requires an existing before checkpoint."],
+    }), true).rollback).toEqual({
+      enabled: false,
+      reason: "Rollback requires an existing before checkpoint.",
+    });
+  });
+
+  it("shows backend rollback failure through user-visible error state", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("rollbackBlockedMessage(result)");
+    expect(appSource).toContain("setNodeActionError(blockedMessage)");
+    expect(appSource).toContain("actionFailureMessage(error");
+  });
+
+  it("renders rolled-back and inactive nodes from existing rollbackStatus", async () => {
+    expect(rollbackLabelForNode({ rollbackStatus: "rolled_back" })).toBe("Rolled back");
+    expect(rollbackLabelForNode({ rollbackStatus: "inactive" })).toBe("Inactive");
+
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("rollbackStatusForNode(node)");
+    expect(appSource).toContain("data-rollback-status={rollbackStatus || undefined}");
+    expect(appSource).toContain("rollback-badge");
+
+    const styleSource = await readSource("./styles.css");
+    expect(styleSource).toContain(".agent-node-shell.rollback-rolled_back");
+    expect(styleSource).toContain(".agent-node-shell.rollback-inactive");
+  });
+
+  it("states rollback scope without claiming evidence/history deletion", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("Rollback affects selected and downstream workflow state, not evidence/history.");
+    expect(appSource).not.toContain("delete evidence");
+    expect(appSource).not.toContain("delete history");
+  });
 });

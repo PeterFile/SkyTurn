@@ -2216,6 +2216,10 @@ h2 {
 
 .agent-node-menu {
   display: inline-grid;
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  z-index: 3;
   flex: 0 0 auto;
   width: 28px;
   height: 28px;
@@ -2410,6 +2414,27 @@ h2 {
   --node-border: 1px solid var(--sk-pink);
 }
 
+.agent-node-shell.rollback-rolled_back,
+.agent-node-shell.rollback-inactive {
+  opacity: 0.58;
+}
+
+.agent-node-shell.rollback-rolled_back .agent-card,
+.agent-node-shell.rollback-inactive .agent-card {
+  filter: grayscale(0.35);
+}
+
+.rollback-badge {
+  border: 1px solid var(--sk-border-muted);
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: rgba(15, 23, 42, 0.08);
+  color: var(--sk-ink-muted);
+}
+
 .agent-card {
   position: relative;
   z-index: 2;
@@ -2425,9 +2450,36 @@ h2 {
   box-shadow: var(--agent-shadow);
   padding: 18px 18px 16px;
   text-align: left;
-  cursor: pointer;
+  cursor: default;
   outline: none;
   will-change: transform;
+}
+
+.agent-card-select {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+}
+
+.agent-card-select:focus {
+  outline: none;
+}
+
+.agent-card-select:focus-visible {
+  outline: 2px solid var(--sk-cobalt);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 5px rgba(255, 241, 39, 0.52);
+}
+
+.agent-card-select .agent-node-header {
+  padding-right: 34px;
 }
 
 .agent-node-shell:hover .agent-card {
@@ -5898,4 +5950,75 @@ select:focus-visible,
   line-height: 1.35;
   margin: 8px 0 0 0;
   overflow-wrap: anywhere;
+}
+
+/* Composer Selection State UI */
+
+.composer-context-pill {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background-color: #dbeafe;
+  color: #051d48;
+  font-size: 13px;
+  width: max-content;
+}
+
+.composer-context-pill .pill-title {
+  font-weight: 700;
+}
+
+.composer-context-pill .pill-meta {
+  font-size: 11px;
+  color: #475569;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.composer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.action-chip {
+  padding: 4px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  background-color: #f8fafc;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 150ms ease, border-color 150ms ease, box-shadow 150ms ease, color 150ms ease;
+}
+
+.action-chip:hover {
+  background-color: #e2e8f0;
+  color: #1e293b;
+}
+
+.action-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.action-chip.selected {
+  background-color: var(--sk-cobalt);
+  color: var(--sk-paper-white);
+  border-color: var(--sk-cobalt-deep);
+}
+
+.composer-action-message {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--sk-ink-muted);
+}
+
+.composer-action-message.error {
+  color: var(--sk-status-failed-text);
 }

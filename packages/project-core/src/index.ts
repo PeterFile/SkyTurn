@@ -418,6 +418,7 @@ export type WorkflowRequestedCheckpointSuccessorIntent = Omit<WorkflowCheckpoint
   WorkflowCheckpointSuccessorIdentity & {
     kind: WorkflowCheckpointSuccessorKind;
     status: "requested";
+    instruction?: string;
     reason?: string;
   };
 
@@ -426,6 +427,7 @@ export interface WorkflowRejectedCheckpointSuccessorIntent extends WorkflowCheck
   status: "rejected";
   successorLaneId?: string;
   successorSemanticKey?: string;
+  instruction?: string;
   reason: string;
 }
 

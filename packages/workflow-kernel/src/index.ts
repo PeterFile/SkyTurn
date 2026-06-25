@@ -1809,6 +1809,7 @@ function normalizeCheckpointIntent(
   const payloadNodeId = stringValue(event.payload.nodeId);
   const successorLaneId = stringValue(event.payload.successorLaneId);
   const successorSemanticKey = stringValue(event.payload.successorSemanticKey);
+  const instruction = stringValue(event.payload.instruction) ?? stringValue(event.payload.text);
   const laneId = checkpoint?.laneId ?? payloadLaneId;
   const nodeId = checkpoint?.nodeId ?? payloadNodeId ?? laneId;
   const ownershipMatches =
@@ -1835,6 +1836,7 @@ function normalizeCheckpointIntent(
     ...(laneId ? { laneId } : {}),
     ...(nodeId ? { nodeId } : {}),
     ...(checkpointId ? { checkpointId } : {}),
+    ...(instruction ? { instruction } : {}),
     createdAt: event.createdAt,
     ...(typeof event.payload.localRollbackSafe === "boolean" ? { localRollbackSafe: event.payload.localRollbackSafe } : {}),
   };

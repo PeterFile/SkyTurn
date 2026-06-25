@@ -3050,6 +3050,49 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(scheduleReadyLanes(repaired, { allowedParallelism: 3 }).map((item) => item.id)).toEqual(["lane-regression-b"]);
   });
 
+  it("retains repair and variant instructions in checkpoint intents", () => {
+    const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
+    const afterCheckpointId = "checkpoint-after-lane-b-run-1";
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint(beforeCheckpointId, "lane-b", "before", "base-sha"),
+      }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint(afterCheckpointId, "lane-b", "after", "head-sha"),
+      }),
+      event("workflow.node.repair_requested", {
+        intentId: "repair-lane-b-after",
+        laneId: "lane-b",
+        checkpointId: afterCheckpointId,
+        successorLaneId: "lane-repair-b",
+        successorSemanticKey: "successor:repair-lane-b",
+        instruction: "Fix the selected node result.",
+      }),
+      event("workflow.node.variant_requested", {
+        intentId: "variant-lane-b-before",
+        laneId: "lane-b",
+        checkpointId: beforeCheckpointId,
+        successorLaneId: "lane-variant-b",
+        successorSemanticKey: "successor:variant-lane-b",
+        instruction: "Try a different implementation.",
+      }),
+    ]);
+
+    expect(projection.checkpointIntents).toEqual([
+      expect.objectContaining({
+        intentId: "repair-lane-b-after",
+        kind: "repair",
+        instruction: "Fix the selected node result.",
+      }),
+      expect.objectContaining({
+        intentId: "variant-lane-b-before",
+        kind: "variant",
+        instruction: "Try a different implementation.",
+      }),
+    ]);
+  });
+
   it("does not schedule rollback successors before rollback is applied", () => {
     const afterCheckpointId = "checkpoint-after-lane-b-run-1";
     const projection = reduceWorkflowEvents([
