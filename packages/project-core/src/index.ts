@@ -2,6 +2,7 @@ export type WorkflowMode = "fast" | "plan";
 export type SessionKind = "plan" | "canvas";
 export type AgentKind = "hermes" | "codex" | "gemini" | "claude-code" | "openclaw";
 export type NodeStatus = "pending" | "running" | "retrying" | "completed" | "failed";
+export type NodeRollbackStatus = "rolled_back" | "inactive" | "rejected";
 export type NodeLifecyclePhase =
   | "Queued"
   | "Think"
@@ -76,6 +77,16 @@ export type UserDecisionAction = "backtrack" | "parallel_worktree" | "continue" 
 export type UserDecisionNodeStatus = "waiting_input" | "answered";
 export type WorkflowVariantAdoptionStrategy = "merge" | "cherry-pick";
 export type WorkflowVariantAdoptionStatus = "requested" | "adopted" | "failed" | "rejected";
+export type WorkflowNodeCheckpointPhase = "before" | "after";
+export type WorkflowNodeCheckpointSource = "agent_bridge" | "workflow_kernel" | "backend" | "user";
+export type WorkflowCheckpointEvidenceRefKind = "run" | "segment" | "evidence" | "changeset" | "artifact" | "commit";
+export type WorkflowRemoteSideEffectEventKind =
+  | "workflow.delivery.pushed"
+  | "workflow.pull_request.created"
+  | "workflow.pull_request.merged"
+  | "workflow.delivery.main_synced";
+export type WorkflowCheckpointIntentKind = "rollback" | "repair" | "variant" | "fork";
+export type WorkflowCheckpointIntentStatus = "requested" | "applied" | "rejected";
 export type ChangesetEvidenceStatus = "available" | "empty" | "failed" | "unknown";
 export type LiveRunChangeOperation = "add" | "delete" | "update" | "move";
 export type FinalChangesetReconciliationStatus = "available" | "empty" | "failed" | "mismatch";
@@ -315,6 +326,114 @@ export interface WorkflowVariantAdoption {
   failureReason?: string;
 }
 
+export interface WorkflowCheckpointEvidenceRef {
+  kind: WorkflowCheckpointEvidenceRefKind;
+  id: string;
+  uri?: string;
+}
+
+export interface WorkflowNodeCheckpointAuthority {
+  laneIdExplicit?: boolean;
+  nodeIdExplicit?: boolean;
+  phaseExplicit?: boolean;
+  executionTargetExplicit?: boolean;
+}
+
+export interface WorkflowNodeCheckpoint {
+  id: string;
+  sessionId: string;
+  nodeId: string;
+  laneId?: string;
+  runId?: string;
+  segmentId?: string;
+  phase: WorkflowNodeCheckpointPhase;
+  executionTarget: SessionExecutionTarget;
+  worktreeId?: string;
+  worktreePath?: string;
+  baseCommit?: string;
+  headCommit?: string;
+  createdAt: string;
+  source: WorkflowNodeCheckpointSource;
+  evidenceRefs: WorkflowCheckpointEvidenceRef[];
+  authority?: WorkflowNodeCheckpointAuthority;
+}
+
+export interface WorkflowRemoteSideEffectRef {
+  eventKind: WorkflowRemoteSideEffectEventKind;
+  eventId: string;
+  laneId?: string;
+  affectedLaneIds?: string[];
+  sessionWide?: boolean;
+  createdAt?: string;
+}
+
+export interface WorkflowRemoteSideEffectPayload {
+  laneId?: string;
+  commitLaneId?: string;
+  targetLaneId?: string;
+  affectedLaneIds?: string[];
+  evidence?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface WorkflowRollbackEligibility {
+  eligible: boolean;
+  targetLaneId: string;
+  targetNodeId?: string;
+  checkpointId?: string;
+  restoreCommitRef?: string;
+  affectedLaneIds: string[];
+  blockingRemoteSideEffects: WorkflowRemoteSideEffectRef[];
+  localRollbackSafe?: boolean;
+  reason?: string;
+}
+
+export interface WorkflowCheckpointIntentBase {
+  intentId: string;
+  sessionId: string;
+  nodeId?: string;
+  laneId?: string;
+  checkpointId?: string;
+  createdAt: string;
+  localRollbackSafe?: boolean;
+}
+
+export interface WorkflowRollbackCheckpointIntent extends WorkflowCheckpointIntentBase {
+  kind: "rollback";
+  status: WorkflowCheckpointIntentStatus;
+  eligibility?: WorkflowRollbackEligibility;
+  reason?: string;
+  successorLaneId?: never;
+  successorSemanticKey?: never;
+}
+
+export type WorkflowCheckpointSuccessorKind = Exclude<WorkflowCheckpointIntentKind, "rollback">;
+
+export type WorkflowCheckpointSuccessorIdentity =
+  | { successorLaneId: string; successorSemanticKey?: string }
+  | { successorLaneId?: string; successorSemanticKey: string };
+
+export type WorkflowRequestedCheckpointSuccessorIntent = Omit<WorkflowCheckpointIntentBase, "laneId"> &
+  { laneId: string } &
+  WorkflowCheckpointSuccessorIdentity & {
+    kind: WorkflowCheckpointSuccessorKind;
+    status: "requested";
+    reason?: string;
+  };
+
+export interface WorkflowRejectedCheckpointSuccessorIntent extends WorkflowCheckpointIntentBase {
+  kind: WorkflowCheckpointSuccessorKind;
+  status: "rejected";
+  successorLaneId?: string;
+  successorSemanticKey?: string;
+  reason: string;
+}
+
+export type WorkflowCheckpointIntent =
+  | WorkflowRollbackCheckpointIntent
+  | WorkflowRequestedCheckpointSuccessorIntent
+  | WorkflowRejectedCheckpointSuccessorIntent;
+
 export interface ChangesetEvidence {
   evidenceId: string;
   changesetId: string;
@@ -418,6 +537,7 @@ export interface CanvasNode {
   display?: CanvasNodeDisplay;
   workflowTrace?: CanvasNodeWorkflowTrace;
   status: NodeStatus;
+  rollbackStatus?: NodeRollbackStatus;
   position: {
     x: number;
     y: number;

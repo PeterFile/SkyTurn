@@ -21,10 +21,25 @@ import {
   type WorkflowLedgerSummary,
   type WorkflowRuntimePolicy,
   type LiveRunChangesEvidence,
+  type WorkflowCheckpointIntent,
+  type WorkflowNodeCheckpoint,
+  type WorkflowRequestedCheckpointSuccessorIntent,
+  type NodeRollbackStatus,
+  type NodeStatus,
+  type WorkflowRollbackEligibility,
+  type WorkflowRemoteSideEffectPayload,
   type SessionTarget,
   type WorkflowVariantAdoption,
   type WorkflowWorktreeIdentity,
 } from "./index";
+
+const stableNodeStatusContract: Record<NodeStatus, true> = {
+  pending: true,
+  running: true,
+  retrying: true,
+  completed: true,
+  failed: true,
+};
 
 describe("agent run contracts", () => {
   it("models OpenClaw discovery with an explicit support level", () => {
@@ -160,8 +175,11 @@ describe("agent run contracts", () => {
       completedAt: "2026-06-12T00:00:01.000Z",
     };
 
+    const status: NodeStatus = deriveNodeStatusFromEvidence(run, evidence);
+
+    expect(Object.keys(stableNodeStatusContract).sort()).toEqual(["completed", "failed", "pending", "retrying", "running"]);
     expect(hasConcreteRunEvidence(evidence)).toBe(false);
-    expect(deriveNodeStatusFromEvidence(run, evidence)).toBe("failed");
+    expect(status).toBe("failed");
   });
 
   it("exports canonical workflow lane semantics for natural flow contracts", () => {
@@ -179,6 +197,7 @@ describe("agent run contracts", () => {
       sideEffects: [],
       reason: "Human decision nodes are not agent tasks.",
     };
+    const rollbackStatus: NodeRollbackStatus = "rolled_back";
     const node = {
       id: "decision-architecture-risk",
       title: "Choose architecture path",
@@ -195,6 +214,7 @@ describe("agent run contracts", () => {
         status: "waiting_input",
       },
       status: "running",
+      rollbackStatus,
       position: { x: 0, y: 0 },
       runId: "run-decision-architecture-risk",
       changesetId: "changeset-decision-architecture-risk",
@@ -214,6 +234,7 @@ describe("agent run contracts", () => {
     expect(node.executable).toBe(false);
     expect(node.runtimePolicy.sandbox).toBe("read-only");
     expect(node.userDecision?.status).toBe("waiting_input");
+    expect(node.rollbackStatus).toBe("rolled_back");
   });
 
   it("publishes ledger, decision, worktree, variant, and changeset evidence contracts", () => {
@@ -280,5 +301,166 @@ describe("agent run contracts", () => {
     expect(worktree.gitdir).toContain("/.git/worktrees/");
     expect(adoption.status).toBe("requested");
     expect(changesetEvidence.source).toBe("git");
+  });
+
+  it("models node-boundary checkpoints and rollback eligibility without tool-call grain", () => {
+    const beforeCheckpoint: WorkflowNodeCheckpoint = {
+      id: "checkpoint-before-lane-implementation-run-1",
+      sessionId: "session-1",
+      nodeId: "node-implementation",
+      laneId: "lane-implementation",
+      runId: "run-implementation-1",
+      segmentId: "segment-implementation-1",
+      phase: "before",
+      executionTarget: "new_worktree",
+      worktreeId: "worktree-implementation",
+      worktreePath: "/repo.worktrees/session-1-implementation",
+      baseCommit: "base-sha",
+      headCommit: "head-before-sha",
+      createdAt: "2026-06-23T00:00:00.000Z",
+      source: "agent_bridge",
+      evidenceRefs: [{ kind: "run", id: "run-implementation-1" }],
+      authority: {
+        laneIdExplicit: true,
+        nodeIdExplicit: true,
+        phaseExplicit: true,
+        executionTargetExplicit: true,
+      },
+    };
+    const afterCheckpoint: WorkflowNodeCheckpoint = {
+      ...beforeCheckpoint,
+      id: "checkpoint-after-lane-implementation-run-1",
+      phase: "after",
+      headCommit: "head-after-sha",
+      evidenceRefs: [{ kind: "changeset", id: "changeset-implementation-1" }],
+    };
+    const eligibility: WorkflowRollbackEligibility = {
+      eligible: false,
+      targetLaneId: "lane-implementation",
+      checkpointId: beforeCheckpoint.id,
+      restoreCommitRef: beforeCheckpoint.headCommit,
+      affectedLaneIds: ["lane-implementation", "lane-validation"],
+      blockingRemoteSideEffects: [
+        {
+          eventKind: "workflow.pull_request.created",
+          laneId: "lane-validation",
+          eventId: "event-pr-created",
+        },
+      ],
+      localRollbackSafe: true,
+      reason: "Remote side effects exist.",
+    };
+    const remoteSideEffectPayload: WorkflowRemoteSideEffectPayload = {
+      affectedLaneIds: ["lane-implementation", "lane-validation"],
+      evidence: { url: "https://example.test/pr/42" },
+    };
+    const repairIntent: WorkflowCheckpointIntent = {
+      intentId: "repair-lane-implementation",
+      sessionId: "session-1",
+      kind: "repair",
+      status: "requested",
+      nodeId: "node-implementation",
+      laneId: "lane-implementation",
+      checkpointId: afterCheckpoint.id,
+      successorLaneId: "lane-implementation-repair",
+      successorSemanticKey: "successor:lane-implementation-repair",
+      createdAt: "2026-06-23T00:00:01.000Z",
+    };
+
+    expect(beforeCheckpoint.phase).toBe("before");
+    expect(afterCheckpoint.phase).toBe("after");
+    expect(beforeCheckpoint.executionTarget).toBe("new_worktree");
+    expect(beforeCheckpoint.authority?.phaseExplicit).toBe(true);
+    expect(beforeCheckpoint.authority?.executionTargetExplicit).toBe(true);
+    expect(beforeCheckpoint.evidenceRefs).toEqual([{ kind: "run", id: "run-implementation-1" }]);
+    expect(beforeCheckpoint).not.toHaveProperty("toolCallId");
+    expect(eligibility.checkpointId).toBe(beforeCheckpoint.id);
+    expect(eligibility.restoreCommitRef).toBe("head-before-sha");
+    expect(eligibility.blockingRemoteSideEffects[0]?.eventKind).toBe("workflow.pull_request.created");
+    expect(remoteSideEffectPayload.affectedLaneIds).toEqual(["lane-implementation", "lane-validation"]);
+    expect(repairIntent.successorLaneId).toBe("lane-implementation-repair");
+    expect(repairIntent.successorSemanticKey).toBe("successor:lane-implementation-repair");
+  });
+
+  it("models rejected successor intents when repair, variant, or fork has no explicit successor identity", () => {
+    const baseIntent = {
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-lane-implementation-run-1",
+      createdAt: "2026-06-23T00:00:01.000Z",
+      status: "rejected",
+      reason: "repair requires successor identity.",
+    } as const;
+    const repairIntentWithoutSuccessor: WorkflowCheckpointIntent = {
+      ...baseIntent,
+      intentId: "repair-lane-implementation",
+      kind: "repair",
+    };
+    const variantIntentWithoutSuccessor: WorkflowCheckpointIntent = {
+      ...baseIntent,
+      intentId: "variant-lane-implementation",
+      kind: "variant",
+      checkpointId: "checkpoint-before-lane-implementation-run-1",
+      reason: "variant requires successor identity.",
+    };
+    const forkIntentWithoutSuccessor: WorkflowCheckpointIntent = {
+      ...baseIntent,
+      intentId: "fork-lane-implementation",
+      kind: "fork",
+      checkpointId: "checkpoint-before-lane-implementation-run-1",
+      reason: "fork requires successor identity.",
+    };
+    const repairIntentWithLaneId: WorkflowCheckpointIntent = {
+      intentId: "repair-lane-implementation-by-id",
+      sessionId: "session-1",
+      kind: "repair",
+      status: "requested",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-lane-implementation-run-1",
+      successorLaneId: "lane-implementation-repair",
+      createdAt: "2026-06-23T00:00:01.000Z",
+    };
+    const repairIntentWithSemanticKey: WorkflowCheckpointIntent = {
+      intentId: "repair-lane-implementation-by-key",
+      sessionId: "session-1",
+      kind: "repair",
+      status: "requested",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-lane-implementation-run-1",
+      successorSemanticKey: "successor:lane-implementation-repair",
+      createdAt: "2026-06-23T00:00:01.000Z",
+    };
+    const requestedSuccessorIntent: WorkflowRequestedCheckpointSuccessorIntent = {
+      intentId: "repair-lane-implementation-targeted",
+      sessionId: "session-1",
+      kind: "repair",
+      status: "requested",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-lane-implementation-run-1",
+      successorSemanticKey: "successor:lane-implementation-repair",
+      createdAt: "2026-06-23T00:00:01.000Z",
+    };
+    const rollbackIntentWithoutSuccessor: WorkflowCheckpointIntent = {
+      intentId: "rollback-lane-implementation",
+      sessionId: "session-1",
+      kind: "rollback",
+      status: "requested",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-lane-implementation-run-1",
+      createdAt: "2026-06-23T00:00:01.000Z",
+    };
+
+    for (const intent of [repairIntentWithoutSuccessor, variantIntentWithoutSuccessor, forkIntentWithoutSuccessor]) {
+      expect(intent.status).toBe("rejected");
+      expect(intent.reason).toMatch(/successor identity/i);
+      expect(intent).not.toHaveProperty("successorLaneId");
+      expect(intent).not.toHaveProperty("successorSemanticKey");
+    }
+    expect(repairIntentWithLaneId.successorLaneId).toBe("lane-implementation-repair");
+    expect(repairIntentWithLaneId.status).toBe("requested");
+    expect(repairIntentWithSemanticKey.successorSemanticKey).toBe("successor:lane-implementation-repair");
+    expect(repairIntentWithSemanticKey.status).toBe("requested");
+    expect(requestedSuccessorIntent.laneId).toBe("lane-implementation");
+    expect(rollbackIntentWithoutSuccessor.status).toBe("requested");
   });
 });
