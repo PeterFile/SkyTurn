@@ -1,6 +1,9 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import {
+  REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
+  selectedNodeActionAvailability,
+  rollbackLabelForNode,
   buildWorktreeAdoptionConfirmation,
   buildWorktreeCleanConfirmation,
   buildWorktreeDeleteBranchConfirmation,
@@ -11,6 +14,7 @@ import {
   summarizeWorktreeComparisonEvidence,
 } from "./App.js";
 import type { CanvasNode, Changeset, FinalChangesetReconciliation } from "@skyturn/project-core";
+import type { SelectedNodeActionState } from "./nodeActionState.js";
 
 function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
   return {
@@ -609,18 +613,26 @@ describe("Slice C UI behavior", () => {
     expect(reactFlow).not.toContain('role="listbox"');
   });
 
-  it("node-scoped composer actions stay display-only until backend wiring", async () => {
+  it("node-scoped composer actions submit through workflow node-action APIs", async () => {
     const appSource = await readSource("./App.tsx");
     const submitHandler = appSource.slice(appSource.indexOf("async function appendRequirementNode"), appSource.indexOf("function retryNode"));
     const composer = appSource.slice(appSource.indexOf("function CanvasComposer("));
-    expect(submitHandler).toContain("async function appendRequirementNode(_action?: ComposerAction)");
-    expect(submitHandler).not.toContain("nodeAction:");
-    expect(submitHandler).not.toContain("nodeId: targetNode");
-    expect(composer).toContain("const nodeActionPendingBackend = selectedNode !== null");
-    expect(composer).toContain('const displayedValue = nodeActionPendingBackend ? "" : value');
-    expect(composer).toContain("const canSubmit = hasValue && !nodeActionPendingBackend");
-    expect(composer).toContain("disabled={disabled || nodeActionPendingBackend}");
-    expect(composer).toContain("Node action submission is not available yet");
+    expect(submitHandler).toContain("async function appendRequirementNode(action?: ComposerAction)");
+    expect(submitHandler).toContain("await submitSelectedNodeAction(action, text)");
+    expect(appSource).toContain("workflow.requestRepair(projectRoot");
+    expect(appSource).toContain("workflow.requestVariant(projectRoot");
+    expect(appSource).toContain("workflow.applyRollback(projectRoot");
+    expect(appSource).toContain("instruction: requestText");
+    expect(appSource).toContain("activeSession?.updatedAt, selectedNode]");
+    expect(appSource).not.toContain("activeSession?.updatedAt, selectedNode?.id");
+    expect(appSource).toContain("workflow.getProjection(projectRoot, sessionId)");
+    expect(appSource).toContain("const projectionState = buildSelectedNodeActionState");
+    expect(appSource).toContain("const rollbackPayload = projectionState.rollbackPayload");
+    expect(appSource).not.toContain("hydrateSelectedNodeActionStateFromEvents");
+    expect(appSource).toContain("laneId: rollbackPayload.laneId");
+    expect(appSource).toContain("checkpointId: rollbackPayload.checkpointId");
+    expect(composer).toContain("const actionAvailability = selectedNodeActionAvailability");
+    expect(composer).toContain("disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}");
   });
 
   it("More button remains outside the node selection target", async () => {
@@ -680,5 +692,148 @@ describe("Slice C UI behavior", () => {
     const styleSource = await readSource("./styles.css");
     expect(styleSource).toContain(".agent-card-select:focus-visible");
     expect(styleSource).toContain("outline: 2px solid var(--sk-cobalt)");
+  });
+});
+
+describe("Slice E node rollback/repair/variant UI wiring", () => {
+  const actionState = (overrides: Partial<SelectedNodeActionState> = {}): SelectedNodeActionState => ({
+    composerMode: "global",
+    canRollback: true,
+    blockedByRemoteSideEffect: false,
+    needsBackendCheck: false,
+    canCreateRepair: true,
+    canCreateVariant: true,
+    checkpoints: {
+      hasBefore: true,
+      hasAfter: true,
+      beforeCheckpointId: "checkpoint-before-node",
+      afterCheckpointId: "checkpoint-after-node",
+    },
+    remoteSideEffects: [],
+    blockedReasons: [],
+    rollbackPayload: {
+      sessionId: "session-1",
+      nodeId: "node-1",
+      laneId: "lane-1",
+      checkpointId: "checkpoint-before-node",
+    },
+    repairPayload: {
+      sessionId: "session-1",
+      nodeId: "node-1",
+      laneId: "lane-1",
+      checkpointId: "checkpoint-after-node",
+      successorLaneId: "lane-1-repair",
+      successorSemanticKey: "repair:lane-1:manual",
+    },
+    variantPayload: {
+      sessionId: "session-1",
+      nodeId: "node-1",
+      laneId: "lane-1",
+      checkpointId: "checkpoint-before-node",
+      successorLaneId: "lane-1-variant",
+      successorSemanticKey: "variant:lane-1:manual",
+    },
+    rollbackEligibility: null,
+    ...overrides,
+  });
+
+  it("enables repair only with after checkpoint and backend", () => {
+    expect(selectedNodeActionAvailability(actionState(), true).repair).toEqual({ enabled: true, reason: null });
+    expect(selectedNodeActionAvailability(actionState({
+      canCreateRepair: false,
+      checkpoints: {
+        hasBefore: true,
+        hasAfter: false,
+        beforeCheckpointId: "checkpoint-before-node",
+        afterCheckpointId: null,
+      },
+      repairPayload: null,
+    }), true).repair).toEqual({
+      enabled: false,
+      reason: "Repair requires an after checkpoint.",
+    });
+    expect(selectedNodeActionAvailability(actionState(), false).repair).toEqual({
+      enabled: false,
+      reason: "Workflow backend unavailable.",
+    });
+  });
+
+  it("enables variant only with before checkpoint and backend", () => {
+    expect(selectedNodeActionAvailability(actionState(), true).variant).toEqual({ enabled: true, reason: null });
+    expect(selectedNodeActionAvailability(actionState({
+      canCreateVariant: false,
+      canRollback: false,
+      checkpoints: {
+        hasBefore: false,
+        hasAfter: true,
+        beforeCheckpointId: null,
+        afterCheckpointId: "checkpoint-after-node",
+      },
+      variantPayload: null,
+      rollbackPayload: null,
+    }), true).variant).toEqual({
+      enabled: false,
+      reason: "Variant requires a before checkpoint.",
+    });
+    expect(selectedNodeActionAvailability(actionState(), false).variant).toEqual({
+      enabled: false,
+      reason: "Workflow backend unavailable.",
+    });
+  });
+
+  it("disables rollback when helper reports remote side effects", () => {
+    expect(selectedNodeActionAvailability(actionState({
+      canRollback: false,
+      blockedByRemoteSideEffect: true,
+      rollbackPayload: null,
+      blockedReasons: ["Remote side effects exist."],
+    }), true).rollback).toEqual({
+      enabled: false,
+      reason: REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
+    });
+  });
+
+  it("allows rollback only when helper marks it eligible and backend is available", () => {
+    expect(selectedNodeActionAvailability(actionState(), true).rollback).toEqual({ enabled: true, reason: null });
+    expect(selectedNodeActionAvailability(actionState(), false).rollback).toEqual({
+      enabled: false,
+      reason: "Workflow backend unavailable.",
+    });
+    expect(selectedNodeActionAvailability(actionState({
+      canRollback: false,
+      rollbackPayload: null,
+      blockedReasons: ["Rollback requires an existing before checkpoint."],
+    }), true).rollback).toEqual({
+      enabled: false,
+      reason: "Rollback requires an existing before checkpoint.",
+    });
+  });
+
+  it("shows backend rollback failure through user-visible error state", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("rollbackBlockedMessage(result)");
+    expect(appSource).toContain("setNodeActionError(blockedMessage)");
+    expect(appSource).toContain("actionFailureMessage(error");
+  });
+
+  it("renders rolled-back and inactive nodes from existing rollbackStatus", async () => {
+    expect(rollbackLabelForNode({ rollbackStatus: "rolled_back" })).toBe("Rolled back");
+    expect(rollbackLabelForNode({ rollbackStatus: "inactive" })).toBe("Inactive");
+
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("rollbackStatusForNode(node)");
+    expect(appSource).toContain("data-rollback-status={rollbackStatus || undefined}");
+    expect(appSource).toContain("rollback-badge");
+
+    const styleSource = await readSource("./styles.css");
+    expect(styleSource).toContain(".agent-node-shell.rollback-rolled_back");
+    expect(styleSource).toContain(".agent-node-shell.rollback-inactive");
+  });
+
+  it("states rollback scope without claiming evidence/history deletion", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("Rollback affects selected and downstream workflow state, not evidence/history.");
+    expect(appSource).not.toContain("delete evidence");
+    expect(appSource).not.toContain("delete history");
   });
 });

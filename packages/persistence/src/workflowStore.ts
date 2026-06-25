@@ -27,6 +27,7 @@ import {
   compileWorkflowIntent,
   createDefaultFlowPolicy,
   evaluateRollbackEligibility,
+  nodeStatusProjectionForFlowLane,
   parseWorkflowIntent,
   reduceWorkflowEvents,
   scheduleReadyLanes as scheduleFlowReadyLanes,
@@ -356,6 +357,7 @@ export interface WorkflowCheckpointSuccessorRequest {
   successorLaneId?: string;
   successorSemanticKey?: string;
   title?: string;
+  instruction?: string;
   now: string;
 }
 
@@ -1242,6 +1244,7 @@ export class WorkflowStore {
           checkpointId: input.checkpointId,
           successorLaneId: currentPrepared.successorLaneId,
           successorSemanticKey: currentPrepared.successorSemanticKey,
+          ...(input.instruction ? { instruction: input.instruction } : {}),
         },
         now: input.now,
       });
@@ -1278,11 +1281,13 @@ export class WorkflowStore {
     const existingSuccessorSemanticKey = optionalText(existing.payload.successorSemanticKey);
     const existingCheckpointId = optionalText(existing.payload.checkpointId);
     const existingLaneId = optionalText(existing.payload.laneId);
+    const existingInstruction = optionalText(existing.payload.instruction);
     if (
       existingSuccessorLaneId !== successorLaneId ||
       existingSuccessorSemanticKey !== successorSemanticKey ||
       existingCheckpointId !== input.checkpointId ||
-      existingLaneId !== (input.laneId ?? existingLaneId)
+      existingLaneId !== (input.laneId ?? existingLaneId) ||
+      existingInstruction !== (input.instruction ?? existingInstruction)
     ) {
       throw new Error(`${kind} idempotent retry conflicts with existing successor identity.`);
     }
@@ -1931,7 +1936,8 @@ function flowLaneToCanvasNode(
 ): CanvasNode {
   const latestSegment = [...projection.segments].reverse().find((segment) => segment.laneId === lane.id);
   const createdWorktree = worktreeForParentLane(projection, lane.id);
-  const status = flowLaneStatusToNodeStatus(lane.status);
+  const statusProjection = nodeStatusProjectionForFlowLane(lane);
+  const status = statusProjection.status;
   return {
     id: lane.id,
     title: lane.title,
@@ -1954,6 +1960,7 @@ function flowLaneToCanvasNode(
       semanticKey: lane.semanticKey,
     },
     status,
+    ...(statusProjection.rollbackStatus ? { rollbackStatus: statusProjection.rollbackStatus } : {}),
     position: { x: 460 + ((index - 1) % 3) * 340, y: 140 + Math.floor((index - 1) / 3) * 220 },
     runId: latestSegment?.runId ?? runIdForLane(session.id, lane.id),
     changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
@@ -2263,13 +2270,6 @@ function changesetsFromFlowEvents(events: WorkflowEventRecord[]): Map<string, st
     if (laneId && changesetId) changesets.set(laneId, changesetId);
   }
   return changesets;
-}
-
-function flowLaneStatusToNodeStatus(status: FlowLane["status"]): NodeStatus {
-  if (status === "completed") return "completed";
-  if (status === "failed" || status === "blocked") return "failed";
-  if (status === "running" || status === "waiting_input") return "running";
-  return "pending";
 }
 
 function progressForFlowLaneStatus(status: FlowLane["status"]): string {

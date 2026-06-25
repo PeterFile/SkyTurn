@@ -125,6 +125,14 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(variantHandler, /workflow\.node\.variant_requested|requestNodeVariant/);
   assert.match(variantHandler, /broadcastWorkflowProjection/);
 
+  const successorNormalizer = main.slice(
+    main.indexOf("function normalizeCheckpointSuccessorInput"),
+    main.indexOf("function appendRollbackRequestedEvent"),
+  );
+  assert.match(successorNormalizer, /optionalText\(readField\(input,\s*"instruction"\)\)/);
+  assert.match(successorNormalizer, /optionalText\(readField\(input,\s*"text"\)\)/);
+  assert.match(successorNormalizer, /instruction:\s*\(optionalText\(readField\(input,\s*"instruction"\)\)\s*\?\?\s*optionalText\(readField\(input,\s*"text"\)\)\)!/);
+
   const worktreeCreateHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:worktree:create"'),
     main.indexOf('ipcMain.handle("workflow:worktree:compare"'),

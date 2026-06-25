@@ -169,6 +169,8 @@ interface WorkflowCheckpointSuccessorInput {
   successorLaneId?: unknown;
   successorSemanticKey?: unknown;
   title?: unknown;
+  instruction?: unknown;
+  text?: unknown;
   now?: unknown;
 }
 
@@ -1974,6 +1976,7 @@ function normalizeCheckpointSuccessorInput(input: WorkflowCheckpointSuccessorInp
   successorLaneId?: string;
   successorSemanticKey?: string;
   title?: string;
+  instruction?: string;
   now: string;
 } {
   if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Workflow checkpoint successor input must be an object.");
@@ -1987,6 +1990,9 @@ function normalizeCheckpointSuccessorInput(input: WorkflowCheckpointSuccessorInp
     ...(optionalText(readField(input, "successorLaneId")) ? { successorLaneId: optionalText(readField(input, "successorLaneId"))! } : {}),
     ...(optionalText(readField(input, "successorSemanticKey")) ? { successorSemanticKey: optionalText(readField(input, "successorSemanticKey"))! } : {}),
     ...(optionalText(readField(input, "title")) ? { title: optionalText(readField(input, "title"))! } : {}),
+    ...(optionalText(readField(input, "instruction")) ?? optionalText(readField(input, "text"))
+      ? { instruction: (optionalText(readField(input, "instruction")) ?? optionalText(readField(input, "text")))! }
+      : {}),
     now: optionalText(readField(input, "now")) ?? new Date().toISOString(),
   };
 }

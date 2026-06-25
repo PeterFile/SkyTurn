@@ -2414,6 +2414,27 @@ h2 {
   --node-border: 1px solid var(--sk-pink);
 }
 
+.agent-node-shell.rollback-rolled_back,
+.agent-node-shell.rollback-inactive {
+  opacity: 0.58;
+}
+
+.agent-node-shell.rollback-rolled_back .agent-card,
+.agent-node-shell.rollback-inactive .agent-card {
+  filter: grayscale(0.35);
+}
+
+.rollback-badge {
+  border: 1px solid var(--sk-border-muted);
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  background: rgba(15, 23, 42, 0.08);
+  color: var(--sk-ink-muted);
+}
+
 .agent-card {
   position: relative;
   z-index: 2;
@@ -5981,8 +6002,23 @@ select:focus-visible,
   color: #1e293b;
 }
 
+.action-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .action-chip.selected {
   background-color: var(--sk-cobalt);
   color: var(--sk-paper-white);
   border-color: var(--sk-cobalt-deep);
+}
+
+.composer-action-message {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--sk-ink-muted);
+}
+
+.composer-action-message.error {
+  color: var(--sk-status-failed-text);
 }

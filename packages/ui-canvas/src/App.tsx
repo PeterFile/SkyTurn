@@ -83,6 +83,7 @@ import {
   type FinalChangesetReconciliation,
   type ImportedProject,
   type NodeModalTab,
+  type NodeRollbackStatus,
   type NodeRuntimeState,
   type NodeStatus,
   type PlanSession,
@@ -152,6 +153,10 @@ import {
   startBridgeRun,
 } from "./workflowRuntime.js";
 import { addRequirementPlanningNode } from "./composer.js";
+import {
+  buildSelectedNodeActionState,
+  type SelectedNodeActionState,
+} from "./nodeActionState.js";
 
 gsap.registerPlugin(useGSAP);
 
@@ -190,9 +195,14 @@ export default function App() {
   const [newTaskMode, setNewTaskMode] = useState<WorkflowMode>("fast");
   const [newTaskProjectId, setNewTaskProjectId] = useState<string | null>(null);
   const [bottomGoal, setBottomGoal] = useState("");
+  const [nodeActionText, setNodeActionText] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
+  const [selectedNodeActionState, setSelectedNodeActionState] = useState<SelectedNodeActionState | null>(null);
+  const [nodeActionBusy, setNodeActionBusy] = useState<Exclude<ComposerAction, null> | null>(null);
+  const [nodeActionError, setNodeActionError] = useState<string | null>(null);
+  const [nodeActionStatus, setNodeActionStatus] = useState<string | null>(null);
   const startedBridgeRuns = useRef(new Set<string>());
   const completedBridgeRunPersistenceClaims = useRef(new Set<string>());
   const workspaceRef = useRef(workspace);
@@ -337,7 +347,68 @@ export default function App() {
     };
   }, [activeProject, selectedNode?.runId]);
 
+  useEffect(() => {
+    setNodeActionText("");
+    setNodeActionError(null);
+    setNodeActionStatus(null);
+  }, [selectedNode?.id]);
 
+  useEffect(() => {
+    if (!activeProject || activeSession?.kind !== "canvas" || !selectedNode) {
+      setSelectedNodeActionState(null);
+      return;
+    }
+
+    const workflow = window.devflow?.workflow;
+    if (!workflow) {
+      setSelectedNodeActionState(buildSelectedNodeActionState({
+        sessionId: activeSession.id,
+        selectedNode,
+        projection: null,
+      }));
+      return;
+    }
+
+    let active = true;
+    const projectRoot = activeProject.rootPath;
+    const sessionId = activeSession.id;
+    void workflow.getProjection(projectRoot, sessionId).then(async (projectionResult) => {
+      const projectionState = buildSelectedNodeActionState({
+        sessionId,
+        selectedNode,
+        projection: projectionResult.projection,
+      });
+      const rollbackPayload = projectionState.rollbackPayload;
+      if (!rollbackPayload) {
+        if (active) setSelectedNodeActionState(projectionState);
+        return;
+      }
+      const eligibilityResult = await workflow.getRollbackEligibility(projectRoot, {
+        sessionId,
+        nodeId: selectedNode.id,
+        laneId: rollbackPayload.laneId,
+        checkpointId: rollbackPayload.checkpointId,
+      });
+      if (!active) return;
+      setSelectedNodeActionState(buildSelectedNodeActionState({
+        sessionId,
+        selectedNode,
+        projection: projectionResult.projection,
+        backendEligibility: eligibilityResult,
+      }));
+    }).catch(() => {
+      if (!active) return;
+      setSelectedNodeActionState(buildSelectedNodeActionState({
+        sessionId,
+        selectedNode,
+        projection: null,
+      }));
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [activeProject?.rootPath, activeSession?.id, activeSession?.kind, activeSession?.updatedAt, selectedNode]);
 
   const activeCanvasSessionId = activeSession?.kind === "canvas" ? activeSession.id : null;
   const updateActiveNodePositions = useCallback(
@@ -505,22 +576,125 @@ export default function App() {
     }));
   }
 
-  async function appendRequirementNode(_action?: ComposerAction) {
-    if (!activeSession || activeSession.kind !== "canvas" || !bottomGoal.trim()) return;
+  async function appendRequirementNode(action?: ComposerAction) {
+    if (!activeSession || activeSession.kind !== "canvas") return;
+    const text = selectedNode ? nodeActionText.trim() : bottomGoal.trim();
+    if (!text) return;
+    if (selectedNode) {
+      await submitSelectedNodeAction(action, text);
+      return;
+    }
     if (window.devflow && activeProject) {
       await window.devflow.appendWorkflowUserInput(activeProject.rootPath, {
         sessionId: activeSession.id,
         inputId: `bottom-${Date.now()}`,
-        text: bottomGoal.trim(),
+        text,
         now: new Date().toISOString(),
       });
     }
-    const result = addRequirementPlanningNode(activeSession, bottomGoal, {
+    const result = addRequirementPlanningNode(activeSession, text, {
       now: new Date().toISOString(),
       projectName: activeProject?.name ?? "project",
     });
     updateCanvasSession(activeSession.id, () => result.session);
     setBottomGoal("");
+  }
+
+  async function submitSelectedNodeAction(action: ComposerAction | undefined, requestText: string) {
+    if (!activeProject || activeSession?.kind !== "canvas" || !selectedNode) return;
+    if (!action) {
+      setNodeActionError("Choose a node action before submitting.");
+      return;
+    }
+
+    const workflow = window.devflow?.workflow;
+    if (!workflow) {
+      setNodeActionError("Workflow backend unavailable.");
+      return;
+    }
+
+    const actionState = selectedNodeActionState;
+    const projectRoot = activeProject.rootPath;
+    setNodeActionBusy(action);
+    setNodeActionError(null);
+    setNodeActionStatus(null);
+
+    try {
+      if (action === "repair") {
+        if (!actionState?.repairPayload) {
+          setNodeActionError("Repair requires an after checkpoint.");
+          return;
+        }
+        const result = await workflow.requestRepair(projectRoot, {
+          ...actionState.repairPayload,
+          instruction: requestText,
+        });
+        applyWorkflowActionResult(result);
+        setNodeActionStatus("Repair lane requested.");
+        setNodeActionText("");
+        return;
+      }
+
+      if (action === "variant") {
+        if (!actionState?.variantPayload) {
+          setNodeActionError("Variant requires a before checkpoint.");
+          return;
+        }
+        const result = await workflow.requestVariant(projectRoot, {
+          ...actionState.variantPayload,
+          instruction: requestText,
+        });
+        applyWorkflowActionResult(result);
+        setNodeActionStatus("Variant lane requested.");
+        setNodeActionText("");
+        return;
+      }
+
+      if (!actionState?.rollbackPayload) {
+        setNodeActionError(selectedNodeActionAvailability(actionState, true).rollback.reason ?? "Rollback is not eligible.");
+        return;
+      }
+      const result = await workflow.applyRollback(projectRoot, {
+        ...actionState.rollbackPayload,
+        text: requestText,
+      });
+      const blockedMessage = rollbackBlockedMessage(result);
+      if (blockedMessage) {
+        setNodeActionError(blockedMessage);
+        await refreshWorkflowProjection();
+        return;
+      }
+      applyWorkflowActionResult(result);
+      setNodeActionStatus("Rollback affects selected and downstream workflow state, not evidence/history.");
+      setNodeActionText("");
+    } catch (error) {
+      setNodeActionError(actionFailureMessage(error, action));
+    } finally {
+      setNodeActionBusy(null);
+    }
+  }
+
+  function applyWorkflowActionResult(result: unknown) {
+    const canvasSession = canvasSessionFromWorkflowResult(result);
+    if (canvasSession) {
+      setWorkspace((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
+      }));
+      return;
+    }
+    void refreshWorkflowProjection();
+  }
+
+  async function refreshWorkflowProjection() {
+    if (!activeProject || activeSession?.kind !== "canvas" || !window.devflow?.workflow) return;
+    const result = await window.devflow.workflow.getProjection(activeProject.rootPath, activeSession.id);
+    if (!result.canvasSession) return;
+    const canvasSession = result.canvasSession;
+    setWorkspace((current) => ({
+      ...current,
+      sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
+    }));
   }
 
   function retryNode(nodeId: string) {
@@ -709,10 +883,15 @@ export default function App() {
           {activeSession?.kind === "canvas" && (
             <CanvasView
               session={activeSession}
-              composerValue={bottomGoal}
+              composerValue={selectedNode ? nodeActionText : bottomGoal}
               composerDisabled={false}
               selectedNode={selectedNode}
-              onComposerChange={setBottomGoal}
+              selectedNodeActionState={selectedNodeActionState}
+              nodeActionBusy={nodeActionBusy}
+              nodeActionError={nodeActionError}
+              nodeActionStatus={nodeActionStatus}
+              workflowBackendAvailable={!!window.devflow?.workflow}
+              onComposerChange={selectedNode ? setNodeActionText : setBottomGoal}
               onComposerSubmit={appendRequirementNode}
               onComposerStop={stopActiveRun}
               onNodePositionsChange={updateActiveNodePositions}
@@ -1007,6 +1186,62 @@ function ProjectStartPage({
 
 export type ComposerAction = "repair" | "variant" | "rollback" | null;
 
+export const REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE =
+  "This node or downstream has already pushed/created PR/merged. Use repair/revert PR flow instead.";
+
+interface NodeActionAvailability {
+  enabled: boolean;
+  reason: string | null;
+}
+
+export function selectedNodeActionAvailability(
+  state: SelectedNodeActionState | null,
+  workflowBackendAvailable: boolean,
+): {
+  repair: NodeActionAvailability;
+  variant: NodeActionAvailability;
+  rollback: NodeActionAvailability;
+} {
+  const unavailable = (reason: string): NodeActionAvailability => ({ enabled: false, reason });
+  if (!workflowBackendAvailable) {
+    const reason = "Workflow backend unavailable.";
+    return { repair: unavailable(reason), variant: unavailable(reason), rollback: unavailable(reason) };
+  }
+  if (!state) {
+    const reason = "Workflow checkpoint state unavailable.";
+    return { repair: unavailable(reason), variant: unavailable(reason), rollback: unavailable(reason) };
+  }
+
+  return {
+    repair: state.canCreateRepair && state.repairPayload
+      ? { enabled: true, reason: null }
+      : unavailable("Repair requires an after checkpoint."),
+    variant: state.canCreateVariant && state.variantPayload
+      ? { enabled: true, reason: null }
+      : unavailable("Variant requires a before checkpoint."),
+    rollback: rollbackActionAvailability(state),
+  };
+}
+
+function rollbackActionAvailability(state: SelectedNodeActionState): NodeActionAvailability {
+  if (state.blockedByRemoteSideEffect) {
+    return { enabled: false, reason: REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE };
+  }
+  if (state.canRollback && state.rollbackPayload) return { enabled: true, reason: null };
+  return { enabled: false, reason: state.blockedReasons[0] ?? "Rollback is not eligible." };
+}
+
+export function rollbackLabelForNode(node: { rollbackStatus?: NodeRollbackStatus | null }): string | null {
+  if (node.rollbackStatus === "rolled_back") return "Rolled back";
+  if (node.rollbackStatus === "inactive") return "Inactive";
+  if (node.rollbackStatus === "rejected") return "Rejected";
+  return null;
+}
+
+function rollbackStatusForNode(node: CanvasNode): NodeRollbackStatus | null {
+  return node.rollbackStatus ?? null;
+}
+
 export function deriveSessionTarget(executionTarget: "current_branch" | "new_worktree", selectedBranch: string): SessionTarget {
   return executionTarget === "current_branch"
     ? { executionTarget, selectedBranch }
@@ -1264,23 +1499,33 @@ function CanvasView({
   composerValue,
   composerDisabled,
   selectedNode,
+  selectedNodeActionState,
+  nodeActionBusy,
+  nodeActionError,
+  nodeActionStatus,
+  workflowBackendAvailable,
   onComposerChange,
   onComposerSubmit,
   onComposerStop,
   onNodePositionsChange,
-  onInspectNode,
   onSelectNode,
+  onInspectNode,
 }: {
   session: CanvasSession;
   composerValue: string;
   composerDisabled: boolean;
   selectedNode: CanvasNode | null;
+  selectedNodeActionState: SelectedNodeActionState | null;
+  nodeActionBusy: Exclude<ComposerAction, null> | null;
+  nodeActionError: string | null;
+  nodeActionStatus: string | null;
+  workflowBackendAvailable: boolean;
   onComposerChange: (value: string) => void;
   onComposerSubmit: (action?: ComposerAction) => void;
   onComposerStop: () => void;
   onNodePositionsChange: (updates: CanvasNodePositionUpdate[]) => void;
-  onInspectNode: (nodeId: string) => void;
   onSelectNode: (nodeId: string | null) => void;
+  onInspectNode: (nodeId: string) => void;
 }) {
   const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
   const autoFitCanvas = shouldAutoFitCanvas(session.nodes);
@@ -1367,6 +1612,11 @@ function CanvasView({
         value={composerValue}
         disabled={composerDisabled}
         selectedNode={selectedNode}
+        selectedNodeActionState={selectedNodeActionState}
+        nodeActionBusy={nodeActionBusy}
+        nodeActionError={nodeActionError}
+        nodeActionStatus={nodeActionStatus}
+        workflowBackendAvailable={workflowBackendAvailable}
         onChange={onComposerChange}
         onSubmit={onComposerSubmit}
         onStop={onComposerStop}
@@ -1582,6 +1832,8 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   const footer = nodeFooterForNode(node, runtime);
   const summary = nodeSummaryForNode(node);
   const streamLine = streamingLogLineForNode(node, runtime);
+  const rollbackStatus = rollbackStatusForNode(node);
+  const rollbackLabel = rollbackLabelForNode(node);
   const eyebrow = nodeEyebrowForNode(node);
   const metadata = nodeMetadataForNode(node);
 
@@ -1870,9 +2122,10 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   return (
     <div
       ref={rootRef}
-      className={`agent-node-shell ${node.status}${selected ? " selected" : ""}`}
+      className={`agent-node-shell ${node.status}${selected ? " selected" : ""}${rollbackStatus ? ` rollback-${rollbackStatus}` : ""}`}
       data-state={node.status}
       data-phase={runtime.phase}
+      data-rollback-status={rollbackStatus || undefined}
     >
       <div ref={handlesRef} className="agent-handles">
         <Handle id="target-left" type="target" position={Position.Left} className="node-handle target-left" />
@@ -1913,6 +2166,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
               {node.status === "failed" && <AlertTriangle size={13} aria-hidden="true" />}
               <span>{footer.primary}</span>
             </div>
+            {rollbackLabel && <div className="rollback-badge">{rollbackLabel}</div>}
           </div>
           <AgentStreamPreview line={streamLine} nodeId={node.id} />
           <div className={`agent-footer ${node.status}`} aria-label="Node metadata">
@@ -4108,6 +4362,11 @@ function CanvasComposer({
   value,
   disabled,
   selectedNode,
+  selectedNodeActionState,
+  nodeActionBusy,
+  nodeActionError,
+  nodeActionStatus,
+  workflowBackendAvailable,
   onChange,
   onSubmit,
   onStop,
@@ -4115,6 +4374,11 @@ function CanvasComposer({
   value: string;
   disabled: boolean;
   selectedNode: CanvasNode | null;
+  selectedNodeActionState: SelectedNodeActionState | null;
+  nodeActionBusy: Exclude<ComposerAction, null> | null;
+  nodeActionError: string | null;
+  nodeActionStatus: string | null;
+  workflowBackendAvailable: boolean;
   onChange: (value: string) => void;
   onSubmit: (action?: ComposerAction) => void;
   onStop: () => void;
@@ -4133,11 +4397,16 @@ function CanvasComposer({
     else placeholder = "Choose an action to continue…";
   }
 
-  const nodeActionPendingBackend = selectedNode !== null;
-  const displayedValue = nodeActionPendingBackend ? "" : value;
+  const actionAvailability = selectedNodeActionAvailability(selectedNodeActionState, workflowBackendAvailable);
+  const displayedValue = value;
   const hasValue = displayedValue.trim().length > 0;
-  const canSubmit = hasValue && !nodeActionPendingBackend;
-  const submitTitle = nodeActionPendingBackend ? "Node action submission is not available yet" : "Submit";
+  const selectedActionAvailability = action ? actionAvailability[action] : null;
+  const canSubmit = selectedNode
+    ? hasValue && !!action && selectedActionAvailability?.enabled === true && nodeActionBusy === null
+    : hasValue;
+  const submitTitle = selectedNode
+    ? selectedActionAvailability?.reason ?? "Submit node action"
+    : "Submit";
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
@@ -4191,6 +4460,8 @@ function CanvasComposer({
             className={`action-chip ${action === "repair" ? "selected" : ""}`}
             onClick={() => setAction("repair")}
             aria-pressed={action === "repair"}
+            disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
+            title={actionAvailability.repair.reason ?? "Repair this node"}
           >
             Repair this node
           </button>
@@ -4199,6 +4470,8 @@ function CanvasComposer({
             className={`action-chip ${action === "variant" ? "selected" : ""}`}
             onClick={() => setAction("variant")}
             aria-pressed={action === "variant"}
+            disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
+            title={actionAvailability.variant.reason ?? "Try another version"}
           >
             Try another version
           </button>
@@ -4207,19 +4480,26 @@ function CanvasComposer({
             className={`action-chip ${action === "rollback" ? "selected" : ""}`}
             onClick={() => setAction("rollback")}
             aria-pressed={action === "rollback"}
+            disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
+            title={actionAvailability.rollback.reason ?? "Rollback node and downstream"}
           >
             Rollback node and downstream
           </button>
         </div>
+      )}
+      {selectedNode && (
+        <p className={nodeActionError ? "composer-action-message error" : "composer-action-message"}>
+          {nodeActionError ?? nodeActionStatus ?? actionAvailability.rollback.reason ?? "Rollback affects selected and downstream workflow state, not evidence/history."}
+        </p>
       )}
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
         <input
           className="canvas-composer-input"
           ref={inputRef}
           value={displayedValue}
-          disabled={disabled || nodeActionPendingBackend}
+          disabled={disabled || nodeActionBusy !== null}
           onChange={(event) => {
-            if (!nodeActionPendingBackend) onChange(event.target.value);
+            onChange(event.target.value);
           }}
           placeholder={placeholder}
           aria-label={placeholder}
@@ -4465,6 +4745,28 @@ function canvasSessionFromWorkflowEvent(event: unknown): CanvasSession | null {
   if (!event || typeof event !== "object") return null;
   const canvasSession = (event as { canvasSession?: unknown }).canvasSession;
   return isCanvasSession(canvasSession) ? canvasSession : null;
+}
+
+function canvasSessionFromWorkflowResult(result: unknown): CanvasSession | null {
+  if (!isRecord(result)) return null;
+  return isCanvasSession(result.canvasSession) ? result.canvasSession : null;
+}
+
+function rollbackBlockedMessage(result: unknown): string | null {
+  if (!isRecord(result) || result.status !== "blocked") return null;
+  const blockedReason = isRecord(result.blockedReason) ? result.blockedReason : null;
+  const remoteSideEffects = Array.isArray(blockedReason?.remoteSideEffects)
+    ? blockedReason.remoteSideEffects
+    : [];
+  if (remoteSideEffects.length > 0) return REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE;
+  const message = optionalText(blockedReason?.message) ?? optionalText(result.reason);
+  return message ?? "Rollback was blocked.";
+}
+
+function actionFailureMessage(error: unknown, action: Exclude<ComposerAction, null>): string {
+  const label = action === "rollback" ? "Rollback" : action === "repair" ? "Repair" : "Variant";
+  const message = error instanceof Error ? error.message : String(error);
+  return `${label} request failed: ${message}`;
 }
 
 function isCanvasSession(value: unknown): value is CanvasSession {

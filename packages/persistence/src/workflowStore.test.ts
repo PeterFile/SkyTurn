@@ -585,6 +585,7 @@ describe("SQLite workflow store", () => {
       now: "2026-06-14T00:00:20.000Z",
     });
     const projection = store.materializeFlowProjection("session-1");
+    const canvas = store.materializeCanvasSession("session-1");
     const rollbackAppliedEvents = store.listEvents("session-1").filter((event) => event.kind === "workflow.node.rollback_applied");
     store.close();
 
@@ -608,6 +609,9 @@ describe("SQLite workflow store", () => {
     expect(projection.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({ rollbackStatus: "rolled_back" });
     expect(projection.lanes.find((lane) => lane.id === "lane-validation")).toMatchObject({ rollbackStatus: "inactive" });
     expect(projection.lanes.find((lane) => lane.id === "lane-review")).toMatchObject({ rollbackStatus: "inactive" });
+    expect(canvas?.nodes.find((node) => node.id === "lane-implementation")).toMatchObject({ status: "failed", rollbackStatus: "rolled_back" });
+    expect(canvas?.nodes.find((node) => node.id === "lane-validation")).toMatchObject({ status: "failed", rollbackStatus: "inactive" });
+    expect(canvas?.nodes.find((node) => node.id === "lane-review")).toMatchObject({ status: "failed", rollbackStatus: "inactive" });
     expect(replayed).toEqual(projection);
     reopened.close();
   });
@@ -972,6 +976,7 @@ describe("SQLite workflow store", () => {
       checkpointId: "checkpoint-after-implementation",
       successorLaneId: "lane-implementation-repair",
       successorSemanticKey: "repair:lane-implementation:manual",
+      instruction: "Fix the failing review notes.",
       now: "2026-06-14T00:00:20.000Z",
     });
     const projection = store.materializeFlowProjection("session-1");
@@ -983,11 +988,13 @@ describe("SQLite workflow store", () => {
       status: "requested",
       event: expect.objectContaining({ kind: "workflow.node.repair_requested" }),
     });
+    expect(repair.event.payload).toMatchObject({ instruction: "Fix the failing review notes." });
     expect(projection.checkpointIntents).toContainEqual(expect.objectContaining({
       kind: "repair",
       status: "requested",
       checkpointId: "checkpoint-after-implementation",
       successorLaneId: "lane-implementation-repair",
+      instruction: "Fix the failing review notes.",
     }));
     expect(projection.lanes.find((lane) => lane.id === "lane-implementation-repair")).toMatchObject({
       laneKind: "fix",
@@ -1157,6 +1164,7 @@ describe("SQLite workflow store", () => {
       checkpointId: "checkpoint-before-implementation",
       successorLaneId: "lane-implementation-variant",
       successorSemanticKey: "variant:lane-implementation:manual",
+      instruction: "Try a simpler implementation path.",
       now: "2026-06-14T00:00:20.000Z",
     });
     const projection = store.materializeFlowProjection("session-1");
@@ -1171,11 +1179,13 @@ describe("SQLite workflow store", () => {
       status: "requested",
       event: expect.objectContaining({ kind: "workflow.node.variant_requested" }),
     });
+    expect(variant.event.payload).toMatchObject({ instruction: "Try a simpler implementation path." });
     expect(projection.checkpointIntents).toContainEqual(expect.objectContaining({
       kind: "variant",
       status: "requested",
       checkpointId: "checkpoint-before-implementation",
       successorLaneId: "lane-implementation-variant",
+      instruction: "Try a simpler implementation path.",
     }));
     expect(projection.lanes.find((lane) => lane.id === "lane-implementation")).toBeDefined();
     expect(projection.lanes.find((lane) => lane.id === "lane-implementation-variant")).toMatchObject({
