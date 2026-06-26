@@ -7,16 +7,18 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption } from "@skyturn/project-core";
+import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption, WorkflowWorktreeIdentity } from "@skyturn/project-core";
 import {
   checkDeliveryPullRequest,
   createDeliveryCommit,
   createDeliveryPullRequest,
   createGitChangesetService,
   createNodeGitWorktreeService,
+  evaluateRollbackWorktreeState,
   mergeDeliveryPullRequest,
   pushDeliveryBranch,
   getGitBranchFacts,
+  resetRollbackWorktreeToCommit,
   syncDeliveryMain,
   type ManagedWorktreeWorkflowEvent,
   worktreeMetadataForVariant,
@@ -104,6 +106,26 @@ function createdEventFor(worktree: {
     idempotencyKey: `worktree:${worktree.worktreeId}:created`,
     sessionId,
   };
+}
+
+async function createRollbackWorktreeFixture(tempRoots: string[]): Promise<{
+  repo: TestRepo;
+  worktree: WorkflowWorktreeIdentity;
+  headCommit: string;
+}> {
+  const repo = await createTestRepo("skyturn-rollback-worktree-");
+  tempRoots.push(repo.tempRoot);
+  const service = createNodeGitWorktreeService();
+  const worktree = await service.createManagedWorktree({
+    sessionId: "session-1",
+    variantId: "rollback",
+    repoRoot: repo.repoRoot,
+    baseCommit: repo.baseCommit,
+    branchName: "skyturn/rollback",
+    parentLaneId: "lane-implementation",
+  });
+  const headCommit = commitVariant(worktree.realPath, "rollback-head");
+  return { repo, worktree, headCommit };
 }
 
 describe("node git worktree service", () => {
@@ -217,6 +239,146 @@ describe("node git worktree service", () => {
     expect(git(repo.repoRoot, ["rev-parse", "--verify", "refs/heads/skyturn/session-1/right"])).toBe(rightHead);
     expect(events.map((event) => event.kind)).toContain("workflow.worktree.clean_requested");
     expect(events.map((event) => event.kind)).toContain("workflow.worktree.cleaned");
+  });
+
+  it("blocks rollback reset when the managed worktree has dirty or untracked files", async () => {
+    const { repo, worktree, headCommit } = await createRollbackWorktreeFixture(tempRoots);
+    writeFileSync(join(worktree.realPath, "untracked.txt"), "dirty\n");
+
+    const result = await evaluateRollbackWorktreeState({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      expectedBranchName: worktree.branchName,
+      expectedHeadCommit: headCommit,
+      restoreCommitRef: repo.baseCommit,
+    });
+
+    expect(result).toMatchObject({
+      status: "manual_repair_required",
+      reasonCode: "dirty_worktree",
+      manualRepairRequired: true,
+    });
+    expect(git(worktree.realPath, ["rev-parse", "HEAD"])).toBe(headCommit);
+  });
+
+  it("blocks rollback reset on the wrong branch before changing HEAD", async () => {
+    const { repo, worktree, headCommit } = await createRollbackWorktreeFixture(tempRoots);
+    git(worktree.realPath, ["checkout", "-b", "skyturn/rollback-other"]);
+
+    const result = await evaluateRollbackWorktreeState({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      expectedBranchName: worktree.branchName,
+      expectedHeadCommit: headCommit,
+      restoreCommitRef: repo.baseCommit,
+    });
+
+    expect(result).toMatchObject({
+      status: "manual_repair_required",
+      reasonCode: "branch_mismatch",
+      manualRepairRequired: true,
+    });
+    expect(git(worktree.realPath, ["rev-parse", "HEAD"])).toBe(headCommit);
+  });
+
+  it("blocks rollback reset when the path is not the recorded managed worktree", async () => {
+    const { repo, worktree, headCommit } = await createRollbackWorktreeFixture(tempRoots);
+
+    const result = await evaluateRollbackWorktreeState({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expectedBranchName: worktree.branchName,
+      expectedHeadCommit: headCommit,
+      restoreCommitRef: repo.baseCommit,
+    });
+
+    expect(result).toMatchObject({
+      status: "manual_repair_required",
+      reasonCode: "unmanaged_worktree",
+      manualRepairRequired: true,
+    });
+    expect(git(worktree.realPath, ["rev-parse", "HEAD"])).toBe(headCommit);
+  });
+
+  it("requires full reachable commit evidence before rollback reset", async () => {
+    const { repo, worktree, headCommit } = await createRollbackWorktreeFixture(tempRoots);
+
+    const shortRestore = await evaluateRollbackWorktreeState({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      expectedBranchName: worktree.branchName,
+      expectedHeadCommit: headCommit,
+      restoreCommitRef: repo.baseCommit.slice(0, 12),
+    });
+    const missingRestore = await evaluateRollbackWorktreeState({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      expectedBranchName: worktree.branchName,
+      expectedHeadCommit: headCommit,
+      restoreCommitRef: "f".repeat(40),
+    });
+
+    expect(shortRestore).toMatchObject({
+      status: "manual_repair_required",
+      reasonCode: "invalid_restore_commit",
+      manualRepairRequired: true,
+    });
+    expect(missingRestore).toMatchObject({
+      status: "manual_repair_required",
+      reasonCode: "missing_restore_commit",
+      manualRepairRequired: true,
+    });
+    expect(git(worktree.realPath, ["rev-parse", "HEAD"])).toBe(headCommit);
+  });
+
+  it("recovers idempotent rollback retry when HEAD is already restored", async () => {
+    const { repo, worktree, headCommit } = await createRollbackWorktreeFixture(tempRoots);
+
+    const applied = await resetRollbackWorktreeToCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      expectedBranchName: worktree.branchName,
+      expectedHeadCommit: headCommit,
+      restoreCommitRef: repo.baseCommit,
+    });
+    const retry = await evaluateRollbackWorktreeState({
+      projectRoot: repo.repoRoot,
+      worktreePath: worktree.realPath,
+      expectedBranchName: worktree.branchName,
+      expectedHeadCommit: headCommit,
+      restoreCommitRef: repo.baseCommit,
+    });
+
+    expect(applied).toMatchObject({
+      status: "applied",
+      headCommit: repo.baseCommit,
+    });
+    expect(retry).toMatchObject({
+      status: "already_restored",
+      headCommit: repo.baseCommit,
+    });
+  });
+
+  it("reports manual repair when git reset fails after rollback request evidence would be durable", async () => {
+    const { repo, worktree, headCommit } = await createRollbackWorktreeFixture(tempRoots);
+    const fakeGit = await installFakeGit(repo.tempRoot, { resetExitCode: 23 });
+
+    await withFakeGit(fakeGit.binDir, async () => {
+      const result = await resetRollbackWorktreeToCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: worktree.realPath,
+        expectedBranchName: worktree.branchName,
+        expectedHeadCommit: headCommit,
+        restoreCommitRef: repo.baseCommit,
+      });
+
+      expect(result).toMatchObject({
+        status: "manual_repair_required",
+        reasonCode: "git_reset_failed",
+        manualRepairRequired: true,
+      });
+      expect(git(worktree.realPath, ["rev-parse", "HEAD"])).toBe(headCommit);
+    });
   });
 
   it("keeps the target checkout clean after a successful cherry-pick adoption preview", async () => {
@@ -1931,6 +2093,29 @@ async function installFakeGh(
   return { binDir, argsPath };
 }
 
+async function installFakeGit(
+  tempRoot: string,
+  options: {
+    resetExitCode: number;
+  },
+): Promise<{ binDir: string }> {
+  const binDir = join(tempRoot, "fake-git-bin");
+  await mkdir(binDir, { recursive: true });
+  const gitPath = join(binDir, "git");
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"reset\" ] && [ \"$2\" = \"--hard\" ]; then",
+    "  echo \"forced git reset failure\" >&2",
+    `  exit ${options.resetExitCode}`,
+    "fi",
+    `exec ${shellSingleQuote(resolveExecutable("git"))} "$@"`,
+    "",
+  ].join("\n");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
 async function withFakeGh<T>(binDir: string, argsPath: string, callback: () => Promise<T>): Promise<T> {
   const previousPath = process.env.PATH;
   const previousArgs = process.env.SKYTURN_FAKE_GH_ARGS;
@@ -1944,6 +2129,30 @@ async function withFakeGh<T>(binDir: string, argsPath: string, callback: () => P
     if (previousArgs === undefined) delete process.env.SKYTURN_FAKE_GH_ARGS;
     else process.env.SKYTURN_FAKE_GH_ARGS = previousArgs;
   }
+}
+
+async function withFakeGit<T>(binDir: string, callback: () => Promise<T>): Promise<T> {
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${binDir}${process.env.PATH ? `:${process.env.PATH}` : ""}`;
+  try {
+    return await callback();
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+}
+
+function resolveExecutable(command: string): string {
+  for (const pathEntry of (process.env.PATH ?? "").split(":")) {
+    if (!pathEntry) continue;
+    const candidate = join(pathEntry, command);
+    if (existsSync(candidate)) return realpathSync(candidate);
+  }
+  throw new Error(`Cannot find executable: ${command}.`);
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function nodeForRepo(repoRoot: string): CanvasNode {

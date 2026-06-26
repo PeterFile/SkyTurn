@@ -322,13 +322,16 @@ interface WorkflowVariantAdoptionLike {
 }
 
 interface LocalRollbackSafety {
-  status: "safe" | "manual_repair_required" | "not_required" | "already_restored";
+  status: "safe" | "manual_repair_required" | "not_required" | "already_restored" | "already_applied";
   reasonCode?: string;
   message?: string;
   worktreePath?: string;
   restoreCommitRef?: string;
+  expectedBranchName?: string;
+  expectedHeadCommit?: string;
   requestId?: string;
   requestedEvent?: unknown;
+  event?: unknown;
 }
 
 interface WorkflowRollbackEligibilityLike {
@@ -413,6 +416,10 @@ interface UnresolvedRemoteSideEffectBlock {
 interface RollbackRequestedEventMatch {
   requestId: string;
   event: unknown;
+}
+
+interface RollbackAppliedEventMatch extends RollbackRequestedEventMatch {
+  requestedEvent: unknown;
 }
 
 interface RollbackRequestedEventValidation {
@@ -839,6 +846,15 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
     if (initialRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, initialRemoteBlock.result);
     const eligibility = initialRemoteBlock.eligibility;
     const localSafety = await evaluateLocalRollbackSafetyForRollback(projectRoot, store, normalized, eligibility);
+    if (localSafety.status === "already_applied" && localSafety.event) {
+      broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+      return workflowRollbackResponse(store, normalized.sessionId, {
+        status: "applied",
+        event: localSafety.event,
+        requestedEvent: localSafety.requestedEvent,
+        eligibility,
+      });
+    }
     if (localSafety.status === "already_restored" && localSafety.requestId) {
       const recoveryRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
       if (recoveryRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, recoveryRemoteBlock.result);
@@ -863,11 +879,18 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
         manualRepairRequired: true,
       });
     }
-    if (localSafety.status !== "safe" || !localSafety.worktreePath || !localSafety.restoreCommitRef) {
+    if (
+      localSafety.status !== "safe" ||
+      !localSafety.worktreePath ||
+      !localSafety.restoreCommitRef ||
+      !localSafety.expectedBranchName ||
+      !localSafety.expectedHeadCommit
+    ) {
       const result = store.applyNodeRollback(normalized);
       return workflowRollbackResponse(store, normalized.sessionId, result);
     }
 
+    const { resetRollbackWorktreeToCommit } = await import("@skyturn/git-worktree/node");
     const finalRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
     if (finalRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, finalRemoteBlock.result);
     const finalEligibility = finalRemoteBlock.eligibility;
@@ -898,24 +921,30 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
         manualRepairRequired: true,
       });
     }
-    try {
-      await gitResetHard(localSafety.worktreePath, localSafety.restoreCommitRef);
-    } catch (error) {
+    const resetResult = await resetRollbackWorktreeToCommit({
+      projectRoot,
+      worktreePath: localSafety.worktreePath,
+      expectedBranchName: localSafety.expectedBranchName,
+      expectedHeadCommit: localSafety.expectedHeadCommit,
+      restoreCommitRef: localSafety.restoreCommitRef,
+    });
+    if (resetResult.status !== "applied" && resetResult.status !== "already_restored") {
+      const message = sanitizeSnippet(resetResult.message) || "Git reset failed; manual repair is required.";
       const rejectedEvent = appendRollbackRejectedEvent(store, normalized, finalEligibility, {
         status: "manual_repair_required",
-        reasonCode: "git_reset_failed",
-        message: sanitizeSnippet(error instanceof Error ? error.message : String(error)),
+        reasonCode: resetResult.reasonCode,
+        message,
       }, requested.requestId);
       broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
       return workflowRollbackResponse(store, normalized.sessionId, {
         status: "blocked",
         event: rejectedEvent,
         requestedEvent: requested.event,
-        eligibility: rollbackEligibilityWithManualRepair(finalEligibility, "Git reset failed; manual repair is required."),
+        eligibility: rollbackEligibilityWithManualRepair(finalEligibility, message),
         blockedReason: {
           code: "manual_repair_required",
-          message: "Git reset failed; manual repair is required.",
-          reasonCode: "git_reset_failed",
+          message,
+          reasonCode: resetResult.reasonCode,
           manualRepairRequired: true,
         },
         manualRepairRequired: true,
@@ -2615,54 +2644,59 @@ async function evaluateLocalRollbackSafetyForRollback(
       message: "Rollback requires a recorded managed branch.",
     };
   }
-  const currentBranchName = await gitCurrentBranch(worktreePath);
-  if (currentBranchName !== expectedBranchName) {
+  const { evaluateRollbackWorktreeState } = await import("@skyturn/git-worktree/node");
+  const worktreeState = await evaluateRollbackWorktreeState({
+    projectRoot,
+    worktreePath,
+    expectedBranchName,
+    expectedHeadCommit: recordedHead.commitSha,
+    restoreCommitRef,
+  });
+  if (worktreeState.status === "manual_repair_required") {
     return {
       status: "manual_repair_required",
-      reasonCode: "branch_mismatch",
-      message: "Worktree branch does not match the SkyTurn-managed branch.",
+      reasonCode: worktreeState.reasonCode,
+      message: worktreeState.message,
     };
   }
-
-  const headSha = await gitRevParseHead(worktreePath);
-  const statusText = await gitStatusPorcelain(worktreePath);
-  if (headSha.toLowerCase() !== recordedHead.commitSha.toLowerCase()) {
-    if (headSha.toLowerCase() === restoreCommitRef.toLowerCase()) {
-      if (statusText.length > 0) {
-        return {
-          status: "manual_repair_required",
-          reasonCode: "dirty_worktree",
-          message: "Worktree has uncommitted changes.",
-        };
-      }
-      const matchingRequest = findMatchingRollbackRequestedEvent(store, input, eligibility, restoreCommitRef);
-      if (matchingRequest) {
-        return {
-          status: "already_restored",
-          worktreePath,
-          restoreCommitRef,
-          requestId: matchingRequest.requestId,
-          requestedEvent: matchingRequest.event,
-        };
-      }
+  if (worktreeState.status === "already_restored") {
+    const matchingApplied = findMatchingRollbackAppliedEvent(store, input, eligibility, restoreCommitRef);
+    if (matchingApplied) {
+      return {
+        status: "already_applied",
+        worktreePath,
+        restoreCommitRef,
+        expectedBranchName,
+        expectedHeadCommit: recordedHead.commitSha,
+        requestId: matchingApplied.requestId,
+        event: matchingApplied.event,
+        requestedEvent: matchingApplied.requestedEvent,
+      };
+    }
+    const matchingRequest = findMatchingRollbackRequestedEvent(store, input, eligibility, restoreCommitRef);
+    if (matchingRequest) {
+      return {
+        status: "already_restored",
+        worktreePath,
+        restoreCommitRef,
+        expectedBranchName,
+        expectedHeadCommit: recordedHead.commitSha,
+        requestId: matchingRequest.requestId,
+        requestedEvent: matchingRequest.event,
+      };
     }
     return {
       status: "manual_repair_required",
       reasonCode: "head_mismatch",
-      message: "Worktree HEAD does not match the SkyTurn-recorded local commit.",
-    };
-  }
-  if (statusText.length > 0) {
-    return {
-      status: "manual_repair_required",
-      reasonCode: "dirty_worktree",
-      message: "Worktree has uncommitted changes.",
+      message: "Worktree HEAD is restored but rollback terminal evidence is missing for this request.",
     };
   }
   return {
     status: "safe",
     worktreePath,
     restoreCommitRef,
+    expectedBranchName,
+    expectedHeadCommit: recordedHead.commitSha,
   };
 }
 
@@ -2696,12 +2730,64 @@ function findMatchingRollbackRequestedEvent(
   return null;
 }
 
+function findMatchingRollbackAppliedEvent(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  restoreCommitRef: string,
+): RollbackAppliedEventMatch | null {
+  const events = store.listEvents(input.sessionId);
+  for (let eventIndex = events.length - 1; eventIndex >= 0; eventIndex -= 1) {
+    const event = events[eventIndex];
+    if (!isRecord(event) || event.kind !== "workflow.node.rollback_applied") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const requestId = optionalText(payload.requestId);
+    if (!requestId) continue;
+    if (input.requestId && requestId !== input.requestId) continue;
+    const applied = { requestId, event };
+    if (!validateRollbackTerminalEventForIpc(input, eligibility, restoreCommitRef, applied, "applied")) continue;
+    const requested = findMatchingRollbackRequestedHistoryForTerminalEvent(store, input, eligibility, restoreCommitRef, requestId, eventIndex);
+    if (!requested) continue;
+    return {
+      requestId,
+      event,
+      requestedEvent: requested.event,
+    };
+  }
+  return null;
+}
+
+function findMatchingRollbackRequestedHistoryForTerminalEvent(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  restoreCommitRef: string,
+  requestId: string,
+  terminalEventIndex: number,
+): RollbackRequestedEventMatch | null {
+  const events = store.listEvents(input.sessionId);
+  for (let eventIndex = events.length - 1; eventIndex >= 0; eventIndex -= 1) {
+    if (eventIndex >= terminalEventIndex) continue;
+    const event = events[eventIndex];
+    if (!isRecord(event) || event.kind !== "workflow.node.rollback_requested") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    if (optionalText(payload.requestId) !== requestId) continue;
+    const requested = { requestId, event };
+    const validation = validateRollbackRequestedEventForIpc(store, input, eligibility, restoreCommitRef, requested, {
+      allowTerminal: true,
+    });
+    if (validation.valid) return requested;
+  }
+  return null;
+}
+
 function validateRollbackRequestedEventForIpc(
   store: WorkflowStoreHost,
   input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
   eligibility: WorkflowRollbackEligibilityLike,
   restoreCommitRef: string,
   requested: RollbackRequestedEventMatch,
+  options: { allowTerminal?: boolean } = {},
 ): RollbackRequestedEventValidation {
   const event = requested.event;
   if (!isRecord(event) || event.kind !== "workflow.node.rollback_requested") {
@@ -2728,8 +2814,37 @@ function validateRollbackRequestedEventForIpc(
   const payloadRestoreCommitRef = optionalText(payload.restoreCommitRef);
   if (payloadRestoreCommitRef !== restoreCommitRef) return invalidRollbackRequestedEventValidation();
   if (payload.localRollbackSafe !== true) return invalidRollbackRequestedEventValidation();
-  if (rollbackRequestHasTerminalEvent(store, input.sessionId, requested.requestId)) return invalidRollbackRequestedEventValidation();
+  if (options?.allowTerminal !== true && rollbackRequestHasTerminalEvent(store, input.sessionId, requested.requestId)) {
+    return invalidRollbackRequestedEventValidation();
+  }
   return { valid: true };
+}
+
+function validateRollbackTerminalEventForIpc(
+  input: { nodeId?: string; laneId?: string; checkpointId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  restoreCommitRef: string,
+  terminal: RollbackRequestedEventMatch,
+  terminalStatus: "applied" | "rejected",
+): boolean {
+  const event = terminal.event;
+  const expectedKind = terminalStatus === "applied" ? "workflow.node.rollback_applied" : "workflow.node.rollback_rejected";
+  if (!isRecord(event) || event.kind !== expectedKind) return false;
+  const payload = isRecord(event.payload) ? event.payload : {};
+  if (optionalText(event.idempotencyKey) !== `rollback:${terminal.requestId}:${terminalStatus}`) return false;
+  const expectedLaneId = rollbackTargetLaneIdForIpc(input, eligibility);
+  const expectedCheckpointId = optionalText(eligibility.checkpointId) ?? optionalText(input.checkpointId);
+  if (!expectedCheckpointId) return false;
+  const expectedNodeId = optionalText(input.nodeId) ?? optionalText(eligibility.targetNodeId);
+  if (optionalText(payload.requestId) !== terminal.requestId) return false;
+  const eventLaneId = optionalText(event.laneId);
+  if (eventLaneId && eventLaneId !== expectedLaneId) return false;
+  if (optionalText(payload.laneId) !== expectedLaneId) return false;
+  if (optionalText(payload.checkpointId) !== expectedCheckpointId) return false;
+  if (optionalText(payload.nodeId) !== expectedNodeId) return false;
+  if (optionalText(payload.restoreCommitRef) !== restoreCommitRef) return false;
+  if (payload.localRollbackSafe !== true) return false;
+  return true;
 }
 
 function rollbackRequestHasTerminalEvent(store: WorkflowStoreHost, sessionId: string, requestId: string): boolean {
@@ -2824,49 +2939,6 @@ async function findRecordedRollbackHead(
 function workflowCheckpointById(projection: unknown, checkpointId: string): Record<string, unknown> | null {
   if (!isRecord(projection) || !Array.isArray(projection.checkpoints)) return null;
   return projection.checkpoints.find((checkpoint) => isRecord(checkpoint) && checkpoint.id === checkpointId) as Record<string, unknown> | undefined ?? null;
-}
-
-async function gitCurrentBranch(worktreePath: string): Promise<string | null> {
-  try {
-    const result = await execFileAsync("git", ["-C", worktreePath, "branch", "--show-current"], {
-      encoding: "utf8",
-      maxBuffer: 2_000_000,
-      shell: false,
-    });
-    const branch = String(result.stdout).trim();
-    return branch.length > 0 ? branch : null;
-  } catch {
-    return null;
-  }
-}
-
-async function gitRevParseHead(worktreePath: string): Promise<string> {
-  const result = await execFileAsync("git", ["-C", worktreePath, "rev-parse", "HEAD"], {
-    encoding: "utf8",
-    maxBuffer: 2_000_000,
-    shell: false,
-  });
-  return String(result.stdout).trim();
-}
-
-async function gitStatusPorcelain(worktreePath: string): Promise<string> {
-  const result = await execFileAsync("git", ["-C", worktreePath, "status", "--porcelain"], {
-    encoding: "utf8",
-    maxBuffer: 2_000_000,
-    shell: false,
-  });
-  return String(result.stdout).trim();
-}
-
-async function gitResetHard(worktreePath: string, restoreCommitRef: string): Promise<void> {
-  if (!isFullCommitSha(restoreCommitRef)) {
-    throw workflowIpcError("INVALID_INPUT", "Rollback restore target must be a full commit SHA.");
-  }
-  await execFileAsync("git", ["-C", worktreePath, "reset", "--hard", restoreCommitRef], {
-    encoding: "utf8",
-    maxBuffer: 2_000_000,
-    shell: false,
-  });
 }
 
 function isFullCommitSha(value: unknown): value is string {

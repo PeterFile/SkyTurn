@@ -686,6 +686,58 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("retains run evidence and rollback history after persisted rollback replay", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-review");
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+
+    store.applyNodeRollback({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      requestId: "rollback-implementation",
+      localRollbackSafe: true,
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const beforeCloseEvents = store.listEvents("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const replayed = reopened.materializeFlowProjection("session-1");
+    const replayedEvents = reopened.listEvents("session-1");
+
+    expect(replayedEvents.map((event) => event.kind)).toEqual(beforeCloseEvents.map((event) => event.kind));
+    expect(replayedEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "workflow.evidence.recorded",
+          payload: expect.objectContaining({ laneId: "lane-implementation" }),
+        }),
+        expect.objectContaining({ kind: "workflow.node.rollback_requested", laneId: "lane-implementation" }),
+        expect.objectContaining({ kind: "workflow.node.rollback_applied", laneId: "lane-implementation" }),
+      ]),
+    );
+    expect(replayed.evidence).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          laneId: "lane-implementation",
+          status: "passed",
+        }),
+      ]),
+    );
+    expect(replayed.rollbackIntents).toEqual([
+      expect.objectContaining({
+        intentId: "rollback-implementation",
+        status: "applied",
+      }),
+    ]);
+    expect(replayed.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({ rollbackStatus: "rolled_back" });
+    reopened.close();
+  });
+
   it("blocks rollback without mutating the ledger after pushed branch evidence", async () => {
     const store = await makeSeededStore();
     declareCodeChangeWorkflow(store);

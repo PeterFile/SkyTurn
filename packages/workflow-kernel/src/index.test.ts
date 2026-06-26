@@ -1406,6 +1406,74 @@ describe("Flow Kernel gate engine and scheduler", () => {
     });
   });
 
+  it("retains rollback request, run evidence, and event history after applying rollback", () => {
+    const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-c", "validation"), status: "ready" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-c", sourceLaneId: "lane-b", targetLaneId: "lane-c" } }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-b-1", laneId: "lane-b", runId: "run-b-1", status: "running" },
+      }),
+      event("workflow.segment.output_delta", {
+        laneId: "lane-b",
+        segmentId: "segment-b-1",
+        text: "implementation output\n",
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-b",
+        segmentId: "segment-b-1",
+        evidence: { id: "evidence-b-1", kind: "run-exit", status: "passed", checks: ["unit"], artifacts: ["artifact-b"] },
+      }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint(beforeCheckpointId, "lane-b", "before", "base-sha"),
+      }),
+      event("workflow.node.rollback_requested", {
+        requestId: "rollback-lane-b",
+        laneId: "lane-b",
+        checkpointId: beforeCheckpointId,
+        localRollbackSafe: true,
+      }),
+      event("workflow.node.rollback_applied", {
+        requestId: "rollback-lane-b",
+        laneId: "lane-b",
+        checkpointId: beforeCheckpointId,
+        localRollbackSafe: true,
+      }),
+    ]);
+
+    expectLaneRollback(projection, "lane-b", "rolled_back");
+    expectLaneRollback(projection, "lane-c", "inactive");
+    expect(projection.rollbackIntents).toEqual([
+      expect.objectContaining({
+        intentId: "rollback-lane-b",
+        status: "applied",
+        checkpointId: beforeCheckpointId,
+      }),
+    ]);
+    expect(projection.evidence).toEqual([
+      expect.objectContaining({
+        id: "evidence-b-1",
+        laneId: "lane-b",
+        status: "passed",
+      }),
+    ]);
+    expect(projection.lanes.find((lane) => lane.id === "lane-b")).toMatchObject({
+      output: ["implementation output\n"],
+    });
+    expect(projection.events.map((item) => item.kind)).toEqual([
+      "workflow.lane.declared",
+      "workflow.lane.declared",
+      "workflow.edge.declared",
+      "workflow.segment.started",
+      "workflow.segment.output_delta",
+      "workflow.evidence.recorded",
+      "workflow.node.checkpoint_recorded",
+      "workflow.node.rollback_requested",
+      "workflow.node.rollback_applied",
+    ]);
+  });
+
   it("keeps late-declared downstream lanes inactive after rollback_applied", () => {
     const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
     const projection = reduceWorkflowEvents([
