@@ -942,6 +942,7 @@ test("workflow rollback apply blocks while affected remote delivery operations a
   assert.match(rollbackRemoteBlockHelper, /blockingInFlightRemoteSideEffects\(projectRoot,\s*input\.sessionId,\s*eligibility\)/);
   assert.match(rollbackApplyHandler, /evaluateRollbackRemoteBlocksForRollback\(workflowProjectRoot,\s*store,\s*normalized\)/);
   assert.match(inFlightHelperSource, /in_flight_remote_side_effect/);
+  assert.match(inFlightHelperSource, /status:\s*"in_flight"/);
   assert.ok(
     rollbackApplyHandler.indexOf("evaluateRollbackRemoteBlocksForRollback") < rollbackApplyHandler.indexOf("evaluateLocalRollbackSafetyForRollback"),
     "rollback must block in-flight remotes before local safety checks and git reset",

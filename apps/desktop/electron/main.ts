@@ -336,10 +336,16 @@ interface WorkflowRollbackEligibilityLike {
   targetLaneId?: string;
   targetNodeId?: string;
   checkpointId?: string;
+  checkpointPhase?: string;
   restoreCommitRef?: string;
   affectedLaneIds?: string[];
+  affectedNodeIds?: string[];
+  downstreamInactiveLaneIds?: string[];
+  downstreamInactiveNodeIds?: string[];
   blockingRemoteSideEffects?: unknown[];
   localRollbackSafe?: boolean;
+  localSafetyStatus?: string;
+  manualRepairReason?: string;
   reason?: string;
 }
 
@@ -365,6 +371,7 @@ type InFlightRemoteSideEffectKind =
 
 interface InFlightRemoteSideEffect {
   eventKind: InFlightRemoteSideEffectKind;
+  status: "in_flight";
   eventId: string;
   projectRoot: string;
   sessionId: string;
@@ -815,7 +822,7 @@ ipcMain.handle("workflow:rollback:eligibility", workflowHandler(async (projectRo
     : workflowRollbackBlockReason(eligibility);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
-    eligibility: manualRepairRequired ? { ...eligibility, eligible: false, localRollbackSafe: false, reason: localSafety.message } : eligibility,
+    eligibility: manualRepairRequired ? rollbackEligibilityWithManualRepair(eligibility, localSafety.message) : eligibility,
     blockedReason,
     manualRepairRequired,
   };
@@ -851,7 +858,7 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
       return workflowRollbackResponse(store, normalized.sessionId, {
         status: "blocked",
         event,
-        eligibility: { ...eligibility, eligible: false, localRollbackSafe: false, reason: localSafety.message },
+        eligibility: rollbackEligibilityWithManualRepair(eligibility, localSafety.message),
         blockedReason: localRollbackSafetyResult(localSafety),
         manualRepairRequired: true,
       });
@@ -881,7 +888,7 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
         status: "blocked",
         event: rejectedEvent,
         requestedEvent: requested.event,
-        eligibility: { ...finalEligibility, eligible: false, localRollbackSafe: false, reason: message },
+        eligibility: rollbackEligibilityWithManualRepair(finalEligibility, message),
         blockedReason: {
           code: "manual_repair_required",
           message,
@@ -904,7 +911,7 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
         status: "blocked",
         event: rejectedEvent,
         requestedEvent: requested.event,
-        eligibility: { ...finalEligibility, eligible: false, localRollbackSafe: false, reason: "Git reset failed; manual repair is required." },
+        eligibility: rollbackEligibilityWithManualRepair(finalEligibility, "Git reset failed; manual repair is required."),
         blockedReason: {
           code: "manual_repair_required",
           message: "Git reset failed; manual repair is required.",
@@ -2110,8 +2117,15 @@ function rollbackEventPayloadForIpc(
     laneId,
     ...(input.nodeId ?? eligibility.targetNodeId ? { nodeId: input.nodeId ?? eligibility.targetNodeId } : {}),
     ...(eligibility.checkpointId ?? input.checkpointId ? { checkpointId: eligibility.checkpointId ?? input.checkpointId } : {}),
+    ...(eligibility.checkpointPhase ? { checkpointPhase: eligibility.checkpointPhase } : {}),
     ...(eligibility.restoreCommitRef ? { restoreCommitRef: eligibility.restoreCommitRef } : {}),
+    ...(Array.isArray(eligibility.affectedLaneIds) ? { affectedLaneIds: eligibility.affectedLaneIds } : {}),
+    ...(Array.isArray(eligibility.affectedNodeIds) ? { affectedNodeIds: eligibility.affectedNodeIds } : {}),
+    ...(Array.isArray(eligibility.downstreamInactiveLaneIds) ? { downstreamInactiveLaneIds: eligibility.downstreamInactiveLaneIds } : {}),
+    ...(Array.isArray(eligibility.downstreamInactiveNodeIds) ? { downstreamInactiveNodeIds: eligibility.downstreamInactiveNodeIds } : {}),
     ...(typeof localRollbackSafe === "boolean" ? { localRollbackSafe } : {}),
+    ...(eligibility.localSafetyStatus ? { localSafetyStatus: eligibility.localSafetyStatus } : {}),
+    ...(eligibility.manualRepairReason ? { manualRepairReason: eligibility.manualRepairReason } : {}),
   };
 }
 
@@ -2162,7 +2176,7 @@ function workflowRollbackBlockReason(eligibility: WorkflowRollbackEligibilityLik
   if (eligibility.localRollbackSafe === false) {
     return {
       code: "manual_repair_required",
-      message: optionalText(eligibility.reason) ?? "Local rollback is not safe.",
+      message: optionalText(eligibility.manualRepairReason) ?? optionalText(eligibility.reason) ?? "Local rollback is not safe.",
       affectedLaneIds,
       manualRepairRequired: true,
     };
@@ -2453,6 +2467,7 @@ function beginInFlightRemoteSideEffect(input: {
   const affectedLaneIds = input.affectedLaneIds ? uniqueStrings(input.affectedLaneIds) : undefined;
   inFlightRemoteSideEffects.set(eventId, {
     eventKind: input.eventKind,
+    status: "in_flight",
     eventId,
     projectRoot: input.projectRoot,
     sessionId: input.sessionId,
@@ -2496,6 +2511,21 @@ function rollbackEligibilityWithInFlightRemoteBlocks(
       ...inFlightBlocks,
     ],
     reason: "Remote side effects are still in flight.",
+  };
+}
+
+function rollbackEligibilityWithManualRepair(
+  eligibility: WorkflowRollbackEligibilityLike,
+  manualRepairReason?: string,
+): WorkflowRollbackEligibilityLike {
+  const reason = manualRepairReason ?? "Local rollback requires manual repair.";
+  return {
+    ...eligibility,
+    eligible: false,
+    localRollbackSafe: false,
+    localSafetyStatus: "manual_repair_required",
+    manualRepairReason: reason,
+    reason,
   };
 }
 

@@ -596,14 +596,24 @@ describe("SQLite workflow store", () => {
     expect(eligibility).toMatchObject({
       eligible: true,
       checkpointId: "checkpoint-before-implementation",
+      checkpointPhase: "before",
       restoreCommitRef: "base-sha",
       affectedLaneIds: expect.arrayContaining(["lane-implementation", "lane-validation", "lane-review"]),
+      affectedNodeIds: expect.arrayContaining(["lane-implementation", "lane-validation", "lane-review"]),
+      downstreamInactiveLaneIds: expect.arrayContaining(["lane-validation", "lane-review"]),
       blockingRemoteSideEffects: [],
+      localSafetyStatus: "safe",
     });
     expect(applied).toMatchObject({
       status: "applied",
       event: expect.objectContaining({ kind: "workflow.node.rollback_applied" }),
-      eligibility: expect.objectContaining({ eligible: true }),
+      eligibility: expect.objectContaining({
+        eligible: true,
+        checkpointPhase: "before",
+        affectedLaneIds: expect.arrayContaining(["lane-implementation", "lane-validation", "lane-review"]),
+        downstreamInactiveLaneIds: expect.arrayContaining(["lane-validation", "lane-review"]),
+        localSafetyStatus: "safe",
+      }),
     });
     expect(rollbackAppliedEvents).toHaveLength(1);
     expect(projection.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({ rollbackStatus: "rolled_back" });
@@ -612,6 +622,7 @@ describe("SQLite workflow store", () => {
     expect(canvas?.nodes.find((node) => node.id === "lane-implementation")).toMatchObject({ status: "failed", rollbackStatus: "rolled_back" });
     expect(canvas?.nodes.find((node) => node.id === "lane-validation")).toMatchObject({ status: "failed", rollbackStatus: "inactive" });
     expect(canvas?.nodes.find((node) => node.id === "lane-review")).toMatchObject({ status: "failed", rollbackStatus: "inactive" });
+    expect(applied.eligibility.downstreamInactiveLaneIds).toEqual(["lane-validation", "lane-review", "lane-commit"]);
     expect(replayed).toEqual(projection);
     reopened.close();
   });
@@ -709,7 +720,9 @@ describe("SQLite workflow store", () => {
       },
       eligibility: {
         eligible: false,
-        blockingRemoteSideEffects: [expect.objectContaining({ eventKind: "workflow.delivery.pushed" })],
+        blockingRemoteSideEffects: [expect.objectContaining({ eventKind: "workflow.delivery.pushed", status: "recorded" })],
+        downstreamInactiveLaneIds: expect.arrayContaining(["lane-validation", "lane-review"]),
+        localSafetyStatus: "safe",
       },
     });
     expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
@@ -748,6 +761,95 @@ describe("SQLite workflow store", () => {
       blockedReason: {
         code: "remote_side_effect",
         eventKinds: ["workflow.pull_request.created"],
+      },
+      eligibility: {
+        blockingRemoteSideEffects: [expect.objectContaining({ eventKind: "workflow.pull_request.created", status: "recorded" })],
+      },
+    });
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
+    store.close();
+  });
+
+  it("blocks rollback when pull request creation is downstream of the selected lane", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.pull_request.created",
+      source: "test",
+      laneId: "lane-validation",
+      idempotencyKey: "pull-request:created:rollback-downstream-block",
+      payload: {
+        laneId: "lane-validation",
+        commitLaneId: "lane-implementation",
+        affectedLaneIds: ["lane-implementation", "lane-validation"],
+        evidence: { number: 43, url: "https://example.test/pr/43", head: "feature/slice-b", commitSha: "local-sha" },
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    const eventCountBefore = store.listEvents("session-1").length;
+
+    const blocked = store.applyNodeRollback({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      localRollbackSafe: true,
+      now: "2026-06-14T00:00:20.000Z",
+    });
+
+    expect(blocked).toMatchObject({
+      status: "blocked",
+      blockedReason: {
+        code: "remote_side_effect",
+        eventKinds: ["workflow.pull_request.created"],
+        affectedLaneIds: ["lane-implementation", "lane-validation", "lane-review", "lane-commit"],
+      },
+      eligibility: {
+        eligible: false,
+        affectedLaneIds: ["lane-implementation", "lane-validation", "lane-review", "lane-commit"],
+        downstreamInactiveLaneIds: ["lane-validation", "lane-review", "lane-commit"],
+        blockingRemoteSideEffects: [
+          expect.objectContaining({
+            eventKind: "workflow.pull_request.created",
+            status: "recorded",
+            laneId: "lane-validation",
+            affectedLaneIds: ["lane-validation", "lane-implementation"],
+          }),
+        ],
+      },
+    });
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
+    store.close();
+  });
+
+  it("returns manual repair required for local unsafe rollback without mutating the ledger", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    const eventCountBefore = store.listEvents("session-1").length;
+
+    const blocked = store.applyNodeRollback({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      localRollbackSafe: false,
+      now: "2026-06-14T00:00:20.000Z",
+    });
+
+    expect(blocked).toMatchObject({
+      status: "blocked",
+      manualRepairRequired: true,
+      blockedReason: {
+        code: "manual_repair_required",
+        manualRepairRequired: true,
+      },
+      eligibility: {
+        eligible: false,
+        localRollbackSafe: false,
+        localSafetyStatus: "unsafe",
+        manualRepairReason: "Local rollback is not safe.",
+        reason: "Local rollback is not safe.",
       },
     });
     expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
@@ -791,6 +893,9 @@ describe("SQLite workflow store", () => {
         code: "remote_side_effect",
         eventKinds: [kind],
       },
+      eligibility: {
+        blockingRemoteSideEffects: [expect.objectContaining({ eventKind: kind, status: "recorded" })],
+      },
     });
     expect(store.listEvents("session-1")).toHaveLength(eventCountBefore);
     store.close();
@@ -831,6 +936,8 @@ describe("SQLite workflow store", () => {
       blockingRemoteSideEffects: [
         expect.objectContaining({
           eventKind: "workflow.delivery.pushed",
+          status: "in_flight",
+          operationId: "remote-push-1",
           laneId: "lane-implementation",
         }),
       ],

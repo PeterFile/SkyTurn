@@ -859,13 +859,19 @@ describe("Flow Kernel gate engine and scheduler", () => {
       phase: "blocked",
       targetLaneId: "lane-b",
       checkpointId: "checkpoint-before-lane-b",
+      checkpointPhase: "before",
       restoreCommitRef: "restore-sha",
       affectedLaneIds: ["lane-b", "lane-c"],
+      affectedNodeIds: ["lane-b", "lane-c"],
+      downstreamInactiveLaneIds: ["lane-c"],
+      downstreamInactiveNodeIds: ["lane-c"],
       localRollbackSafe: true,
+      localSafetyStatus: "safe",
     });
     expect(loopState.rollback.remoteBlockers).toEqual([
       expect.objectContaining({
         eventKind: "workflow.pull_request.created",
+        status: "recorded",
         laneId: "lane-b",
         affectedLaneIds: ["lane-b"],
       }),
@@ -873,6 +879,77 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(loopState.blockedReason).toMatchObject({
       code: "remote_side_effect",
       affectedLaneIds: ["lane-b", "lane-c"],
+    });
+  });
+
+  it("projects selected rollback impact without upstream or sibling lanes", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-a", "design"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-c", "validation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-d", "review"), status: "completed" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-a-b", sourceLaneId: "lane-a", targetLaneId: "lane-b" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-c", sourceLaneId: "lane-b", targetLaneId: "lane-c" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-a-d", sourceLaneId: "lane-a", targetLaneId: "lane-d" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint("checkpoint-before-lane-b", "lane-b", "before", "restore-sha", "node-b"),
+      }),
+    ]);
+
+    const eligibility = evaluateRollbackEligibility(projection, "lane-b", {
+      checkpointId: "checkpoint-before-lane-b",
+      targetNodeId: "node-b",
+      localRollbackSafe: true,
+    });
+
+    expect(eligibility).toMatchObject({
+      eligible: true,
+      targetLaneId: "lane-b",
+      targetNodeId: "node-b",
+      checkpointId: "checkpoint-before-lane-b",
+      checkpointPhase: "before",
+      restoreCommitRef: "restore-sha",
+      affectedLaneIds: ["lane-b", "lane-c"],
+      affectedNodeIds: ["node-b", "lane-c"],
+      downstreamInactiveLaneIds: ["lane-c"],
+      downstreamInactiveNodeIds: ["lane-c"],
+      localRollbackSafe: true,
+      localSafetyStatus: "safe",
+      blockingRemoteSideEffects: [],
+    });
+    expect(eligibility.affectedLaneIds).not.toContain("lane-a");
+    expect(eligibility.affectedLaneIds).not.toContain("lane-d");
+  });
+
+  it("blocks selected rollback when a downstream pull request exists", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: { ...lane("lane-c", "pull_request"), status: "completed" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-c", sourceLaneId: "lane-b", targetLaneId: "lane-c" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint("checkpoint-before-lane-b", "lane-b", "before", "restore-sha"),
+      }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-c",
+        commitLaneId: "lane-b",
+        evidence: { number: 42, url: "https://example.test/pr/42", commitSha: "restore-sha" },
+      }),
+    ]);
+
+    expect(evaluateRollbackEligibility(projection, "lane-b", { checkpointId: "checkpoint-before-lane-b", localRollbackSafe: true })).toMatchObject({
+      eligible: false,
+      affectedLaneIds: ["lane-b", "lane-c"],
+      downstreamInactiveLaneIds: ["lane-c"],
+      localSafetyStatus: "safe",
+      blockingRemoteSideEffects: [
+        expect.objectContaining({
+          eventKind: "workflow.pull_request.created",
+          status: "recorded",
+          laneId: "lane-c",
+          affectedLaneIds: ["lane-c", "lane-b"],
+        }),
+      ],
+      reason: "Remote side effects exist.",
     });
   });
 

@@ -879,8 +879,11 @@ export class WorkflowStore {
         eligible: false,
         targetLaneId: input.laneId ?? input.nodeId ?? "",
         affectedLaneIds: [],
+        downstreamInactiveLaneIds: [],
         blockingRemoteSideEffects: [],
         ...(typeof input.localRollbackSafe === "boolean" ? { localRollbackSafe: input.localRollbackSafe } : {}),
+        localSafetyStatus: rollbackLocalSafetyStatus(input.localRollbackSafe),
+        ...(input.localRollbackSafe === false ? { manualRepairReason: "Local rollback is not safe." } : {}),
         reason: "Rollback target lane does not exist.",
       };
     }
@@ -894,13 +897,17 @@ export class WorkflowStore {
   applyNodeRollback(input: WorkflowNodeRollbackInput): WorkflowNodeRollbackResult {
     this.requireKnownSession(input.sessionId);
     const eligibility = this.getNodeRollbackEligibility(input);
-    if (!eligibility.eligible || input.manualRepairRequired === true) {
+    const manualRepairRequired = input.manualRepairRequired === true || eligibility.localRollbackSafe === false;
+    const blockedEligibility = input.manualRepairRequired === true
+      ? rollbackEligibilityWithManualRepair(eligibility, "Local rollback requires manual repair.")
+      : eligibility;
+    if (!blockedEligibility.eligible || manualRepairRequired) {
       const projection = this.materializeFlowProjection(input.sessionId);
       return {
         status: "blocked",
-        eligibility,
-        blockedReason: rollbackBlockReason(eligibility, input.manualRepairRequired === true),
-        ...(input.manualRepairRequired === true ? { manualRepairRequired: true } : {}),
+        eligibility: blockedEligibility,
+        blockedReason: rollbackBlockReason(blockedEligibility, manualRepairRequired),
+        ...(manualRepairRequired ? { manualRepairRequired: true } : {}),
         projection,
       };
     }
@@ -2129,22 +2136,42 @@ function rollbackEventPayload(
     laneId: eligibility.targetLaneId,
     ...(input.nodeId ?? eligibility.targetNodeId ? { nodeId: input.nodeId ?? eligibility.targetNodeId } : {}),
     ...(eligibility.checkpointId ? { checkpointId: eligibility.checkpointId } : {}),
+    ...(eligibility.checkpointPhase ? { checkpointPhase: eligibility.checkpointPhase } : {}),
+    ...(eligibility.restoreCommitRef ? { restoreCommitRef: eligibility.restoreCommitRef } : {}),
+    affectedLaneIds: eligibility.affectedLaneIds,
+    ...(eligibility.affectedNodeIds ? { affectedNodeIds: eligibility.affectedNodeIds } : {}),
+    downstreamInactiveLaneIds: eligibility.downstreamInactiveLaneIds,
+    ...(eligibility.downstreamInactiveNodeIds ? { downstreamInactiveNodeIds: eligibility.downstreamInactiveNodeIds } : {}),
     ...(typeof input.localRollbackSafe === "boolean" ? { localRollbackSafe: input.localRollbackSafe } : {}),
+    ...(eligibility.localSafetyStatus ? { localSafetyStatus: eligibility.localSafetyStatus } : {}),
+    ...(eligibility.manualRepairReason ? { manualRepairReason: eligibility.manualRepairReason } : {}),
   };
+}
+
+function rollbackEligibilityWithManualRepair(
+  eligibility: WorkflowRollbackEligibility,
+  manualRepairReason: string,
+): WorkflowRollbackEligibility {
+  return {
+    ...eligibility,
+    eligible: false,
+    localRollbackSafe: false,
+    localSafetyStatus: "manual_repair_required",
+    manualRepairReason,
+    reason: manualRepairReason,
+  };
+}
+
+function rollbackLocalSafetyStatus(localRollbackSafe: boolean | undefined): WorkflowRollbackEligibility["localSafetyStatus"] {
+  if (localRollbackSafe === true) return "safe";
+  if (localRollbackSafe === false) return "unsafe";
+  return "unknown";
 }
 
 function rollbackBlockReason(
   eligibility: WorkflowRollbackEligibility,
   manualRepairRequired: boolean,
 ): WorkflowRollbackBlockReason {
-  if (manualRepairRequired) {
-    return {
-      code: "manual_repair_required",
-      message: "Local rollback requires manual repair.",
-      affectedLaneIds: eligibility.affectedLaneIds,
-      manualRepairRequired: true,
-    };
-  }
   if (eligibility.blockingRemoteSideEffects.length > 0) {
     return {
       code: "remote_side_effect",
@@ -2152,6 +2179,14 @@ function rollbackBlockReason(
       eventKinds: uniqueStrings(eligibility.blockingRemoteSideEffects.map((effect) => effect.eventKind)),
       remoteSideEffects: eligibility.blockingRemoteSideEffects,
       affectedLaneIds: eligibility.affectedLaneIds,
+    };
+  }
+  if (manualRepairRequired) {
+    return {
+      code: "manual_repair_required",
+      message: eligibility.manualRepairReason ?? "Local rollback requires manual repair.",
+      affectedLaneIds: eligibility.affectedLaneIds,
+      manualRepairRequired: true,
     };
   }
   if (eligibility.localRollbackSafe === false) {

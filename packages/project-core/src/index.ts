@@ -85,6 +85,14 @@ export type WorkflowRemoteSideEffectEventKind =
   | "workflow.pull_request.created"
   | "workflow.pull_request.merged"
   | "workflow.delivery.main_synced";
+export type WorkflowRemoteSideEffectStatus = "recorded" | "in_flight";
+export type WorkflowRollbackLocalSafetyStatus =
+  | "unknown"
+  | "safe"
+  | "unsafe"
+  | "not_required"
+  | "manual_repair_required"
+  | "already_restored";
 export type WorkflowCheckpointIntentKind = "rollback" | "repair" | "variant" | "fork";
 export type WorkflowCheckpointIntentStatus = "requested" | "applied" | "rejected";
 export type ChangesetEvidenceStatus = "available" | "empty" | "failed" | "unknown";
@@ -360,10 +368,12 @@ export interface WorkflowNodeCheckpoint {
 
 export interface WorkflowRemoteSideEffectRef {
   eventKind: WorkflowRemoteSideEffectEventKind;
+  status?: WorkflowRemoteSideEffectStatus;
   eventId: string;
   laneId?: string;
   affectedLaneIds?: string[];
   sessionWide?: boolean;
+  operationId?: string;
   createdAt?: string;
 }
 
@@ -381,10 +391,16 @@ export interface WorkflowRollbackEligibility {
   targetLaneId: string;
   targetNodeId?: string;
   checkpointId?: string;
+  checkpointPhase?: WorkflowNodeCheckpointPhase;
   restoreCommitRef?: string;
   affectedLaneIds: string[];
+  affectedNodeIds?: string[];
+  downstreamInactiveLaneIds: string[];
+  downstreamInactiveNodeIds?: string[];
   blockingRemoteSideEffects: WorkflowRemoteSideEffectRef[];
   localRollbackSafe?: boolean;
+  localSafetyStatus?: WorkflowRollbackLocalSafetyStatus;
+  manualRepairReason?: string;
   reason?: string;
 }
 
@@ -477,10 +493,16 @@ export interface WorkflowRollbackLoopState {
   targetLaneId?: string;
   targetNodeId?: string;
   checkpointId?: string;
+  checkpointPhase?: WorkflowNodeCheckpointPhase;
   restoreCommitRef?: string;
   affectedLaneIds: string[];
+  affectedNodeIds?: string[];
+  downstreamInactiveLaneIds: string[];
+  downstreamInactiveNodeIds?: string[];
   remoteBlockers: WorkflowRemoteSideEffectRef[];
   localRollbackSafe?: boolean;
+  localSafetyStatus?: WorkflowRollbackLocalSafetyStatus;
+  manualRepairReason?: string;
   blockedReason?: WorkflowLoopBlockedReason;
 }
 

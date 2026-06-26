@@ -18,6 +18,7 @@ import type {
   WorkflowRemoteSideEffectEventKind,
   WorkflowRemoteSideEffectRef,
   WorkflowRollbackEligibility,
+  WorkflowRollbackLocalSafetyStatus,
   WorkflowDeliveryCheckStatus,
   WorkflowDeliveryLoopState,
   WorkflowDeliveryReviewStatus,
@@ -1049,6 +1050,7 @@ function projectRollbackLoopState(
     return {
       phase: "not_requested",
       affectedLaneIds: [],
+      downstreamInactiveLaneIds: [],
       remoteBlockers: [],
     };
   }
@@ -1075,10 +1077,16 @@ function projectRollbackLoopState(
     targetLaneId,
     ...(eligibility.targetNodeId ? { targetNodeId: eligibility.targetNodeId } : {}),
     ...(eligibility.checkpointId ? { checkpointId: eligibility.checkpointId } : {}),
+    ...(eligibility.checkpointPhase ? { checkpointPhase: eligibility.checkpointPhase } : {}),
     ...(eligibility.restoreCommitRef ? { restoreCommitRef: eligibility.restoreCommitRef } : {}),
     affectedLaneIds: eligibility.affectedLaneIds,
+    ...(eligibility.affectedNodeIds ? { affectedNodeIds: eligibility.affectedNodeIds } : {}),
+    downstreamInactiveLaneIds: eligibility.downstreamInactiveLaneIds,
+    ...(eligibility.downstreamInactiveNodeIds ? { downstreamInactiveNodeIds: eligibility.downstreamInactiveNodeIds } : {}),
     remoteBlockers: eligibility.blockingRemoteSideEffects,
     ...(typeof eligibility.localRollbackSafe === "boolean" ? { localRollbackSafe: eligibility.localRollbackSafe } : {}),
+    ...(eligibility.localSafetyStatus ? { localSafetyStatus: eligibility.localSafetyStatus } : {}),
+    ...(eligibility.manualRepairReason ? { manualRepairReason: eligibility.manualRepairReason } : {}),
     ...(blockedReason ? { blockedReason } : {}),
   };
 }
@@ -1192,13 +1200,27 @@ export function evaluateRollbackEligibility(
     targetNodeId: input.targetNodeId,
   });
   const resolvedCheckpointId = checkpointValidation.checkpoint?.id;
+  const checkpointPhase = checkpointValidation.checkpoint?.phase;
   const restoreCommitRef = checkpointValidation.reason || !checkpointValidation.checkpoint
     ? undefined
     : checkpointRestoreCommitRef(checkpointValidation.checkpoint);
+  const nodeIdByLaneId = rollbackNodeIdByLaneId(
+    affectedLaneIds,
+    targetLaneId,
+    input.targetNodeId,
+    checkpointValidation.checkpoint,
+  );
+  const affectedNodeIds = affectedLaneIds.length > 0 ? affectedLaneIds.map((laneId) => nodeIdByLaneId.get(laneId) ?? laneId) : undefined;
+  const downstreamInactiveLaneIds = downstreamInactiveRollbackLaneIds(projection, targetLaneId, affectedLaneIds);
+  const downstreamInactiveNodeIds = affectedNodeIds
+    ? downstreamInactiveLaneIds.map((laneId) => nodeIdByLaneId.get(laneId) ?? laneId)
+    : undefined;
   const blockingRemoteSideEffects = remoteSideEffectsForLanes(projection, new Set(affectedLaneIds), input.throughSeq);
   const inheritedLocalRollbackSafe = latestRequest?.status === "rejected" ? undefined : latestRequest?.localRollbackSafe;
   const localRollbackSafe = input.localRollbackSafe ?? inheritedLocalRollbackSafe;
   const localRollbackBlocked = localRollbackSafe === false;
+  const localSafetyStatus = rollbackLocalSafetyStatus(localRollbackSafe);
+  const manualRepairReason = localRollbackBlocked ? "Local rollback is not safe." : undefined;
   const reason =
     affectedLaneIds.length === 0
       ? "Rollback target lane does not exist."
@@ -1217,10 +1239,16 @@ export function evaluateRollbackEligibility(
       ? { targetNodeId: checkpointValidation.checkpoint.nodeId }
       : {}),
     ...(resolvedCheckpointId ? { checkpointId: resolvedCheckpointId } : {}),
+    ...(checkpointPhase ? { checkpointPhase } : {}),
     ...(restoreCommitRef ? { restoreCommitRef } : {}),
     affectedLaneIds,
+    ...(affectedNodeIds ? { affectedNodeIds } : {}),
+    downstreamInactiveLaneIds,
+    ...(downstreamInactiveNodeIds ? { downstreamInactiveNodeIds } : {}),
     blockingRemoteSideEffects,
     ...(typeof localRollbackSafe === "boolean" ? { localRollbackSafe } : {}),
+    localSafetyStatus,
+    ...(manualRepairReason ? { manualRepairReason } : {}),
     reason,
   };
 }
@@ -2401,6 +2429,41 @@ function checkpointRestoreCommitRef(checkpoint: WorkflowNodeCheckpoint): string 
   return checkpoint.headCommit;
 }
 
+function rollbackNodeIdByLaneId(
+  affectedLaneIds: string[],
+  targetLaneId: string,
+  targetNodeId: string | undefined,
+  checkpoint: WorkflowNodeCheckpoint | null,
+): Map<string, string> {
+  const byLaneId = new Map<string, string>();
+  for (const laneId of affectedLaneIds) {
+    byLaneId.set(laneId, laneId);
+  }
+  if (affectedLaneIds.includes(targetLaneId)) {
+    byLaneId.set(targetLaneId, targetNodeId ?? checkpoint?.nodeId ?? targetLaneId);
+  }
+  return byLaneId;
+}
+
+function downstreamInactiveRollbackLaneIds(
+  projection: FlowProjection,
+  targetLaneId: string,
+  affectedLaneIds: string[],
+): string[] {
+  const downstream = new Set<string>(affectedLaneIds.filter((id) => id !== targetLaneId));
+  if (downstream.size === 0) return [];
+  const preserved = preservedRollbackSuccessorSubgraph(projection, targetLaneId, downstream);
+  return [...downstream].filter((laneId) => !preserved.has(laneId));
+}
+
+function rollbackLocalSafetyStatus(
+  localRollbackSafe: boolean | undefined,
+): WorkflowRollbackLocalSafetyStatus {
+  if (localRollbackSafe === true) return "safe";
+  if (localRollbackSafe === false) return "unsafe";
+  return "unknown";
+}
+
 function affectedRollbackLaneIds(projection: FlowProjection, targetLaneId: string): string[] {
   if (!projection.lanes.some((lane) => lane.id === targetLaneId)) return [];
   return [targetLaneId, ...downstreamLaneIds(projection.edges, targetLaneId)];
@@ -2555,6 +2618,7 @@ function remoteSideEffectsForLanes(
     if (remoteSideEffectIsSessionWide(event)) {
       refs.push({
         eventKind: event.kind,
+        status: "recorded",
         eventId: event.id,
         affectedLaneIds: [...affectedLaneIds],
         sessionWide: true,
@@ -2566,6 +2630,7 @@ function remoteSideEffectsForLanes(
     if (laneIds.length === 0) {
       refs.push({
         eventKind: event.kind,
+        status: "recorded",
         eventId: event.id,
         affectedLaneIds: [...affectedLaneIds],
         sessionWide: true,
@@ -2577,6 +2642,7 @@ function remoteSideEffectsForLanes(
     if (matchingLaneIds.length === 0) continue;
     refs.push({
       eventKind: event.kind,
+      status: "recorded",
       eventId: event.id,
       laneId: matchingLaneIds[0],
       affectedLaneIds: matchingLaneIds,
@@ -2587,6 +2653,7 @@ function remoteSideEffectsForLanes(
     if (request.sessionWide) {
       refs.push({
         eventKind: request.eventKind,
+        status: "in_flight",
         eventId: request.eventId,
         affectedLaneIds: [...affectedLaneIds],
         sessionWide: true,
@@ -2599,6 +2666,7 @@ function remoteSideEffectsForLanes(
     if (matchingLaneIds.length === 0) continue;
     refs.push({
       eventKind: request.eventKind,
+      status: "in_flight",
       eventId: request.eventId,
       laneId: matchingLaneIds[0],
       affectedLaneIds: matchingLaneIds,
