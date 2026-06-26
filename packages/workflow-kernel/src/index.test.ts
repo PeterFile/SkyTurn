@@ -3517,6 +3517,245 @@ describe("Flow Kernel gate engine and scheduler", () => {
     ]);
   });
 
+  it("schedules checkpoint repair successors from failed source evidence without rolling back the original lane", () => {
+    const afterCheckpointId = "checkpoint-after-lane-b-run-1";
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-b", "implementation") }),
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-repair-b", "fix"),
+          semanticKey: "manual:repair-lane-b",
+        },
+      }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-repair", sourceLaneId: "lane-b", targetLaneId: "lane-repair-b" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint(afterCheckpointId, "lane-b", "after", "head-sha"),
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-b-1", laneId: "lane-b", runId: "run-b-1", status: "running" },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-b",
+        segmentId: "segment-b-1",
+        status: "failed",
+        exitCode: 1,
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-b",
+        segmentId: "segment-b-1",
+        evidence: { id: "evidence-b-failed", kind: "run-exit", status: "failed", checks: ["run-exit:failed"], artifacts: [] },
+      }),
+      event("workflow.node.repair_requested", {
+        intentId: "repair-lane-b-after",
+        laneId: "lane-b",
+        checkpointId: afterCheckpointId,
+        successorLaneId: "lane-repair-b",
+        successorSemanticKey: "manual:repair-lane-b",
+        sourceEvidenceIds: ["evidence-b-failed"],
+      }),
+    ]);
+
+    expect(projection.lanes.find((item) => item.id === "lane-b")?.status).toBe("failed");
+    expect(projection.lanes.find((item) => item.id === "lane-b")?.rollbackStatus).toBeUndefined();
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual(["lane-repair-b"]);
+  });
+
+  it("does not schedule checkpoint repair successors when failed evidence is outside the selected checkpoint run", () => {
+    const afterCheckpointId = "checkpoint-after-lane-b-run-old";
+    const oldCheckpoint = {
+      ...checkpoint(afterCheckpointId, "lane-b", "after", "old-head-sha"),
+      runId: "run-b-old",
+      segmentId: "segment-b-old",
+      evidenceRefs: [{ kind: "evidence", id: "evidence-b-new-failed" }],
+    };
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-b", "implementation") }),
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-repair-b", "fix"),
+          semanticKey: "manual:repair-lane-b",
+        },
+      }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-repair", sourceLaneId: "lane-b", targetLaneId: "lane-repair-b" } }),
+      event("workflow.node.checkpoint_recorded", { checkpoint: oldCheckpoint }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-b-new", laneId: "lane-b", runId: "run-b-new", status: "running" },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-b",
+        segmentId: "segment-b-new",
+        status: "failed",
+        exitCode: 1,
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-b",
+        segmentId: "segment-b-new",
+        evidence: { id: "evidence-b-new-failed", kind: "run-exit", status: "failed", checks: ["run-exit:failed"], artifacts: [] },
+      }),
+      event("workflow.node.repair_requested", {
+        intentId: "repair-lane-b-after",
+        laneId: "lane-b",
+        checkpointId: afterCheckpointId,
+        successorLaneId: "lane-repair-b",
+        successorSemanticKey: "manual:repair-lane-b",
+        sourceEvidenceIds: ["evidence-b-new-failed"],
+      }),
+    ]);
+
+    expect(projection.checkpointIntents).toContainEqual(expect.objectContaining({
+      intentId: "repair-lane-b-after",
+      status: "requested",
+    }));
+    expect(projection.lanes.find((item) => item.id === "lane-b")?.status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual([]);
+  });
+
+  it("does not schedule checkpoint repair successors from source evidence when checkpoint run cannot be validated", () => {
+    const afterCheckpointId = "checkpoint-after-lane-b-run-old";
+    const oldCheckpoint = {
+      ...checkpoint(afterCheckpointId, "lane-b", "after", "old-head-sha"),
+      runId: "run-b-old",
+      segmentId: "segment-b-old",
+      evidenceRefs: [{ kind: "evidence", id: "evidence-b-old-failed" }],
+    };
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-b", "implementation") }),
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-repair-b", "fix"),
+          semanticKey: "manual:repair-lane-b",
+        },
+      }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-repair", sourceLaneId: "lane-b", targetLaneId: "lane-repair-b" } }),
+      event("workflow.node.checkpoint_recorded", { checkpoint: oldCheckpoint }),
+      event("workflow.segment.finished", {
+        laneId: "lane-b",
+        segmentId: "segment-b-old",
+        status: "failed",
+        exitCode: 1,
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-b",
+        segmentId: "segment-b-old",
+        evidence: { id: "evidence-b-old-failed", kind: "run-exit", status: "failed", checks: ["run-exit:failed"], artifacts: [] },
+      }),
+      event("workflow.node.repair_requested", {
+        intentId: "repair-lane-b-after",
+        laneId: "lane-b",
+        checkpointId: afterCheckpointId,
+        successorLaneId: "lane-repair-b",
+        successorSemanticKey: "manual:repair-lane-b",
+        sourceEvidenceIds: ["evidence-b-old-failed"],
+      }),
+    ]);
+
+    expect(projection.lanes.find((item) => item.id === "lane-b")?.status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual([]);
+  });
+
+  it("schedules checkpoint repair successors when failed evidence belongs to the selected checkpoint run", () => {
+    const afterCheckpointId = "checkpoint-after-lane-b-run-1";
+    const selectedCheckpoint = {
+      ...checkpoint(afterCheckpointId, "lane-b", "after", "head-sha"),
+      runId: "run-b-1",
+      segmentId: "segment-b-run-1-failure",
+    };
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-b", "implementation") }),
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-repair-b", "fix"),
+          semanticKey: "manual:repair-lane-b",
+        },
+      }),
+      event("workflow.edge.declared", { edge: { id: "edge-b-repair", sourceLaneId: "lane-b", targetLaneId: "lane-repair-b" } }),
+      event("workflow.node.checkpoint_recorded", { checkpoint: selectedCheckpoint }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-b-run-1-failure", laneId: "lane-b", runId: "run-b-1", status: "running" },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-b",
+        segmentId: "segment-b-run-1-failure",
+        status: "failed",
+        exitCode: 1,
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-b",
+        segmentId: "segment-b-run-1-failure",
+        evidence: { id: "evidence-b-run-1-failed", kind: "run-exit", status: "failed", checks: ["run-exit:failed"], artifacts: [] },
+      }),
+      event("workflow.node.repair_requested", {
+        intentId: "repair-lane-b-after",
+        laneId: "lane-b",
+        checkpointId: afterCheckpointId,
+        successorLaneId: "lane-repair-b",
+        successorSemanticKey: "manual:repair-lane-b",
+        sourceEvidenceIds: ["evidence-b-run-1-failed"],
+      }),
+    ]);
+
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual(["lane-repair-b"]);
+  });
+
+  it("preserves executable lane brief through projection for repair prompts", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-repair-b", "fix"),
+          semanticSubtype: "repair",
+          brief: "Repair from after checkpoint checkpoint-after-lane-b-run-1; source lane lane-b; failed evidence evidence-b-failed.",
+        },
+      }),
+    ]);
+
+    const repairLane = projection.lanes.find((item) => item.id === "lane-repair-b") as { brief?: string } | undefined;
+
+    expect(repairLane).toMatchObject({
+      brief: expect.stringContaining("after checkpoint checkpoint-after-lane-b-run-1"),
+    });
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 })[0] as { brief?: string }).toMatchObject({
+      brief: expect.stringContaining("failed evidence evidence-b-failed"),
+    });
+  });
+
+  it("schedules checkpoint variants from the selected before checkpoint dependencies without overwriting the original lane", () => {
+    const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-a", "design"), status: "completed" } }),
+      event("workflow.lane.declared", { lane: lane("lane-b", "implementation") }),
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-variant-b", "implementation"),
+          semanticKey: "successor:variant-lane-b",
+        },
+      }),
+      event("workflow.edge.declared", { edge: { id: "edge-a-b", sourceLaneId: "lane-a", targetLaneId: "lane-b" } }),
+      event("workflow.edge.declared", { edge: { id: "edge-a-variant-b", sourceLaneId: "lane-a", targetLaneId: "lane-variant-b" } }),
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: checkpoint(beforeCheckpointId, "lane-b", "before", "base-sha"),
+      }),
+      event("workflow.node.variant_requested", {
+        intentId: "variant-lane-b-before",
+        laneId: "lane-b",
+        checkpointId: beforeCheckpointId,
+        successorLaneId: "lane-variant-b",
+        successorSemanticKey: "successor:variant-lane-b",
+      }),
+    ]);
+
+    expect(projection.checkpointIntents).toContainEqual(expect.objectContaining({
+      intentId: "variant-lane-b-before",
+      kind: "variant",
+      status: "requested",
+    }));
+    expect(projection.lanes.find((item) => item.id === "lane-b")?.status).toBe("pending");
+    expect(projection.lanes.find((item) => item.id === "lane-variant-b")?.status).toBe("pending");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((item) => item.id)).toEqual([
+      "lane-b",
+      "lane-variant-b",
+    ]);
+  });
+
   it("does not schedule rollback successors before rollback is applied", () => {
     const afterCheckpointId = "checkpoint-after-lane-b-run-1";
     const projection = reduceWorkflowEvents([

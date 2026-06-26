@@ -1168,6 +1168,279 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("requests checkpoint repair once with failed evidence context without inventing a regression lane", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
+
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.started",
+      source: "test",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      idempotencyKey: "manual-failure:started",
+      payload: {
+        segment: {
+          id: "segment-session-1-lane-implementation",
+          laneId: "lane-implementation",
+          runId: "run-session-1-lane-implementation",
+          status: "running",
+        },
+      },
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      idempotencyKey: "manual-failure:evidence",
+      payload: {
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        evidence: {
+          id: "evidence-segment-session-1-lane-implementation",
+          kind: "run-exit",
+          status: "failed",
+          checks: ["run-exit:Agent run exit:failed"],
+          artifacts: [],
+          detail: "exit 1",
+        },
+      },
+      now: "2026-06-14T00:00:10.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.finished",
+      source: "test",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      idempotencyKey: "manual-failure:finished",
+      payload: {
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        status: "failed",
+        exitCode: 1,
+      },
+      now: "2026-06-14T00:00:10.000Z",
+    });
+    const firstRequest = store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "manual-repair-intent-1",
+      successorLaneId: "lane-implementation-manual-repair",
+      successorSemanticKey: "manual:repair:lane-implementation",
+      instruction: "Repair from the failed run evidence.",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const eventCountBeforeRetry = store.listEvents("session-1").length;
+    const retry = store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "manual-repair-intent-1",
+      successorLaneId: "lane-implementation-manual-repair",
+      successorSemanticKey: "manual:repair:lane-implementation",
+      instruction: "Repair from the failed run evidence.",
+      now: "2026-06-14T00:00:21.000Z",
+    });
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBeforeRetry);
+    const projection = store.materializeFlowProjection("session-1");
+    const scheduled = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 10,
+      now: "2026-06-14T00:00:22.000Z",
+    });
+    const scheduledProjection = store.materializeFlowProjection("session-1");
+    const canvasSession = store.materializeCanvasSession("session-1");
+    const scheduledCanvasSession = store.materializeCanvasSession("session-1");
+    const repairLane = projection.lanes.find((lane) => lane.id === "lane-implementation-manual-repair");
+    const scheduledRepairLane = scheduled.readyLanes.find((lane) => lane.id === "lane-implementation-manual-repair") as
+      | { brief?: string }
+      | undefined;
+    const repairNode = canvasSession?.nodes.find((node) => node.id === "lane-implementation-manual-repair");
+    const scheduledRepairNode = scheduledCanvasSession?.nodes.find((node) => node.id === "lane-implementation-manual-repair");
+    const regressionLanes = projection.lanes.filter((lane) => lane.semanticKey.startsWith("regression:manual:repair:lane-implementation"));
+    const failedEvidenceId = "evidence-segment-session-1-lane-implementation";
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+
+    expect(firstRequest.event.id).toBe(retry.event.id);
+    expect(eventCountBeforeRetry).toBeGreaterThan(0);
+    expect(reopened.materializeFlowProjection("session-1").events).toHaveLength(scheduledProjection.events.length);
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({ status: "failed" });
+    expect(projection.evidence).toContainEqual(expect.objectContaining({
+      id: failedEvidenceId,
+      laneId: "lane-implementation",
+      status: "failed",
+    }));
+    expect(firstRequest.event.payload).toMatchObject({
+      sourceEvidenceIds: [failedEvidenceId],
+      sourceLaneId: "lane-implementation",
+      sourceNodeId: "lane-implementation",
+      sourceCheckpointId: "checkpoint-after-implementation",
+      failedRunId: "run-session-1-lane-implementation",
+    });
+    expect(firstRequest.event.payload).not.toHaveProperty("regressionLaneId");
+    expect(firstRequest.event.payload).not.toHaveProperty("regressionSemanticKey");
+    expect(repairLane).toMatchObject({
+      laneKind: "fix",
+      semanticSubtype: "repair",
+      output: expect.arrayContaining([
+        expect.stringContaining("source lane lane-implementation"),
+        expect.stringContaining("checkpoint checkpoint-after-implementation"),
+        expect.stringContaining(failedEvidenceId),
+      ]),
+    });
+    const repairBrief = repairNode?.context.brief ?? "";
+    expect(repairBrief).toContain("after checkpoint checkpoint-after-implementation");
+    expect(repairBrief).toContain("source lane lane-implementation");
+    expect(repairBrief).toContain("source node lane-implementation");
+    expect(repairBrief).toContain("source run run-session-1-lane-implementation");
+    expect(repairBrief).toContain("source segment segment-session-1-lane-implementation");
+    expect(repairBrief).toContain(`failed evidence ${failedEvidenceId}`);
+    expect(repairBrief).toContain("failed detail exit 1");
+    expect(repairBrief).toContain("instruction Repair from the failed run evidence.");
+    expect(scheduledRepairLane?.brief).toBe(repairBrief);
+    expect(scheduledRepairNode?.context.brief).toBe(repairBrief);
+    expect(regressionLanes).toEqual([]);
+    expect(projection.edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceLaneId: "lane-implementation", targetLaneId: "lane-implementation-manual-repair" }),
+    ]));
+    expect(projection.edges.some((edge) => edge.sourceLaneId === "lane-implementation-manual-repair")).toBe(false);
+    expect(scheduled.readyLanes.map((lane) => lane.id)).toContain("lane-implementation-manual-repair");
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(scheduledProjection);
+    reopened.close();
+  });
+
+  it("uses failed evidence matching the selected repair checkpoint segment instead of newer lane failure", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    recordCheckpointForSegment(
+      store,
+      "checkpoint-after-implementation-old",
+      "lane-implementation",
+      "run-implementation-old",
+      "segment-implementation-old",
+      "2026-06-14T00:00:08.000Z",
+    );
+    appendFailedEvidence(
+      store,
+      "lane-implementation",
+      "segment-implementation-old",
+      "old-failed-evidence",
+      "old failure detail",
+      "2026-06-14T00:00:10.000Z",
+      "run-implementation-old",
+    );
+    recordCheckpointForSegment(
+      store,
+      "checkpoint-after-implementation-new",
+      "lane-implementation",
+      "run-implementation-new",
+      "segment-implementation-new",
+      "2026-06-14T00:00:11.000Z",
+    );
+    appendFailedEvidence(
+      store,
+      "lane-implementation",
+      "segment-implementation-new",
+      "new-failed-evidence",
+      "new failure detail",
+      "2026-06-14T00:00:12.000Z",
+      "run-implementation-new",
+    );
+
+    const repair = store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation-old",
+      intentId: "repair-old-checkpoint",
+      successorLaneId: "lane-implementation-old-repair",
+      successorSemanticKey: "manual:repair:lane-implementation:old",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const canvasSession = store.materializeCanvasSession("session-1");
+    const repairNode = canvasSession?.nodes.find((node) => node.id === "lane-implementation-old-repair");
+    const repairBrief = repairNode?.context.brief ?? "";
+    store.close();
+
+    expect(repair.event.payload).toMatchObject({
+      sourceEvidenceIds: ["old-failed-evidence"],
+      failedEvidenceId: "old-failed-evidence",
+      failedEvidenceDetail: "old failure detail",
+      failedSegmentId: "segment-implementation-old",
+    });
+    expect(repair.event.payload).not.toMatchObject({
+      sourceEvidenceIds: ["new-failed-evidence"],
+      failedEvidenceDetail: "new failure detail",
+    });
+    expect(repairBrief).toContain("failed evidence old-failed-evidence");
+    expect(repairBrief).toContain("failed detail old failure detail");
+    expect(repairBrief).not.toContain("new-failed-evidence");
+    expect(repairBrief).not.toContain("new failure detail");
+  });
+
+  it("does not attach failed evidence referenced by a checkpoint when selected run and segment do not match", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    appendFailedEvidence(
+      store,
+      "lane-implementation",
+      "segment-implementation-new",
+      "new-failed-evidence",
+      "new failure detail",
+      "2026-06-14T00:00:10.000Z",
+      "run-implementation-new",
+    );
+    recordCheckpointForSegment(
+      store,
+      "checkpoint-after-implementation-old",
+      "lane-implementation",
+      "run-implementation-old",
+      "segment-implementation-old",
+      "2026-06-14T00:00:12.000Z",
+      [{ kind: "evidence", id: "new-failed-evidence" }],
+    );
+
+    const repair = store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation-old",
+      intentId: "repair-old-checkpoint-mismatched-evidence",
+      successorLaneId: "lane-implementation-old-repair",
+      successorSemanticKey: "manual:repair:lane-implementation:old",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const canvasSession = store.materializeCanvasSession("session-1");
+    const repairNode = canvasSession?.nodes.find((node) => node.id === "lane-implementation-old-repair");
+    const repairBrief = repairNode?.context.brief ?? "";
+    store.close();
+
+    expect(repair.event.payload).not.toHaveProperty("sourceEvidenceIds");
+    expect(repair.event.payload).not.toHaveProperty("failedEvidenceId");
+    expect(repair.event.payload).not.toHaveProperty("failedEvidenceDetail");
+    expect(repair.event.payload).not.toHaveProperty("failedSegmentId");
+    expect(repair.event.payload).toMatchObject({
+      failedEvidenceFallbackReason: expect.stringContaining("No failed evidence matched"),
+    });
+    expect(repairBrief).toContain("No failed evidence matched");
+    expect(repairBrief).not.toContain("new-failed-evidence");
+    expect(repairBrief).not.toContain("new failure detail");
+  });
+
   it("rejects conflicting idempotent repair retries before adding successor edges", async () => {
     const store = await makeSeededStore();
     declareCodeChangeWorkflow(store);
@@ -1310,7 +1583,7 @@ describe("SQLite workflow store", () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
     seedStore(store);
-    declareCodeChangeWorkflow(store);
+    declareCompletedImplementationWithUpstream(store);
     recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
     const upstreamBefore = store
       .materializeFlowProjection("session-1")
@@ -1353,6 +1626,99 @@ describe("SQLite workflow store", () => {
     });
     expect(variantIncoming).toEqual(upstreamBefore);
     expect(reopened.materializeFlowProjection("session-1")).toEqual(projection);
+    reopened.close();
+  });
+
+  it("materializes and schedules variant successor brief with manual instruction", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCompletedImplementationWithUpstream(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+
+    store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      successorLaneId: "lane-implementation-variant",
+      successorSemanticKey: "variant:lane-implementation:manual",
+      instruction: "Try a simpler implementation path.",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+    const canvasSession = store.materializeCanvasSession("session-1");
+    const scheduled = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      now: "2026-06-14T00:00:22.000Z",
+    });
+    const scheduledCanvasSession = store.materializeCanvasSession("session-1");
+    const variantLane = projection.lanes.find((lane) => lane.id === "lane-implementation-variant") as { brief?: string } | undefined;
+    const variantNode = canvasSession?.nodes.find((node) => node.id === "lane-implementation-variant");
+    const scheduledVariantLane = scheduled.readyLanes.find((lane) => lane.id === "lane-implementation-variant") as
+      | { brief?: string }
+      | undefined;
+    const scheduledVariantNode = scheduledCanvasSession?.nodes.find((node) => node.id === "lane-implementation-variant");
+    store.close();
+
+    expect(variantLane?.brief).toContain("Variant from before checkpoint checkpoint-before-implementation");
+    expect(variantLane?.brief).toContain("instruction Try a simpler implementation path.");
+    expect(variantNode?.context.brief).toBe(variantLane?.brief);
+    expect(scheduledVariantLane?.brief).toBe(variantLane?.brief);
+    expect(scheduledVariantNode?.context.brief).toBe(variantLane?.brief);
+  });
+
+  it("keeps checkpoint variant isolated, idempotent, and schedulable without mutating the original lane", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCompletedImplementationWithUpstream(store);
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+
+    const variant = store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      intentId: "variant-intent-idempotent",
+      successorLaneId: "lane-implementation-variant",
+      successorSemanticKey: "variant:lane-implementation:idempotent",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const eventCountBeforeRetry = store.listEvents("session-1").length;
+    const retry = store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+      intentId: "variant-intent-idempotent",
+      successorLaneId: "lane-implementation-variant",
+      successorSemanticKey: "variant:lane-implementation:idempotent",
+      now: "2026-06-14T00:00:21.000Z",
+    });
+    const beforeSchedule = store.materializeFlowProjection("session-1");
+    const scheduled = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      now: "2026-06-14T00:00:22.000Z",
+    });
+    const afterSchedule = store.materializeFlowProjection("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+
+    expect(retry.event.id).toBe(variant.event.id);
+    expect(reopened.listEvents("session-1")).toHaveLength(eventCountBeforeRetry + 1);
+    expect(beforeSchedule.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({ status: "completed" });
+    expect(beforeSchedule.lanes.find((lane) => lane.id === "lane-implementation-variant")).toMatchObject({
+      status: "pending",
+      semanticKey: "variant:lane-implementation:idempotent",
+    });
+    expect(beforeSchedule.checkpointIntents.filter((intent) => intent.intentId === "variant-intent-idempotent")).toHaveLength(1);
+    expect(beforeSchedule.edges).toContainEqual(expect.objectContaining({
+      sourceLaneId: "lane-upstream",
+      targetLaneId: "lane-implementation-variant",
+    }));
+    expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual(["lane-implementation-variant"]);
+    expect(afterSchedule.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({ status: "completed" });
+    expect(afterSchedule.lanes.find((lane) => lane.id === "lane-implementation-variant")).toMatchObject({ status: "running" });
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(afterSchedule);
     reopened.close();
   });
 
@@ -2230,6 +2596,47 @@ function declareCodeChangeWorkflow(store: ReturnType<typeof createWorkflowStore>
   }, "2026-06-14T00:00:02.000Z");
 }
 
+function declareCompletedImplementationWithUpstream(store: ReturnType<typeof createWorkflowStore>): void {
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.lane.declared",
+    source: "test",
+    idempotencyKey: "lane:upstream",
+    payload: { lane: { id: "lane-upstream", semanticKey: "lane-upstream", kind: "design", title: "Upstream", agentKind: "codex", status: "completed" } },
+    now: "2026-06-14T00:00:01.000Z",
+  });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.lane.declared",
+    source: "test",
+    idempotencyKey: "lane:implementation",
+    payload: { lane: { id: "lane-implementation", semanticKey: "lane-implementation", kind: "implementation", title: "Implement", agentKind: "codex", status: "completed" } },
+    now: "2026-06-14T00:00:02.000Z",
+  });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.edge.declared",
+    source: "test",
+    idempotencyKey: "edge:upstream-implementation",
+    payload: { edge: { id: "edge-upstream-implementation", sourceLaneId: "lane-upstream", targetLaneId: "lane-implementation" } },
+    now: "2026-06-14T00:00:03.000Z",
+  });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.evidence.recorded",
+    source: "test",
+    laneId: "lane-implementation",
+    segmentId: "segment-session-1-lane-implementation",
+    idempotencyKey: "evidence:implementation-completed",
+    payload: {
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      evidence: { id: "evidence-implementation-completed", kind: "run-exit", status: "passed", checks: [], artifacts: [] },
+    },
+    now: "2026-06-14T00:00:04.000Z",
+  });
+}
+
 function advanceCodeChangeWorkflowToLane(
   store: ReturnType<typeof createWorkflowStore>,
   targetLaneId: "lane-implementation" | "lane-validation" | "lane-review",
@@ -2323,6 +2730,108 @@ function recordCheckpoint(
       },
     },
     now: "2026-06-14T00:00:08.000Z",
+  });
+}
+
+function recordCheckpointForSegment(
+  store: ReturnType<typeof createWorkflowStore>,
+  checkpointId: string,
+  laneId: string,
+  runId: string,
+  segmentId: string,
+  now: string,
+  evidenceRefs: Array<{ kind: "run" | "evidence"; id: string }> = [{ kind: "run", id: runId }],
+): void {
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.node.checkpoint_recorded",
+    source: "test",
+    laneId,
+    idempotencyKey: `checkpoint:${checkpointId}`,
+    payload: {
+      checkpoint: {
+        id: checkpointId,
+        sessionId: "session-1",
+        nodeId: laneId,
+        laneId,
+        runId,
+        segmentId,
+        phase: "after",
+        executionTarget: "current_branch",
+        baseCommit: "base-sha",
+        headCommit: `${checkpointId}-head-sha`,
+        createdAt: now,
+        source: "backend",
+        evidenceRefs,
+      },
+    },
+    now,
+  });
+}
+
+function appendFailedEvidence(
+  store: ReturnType<typeof createWorkflowStore>,
+  laneId: string,
+  segmentId: string,
+  evidenceId: string,
+  detail: string,
+  now: string,
+  runId?: string,
+): void {
+  if (runId) {
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.started",
+      source: "test",
+      laneId,
+      segmentId,
+      idempotencyKey: `segment:${segmentId}:started`,
+      payload: {
+        segment: {
+          id: segmentId,
+          laneId,
+          runId,
+          status: "running",
+        },
+      },
+      now,
+    });
+  }
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.evidence.recorded",
+    source: "test",
+    laneId,
+    segmentId,
+    idempotencyKey: `evidence:${evidenceId}`,
+    payload: {
+      laneId,
+      segmentId,
+      evidence: {
+        id: evidenceId,
+        kind: "run-exit",
+        status: "failed",
+        checks: ["run-exit:failed"],
+        artifacts: [],
+        detail,
+      },
+    },
+    now,
+  });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.segment.finished",
+    source: "test",
+    laneId,
+    segmentId,
+    idempotencyKey: `segment:${segmentId}:finished`,
+    payload: {
+      laneId,
+      segmentId,
+      status: "failed",
+      exitCode: 1,
+    },
+    now,
   });
 }
 

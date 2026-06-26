@@ -35,6 +35,7 @@ import {
   reduceWorkflowEvents,
   scheduleReadyLanes as scheduleFlowReadyLanes,
   type CompileWorkflowIntentResult,
+  type FlowEvidence,
   type FlowEvent,
   type FlowEventKind,
   type FlowLane,
@@ -381,6 +382,10 @@ interface PreparedCheckpointSuccessorRequest {
   successorSemanticKey: string;
   intentId: string;
   edgeSources: string[];
+  sourceEvidenceIds: string[];
+  failedEvidence?: FlowEvidence;
+  failedRunId?: string;
+  failedEvidenceFallbackReason?: string;
 }
 
 export interface SegmentEvidenceInput {
@@ -1220,8 +1225,13 @@ export class WorkflowStore {
       const lanePayload = successorLanePayload(
         kind,
         currentPrepared.lane,
+        currentPrepared.checkpoint,
         currentPrepared.successorLaneId,
         currentPrepared.successorSemanticKey,
+        currentPrepared.sourceEvidenceIds,
+        currentPrepared.failedEvidence,
+        currentPrepared.failedEvidenceFallbackReason,
+        input.instruction,
         input.title,
       );
       const laneEvent = this.insertEventInTransaction({
@@ -1260,13 +1270,31 @@ export class WorkflowStore {
           laneId: currentPrepared.targetLaneId,
           nodeId: currentPrepared.checkpoint.nodeId,
           checkpointId: input.checkpointId,
+          sourceLaneId: currentPrepared.targetLaneId,
+          sourceNodeId: currentPrepared.checkpoint.nodeId,
+          sourceCheckpointId: input.checkpointId,
+          checkpointPhase: currentPrepared.checkpoint.phase,
+          ...(currentPrepared.checkpoint.runId ? { sourceRunId: currentPrepared.checkpoint.runId } : {}),
+          ...(currentPrepared.checkpoint.segmentId ? { sourceSegmentId: currentPrepared.checkpoint.segmentId } : {}),
+          ...(currentPrepared.failedEvidence?.segmentId ? { failedSegmentId: currentPrepared.failedEvidence.segmentId } : {}),
+          ...(currentPrepared.failedEvidence?.id ? { failedEvidenceId: currentPrepared.failedEvidence.id } : {}),
+          ...(currentPrepared.failedEvidence?.kind ? { failedEvidenceKind: currentPrepared.failedEvidence.kind } : {}),
+          ...(currentPrepared.failedEvidence?.detail ? { failedEvidenceDetail: currentPrepared.failedEvidence.detail } : {}),
+          ...(currentPrepared.sourceEvidenceIds.length > 0 ? { sourceEvidenceIds: currentPrepared.sourceEvidenceIds } : {}),
+          ...(currentPrepared.failedRunId ? { failedRunId: currentPrepared.failedRunId } : {}),
+          ...(currentPrepared.failedEvidenceFallbackReason ? { failedEvidenceFallbackReason: currentPrepared.failedEvidenceFallbackReason } : {}),
           successorLaneId: currentPrepared.successorLaneId,
           successorSemanticKey: currentPrepared.successorSemanticKey,
           ...(input.instruction ? { instruction: input.instruction } : {}),
         },
         now: input.now,
       });
-      return { kind: "created" as const, laneEvent, edgeEvents, event };
+      return {
+        kind: "created" as const,
+        laneEvent,
+        edgeEvents,
+        event,
+      };
     });
     const result = tx();
     if (result.kind === "existing") return result.existing;
@@ -1314,12 +1342,10 @@ export class WorkflowStore {
       throw new Error(`${kind} idempotent retry conflicts with missing existing successor lane.`);
     }
     const edgePrefix = `checkpoint-successor:${intentId}:edge:`;
-    const edgeSuffix = `:${successorLaneId}`;
     const edgeEvents = this.listEvents(input.sessionId).filter((event) =>
       event.kind === "workflow.edge.declared" &&
       typeof event.idempotencyKey === "string" &&
-      event.idempotencyKey.startsWith(edgePrefix) &&
-      event.idempotencyKey.endsWith(edgeSuffix)
+      event.idempotencyKey.startsWith(edgePrefix)
     );
     return {
       status: "requested",
@@ -1985,7 +2011,7 @@ function flowLaneToCanvasNode(
     output: lane.output.length > 0 ? lane.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
     worktree: worktreeForSessionTarget(session, lane.id, undefined, createdWorktree),
     context: {
-      brief: lane.title,
+      brief: lane.brief ?? lane.title,
       sessionGoal: session.goal,
       relatedRequirements: "Compiled from Hermes WorkflowIntent.",
       relatedDesign: "Flow Kernel policy/gate/compiler creates the DAG projection.",
@@ -2225,6 +2251,11 @@ function prepareCheckpointSuccessorRequest(
   if (checkpoint.phase !== requiredPhase) throw new Error(`${kind} requires a ${requiredPhase} checkpoint.`);
   const lane = projection.lanes.find((item) => item.id === targetLaneId);
   if (!lane) throw new Error(`${kind} requires a known target lane.`);
+  const failedEvidence = kind === "repair" ? failedEvidenceForCheckpoint(projection, targetLaneId, checkpoint) : undefined;
+  const failedRunId = failedEvidence ? runIdForFailedEvidence(projection, checkpoint, failedEvidence, input.sessionId) : undefined;
+  const failedEvidenceFallbackReason = kind === "repair" && !failedEvidence
+    ? "No failed evidence matched the selected checkpoint segment or run; repair is scoped to checkpoint context only."
+    : undefined;
   const successorLaneId = input.successorLaneId ?? `${kind}-${targetLaneId}-${input.checkpointId}`;
   const successorSemanticKey = input.successorSemanticKey ?? `${kind}:${targetLaneId}:${input.checkpointId}`;
   const intentId = input.intentId ?? `${kind}:${successorLaneId}:${input.checkpointId}`;
@@ -2237,6 +2268,10 @@ function prepareCheckpointSuccessorRequest(
     successorSemanticKey,
     intentId,
     edgeSources: kind === "repair" ? [targetLaneId] : incomingLaneIds(projection, targetLaneId),
+    sourceEvidenceIds: failedEvidence ? [failedEvidence.id] : [],
+    ...(failedEvidence ? { failedEvidence } : {}),
+    ...(failedRunId ? { failedRunId } : {}),
+    ...(failedEvidenceFallbackReason ? { failedEvidenceFallbackReason } : {}),
   };
 }
 
@@ -2249,11 +2284,25 @@ function checkpointPhaseIsExplicit(projection: FlowProjection, checkpoint: Workf
 function successorLanePayload(
   kind: "repair" | "variant",
   lane: FlowLane,
+  checkpoint: WorkflowNodeCheckpoint,
   successorLaneId: string,
   successorSemanticKey: string,
+  sourceEvidenceIds: string[],
+  failedEvidence?: FlowEvidence,
+  failedEvidenceFallbackReason?: string,
+  instruction?: string,
   title?: string,
 ): Record<string, unknown> {
   if (kind === "repair") {
+    const brief = checkpointSuccessorContextBrief(
+      kind,
+      lane,
+      checkpoint,
+      sourceEvidenceIds,
+      failedEvidence,
+      failedEvidenceFallbackReason,
+      instruction,
+    );
     return {
       id: successorLaneId,
       semanticKey: successorSemanticKey,
@@ -2261,11 +2310,24 @@ function successorLanePayload(
       laneKind: "fix",
       semanticSubtype: "repair",
       title: title ?? `Repair ${lane.title}`,
+      brief,
       agentKind: lane.agentKind,
       status: "pending",
-      output: [],
+      fileScopes: lane.fileScopes,
+      packageScopes: lane.packageScopes,
+      requiredEvidence: lane.requiredEvidence,
+      output: checkpointSuccessorContextOutput("repair", lane, checkpoint, sourceEvidenceIds, failedEvidence, failedEvidenceFallbackReason),
     };
   }
+  const brief = checkpointSuccessorContextBrief(
+    kind,
+    lane,
+    checkpoint,
+    sourceEvidenceIds,
+    failedEvidence,
+    failedEvidenceFallbackReason,
+    instruction,
+  );
   return {
     id: successorLaneId,
     semanticKey: successorSemanticKey,
@@ -2273,13 +2335,110 @@ function successorLanePayload(
     laneKind: lane.laneKind,
     semanticSubtype: lane.semanticSubtype,
     title: title ?? `Variant ${lane.title}`,
+    brief,
     agentKind: lane.agentKind,
     status: "pending",
     fileScopes: lane.fileScopes,
     packageScopes: lane.packageScopes,
     requiredEvidence: lane.requiredEvidence,
-    output: [],
+    output: checkpointSuccessorContextOutput("variant", lane, checkpoint, sourceEvidenceIds),
   };
+}
+
+function checkpointSuccessorContextOutput(
+  kind: "repair" | "variant",
+  lane: FlowLane,
+  checkpoint: WorkflowNodeCheckpoint,
+  sourceEvidenceIds: string[],
+  failedEvidence?: FlowEvidence,
+  failedEvidenceFallbackReason?: string,
+): string[] {
+  return [
+    `${kind} successor for source lane ${lane.id}.`,
+    `Original node ${checkpoint.nodeId}; checkpoint ${checkpoint.id} (${checkpoint.phase}).`,
+    ...(checkpoint.runId ? [`Checkpoint run ${checkpoint.runId}.`] : []),
+    ...(checkpoint.segmentId ? [`Checkpoint segment ${checkpoint.segmentId}.`] : []),
+    ...(sourceEvidenceIds.length > 0 ? [`Failed evidence ${sourceEvidenceIds.join(", ")}.`] : []),
+    ...(failedEvidence?.detail ? [`Failed detail ${failedEvidence.detail}.`] : []),
+    ...(failedEvidenceFallbackReason ? [failedEvidenceFallbackReason] : []),
+  ];
+}
+
+function checkpointSuccessorContextBrief(
+  kind: "repair" | "variant",
+  lane: FlowLane,
+  checkpoint: WorkflowNodeCheckpoint,
+  sourceEvidenceIds: string[],
+  failedEvidence?: FlowEvidence,
+  failedEvidenceFallbackReason?: string,
+  instruction?: string,
+): string {
+  const trimmedInstruction = instruction?.trim();
+  return [
+    `${kind === "repair" ? "Repair" : "Variant"} from ${checkpoint.phase} checkpoint ${checkpoint.id}.`,
+    `source lane ${lane.id}; source node ${checkpoint.nodeId}.`,
+    ...(checkpoint.runId ? [`source run ${checkpoint.runId}.`] : []),
+    ...(checkpoint.segmentId ? [`source segment ${checkpoint.segmentId}.`] : []),
+    ...(sourceEvidenceIds.length > 0 ? [`failed evidence ${sourceEvidenceIds.join(", ")}.`] : []),
+    ...(failedEvidence?.detail ? [`failed detail ${failedEvidence.detail}.`] : []),
+    ...(failedEvidenceFallbackReason ? [failedEvidenceFallbackReason] : []),
+    ...(trimmedInstruction ? [`instruction ${trimmedInstruction}`] : []),
+  ].join(" ");
+}
+
+function failedEvidenceForCheckpoint(
+  projection: FlowProjection,
+  laneId: string,
+  checkpoint: WorkflowNodeCheckpoint,
+): FlowEvidence | undefined {
+  const candidates = [...projection.evidence]
+    .reverse()
+    .filter((evidence) => evidence.laneId === laneId && evidence.status === "failed");
+  if (checkpoint.segmentId) {
+    const segmentMatch = candidates.find((evidence) =>
+      evidence.segmentId === checkpoint.segmentId &&
+      failedEvidenceRunMatchesCheckpoint(projection, laneId, checkpoint, evidence)
+    );
+    if (segmentMatch) return segmentMatch;
+    return undefined;
+  }
+  if (checkpoint.runId) {
+    const runMatch = candidates.find((evidence) => failedEvidenceRunMatchesCheckpoint(projection, laneId, checkpoint, evidence));
+    if (runMatch) return runMatch;
+    return undefined;
+  }
+  const checkpointEvidenceIds = new Set(
+    checkpoint.evidenceRefs
+      .filter((ref) => ref.kind === "evidence")
+      .map((ref) => ref.id),
+  );
+  if (checkpointEvidenceIds.size > 0) {
+    return candidates.find((evidence) => checkpointEvidenceIds.has(evidence.id));
+  }
+  return undefined;
+}
+
+function failedEvidenceRunMatchesCheckpoint(
+  projection: FlowProjection,
+  laneId: string,
+  checkpoint: WorkflowNodeCheckpoint,
+  evidence: FlowEvidence,
+): boolean {
+  if (!checkpoint.runId) return true;
+  const segment = projection.segments.find((item) => item.id === evidence.segmentId && item.laneId === laneId);
+  return segment?.runId === checkpoint.runId;
+}
+
+function runIdForFailedEvidence(
+  projection: FlowProjection,
+  checkpoint: WorkflowNodeCheckpoint,
+  failedEvidence: FlowEvidence,
+  sessionId: string,
+): string | undefined {
+  const segment = projection.segments.find((item) => item.id === failedEvidence.segmentId);
+  if (segment?.runId) return segment.runId;
+  if (checkpoint.segmentId === failedEvidence.segmentId && checkpoint.runId) return checkpoint.runId;
+  return runIdFromSegmentId(sessionId, failedEvidence.segmentId);
 }
 
 function incomingLaneIds(projection: FlowProjection, laneId: string): string[] {
@@ -2342,6 +2501,11 @@ function runtimeForNodeStatus(status: NodeStatus, action: string): NodeRuntimeSt
 
 function runIdForLane(sessionId: string, laneId: string): string {
   return `run-${sessionId}-${laneId}`;
+}
+
+function runIdFromSegmentId(sessionId: string, segmentId: string): string | undefined {
+  const prefix = `segment-${sessionId}-`;
+  return segmentId.startsWith(prefix) ? runIdForLane(sessionId, segmentId.slice(prefix.length)) : undefined;
 }
 
 function segmentIdForLane(sessionId: string, laneId: string): string {
