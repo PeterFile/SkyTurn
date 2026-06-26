@@ -2965,13 +2965,20 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
         prNumber: prEvidence.number,
-        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+        expectedHeadSha: prEvidence.headSha,
       });
       const checkStatus = deliveryCheckStatusForEvidence(result.evidence.status);
+      const reviewStatus = deliveryReviewStatusFromEvidence(result.evidence);
+
       setPrChecks({
         checkStatus,
+        reviewStatus,
         expectedHeadSha: result.evidence.headSha,
-        mergeable: checkStatus === "passing",
+        mergeable:
+          checkStatus === "passing" &&
+          deliveryGateMergeableFromEvidence(result.evidence) &&
+          reviewStatus !== "changes_requested" &&
+          reviewStatus !== "unknown",
       });
       setPrCheckStatus(`checks: ${checkStatus}`);
     } catch (e) {
@@ -2987,7 +2994,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
 
     const trimmedTitle = mergeTitle.trim();
     if (!mergeConfirmed || trimmedTitle === "") return;
-    const headSha = prEvidence.headSha ?? commitEvidence?.commitSha;
+    const headSha = prEvidence.headSha;
     if (
       prChecks?.checkStatus !== "passing" ||
       !prChecks.mergeable ||
@@ -3006,7 +3013,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
         prNumber: prEvidence.number,
-        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+        expectedHeadSha: prEvidence.headSha,
         title: trimmedTitle,
         method: "squash",
       });
@@ -3038,7 +3045,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
         prNumber: prEvidence.number,
-        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+        expectedHeadSha: prEvidence.headSha,
       });
       if (result.status === "synced") {
         setSyncStatus("synced");
@@ -3452,7 +3459,7 @@ function DeliveryLifecyclePanel({
   const mergeRequestDisabled = !state.mergeReady || mergeStatus === "merging";
   const confirmMergeDisabled = !state.canMerge;
   const cleanupDisabled = !state.canCleanup || missingCleanMetadata;
-  const headSha = pullRequest?.headSha ?? commitEvidence?.commitSha;
+  const headSha = pullRequest?.headSha;
 
   return (
     <section className="delivery-panel" aria-label="Delivery lifecycle">
@@ -3674,6 +3681,28 @@ function deliveryCheckStatusForEvidence(status: string): DeliveryPullRequestChec
   if (status === "passed") return "passing";
   if (status === "failed") return "failing";
   return "pending";
+}
+
+function deliveryReviewStatusFromEvidence(evidence: unknown): DeliveryPullRequestChecks["reviewStatus"] {
+  const record = asRecord(evidence);
+  const review = asRecord(record?.review);
+  const gate = asRecord(record?.gate);
+  return deliveryReviewStatusForEvidence(
+    optionalText(review?.status) ??
+    optionalText(gate?.reviewStatus),
+  );
+}
+
+function deliveryGateMergeableFromEvidence(evidence: unknown): boolean {
+  const gate = asRecord(asRecord(evidence)?.gate);
+  return typeof gate?.mergeable === "boolean" ? gate.mergeable : false;
+}
+
+function deliveryReviewStatusForEvidence(status?: string): DeliveryPullRequestChecks["reviewStatus"] {
+  if (status === "approved") return "approved";
+  if (status === "changes_requested") return "changes_requested";
+  if (status === "pending") return "pending";
+  return "unknown";
 }
 
 export function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
