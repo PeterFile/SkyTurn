@@ -42,6 +42,10 @@ export interface SelectedNodeCheckpointDisplay {
   hasAfter: boolean;
   beforeCheckpointId: string | null;
   afterCheckpointId: string | null;
+  beforeCommitSha: string | null;
+  afterCommitSha: string | null;
+  beforeSource: string | null;
+  afterSource: string | null;
 }
 
 export interface SelectedNodeActionState {
@@ -230,6 +234,10 @@ function failClosed(reason: string): SelectedNodeActionState {
       hasAfter: false,
       beforeCheckpointId: null,
       afterCheckpointId: null,
+      beforeCommitSha: null,
+      afterCommitSha: null,
+      beforeSource: null,
+      afterSource: null,
     },
     remoteSideEffects: [],
     blockedReasons: [reason],
@@ -259,6 +267,10 @@ function checkpointDisplay(
     hasAfter: !!afterCheckpoint,
     beforeCheckpointId: beforeCheckpoint?.id ?? null,
     afterCheckpointId: afterCheckpoint?.id ?? null,
+    beforeCommitSha: beforeCheckpoint?.headCommit?.substring(0, 7) ?? null,
+    afterCommitSha: afterCheckpoint?.headCommit?.substring(0, 7) ?? null,
+    beforeSource: beforeCheckpoint?.source ?? null,
+    afterSource: afterCheckpoint?.source ?? null,
   };
 }
 

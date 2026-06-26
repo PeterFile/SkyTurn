@@ -6022,3 +6022,41 @@ select:focus-visible,
 .composer-action-message.error {
   color: var(--sk-status-failed-text);
 }
+
+.composer-checkpoint-summary,
+.composer-impact-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-radius: 4px;
+  background-color: var(--sk-surface-warm-muted);
+  font-size: 12px;
+  color: var(--sk-ink-muted);
+}
+
+.checkpoint-row,
+.impact-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.checkpoint-label,
+.impact-label {
+  font-weight: 700;
+  color: var(--sk-ink);
+  min-width: 50px;
+}
+
+.checkpoint-missing {
+  color: var(--sk-status-warning-text);
+  font-style: italic;
+}
+
+.checkpoint-detail,
+.impact-detail {
+  font-family: var(--sk-font-mono);
+  font-size: 11px;
+}
