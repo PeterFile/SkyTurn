@@ -631,6 +631,25 @@ describe("Slice C UI behavior", () => {
     expect(appSource).not.toContain("hydrateSelectedNodeActionStateFromEvents");
     expect(appSource).toContain("laneId: rollbackPayload.laneId");
     expect(appSource).toContain("checkpointId: rollbackPayload.checkpointId");
+    expect(submitHandler).toContain("nodeActionPayloadMatchesSelection(repairPayload, activeSession.id, selectedNode.id)");
+    expect(submitHandler).toContain("nodeActionPayloadMatchesSelection(variantPayload, activeSession.id, selectedNode.id)");
+    expect(submitHandler).toContain("nodeActionPayloadMatchesSelection(rollbackPayload, activeSession.id, selectedNode.id)");
+    expect(appSource).toContain("const selectedNodeActionGenerationRef = useRef(0);");
+    expect(appSource).toContain("selectedNodeActionGenerationRef.current += 1;");
+    expect(submitHandler).toContain("const actionGeneration = selectedNodeActionGenerationRef.current + 1;");
+    expect(submitHandler).toContain("selectedNodeActionGenerationRef.current = actionGeneration;");
+    expect(submitHandler).toContain("nodeActionPayloadMatchesSelection(selectedNodeActionScopeRef.current, actionScope.sessionId, actionScope.nodeId) &&");
+    expect(submitHandler).toContain("selectedNodeActionGenerationRef.current === actionGeneration");
+    expect(submitHandler).toContain("if (!actionStillCurrent()) return;");
+    expect(submitHandler).toContain("applyWorkflowActionResult(result, actionStillCurrent)");
+    expect(submitHandler).toContain("await refreshWorkflowProjection(actionStillCurrent)");
+    expect(submitHandler).toContain("if (actionStillCurrent()) setNodeActionError");
+    expect(submitHandler).toContain("if (actionStillCurrent()) setNodeActionBusy(null)");
+    expect(submitHandler).toContain("Selected node action is stale. Reselect the node and try again.");
+    expect(appSource).toContain("const selectedNodeActionScopeKey = activeSession?.kind === \"canvas\" && selectedNode");
+    expect(appSource).toContain("}, [selectedNodeActionScopeKey]);");
+    expect(composer).toContain("selectedNodeActionScopeKey: string | null");
+    expect(composer).toContain("}, [selectedNodeActionScopeKey]);");
     expect(composer).toContain("const actionAvailability = selectedNodeActionAvailability");
     expect(composer).toContain("disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}");
   });
@@ -708,6 +727,10 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
       hasAfter: true,
       beforeCheckpointId: "checkpoint-before-node",
       afterCheckpointId: "checkpoint-after-node",
+      beforeCommitSha: null,
+      afterCommitSha: null,
+      beforeSource: null,
+      afterSource: null,
     },
     remoteSideEffects: [],
     blockedReasons: [],
@@ -746,6 +769,10 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
         hasAfter: false,
         beforeCheckpointId: "checkpoint-before-node",
         afterCheckpointId: null,
+        beforeCommitSha: null,
+        afterCommitSha: null,
+        beforeSource: null,
+        afterSource: null,
       },
       repairPayload: null,
     }), true).repair).toEqual({
@@ -768,6 +795,10 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
         hasAfter: true,
         beforeCheckpointId: null,
         afterCheckpointId: "checkpoint-after-node",
+        beforeCommitSha: null,
+        afterCommitSha: null,
+        beforeSource: null,
+        afterSource: null,
       },
       variantPayload: null,
       rollbackPayload: null,
@@ -835,5 +866,44 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     expect(appSource).toContain("Rollback affects selected and downstream workflow state, not evidence/history.");
     expect(appSource).not.toContain("delete evidence");
     expect(appSource).not.toContain("delete history");
+  });
+
+  it("selected node scope change clears stale action state", async () => {
+    const appSource = await readSource("./App.tsx");
+    const useEffectSource = appSource.slice(appSource.indexOf("const workflow = window.devflow?.workflow;"), appSource.indexOf("const projectRoot = activeProject.rootPath;"));
+    expect(appSource).toContain("const selectedNodeActionScopeKey = activeSession?.kind === \"canvas\" && selectedNode");
+    expect(appSource).not.toContain("}, [selectedNode?.id]);");
+    expect(appSource).toContain("selectedNodeActionGenerationRef.current += 1;");
+    expect(appSource).toContain("setNodeActionBusy(null);");
+    expect(appSource).toContain("}, [selectedNodeActionScopeKey]);");
+    expect(useEffectSource).toContain("setSelectedNodeActionState(null);");
+  });
+
+  it("eligible rollback shows selected plus downstream summary", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("Selected + downstream:");
+    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.affectedLaneIds.length");
+    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.affectedLaneIds.join(', ')");
+  });
+
+  it("checkpoint summary renders checkpoint/restore commit/source", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("Before:");
+    expect(appSource).toContain("After:");
+    expect(appSource).toContain("selectedNodeActionState.checkpoints.beforeCommitSha");
+    expect(appSource).toContain("selectedNodeActionState.checkpoints.beforeSource");
+    expect(appSource).toContain("selectedNodeActionState.checkpoints.afterCommitSha");
+    expect(appSource).toContain("selectedNodeActionState.checkpoints.afterSource");
+    expect(appSource).toContain("Restore commit:");
+    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.restoreCommitRef");
+  });
+
+  it("remote blocker/manual repair disables rollback and shows correct message", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("Remote blockers:");
+    expect(appSource).toContain("selectedNodeActionState.remoteSideEffects.map(r => r.eventKind).join(', ')");
+    expect(appSource).toContain("Manual repair:");
+    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility?.manualRepairReason");
+    expect(appSource).toContain("Backend check required");
   });
 });
