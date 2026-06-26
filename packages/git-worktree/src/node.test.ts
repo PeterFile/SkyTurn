@@ -1637,6 +1637,36 @@ describe("delivery remote actions", () => {
     });
   });
 
+  it("rejects squash merge when review evidence is unknown or missing", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-merge-review-missing-");
+    tempRoots.push(repo.tempRoot);
+    const cases = [
+      { label: "missing" },
+      { label: "unknown", reviewDecision: "UNKNOWN" },
+    ] as const;
+
+    for (const item of cases) {
+      const fakeGh = await installFakeGh(join(repo.tempRoot, item.label), {
+        prHeadSha: repo.baseCommit,
+        ...(item.reviewDecision ? { reviewDecision: item.reviewDecision } : {}),
+        checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+      });
+
+      await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+        await expect(mergeDeliveryPullRequest({
+          projectRoot: repo.repoRoot,
+          prNumber: 1,
+          expectedHeadSha: repo.baseCommit,
+          subject: "feat(delivery): merge exact checked pr",
+        })).rejects.toMatchObject({
+          code: "DELIVERY_REJECTED",
+          message: expect.stringContaining("review evidence must be approved or pending"),
+        });
+        expect(existsSync(fakeGh.argsPath)).toBe(false);
+      });
+    }
+  });
+
   it("rejects squash merge when the expected head sha does not match the PR", async () => {
     const repo = await createTestRepo("skyturn-delivery-pr-merge-stale-");
     tempRoots.push(repo.tempRoot);
@@ -1713,6 +1743,7 @@ describe("delivery remote actions", () => {
     tempRoots.push(repo.tempRoot);
     const fakeGh = await installFakeGh(repo.tempRoot, {
       prHeadSha: repo.baseCommit,
+      reviewDecision: "APPROVED",
       checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
       mergeRequiresMatchHead: repo.baseCommit,
     });

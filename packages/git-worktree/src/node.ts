@@ -880,9 +880,7 @@ export async function mergeDeliveryPullRequest(input: DeliveryPullRequestMergeIn
   if (checksEvidence.status !== "passed") {
     throwRemote("DELIVERY_REJECTED", `Pull request checks must be passed before merge; got ${checksEvidence.status}.`);
   }
-  if (checksEvidence.review.status === "changes_requested") {
-    throwRemote("DELIVERY_REJECTED", "Pull request review requested changes before merge.");
-  }
+  assertPullRequestReviewAllowsMerge(checksEvidence.review);
   const command = await runDeliveryCommand("gh", repoRoot, [
     "pr",
     "merge",
@@ -904,6 +902,17 @@ export async function mergeDeliveryPullRequest(input: DeliveryPullRequestMergeIn
     review: checksEvidence.review,
     command,
   };
+}
+
+function assertPullRequestReviewAllowsMerge(review: DeliveryPullRequestReviewGate): void {
+  if (review.status === "approved" || review.status === "pending") return;
+  if (review.status === "changes_requested") {
+    throwRemote("DELIVERY_REJECTED", "Pull request review requested changes before merge.");
+  }
+  throwRemote(
+    "DELIVERY_REJECTED",
+    `Pull request review evidence must be approved or pending before merge; got ${review.status || "unknown"}.`,
+  );
 }
 
 export async function syncDeliveryMain(input: DeliveryMainSyncInput): Promise<DeliveryMainSyncEvidence> {

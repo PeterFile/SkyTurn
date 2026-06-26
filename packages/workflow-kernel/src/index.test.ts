@@ -558,6 +558,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
         url: "https://example.test/pr/15/checks",
         headSha: "sha-a",
         status: "passed",
+        review: { status: "approved" },
         checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/1" }],
       }),
     ]);
@@ -569,6 +570,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
         url: "https://example.test/pr/15/checks",
         headSha: "sha-b",
         status: "passed",
+        review: { status: "pending" },
         checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/2" }],
       }),
     ]);
@@ -580,6 +582,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
         url: "https://example.test/pr/15/checks",
         headSha: "sha-b",
         status: "passed",
+        review: { status: "pending" },
         checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/3" }],
       }),
     ]);
@@ -596,7 +599,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
       laneId: "lane-ci",
       kind: "pull-request-checks",
       status: "passed",
-      checks: ["Build and test:passed"],
+      checks: ["Build and test:passed", "review:pending"],
     });
 
     const staleLoopState = projectLoopEngineeringState(stale);
@@ -640,6 +643,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
         url: "https://example.test/pr/16/checks",
         headSha: "sha-a",
         status: "passed",
+        review: { status: "approved" },
         checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/1" }],
       }),
       event("workflow.delivery.pushed", {
@@ -699,10 +703,10 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual(["lane-merge"]);
   });
 
-  it("keeps pending or unknown review non-blocking when exact-head checks pass", () => {
+  it("keeps approved and pending review non-blocking when exact-head checks pass", () => {
     const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
 
-    for (const reviewStatus of ["pending", "unknown"] as const) {
+    for (const reviewStatus of ["approved", "pending"] as const) {
       const projection = reduceWorkflowEvents([
         event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
         event("workflow.pull_request.created", {
@@ -726,7 +730,83 @@ describe("Flow Kernel gate engine and scheduler", () => {
         phase: "merge_ready",
         review: { status: reviewStatus },
       });
+      expect(projectLoopEngineeringState(projection).nextAction.kind).toBe("merge_pull_request");
     }
+  });
+
+  it("blocks merge when exact-head checks pass with unknown review evidence", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.lane.declared", { lane: lane("lane-merge", "merge") }),
+      event("workflow.edge.declared", { edge: { id: "edge-ci-merge", sourceLaneId: "lane-ci", targetLaneId: "lane-merge" } }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-ci",
+        prNumber: 20,
+        url: "https://example.test/pr/20",
+        headSha: "sha-current",
+      }),
+      event(checksRecordedKind, {
+        laneId: "lane-ci",
+        prNumber: 20,
+        url: "https://example.test/pr/20/checks",
+        headSha: "sha-current",
+        status: "passed",
+        review: { status: "unknown" },
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/20" }],
+      }),
+    ]);
+
+    const loopState = projectLoopEngineeringState(projection);
+    expect(projection.lanes.find((item) => item.id === "lane-ci")?.status).toBe("running");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual([]);
+    expect(loopState.delivery).toMatchObject({
+      phase: "checks_pending",
+      review: { status: "unknown" },
+    });
+    expect(loopState.nextAction.kind).not.toBe("merge_pull_request");
+    expect(loopState.nextAction).toMatchObject({
+      kind: "wait_for_checks",
+      loop: "delivery",
+      laneId: "lane-ci",
+    });
+  });
+
+  it("blocks merge when exact-head checks pass without review evidence", () => {
+    const checksRecordedKind = "workflow.pull_request.checks_recorded" as FlowEventKind;
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.lane.declared", { lane: lane("lane-merge", "merge") }),
+      event("workflow.edge.declared", { edge: { id: "edge-ci-merge", sourceLaneId: "lane-ci", targetLaneId: "lane-merge" } }),
+      event("workflow.pull_request.created", {
+        laneId: "lane-ci",
+        prNumber: 21,
+        url: "https://example.test/pr/21",
+        headSha: "sha-current",
+      }),
+      event(checksRecordedKind, {
+        laneId: "lane-ci",
+        prNumber: 21,
+        url: "https://example.test/pr/21/checks",
+        headSha: "sha-current",
+        status: "passed",
+        checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/21" }],
+      }),
+    ]);
+
+    const loopState = projectLoopEngineeringState(projection);
+    expect(projection.lanes.find((item) => item.id === "lane-ci")?.status).toBe("running");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual([]);
+    expect(loopState.delivery).toMatchObject({
+      phase: "checks_pending",
+      review: { status: "unknown" },
+    });
+    expect(loopState.nextAction.kind).not.toBe("merge_pull_request");
+    expect(loopState.nextAction).toMatchObject({
+      kind: "wait_for_checks",
+      loop: "delivery",
+      laneId: "lane-ci",
+    });
   });
 
   it("replays Electron checks events with nested evidence for exact-head gates", () => {
@@ -751,6 +831,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
           number: 17,
           url: "https://example.test/pr/17",
           headSha: "sha-c",
+          review: { status: "pending", detail: "No blocking review." },
           checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/current" }],
         },
       }),
@@ -763,7 +844,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
       laneId: "lane-ci",
       kind: "pull-request-checks",
       status: "passed",
-      checks: ["Build and test:passed"],
+      checks: ["Build and test:passed", "review:pending"],
       artifacts: ["https://example.test/pr/17", "https://example.test/checks/current"],
     });
   });

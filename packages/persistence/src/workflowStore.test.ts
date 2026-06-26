@@ -1902,6 +1902,7 @@ describe("SQLite workflow store", () => {
         url: "https://example.test/pr/21/checks",
         headSha: "sha-b",
         status: "passed",
+        review: { status: "approved" },
         checks: [{ name: "Build and test", status: "passed", url: "https://example.test/checks/current" }],
       },
       now: "2026-06-14T00:00:08.000Z",
@@ -1915,7 +1916,7 @@ describe("SQLite workflow store", () => {
       laneId: "lane-ci",
       kind: "pull-request-checks",
       status: "passed",
-      checks: ["Build and test:passed"],
+      checks: ["Build and test:passed", "review:approved"],
     });
     expect(store.getLoopEngineeringState("session-1").nextAction).toMatchObject({
       kind: "merge_pull_request",
@@ -2132,6 +2133,7 @@ describe("SQLite workflow store", () => {
           number: 22,
           url: "https://example.test/pr/22",
           headSha: "sha-c",
+          review: { status: "approved" },
           checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/current" }],
         },
       },
@@ -2146,7 +2148,7 @@ describe("SQLite workflow store", () => {
       laneId: "lane-ci",
       kind: "pull-request-checks",
       status: "passed",
-      checks: ["Build and test:passed"],
+      checks: ["Build and test:passed", "review:approved"],
       artifacts: ["https://example.test/pr/22", "https://example.test/checks/current"],
     });
     store.close();

@@ -763,7 +763,7 @@ function stalePullRequestCheckGateLaneIds(projection: FlowProjection): Set<strin
   for (const [laneId, payload] of latestChecksByLaneId) {
     const lane = projection.lanes.find((item) => item.id === laneId);
     if (!lane || !isPullRequestCheckGateLane(lane)) continue;
-    if (payload.status !== "passed" || payload.review.status === "changes_requested" || !matchesCurrentPullRequestHead(headState, payload)) {
+    if (!pullRequestChecksAllowMerge(payload) || !matchesCurrentPullRequestHead(headState, payload)) {
       stale.add(laneId);
     }
   }
@@ -936,15 +936,13 @@ function projectDeliveryLoopState(projection: FlowProjection): WorkflowDeliveryL
         phase = "checks_stale";
         continue;
       }
-      phase = review.status === "changes_requested"
+      phase = review.status === "changes_requested" || recorded.payload.status === "changes_requested"
         ? "changes_requested"
-        : recorded.payload.status === "passed"
+        : recorded.payload.status === "passed" && reviewStatusAllowsMerge(review.status)
         ? "merge_ready"
         : recorded.payload.status === "failed"
           ? "checks_failed"
-          : recorded.payload.status === "changes_requested"
-            ? "changes_requested"
-            : "checks_pending";
+          : "checks_pending";
     }
     if (event.kind === "workflow.pull_request.merged") {
       phase = "merged";
@@ -978,6 +976,14 @@ function projectDeliveryLoopState(projection: FlowProjection): WorkflowDeliveryL
     review,
     ...(blockedReason ? { blockedReason } : {}),
   };
+}
+
+function pullRequestChecksAllowMerge(payload: PullRequestChecksRecordedPayload): boolean {
+  return payload.status === "passed" && reviewStatusAllowsMerge(payload.review.status);
+}
+
+function reviewStatusAllowsMerge(status: WorkflowDeliveryReviewStatus): boolean {
+  return status === "approved" || status === "pending";
 }
 
 function headShaChangedAfterChecks(
@@ -1409,8 +1415,7 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
         if (
           lane &&
           isPullRequestCheckGateLane(lane) &&
-          checks.payload.status === "passed" &&
-          checks.payload.review.status !== "changes_requested" &&
+          pullRequestChecksAllowMerge(checks.payload) &&
           matchesCurrentPullRequestHead(pullRequestHeadState, checks.payload)
         ) {
           setLaneStatus(projection, lane.id, "completed");

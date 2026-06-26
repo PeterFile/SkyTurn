@@ -469,6 +469,63 @@ test("workflow pull request merge helper enforces stale, pending, failed, and re
   assert.match(helperSource, /checks must be passed before merge/i);
   assert.match(helperSource, /review requested changes/i);
   assert.match(helperSource, /reviewStatus|review\.status/);
+  assert.match(helperSource, /review evidence must be approved or pending/i);
+  assert.match(helperSource, /reviewStatus !== "approved" && evidence\.reviewStatus !== "pending"/);
+});
+
+test("workflow pull request merge helper rejects unknown or missing review evidence", async () => {
+  const { findDeliveryPullRequestChecksEvidence } = await loadMainMergeGateHelpers();
+  const expectedHeadSha = "abc123";
+  const baseEvent = {
+    kind: "workflow.pull_request.checks_recorded",
+    laneId: "pr-lane",
+    payload: {
+      laneId: "pr-lane",
+      evidence: {
+        status: "passed",
+        headSha: expectedHeadSha,
+      },
+    },
+  };
+
+  for (const reviewStatus of ["approved", "pending"]) {
+    const evidence = findDeliveryPullRequestChecksEvidence(
+      storeWithEvents([{
+        ...baseEvent,
+        payload: {
+          ...baseEvent.payload,
+          evidence: {
+            ...baseEvent.payload.evidence,
+            gate: { reviewStatus },
+          },
+        },
+      }]),
+      "session-1",
+      "pr-lane",
+      expectedHeadSha,
+    );
+    assert.equal(evidence.reviewStatus, reviewStatus);
+  }
+
+  for (const event of [
+    baseEvent,
+    {
+      ...baseEvent,
+      payload: {
+        ...baseEvent.payload,
+        evidence: {
+          ...baseEvent.payload.evidence,
+          gate: { reviewStatus: "unknown" },
+        },
+      },
+    },
+  ]) {
+    assert.throws(
+      () => findDeliveryPullRequestChecksEvidence(storeWithEvents([event]), "session-1", "pr-lane", expectedHeadSha),
+      (error) => error?.code === "DELIVERY_REJECTED" &&
+        /review evidence must be approved or pending/i.test(error.message),
+    );
+  }
 });
 
 test("workflow delivery sync main requires recorded PR merge evidence for the requested head", async () => {
@@ -1885,6 +1942,53 @@ async function loadWorkflowIpcContracts() {
   const module = { exports: {} };
   vm.runInNewContext(output, { module, exports: module.exports }, { filename: "workflowIpcContracts.ts" });
   return module.exports;
+}
+
+async function loadMainMergeGateHelpers() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    'function workflowIpcError(code, message) { const error = new Error(message); error.code = code; return error; }',
+    'function isRecord(value) { return !!value && typeof value === "object" && !Array.isArray(value); }',
+    'function optionalText(value) { return typeof value === "string" && value.trim() ? value.trim() : undefined; }',
+    'function requireText(value, field) { const text = optionalText(value); if (!text) throw workflowIpcError("INVALID_INPUT", `${field} is required.`); return text; }',
+    extractFunction(main, "findDeliveryPullRequestChecksEvidence"),
+    extractFunction(main, "pullRequestReviewStatusForIpc"),
+    extractFunction(main, "normalizePullRequestReviewStatusForIpc"),
+    "module.exports = { findDeliveryPullRequestChecksEvidence };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.mergeGate.ts" });
+  return module.exports;
+}
+
+function extractFunction(source, name) {
+  const start = source.indexOf(`function ${name}`);
+  assert.ok(start >= 0, `missing function ${name}`);
+  const braceStart = source.indexOf("{", start);
+  assert.ok(braceStart > start, `missing function body for ${name}`);
+  let depth = 0;
+  for (let index = braceStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+    if (depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`unterminated function ${name}`);
+}
+
+function storeWithEvents(events) {
+  return {
+    listEvents() {
+      return events;
+    },
+  };
 }
 
 function escapeRegExp(value) {

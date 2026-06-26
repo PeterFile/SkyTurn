@@ -3719,11 +3719,17 @@ function findDeliveryPullRequestChecksEvidence(
     };
     latestEvidence ??= evidence;
     if (evidence.headSha !== expectedHeadSha) continue;
+    if (evidence.status !== "passed") {
+      throw workflowIpcError("DELIVERY_REJECTED", `Pull request checks must be passed before merge; got ${evidence.status}.`);
+    }
     if (evidence.reviewStatus === "changes_requested") {
       throw workflowIpcError("DELIVERY_REJECTED", "Pull request review requested changes before merge.");
     }
-    if (evidence.status !== "passed") {
-      throw workflowIpcError("DELIVERY_REJECTED", `Pull request checks must be passed before merge; got ${evidence.status}.`);
+    if (evidence.reviewStatus !== "approved" && evidence.reviewStatus !== "pending") {
+      throw workflowIpcError(
+        "DELIVERY_REJECTED",
+        `Pull request review evidence must be approved or pending before merge; got ${evidence.reviewStatus || "unknown"}.`,
+      );
     }
     return evidence;
   }
