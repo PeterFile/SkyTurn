@@ -104,7 +104,7 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(rollbackRemoteBlockHelper, /getNodeRollbackEligibility/);
   assert.match(rollbackRemoteBlockHelper, /blockingRemoteSideEffects/);
   assert.match(rollbackApplyHandler, /evaluateLocalRollbackSafetyForRollback/);
-  assert.match(rollbackApplyHandler, /gitResetHard/);
+  assert.match(rollbackApplyHandler, /resetRollbackWorktreeToCommit/);
   assert.match(rollbackApplyHandler, /applyNodeRollback/);
   assert.match(rollbackApplyHandler, /broadcastWorkflowProjection/);
   assert.doesNotMatch(rollbackApplyHandler, /pushDeliveryBranch|createDeliveryPullRequest|mergeDeliveryPullRequest|syncDeliveryMain/);
@@ -435,8 +435,10 @@ test("workflow pull request merge stays explicit and separate from cleanup", asy
   const sessionIndex = mergeHandler.indexOf("const sessionId = assertWorkflowSessionId");
   const laneIndex = mergeHandler.indexOf("assertWorkflowPullRequestLaneKind");
   const evidenceIndex = mergeHandler.indexOf("findDeliveryPullRequestEvidence");
+  const currentHeadIndex = mergeHandler.indexOf("findDeliveryPullRequestCurrentHeadEvidence");
   const checksEvidenceIndex = mergeHandler.indexOf("findDeliveryPullRequestChecksEvidence");
   const matchIndex = mergeHandler.indexOf("assertDeliveryPullRequestEvidenceInputMatches");
+  const subjectGuardIndex = mergeHandler.indexOf("assertConventionalCommitSubjectForIpc");
   const importIndex = mergeHandler.indexOf('await import("@skyturn/git-worktree/node")');
   const mergeIndex = mergeHandler.indexOf("mergeDeliveryPullRequest({");
   const eventIndex = mergeHandler.indexOf('kind: "workflow.pull_request.merged"');
@@ -444,14 +446,86 @@ test("workflow pull request merge stays explicit and separate from cleanup", asy
   assert.ok(sessionIndex >= 0, "merge IPC must require a workflow sessionId");
   assert.ok(laneIndex > sessionIndex, "merge IPC must validate an explicit pull_request lane");
   assert.ok(evidenceIndex > laneIndex, "merge IPC must load recorded PR evidence");
-  assert.ok(checksEvidenceIndex > evidenceIndex, "merge IPC must require previously recorded passed checks");
+  assert.ok(currentHeadIndex > evidenceIndex, "merge IPC must derive the current PR head from recorded delivery evidence");
+  assert.ok(checksEvidenceIndex > currentHeadIndex, "merge IPC must require previously recorded exact-head checks and review gate");
   assert.ok(matchIndex > checksEvidenceIndex, "merge IPC must reject stale expectedHeadSha before gh merge");
+  assert.ok(subjectGuardIndex > matchIndex, "merge IPC must reject a non-Conventional merge subject before gh merge");
   assert.ok(importIndex > matchIndex, "merge IPC must validate recorded evidence before importing gh implementation");
   assert.ok(mergeIndex > importIndex, "gh merge must only happen inside the explicit merge IPC");
   assert.ok(eventIndex > mergeIndex, "merged event must be appended only after gh merge returns");
   assert.doesNotMatch(mergeHandler, /workflow:worktree:clean/);
   assert.doesNotMatch(mergeHandler, /cleanManagedWorktree/);
   assert.doesNotMatch(mergeHandler, /deleteBranch:\s*true/);
+});
+
+test("workflow pull request merge helper enforces stale, pending, failed, and review gates", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const helperSource = main.slice(
+    main.indexOf("function findDeliveryPullRequestChecksEvidence"),
+    main.indexOf("function findDeliveryPullRequestMergeEvidence"),
+  );
+
+  assert.match(helperSource, /checks are stale/i);
+  assert.match(helperSource, /checks must be passed before merge/i);
+  assert.match(helperSource, /review requested changes/i);
+  assert.match(helperSource, /reviewStatus|review\.status/);
+  assert.match(helperSource, /review evidence must be approved or pending/i);
+  assert.match(helperSource, /reviewStatus !== "approved" && evidence\.reviewStatus !== "pending"/);
+});
+
+test("workflow pull request merge helper rejects unknown or missing review evidence", async () => {
+  const { findDeliveryPullRequestChecksEvidence } = await loadMainMergeGateHelpers();
+  const expectedHeadSha = "abc123";
+  const baseEvent = {
+    kind: "workflow.pull_request.checks_recorded",
+    laneId: "pr-lane",
+    payload: {
+      laneId: "pr-lane",
+      evidence: {
+        status: "passed",
+        headSha: expectedHeadSha,
+      },
+    },
+  };
+
+  for (const reviewStatus of ["approved", "pending"]) {
+    const evidence = findDeliveryPullRequestChecksEvidence(
+      storeWithEvents([{
+        ...baseEvent,
+        payload: {
+          ...baseEvent.payload,
+          evidence: {
+            ...baseEvent.payload.evidence,
+            gate: { reviewStatus },
+          },
+        },
+      }]),
+      "session-1",
+      "pr-lane",
+      expectedHeadSha,
+    );
+    assert.equal(evidence.reviewStatus, reviewStatus);
+  }
+
+  for (const event of [
+    baseEvent,
+    {
+      ...baseEvent,
+      payload: {
+        ...baseEvent.payload,
+        evidence: {
+          ...baseEvent.payload.evidence,
+          gate: { reviewStatus: "unknown" },
+        },
+      },
+    },
+  ]) {
+    assert.throws(
+      () => findDeliveryPullRequestChecksEvidence(storeWithEvents([event]), "session-1", "pr-lane", expectedHeadSha),
+      (error) => error?.code === "DELIVERY_REJECTED" &&
+        /review evidence must be approved or pending/i.test(error.message),
+    );
+  }
 });
 
 test("workflow delivery sync main requires recorded PR merge evidence for the requested head", async () => {
@@ -805,14 +879,14 @@ test("workflow rollback IPC keeps local git reset behind exact recorded-head saf
 
   assert.match(helperSource, /assertManagedRollbackWorktree/);
   assert.match(helperSource, /findRecordedRollbackHead/);
-  assert.match(helperSource, /gitRevParseHead/);
-  assert.match(helperSource, /gitStatusPorcelain/);
-  assert.match(helperSource, /headSha\.toLowerCase\(\) !== recordedHead\.commitSha\.toLowerCase\(\)/);
-  assert.match(helperSource, /statusText\.length > 0/);
+  assert.match(helperSource, /evaluateRollbackWorktreeState/);
+  assert.match(helperSource, /expectedHeadCommit:\s*recordedHead\.commitSha/);
+  assert.match(helperSource, /expectedBranchName/);
+  assert.match(helperSource, /worktreeState\.status === "manual_repair_required"/);
   assert.match(helperSource, /status:\s*"safe"/);
   assert.match(helperSource, /status:\s*"manual_repair_required"/);
+  assert.match(helperSource, /reasonCode:\s*worktreeState\.reasonCode/);
   assert.match(helperSource, /reasonCode:\s*"head_mismatch"/);
-  assert.match(helperSource, /reasonCode:\s*"dirty_worktree"/);
   assert.doesNotMatch(helperSource, /ls-remote|push|pull-request|gh\s/);
 });
 
@@ -823,8 +897,13 @@ test("workflow rollback IPC requires full recorded commit SHAs before reset", as
     main.indexOf("function localRollbackSafetyResult"),
   );
   const resetHelper = main.slice(
-    main.indexOf("async function gitResetHard"),
+    main.indexOf("function isFullCommitSha"),
     main.indexOf("async function normalizeChangesetNodeForProject"),
+  );
+  const gitWorktree = await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "node.ts"), "utf8");
+  const rollbackHelper = gitWorktree.slice(
+    gitWorktree.indexOf("export async function evaluateRollbackWorktreeState"),
+    gitWorktree.indexOf("export async function createDeliveryCommit"),
   );
 
   assert.match(main, /function isFullCommitSha/);
@@ -832,7 +911,9 @@ test("workflow rollback IPC requires full recorded commit SHAs before reset", as
   assert.match(helperSource, /reasonCode:\s*"invalid_restore_commit"/);
   assert.match(helperSource, /!isFullCommitSha\(recordedHead\.commitSha\)/);
   assert.match(helperSource, /reasonCode:\s*"invalid_recorded_commit"/);
-  assert.match(resetHelper, /if \(!isFullCommitSha\(restoreCommitRef\)\)/);
+  assert.match(rollbackHelper, /!isFullCommitSha\(restoreCommitRef\)/);
+  assert.match(rollbackHelper, /!isFullCommitSha\(expectedHeadCommit\)/);
+  assert.match(rollbackHelper, /commitObjectExists\(worktreePath,\s*restoreCommitRef\)/);
   assert.doesNotMatch(resetHelper, /validateGitRefText\(restoreCommitRef\)/);
 });
 
@@ -865,25 +946,27 @@ test("workflow rollback local safety rejects branch mismatch before reset", asyn
     main.indexOf("async function assertManagedRollbackWorktree"),
     main.indexOf("async function findRecordedRollbackHead"),
   );
-  const currentBranchHelper = main.slice(
-    main.indexOf("async function gitCurrentBranch"),
-    main.indexOf("async function gitRevParseHead"),
+  const gitWorktree = await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "node.ts"), "utf8");
+  const rollbackHelper = gitWorktree.slice(
+    gitWorktree.indexOf("export async function evaluateRollbackWorktreeState"),
+    gitWorktree.indexOf("export async function createDeliveryCommit"),
   );
 
   const expectedBranchIndex = helperSource.indexOf("const expectedBranchName");
-  const currentBranchIndex = helperSource.indexOf("gitCurrentBranch(worktreePath)");
-  const mismatchIndex = helperSource.indexOf('reasonCode: "branch_mismatch"');
-  const headIndex = helperSource.indexOf("gitRevParseHead(worktreePath)");
-  const safeIndex = helperSource.indexOf('status: "safe"');
+  const helperCallIndex = helperSource.indexOf("evaluateRollbackWorktreeState");
+  const mismatchIndex = rollbackHelper.indexOf('rollbackManualRepair("branch_mismatch"');
+  const headIndex = rollbackHelper.indexOf("const headCommit");
+  const safeIndex = rollbackHelper.indexOf('status: "safe"');
 
   assert.match(managedWorktreeHelper, /branchName:\s*optionalText\(worktree\.branchName\)/);
   assert.match(helperSource, /recordedHead\.branchName/);
   assert.ok(expectedBranchIndex >= 0, "rollback safety must derive an expected branch from managed or recorded evidence");
-  assert.ok(currentBranchIndex > expectedBranchIndex, "rollback safety must read the current branch before HEAD safety");
-  assert.ok(mismatchIndex > currentBranchIndex, "branch mismatch must return manual repair evidence");
+  assert.ok(helperCallIndex > expectedBranchIndex, "rollback safety must pass expected branch evidence into git-worktree validation");
+  assert.ok(mismatchIndex >= 0, "branch mismatch must return manual repair evidence");
   assert.ok(headIndex > mismatchIndex, "rollback safety must block branch mismatch before recorded-head checks pass");
   assert.ok(safeIndex > mismatchIndex, "rollback safety must not return safe before exact branch match");
-  assert.match(currentBranchHelper, /"branch",\s*"--show-current"/);
+  assert.match(rollbackHelper, /currentBranch\(worktreePath\)/);
+  assert.match(rollbackHelper, /listed\.entry\.branch !== expectedBranchRef/);
   assert.doesNotMatch(helperSource, /gitResetHard/);
 });
 
@@ -925,6 +1008,7 @@ test("workflow rollback apply blocks while affected remote delivery operations a
   assert.match(rollbackRemoteBlockHelper, /blockingInFlightRemoteSideEffects\(projectRoot,\s*input\.sessionId,\s*eligibility\)/);
   assert.match(rollbackApplyHandler, /evaluateRollbackRemoteBlocksForRollback\(workflowProjectRoot,\s*store,\s*normalized\)/);
   assert.match(inFlightHelperSource, /in_flight_remote_side_effect/);
+  assert.match(inFlightHelperSource, /status:\s*"in_flight"/);
   assert.ok(
     rollbackApplyHandler.indexOf("evaluateRollbackRemoteBlocksForRollback") < rollbackApplyHandler.indexOf("evaluateLocalRollbackSafetyForRollback"),
     "rollback must block in-flight remotes before local safety checks and git reset",
@@ -997,14 +1081,14 @@ test("workflow rollback apply rechecks remote blockers under the session mutatio
   const finalCheckIndex = rollbackApplyHandler.lastIndexOf("evaluateRollbackRemoteBlocksForRollback");
   const blockReturnIndex = rollbackApplyHandler.indexOf("if (finalRemoteBlock.result) return workflowRollbackResponse");
   const requestIndex = rollbackApplyHandler.indexOf("appendRollbackRequestedEvent");
-  const resetIndex = rollbackApplyHandler.indexOf("gitResetHard");
+  const resetIndex = rollbackApplyHandler.indexOf("const resetResult = await resetRollbackWorktreeToCommit");
 
   assert.ok(lockIndex >= 0, "rollback apply must enter the same session mutation lock used by remote mutations");
   assert.ok(localSafetyIndex > lockIndex, "local rollback safety must run inside the session mutation lock");
   assert.ok(finalCheckIndex > localSafetyIndex, "rollback apply must re-materialize remote blockers after async local safety");
   assert.ok(blockReturnIndex > finalCheckIndex, "rollback apply must return blocked when a final remote blocker appears");
   assert.ok(requestIndex > blockReturnIndex, "rollback_requested must not be written until final remote blockers are clear");
-  assert.ok(resetIndex > requestIndex, "git reset must stay after final blocker check and rollback_requested");
+  assert.ok(resetIndex > requestIndex, "git reset helper must stay after final blocker check and rollback_requested");
 
   for (const [handler, remoteCall, eventKind] of remoteHandlers) {
     const remoteLockIndex = handler.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, sessionId");
@@ -1334,15 +1418,16 @@ test("workflow rollback apply persists rollback request before git reset and rej
   );
 
   const requestIndex = rollbackApplyHandler.indexOf("appendRollbackRequestedEvent");
-  const resetIndex = rollbackApplyHandler.indexOf("gitResetHard");
+  const resetIndex = rollbackApplyHandler.indexOf("const resetResult = await resetRollbackWorktreeToCommit");
   const appliedIndex = rollbackApplyHandler.lastIndexOf("appendRollbackAppliedEvent");
   const rejectedIndex = rollbackApplyHandler.indexOf("appendRollbackRejectedEvent");
   assert.ok(requestIndex >= 0, "rollback apply must persist workflow.node.rollback_requested explicitly");
-  assert.ok(resetIndex > requestIndex, "git reset must run only after rollback_requested is durable");
-  assert.ok(appliedIndex > resetIndex, "rollback_applied must be recorded only after git reset succeeds");
+  assert.ok(resetIndex > requestIndex, "git reset helper must run only after rollback_requested is durable");
+  assert.ok(appliedIndex > resetIndex, "rollback_applied must be recorded only after git reset helper returns applied/restored");
   assert.ok(rejectedIndex >= 0, "local safety or reset failure must persist workflow.node.rollback_rejected evidence");
-  assert.match(rollbackApplyHandler, /catch\s*\(error\)[\s\S]*appendRollbackRejectedEvent/);
-  assert.doesNotMatch(rollbackApplyHandler, /gitResetHard[\s\S]*applyNodeRollback/);
+  assert.match(rollbackApplyHandler, /resetResult\.status !== "applied" && resetResult\.status !== "already_restored"[\s\S]*appendRollbackRejectedEvent/);
+  assert.match(rollbackApplyHandler, /reasonCode:\s*resetResult\.reasonCode/);
+  assert.doesNotMatch(rollbackApplyHandler, /resetRollbackWorktreeToCommit[\s\S]*applyNodeRollback/);
 });
 
 test("workflow rollback retry recovers crash window when HEAD is already restored", async () => {
@@ -1361,9 +1446,69 @@ test("workflow rollback retry recovers crash window when HEAD is already restore
   assert.match(rollbackApplyHandler, /localSafety\.status === "already_restored"/);
   assert.match(rollbackApplyHandler, /appendRollbackAppliedEvent\(store,\s*normalized,\s*finalEligibility,\s*localSafety\.requestId\)/);
   assert.match(localSafetyHelper, /findMatchingRollbackRequestedEvent/);
-  assert.match(localSafetyHelper, /headSha\.toLowerCase\(\) === restoreCommitRef\.toLowerCase\(\)/);
-  assert.match(localSafetyHelper, /statusText\.length > 0/);
-  assert.doesNotMatch(localSafetyHelper, /already_restored[\s\S]*gitResetHard/);
+  assert.match(localSafetyHelper, /worktreeState\.status === "already_restored"/);
+  assert.match(localSafetyHelper, /findMatchingRollbackAppliedEvent/);
+  assert.doesNotMatch(localSafetyHelper, /already_restored[\s\S]*resetRollbackWorktreeToCommit/);
+});
+
+test("workflow rollback retry after applied is idempotent only with matching restored worktree evidence", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const rollbackApplyHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+  const localSafetyHelper = main.slice(
+    main.indexOf("async function evaluateLocalRollbackSafetyForRollback"),
+    main.indexOf("function localRollbackSafetyResult"),
+  );
+  const appliedHelper = main.slice(
+    main.indexOf("function findMatchingRollbackAppliedEvent"),
+    main.indexOf("function validateRollbackRequestedEventForIpc"),
+  );
+
+  const alreadyAppliedIndex = rollbackApplyHandler.indexOf('localSafety.status === "already_applied"');
+  const alreadyRestoredIndex = rollbackApplyHandler.indexOf('localSafety.status === "already_restored"');
+  const resetIndex = rollbackApplyHandler.indexOf("const resetResult = await resetRollbackWorktreeToCommit");
+
+  assert.ok(alreadyAppliedIndex >= 0, "rollback apply must recognize already-applied retries");
+  assert.ok(alreadyAppliedIndex < alreadyRestoredIndex, "already-applied retry must return before crash-window recovery appends a new terminal event");
+  assert.ok(resetIndex > alreadyRestoredIndex, "already-applied retry must not run git reset again");
+  assert.match(localSafetyHelper, /worktreeState\.status === "already_restored"[\s\S]*findMatchingRollbackAppliedEvent/);
+  assert.doesNotMatch(appliedHelper, /if \(!input\.requestId\) return null/);
+  assert.match(appliedHelper, /if \(input\.requestId && requestId !== input\.requestId\) continue/);
+  assert.match(appliedHelper, /event\.kind !== "workflow\.node\.rollback_applied"/);
+  assert.match(appliedHelper, /validateRollbackTerminalEventForIpc\(input,\s*eligibility,\s*restoreCommitRef,\s*applied,\s*"applied"\)/);
+  assert.match(appliedHelper, /findMatchingRollbackRequestedHistoryForTerminalEvent/);
+});
+
+test("workflow rollback terminal-only applied event requires manual repair instead of success", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const localSafetyHelper = main.slice(
+    main.indexOf("async function evaluateLocalRollbackSafetyForRollback"),
+    main.indexOf("function localRollbackSafetyResult"),
+  );
+  const appliedHelper = main.slice(
+    main.indexOf("function findMatchingRollbackAppliedEvent"),
+    main.indexOf("function validateRollbackRequestedEventForIpc"),
+  );
+  const requestedHistoryHelper = main.slice(
+    main.indexOf("function findMatchingRollbackRequestedHistoryForTerminalEvent"),
+    main.indexOf("function validateRollbackRequestedEventForIpc"),
+  );
+  const validationHelper = main.slice(
+    main.indexOf("function validateRollbackRequestedEventForIpc"),
+    main.indexOf("function validateRollbackTerminalEventForIpc"),
+  );
+
+  assert.match(localSafetyHelper, /message:\s*"Worktree HEAD is restored but rollback terminal evidence is missing for this request\."/);
+  assert.match(appliedHelper, /const requested = findMatchingRollbackRequestedHistoryForTerminalEvent/);
+  assert.match(appliedHelper, /if \(!requested\) continue/);
+  assert.match(appliedHelper, /requestedEvent:\s*requested\.event/);
+  assert.match(requestedHistoryHelper, /eventIndex >= terminalEventIndex/);
+  assert.match(requestedHistoryHelper, /event\.kind !== "workflow\.node\.rollback_requested"/);
+  assert.match(requestedHistoryHelper, /validateRollbackRequestedEventForIpc\([\s\S]*allowTerminal:\s*true/);
+  assert.match(validationHelper, /allowTerminal\?:\s*boolean/);
+  assert.match(validationHelper, /options\?\.allowTerminal !== true && rollbackRequestHasTerminalEvent/);
 });
 
 test("workflow rollback retry reuses unresolved rollback request before reset when HEAD is unchanged", async () => {
@@ -1378,14 +1523,14 @@ test("workflow rollback retry reuses unresolved rollback request before reset wh
   const collisionIndex = rollbackApplyHandler.indexOf("findRollbackRequestedEventByIdempotencyKey");
   const appendIndex = rollbackApplyHandler.indexOf("appendRollbackRequestedEvent");
   const validationIndex = rollbackApplyHandler.indexOf("validateRollbackRequestedEventForIpc");
-  const resetIndex = rollbackApplyHandler.indexOf("gitResetHard");
+  const resetIndex = rollbackApplyHandler.indexOf("const resetResult = await resetRollbackWorktreeToCommit");
 
   assert.ok(finalBlockIndex >= 0, "rollback apply must recheck remote blockers before reset");
   assert.ok(reuseIndex > finalBlockIndex, "rollback apply must look for an existing unresolved rollback request after final eligibility");
   assert.ok(collisionIndex > reuseIndex, "rollback apply must check rollback_requested idempotency collisions before append");
   assert.ok(appendIndex > collisionIndex, "rollback apply must only append rollback_requested after reuse and collision lookup miss");
   assert.ok(validationIndex > appendIndex, "rollback apply must validate reused or appended rollback_requested before reset");
-  assert.ok(resetIndex > validationIndex, "git reset must stay after request reuse, collision lookup, append, and validation");
+  assert.ok(resetIndex > validationIndex, "git reset helper must stay after request reuse, collision lookup, append, and validation");
   assert.match(rollbackApplyHandler, /const requested = existingRollbackRequest[\s\S]*\?\? findRollbackRequestedEventByIdempotencyKey[\s\S]*\?\? appendRollbackRequestedEvent/);
   assert.doesNotMatch(rollbackApplyHandler, /const requested = appendRollbackRequestedEvent\(store,\s*normalized,\s*finalEligibility\);/);
 });
@@ -1406,14 +1551,14 @@ test("workflow rollback request id collision is rejected before git reset when r
   const appendIndex = rollbackApplyHandler.indexOf("appendRollbackRequestedEvent");
   const validationIndex = rollbackApplyHandler.indexOf("validateRollbackRequestedEventForIpc");
   const rejectionIndex = rollbackApplyHandler.indexOf('reasonCode: "request_id_conflict"');
-  const resetIndex = rollbackApplyHandler.indexOf("gitResetHard");
+  const resetIndex = rollbackApplyHandler.indexOf("const resetResult = await resetRollbackWorktreeToCommit");
 
   assert.ok(reuseIndex >= 0, "rollback apply must first reuse a matching unresolved request");
   assert.ok(collisionIndex > reuseIndex, "rollback apply must detect idempotency-key collisions before appending");
   assert.ok(appendIndex > collisionIndex, "rollback apply must not append a duplicate requested event on collision");
   assert.ok(validationIndex > appendIndex, "rollback apply must validate the requested event before reset");
   assert.ok(rejectionIndex > validationIndex, "rollback apply must reject mismatched requested events");
-  assert.ok(resetIndex > rejectionIndex, "git reset must stay unreachable on request-id collision rejection");
+  assert.ok(resetIndex > rejectionIndex, "git reset helper must stay unreachable on request-id collision rejection");
   assert.match(rollbackApplyHandler, /appendRollbackRejectedEvent\(store,\s*normalized,\s*finalEligibility,[\s\S]*requested\.requestId\)/);
   assert.match(rollbackApplyHandler, /requestedEvent:\s*requested\.event/);
 
@@ -1797,6 +1942,53 @@ async function loadWorkflowIpcContracts() {
   const module = { exports: {} };
   vm.runInNewContext(output, { module, exports: module.exports }, { filename: "workflowIpcContracts.ts" });
   return module.exports;
+}
+
+async function loadMainMergeGateHelpers() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    'function workflowIpcError(code, message) { const error = new Error(message); error.code = code; return error; }',
+    'function isRecord(value) { return !!value && typeof value === "object" && !Array.isArray(value); }',
+    'function optionalText(value) { return typeof value === "string" && value.trim() ? value.trim() : undefined; }',
+    'function requireText(value, field) { const text = optionalText(value); if (!text) throw workflowIpcError("INVALID_INPUT", `${field} is required.`); return text; }',
+    extractFunction(main, "findDeliveryPullRequestChecksEvidence"),
+    extractFunction(main, "pullRequestReviewStatusForIpc"),
+    extractFunction(main, "normalizePullRequestReviewStatusForIpc"),
+    "module.exports = { findDeliveryPullRequestChecksEvidence };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.mergeGate.ts" });
+  return module.exports;
+}
+
+function extractFunction(source, name) {
+  const start = source.indexOf(`function ${name}`);
+  assert.ok(start >= 0, `missing function ${name}`);
+  const braceStart = source.indexOf("{", start);
+  assert.ok(braceStart > start, `missing function body for ${name}`);
+  let depth = 0;
+  for (let index = braceStart; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+    if (depth === 0) return source.slice(start, index + 1);
+  }
+  throw new Error(`unterminated function ${name}`);
+}
+
+function storeWithEvents(events) {
+  return {
+    listEvents() {
+      return events;
+    },
+  };
 }
 
 function escapeRegExp(value) {

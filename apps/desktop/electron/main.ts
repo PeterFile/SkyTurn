@@ -240,11 +240,19 @@ interface DeliveryPullRequestEvidenceLike {
   number: number;
   url: string;
   commitSha: string;
+  commitLaneId?: string;
+  headBranch?: string;
+}
+
+interface DeliveryPullRequestCurrentHeadEvidenceLike {
+  headSha: string;
+  headBranch?: string;
 }
 
 interface DeliveryPullRequestChecksEvidenceLike {
   status: string;
   headSha: string;
+  reviewStatus: string;
 }
 
 interface DeliveryPullRequestMergeEvidenceLike {
@@ -314,13 +322,16 @@ interface WorkflowVariantAdoptionLike {
 }
 
 interface LocalRollbackSafety {
-  status: "safe" | "manual_repair_required" | "not_required" | "already_restored";
+  status: "safe" | "manual_repair_required" | "not_required" | "already_restored" | "already_applied";
   reasonCode?: string;
   message?: string;
   worktreePath?: string;
   restoreCommitRef?: string;
+  expectedBranchName?: string;
+  expectedHeadCommit?: string;
   requestId?: string;
   requestedEvent?: unknown;
+  event?: unknown;
 }
 
 interface WorkflowRollbackEligibilityLike {
@@ -328,10 +339,16 @@ interface WorkflowRollbackEligibilityLike {
   targetLaneId?: string;
   targetNodeId?: string;
   checkpointId?: string;
+  checkpointPhase?: string;
   restoreCommitRef?: string;
   affectedLaneIds?: string[];
+  affectedNodeIds?: string[];
+  downstreamInactiveLaneIds?: string[];
+  downstreamInactiveNodeIds?: string[];
   blockingRemoteSideEffects?: unknown[];
   localRollbackSafe?: boolean;
+  localSafetyStatus?: string;
+  manualRepairReason?: string;
   reason?: string;
 }
 
@@ -357,6 +374,7 @@ type InFlightRemoteSideEffectKind =
 
 interface InFlightRemoteSideEffect {
   eventKind: InFlightRemoteSideEffectKind;
+  status: "in_flight";
   eventId: string;
   projectRoot: string;
   sessionId: string;
@@ -398,6 +416,10 @@ interface UnresolvedRemoteSideEffectBlock {
 interface RollbackRequestedEventMatch {
   requestId: string;
   event: unknown;
+}
+
+interface RollbackAppliedEventMatch extends RollbackRequestedEventMatch {
+  requestedEvent: unknown;
 }
 
 interface RollbackRequestedEventValidation {
@@ -807,7 +829,7 @@ ipcMain.handle("workflow:rollback:eligibility", workflowHandler(async (projectRo
     : workflowRollbackBlockReason(eligibility);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
-    eligibility: manualRepairRequired ? { ...eligibility, eligible: false, localRollbackSafe: false, reason: localSafety.message } : eligibility,
+    eligibility: manualRepairRequired ? rollbackEligibilityWithManualRepair(eligibility, localSafety.message) : eligibility,
     blockedReason,
     manualRepairRequired,
   };
@@ -824,6 +846,15 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
     if (initialRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, initialRemoteBlock.result);
     const eligibility = initialRemoteBlock.eligibility;
     const localSafety = await evaluateLocalRollbackSafetyForRollback(projectRoot, store, normalized, eligibility);
+    if (localSafety.status === "already_applied" && localSafety.event) {
+      broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+      return workflowRollbackResponse(store, normalized.sessionId, {
+        status: "applied",
+        event: localSafety.event,
+        requestedEvent: localSafety.requestedEvent,
+        eligibility,
+      });
+    }
     if (localSafety.status === "already_restored" && localSafety.requestId) {
       const recoveryRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
       if (recoveryRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, recoveryRemoteBlock.result);
@@ -843,16 +874,23 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
       return workflowRollbackResponse(store, normalized.sessionId, {
         status: "blocked",
         event,
-        eligibility: { ...eligibility, eligible: false, localRollbackSafe: false, reason: localSafety.message },
+        eligibility: rollbackEligibilityWithManualRepair(eligibility, localSafety.message),
         blockedReason: localRollbackSafetyResult(localSafety),
         manualRepairRequired: true,
       });
     }
-    if (localSafety.status !== "safe" || !localSafety.worktreePath || !localSafety.restoreCommitRef) {
+    if (
+      localSafety.status !== "safe" ||
+      !localSafety.worktreePath ||
+      !localSafety.restoreCommitRef ||
+      !localSafety.expectedBranchName ||
+      !localSafety.expectedHeadCommit
+    ) {
       const result = store.applyNodeRollback(normalized);
       return workflowRollbackResponse(store, normalized.sessionId, result);
     }
 
+    const { resetRollbackWorktreeToCommit } = await import("@skyturn/git-worktree/node");
     const finalRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
     if (finalRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, finalRemoteBlock.result);
     const finalEligibility = finalRemoteBlock.eligibility;
@@ -873,7 +911,7 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
         status: "blocked",
         event: rejectedEvent,
         requestedEvent: requested.event,
-        eligibility: { ...finalEligibility, eligible: false, localRollbackSafe: false, reason: message },
+        eligibility: rollbackEligibilityWithManualRepair(finalEligibility, message),
         blockedReason: {
           code: "manual_repair_required",
           message,
@@ -883,24 +921,30 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
         manualRepairRequired: true,
       });
     }
-    try {
-      await gitResetHard(localSafety.worktreePath, localSafety.restoreCommitRef);
-    } catch (error) {
+    const resetResult = await resetRollbackWorktreeToCommit({
+      projectRoot,
+      worktreePath: localSafety.worktreePath,
+      expectedBranchName: localSafety.expectedBranchName,
+      expectedHeadCommit: localSafety.expectedHeadCommit,
+      restoreCommitRef: localSafety.restoreCommitRef,
+    });
+    if (resetResult.status !== "applied" && resetResult.status !== "already_restored") {
+      const message = sanitizeSnippet(resetResult.message) || "Git reset failed; manual repair is required.";
       const rejectedEvent = appendRollbackRejectedEvent(store, normalized, finalEligibility, {
         status: "manual_repair_required",
-        reasonCode: "git_reset_failed",
-        message: sanitizeSnippet(error instanceof Error ? error.message : String(error)),
+        reasonCode: resetResult.reasonCode,
+        message,
       }, requested.requestId);
       broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
       return workflowRollbackResponse(store, normalized.sessionId, {
         status: "blocked",
         event: rejectedEvent,
         requestedEvent: requested.event,
-        eligibility: { ...finalEligibility, eligible: false, localRollbackSafe: false, reason: "Git reset failed; manual repair is required." },
+        eligibility: rollbackEligibilityWithManualRepair(finalEligibility, message),
         blockedReason: {
           code: "manual_repair_required",
-          message: "Git reset failed; manual repair is required.",
-          reasonCode: "git_reset_failed",
+          message,
+          reasonCode: resetResult.reasonCode,
           manualRepairRequired: true,
         },
         manualRepairRequired: true,
@@ -1399,7 +1443,8 @@ ipcMain.handle("workflow:pullRequest:checks", workflowHandler(async (projectRoot
   const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
   assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
   const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
-  const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+  const currentHead = findDeliveryPullRequestCurrentHeadEvidence(store, sessionId, laneId, prEvidence);
+  const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence, currentHead.headSha);
   const realProjectRoot = await fs.realpath(projectRoot);
   const { checkDeliveryPullRequest } = await import("@skyturn/git-worktree/node");
   let evidence: Awaited<ReturnType<typeof checkDeliveryPullRequest>>;
@@ -1418,7 +1463,7 @@ ipcMain.handle("workflow:pullRequest:checks", workflowHandler(async (projectRoot
     kind: "workflow.pull_request.checks_recorded",
     source: "electron-main",
     laneId,
-    idempotencyKey: `pull-request-checks:${evidence.number}:${evidence.headSha}:${evidence.status}`,
+    idempotencyKey: `pull-request-checks:${evidence.number}:${evidence.headSha}:${evidence.status}:${evidence.review.status}`,
     payload: {
       laneId,
       prNumber: evidence.number,
@@ -1426,6 +1471,8 @@ ipcMain.handle("workflow:pullRequest:checks", workflowHandler(async (projectRoot
       headSha: evidence.headSha,
       status: evidence.status,
       checks: evidence.checks,
+      review: evidence.review,
+      gate: evidence.gate,
       evidence,
     },
     now: new Date().toISOString(),
@@ -1447,12 +1494,14 @@ ipcMain.handle("workflow:pullRequest:merge", workflowHandler(async (projectRoot:
     const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
     assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
     const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
-    const checksEvidence = findDeliveryPullRequestChecksEvidence(store, sessionId, laneId, prEvidence.commitSha);
-    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+    const currentHead = findDeliveryPullRequestCurrentHeadEvidence(store, sessionId, laneId, prEvidence);
+    const checksEvidence = findDeliveryPullRequestChecksEvidence(store, sessionId, laneId, currentHead.headSha);
+    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence, currentHead.headSha);
     if (checksEvidence.headSha !== expectedHeadSha) {
       throw workflowIpcError("INVALID_INPUT", "Recorded pull request checks do not match the requested head SHA.");
     }
     const subject = requireText(readField(input, "subject") ?? readField(input, "title"), "pull request merge subject");
+    assertConventionalCommitSubjectForIpc(subject);
     const body = optionalText(readField(input, "body")) ?? undefined;
     const remoteEventKind = "workflow.pull_request.merged";
     const remoteDetails = {
@@ -1525,7 +1574,8 @@ ipcMain.handle("workflow:delivery:syncMain", workflowHandler(async (projectRoot:
     const laneId = requireText(readField(input, "laneId"), "workflow pull request laneId");
     assertWorkflowPullRequestLaneKind(store, sessionId, laneId);
     const prEvidence = findDeliveryPullRequestEvidence(store, sessionId, laneId);
-    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence);
+    const currentHead = findDeliveryPullRequestCurrentHeadEvidence(store, sessionId, laneId, prEvidence);
+    const expectedHeadSha = assertDeliveryPullRequestEvidenceInputMatches(input, prEvidence, currentHead.headSha);
     const mergeEvidence = findDeliveryPullRequestMergeEvidence(store, sessionId, laneId, prEvidence, expectedHeadSha);
     const remote = optionalText(readField(input, "remote"));
     const mainBranch = optionalText(readField(input, "mainBranch")) ?? "main";
@@ -2096,8 +2146,15 @@ function rollbackEventPayloadForIpc(
     laneId,
     ...(input.nodeId ?? eligibility.targetNodeId ? { nodeId: input.nodeId ?? eligibility.targetNodeId } : {}),
     ...(eligibility.checkpointId ?? input.checkpointId ? { checkpointId: eligibility.checkpointId ?? input.checkpointId } : {}),
+    ...(eligibility.checkpointPhase ? { checkpointPhase: eligibility.checkpointPhase } : {}),
     ...(eligibility.restoreCommitRef ? { restoreCommitRef: eligibility.restoreCommitRef } : {}),
+    ...(Array.isArray(eligibility.affectedLaneIds) ? { affectedLaneIds: eligibility.affectedLaneIds } : {}),
+    ...(Array.isArray(eligibility.affectedNodeIds) ? { affectedNodeIds: eligibility.affectedNodeIds } : {}),
+    ...(Array.isArray(eligibility.downstreamInactiveLaneIds) ? { downstreamInactiveLaneIds: eligibility.downstreamInactiveLaneIds } : {}),
+    ...(Array.isArray(eligibility.downstreamInactiveNodeIds) ? { downstreamInactiveNodeIds: eligibility.downstreamInactiveNodeIds } : {}),
     ...(typeof localRollbackSafe === "boolean" ? { localRollbackSafe } : {}),
+    ...(eligibility.localSafetyStatus ? { localSafetyStatus: eligibility.localSafetyStatus } : {}),
+    ...(eligibility.manualRepairReason ? { manualRepairReason: eligibility.manualRepairReason } : {}),
   };
 }
 
@@ -2148,7 +2205,7 @@ function workflowRollbackBlockReason(eligibility: WorkflowRollbackEligibilityLik
   if (eligibility.localRollbackSafe === false) {
     return {
       code: "manual_repair_required",
-      message: optionalText(eligibility.reason) ?? "Local rollback is not safe.",
+      message: optionalText(eligibility.manualRepairReason) ?? optionalText(eligibility.reason) ?? "Local rollback is not safe.",
       affectedLaneIds,
       manualRepairRequired: true,
     };
@@ -2439,6 +2496,7 @@ function beginInFlightRemoteSideEffect(input: {
   const affectedLaneIds = input.affectedLaneIds ? uniqueStrings(input.affectedLaneIds) : undefined;
   inFlightRemoteSideEffects.set(eventId, {
     eventKind: input.eventKind,
+    status: "in_flight",
     eventId,
     projectRoot: input.projectRoot,
     sessionId: input.sessionId,
@@ -2482,6 +2540,21 @@ function rollbackEligibilityWithInFlightRemoteBlocks(
       ...inFlightBlocks,
     ],
     reason: "Remote side effects are still in flight.",
+  };
+}
+
+function rollbackEligibilityWithManualRepair(
+  eligibility: WorkflowRollbackEligibilityLike,
+  manualRepairReason?: string,
+): WorkflowRollbackEligibilityLike {
+  const reason = manualRepairReason ?? "Local rollback requires manual repair.";
+  return {
+    ...eligibility,
+    eligible: false,
+    localRollbackSafe: false,
+    localSafetyStatus: "manual_repair_required",
+    manualRepairReason: reason,
+    reason,
   };
 }
 
@@ -2571,54 +2644,59 @@ async function evaluateLocalRollbackSafetyForRollback(
       message: "Rollback requires a recorded managed branch.",
     };
   }
-  const currentBranchName = await gitCurrentBranch(worktreePath);
-  if (currentBranchName !== expectedBranchName) {
+  const { evaluateRollbackWorktreeState } = await import("@skyturn/git-worktree/node");
+  const worktreeState = await evaluateRollbackWorktreeState({
+    projectRoot,
+    worktreePath,
+    expectedBranchName,
+    expectedHeadCommit: recordedHead.commitSha,
+    restoreCommitRef,
+  });
+  if (worktreeState.status === "manual_repair_required") {
     return {
       status: "manual_repair_required",
-      reasonCode: "branch_mismatch",
-      message: "Worktree branch does not match the SkyTurn-managed branch.",
+      reasonCode: worktreeState.reasonCode,
+      message: worktreeState.message,
     };
   }
-
-  const headSha = await gitRevParseHead(worktreePath);
-  const statusText = await gitStatusPorcelain(worktreePath);
-  if (headSha.toLowerCase() !== recordedHead.commitSha.toLowerCase()) {
-    if (headSha.toLowerCase() === restoreCommitRef.toLowerCase()) {
-      if (statusText.length > 0) {
-        return {
-          status: "manual_repair_required",
-          reasonCode: "dirty_worktree",
-          message: "Worktree has uncommitted changes.",
-        };
-      }
-      const matchingRequest = findMatchingRollbackRequestedEvent(store, input, eligibility, restoreCommitRef);
-      if (matchingRequest) {
-        return {
-          status: "already_restored",
-          worktreePath,
-          restoreCommitRef,
-          requestId: matchingRequest.requestId,
-          requestedEvent: matchingRequest.event,
-        };
-      }
+  if (worktreeState.status === "already_restored") {
+    const matchingApplied = findMatchingRollbackAppliedEvent(store, input, eligibility, restoreCommitRef);
+    if (matchingApplied) {
+      return {
+        status: "already_applied",
+        worktreePath,
+        restoreCommitRef,
+        expectedBranchName,
+        expectedHeadCommit: recordedHead.commitSha,
+        requestId: matchingApplied.requestId,
+        event: matchingApplied.event,
+        requestedEvent: matchingApplied.requestedEvent,
+      };
+    }
+    const matchingRequest = findMatchingRollbackRequestedEvent(store, input, eligibility, restoreCommitRef);
+    if (matchingRequest) {
+      return {
+        status: "already_restored",
+        worktreePath,
+        restoreCommitRef,
+        expectedBranchName,
+        expectedHeadCommit: recordedHead.commitSha,
+        requestId: matchingRequest.requestId,
+        requestedEvent: matchingRequest.event,
+      };
     }
     return {
       status: "manual_repair_required",
       reasonCode: "head_mismatch",
-      message: "Worktree HEAD does not match the SkyTurn-recorded local commit.",
-    };
-  }
-  if (statusText.length > 0) {
-    return {
-      status: "manual_repair_required",
-      reasonCode: "dirty_worktree",
-      message: "Worktree has uncommitted changes.",
+      message: "Worktree HEAD is restored but rollback terminal evidence is missing for this request.",
     };
   }
   return {
     status: "safe",
     worktreePath,
     restoreCommitRef,
+    expectedBranchName,
+    expectedHeadCommit: recordedHead.commitSha,
   };
 }
 
@@ -2652,12 +2730,64 @@ function findMatchingRollbackRequestedEvent(
   return null;
 }
 
+function findMatchingRollbackAppliedEvent(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  restoreCommitRef: string,
+): RollbackAppliedEventMatch | null {
+  const events = store.listEvents(input.sessionId);
+  for (let eventIndex = events.length - 1; eventIndex >= 0; eventIndex -= 1) {
+    const event = events[eventIndex];
+    if (!isRecord(event) || event.kind !== "workflow.node.rollback_applied") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const requestId = optionalText(payload.requestId);
+    if (!requestId) continue;
+    if (input.requestId && requestId !== input.requestId) continue;
+    const applied = { requestId, event };
+    if (!validateRollbackTerminalEventForIpc(input, eligibility, restoreCommitRef, applied, "applied")) continue;
+    const requested = findMatchingRollbackRequestedHistoryForTerminalEvent(store, input, eligibility, restoreCommitRef, requestId, eventIndex);
+    if (!requested) continue;
+    return {
+      requestId,
+      event,
+      requestedEvent: requested.event,
+    };
+  }
+  return null;
+}
+
+function findMatchingRollbackRequestedHistoryForTerminalEvent(
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  restoreCommitRef: string,
+  requestId: string,
+  terminalEventIndex: number,
+): RollbackRequestedEventMatch | null {
+  const events = store.listEvents(input.sessionId);
+  for (let eventIndex = events.length - 1; eventIndex >= 0; eventIndex -= 1) {
+    if (eventIndex >= terminalEventIndex) continue;
+    const event = events[eventIndex];
+    if (!isRecord(event) || event.kind !== "workflow.node.rollback_requested") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    if (optionalText(payload.requestId) !== requestId) continue;
+    const requested = { requestId, event };
+    const validation = validateRollbackRequestedEventForIpc(store, input, eligibility, restoreCommitRef, requested, {
+      allowTerminal: true,
+    });
+    if (validation.valid) return requested;
+  }
+  return null;
+}
+
 function validateRollbackRequestedEventForIpc(
   store: WorkflowStoreHost,
   input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string; requestId?: string },
   eligibility: WorkflowRollbackEligibilityLike,
   restoreCommitRef: string,
   requested: RollbackRequestedEventMatch,
+  options: { allowTerminal?: boolean } = {},
 ): RollbackRequestedEventValidation {
   const event = requested.event;
   if (!isRecord(event) || event.kind !== "workflow.node.rollback_requested") {
@@ -2684,8 +2814,37 @@ function validateRollbackRequestedEventForIpc(
   const payloadRestoreCommitRef = optionalText(payload.restoreCommitRef);
   if (payloadRestoreCommitRef !== restoreCommitRef) return invalidRollbackRequestedEventValidation();
   if (payload.localRollbackSafe !== true) return invalidRollbackRequestedEventValidation();
-  if (rollbackRequestHasTerminalEvent(store, input.sessionId, requested.requestId)) return invalidRollbackRequestedEventValidation();
+  if (options?.allowTerminal !== true && rollbackRequestHasTerminalEvent(store, input.sessionId, requested.requestId)) {
+    return invalidRollbackRequestedEventValidation();
+  }
   return { valid: true };
+}
+
+function validateRollbackTerminalEventForIpc(
+  input: { nodeId?: string; laneId?: string; checkpointId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+  restoreCommitRef: string,
+  terminal: RollbackRequestedEventMatch,
+  terminalStatus: "applied" | "rejected",
+): boolean {
+  const event = terminal.event;
+  const expectedKind = terminalStatus === "applied" ? "workflow.node.rollback_applied" : "workflow.node.rollback_rejected";
+  if (!isRecord(event) || event.kind !== expectedKind) return false;
+  const payload = isRecord(event.payload) ? event.payload : {};
+  if (optionalText(event.idempotencyKey) !== `rollback:${terminal.requestId}:${terminalStatus}`) return false;
+  const expectedLaneId = rollbackTargetLaneIdForIpc(input, eligibility);
+  const expectedCheckpointId = optionalText(eligibility.checkpointId) ?? optionalText(input.checkpointId);
+  if (!expectedCheckpointId) return false;
+  const expectedNodeId = optionalText(input.nodeId) ?? optionalText(eligibility.targetNodeId);
+  if (optionalText(payload.requestId) !== terminal.requestId) return false;
+  const eventLaneId = optionalText(event.laneId);
+  if (eventLaneId && eventLaneId !== expectedLaneId) return false;
+  if (optionalText(payload.laneId) !== expectedLaneId) return false;
+  if (optionalText(payload.checkpointId) !== expectedCheckpointId) return false;
+  if (optionalText(payload.nodeId) !== expectedNodeId) return false;
+  if (optionalText(payload.restoreCommitRef) !== restoreCommitRef) return false;
+  if (payload.localRollbackSafe !== true) return false;
+  return true;
 }
 
 function rollbackRequestHasTerminalEvent(store: WorkflowStoreHost, sessionId: string, requestId: string): boolean {
@@ -2780,49 +2939,6 @@ async function findRecordedRollbackHead(
 function workflowCheckpointById(projection: unknown, checkpointId: string): Record<string, unknown> | null {
   if (!isRecord(projection) || !Array.isArray(projection.checkpoints)) return null;
   return projection.checkpoints.find((checkpoint) => isRecord(checkpoint) && checkpoint.id === checkpointId) as Record<string, unknown> | undefined ?? null;
-}
-
-async function gitCurrentBranch(worktreePath: string): Promise<string | null> {
-  try {
-    const result = await execFileAsync("git", ["-C", worktreePath, "branch", "--show-current"], {
-      encoding: "utf8",
-      maxBuffer: 2_000_000,
-      shell: false,
-    });
-    const branch = String(result.stdout).trim();
-    return branch.length > 0 ? branch : null;
-  } catch {
-    return null;
-  }
-}
-
-async function gitRevParseHead(worktreePath: string): Promise<string> {
-  const result = await execFileAsync("git", ["-C", worktreePath, "rev-parse", "HEAD"], {
-    encoding: "utf8",
-    maxBuffer: 2_000_000,
-    shell: false,
-  });
-  return String(result.stdout).trim();
-}
-
-async function gitStatusPorcelain(worktreePath: string): Promise<string> {
-  const result = await execFileAsync("git", ["-C", worktreePath, "status", "--porcelain"], {
-    encoding: "utf8",
-    maxBuffer: 2_000_000,
-    shell: false,
-  });
-  return String(result.stdout).trim();
-}
-
-async function gitResetHard(worktreePath: string, restoreCommitRef: string): Promise<void> {
-  if (!isFullCommitSha(restoreCommitRef)) {
-    throw workflowIpcError("INVALID_INPUT", "Rollback restore target must be a full commit SHA.");
-  }
-  await execFileAsync("git", ["-C", worktreePath, "reset", "--hard", restoreCommitRef], {
-    encoding: "utf8",
-    maxBuffer: 2_000_000,
-    shell: false,
-  });
 }
 
 function isFullCommitSha(value: unknown): value is string {
@@ -3541,9 +3657,44 @@ function findDeliveryPullRequestEvidence(
       number: normalizePullRequestNumberForIpc(payload.evidence.number),
       url: requireText(payload.evidence.url, "pull request URL"),
       commitSha: requireText(payload.evidence.commitSha, "pull request head SHA"),
+      ...(optionalText(payload.commitLaneId) ? { commitLaneId: optionalText(payload.commitLaneId)! } : {}),
+      ...(optionalText(payload.evidence.head) ? { headBranch: optionalText(payload.evidence.head)! } : {}),
     };
   }
   throw workflowIpcError("INVALID_INPUT", `No pull request evidence is recorded for lane ${laneId}.`);
+}
+
+function findDeliveryPullRequestCurrentHeadEvidence(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  laneId: string,
+  prEvidence: DeliveryPullRequestEvidenceLike,
+): DeliveryPullRequestCurrentHeadEvidenceLike {
+  let current: DeliveryPullRequestCurrentHeadEvidenceLike = {
+    headSha: prEvidence.commitSha,
+    ...(prEvidence.headBranch ? { headBranch: prEvidence.headBranch } : {}),
+  };
+  const events = store.listEvents(sessionId);
+  for (const event of events) {
+    if (!isRecord(event) || event.kind !== "workflow.delivery.pushed") continue;
+    const payload = isRecord(event.payload) ? event.payload : {};
+    const eventLaneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+    if (prEvidence.commitLaneId) {
+      if (eventLaneId !== prEvidence.commitLaneId) continue;
+    } else if (eventLaneId !== laneId) {
+      continue;
+    }
+    const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+    const headSha = optionalText(payload.commitSha) ?? optionalText(evidence.commitSha);
+    if (!headSha) continue;
+    const headBranch = optionalText(payload.branch) ?? optionalText(evidence.branch);
+    if (prEvidence.headBranch && headBranch && headBranch !== prEvidence.headBranch) continue;
+    current = {
+      headSha,
+      ...(headBranch ?? current.headBranch ? { headBranch: headBranch ?? current.headBranch } : {}),
+    };
+  }
+  return current;
 }
 
 function findDeliveryPullRequestChecksEvidence(
@@ -3553,6 +3704,7 @@ function findDeliveryPullRequestChecksEvidence(
   expectedHeadSha: string,
 ): DeliveryPullRequestChecksEvidenceLike {
   const events = store.listEvents(sessionId);
+  let latestEvidence: DeliveryPullRequestChecksEvidenceLike | null = null;
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (!isRecord(event) || event.kind !== "workflow.pull_request.checks_recorded") continue;
@@ -3563,14 +3715,28 @@ function findDeliveryPullRequestChecksEvidence(
     const evidence = {
       status: requireText(payload.evidence.status, "pull request checks status"),
       headSha: requireText(payload.evidence.headSha, "pull request checks head SHA"),
+      reviewStatus: pullRequestReviewStatusForIpc(payload, payload.evidence),
     };
+    latestEvidence ??= evidence;
     if (evidence.headSha !== expectedHeadSha) continue;
     if (evidence.status !== "passed") {
       throw workflowIpcError("DELIVERY_REJECTED", `Pull request checks must be passed before merge; got ${evidence.status}.`);
     }
+    if (evidence.reviewStatus === "changes_requested") {
+      throw workflowIpcError("DELIVERY_REJECTED", "Pull request review requested changes before merge.");
+    }
+    if (evidence.reviewStatus !== "approved" && evidence.reviewStatus !== "pending") {
+      throw workflowIpcError(
+        "DELIVERY_REJECTED",
+        `Pull request review evidence must be approved or pending before merge; got ${evidence.reviewStatus || "unknown"}.`,
+      );
+    }
     return evidence;
   }
-  throw workflowIpcError("DELIVERY_REJECTED", "No passed pull request checks are recorded for this head SHA.");
+  if (latestEvidence && latestEvidence.headSha !== expectedHeadSha) {
+    throw workflowIpcError("DELIVERY_REJECTED", "Pull request checks are stale for the current head.");
+  }
+  throw workflowIpcError("DELIVERY_REJECTED", "No pull request checks are recorded for this head SHA.");
 }
 
 function findDeliveryPullRequestMergeEvidence(
@@ -3604,6 +3770,42 @@ function findDeliveryPullRequestMergeEvidence(
   throw workflowIpcError("DELIVERY_REJECTED", "No pull request merge evidence is recorded for this PR head.");
 }
 
+function pullRequestReviewStatusForIpc(
+  payload: Record<string, unknown>,
+  evidence: Record<string, unknown>,
+): string {
+  const payloadReview = isRecord(payload.review) ? payload.review : {};
+  const evidenceReview = isRecord(evidence.review) ? evidence.review : {};
+  const payloadGate = isRecord(payload.gate) ? payload.gate : {};
+  const evidenceGate = isRecord(evidence.gate) ? evidence.gate : {};
+  const explicit = optionalText(payloadReview.status) ??
+    optionalText(evidenceReview.status) ??
+    optionalText(payloadGate.reviewStatus) ??
+    optionalText(evidenceGate.reviewStatus);
+  const normalized = normalizePullRequestReviewStatusForIpc(explicit);
+  if (normalized) return normalized;
+  const checks = Array.isArray(payload.checks) ? payload.checks : Array.isArray(evidence.checks) ? evidence.checks : [];
+  return checks.some((check) => isRecord(check) && normalizePullRequestReviewStatusForIpc(optionalText(check.status)) === "changes_requested")
+    ? "changes_requested"
+    : "unknown";
+}
+
+function normalizePullRequestReviewStatusForIpc(value: string | null | undefined): string | null {
+  const status = value?.trim().toLowerCase();
+  if (!status) return null;
+  if (status === "approved" || status === "approve") return "approved";
+  if (status === "changes_requested" || status === "changes requested") return "changes_requested";
+  if (status === "review_required" || status === "review required" || status === "pending") return "pending";
+  if (status === "unknown") return "unknown";
+  return null;
+}
+
+function assertConventionalCommitSubjectForIpc(subject: string): void {
+  if (!/^[a-z][a-z0-9-]*(?:\([a-z0-9._/-]+\))?!?: .+$/.test(subject)) {
+    throw workflowIpcError("INVALID_INPUT", "Pull request merge subject must use Conventional Commits format.");
+  }
+}
+
 function assertDeliveryEvidenceInputMatches(
   input: Record<string, unknown>,
   evidence: DeliveryCommitEvidenceLike,
@@ -3621,10 +3823,11 @@ function assertDeliveryEvidenceInputMatches(
 function assertDeliveryPullRequestEvidenceInputMatches(
   input: Record<string, unknown>,
   evidence: DeliveryPullRequestEvidenceLike,
+  currentHeadSha: string = evidence.commitSha,
 ): string {
   const expectedHeadSha = requireText(readField(input, "expectedHeadSha"), "expected pull request head SHA");
-  if (expectedHeadSha !== evidence.commitSha) {
-    throw workflowIpcError("REMOTE_HEAD_MISMATCH", "Expected head SHA does not match recorded pull request evidence.");
+  if (expectedHeadSha !== currentHeadSha) {
+    throw workflowIpcError("REMOTE_HEAD_MISMATCH", "Expected head SHA does not match recorded current pull request head evidence.");
   }
   const prNumber = positiveInteger(readField(input, "prNumber"));
   if (prNumber !== null && prNumber !== evidence.number) {

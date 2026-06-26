@@ -88,32 +88,83 @@ describe("buildDeliveryPanelState", () => {
     };
     expect(buildDeliveryPanelState(input({
       pullRequest: pr,
-      checks: { checkStatus: "passing", expectedHeadSha: "def9999", mergeable: true },
+      checks: { checkStatus: "passing", reviewStatus: "pending", expectedHeadSha: "def9999", mergeable: true },
       mergeTitle: "feat(ui): add panel",
       mergeConfirmed: true,
     })).mergeReady).toBe(false);
     expect(buildDeliveryPanelState(input({
       pullRequest: pr,
-      checks: { checkStatus: "pending", expectedHeadSha: "abc1234", mergeable: true },
+      checks: { checkStatus: "pending", reviewStatus: "pending", expectedHeadSha: "abc1234", mergeable: true },
       mergeTitle: "feat(ui): add panel",
       mergeConfirmed: true,
     })).mergeReady).toBe(false);
     expect(buildDeliveryPanelState(input({
       pullRequest: pr,
-      checks: { checkStatus: "passing", expectedHeadSha: "abc1234", mergeable: true },
+      checks: { checkStatus: "passing", reviewStatus: "pending", expectedHeadSha: "abc1234", mergeable: true },
       mergeTitle: "feat(ui): add panel",
       mergeConfirmed: true,
     })).mergeReady).toBe(true);
   });
 
+  it("fails closed when review evidence is missing", () => {
+    const pr = { number: 42, url: "https://example.test/pull/42", headSha: "abc1234", title: "feat(ui): add panel" };
+    expect(buildDeliveryPanelState(input({
+      pullRequest: pr,
+      checks: { checkStatus: "passing", expectedHeadSha: "abc1234", mergeable: true } as any,
+      mergeTitle: "feat(ui): add panel",
+      mergeConfirmed: true,
+    })).mergeReady).toBe(false);
+  });
+
   it("requires explicit merge confirmation and title", () => {
     const ready = input({
       pullRequest: { number: 42, url: "https://example.test/pull/42", headSha: "abc1234", title: "feat(ui): add panel" },
-      checks: { checkStatus: "passing", expectedHeadSha: "abc1234", mergeable: true },
+      checks: { checkStatus: "passing", reviewStatus: "approved", expectedHeadSha: "abc1234", mergeable: true },
     });
     expect(buildDeliveryPanelState(ready).canMerge).toBe(false);
     expect(buildDeliveryPanelState({ ...ready, mergeTitle: "feat(ui): add panel" }).canMerge).toBe(false);
     expect(buildDeliveryPanelState({ ...ready, mergeTitle: "feat(ui): add panel", mergeConfirmed: true }).canMerge).toBe(true);
+  });
+
+  it("blocks merge when reviewStatus is changes_requested", () => {
+    const pr = { number: 42, url: "https://example.test/pull/42", headSha: "abc1234", title: "feat(ui): add panel" };
+    expect(buildDeliveryPanelState(input({
+      pullRequest: pr,
+      checks: { checkStatus: "passing", reviewStatus: "changes_requested", expectedHeadSha: "abc1234", mergeable: true },
+      mergeTitle: "feat(ui): add panel",
+      mergeConfirmed: true,
+    })).mergeReady).toBe(false);
+  });
+
+  it("blocks merge when mergeable is false", () => {
+    const pr = { number: 42, url: "https://example.test/pull/42", headSha: "abc1234", title: "feat(ui): add panel" };
+    expect(buildDeliveryPanelState(input({
+      pullRequest: pr,
+      checks: { checkStatus: "passing", reviewStatus: "approved", expectedHeadSha: "abc1234", mergeable: false },
+      mergeTitle: "feat(ui): add panel",
+      mergeConfirmed: true,
+    })).mergeReady).toBe(false);
+  });
+
+  it("blocks merge when expectedHeadSha is missing", () => {
+    const pr = { number: 42, url: "https://example.test/pull/42", headSha: "abc1234", title: "feat(ui): add panel" };
+    expect(buildDeliveryPanelState(input({
+      pullRequest: pr,
+      checks: { checkStatus: "passing", reviewStatus: "approved", mergeable: true } as any,
+      mergeTitle: "feat(ui): add panel",
+      mergeConfirmed: true,
+    })).mergeReady).toBe(false);
+  });
+
+  it("blocks merge when current PR headSha is missing", () => {
+    const pr = { number: 42, url: "https://example.test/pull/42", title: "feat(ui): add panel" };
+    expect(buildDeliveryPanelState(input({
+      commitEvidence: { commitSha: "abc1234", branch: "feature/x" },
+      pullRequest: pr,
+      checks: { checkStatus: "passing", reviewStatus: "approved", expectedHeadSha: "abc1234", mergeable: true },
+      mergeTitle: "feat(ui): add panel",
+      mergeConfirmed: true,
+    })).mergeReady).toBe(false);
   });
 
   it("disables cleanup until merge or sync unless explicitly allowed", () => {
@@ -200,6 +251,8 @@ describe("hydrateDeliveryLifecycleFromWorkflowEvents", () => {
             url: "https://example.test/pull/42",
             headSha: "sha-b",
             checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/1" }],
+            review: { status: "pending" },
+            gate: { reviewStatus: "pending", mergeable: true },
           },
         },
       },
@@ -257,6 +310,7 @@ describe("hydrateDeliveryLifecycleFromWorkflowEvents", () => {
     });
     expect(restored.checks).toEqual({
       checkStatus: "passing",
+      reviewStatus: "pending",
       expectedHeadSha: "sha-b",
       mergeable: true,
     });
@@ -305,5 +359,67 @@ describe("hydrateDeliveryLifecycleFromWorkflowEvents", () => {
     expect(panelState.prCreatedCompletesTask).toBe(false);
     expect(panelState.mergeReady).toBe(false);
     expect(panelState.canMerge).toBe(false);
+  });
+
+  it("blocks merge when hydrated review.status is changes_requested", () => {
+    const restored = hydrateDeliveryLifecycleFromWorkflowEvents([
+      {
+        kind: "workflow.pull_request.created",
+        payload: {
+          laneId: "lane-pr",
+          evidence: { number: 42, headSha: "sha-a" },
+        },
+      },
+      {
+        kind: "workflow.pull_request.checks_recorded",
+        payload: {
+          laneId: "lane-pr",
+          evidence: {
+            status: "passed",
+            headSha: "sha-a",
+            review: { status: "changes_requested" },
+            gate: { reviewStatus: "changes_requested", mergeable: false },
+          },
+        },
+      },
+    ], { commitLaneId: "lane-commit", pullRequestLaneId: "lane-pr" });
+
+    const panelState = buildDeliveryPanelState(input({
+      pullRequest: restored.pullRequest,
+      checks: restored.checks,
+      mergeTitle: "Title",
+      mergeConfirmed: true,
+    }));
+    expect(panelState.mergeReady).toBe(false);
+    expect(restored.checks?.reviewStatus).toBe("changes_requested");
+  });
+
+  it("fails closed (merge blocked) when hydrated missing review evidence", () => {
+    const restored = hydrateDeliveryLifecycleFromWorkflowEvents([
+      {
+        kind: "workflow.pull_request.created",
+        payload: {
+          laneId: "lane-pr",
+          evidence: { number: 42, headSha: "sha-a" },
+        },
+      },
+      {
+        kind: "workflow.pull_request.checks_recorded",
+        payload: {
+          laneId: "lane-pr",
+          evidence: { status: "passed", headSha: "sha-a" }, // No review/gate.
+        },
+      },
+    ], { commitLaneId: "lane-commit", pullRequestLaneId: "lane-pr" });
+
+    const panelState = buildDeliveryPanelState(input({
+      pullRequest: restored.pullRequest,
+      checks: restored.checks,
+      mergeTitle: "Title",
+      mergeConfirmed: true,
+    }));
+    expect(panelState.mergeReady).toBe(false);
+    expect(restored.checks?.reviewStatus).toBe("unknown");
+    expect(restored.checks?.mergeable).toBe(false);
   });
 });

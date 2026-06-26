@@ -116,6 +116,64 @@ export interface ManagedWorktreeCleanupResult {
   reason?: string;
 }
 
+export type RollbackWorktreeManualRepairReasonCode =
+  | "invalid_restore_commit"
+  | "invalid_recorded_commit"
+  | "missing_restore_commit"
+  | "missing_recorded_commit"
+  | "unmanaged_worktree"
+  | "branch_mismatch"
+  | "head_mismatch"
+  | "dirty_worktree"
+  | "git_reset_failed"
+  | "post_reset_mismatch";
+
+export interface RollbackWorktreeInput {
+  projectRoot: string;
+  worktreePath: string;
+  expectedBranchName: string;
+  expectedHeadCommit: string;
+  restoreCommitRef: string;
+}
+
+export interface RollbackWorktreeSafeState {
+  status: "safe";
+  worktreePath: string;
+  branchName: string;
+  headCommit: string;
+  restoreCommitRef: string;
+}
+
+export interface RollbackWorktreeAlreadyRestoredState {
+  status: "already_restored";
+  worktreePath: string;
+  branchName: string;
+  headCommit: string;
+  restoreCommitRef: string;
+}
+
+export interface RollbackWorktreeAppliedState {
+  status: "applied";
+  worktreePath: string;
+  branchName: string;
+  headCommit: string;
+  restoreCommitRef: string;
+}
+
+export interface RollbackWorktreeManualRepairState {
+  status: "manual_repair_required";
+  reasonCode: RollbackWorktreeManualRepairReasonCode;
+  message: string;
+  manualRepairRequired: true;
+  worktreePath?: string;
+  branchName?: string;
+  headCommit?: string;
+  restoreCommitRef?: string;
+}
+
+export type RollbackWorktreeState = RollbackWorktreeSafeState | RollbackWorktreeAlreadyRestoredState | RollbackWorktreeManualRepairState;
+export type RollbackWorktreeResetResult = RollbackWorktreeAppliedState | RollbackWorktreeAlreadyRestoredState | RollbackWorktreeManualRepairState;
+
 export interface VariantComparisonInput {
   left: WorkflowWorktreeIdentity;
   right: WorkflowWorktreeIdentity;
@@ -296,6 +354,7 @@ export interface DeliveryPullRequestChecksInput {
 }
 
 export type DeliveryPullRequestCheckStatus = "passed" | "failed" | "pending";
+export type DeliveryPullRequestReviewStatus = "approved" | "changes_requested" | "pending" | "unknown";
 
 export interface DeliveryPullRequestCheck {
   name: string;
@@ -306,12 +365,30 @@ export interface DeliveryPullRequestCheck {
   detail?: string;
 }
 
+export interface DeliveryPullRequestReviewGate {
+  status: DeliveryPullRequestReviewStatus;
+  decision: string;
+  detail?: string;
+  reviewer?: string;
+  link?: string;
+}
+
+export interface DeliveryPullRequestGateSummary {
+  headSha: string;
+  checksStatus: DeliveryPullRequestCheckStatus;
+  reviewStatus: DeliveryPullRequestReviewStatus;
+  state: string;
+  mergeable: boolean;
+}
+
 export interface DeliveryPullRequestChecksEvidence {
   status: DeliveryPullRequestCheckStatus;
   number: number;
   url?: string;
   headSha: string;
   checks: DeliveryPullRequestCheck[];
+  review: DeliveryPullRequestReviewGate;
+  gate: DeliveryPullRequestGateSummary;
   command: DeliveryCommandResult;
   summary: string;
 }
@@ -332,6 +409,7 @@ export interface DeliveryPullRequestMergeEvidence {
   headSha: string;
   subject: string;
   checks: DeliveryPullRequestCheck[];
+  review: DeliveryPullRequestReviewGate;
   command: DeliveryCommandResult;
 }
 

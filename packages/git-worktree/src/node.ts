@@ -30,6 +30,7 @@ import {
   type DeliveryPullRequestChecksEvidence,
   type DeliveryPullRequestChecksInput,
   type DeliveryPullRequestEvidence,
+  type DeliveryPullRequestReviewGate,
   type DeliveryPullRequestInput,
   type DeliveryPullRequestMergeEvidence,
   type DeliveryPullRequestMergeInput,
@@ -41,6 +42,11 @@ import {
   type ManagedWorktreeCleanupResult,
   type ManagedWorktreeCreateInput,
   type ManagedWorktreeService,
+  type RollbackWorktreeInput,
+  type RollbackWorktreeManualRepairState,
+  type RollbackWorktreeManualRepairReasonCode,
+  type RollbackWorktreeResetResult,
+  type RollbackWorktreeState,
   type VariantComparisonEvidence,
   type VariantComparisonInput,
   type VariantAdoptionService,
@@ -580,6 +586,134 @@ export async function getGitBranchFacts(repoRoot: string): Promise<GitBranchFact
   };
 }
 
+export async function evaluateRollbackWorktreeState(input: RollbackWorktreeInput): Promise<RollbackWorktreeState> {
+  const restoreCommitRef = input.restoreCommitRef;
+  const expectedHeadCommit = input.expectedHeadCommit;
+  if (!isFullCommitSha(restoreCommitRef)) {
+    return rollbackManualRepair("invalid_restore_commit", "Rollback restore target must be a recorded full commit SHA.");
+  }
+  if (!isFullCommitSha(expectedHeadCommit)) {
+    return rollbackManualRepair("invalid_recorded_commit", "Rollback recorded HEAD must be a full commit SHA.", {
+      restoreCommitRef,
+    });
+  }
+
+  const context = await resolveRollbackWorktreeContext(input);
+  if (!context.ok) return context.result;
+  const { repoRoot, worktreePath } = context;
+
+  if (!await commitObjectExists(worktreePath, restoreCommitRef)) {
+    return rollbackManualRepair("missing_restore_commit", "Rollback restore commit is not present in the worktree repository.", {
+      worktreePath,
+      restoreCommitRef,
+    });
+  }
+  if (!await commitObjectExists(worktreePath, expectedHeadCommit)) {
+    return rollbackManualRepair("missing_recorded_commit", "Rollback recorded HEAD commit is not present in the worktree repository.", {
+      worktreePath,
+      restoreCommitRef,
+    });
+  }
+
+  const listed = await findListedRollbackWorktree(repoRoot, worktreePath);
+  if (!listed.ok) return listed.result;
+  const expectedBranchRef = `refs/heads/${input.expectedBranchName}`;
+  const branchName = await currentBranch(worktreePath).catch(() => "");
+  if (branchName !== input.expectedBranchName || listed.entry.branch !== expectedBranchRef) {
+    return rollbackManualRepair("branch_mismatch", "Worktree branch does not match the SkyTurn-managed branch.", {
+      worktreePath,
+      branchName: branchName || undefined,
+      restoreCommitRef,
+    });
+  }
+  const headCommit = await currentHead(worktreePath).catch(() => "");
+  if (!isFullCommitSha(headCommit) || listed.entry.head?.toLowerCase() !== headCommit.toLowerCase()) {
+    return rollbackManualRepair("head_mismatch", "Worktree HEAD does not match git worktree list evidence.", {
+      worktreePath,
+      branchName,
+      headCommit: headCommit || undefined,
+      restoreCommitRef,
+    });
+  }
+
+  const dirtyStatus = await runGit(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all", "--"], { allowFailure: true });
+  if (dirtyStatus.exitCode !== 0) {
+    return rollbackManualRepair("dirty_worktree", "Worktree clean status could not be verified.", {
+      worktreePath,
+      branchName,
+      headCommit,
+      restoreCommitRef,
+    });
+  }
+  if (dirtyStatus.stdout.trim()) {
+    return rollbackManualRepair("dirty_worktree", "Worktree has uncommitted changes.", {
+      worktreePath,
+      branchName,
+      headCommit,
+      restoreCommitRef,
+    });
+  }
+  if (headCommit.toLowerCase() === expectedHeadCommit.toLowerCase()) {
+    return {
+      status: "safe",
+      worktreePath,
+      branchName,
+      headCommit,
+      restoreCommitRef,
+    };
+  }
+  if (headCommit.toLowerCase() === restoreCommitRef.toLowerCase()) {
+    return {
+      status: "already_restored",
+      worktreePath,
+      branchName,
+      headCommit,
+      restoreCommitRef,
+    };
+  }
+  return rollbackManualRepair("head_mismatch", "Worktree HEAD does not match the SkyTurn-recorded local commit.", {
+    worktreePath,
+    branchName,
+    headCommit,
+    restoreCommitRef,
+  });
+}
+
+export async function resetRollbackWorktreeToCommit(input: RollbackWorktreeInput): Promise<RollbackWorktreeResetResult> {
+  const before = await evaluateRollbackWorktreeState(input);
+  if (before.status !== "safe") return before;
+
+  const reset = await runGit(before.worktreePath, ["reset", "--hard", input.restoreCommitRef], { allowFailure: true });
+  if (reset.exitCode !== 0) {
+    return rollbackManualRepair("git_reset_failed", `Git reset failed; manual repair is required. ${errorMessage(reset.stderr || reset.stdout)}`.trim(), {
+      worktreePath: before.worktreePath,
+      branchName: before.branchName,
+      headCommit: before.headCommit,
+      restoreCommitRef: before.restoreCommitRef,
+    });
+  }
+
+  const after = await evaluateRollbackWorktreeState({
+    ...input,
+    expectedHeadCommit: input.restoreCommitRef,
+  });
+  if (after.status !== "safe") {
+    return rollbackManualRepair("post_reset_mismatch", "Git reset completed but post-reset worktree evidence is ambiguous.", {
+      worktreePath: "worktreePath" in after ? after.worktreePath : before.worktreePath,
+      branchName: "branchName" in after ? after.branchName : before.branchName,
+      headCommit: "headCommit" in after ? after.headCommit : undefined,
+      restoreCommitRef: input.restoreCommitRef,
+    });
+  }
+  return {
+    status: "applied",
+    worktreePath: after.worktreePath,
+    branchName: after.branchName,
+    headCommit: after.headCommit,
+    restoreCommitRef: after.restoreCommitRef,
+  };
+}
+
 export async function createDeliveryCommit(input: DeliveryCommitInput): Promise<DeliveryCommitEvidence> {
   assertDeliveryReconciliationStatus(input.reconciliationStatus, input.acceptMismatch === true);
   const subject = normalizeCommitSubject(input.subject);
@@ -715,8 +849,16 @@ export async function checkDeliveryPullRequest(input: DeliveryPullRequestChecksI
     ...(verifiedPr.url ? { url: verifiedPr.url } : {}),
     headSha: verifiedPr.headSha,
     checks,
+    review: verifiedPr.review,
+    gate: {
+      headSha: verifiedPr.headSha,
+      checksStatus: status,
+      reviewStatus: verifiedPr.review.status,
+      state: verifiedPr.state,
+      mergeable: verifiedPr.mergeable,
+    },
     command: execution.result,
-    summary: pullRequestChecksSummary(checks, status),
+    summary: pullRequestChecksSummary(checks, status, verifiedPr.review),
   };
 }
 
@@ -738,6 +880,7 @@ export async function mergeDeliveryPullRequest(input: DeliveryPullRequestMergeIn
   if (checksEvidence.status !== "passed") {
     throwRemote("DELIVERY_REJECTED", `Pull request checks must be passed before merge; got ${checksEvidence.status}.`);
   }
+  assertPullRequestReviewAllowsMerge(checksEvidence.review);
   const command = await runDeliveryCommand("gh", repoRoot, [
     "pr",
     "merge",
@@ -756,8 +899,20 @@ export async function mergeDeliveryPullRequest(input: DeliveryPullRequestMergeIn
     headSha: pr.headSha,
     subject,
     checks: checksEvidence.checks,
+    review: checksEvidence.review,
     command,
   };
+}
+
+function assertPullRequestReviewAllowsMerge(review: DeliveryPullRequestReviewGate): void {
+  if (review.status === "approved" || review.status === "pending") return;
+  if (review.status === "changes_requested") {
+    throwRemote("DELIVERY_REJECTED", "Pull request review requested changes before merge.");
+  }
+  throwRemote(
+    "DELIVERY_REJECTED",
+    `Pull request review evidence must be approved or pending before merge; got ${review.status || "unknown"}.`,
+  );
 }
 
 export async function syncDeliveryMain(input: DeliveryMainSyncInput): Promise<DeliveryMainSyncEvidence> {
@@ -902,6 +1057,7 @@ interface PullRequestState {
   headSha: string;
   state: string;
   mergeable: boolean;
+  review: DeliveryPullRequestReviewGate;
 }
 
 async function fetchPullRequestState(
@@ -915,7 +1071,7 @@ async function fetchPullRequestState(
     "view",
     selector,
     "--json",
-    "number,url,headRefOid,state,mergeable",
+    "number,url,headRefOid,state,mergeable,reviewDecision,reviews",
   ]);
   const value = parseJsonObject(execution.rawStdout, "GitHub CLI did not return pull request JSON.");
   const number = normalizePullRequestNumber(value.number ?? input.prNumber ?? numberFromPullRequestUrl(input.prUrl));
@@ -933,6 +1089,7 @@ async function fetchPullRequestState(
     headSha,
     state,
     mergeable: normalizePullRequestMergeable(value.mergeable),
+    review: normalizePullRequestReviewGate(value),
   };
 }
 
@@ -970,6 +1127,51 @@ function normalizePullRequestMergeable(value: unknown): boolean {
   if (value === true) return true;
   if (typeof value !== "string") return false;
   return value.trim().toUpperCase() === "MERGEABLE";
+}
+
+function normalizePullRequestReviewGate(value: Record<string, unknown>): DeliveryPullRequestReviewGate {
+  const decision = textFromUnknown(value.reviewDecision);
+  const latestReview = latestActionableReview(value.reviews);
+  const status = reviewStatusFromDecision(decision) ?? reviewStatusFromDecision(latestReview?.state) ?? "unknown";
+  return {
+    status,
+    decision: sanitizeCommandOutput(decision ?? latestReview?.state ?? "UNKNOWN"),
+    ...(latestReview?.detail ? { detail: sanitizeCommandOutput(latestReview.detail) } : {}),
+    ...(latestReview?.reviewer ? { reviewer: sanitizeCommandOutput(latestReview.reviewer) } : {}),
+    ...(latestReview?.link ? { link: sanitizeCommandOutput(latestReview.link) } : {}),
+  };
+}
+
+function latestActionableReview(value: unknown): { state: string; reviewer?: string; detail?: string; link?: string } | null {
+  if (!Array.isArray(value)) return null;
+  const reviews = value
+    .filter(isRecord)
+    .map((review, index) => ({
+      state: textFromUnknown(review.state) ?? textFromUnknown(review.reviewDecision) ?? "",
+      reviewer: reviewAuthor(review.author),
+      detail: textFromUnknown(review.body) ?? textFromUnknown(review.description) ?? undefined,
+      link: textFromUnknown(review.url) ?? textFromUnknown(review.link) ?? undefined,
+      index,
+    }))
+    .filter((review) => review.state);
+  return reviews.reverse().find((review) => {
+    const status = reviewStatusFromDecision(review.state);
+    return status === "approved" || status === "changes_requested";
+  }) ?? null;
+}
+
+function reviewAuthor(value: unknown): string | undefined {
+  if (isRecord(value)) return textFromUnknown(value.login) ?? undefined;
+  return textFromUnknown(value) ?? undefined;
+}
+
+function reviewStatusFromDecision(value: string | null | undefined): DeliveryPullRequestReviewGate["status"] | null {
+  const decision = value?.trim().toLowerCase();
+  if (!decision) return null;
+  if (decision === "approved" || decision === "approve") return "approved";
+  if (decision === "changes_requested" || decision === "changes requested") return "changes_requested";
+  if (decision === "review_required" || decision === "review required" || decision === "pending") return "pending";
+  return null;
 }
 
 function parsePullRequestChecks(output: string): DeliveryPullRequestCheck[] {
@@ -1011,11 +1213,15 @@ function aggregatePullRequestChecks(checks: DeliveryPullRequestCheck[]): Deliver
   return "pending";
 }
 
-function pullRequestChecksSummary(checks: DeliveryPullRequestCheck[], status: DeliveryPullRequestChecksEvidence["status"]): string {
+function pullRequestChecksSummary(
+  checks: DeliveryPullRequestCheck[],
+  status: DeliveryPullRequestChecksEvidence["status"],
+  review: DeliveryPullRequestReviewGate,
+): string {
   const passed = checks.filter((check) => check.status === "passed").length;
   const failed = checks.filter((check) => check.status === "failed").length;
   const pending = checks.filter((check) => check.status === "pending").length;
-  return `${checks.length} checks: ${passed} passed, ${failed} failed, ${pending} pending; overall ${status}.`;
+  return `${checks.length} checks: ${passed} passed, ${failed} failed, ${pending} pending; overall ${status}; review ${review.status}.`;
 }
 
 function parseJsonObject(output: string, message: string): Record<string, unknown> {
@@ -1550,6 +1756,68 @@ async function ensureManagedRoot(repoRoot: string): Promise<string> {
 async function verifyCommit(repoRoot: string, commit: string, label: string): Promise<string> {
   validateCommitHash(commit, label);
   return (await runGit(repoRoot, ["rev-parse", "--verify", `${commit}^{commit}`])).stdout;
+}
+
+function isFullCommitSha(value: string): boolean {
+  return /^[0-9a-fA-F]{40}$/.test(value);
+}
+
+async function commitObjectExists(cwd: string, commit: string): Promise<boolean> {
+  const result = await runGit(cwd, ["rev-parse", "--verify", `${commit}^{commit}`], { allowFailure: true });
+  return result.exitCode === 0 && result.stdout.toLowerCase() === commit.toLowerCase();
+}
+
+async function resolveRollbackWorktreeContext(input: RollbackWorktreeInput): Promise<
+  | { ok: true; repoRoot: string; worktreePath: string }
+  | { ok: false; result: RollbackWorktreeManualRepairState }
+> {
+  let repoRoot = "";
+  let worktreePath = "";
+  try {
+    repoRoot = await assertGitRepo(input.projectRoot);
+    worktreePath = await realpath(input.worktreePath);
+    const managedRoot = await realpath(resolve(dirname(repoRoot), `${basename(repoRoot)}.worktrees`));
+    assertPathInside(worktreePath, managedRoot, "rollback worktree path");
+  } catch {
+    return {
+      ok: false,
+      result: rollbackManualRepair("unmanaged_worktree", "Rollback requires a SkyTurn-managed worktree."),
+    };
+  }
+  return { ok: true, repoRoot, worktreePath };
+}
+
+async function findListedRollbackWorktree(repoRoot: string, worktreePath: string): Promise<
+  | { ok: true; entry: GitWorktreeListEntry }
+  | { ok: false; result: RollbackWorktreeManualRepairState }
+> {
+  try {
+    return { ok: true, entry: await findListedWorktree(repoRoot, worktreePath) };
+  } catch {
+    return {
+      ok: false,
+      result: rollbackManualRepair("unmanaged_worktree", "Rollback worktree is not listed by git.", {
+        worktreePath,
+      }),
+    };
+  }
+}
+
+function rollbackManualRepair(
+  reasonCode: RollbackWorktreeManualRepairReasonCode,
+  message: string,
+  facts: Partial<Pick<RollbackWorktreeManualRepairState, "worktreePath" | "branchName" | "headCommit" | "restoreCommitRef">> = {},
+): RollbackWorktreeManualRepairState {
+  return {
+    status: "manual_repair_required",
+    reasonCode,
+    message,
+    manualRepairRequired: true,
+    ...(facts.worktreePath ? { worktreePath: facts.worktreePath } : {}),
+    ...(facts.branchName ? { branchName: facts.branchName } : {}),
+    ...(facts.headCommit ? { headCommit: facts.headCommit } : {}),
+    ...(facts.restoreCommitRef ? { restoreCommitRef: facts.restoreCommitRef } : {}),
+  };
 }
 
 async function verifyGitRef(repoRoot: string, ref: string): Promise<string> {

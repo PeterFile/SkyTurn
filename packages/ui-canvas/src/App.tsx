@@ -206,6 +206,8 @@ export default function App() {
   const startedBridgeRuns = useRef(new Set<string>());
   const completedBridgeRunPersistenceClaims = useRef(new Set<string>());
   const workspaceRef = useRef(workspace);
+  const selectedNodeActionScopeRef = useRef<{ sessionId: string; nodeId: string } | null>(null);
+  const selectedNodeActionGenerationRef = useRef(0);
 
   const activeProject = workspace.projects.find((project) => project.id === workspace.activeProjectId) ?? null;
   const activeSession =
@@ -216,6 +218,9 @@ export default function App() {
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
       : null;
+  const selectedNodeActionScopeKey = activeSession?.kind === "canvas" && selectedNode
+    ? `${activeSession.id}:${selectedNode.id}`
+    : null;
   const inspectedNode =
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === inspectedNodeId) ?? null
@@ -348,10 +353,18 @@ export default function App() {
   }, [activeProject, selectedNode?.runId]);
 
   useEffect(() => {
+    selectedNodeActionGenerationRef.current += 1;
+    selectedNodeActionScopeRef.current = activeSession?.kind === "canvas" && selectedNode
+      ? { sessionId: activeSession.id, nodeId: selectedNode.id }
+      : null;
+  }, [selectedNodeActionScopeKey]);
+
+  useEffect(() => {
     setNodeActionText("");
     setNodeActionError(null);
     setNodeActionStatus(null);
-  }, [selectedNode?.id]);
+    setNodeActionBusy(null);
+  }, [selectedNodeActionScopeKey]);
 
   useEffect(() => {
     if (!activeProject || activeSession?.kind !== "canvas" || !selectedNode) {
@@ -368,6 +381,8 @@ export default function App() {
       }));
       return;
     }
+
+    setSelectedNodeActionState(null);
 
     let active = true;
     const projectRoot = activeProject.rootPath;
@@ -614,6 +629,12 @@ export default function App() {
     }
 
     const actionState = selectedNodeActionState;
+    const actionScope = { sessionId: activeSession.id, nodeId: selectedNode.id };
+    const actionGeneration = selectedNodeActionGenerationRef.current + 1;
+    selectedNodeActionGenerationRef.current = actionGeneration;
+    const actionStillCurrent = () =>
+      nodeActionPayloadMatchesSelection(selectedNodeActionScopeRef.current, actionScope.sessionId, actionScope.nodeId) &&
+      selectedNodeActionGenerationRef.current === actionGeneration;
     const projectRoot = activeProject.rootPath;
     setNodeActionBusy(action);
     setNodeActionError(null);
@@ -621,60 +642,79 @@ export default function App() {
 
     try {
       if (action === "repair") {
-        if (!actionState?.repairPayload) {
+        const repairPayload = actionState?.repairPayload;
+        if (!repairPayload) {
           setNodeActionError("Repair requires an after checkpoint.");
           return;
         }
+        if (!nodeActionPayloadMatchesSelection(repairPayload, activeSession.id, selectedNode.id)) {
+          setNodeActionError("Selected node action is stale. Reselect the node and try again.");
+          return;
+        }
         const result = await workflow.requestRepair(projectRoot, {
-          ...actionState.repairPayload,
+          ...repairPayload,
           instruction: requestText,
         });
-        applyWorkflowActionResult(result);
+        if (!actionStillCurrent()) return;
+        applyWorkflowActionResult(result, actionStillCurrent);
         setNodeActionStatus("Repair lane requested.");
         setNodeActionText("");
         return;
       }
 
       if (action === "variant") {
-        if (!actionState?.variantPayload) {
+        const variantPayload = actionState?.variantPayload;
+        if (!variantPayload) {
           setNodeActionError("Variant requires a before checkpoint.");
           return;
         }
+        if (!nodeActionPayloadMatchesSelection(variantPayload, activeSession.id, selectedNode.id)) {
+          setNodeActionError("Selected node action is stale. Reselect the node and try again.");
+          return;
+        }
         const result = await workflow.requestVariant(projectRoot, {
-          ...actionState.variantPayload,
+          ...variantPayload,
           instruction: requestText,
         });
-        applyWorkflowActionResult(result);
+        if (!actionStillCurrent()) return;
+        applyWorkflowActionResult(result, actionStillCurrent);
         setNodeActionStatus("Variant lane requested.");
         setNodeActionText("");
         return;
       }
 
-      if (!actionState?.rollbackPayload) {
+      const rollbackPayload = actionState?.rollbackPayload;
+      if (!rollbackPayload) {
         setNodeActionError(selectedNodeActionAvailability(actionState, true).rollback.reason ?? "Rollback is not eligible.");
         return;
       }
+      if (!nodeActionPayloadMatchesSelection(rollbackPayload, activeSession.id, selectedNode.id)) {
+        setNodeActionError("Selected node action is stale. Reselect the node and try again.");
+        return;
+      }
       const result = await workflow.applyRollback(projectRoot, {
-        ...actionState.rollbackPayload,
+        ...rollbackPayload,
         text: requestText,
       });
+      if (!actionStillCurrent()) return;
       const blockedMessage = rollbackBlockedMessage(result);
       if (blockedMessage) {
         setNodeActionError(blockedMessage);
-        await refreshWorkflowProjection();
+        await refreshWorkflowProjection(actionStillCurrent);
         return;
       }
-      applyWorkflowActionResult(result);
+      applyWorkflowActionResult(result, actionStillCurrent);
       setNodeActionStatus("Rollback affects selected and downstream workflow state, not evidence/history.");
       setNodeActionText("");
     } catch (error) {
-      setNodeActionError(actionFailureMessage(error, action));
+      if (actionStillCurrent()) setNodeActionError(actionFailureMessage(error, action));
     } finally {
-      setNodeActionBusy(null);
+      if (actionStillCurrent()) setNodeActionBusy(null);
     }
   }
 
-  function applyWorkflowActionResult(result: unknown) {
+  function applyWorkflowActionResult(result: unknown, shouldApply?: () => boolean) {
+    if (shouldApply && !shouldApply()) return;
     const canvasSession = canvasSessionFromWorkflowResult(result);
     if (canvasSession) {
       setWorkspace((current) => ({
@@ -683,12 +723,14 @@ export default function App() {
       }));
       return;
     }
-    void refreshWorkflowProjection();
+    void refreshWorkflowProjection(shouldApply);
   }
 
-  async function refreshWorkflowProjection() {
+  async function refreshWorkflowProjection(shouldApply?: () => boolean) {
+    if (shouldApply && !shouldApply()) return;
     if (!activeProject || activeSession?.kind !== "canvas" || !window.devflow?.workflow) return;
     const result = await window.devflow.workflow.getProjection(activeProject.rootPath, activeSession.id);
+    if (shouldApply && !shouldApply()) return;
     if (!result.canvasSession) return;
     const canvasSession = result.canvasSession;
     setWorkspace((current) => ({
@@ -886,6 +928,7 @@ export default function App() {
               composerValue={selectedNode ? nodeActionText : bottomGoal}
               composerDisabled={false}
               selectedNode={selectedNode}
+              selectedNodeActionScopeKey={selectedNodeActionScopeKey}
               selectedNodeActionState={selectedNodeActionState}
               nodeActionBusy={nodeActionBusy}
               nodeActionError={nodeActionError}
@@ -1231,6 +1274,14 @@ function rollbackActionAvailability(state: SelectedNodeActionState): NodeActionA
   return { enabled: false, reason: state.blockedReasons[0] ?? "Rollback is not eligible." };
 }
 
+function nodeActionPayloadMatchesSelection(
+  payload: { sessionId: string; nodeId: string } | null | undefined,
+  sessionId: string,
+  nodeId: string,
+): boolean {
+  return payload?.sessionId === sessionId && payload.nodeId === nodeId;
+}
+
 export function rollbackLabelForNode(node: { rollbackStatus?: NodeRollbackStatus | null }): string | null {
   if (node.rollbackStatus === "rolled_back") return "Rolled back";
   if (node.rollbackStatus === "inactive") return "Inactive";
@@ -1499,6 +1550,7 @@ function CanvasView({
   composerValue,
   composerDisabled,
   selectedNode,
+  selectedNodeActionScopeKey,
   selectedNodeActionState,
   nodeActionBusy,
   nodeActionError,
@@ -1515,6 +1567,7 @@ function CanvasView({
   composerValue: string;
   composerDisabled: boolean;
   selectedNode: CanvasNode | null;
+  selectedNodeActionScopeKey: string | null;
   selectedNodeActionState: SelectedNodeActionState | null;
   nodeActionBusy: Exclude<ComposerAction, null> | null;
   nodeActionError: string | null;
@@ -1612,6 +1665,7 @@ function CanvasView({
         value={composerValue}
         disabled={composerDisabled}
         selectedNode={selectedNode}
+        selectedNodeActionScopeKey={selectedNodeActionScopeKey}
         selectedNodeActionState={selectedNodeActionState}
         nodeActionBusy={nodeActionBusy}
         nodeActionError={nodeActionError}
@@ -2965,13 +3019,20 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
         prNumber: prEvidence.number,
-        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+        expectedHeadSha: prEvidence.headSha,
       });
       const checkStatus = deliveryCheckStatusForEvidence(result.evidence.status);
+      const reviewStatus = deliveryReviewStatusFromEvidence(result.evidence);
+
       setPrChecks({
         checkStatus,
+        reviewStatus,
         expectedHeadSha: result.evidence.headSha,
-        mergeable: checkStatus === "passing",
+        mergeable:
+          checkStatus === "passing" &&
+          deliveryGateMergeableFromEvidence(result.evidence) &&
+          reviewStatus !== "changes_requested" &&
+          reviewStatus !== "unknown",
       });
       setPrCheckStatus(`checks: ${checkStatus}`);
     } catch (e) {
@@ -2987,7 +3048,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
 
     const trimmedTitle = mergeTitle.trim();
     if (!mergeConfirmed || trimmedTitle === "") return;
-    const headSha = prEvidence.headSha ?? commitEvidence?.commitSha;
+    const headSha = prEvidence.headSha;
     if (
       prChecks?.checkStatus !== "passing" ||
       !prChecks.mergeable ||
@@ -3006,7 +3067,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
         prNumber: prEvidence.number,
-        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+        expectedHeadSha: prEvidence.headSha,
         title: trimmedTitle,
         method: "squash",
       });
@@ -3038,7 +3099,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         sessionId: session.id,
         laneId: dependentPrLaneId ?? node.id,
         prNumber: prEvidence.number,
-        expectedHeadSha: prEvidence.headSha ?? commitEvidence?.commitSha,
+        expectedHeadSha: prEvidence.headSha,
       });
       if (result.status === "synced") {
         setSyncStatus("synced");
@@ -3452,7 +3513,7 @@ function DeliveryLifecyclePanel({
   const mergeRequestDisabled = !state.mergeReady || mergeStatus === "merging";
   const confirmMergeDisabled = !state.canMerge;
   const cleanupDisabled = !state.canCleanup || missingCleanMetadata;
-  const headSha = pullRequest?.headSha ?? commitEvidence?.commitSha;
+  const headSha = pullRequest?.headSha;
 
   return (
     <section className="delivery-panel" aria-label="Delivery lifecycle">
@@ -3674,6 +3735,28 @@ function deliveryCheckStatusForEvidence(status: string): DeliveryPullRequestChec
   if (status === "passed") return "passing";
   if (status === "failed") return "failing";
   return "pending";
+}
+
+function deliveryReviewStatusFromEvidence(evidence: unknown): DeliveryPullRequestChecks["reviewStatus"] {
+  const record = asRecord(evidence);
+  const review = asRecord(record?.review);
+  const gate = asRecord(record?.gate);
+  return deliveryReviewStatusForEvidence(
+    optionalText(review?.status) ??
+    optionalText(gate?.reviewStatus),
+  );
+}
+
+function deliveryGateMergeableFromEvidence(evidence: unknown): boolean {
+  const gate = asRecord(asRecord(evidence)?.gate);
+  return typeof gate?.mergeable === "boolean" ? gate.mergeable : false;
+}
+
+function deliveryReviewStatusForEvidence(status?: string): DeliveryPullRequestChecks["reviewStatus"] {
+  if (status === "approved") return "approved";
+  if (status === "changes_requested") return "changes_requested";
+  if (status === "pending") return "pending";
+  return "unknown";
 }
 
 export function changeReviewSummary(node: CanvasNode, changeset: Changeset): string {
@@ -4362,6 +4445,7 @@ function CanvasComposer({
   value,
   disabled,
   selectedNode,
+  selectedNodeActionScopeKey,
   selectedNodeActionState,
   nodeActionBusy,
   nodeActionError,
@@ -4374,6 +4458,7 @@ function CanvasComposer({
   value: string;
   disabled: boolean;
   selectedNode: CanvasNode | null;
+  selectedNodeActionScopeKey: string | null;
   selectedNodeActionState: SelectedNodeActionState | null;
   nodeActionBusy: Exclude<ComposerAction, null> | null;
   nodeActionError: string | null;
@@ -4387,7 +4472,7 @@ function CanvasComposer({
 
   useEffect(() => {
     setAction(null);
-  }, [selectedNode?.id]);
+  }, [selectedNodeActionScopeKey]);
 
   let placeholder = "Insert requirement or node";
   if (selectedNode) {
@@ -4453,6 +4538,34 @@ function CanvasComposer({
           <span className="pill-meta">{selectedNode.agent} · {selectedNode.status}</span>
         </div>
       )}
+      {selectedNode && selectedNodeActionState && (
+        <div className="composer-checkpoint-summary">
+          <div className="checkpoint-row">
+            <span className="checkpoint-label">Before:</span>
+            {selectedNodeActionState.checkpoints.hasBefore ? (
+              <span className="checkpoint-detail">
+                {selectedNodeActionState.checkpoints.beforeCheckpointId?.split('-').pop()}
+                {selectedNodeActionState.checkpoints.beforeCommitSha && ` (${selectedNodeActionState.checkpoints.beforeCommitSha})`}
+                {selectedNodeActionState.checkpoints.beforeSource && ` [${selectedNodeActionState.checkpoints.beforeSource}]`}
+              </span>
+            ) : (
+              <span className="checkpoint-missing">Missing</span>
+            )}
+          </div>
+          <div className="checkpoint-row">
+            <span className="checkpoint-label">After:</span>
+            {selectedNodeActionState.checkpoints.hasAfter ? (
+              <span className="checkpoint-detail">
+                {selectedNodeActionState.checkpoints.afterCheckpointId?.split('-').pop()}
+                {selectedNodeActionState.checkpoints.afterCommitSha && ` (${selectedNodeActionState.checkpoints.afterCommitSha})`}
+                {selectedNodeActionState.checkpoints.afterSource && ` [${selectedNodeActionState.checkpoints.afterSource}]`}
+              </span>
+            ) : (
+              <span className="checkpoint-missing">Missing</span>
+            )}
+          </div>
+        </div>
+      )}
       {selectedNode && (
         <div className="composer-actions">
           <button
@@ -4485,6 +4598,39 @@ function CanvasComposer({
           >
             Rollback node and downstream
           </button>
+        </div>
+      )}
+      {selectedNode && selectedNodeActionState && (
+        <div className="composer-impact-summary">
+          {selectedNodeActionState.rollbackEligibility?.affectedLaneIds && selectedNodeActionState.rollbackEligibility.affectedLaneIds.length > 0 && (
+            <div className="impact-row">
+              <span className="impact-label">Selected + downstream:</span>
+              <span className="impact-detail">
+                {selectedNodeActionState.rollbackEligibility.affectedLaneIds.length}
+                ({selectedNodeActionState.rollbackEligibility.affectedLaneIds.join(', ')})
+              </span>
+            </div>
+          )}
+          {selectedNodeActionState.rollbackEligibility?.restoreCommitRef && (
+            <div className="impact-row">
+              <span className="impact-label">Restore commit:</span>
+              <span className="impact-detail">{selectedNodeActionState.rollbackEligibility.restoreCommitRef.substring(0, 7)}</span>
+            </div>
+          )}
+          {selectedNodeActionState.remoteSideEffects.length > 0 && (
+            <div className="impact-row">
+              <span className="impact-label">Remote blockers:</span>
+              <span className="impact-detail">
+                {selectedNodeActionState.remoteSideEffects.map(r => r.eventKind).join(', ')}
+              </span>
+            </div>
+          )}
+          {(selectedNodeActionState.rollbackEligibility?.manualRepairReason || selectedNodeActionState.needsBackendCheck) && (
+            <div className="impact-row">
+              <span className="impact-label">Manual repair:</span>
+              <span className="impact-detail">{selectedNodeActionState.rollbackEligibility?.manualRepairReason || "Backend check required"}</span>
+            </div>
+          )}
         </div>
       )}
       {selectedNode && (

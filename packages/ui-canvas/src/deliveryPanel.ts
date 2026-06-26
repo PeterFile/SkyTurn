@@ -1,5 +1,6 @@
 export type DeliveryBusyAction = "commit" | "push" | "create-pr" | "check-pr" | "merge" | "sync" | "cleanup";
 export type PullRequestCheckStatus = "passing" | "failing" | "pending";
+export type PullRequestReviewStatus = "approved" | "changes_requested" | "pending" | "unknown";
 
 export interface DeliveryPanelBackendAvailability {
   commit: boolean;
@@ -33,6 +34,7 @@ export interface DeliveryPullRequestSummary {
 
 export interface DeliveryPullRequestChecks {
   checkStatus: PullRequestCheckStatus;
+  reviewStatus: PullRequestReviewStatus;
   expectedHeadSha?: string;
   mergeable: boolean;
 }
@@ -57,6 +59,13 @@ export interface DeliveryPanelInput {
   busyAction: DeliveryBusyAction | null;
 }
 
+export type DeliveryStepStatus = "ready" | "blocked" | "done" | "stale" | "pending";
+
+export interface DeliveryStepState {
+  status: DeliveryStepStatus;
+  blockedMessage?: string;
+}
+
 export interface DeliveryPanelState {
   canCommit: boolean;
   canPush: boolean;
@@ -68,7 +77,16 @@ export interface DeliveryPanelState {
   canSync: boolean;
   canCleanup: boolean;
   deleteBranchRequested: boolean;
-  prCreatedCompletesTask: false;
+  prCreatedCompletesTask: boolean;
+
+  commitStep: DeliveryStepState;
+  pushStep: DeliveryStepState;
+  prStep: DeliveryStepState;
+  checkStep: DeliveryStepState;
+  reviewStep: DeliveryStepState;
+  mergeStep: DeliveryStepState;
+  syncStep: DeliveryStepState;
+  cleanupStep: DeliveryStepState;
 }
 
 export interface DeliveryLifecycleHydrationOptions {
@@ -89,60 +107,174 @@ export function buildDeliveryPanelState(input: DeliveryPanelInput): DeliveryPane
   const hasCommit = !!input.commitEvidence;
   const hasPushedBranch = !!input.pushEvidence;
   const hasPullRequest = !!input.pullRequest;
-  const headSha = input.pullRequest?.headSha ?? input.commitEvidence?.commitSha;
+  const headSha = input.pullRequest?.headSha;
   const expectedHeadSha = input.checks?.expectedHeadSha;
+
+  const isStaleChecks = !!expectedHeadSha && !!headSha && headSha !== expectedHeadSha;
+
   const exactHeadChecksPassed =
     input.checks?.checkStatus === "passing" &&
-    input.checks.mergeable &&
-    !!headSha &&
     !!expectedHeadSha &&
+    !!headSha &&
     headSha === expectedHeadSha;
-  const mergeReady = hasPullRequest && exactHeadChecksPassed;
+
+  const reviewStatus = input.checks?.reviewStatus;
+  const reviewChangesRequested = reviewStatus === "changes_requested";
+  const reviewStatusKnown = reviewStatus === "approved" || reviewStatus === "pending";
+
+  const mergeReady =
+    hasPullRequest &&
+    exactHeadChecksPassed &&
+    input.checks?.mergeable === true &&
+    reviewStatusKnown &&
+    !reviewChangesRequested;
   const cleanupAllowed = input.mergeComplete || input.syncComplete || input.cleanupExplicitlyAllowed;
   const deleteBranchBlocked = input.deleteBranch && !input.deleteBranchConfirmed;
 
+  const commitStep: DeliveryStepState = { status: "blocked", blockedMessage: "no commit evidence" };
+  const pushStep: DeliveryStepState = { status: "blocked", blockedMessage: "no commit evidence" };
+  const prStep: DeliveryStepState = { status: "blocked", blockedMessage: "no pushed branch" };
+  const checkStep: DeliveryStepState = { status: "blocked", blockedMessage: "PR not created" };
+  const reviewStep: DeliveryStepState = { status: "blocked", blockedMessage: "PR not created" };
+  const mergeStep: DeliveryStepState = { status: "blocked", blockedMessage: "PR not created" };
+  const syncStep: DeliveryStepState = { status: "blocked", blockedMessage: "merge not complete" };
+  const cleanupStep: DeliveryStepState = { status: "blocked", blockedMessage: "cleanup not confirmed" };
+
+  if (hasCommit) {
+    commitStep.status = "done";
+  } else if (input.isCommitLane && input.hasGitEvidence && input.hasGitChanges) {
+    commitStep.status = input.busyAction === "commit" ? "pending" : "ready";
+  } else {
+    commitStep.status = "blocked";
+    commitStep.blockedMessage = "no git changes";
+  }
+
+  if (hasPullRequest) {
+    pushStep.status = "blocked";
+    pushStep.blockedMessage = "PR already exists";
+  } else if (hasPushedBranch && input.pushEvidence?.commitSha === input.commitEvidence?.commitSha) {
+    pushStep.status = "done";
+  } else if (hasCommit) {
+    pushStep.status = input.busyAction === "push" ? "pending" : "ready";
+  } else {
+    pushStep.status = "blocked";
+    pushStep.blockedMessage = "no commit evidence";
+  }
+
+  if (hasPullRequest) {
+    prStep.status = "done";
+  } else if (hasPushedBranch && !!input.commitEvidence?.branch) {
+    prStep.status = input.busyAction === "create-pr" ? "pending" : "ready";
+  } else {
+    prStep.status = "blocked";
+    prStep.blockedMessage = "no pushed branch";
+  }
+
+  if (hasPullRequest) {
+    if (input.busyAction === "check-pr") {
+      checkStep.status = "pending";
+    } else if (!input.checks) {
+      checkStep.status = "ready";
+    } else if (isStaleChecks) {
+      checkStep.status = "stale";
+      checkStep.blockedMessage = "checks stale";
+    } else if (input.checks.checkStatus === "failing") {
+      checkStep.status = "blocked";
+      checkStep.blockedMessage = "checks failing";
+    } else if (input.checks.checkStatus === "passing") {
+      checkStep.status = "done";
+    } else {
+      checkStep.status = "pending";
+      checkStep.blockedMessage = "checks pending";
+    }
+  }
+
+  if (hasPullRequest) {
+    if (!input.checks) {
+      reviewStep.status = "blocked";
+      reviewStep.blockedMessage = "checks pending";
+    } else if (isStaleChecks) {
+      reviewStep.status = "stale";
+      reviewStep.blockedMessage = "checks stale";
+    } else if (input.checks.reviewStatus === "changes_requested") {
+      reviewStep.status = "blocked";
+      reviewStep.blockedMessage = "review changes requested";
+    } else if (input.checks.reviewStatus === "approved") {
+      reviewStep.status = "done";
+    } else {
+      reviewStep.status = "ready";
+    }
+  }
+
+  if (input.mergeComplete) {
+    mergeStep.status = "done";
+  } else if (mergeReady) {
+    if (input.busyAction === "merge") {
+      mergeStep.status = "pending";
+    } else if (input.mergeConfirmed && input.mergeTitle.trim().length > 0) {
+      mergeStep.status = "ready";
+    } else {
+      mergeStep.status = "blocked";
+      mergeStep.blockedMessage = "merge not confirmed";
+    }
+  } else {
+    mergeStep.status = "blocked";
+    if (!hasPullRequest) {
+      mergeStep.blockedMessage = "PR not created";
+    } else if (isStaleChecks) {
+      mergeStep.blockedMessage = "checks stale";
+    } else if (input.checks?.checkStatus === "failing") {
+      mergeStep.blockedMessage = "checks failing";
+    } else if (input.checks?.reviewStatus === "changes_requested") {
+      mergeStep.blockedMessage = "review changes requested";
+    } else {
+      mergeStep.blockedMessage = "checks pending";
+    }
+  }
+
+  if (input.syncComplete) {
+    syncStep.status = "done";
+  } else if (input.mergeComplete) {
+    syncStep.status = input.busyAction === "sync" ? "pending" : "ready";
+  } else {
+    syncStep.status = "blocked";
+    syncStep.blockedMessage = "merge not complete";
+  }
+
+  if (cleanupAllowed) {
+    if (input.busyAction === "cleanup") {
+      cleanupStep.status = "pending";
+    } else if (input.cleanupConfirmed && !deleteBranchBlocked) {
+      cleanupStep.status = "ready";
+    } else {
+      cleanupStep.status = "blocked";
+      cleanupStep.blockedMessage = "cleanup not confirmed";
+    }
+  } else {
+    cleanupStep.status = "blocked";
+    cleanupStep.blockedMessage = "cleanup not confirmed";
+  }
+
   return {
-    canCommit:
-      input.backend.commit &&
-      input.busyAction !== "commit" &&
-      input.isCommitLane &&
-      input.hasGitEvidence &&
-      input.hasGitChanges,
-    canPush:
-      input.backend.push &&
-      input.busyAction !== "push" &&
-      hasCommit &&
-      !hasPullRequest,
-    canCreatePr:
-      input.backend.createPr &&
-      input.busyAction !== "create-pr" &&
-      hasPushedBranch &&
-      !!input.commitEvidence?.branch &&
-      !hasPullRequest,
-    canCheckPr:
-      input.backend.checkPr &&
-      input.busyAction !== "check-pr" &&
-      hasPullRequest,
+    canCommit: input.backend.commit && commitStep.status === "ready",
+    canPush: input.backend.push && pushStep.status === "ready",
+    canCreatePr: input.backend.createPr && prStep.status === "ready",
+    canCheckPr: input.backend.checkPr && hasPullRequest && input.busyAction !== "check-pr",
     exactHeadChecksPassed,
     mergeReady,
-    canMerge:
-      input.backend.merge &&
-      input.busyAction !== "merge" &&
-      mergeReady &&
-      input.mergeConfirmed &&
-      input.mergeTitle.trim().length > 0,
-    canSync:
-      input.backend.sync &&
-      input.busyAction !== "sync" &&
-      input.mergeComplete,
-    canCleanup:
-      input.backend.cleanup &&
-      input.busyAction !== "cleanup" &&
-      cleanupAllowed &&
-      input.cleanupConfirmed &&
-      !deleteBranchBlocked,
+    canMerge: input.backend.merge && mergeStep.status === "ready",
+    canSync: input.backend.sync && syncStep.status === "ready",
+    canCleanup: input.backend.cleanup && cleanupStep.status === "ready",
     deleteBranchRequested: input.deleteBranch,
     prCreatedCompletesTask: false,
+    commitStep,
+    pushStep,
+    prStep,
+    checkStep,
+    reviewStep,
+    mergeStep,
+    syncStep,
+    cleanupStep,
   };
 }
 
@@ -213,10 +345,13 @@ export function hydrateDeliveryLifecycleFromWorkflowEvents(
     if (event.kind === "workflow.pull_request.checks_recorded" && matchesPullRequestEvent(laneId, payload, state, options)) {
       const headSha = text(payload.headSha) ?? text(evidence.headSha);
       const status = deliveryCheckStatus(text(payload.status) ?? text(evidence.status));
+      const reviewStatus = deliveryReviewStatusFromEvent(payload, evidence);
+      const gateMergeable = deliveryGateMergeableFromEvent(payload, evidence);
       state.checks = {
         checkStatus: status,
+        reviewStatus,
         ...(headSha ? { expectedHeadSha: headSha } : {}),
-        mergeable: status === "passing",
+        mergeable: status === "passing" && gateMergeable === true,
       };
       state.mergeComplete = false;
       state.syncComplete = false;
@@ -290,6 +425,55 @@ function deliveryCheckStatus(status: string | undefined): PullRequestCheckStatus
   if (status === "passed") return "passing";
   if (status === "failed") return "failing";
   return "pending";
+}
+
+function deliveryReviewStatusFromEvent(
+  payload: Record<string, unknown>,
+  evidence: Record<string, unknown>,
+): PullRequestReviewStatus {
+  const payloadReview = isRecord(payload.review) ? payload.review : {};
+  const evidenceReview = isRecord(evidence.review) ? evidence.review : {};
+  const payloadGate = isRecord(payload.gate) ? payload.gate : {};
+  const evidenceGate = isRecord(evidence.gate) ? evidence.gate : {};
+  return deliveryReviewStatus(
+    text(payloadReview.status) ??
+    text(evidenceReview.status) ??
+    text(payloadGate.reviewStatus) ??
+    text(evidenceGate.reviewStatus) ??
+    deliveryReviewStatusFromChecks(payload.checks) ??
+    deliveryReviewStatusFromChecks(evidence.checks),
+  );
+}
+
+function deliveryGateMergeableFromEvent(
+  payload: Record<string, unknown>,
+  evidence: Record<string, unknown>,
+): boolean | undefined {
+  const payloadGate = isRecord(payload.gate) ? payload.gate : null;
+  const evidenceGate = isRecord(evidence.gate) ? evidence.gate : null;
+  const value = payloadGate?.mergeable ?? evidenceGate?.mergeable;
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function deliveryReviewStatusFromChecks(checks: unknown): string | undefined {
+  if (!Array.isArray(checks)) return undefined;
+  for (const check of checks) {
+    if (!isRecord(check)) continue;
+    const status = text(check.status);
+    const name = text(check.name)?.toLowerCase() ?? "";
+    const workflow = text(check.workflow)?.toLowerCase() ?? "";
+    const normalized = deliveryReviewStatus(status);
+    if (normalized === "unknown") continue;
+    if (name.includes("review") || workflow.includes("review") || normalized === "changes_requested") return normalized;
+  }
+  return undefined;
+}
+
+function deliveryReviewStatus(status: string | undefined): PullRequestReviewStatus {
+  if (status === "approved") return "approved";
+  if (status === "changes_requested") return "changes_requested";
+  if (status === "pending") return "pending";
+  return "unknown";
 }
 
 function text(value: unknown): string | undefined {
