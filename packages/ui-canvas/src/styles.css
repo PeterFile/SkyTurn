@@ -554,6 +554,105 @@ h2 {
   text-align: center;
 }
 
+.agent-readiness-block {
+  display: grid;
+  gap: 8px;
+  width: min(620px, 100%);
+  border: 1px solid var(--sk-border-muted);
+  border-radius: var(--sk-radius-md);
+  background: color-mix(in srgb, var(--sk-surface-warm) 88%, transparent);
+  color: var(--sk-text-legacy-body);
+  padding: 12px 14px;
+  box-shadow: var(--sk-shadow-sm);
+}
+
+.agent-readiness-block.compact {
+  position: absolute;
+  right: 14px;
+  bottom: 66px;
+  z-index: 5;
+  width: min(420px, calc(100% - 28px));
+  padding: 9px 11px;
+}
+
+.agent-readiness-block.ready {
+  border-color: var(--sk-status-completed-border);
+}
+
+.agent-readiness-block.degraded,
+.agent-readiness-block.mock-only {
+  border-color: var(--sk-status-running-border);
+}
+
+.agent-readiness-block.blocked {
+  border-color: var(--sk-status-failed-legacy);
+}
+
+.agent-readiness-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.agent-readiness-title {
+  overflow: hidden;
+  color: var(--sk-text-strong);
+  font-size: 12px;
+  font-weight: 900;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.agent-readiness-support {
+  flex: 0 0 auto;
+  border: 1px solid var(--sk-border-muted);
+  border-radius: var(--sk-radius-pill);
+  color: var(--sk-muted-strong);
+  font-size: 11px;
+  font-weight: 800;
+  padding: 2px 7px;
+}
+
+.agent-readiness-block p {
+  margin: 0;
+  color: var(--sk-muted-strong);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.agent-readiness-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.agent-readiness-facts div {
+  min-width: 0;
+}
+
+.agent-readiness-facts dt,
+.agent-readiness-facts dd {
+  overflow: hidden;
+  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-readiness-facts dt {
+  color: var(--sk-text-legacy-body);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.agent-readiness-facts dd {
+  color: var(--sk-text-legacy-soft);
+  font-size: 11px;
+}
+
 .bottom-bar {
   display: grid;
   grid-template-columns: 38px minmax(0, 1fr) 38px;

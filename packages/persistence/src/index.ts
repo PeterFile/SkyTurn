@@ -16,6 +16,7 @@ import {
   type AgentDescriptor,
   type AgentKind,
   type AgentRun,
+  type AgentWorkflowReadinessSummary,
   type CanvasNode,
   type CanvasSession,
   type CanvasSessionTab,
@@ -168,7 +169,7 @@ export interface DevflowApi {
   saveWorkspace: (state: unknown) => Promise<{ ok: boolean }>;
   openEditor: (editor: EditorKind, worktreePath: string) => Promise<{ ok: boolean; message: string }>;
   discoverAgents: () => Promise<{ protocolVersion: number; agents: AgentDescriptor[] }>;
-  getAgentHealth: () => Promise<{ protocolVersion: number; agents: AgentDescriptor[] }>;
+  getAgentHealth: () => Promise<{ protocolVersion: number; agents: AgentDescriptor[]; readiness: AgentWorkflowReadinessSummary }>;
   startAgentRun: (input: StartAgentRunInput) => Promise<{ protocolVersion: number; run: AgentRun }>;
   sendRunMessage: (runId: string, message: string) => Promise<{ protocolVersion: number; ok: boolean }>;
   cancelAgentRun: (runId: string, reason: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;

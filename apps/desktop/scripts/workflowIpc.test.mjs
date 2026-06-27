@@ -59,6 +59,15 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(main, /assertExecutableStartInput/);
   assert.match(main, /rejectMissingWorkflowProjectionNode/);
 
+  const agentHealthHandler = main.slice(
+    main.indexOf('ipcMain.handle("agent:health"'),
+    main.indexOf('ipcMain.handle("run:start"'),
+  );
+  assert.match(agentHealthHandler, /bridge\.discoverAgents\(\)/);
+  assert.match(agentHealthHandler, /summarizeAgentReadiness\(agents\)/);
+  assert.match(agentHealthHandler, /readiness/);
+  assert.doesNotMatch(agentHealthHandler, /spawn|execFile|createWorkflowStore|better-sqlite3/);
+
   const recordRunResultHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:recordRunResult"'),
     main.indexOf('ipcMain.handle("workflow:projection"'),

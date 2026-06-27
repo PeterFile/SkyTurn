@@ -76,6 +76,7 @@ import {
   NODE_MODAL_TABS,
   deriveNodeStatusFromEvidence,
   type AgentKind,
+  type AgentWorkflowReadinessSummary,
   type CanvasNode,
   type CanvasSession,
   type CanvasSessionTab,
@@ -200,6 +201,7 @@ export default function App() {
   const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
   const [selectedNodeActionState, setSelectedNodeActionState] = useState<SelectedNodeActionState | null>(null);
+  const [agentReadiness, setAgentReadiness] = useState<AgentWorkflowReadinessSummary | null>(null);
   const [nodeActionBusy, setNodeActionBusy] = useState<Exclude<ComposerAction, null> | null>(null);
   const [nodeActionError, setNodeActionError] = useState<string | null>(null);
   const [nodeActionStatus, setNodeActionStatus] = useState<string | null>(null);
@@ -270,9 +272,13 @@ export default function App() {
   useEffect(() => {
     if (!window.devflow || !activeProject) return;
     let active = true;
-    void window.devflow.discoverAgents().then((result) => {
+    void window.devflow.getAgentHealth().then((result) => {
       if (!active) return;
       setWorkspace((current) => ({ ...current, agents: result.agents }));
+      setAgentReadiness(result.readiness);
+    }).catch(() => {
+      if (!active) return;
+      setAgentReadiness(null);
     });
     return () => {
       active = false;
@@ -925,6 +931,7 @@ export default function App() {
           {activeSession?.kind === "canvas" && (
             <CanvasView
               session={activeSession}
+              agentReadiness={agentReadiness}
               composerValue={selectedNode ? nodeActionText : bottomGoal}
               composerDisabled={false}
               selectedNode={selectedNode}
@@ -955,6 +962,7 @@ export default function App() {
               mode={newTaskMode}
               projects={workspace.projects}
               selectedProjectId={resolvedNewTaskProjectId}
+              agentReadiness={agentReadiness}
               onGoalChange={setNewTaskGoal}
               onModeChange={setNewTaskMode}
               onProjectChange={setNewTaskProjectId}
@@ -1192,6 +1200,7 @@ function ProjectStartPage({
   mode,
   projects,
   selectedProjectId,
+  agentReadiness,
   onGoalChange,
   onModeChange,
   onProjectChange,
@@ -1201,6 +1210,7 @@ function ProjectStartPage({
   mode: WorkflowMode;
   projects: ImportedProject[];
   selectedProjectId: string | null;
+  agentReadiness: AgentWorkflowReadinessSummary | null;
   onGoalChange: (goal: string) => void;
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
@@ -1210,6 +1220,7 @@ function ProjectStartPage({
     <section className="empty-stage">
       <div className="project-start-page">
         <h1 className="project-start-title">What should we build in SkyTurn?</h1>
+        <AgentReadinessBlock readiness={agentReadiness} />
         <SessionComposer
           variant="inline"
           goal={goal}
@@ -1225,6 +1236,48 @@ function ProjectStartPage({
       </div>
     </section>
   );
+}
+
+function AgentReadinessBlock({
+  readiness,
+  compact = false,
+}: {
+  readiness: AgentWorkflowReadinessSummary | null;
+  compact?: boolean;
+}) {
+  if (!readiness) return null;
+  const details = [
+    `Hermes CLI ${readiness.checks.hermesCli}; auth ${readiness.checks.hermesAuth}`,
+    `Codex CLI ${readiness.checks.codexCli}; auth ${readiness.checks.codexAuth}`,
+  ];
+  const className = ["agent-readiness-block", readiness.status, compact ? "compact" : ""].filter(Boolean).join(" ");
+
+  return (
+    <aside className={className} aria-label="Agent readiness">
+      <div className="agent-readiness-head">
+        <span className="agent-readiness-title">{agentReadinessLabel(readiness)}</span>
+        <span className="agent-readiness-support">{readiness.runSupport}</span>
+      </div>
+      <p>{readiness.message}</p>
+      {!compact && (
+        <dl className="agent-readiness-facts">
+          {details.map((detail) => (
+            <div key={detail}>
+              <dt>{detail.split(";")[0]}</dt>
+              <dd>{detail.split("; ")[1]}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </aside>
+  );
+}
+
+function agentReadinessLabel(readiness: AgentWorkflowReadinessSummary): string {
+  if (readiness.status === "ready") return "Real loop ready";
+  if (readiness.status === "degraded") return "Real loop degraded";
+  if (readiness.status === "blocked") return "Real loop blocked";
+  return "Mock fallback only";
 }
 
 export type ComposerAction = "repair" | "variant" | "rollback" | null;
@@ -1547,6 +1600,7 @@ function PlanView({ session, onConfirm }: { session: PlanSession; onConfirm: (se
 
 function CanvasView({
   session,
+  agentReadiness,
   composerValue,
   composerDisabled,
   selectedNode,
@@ -1564,6 +1618,7 @@ function CanvasView({
   onInspectNode,
 }: {
   session: CanvasSession;
+  agentReadiness: AgentWorkflowReadinessSummary | null;
   composerValue: string;
   composerDisabled: boolean;
   selectedNode: CanvasNode | null;
@@ -1661,6 +1716,7 @@ function CanvasView({
         />
         <Controls showInteractive={false} />
       </ReactFlow>
+      <AgentReadinessBlock readiness={agentReadiness} compact />
       <CanvasComposer
         value={composerValue}
         disabled={composerDisabled}
