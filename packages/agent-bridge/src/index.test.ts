@@ -30,7 +30,7 @@ afterEach(async () => {
 
 describe("agent bridge", () => {
   it("discovers missing real agents without claiming run support", async () => {
-    const discovery = createDiscoveryService({ pathValue: "" });
+    const discovery = createDiscoveryService({ pathValue: "", env: {}, codexConfigRoot: null });
 
     const agents = await discovery.discover();
     const codex = agents.find((agent) => agent.kind === "codex");
@@ -43,7 +43,7 @@ describe("agent bridge", () => {
     const root = await makeTempRoot();
     const bin = join(root, "codex");
     await writeFile(bin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    const discovery = createDiscoveryService({ pathValue: root });
+    const discovery = createDiscoveryService({ pathValue: root, env: {}, codexConfigRoot: null });
 
     const agents = await discovery.discover();
     const codex = agents.find((agent) => agent.kind === "codex");
@@ -112,6 +112,187 @@ describe("agent bridge", () => {
       },
     });
     expect(codex?.supportLevel).not.toBe("supported-run");
+  });
+
+  it("reports Codex auth available from a parseable injected local auth file without exposing secret contents", async () => {
+    const root = await makeTempRoot();
+    const codexPath = join(root, "codex");
+    const codexConfigRoot = join(root, "codex-config");
+    const secretAccessToken = "local-access-token-secret";
+    const secretRefreshToken = "local-refresh-token-secret";
+    const accountEmail = "developer@example.test";
+    const accountId = "acct-secret-id";
+    await mkdir(codexConfigRoot);
+    await writeFile(
+      join(codexConfigRoot, "auth.json"),
+      JSON.stringify({
+        account_id: accountId,
+        email: accountEmail,
+        tokens: {
+          access_token: secretAccessToken,
+          refresh_token: secretRefreshToken,
+        },
+      }),
+    );
+    await writeFile(
+      codexPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then echo \"codex 1.2.3\"; exit 0; fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {},
+          pathValue: "",
+          codexConfigRoot,
+        }),
+      ],
+      pathValue: "",
+    });
+
+    const agents = await bridge.discoverAgents();
+    const codex = agents.find((agent) => agent.kind === "codex");
+    const descriptor = JSON.stringify(codex);
+
+    expect(codex).toMatchObject({
+      status: "available",
+      readiness: {
+        cli: { available: true, path: codexPath, version: "codex 1.2.3" },
+        auth: { status: "available" },
+      },
+    });
+    expect(descriptor).not.toContain(secretAccessToken);
+    expect(descriptor).not.toContain(secretRefreshToken);
+    expect(descriptor).not.toContain(accountEmail);
+    expect(descriptor).not.toContain(accountId);
+  });
+
+  it("reports local Codex auth available when the adapter ignores user config", async () => {
+    const root = await makeTempRoot();
+    const codexPath = join(root, "codex");
+    const codexConfigRoot = join(root, "codex-config");
+    await mkdir(codexConfigRoot);
+    await writeFile(
+      join(codexConfigRoot, "auth.json"),
+      JSON.stringify({ tokens: { access_token: "local-access-token-secret" } }),
+    );
+    await writeFile(
+      codexPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then echo \"codex 1.2.3\"; exit 0; fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {},
+          pathValue: "",
+          codexConfigRoot,
+          extraArgs: ["--ignore-user-config"],
+        }),
+      ],
+      pathValue: "",
+    });
+
+    const agents = await bridge.discoverAgents();
+    const codex = agents.find((agent) => agent.kind === "codex");
+
+    expect(codex).toMatchObject({
+      status: "available",
+      readiness: {
+        cli: { available: true, path: codexPath, version: "codex 1.2.3" },
+        auth: { status: "available" },
+      },
+    });
+  });
+
+  it("uses CODEX_HOME as the default local Codex auth root", async () => {
+    const root = await makeTempRoot();
+    const codexPath = join(root, "codex");
+    const codexHome = join(root, "codex-home");
+    await mkdir(codexHome);
+    await writeFile(
+      join(codexHome, "auth.json"),
+      JSON.stringify({ tokens: { access_token: "codex-home-access-token-secret" } }),
+    );
+    await writeFile(
+      codexPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then echo \"codex 1.2.3\"; exit 0; fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: { CODEX_HOME: codexHome },
+          pathValue: "",
+        }),
+      ],
+      pathValue: "",
+    });
+
+    const agents = await bridge.discoverAgents();
+    const codex = agents.find((agent) => agent.kind === "codex");
+
+    expect(codex).toMatchObject({
+      status: "available",
+      readiness: {
+        cli: { available: true, path: codexPath, version: "codex 1.2.3" },
+        auth: { status: "available" },
+      },
+    });
+  });
+
+  it("reports Codex auth missing when an injected local auth location is checked without env or token evidence", async () => {
+    const root = await makeTempRoot();
+    const codexPath = join(root, "codex");
+    const codexConfigRoot = join(root, "codex-config");
+    await mkdir(codexConfigRoot);
+    await writeFile(
+      codexPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then echo \"codex 1.2.3\"; exit 0; fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {},
+          pathValue: "",
+          codexConfigRoot,
+        }),
+      ],
+      pathValue: "",
+    });
+
+    const agents = await bridge.discoverAgents();
+    const codex = agents.find((agent) => agent.kind === "codex");
+
+    expect(codex).toMatchObject({
+      status: "available",
+      readiness: {
+        cli: { available: true, path: codexPath, version: "codex 1.2.3" },
+        auth: { status: "missing" },
+        categories: ["auth-missing"],
+      },
+    });
   });
 
   it("does not expose provider secrets to CLI version probes", async () => {
@@ -556,18 +737,59 @@ describe("agent bridge", () => {
     expect(evidence.exitCode).toBe(1);
   });
 
+  it("redacts secret-like values from Codex stderr progress and failure events", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    const accessToken = "access-token-secret-123456";
+    const apiKey = "sk-secretvalue123456";
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        `process.stderr.write('not logged in; OPENAI_API_KEY="${apiKey}" access_token="${accessToken}"\\n');`,
+        `process.stderr.write(JSON.stringify({ OPENAI_API_KEY: "${apiKey}", access_token: "${accessToken}" }) + '\\n');`,
+        "process.exit(1);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const failed = waitForEvent(bridge, (event) => event.kind === "status" && event.payload.status === "failed");
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-secret-stderr",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Implement the task",
+    });
+    await failed;
+
+    const serializedEvents = JSON.stringify(await loadRunEvents(projectRoot, run.id));
+
+    expect(serializedEvents).not.toContain(apiKey);
+    expect(serializedEvents).not.toContain(accessToken);
+    expect(serializedEvents).toContain("[redacted]");
+  });
+
   it("preserves Codex JSON stdout auth failures after non-zero close", async () => {
     const projectRoot = await makeTempRoot();
     await mkdir(join(projectRoot, ".git"));
     const binRoot = await makeTempRoot();
     const codexPath = join(binRoot, "codex");
+    const secretAccessToken = "stdout-access-token-secret-123456";
     await writeFile(
       codexPath,
       [
         "#!/usr/bin/env node",
         "process.stdout.write(JSON.stringify({",
         "  type: 'turn.failed',",
-        "  error: { message: 'not logged in; authentication required' },",
+        `  error: { message: 'not logged in; authentication required {"access_token":"${secretAccessToken}"}' },`,
         "}) + '\\n');",
         "process.exit(1);",
       ].join("\n"),
@@ -613,6 +835,8 @@ describe("agent bridge", () => {
     expect(evidence.status).toBe("failed");
     expect(evidence.exitCode).toBe(1);
     expect(evidence.errorReason).toContain("not logged in");
+    expect(evidence.errorReason).not.toContain(secretAccessToken);
+    expect(JSON.stringify(events)).not.toContain(secretAccessToken);
   });
 
   it("classifies Codex non-zero exits separately from auth failures", async () => {
@@ -1620,6 +1844,49 @@ describe("agent bridge", () => {
       status: "failed",
       detail: "exit 3",
     });
+  });
+
+  it("redacts secret-like values from Hermes output and failure events", async () => {
+    const projectRoot = await makeTempRoot();
+    const binRoot = await makeTempRoot();
+    const hermesPath = join(binRoot, "hermes");
+    const apiKey = "hermes-api-key-secret-123456";
+    const token = "hermes-token-secret-123456";
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        `process.stdout.write('planning with HERMES_API_KEY="${apiKey}"\\n');`,
+        `process.stdout.write(JSON.stringify({ HERMES_API_KEY: "${apiKey}" }) + '\\n');`,
+        `process.stderr.write('planner crashed token="${token}"\\n');`,
+        `process.stderr.write(JSON.stringify({ token: "${token}" }) + '\\n');`,
+        "process.exit(3);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createHermesCliAdapter({ executablePath: hermesPath })],
+    });
+    const failed = waitForEvent(bridge, (event) => event.kind === "status" && event.payload.status === "failed");
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes-secret-output",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "hermes",
+      prompt: "Plan a workflow",
+    });
+    await failed;
+
+    const serializedEvents = JSON.stringify(await loadRunEvents(projectRoot, run.id));
+    const output = await readTaskOutput(projectRoot, "node-hermes-secret-output");
+
+    expect(serializedEvents).not.toContain(apiKey);
+    expect(serializedEvents).not.toContain(token);
+    expect(output).not.toContain(apiKey);
+    expect(output).toContain("[redacted]");
   });
 
   it("emits non-terminal stalled telemetry before the Hermes CLI hard timeout", async () => {
