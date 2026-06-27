@@ -49,6 +49,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  Fragment,
   memo,
   useCallback,
   useEffect,
@@ -89,6 +90,7 @@ import {
   type NodeStatus,
   type PlanSession,
   type RunEvent,
+  type RunEvidence,
   type SessionTarget,
   type UserDecisionAction,
   type WorkflowMode,
@@ -978,6 +980,7 @@ export default function App() {
           projectRoot={activeProject.rootPath}
           session={activeSession}
           runEvents={workspace.runEvents?.[inspectedNode.runId] ?? []}
+          runEvidence={workspace.runEvidence?.[inspectedNode.runId] ?? null}
           tab={modalTab}
           onTab={setModalTab}
           onClose={() => setInspectedNodeId(null)}
@@ -2433,6 +2436,7 @@ function NodeModal({
   projectRoot,
   session,
   runEvents,
+  runEvidence,
   tab,
   onTab,
   onClose,
@@ -2447,6 +2451,7 @@ function NodeModal({
   projectRoot: string;
   session: CanvasSession;
   runEvents: RunEvent[];
+  runEvidence: RunEvidence | null;
   tab: NodeModalTab;
   onTab: (tab: NodeModalTab) => void;
   onClose: () => void;
@@ -2544,7 +2549,7 @@ function NodeModal({
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
-          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} />}
+          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} />}
         </div>
       </section>
     </div>
@@ -4182,7 +4187,55 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function ContextTab({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
+export function runEvidenceFactsForDisplay(runEvidence: RunEvidence): Array<{ label: string; value: string }> {
+  const facts = [
+    { label: "Run status", value: runEvidence.status },
+    ...(runEvidence.exitCode !== null ? [{ label: "Exit code", value: String(runEvidence.exitCode) }] : []),
+    {
+      label: "Checks",
+      value: runEvidence.checks.length
+        ? runEvidence.checks.map((check) => `${check.kind}: ${check.status}`).join(", ")
+        : "None",
+    },
+    {
+      label: "Artifacts",
+      value: runEvidence.artifacts.length
+        ? `${runEvidence.artifacts.length} (${runEvidence.artifacts.join(", ")})`
+        : "None",
+    },
+  ];
+
+  const timeoutReason = runEvidence.status === "timed-out"
+    ? runEvidence.errorReason ?? runEvidence.checks.find((check) => check.kind === "run-timeout" && typeof check.detail === "string")?.detail ?? null
+    : null;
+
+  if (timeoutReason) {
+    facts.push({ label: "Reason", value: `Timeout: ${timeoutReason}` });
+  } else if (runEvidence.errorReason) {
+    facts.push({ label: "Reason", value: `Error: ${runEvidence.errorReason}` });
+  } else if (runEvidence.cancelReason) {
+    facts.push({ label: "Reason", value: `Cancelled: ${runEvidence.cancelReason}` });
+  }
+
+  return facts;
+}
+
+function RunEvidenceFacts({ runEvidence }: { runEvidence: RunEvidence }) {
+  const facts = runEvidenceFactsForDisplay(runEvidence);
+
+  return (
+    <>
+      {facts.map((fact) => (
+        <Fragment key={fact.label}>
+          <dt>{fact.label}</dt>
+          <dd>{fact.value}</dd>
+        </Fragment>
+      ))}
+    </>
+  );
+}
+
+function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasNode; session: CanvasSession; projectRoot: string; runEvidence?: RunEvidence | null }) {
   const isNewWorktree = node.worktree.executionTarget === "new_worktree" || !!node.worktree.worktreeId;
 
   return (
@@ -4222,6 +4275,14 @@ function ContextTab({ node, session, projectRoot }: { node: CanvasNode; session:
         <dd>{node.context.relatedTasks}</dd>
         <dt>Constraints</dt>
         <dd>{node.context.constraints.join("; ")}</dd>
+        {runEvidence ? (
+          <RunEvidenceFacts runEvidence={runEvidence} />
+        ) : (
+          <>
+            <dt>Run evidence</dt>
+            <dd>No run evidence yet</dd>
+          </>
+        )}
       </dl>
       <WorktreeActions node={node} session={session} projectRoot={projectRoot} />
     </div>
