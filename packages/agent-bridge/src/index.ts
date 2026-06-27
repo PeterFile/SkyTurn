@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { access, appendFile, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
+import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 
@@ -43,6 +44,7 @@ const cliProbeTimeoutMs = 1_500;
 const maxStructuredChangeDiffBytes = 64_000;
 const codexAuthEnvNames = ["OPENAI_API_KEY"];
 const hermesAuthEnvNames = ["HERMES_API_KEY"];
+const codexAuthFileName = "auth.json";
 
 type CliFailureCategory =
   | "cli-missing"
@@ -63,6 +65,9 @@ interface AgentRunWatchdogPolicy {
 
 export interface DiscoveryOptions {
   pathValue?: string;
+  env?: NodeJS.ProcessEnv;
+  codexConfigRoot?: string | null;
+  codexAuthFilePath?: string | null;
 }
 
 export interface DiscoveryService {
@@ -72,6 +77,8 @@ export interface DiscoveryService {
 export interface AgentBridgeOptions {
   adapters?: LocalAgentAdapterContract[];
   pathValue?: string;
+  codexConfigRoot?: string | null;
+  codexAuthFilePath?: string | null;
 }
 
 export type CodexCliSandbox = AgentRunSandbox;
@@ -86,6 +93,8 @@ export interface CodexCliAdapterOptions {
   env?: NodeJS.ProcessEnv;
   extraArgs?: string[];
   pathValue?: string;
+  codexConfigRoot?: string | null;
+  codexAuthFilePath?: string | null;
 }
 
 export interface HermesCliAdapterOptions {
@@ -114,8 +123,10 @@ export function createDiscoveryService(options: DiscoveryOptions = {}): Discover
             supportLevel: contract.supportLevel,
             capabilities: contract.capabilities,
             configFiles: contract.nativeConfigFiles,
-            env: process.env,
+            env: options.env ?? process.env,
             authEnvNames: authEnvNamesForAgent(contract.kind),
+            codexConfigRoot: options.codexConfigRoot,
+            codexAuthFilePath: options.codexAuthFilePath,
           });
         }),
       );
@@ -132,7 +143,11 @@ export class AgentBridge {
 
   constructor(options: AgentBridgeOptions = {}) {
     this.adapters = new Map((options.adapters ?? [createMockAgentAdapter()]).map((adapter) => [adapter.kind, adapter]));
-    this.discovery = createDiscoveryService({ pathValue: options.pathValue });
+    this.discovery = createDiscoveryService({
+      pathValue: options.pathValue,
+      codexConfigRoot: options.codexConfigRoot,
+      codexAuthFilePath: options.codexAuthFilePath,
+    });
   }
 
   async discoverAgents(): Promise<AgentDescriptor[]> {
@@ -481,6 +496,8 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         configFiles: ["AGENTS.md", "skills"],
         env: options.env ?? process.env,
         authEnvNames: codexAuthEnvNames,
+        codexConfigRoot: options.codexConfigRoot,
+        codexAuthFilePath: options.codexAuthFilePath,
       });
     },
     async startRun(input, sink) {
@@ -544,7 +561,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         stdout.on("line", (line) => {
           if (watchdog.isFinalized()) return;
           watchdog.markActivity();
-          const drafts = codexStdoutLineToDrafts(line);
+          const drafts = codexStdoutLineToDrafts(line).map(redactRunEventDraft);
           stdoutFailureCategory ??= specificCliFailureCategoryFromDrafts(drafts);
           for (const draft of drafts) {
             if (watchdog.isFinalized()) return;
@@ -560,10 +577,11 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
           watchdog.markActivity();
-          stderrLines.push(line);
+          const safeLine = redactSecretLikeText(line);
+          stderrLines.push(safeLine);
           void emit({
             kind: "progress",
-            payload: { source: "codex", stream: "stderr", format: "text", text: line },
+            payload: { source: "codex", stream: "stderr", format: "text", text: safeLine },
           });
         });
       }
@@ -737,9 +755,10 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
           watchdog.markActivity();
+          const safeLine = redactSecretLikeText(line);
           void emit({
             kind: "output",
-            payload: { source: "hermes", text: line },
+            payload: { source: "hermes", text: safeLine },
           });
         });
       }
@@ -751,10 +770,11 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
           watchdog.markActivity();
-          stderrLines.push(line);
+          const safeLine = redactSecretLikeText(line);
+          stderrLines.push(safeLine);
           void emit({
             kind: "progress",
-            payload: { source: "hermes", stream: "stderr", format: "text", text: line },
+            payload: { source: "hermes", stream: "stderr", format: "text", text: safeLine },
           });
         });
       }
@@ -1008,6 +1028,8 @@ async function detectCliDescriptor(input: {
   configFiles: string[];
   env: NodeJS.ProcessEnv;
   authEnvNames: string[];
+  codexConfigRoot?: string | null;
+  codexAuthFilePath?: string | null;
 }): Promise<AgentDescriptor> {
   const executablePath = await resolveCliExecutable(input.executablePath, input.candidates, input.pathValue);
   if (!executablePath) {
@@ -1030,9 +1052,17 @@ async function detectCliDescriptor(input: {
   }
 
   const versionProbe = await probeCliVersion(executablePath, input.env);
-  const auth = authReadiness(input.env, input.authEnvNames);
+  const auth = await authReadiness({
+    kind: input.kind,
+    env: input.env,
+    authEnvNames: input.authEnvNames,
+    codexConfigRoot: input.codexConfigRoot,
+    codexAuthFilePath: input.codexAuthFilePath,
+  });
   const categories: AgentReadinessCategory[] = [];
   if (versionProbe.error) categories.push("version-probe-failed");
+  if (auth.status === "missing") categories.push("auth-missing");
+  if (auth.status === "unknown" && hasAuthReadinessRequirement(input.kind)) categories.push("auth-unknown");
   return {
     kind: input.kind,
     label: input.label,
@@ -1099,12 +1129,78 @@ function authEnvNamesForAgent(kind: AgentKind): string[] {
   return [];
 }
 
-function authReadiness(
-  env: NodeJS.ProcessEnv,
-  names: string[],
-): NonNullable<AgentDescriptor["readiness"]>["auth"] {
-  const hasEnvAuth = names.some((name) => typeof env[name] === "string" && env[name]?.trim().length);
-  return hasEnvAuth ? { status: "available", source: "environment" } : { status: "unknown" };
+async function authReadiness(input: {
+  kind: AgentKind;
+  env: NodeJS.ProcessEnv;
+  authEnvNames: string[];
+  codexConfigRoot?: string | null;
+  codexAuthFilePath?: string | null;
+}): Promise<NonNullable<AgentDescriptor["readiness"]>["auth"]> {
+  const hasEnvAuth = input.authEnvNames.some((name) => {
+    const value = input.env[name];
+    return typeof value === "string" && value.trim().length > 0;
+  });
+  if (hasEnvAuth) return { status: "available", source: "environment" };
+  if (input.kind !== "codex") return { status: "unknown" };
+
+  const authFilePath = codexAuthEvidencePath(input);
+  if (!authFilePath) return { status: "unknown" };
+  return codexLocalAuthReadiness(authFilePath);
+}
+
+function codexAuthEvidencePath(input: {
+  env: NodeJS.ProcessEnv;
+  codexConfigRoot?: string | null;
+  codexAuthFilePath?: string | null;
+}): string | null {
+  if (input.codexAuthFilePath !== undefined) return input.codexAuthFilePath;
+  if (input.codexConfigRoot !== undefined) {
+    return input.codexConfigRoot ? join(input.codexConfigRoot, codexAuthFileName) : null;
+  }
+  const codexHome = input.env.CODEX_HOME;
+  if (typeof codexHome === "string" && codexHome.trim()) return join(codexHome, codexAuthFileName);
+  return join(homedir(), ".codex", codexAuthFileName);
+}
+
+async function codexLocalAuthReadiness(
+  authFilePath: string,
+): Promise<NonNullable<AgentDescriptor["readiness"]>["auth"]> {
+  try {
+    const raw = await readFile(authFilePath, "utf8");
+    if (!raw.trim()) return { status: "missing" };
+    const value = JSON.parse(raw) as unknown;
+    return hasCodexAuthTokenShape(value) ? { status: "available" } : { status: "missing" };
+  } catch (error) {
+    if (error instanceof SyntaxError || isFileMissingError(error)) return { status: "missing" };
+    return { status: "unknown" };
+  }
+}
+
+function hasCodexAuthTokenShape(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (hasNonEmptyStringField(value, "OPENAI_API_KEY")) return true;
+  const tokens = value.tokens;
+  return (
+    isRecord(tokens) &&
+    (hasNonEmptyStringField(tokens, "access_token") ||
+      hasNonEmptyStringField(tokens, "id_token") ||
+      hasNonEmptyStringField(tokens, "refresh_token"))
+  );
+}
+
+function hasNonEmptyStringField(record: Record<string, unknown>, field: string): boolean {
+  const value = record[field];
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function hasAuthReadinessRequirement(kind: AgentKind): boolean {
+  return kind === "codex" || kind === "hermes";
+}
+
+function isFileMissingError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
 
 function probeCliVersion(executablePath: string, env: NodeJS.ProcessEnv): Promise<{ version: string | null; error: string | null }> {
@@ -1247,6 +1343,32 @@ function formatProcessFailureMessage(
   const stderr = firstOutputLine(stderrLines.join("\n"));
   const exitDetail = formatExitDetail(exitCode, signal);
   return stderr ? `${commandLabel} failed: ${stderr}` : `${commandLabel} failed: ${exitDetail}`;
+}
+
+function redactSecretLikeText(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, "[redacted]")
+    .replace(
+      /(["']?)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|OPENAI_API_KEY|HERMES_API_KEY|ANTHROPIC_API_KEY)\1(\s*[:=]\s*)(["']?)[^\s,'\"}]{8,}\4/gi,
+      "$1$2$1$3$4[redacted]$4",
+    );
+}
+
+function redactRunEventDraft(draft: RunEventDraft): RunEventDraft {
+  return {
+    ...draft,
+    payload: redactSecretLikeValue(draft.payload) as RunEventDraft["payload"],
+  };
+}
+
+function redactSecretLikeValue(value: unknown): unknown {
+  if (typeof value === "string") return redactSecretLikeText(value);
+  if (Array.isArray(value)) return value.map(redactSecretLikeValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, nested]) => [key, redactSecretLikeValue(nested)]),
+  );
 }
 
 function errorMessage(error: unknown): string {
