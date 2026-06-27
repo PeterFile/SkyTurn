@@ -11,9 +11,10 @@ import {
   deriveSessionTarget,
   hasAvailableChangeEvidence,
   hasFinalGitEvidence,
+  runEvidenceFactsForDisplay,
   summarizeWorktreeComparisonEvidence,
 } from "./App.js";
-import type { CanvasNode, Changeset, FinalChangesetReconciliation } from "@skyturn/project-core";
+import type { CanvasNode, Changeset, FinalChangesetReconciliation, RunEvidence } from "@skyturn/project-core";
 import type { SelectedNodeActionState } from "./nodeActionState.js";
 
 function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
@@ -42,6 +43,22 @@ function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
       baselineRef: "base",
       baseCommit: "base",
     },
+  };
+}
+
+function mockRunEvidence(overrides: Partial<RunEvidence> = {}): RunEvidence {
+  return {
+    runId: "run-1",
+    status: "succeeded",
+    exitCode: 0,
+    changesetId: "cs-1",
+    checks: [{ kind: "test", name: "unit", status: "passed" }],
+    artifacts: ["patch", "screenshot"],
+    review: null,
+    errorReason: null,
+    cancelReason: null,
+    completedAt: "2026-06-27T00:00:00.000Z",
+    ...overrides,
   };
 }
 
@@ -210,6 +227,42 @@ describe("UI source validation", () => {
     // Ensure we do not use inline styles in ChangesTab
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab"));
     expect(changesTab).not.toContain("style={{");
+  });
+
+  it("ContextTab renders run evidence facts and handles missing evidence", async () => {
+    const appSource = await readSource("./App.tsx");
+    const contextTab = appSource.slice(appSource.indexOf("function ContextTab("), appSource.indexOf("function WorktreeActions"));
+    expect(contextTab).toContain("RunEvidenceFacts runEvidence={runEvidence}");
+    expect(contextTab).toContain("No run evidence yet");
+  });
+
+  it("formats succeeded run evidence without output logs", () => {
+    expect(runEvidenceFactsForDisplay(mockRunEvidence())).toEqual([
+      { label: "Run status", value: "succeeded" },
+      { label: "Exit code", value: "0" },
+      { label: "Checks", value: "test: passed" },
+      { label: "Artifacts", value: "2 (patch, screenshot)" },
+    ]);
+  });
+
+  it("formats failed, timed-out, and cancelled run evidence reasons", () => {
+    expect(runEvidenceFactsForDisplay(mockRunEvidence({ status: "failed", exitCode: 1, errorReason: "tests failed" }))).toContainEqual({
+      label: "Reason",
+      value: "Error: tests failed",
+    });
+    expect(runEvidenceFactsForDisplay(mockRunEvidence({
+      status: "timed-out",
+      exitCode: null,
+      errorReason: null,
+      checks: [{ kind: "run-timeout", name: "watchdog", status: "failed", detail: "watchdog expired" }],
+    }))).toContainEqual({
+      label: "Reason",
+      value: "Timeout: watchdog expired",
+    });
+    expect(runEvidenceFactsForDisplay(mockRunEvidence({ status: "cancelled", exitCode: null, cancelReason: "user stopped run" }))).toContainEqual({
+      label: "Reason",
+      value: "Cancelled: user stopped run",
+    });
   });
 
   it("includes visible copy for new session target selection", async () => {
