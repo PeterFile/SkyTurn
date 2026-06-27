@@ -9,6 +9,7 @@ import {
   DEVFLOW_FILES,
   defaultDevflowFileContent,
 } from "@skyturn/project-memory";
+import type { AgentDescriptor } from "@skyturn/project-core" with { "resolution-mode": "import" };
 import {
   isTrustedPlannerRootStartInput,
   normalizeWorkflowIpcError,
@@ -441,7 +442,7 @@ const workflowSessionMutationLocks = new Map<string, Promise<void>>();
 let remoteSideEffectSequence = 0;
 
 interface AgentBridgeHost {
-  discoverAgents(): Promise<unknown[]>;
+  discoverAgents(): Promise<AgentDescriptor[]>;
   listRuns(): unknown[];
   onRunEvent(listener: (event: unknown) => void): () => void;
   startRun(input: unknown): Promise<unknown>;
@@ -561,9 +562,12 @@ ipcMain.handle("agent:discover", async () => {
 
 ipcMain.handle("agent:health", async () => {
   const bridge = await getAgentBridge();
+  const agents = await bridge.discoverAgents();
+  const { summarizeAgentReadiness } = await import("@skyturn/project-core");
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
-    agents: await bridge.discoverAgents(),
+    agents,
+    readiness: summarizeAgentReadiness(agents),
   };
 });
 

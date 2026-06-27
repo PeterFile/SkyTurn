@@ -22,6 +22,7 @@
     "@skyturn/orchestrator": "workspace:*",
     "@skyturn/persistence": "workspace:*",
     "@skyturn/planner": "workspace:*",
+    "@skyturn/project-core": "workspace:*",
     "@skyturn/project-memory": "workspace:*",
     "@skyturn/ui-canvas": "workspace:*",
     "@skyturn/workflow-kernel": "workspace:*",

@@ -158,6 +158,145 @@ export interface AgentDescriptor {
   };
 }
 
+export type AgentWorkflowReadinessStatus = "ready" | "degraded" | "blocked" | "mock-only";
+export type AgentWorkflowRunSupport = "supported-run" | "experimental-run" | "mock-only" | "unavailable";
+export type AgentWorkflowReadinessCheckStatus = "ready" | "missing" | "unknown";
+export type AgentWorkflowReadinessReason =
+  | "hermes-cli-missing"
+  | "codex-cli-missing"
+  | "hermes-auth-missing"
+  | "codex-auth-missing"
+  | "hermes-auth-unknown"
+  | "codex-auth-unknown"
+  | "experimental-run"
+  | "supported-run"
+  | "mock-only-fallback";
+
+export interface AgentWorkflowReadinessChecks {
+  hermesCli: AgentWorkflowReadinessCheckStatus;
+  codexCli: AgentWorkflowReadinessCheckStatus;
+  hermesAuth: AgentAuthReadinessStatus;
+  codexAuth: AgentAuthReadinessStatus;
+  mockFallback: boolean;
+}
+
+export interface AgentWorkflowReadinessSummary {
+  status: AgentWorkflowReadinessStatus;
+  runSupport: AgentWorkflowRunSupport;
+  message: string;
+  reasons: AgentWorkflowReadinessReason[];
+  checks: AgentWorkflowReadinessChecks;
+}
+
+export function summarizeAgentReadiness(agents: readonly AgentDescriptor[]): AgentWorkflowReadinessSummary {
+  const hermes = agentByKind(agents, "hermes");
+  const codex = agentByKind(agents, "codex");
+  const checks: AgentWorkflowReadinessChecks = {
+    hermesCli: agentCliCheck(hermes),
+    codexCli: agentCliCheck(codex),
+    hermesAuth: agentAuthCheck(hermes),
+    codexAuth: agentAuthCheck(codex),
+    mockFallback: agents.some((agent) => agent.supportLevel === "mock-only"),
+  };
+  const reasons: AgentWorkflowReadinessReason[] = [];
+
+  if (checks.hermesCli === "missing") reasons.push("hermes-cli-missing");
+  if (checks.codexCli === "missing") reasons.push("codex-cli-missing");
+  if (checks.hermesAuth === "missing") reasons.push("hermes-auth-missing");
+  if (checks.codexAuth === "missing") reasons.push("codex-auth-missing");
+  if (checks.hermesAuth === "unknown") reasons.push("hermes-auth-unknown");
+  if (checks.codexAuth === "unknown") reasons.push("codex-auth-unknown");
+
+  const cliBlocked = checks.hermesCli === "missing" || checks.codexCli === "missing";
+  const authBlocked = checks.hermesAuth === "missing" || checks.codexAuth === "missing";
+  const realCliReady = checks.hermesCli === "ready" && checks.codexCli === "ready";
+  const realExperimental = [hermes, codex].some((agent) => agent?.supportLevel === "experimental-run");
+  const realSupported = [hermes, codex].every((agent) => agent?.supportLevel === "supported-run");
+
+  if (checks.mockFallback && !realCliReady) {
+    reasons.push("mock-only-fallback");
+    return {
+      status: "mock-only",
+      runSupport: "mock-only",
+      message: "Mock fallback only; install and authenticate Hermes and Codex for real workflow runs.",
+      reasons: uniqueReadinessReasons(reasons),
+      checks,
+    };
+  }
+
+  if (realExperimental) reasons.push("experimental-run");
+  if (realSupported) reasons.push("supported-run");
+
+  if (cliBlocked || authBlocked) {
+    return {
+      status: "blocked",
+      runSupport: "unavailable",
+      message: blockedAgentReadinessMessage(checks),
+      reasons: uniqueReadinessReasons(reasons),
+      checks,
+    };
+  }
+
+  if (!realCliReady) {
+    return {
+      status: "blocked",
+      runSupport: "unavailable",
+      message: "Hermes and Codex CLI readiness could not be verified for real workflow runs.",
+      reasons: uniqueReadinessReasons(reasons),
+      checks,
+    };
+  }
+
+  if (checks.hermesAuth === "unknown" || checks.codexAuth === "unknown" || realExperimental) {
+    return {
+      status: "degraded",
+      runSupport: realExperimental ? "experimental-run" : "supported-run",
+      message: "Real loop available in experimental mode; verify agent auth before relying on long runs.",
+      reasons: uniqueReadinessReasons(reasons),
+      checks,
+    };
+  }
+
+  return {
+    status: "ready",
+    runSupport: "supported-run",
+    message: "Real loop ready.",
+    reasons: uniqueReadinessReasons(reasons),
+    checks,
+  };
+}
+
+function agentByKind(agents: readonly AgentDescriptor[], kind: AgentKind): AgentDescriptor | undefined {
+  return agents.find((agent) => agent.kind === kind);
+}
+
+function agentCliCheck(agent: AgentDescriptor | undefined): AgentWorkflowReadinessCheckStatus {
+  if (!agent) return "missing";
+  if (agent.supportLevel === "mock-only") return "unknown";
+  if (agent.readiness?.cli.available === false) return "missing";
+  if (agent.readiness?.cli.available === true) return "ready";
+  if (agent.status === "missing" || !agent.executablePath) return "missing";
+  if (agent.status === "available") return "ready";
+  return "unknown";
+}
+
+function agentAuthCheck(agent: AgentDescriptor | undefined): AgentAuthReadinessStatus {
+  if (!agent || agent.supportLevel === "mock-only") return "unknown";
+  return agent.readiness?.auth.status ?? "unknown";
+}
+
+function blockedAgentReadinessMessage(checks: AgentWorkflowReadinessChecks): string {
+  if (checks.hermesCli === "missing") return "Hermes CLI missing; install Hermes before starting real planner runs.";
+  if (checks.codexCli === "missing") return "Codex CLI missing; install Codex before starting real executor runs.";
+  if (checks.hermesAuth === "missing") return "Hermes auth missing; authenticate Hermes before starting real planner runs.";
+  if (checks.codexAuth === "missing") return "Codex auth missing; authenticate Codex before starting real executor runs.";
+  return "Agent readiness blocked.";
+}
+
+function uniqueReadinessReasons(reasons: AgentWorkflowReadinessReason[]): AgentWorkflowReadinessReason[] {
+  return [...new Set(reasons)];
+}
+
 export interface AgentRun {
   id: string;
   nodeId: string;

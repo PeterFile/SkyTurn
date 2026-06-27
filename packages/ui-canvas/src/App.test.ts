@@ -218,6 +218,33 @@ describe("UI source validation", () => {
     expect(appSource).toContain("Create a candidate worktree from the selected branch.");
   });
 
+  it("loads agent health through desktop IPC and stores discovered agents", async () => {
+    const appSource = await readSource("./App.tsx");
+    const healthEffect = appSource.slice(
+      appSource.indexOf("window.devflow.getAgentHealth"),
+      appSource.indexOf("window.devflow.onRunEvent"),
+    );
+
+    expect(healthEffect).toContain("window.devflow.getAgentHealth()");
+    expect(healthEffect).toContain("agents: result.agents");
+    expect(healthEffect).toContain("setAgentReadiness");
+    expect(healthEffect).not.toContain("window.devflow.discoverAgents()");
+  });
+
+  it("renders compact agent readiness near session creation and canvas composer", async () => {
+    const appSource = await readSource("./App.tsx");
+    const projectStart = appSource.slice(appSource.indexOf("function ProjectStartPage"), appSource.indexOf("export type ComposerAction"));
+    const canvasView = appSource.slice(appSource.indexOf("function CanvasView("), appSource.indexOf("function CanvasViewportController"));
+
+    expect(projectStart).toContain("<AgentReadinessBlock");
+    expect(projectStart).toContain("readiness={agentReadiness}");
+    expect(canvasView).toContain("<AgentReadinessBlock");
+    expect(canvasView).toContain("readiness={agentReadiness}");
+    expect(appSource).toContain("function AgentReadinessBlock");
+    expect(appSource).toContain("Real loop ready");
+    expect(appSource).toContain("Mock fallback only");
+  });
+
   it("does not parse agent prose for changed-file truth in ChangesTab", async () => {
     const appSource = await readSource("./App.tsx");
     const changesTab = appSource.slice(appSource.indexOf("function ChangesTab"), appSource.indexOf("export function changeReviewSummary"));

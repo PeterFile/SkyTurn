@@ -29,6 +29,9 @@ importers:
       '@skyturn/planner':
         specifier: workspace:*
         version: link:../../packages/planner
+      '@skyturn/project-core':
+        specifier: workspace:*
+        version: link:../../packages/project-core
       '@skyturn/project-memory':
         specifier: workspace:*
         version: link:../../packages/project-memory

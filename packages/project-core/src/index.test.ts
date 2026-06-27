@@ -8,6 +8,7 @@ import {
   WORKFLOW_LANE_KINDS,
   deriveNodeStatusFromEvidence,
   hasConcreteRunEvidence,
+  summarizeAgentReadiness,
   type FinalChangesetReconciliation,
   type AgentDescriptor,
   type AgentRun,
@@ -42,7 +43,129 @@ const stableNodeStatusContract: Record<NodeStatus, true> = {
   failed: true,
 };
 
+function readiness({
+  cliAvailable = true,
+  auth,
+  categories = [],
+}: {
+  cliAvailable?: boolean;
+  auth: NonNullable<AgentDescriptor["readiness"]>["auth"]["status"];
+  categories?: NonNullable<AgentDescriptor["readiness"]>["categories"];
+}): NonNullable<AgentDescriptor["readiness"]> {
+  return {
+    level: cliAvailable ? "experimental-run" : "unavailable",
+    cli: {
+      available: cliAvailable,
+      path: cliAvailable ? "/usr/local/bin/agent" : null,
+      version: cliAvailable ? "agent 1.0.0" : null,
+    },
+    auth: auth === "available" ? { status: auth, source: "environment" } : { status: auth },
+    categories,
+  };
+}
+
+function agentDescriptor(input: Partial<AgentDescriptor> & Pick<AgentDescriptor, "kind">): AgentDescriptor {
+  return {
+    kind: input.kind,
+    label: input.label ?? input.kind,
+    executablePath: input.executablePath ?? "/usr/local/bin/agent",
+    version: input.version ?? "agent 1.0.0",
+    status: input.status ?? "available",
+    supportLevel: input.supportLevel ?? "experimental-run",
+    capabilities: input.capabilities ?? ["chat"],
+    configFiles: input.configFiles ?? [],
+    ...(input.readiness !== undefined ? { readiness: input.readiness } : {}),
+  };
+}
+
 describe("agent run contracts", () => {
+  it("summarizes experimental real-loop readiness without claiming supported-run", () => {
+    const summary = summarizeAgentReadiness([
+      agentDescriptor({
+        kind: "hermes",
+        supportLevel: "experimental-run",
+        readiness: readiness({ auth: "unknown" }),
+      }),
+      agentDescriptor({
+        kind: "codex",
+        supportLevel: "experimental-run",
+        readiness: readiness({ auth: "available" }),
+      }),
+    ]);
+
+    expect(summary.status).toBe("degraded");
+    expect(summary.runSupport).toBe("experimental-run");
+    expect(summary.checks.hermesCli).toBe("ready");
+    expect(summary.checks.codexCli).toBe("ready");
+    expect(summary.checks.hermesAuth).toBe("unknown");
+    expect(summary.checks.codexAuth).toBe("available");
+    expect(summary.reasons).toContain("hermes-auth-unknown");
+    expect(summary.reasons).toContain("experimental-run");
+    expect(summary.reasons).not.toContain("supported-run");
+  });
+
+  it("blocks real workflow runs when the Codex CLI is missing", () => {
+    const summary = summarizeAgentReadiness([
+      agentDescriptor({
+        kind: "hermes",
+        supportLevel: "experimental-run",
+        readiness: readiness({ auth: "available" }),
+      }),
+      agentDescriptor({
+        kind: "codex",
+        status: "missing",
+        executablePath: null,
+        supportLevel: "detected-only",
+        readiness: readiness({ cliAvailable: false, auth: "unknown", categories: ["cli-missing"] }),
+      }),
+    ]);
+
+    expect(summary.status).toBe("blocked");
+    expect(summary.runSupport).toBe("unavailable");
+    expect(summary.checks.codexCli).toBe("missing");
+    expect(summary.reasons).toContain("codex-cli-missing");
+    expect(summary.message).toContain("Codex CLI missing");
+  });
+
+  it("distinguishes mock-only fallback from real workflow readiness", () => {
+    const summary = summarizeAgentReadiness([
+      agentDescriptor({
+        kind: "codex",
+        label: "Mock Codex Agent",
+        supportLevel: "mock-only",
+        executablePath: null,
+        readiness: undefined,
+      }),
+    ]);
+
+    expect(summary.status).toBe("mock-only");
+    expect(summary.runSupport).toBe("mock-only");
+    expect(summary.checks.mockFallback).toBe(true);
+    expect(summary.reasons).toContain("mock-only-fallback");
+    expect(summary.message).toContain("Mock fallback only");
+  });
+
+  it("distinguishes missing auth from unknown auth", () => {
+    const summary = summarizeAgentReadiness([
+      agentDescriptor({
+        kind: "hermes",
+        supportLevel: "experimental-run",
+        readiness: readiness({ auth: "missing", categories: ["auth-missing"] }),
+      }),
+      agentDescriptor({
+        kind: "codex",
+        supportLevel: "experimental-run",
+        readiness: readiness({ auth: "unknown" }),
+      }),
+    ]);
+
+    expect(summary.status).toBe("blocked");
+    expect(summary.checks.hermesAuth).toBe("missing");
+    expect(summary.checks.codexAuth).toBe("unknown");
+    expect(summary.reasons).toContain("hermes-auth-missing");
+    expect(summary.reasons).toContain("codex-auth-unknown");
+  });
+
   it("models OpenClaw discovery with an explicit support level", () => {
     const descriptor: AgentDescriptor = {
       kind: "openclaw",
