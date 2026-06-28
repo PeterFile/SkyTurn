@@ -1516,20 +1516,25 @@ function SessionComposer({
         />
         <ModeSwitch mode={mode} onChange={onModeChange} compact />
 
-        <div className="target-selector">
-          <div className="target-selector-controls">
+        <div className="target-selector-group">
+          <div className="target-selector-inner">
+            <span className="target-label" aria-hidden="true">Target:</span>
             <select
               value={executionTarget}
               onChange={e => setExecutionTarget(e.target.value as "current_branch" | "new_worktree")}
-              className="execution-target-select"
+              className="target-select"
+              aria-label="Execution Target"
             >
               <option value="current_branch">Current branch</option>
               <option value="new_worktree">New worktree</option>
             </select>
+            <span className="target-divider" aria-hidden="true">|</span>
+            <span className="target-label" aria-hidden="true">Branch:</span>
             <select
               value={selectedBranch}
               onChange={e => setSelectedBranch(e.target.value)}
-              className="branch-select"
+              className="target-select branch-select"
+              aria-label="Branch"
             >
               {branches.map(b => <option key={b} value={b}>{b}</option>)}
               {!branches.includes(selectedBranch) && <option value={selectedBranch}>{selectedBranch}</option>}
