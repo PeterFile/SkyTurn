@@ -88,6 +88,7 @@ import {
   type NodeRollbackStatus,
   type NodeRuntimeState,
   type NodeStatus,
+  type PlanMarkdown,
   type PlanSession,
   type RunEvent,
   type RunEvidence,
@@ -188,6 +189,14 @@ const nodeTypes: NodeTypes = {
 const edgeTypes: EdgeTypes = {
   agent: MemoAgentEdge,
 };
+
+type PlanSectionKey = keyof PlanMarkdown;
+
+const PLAN_SECTION_STEPS: Array<{ key: PlanSectionKey; label: string }> = [
+  { key: "requirements", label: "Requirements" },
+  { key: "design", label: "Design" },
+  { key: "tasks", label: "Tasks" },
+];
 
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(() => {
@@ -537,6 +546,25 @@ export default function App() {
       sessions: current.sessions.map((item) => (item.id === session.id ? canvas : item)),
       changesets: { ...current.changesets, ...changesetsForSession(canvas) },
       activeSessionId: canvas.id,
+    }));
+  }
+
+  function updatePlanSection(sessionId: string, section: PlanSectionKey, value: string) {
+    const updatedAt = new Date().toISOString();
+    setWorkspace((current) => ({
+      ...current,
+      sessions: current.sessions.map((session) =>
+        session.id === sessionId && session.kind === "plan"
+          ? {
+              ...session,
+              updatedAt,
+              plan: {
+                ...session.plan,
+                [section]: value,
+              },
+            }
+          : session,
+      ),
     }));
   }
 
@@ -929,7 +957,13 @@ export default function App() {
         />
 
         <main className="stage">
-          {activeSession?.kind === "plan" && <PlanView session={activeSession} onConfirm={confirmPlan} />}
+          {activeSession?.kind === "plan" && (
+            <PlanView
+              session={activeSession}
+              onPlanChange={(section, value) => updatePlanSection(activeSession.id, section, value)}
+              onConfirm={confirmPlan}
+            />
+          )}
           {activeSession?.kind === "canvas" && (
             <CanvasView
               session={activeSession}
@@ -1516,20 +1550,25 @@ function SessionComposer({
         />
         <ModeSwitch mode={mode} onChange={onModeChange} compact />
 
-        <div className="target-selector">
-          <div className="target-selector-controls">
+        <div className="target-selector-group">
+          <div className="target-selector-inner">
+            <span className="target-label" aria-hidden="true">Target:</span>
             <select
               value={executionTarget}
               onChange={e => setExecutionTarget(e.target.value as "current_branch" | "new_worktree")}
-              className="execution-target-select"
+              className="target-select"
+              aria-label="Execution Target"
             >
               <option value="current_branch">Current branch</option>
               <option value="new_worktree">New worktree</option>
             </select>
+            <span className="target-divider" aria-hidden="true">|</span>
+            <span className="target-label" aria-hidden="true">Branch:</span>
             <select
               value={selectedBranch}
               onChange={e => setSelectedBranch(e.target.value)}
-              className="branch-select"
+              className="target-select branch-select"
+              aria-label="Branch"
             >
               {branches.map(b => <option key={b} value={b}>{b}</option>)}
               {!branches.includes(selectedBranch) && <option value={selectedBranch}>{selectedBranch}</option>}
@@ -1573,30 +1612,148 @@ function formatRelativeTime(value: string): string {
   return `${Math.floor(days / 30)}mo`;
 }
 
-function PlanView({ session, onConfirm }: { session: PlanSession; onConfirm: (session: PlanSession) => void }) {
+function PlanView({
+  session,
+  onPlanChange,
+  onConfirm,
+}: {
+  session: PlanSession;
+  onPlanChange: (section: PlanSectionKey, value: string) => void;
+  onConfirm: (session: PlanSession) => void;
+}) {
+  const [activeSection, setActiveSection] = useState<PlanSectionKey>("requirements");
+  const [agentInstruction, setAgentInstruction] = useState("");
+  const [revisionStatus, setRevisionStatus] = useState<string | null>(null);
+  const editorId = useId();
+  const requestId = useId();
+  const activeIndex = Math.max(0, PLAN_SECTION_STEPS.findIndex((step) => step.key === activeSection));
+  const activeStep = PLAN_SECTION_STEPS[activeIndex] ?? PLAN_SECTION_STEPS[0];
+  const activeText = session.plan[activeStep.key];
+  const isDesktopShell = typeof window !== "undefined" && Boolean(window.devflow);
+
+  function changeActiveSection(section: PlanSectionKey) {
+    setActiveSection(section);
+    setRevisionStatus(null);
+  }
+
+  function requestAgentRevision(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const instruction = agentInstruction.trim();
+    if (!instruction) return;
+
+    const revisionNote = [
+      `### ${isDesktopShell ? "Agent revision request" : "Mock agent revision"}`,
+      "",
+      `- Page: ${activeStep.label}`,
+      `- Request: ${instruction}`,
+      isDesktopShell
+        ? "- Status: Captured locally; no desktop plan-revision IPC is connected yet."
+        : "- Mock response: deterministic local revision note appended for review.",
+    ].join("\n");
+    const currentText = activeText.trimEnd();
+    const nextText = currentText ? `${currentText}\n\n${revisionNote}` : revisionNote;
+
+    onPlanChange(activeStep.key, nextText);
+    setAgentInstruction("");
+    setRevisionStatus(
+      isDesktopShell
+        ? "Plan revision request captured. Edit this page before converting."
+        : "Mock agent revision note appended. Review the page before converting.",
+    );
+  }
+
   return (
     <section className="plan-view">
       <div className="plan-header">
         <div>
           <p className="eyebrow">Plan</p>
           <h2>{session.title}</h2>
+          <p>Review one plan page at a time.</p>
         </div>
         <button className="primary-action compact-action" onClick={() => onConfirm(session)}>
           <Play size={16} />
           Convert to Canvas
         </button>
       </div>
-      <div className="markdown-grid">
-        <article>
-          <ReactMarkdown>{session.plan.requirements}</ReactMarkdown>
-        </article>
-        <article>
-          <ReactMarkdown>{session.plan.design}</ReactMarkdown>
-        </article>
-        <article>
-          <ReactMarkdown>{session.plan.tasks}</ReactMarkdown>
-        </article>
+
+      <div className="plan-stepbar" aria-label="Plan progress">
+        <span>
+          Step {activeIndex + 1} of {PLAN_SECTION_STEPS.length}
+        </span>
+        <div className="plan-step-buttons">
+          {PLAN_SECTION_STEPS.map((step, index) => (
+            <button
+              key={step.key}
+              className={step.key === activeStep.key ? "active" : ""}
+              type="button"
+              aria-current={step.key === activeStep.key ? "step" : undefined}
+              onClick={() => changeActiveSection(step.key)}
+            >
+              <span>{index + 1}</span>
+              {step.label}
+            </button>
+          ))}
+        </div>
       </div>
+
+      <div className="plan-workspace">
+        <div className="plan-editor-card">
+          <div className="plan-section-heading">
+            <div>
+              <p className="eyebrow">{activeStep.label}</p>
+              <h3>{activeStep.label}</h3>
+            </div>
+            <div className="plan-step-actions">
+              <button
+                type="button"
+                disabled={activeIndex === 0}
+                onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex - 1]?.key ?? activeStep.key)}
+              >
+                Back
+              </button>
+              <button
+                type="button"
+                disabled={activeIndex === PLAN_SECTION_STEPS.length - 1}
+                onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key ?? activeStep.key)}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+          <label className="plan-editor-label" htmlFor={editorId}>
+            Edit this page
+          </label>
+          <textarea
+            id={editorId}
+            className="plan-editor"
+            value={activeText}
+            onChange={(event) => onPlanChange(activeStep.key, event.currentTarget.value)}
+          />
+        </div>
+
+        <div className="plan-preview-card" aria-label={`${activeStep.label} preview`}>
+          <ReactMarkdown>{activeText}</ReactMarkdown>
+        </div>
+      </div>
+
+      <form className="plan-agent-panel" onSubmit={requestAgentRevision}>
+        <div>
+          <label htmlFor={requestId}>Ask agent to revise this page</label>
+          <p>Convert only after the plan is acceptable.</p>
+        </div>
+        <textarea
+          id={requestId}
+          value={agentInstruction}
+          onChange={(event) => setAgentInstruction(event.currentTarget.value)}
+          placeholder={`Request changes to ${activeStep.label.toLowerCase()}`}
+        />
+        <div className="plan-agent-actions">
+          {revisionStatus && <span>{revisionStatus}</span>}
+          <button className="primary-action compact-action" type="submit" disabled={!agentInstruction.trim()}>
+            Request revision
+          </button>
+        </div>
+      </form>
     </section>
   );
 }
@@ -2267,6 +2424,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
           </span>
           <div className="agent-node-header">
             <span className="agent-node-eyebrow">{eyebrow}</span>
+            {selected && <span className="agent-node-target-badge">Composer target</span>}
           </div>
           <span className="agent-node-title">{node.title}</span>
           <div className="agent-node-meta-row">
@@ -4650,37 +4808,39 @@ function CanvasComposer({
       onPointerDown={(event) => event.stopPropagation()}
     >
       {selectedNode && (
-        <div className="composer-context-pill">
-          <span className="pill-title">{selectedNode.title}</span>
-          <span className="pill-meta">{selectedNode.agent} · {selectedNode.status}</span>
+        <div className="composer-context-header">
+          <span className="context-label">Node action target:</span>
+          <span className="context-title">{selectedNode.title}</span>
+          <span className="context-meta">({selectedNode.status})</span>
         </div>
       )}
       {selectedNode && selectedNodeActionState && (
-        <div className="composer-checkpoint-summary">
-          <div className="checkpoint-row">
-            <span className="checkpoint-label">Before:</span>
-            {selectedNodeActionState.checkpoints.hasBefore ? (
-              <span className="checkpoint-detail">
-                {selectedNodeActionState.checkpoints.beforeCheckpointId?.split('-').pop()}
-                {selectedNodeActionState.checkpoints.beforeCommitSha && ` (${selectedNodeActionState.checkpoints.beforeCommitSha})`}
-                {selectedNodeActionState.checkpoints.beforeSource && ` [${selectedNodeActionState.checkpoints.beforeSource}]`}
-              </span>
-            ) : (
-              <span className="checkpoint-missing">Missing</span>
-            )}
-          </div>
-          <div className="checkpoint-row">
-            <span className="checkpoint-label">After:</span>
-            {selectedNodeActionState.checkpoints.hasAfter ? (
-              <span className="checkpoint-detail">
-                {selectedNodeActionState.checkpoints.afterCheckpointId?.split('-').pop()}
-                {selectedNodeActionState.checkpoints.afterCommitSha && ` (${selectedNodeActionState.checkpoints.afterCommitSha})`}
-                {selectedNodeActionState.checkpoints.afterSource && ` [${selectedNodeActionState.checkpoints.afterSource}]`}
-              </span>
-            ) : (
-              <span className="checkpoint-missing">Missing</span>
-            )}
-          </div>
+        <div className="composer-evidence-chips">
+          {selectedNodeActionState.checkpoints.hasBefore && (
+            <span className="evidence-chip" title={`Before: ${selectedNodeActionState.checkpoints.beforeCheckpointId}`}>
+              <Check size={12} /> Before Checkpoint
+            </span>
+          )}
+          {selectedNodeActionState.checkpoints.hasAfter && (
+            <span className="evidence-chip" title={`After: ${selectedNodeActionState.checkpoints.afterCheckpointId}`}>
+              <Check size={12} /> After Checkpoint
+            </span>
+          )}
+          {selectedNodeActionState.rollbackEligibility?.affectedLaneIds && selectedNodeActionState.rollbackEligibility.affectedLaneIds.length > 0 && (
+            <span className="evidence-chip impact" title={`Restores to ${selectedNodeActionState.rollbackEligibility.restoreCommitRef}`}>
+              <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility.affectedLaneIds.length} downstream nodes affected
+            </span>
+          )}
+          {selectedNodeActionState.remoteSideEffects.length > 0 && (
+            <span className="evidence-chip error">
+              <AlertTriangle size={12} /> Remote blockers: {selectedNodeActionState.remoteSideEffects.length}
+            </span>
+          )}
+          {(selectedNodeActionState.rollbackEligibility?.manualRepairReason || selectedNodeActionState.needsBackendCheck) && (
+            <span className="evidence-chip error">
+              <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility?.manualRepairReason || "Backend check required"}
+            </span>
+          )}
         </div>
       )}
       {selectedNode && (
@@ -4691,9 +4851,9 @@ function CanvasComposer({
             onClick={() => setAction("repair")}
             aria-pressed={action === "repair"}
             disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
-            title={actionAvailability.repair.reason ?? "Repair this node"}
+            title={actionAvailability.repair.reason ?? "Repair"}
           >
-            Repair this node
+            Repair
           </button>
           <button
             type="button"
@@ -4701,9 +4861,9 @@ function CanvasComposer({
             onClick={() => setAction("variant")}
             aria-pressed={action === "variant"}
             disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
-            title={actionAvailability.variant.reason ?? "Try another version"}
+            title={actionAvailability.variant.reason ?? "Variant"}
           >
-            Try another version
+            Variant
           </button>
           <button
             type="button"
@@ -4711,48 +4871,20 @@ function CanvasComposer({
             onClick={() => setAction("rollback")}
             aria-pressed={action === "rollback"}
             disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
-            title={actionAvailability.rollback.reason ?? "Rollback node and downstream"}
+            title={actionAvailability.rollback.reason ?? "Rollback"}
           >
-            Rollback node and downstream
+            Rollback
           </button>
-        </div>
-      )}
-      {selectedNode && selectedNodeActionState && (
-        <div className="composer-impact-summary">
-          {selectedNodeActionState.rollbackEligibility?.affectedLaneIds && selectedNodeActionState.rollbackEligibility.affectedLaneIds.length > 0 && (
-            <div className="impact-row">
-              <span className="impact-label">Selected + downstream:</span>
-              <span className="impact-detail">
-                {selectedNodeActionState.rollbackEligibility.affectedLaneIds.length}
-                ({selectedNodeActionState.rollbackEligibility.affectedLaneIds.join(', ')})
-              </span>
-            </div>
-          )}
-          {selectedNodeActionState.rollbackEligibility?.restoreCommitRef && (
-            <div className="impact-row">
-              <span className="impact-label">Restore commit:</span>
-              <span className="impact-detail">{selectedNodeActionState.rollbackEligibility.restoreCommitRef.substring(0, 7)}</span>
-            </div>
-          )}
-          {selectedNodeActionState.remoteSideEffects.length > 0 && (
-            <div className="impact-row">
-              <span className="impact-label">Remote blockers:</span>
-              <span className="impact-detail">
-                {selectedNodeActionState.remoteSideEffects.map(r => r.eventKind).join(', ')}
-              </span>
-            </div>
-          )}
-          {(selectedNodeActionState.rollbackEligibility?.manualRepairReason || selectedNodeActionState.needsBackendCheck) && (
-            <div className="impact-row">
-              <span className="impact-label">Manual repair:</span>
-              <span className="impact-detail">{selectedNodeActionState.rollbackEligibility?.manualRepairReason || "Backend check required"}</span>
-            </div>
-          )}
         </div>
       )}
       {selectedNode && (
         <p className={nodeActionError ? "composer-action-message error" : "composer-action-message"}>
-          {nodeActionError ?? nodeActionStatus ?? actionAvailability.rollback.reason ?? "Rollback affects selected and downstream workflow state, not evidence/history."}
+          {nodeActionError ?? nodeActionStatus ?? (
+            action === "repair" ? "Repair modifies the node's result using the After checkpoint." :
+            action === "variant" ? "Variant attempts a new run starting from the Before checkpoint." :
+            action === "rollback" ? (actionAvailability.rollback.reason ?? "Rollback affects selected and downstream workflow state, not evidence/history.") :
+            "Select an action to continue."
+          )}
         </p>
       )}
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
