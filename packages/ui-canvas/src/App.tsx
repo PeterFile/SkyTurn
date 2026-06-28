@@ -88,6 +88,7 @@ import {
   type NodeRollbackStatus,
   type NodeRuntimeState,
   type NodeStatus,
+  type PlanMarkdown,
   type PlanSession,
   type RunEvent,
   type RunEvidence,
@@ -188,6 +189,14 @@ const nodeTypes: NodeTypes = {
 const edgeTypes: EdgeTypes = {
   agent: MemoAgentEdge,
 };
+
+type PlanSectionKey = keyof PlanMarkdown;
+
+const PLAN_SECTION_STEPS: Array<{ key: PlanSectionKey; label: string }> = [
+  { key: "requirements", label: "Requirements" },
+  { key: "design", label: "Design" },
+  { key: "tasks", label: "Tasks" },
+];
 
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(() => {
@@ -537,6 +546,25 @@ export default function App() {
       sessions: current.sessions.map((item) => (item.id === session.id ? canvas : item)),
       changesets: { ...current.changesets, ...changesetsForSession(canvas) },
       activeSessionId: canvas.id,
+    }));
+  }
+
+  function updatePlanSection(sessionId: string, section: PlanSectionKey, value: string) {
+    const updatedAt = new Date().toISOString();
+    setWorkspace((current) => ({
+      ...current,
+      sessions: current.sessions.map((session) =>
+        session.id === sessionId && session.kind === "plan"
+          ? {
+              ...session,
+              updatedAt,
+              plan: {
+                ...session.plan,
+                [section]: value,
+              },
+            }
+          : session,
+      ),
     }));
   }
 
@@ -929,7 +957,13 @@ export default function App() {
         />
 
         <main className="stage">
-          {activeSession?.kind === "plan" && <PlanView session={activeSession} onConfirm={confirmPlan} />}
+          {activeSession?.kind === "plan" && (
+            <PlanView
+              session={activeSession}
+              onPlanChange={(section, value) => updatePlanSection(activeSession.id, section, value)}
+              onConfirm={confirmPlan}
+            />
+          )}
           {activeSession?.kind === "canvas" && (
             <CanvasView
               session={activeSession}
@@ -1573,30 +1607,148 @@ function formatRelativeTime(value: string): string {
   return `${Math.floor(days / 30)}mo`;
 }
 
-function PlanView({ session, onConfirm }: { session: PlanSession; onConfirm: (session: PlanSession) => void }) {
+function PlanView({
+  session,
+  onPlanChange,
+  onConfirm,
+}: {
+  session: PlanSession;
+  onPlanChange: (section: PlanSectionKey, value: string) => void;
+  onConfirm: (session: PlanSession) => void;
+}) {
+  const [activeSection, setActiveSection] = useState<PlanSectionKey>("requirements");
+  const [agentInstruction, setAgentInstruction] = useState("");
+  const [revisionStatus, setRevisionStatus] = useState<string | null>(null);
+  const editorId = useId();
+  const requestId = useId();
+  const activeIndex = Math.max(0, PLAN_SECTION_STEPS.findIndex((step) => step.key === activeSection));
+  const activeStep = PLAN_SECTION_STEPS[activeIndex] ?? PLAN_SECTION_STEPS[0];
+  const activeText = session.plan[activeStep.key];
+  const isDesktopShell = typeof window !== "undefined" && Boolean(window.devflow);
+
+  function changeActiveSection(section: PlanSectionKey) {
+    setActiveSection(section);
+    setRevisionStatus(null);
+  }
+
+  function requestAgentRevision(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const instruction = agentInstruction.trim();
+    if (!instruction) return;
+
+    const revisionNote = [
+      `### ${isDesktopShell ? "Agent revision request" : "Mock agent revision"}`,
+      "",
+      `- Page: ${activeStep.label}`,
+      `- Request: ${instruction}`,
+      isDesktopShell
+        ? "- Status: Captured locally; no desktop plan-revision IPC is connected yet."
+        : "- Mock response: deterministic local revision note appended for review.",
+    ].join("\n");
+    const currentText = activeText.trimEnd();
+    const nextText = currentText ? `${currentText}\n\n${revisionNote}` : revisionNote;
+
+    onPlanChange(activeStep.key, nextText);
+    setAgentInstruction("");
+    setRevisionStatus(
+      isDesktopShell
+        ? "Plan revision request captured. Edit this page before converting."
+        : "Mock agent revision note appended. Review the page before converting.",
+    );
+  }
+
   return (
     <section className="plan-view">
       <div className="plan-header">
         <div>
           <p className="eyebrow">Plan</p>
           <h2>{session.title}</h2>
+          <p>Review one plan page at a time.</p>
         </div>
         <button className="primary-action compact-action" onClick={() => onConfirm(session)}>
           <Play size={16} />
           Convert to Canvas
         </button>
       </div>
-      <div className="markdown-grid">
-        <article>
-          <ReactMarkdown>{session.plan.requirements}</ReactMarkdown>
-        </article>
-        <article>
-          <ReactMarkdown>{session.plan.design}</ReactMarkdown>
-        </article>
-        <article>
-          <ReactMarkdown>{session.plan.tasks}</ReactMarkdown>
-        </article>
+
+      <div className="plan-stepbar" aria-label="Plan progress">
+        <span>
+          Step {activeIndex + 1} of {PLAN_SECTION_STEPS.length}
+        </span>
+        <div className="plan-step-buttons">
+          {PLAN_SECTION_STEPS.map((step, index) => (
+            <button
+              key={step.key}
+              className={step.key === activeStep.key ? "active" : ""}
+              type="button"
+              aria-current={step.key === activeStep.key ? "step" : undefined}
+              onClick={() => changeActiveSection(step.key)}
+            >
+              <span>{index + 1}</span>
+              {step.label}
+            </button>
+          ))}
+        </div>
       </div>
+
+      <div className="plan-workspace">
+        <div className="plan-editor-card">
+          <div className="plan-section-heading">
+            <div>
+              <p className="eyebrow">{activeStep.label}</p>
+              <h3>{activeStep.label}</h3>
+            </div>
+            <div className="plan-step-actions">
+              <button
+                type="button"
+                disabled={activeIndex === 0}
+                onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex - 1]?.key ?? activeStep.key)}
+              >
+                Back
+              </button>
+              <button
+                type="button"
+                disabled={activeIndex === PLAN_SECTION_STEPS.length - 1}
+                onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key ?? activeStep.key)}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+          <label className="plan-editor-label" htmlFor={editorId}>
+            Edit this page
+          </label>
+          <textarea
+            id={editorId}
+            className="plan-editor"
+            value={activeText}
+            onChange={(event) => onPlanChange(activeStep.key, event.currentTarget.value)}
+          />
+        </div>
+
+        <div className="plan-preview-card" aria-label={`${activeStep.label} preview`}>
+          <ReactMarkdown>{activeText}</ReactMarkdown>
+        </div>
+      </div>
+
+      <form className="plan-agent-panel" onSubmit={requestAgentRevision}>
+        <div>
+          <label htmlFor={requestId}>Ask agent to revise this page</label>
+          <p>Convert only after the plan is acceptable.</p>
+        </div>
+        <textarea
+          id={requestId}
+          value={agentInstruction}
+          onChange={(event) => setAgentInstruction(event.currentTarget.value)}
+          placeholder={`Request changes to ${activeStep.label.toLowerCase()}`}
+        />
+        <div className="plan-agent-actions">
+          {revisionStatus && <span>{revisionStatus}</span>}
+          <button className="primary-action compact-action" type="submit" disabled={!agentInstruction.trim()}>
+            Request revision
+          </button>
+        </div>
+      </form>
     </section>
   );
 }
