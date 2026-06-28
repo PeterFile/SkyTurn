@@ -484,20 +484,89 @@ h2 {
 
 .plan-view {
   display: grid;
-  grid-template-rows: auto 1fr;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   gap: 16px;
   overflow: auto;
   padding: 22px;
 }
 
-.markdown-grid {
+.plan-header p {
+  margin: 0;
+  color: var(--sk-text-legacy-muted);
+}
+
+.plan-stepbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--sk-border-muted);
+  border-radius: var(--sk-radius-md);
+  background: var(--sk-surface-warm);
+  padding: 10px 12px;
+}
+
+.plan-stepbar > span {
+  color: var(--sk-text-legacy-muted);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.plan-step-buttons,
+.plan-step-actions,
+.plan-agent-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plan-step-buttons button,
+.plan-step-actions button {
+  border: 1px solid var(--sk-border-muted);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-white);
+  color: var(--sk-text-legacy);
+  padding: 7px 10px;
+  font-weight: 800;
+}
+
+.plan-step-buttons button {
+  justify-content: flex-start;
+}
+
+.plan-step-buttons button span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-right: 6px;
+  border-radius: var(--sk-radius-pill);
+  background: var(--sk-surface-muted);
+  font-size: 11px;
+}
+
+.plan-step-buttons button.active {
+  border-color: var(--sk-accent);
+  background: var(--sk-accent-soft);
+}
+
+.plan-step-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.plan-workspace {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.15fr) minmax(280px, 0.85fr);
   gap: 14px;
   min-height: 0;
 }
 
-.markdown-grid article {
+.plan-editor-card,
+.plan-preview-card,
+.plan-agent-panel {
   overflow: auto;
   border: 1px solid var(--sk-border-muted);
   border-radius: var(--sk-radius-md);
@@ -505,13 +574,86 @@ h2 {
   padding: 18px;
 }
 
-.markdown-grid h2 {
-  margin-bottom: 14px;
+.plan-editor-card {
+  display: grid;
+  grid-template-rows: auto auto minmax(260px, 1fr);
+  gap: 10px;
+  min-height: 0;
+}
+
+.plan-section-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.plan-section-heading h3,
+.plan-preview-card h2,
+.plan-preview-card h3 {
+  margin: 0 0 12px;
   font-size: 18px;
 }
 
-.markdown-grid li {
+.plan-editor-label,
+.plan-agent-panel label {
+  color: var(--sk-text-legacy);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.plan-editor,
+.plan-agent-panel textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--sk-border-muted);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-white);
+  color: var(--sk-text-legacy);
+  padding: 12px;
+  resize: vertical;
+}
+
+.plan-editor {
+  min-height: 300px;
+  resize: none;
+}
+
+.plan-preview-card {
+  min-height: 0;
+}
+
+.plan-preview-card li {
   margin: 10px 0;
+}
+
+.plan-agent-panel {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.35fr) minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+}
+
+.plan-agent-panel p {
+  margin: 4px 0 0;
+  color: var(--sk-text-legacy-muted);
+  font-size: 12px;
+}
+
+.plan-agent-panel textarea {
+  min-height: 72px;
+}
+
+.plan-agent-actions {
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.plan-agent-actions span {
+  max-width: 240px;
+  color: var(--sk-text-legacy-muted);
+  font-size: 12px;
+  text-align: right;
 }
 
 .empty-stage {
@@ -1459,8 +1601,33 @@ h2 {
     flex: 1 1 100%;
   }
 
-  .markdown-grid {
+  .plan-stepbar,
+  .plan-section-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .plan-agent-panel {
     grid-template-columns: 1fr;
+  }
+
+  .plan-step-buttons,
+  .plan-step-actions,
+  .plan-agent-actions {
+    flex-wrap: wrap;
+  }
+
+  .plan-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .plan-agent-actions {
+    align-items: flex-start;
+  }
+
+  .plan-agent-actions span {
+    max-width: none;
+    text-align: left;
   }
 
   .context-grid {
@@ -2154,11 +2321,14 @@ h2 {
   padding: 16px;
 }
 
-.markdown-grid {
+.plan-workspace {
   gap: 12px;
 }
 
-.markdown-grid article {
+.plan-stepbar,
+.plan-editor-card,
+.plan-preview-card,
+.plan-agent-panel {
   border-color: var(--sk-border);
   border-radius: var(--sk-radius-md);
   background: var(--sk-surface);
@@ -3948,7 +4118,10 @@ select:focus-visible,
 .home-panel,
 .session-panel,
 .node-modal,
-.markdown-grid article,
+.plan-stepbar,
+.plan-editor-card,
+.plan-preview-card,
+.plan-agent-panel,
 .changes-summary,
 .changes-toolbar,
 .diff2html-shell,

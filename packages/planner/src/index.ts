@@ -155,6 +155,7 @@ export function convertPlanToCanvas(session: PlanSession): CanvasSession {
     mode: "plan",
     seeds: planSeeds,
     title: session.title,
+    plan: session.plan,
   });
 }
 
@@ -164,12 +165,14 @@ function createCanvasSession({
   mode,
   seeds,
   title,
+  plan: planMarkdown = plan,
 }: {
   input: CreateSessionInput;
   sessionId: string;
   mode: "fast" | "plan";
   seeds: TaskSeed[];
   title: string;
+  plan?: PlanMarkdown;
 }): CanvasSession {
   const target = normalizeSessionTarget(input.target);
   const nodes = seeds.map((seed, index) =>
@@ -179,7 +182,8 @@ function createCanvasSession({
       sessionId,
       target,
       status: seed.status ?? (index === 0 ? "running" : "pending"),
-      relatedTasks: mode === "plan" ? plan.tasks : "Mock Hermes graph",
+      plan: planMarkdown,
+      relatedTasks: mode === "plan" ? planMarkdown.tasks : "Mock Hermes graph",
     }),
   );
   return {
@@ -209,6 +213,7 @@ function createNode({
   sessionId,
   target,
   status,
+  plan: planMarkdown,
   relatedTasks,
 }: {
   seed: TaskSeed;
@@ -216,6 +221,7 @@ function createNode({
   sessionId: string;
   target: SessionTarget;
   status: CanvasNode["status"];
+  plan: PlanMarkdown;
   relatedTasks: string;
 }): CanvasNode {
   return {
@@ -234,8 +240,8 @@ function createNode({
     context: {
       brief: seed.brief,
       sessionGoal: input.goal,
-      relatedRequirements: plan.requirements,
-      relatedDesign: plan.design,
+      relatedRequirements: planMarkdown.requirements,
+      relatedDesign: planMarkdown.design,
       relatedTasks:
         seed.agent === "hermes" ? "createWorkflowCard, updateWorkflowCard, deleteWorkflowCard" : relatedTasks,
       dependencies: seed.dependencies,

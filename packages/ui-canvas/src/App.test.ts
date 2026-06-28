@@ -271,6 +271,18 @@ describe("UI source validation", () => {
     expect(appSource).toContain("Create a candidate worktree from the selected branch.");
   });
 
+  it("PlanView is a single-page editor instead of three simultaneous markdown articles", async () => {
+    const appSource = await readSource("./App.tsx");
+    const planView = appSource.slice(appSource.indexOf("function PlanView("), appSource.indexOf("function CanvasView("));
+
+    expect(planView).toContain("Review one plan page at a time");
+    expect(planView).toContain("Ask agent to revise this page");
+    expect(planView).toContain("<textarea");
+    expect(planView).not.toContain("markdown-grid");
+    expect(planView).not.toContain("<article");
+    expect((planView.match(/<ReactMarkdown/g) ?? [])).toHaveLength(1);
+  });
+
   it("loads agent health through desktop IPC and stores discovered agents", async () => {
     const appSource = await readSource("./App.tsx");
     const healthEffect = appSource.slice(

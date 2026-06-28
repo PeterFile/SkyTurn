@@ -135,4 +135,26 @@ describe("canvas session factory", () => {
       { id: "edge-node-2-node-3", source: "node-2", target: "node-3" },
     ]);
   });
+
+  it("converts the edited plan text into node context", () => {
+    const plan = createPlanSession({
+      projectId: "project-1",
+      goal: "Plan then execute edited draft",
+      createdAt: "2026-06-10T00:00:00.000Z",
+    });
+    const editedPlan = {
+      ...plan,
+      plan: {
+        requirements: "## Requirements\n\n- Edited requirement from user review.",
+        design: "## Design\n\n- Edited design from user review.",
+        tasks: "## Tasks\n\n- [ ] Edited task from user review.",
+      },
+    };
+
+    const canvas = convertPlanToCanvas(editedPlan);
+
+    expect(canvas.nodes[1]?.context.relatedRequirements).toContain("Edited requirement");
+    expect(canvas.nodes[1]?.context.relatedDesign).toContain("Edited design");
+    expect(canvas.nodes[1]?.context.relatedTasks).toContain("Edited task");
+  });
 });
