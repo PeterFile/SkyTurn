@@ -914,35 +914,70 @@ h2 {
   line-height: 1.45;
 }
 
-.target-selector {
+.target-selector-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.target-selector-inner {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-left: 12px;
+  gap: 4px;
+  height: 34px;
+  background-color: #f8fafc;
+  background-image: var(--sk-paper-white);
+  box-shadow: 0 2px 5px rgba(5, 29, 72, 0.1), inset 0 0 0 1px rgba(5, 29, 72, 0.1);
+  clip-path: polygon(1% 4%, 99% 0, 97% 96%, 0 100%);
+  padding: 0 10px;
   font-size: 12px;
 }
 
-.target-selector-controls {
-  display: flex;
-  gap: 8px;
-  align-items: center;
+.target-label {
+  color: #64748b;
+  font-weight: 500;
+  user-select: none;
 }
 
-.execution-target-select,
-.branch-select {
-  padding: 2px 4px;
-  border-radius: var(--sk-radius-sm, 4px);
-  border: 1px solid var(--sk-border-muted);
+.target-select {
+  appearance: none;
+  border: none;
   background: transparent;
-  color: inherit;
+  color: #051d48;
+  font-weight: 700;
+  padding: 0 14px 0 2px;
+  margin: 0;
+  cursor: pointer;
+  outline: none;
+  background-image: url("data:image/svg+xml;charset=US-ASCII,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22292.4%22%20height%3D%22292.4%22%3E%3Cpath%20fill%3D%22%23051d48%22%20d%3D%22M287%2069.4a17.6%2017.6%200%200%200-13-5.4H18.4c-5%200-9.3%201.8-12.9%205.4A17.6%2017.6%200%200%200%200%2082.2c0%205%201.8%209.3%205.4%2012.9l128%20127.9c3.6%203.6%207.8%205.4%2012.8%205.4s9.2-1.8%2012.8-5.4L287%2095c3.5-3.5%205.4-7.8%205.4-12.8%200-5-1.9-9.2-5.5-12.8z%22%2F%3E%3C%2Fsvg%3E");
+  background-repeat: no-repeat;
+  background-position: right center;
+  background-size: 8px auto;
+  min-width: 0;
 }
 
-.branch-select {
-  max-width: 150px;
+.target-select.branch-select {
+  max-width: 140px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.target-select:focus-visible {
+  text-decoration: underline;
+}
+
+.target-divider {
+  color: #cbd5e1;
+  margin: 0 2px;
+  user-select: none;
 }
 
 .target-selector-hint {
-  color: var(--sk-text-legacy-muted);
+  font-size: 11px;
+  color: #758696;
+  line-height: 1.2;
+  margin-left: 4px;
 }
 
 .live-changes-layer {
@@ -5398,6 +5433,7 @@ select:focus-visible,
   z-index: 2;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   align-self: flex-start;
   width: calc(100% - 74px);
