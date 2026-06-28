@@ -743,13 +743,15 @@ describe("Slice C UI behavior", () => {
     expect(menuButton).toContain("event.stopPropagation()");
   });
 
-  it("selected node appears in the bottom composer", async () => {
+  it("selected node appears in the bottom composer and cards", async () => {
     const appSource = await readSource("./App.tsx");
     const composer = appSource.slice(appSource.indexOf('function CanvasComposer('));
     expect(composer).toContain('selectedNode && (');
-    expect(composer).toContain('className="composer-context-pill"');
-    expect(composer).toContain('{selectedNode.title}');
-    expect(composer).toContain('{selectedNode.agent}');
+    expect(composer).toContain('className="composer-context-header"');
+    expect(composer).toContain('Node action target:');
+    expect(composer).toContain('className="context-title"');
+    expect(appSource).toContain('className="agent-node-target-badge"');
+    expect(appSource).toContain('Composer target');
   });
 
   it("action chips change composer mode/placeholder", async () => {
@@ -961,28 +963,24 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
 
   it("eligible rollback shows selected plus downstream summary", async () => {
     const appSource = await readSource("./App.tsx");
-    expect(appSource).toContain("Selected + downstream:");
+    expect(appSource).toContain("downstream nodes affected");
+    expect(appSource).toContain("evidence-chip impact");
     expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.affectedLaneIds.length");
-    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.affectedLaneIds.join(', ')");
   });
 
   it("checkpoint summary renders checkpoint/restore commit/source", async () => {
     const appSource = await readSource("./App.tsx");
-    expect(appSource).toContain("Before:");
-    expect(appSource).toContain("After:");
-    expect(appSource).toContain("selectedNodeActionState.checkpoints.beforeCommitSha");
-    expect(appSource).toContain("selectedNodeActionState.checkpoints.beforeSource");
-    expect(appSource).toContain("selectedNodeActionState.checkpoints.afterCommitSha");
-    expect(appSource).toContain("selectedNodeActionState.checkpoints.afterSource");
-    expect(appSource).toContain("Restore commit:");
+    expect(appSource).toContain("Before Checkpoint");
+    expect(appSource).toContain("After Checkpoint");
+    expect(appSource).toContain("selectedNodeActionState.checkpoints.beforeCheckpointId");
+    expect(appSource).toContain("selectedNodeActionState.checkpoints.afterCheckpointId");
     expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.restoreCommitRef");
   });
 
   it("remote blocker/manual repair disables rollback and shows correct message", async () => {
     const appSource = await readSource("./App.tsx");
     expect(appSource).toContain("Remote blockers:");
-    expect(appSource).toContain("selectedNodeActionState.remoteSideEffects.map(r => r.eventKind).join(', ')");
-    expect(appSource).toContain("Manual repair:");
+    expect(appSource).toContain("selectedNodeActionState.remoteSideEffects.length");
     expect(appSource).toContain("selectedNodeActionState.rollbackEligibility?.manualRepairReason");
     expect(appSource).toContain("Backend check required");
   });

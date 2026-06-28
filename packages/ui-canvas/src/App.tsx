@@ -2267,6 +2267,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
           </span>
           <div className="agent-node-header">
             <span className="agent-node-eyebrow">{eyebrow}</span>
+            {selected && <span className="agent-node-target-badge">Composer target</span>}
           </div>
           <span className="agent-node-title">{node.title}</span>
           <div className="agent-node-meta-row">
@@ -4650,37 +4651,39 @@ function CanvasComposer({
       onPointerDown={(event) => event.stopPropagation()}
     >
       {selectedNode && (
-        <div className="composer-context-pill">
-          <span className="pill-title">{selectedNode.title}</span>
-          <span className="pill-meta">{selectedNode.agent} · {selectedNode.status}</span>
+        <div className="composer-context-header">
+          <span className="context-label">Node action target:</span>
+          <span className="context-title">{selectedNode.title}</span>
+          <span className="context-meta">({selectedNode.status})</span>
         </div>
       )}
       {selectedNode && selectedNodeActionState && (
-        <div className="composer-checkpoint-summary">
-          <div className="checkpoint-row">
-            <span className="checkpoint-label">Before:</span>
-            {selectedNodeActionState.checkpoints.hasBefore ? (
-              <span className="checkpoint-detail">
-                {selectedNodeActionState.checkpoints.beforeCheckpointId?.split('-').pop()}
-                {selectedNodeActionState.checkpoints.beforeCommitSha && ` (${selectedNodeActionState.checkpoints.beforeCommitSha})`}
-                {selectedNodeActionState.checkpoints.beforeSource && ` [${selectedNodeActionState.checkpoints.beforeSource}]`}
-              </span>
-            ) : (
-              <span className="checkpoint-missing">Missing</span>
-            )}
-          </div>
-          <div className="checkpoint-row">
-            <span className="checkpoint-label">After:</span>
-            {selectedNodeActionState.checkpoints.hasAfter ? (
-              <span className="checkpoint-detail">
-                {selectedNodeActionState.checkpoints.afterCheckpointId?.split('-').pop()}
-                {selectedNodeActionState.checkpoints.afterCommitSha && ` (${selectedNodeActionState.checkpoints.afterCommitSha})`}
-                {selectedNodeActionState.checkpoints.afterSource && ` [${selectedNodeActionState.checkpoints.afterSource}]`}
-              </span>
-            ) : (
-              <span className="checkpoint-missing">Missing</span>
-            )}
-          </div>
+        <div className="composer-evidence-chips">
+          {selectedNodeActionState.checkpoints.hasBefore && (
+            <span className="evidence-chip" title={`Before: ${selectedNodeActionState.checkpoints.beforeCheckpointId}`}>
+              <Check size={12} /> Before Checkpoint
+            </span>
+          )}
+          {selectedNodeActionState.checkpoints.hasAfter && (
+            <span className="evidence-chip" title={`After: ${selectedNodeActionState.checkpoints.afterCheckpointId}`}>
+              <Check size={12} /> After Checkpoint
+            </span>
+          )}
+          {selectedNodeActionState.rollbackEligibility?.affectedLaneIds && selectedNodeActionState.rollbackEligibility.affectedLaneIds.length > 0 && (
+            <span className="evidence-chip impact" title={`Restores to ${selectedNodeActionState.rollbackEligibility.restoreCommitRef}`}>
+              <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility.affectedLaneIds.length} downstream nodes affected
+            </span>
+          )}
+          {selectedNodeActionState.remoteSideEffects.length > 0 && (
+            <span className="evidence-chip error">
+              <AlertTriangle size={12} /> Remote blockers: {selectedNodeActionState.remoteSideEffects.length}
+            </span>
+          )}
+          {(selectedNodeActionState.rollbackEligibility?.manualRepairReason || selectedNodeActionState.needsBackendCheck) && (
+            <span className="evidence-chip error">
+              <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility?.manualRepairReason || "Backend check required"}
+            </span>
+          )}
         </div>
       )}
       {selectedNode && (
@@ -4691,9 +4694,9 @@ function CanvasComposer({
             onClick={() => setAction("repair")}
             aria-pressed={action === "repair"}
             disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
-            title={actionAvailability.repair.reason ?? "Repair this node"}
+            title={actionAvailability.repair.reason ?? "Repair"}
           >
-            Repair this node
+            Repair
           </button>
           <button
             type="button"
@@ -4701,9 +4704,9 @@ function CanvasComposer({
             onClick={() => setAction("variant")}
             aria-pressed={action === "variant"}
             disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
-            title={actionAvailability.variant.reason ?? "Try another version"}
+            title={actionAvailability.variant.reason ?? "Variant"}
           >
-            Try another version
+            Variant
           </button>
           <button
             type="button"
@@ -4711,48 +4714,20 @@ function CanvasComposer({
             onClick={() => setAction("rollback")}
             aria-pressed={action === "rollback"}
             disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
-            title={actionAvailability.rollback.reason ?? "Rollback node and downstream"}
+            title={actionAvailability.rollback.reason ?? "Rollback"}
           >
-            Rollback node and downstream
+            Rollback
           </button>
-        </div>
-      )}
-      {selectedNode && selectedNodeActionState && (
-        <div className="composer-impact-summary">
-          {selectedNodeActionState.rollbackEligibility?.affectedLaneIds && selectedNodeActionState.rollbackEligibility.affectedLaneIds.length > 0 && (
-            <div className="impact-row">
-              <span className="impact-label">Selected + downstream:</span>
-              <span className="impact-detail">
-                {selectedNodeActionState.rollbackEligibility.affectedLaneIds.length}
-                ({selectedNodeActionState.rollbackEligibility.affectedLaneIds.join(', ')})
-              </span>
-            </div>
-          )}
-          {selectedNodeActionState.rollbackEligibility?.restoreCommitRef && (
-            <div className="impact-row">
-              <span className="impact-label">Restore commit:</span>
-              <span className="impact-detail">{selectedNodeActionState.rollbackEligibility.restoreCommitRef.substring(0, 7)}</span>
-            </div>
-          )}
-          {selectedNodeActionState.remoteSideEffects.length > 0 && (
-            <div className="impact-row">
-              <span className="impact-label">Remote blockers:</span>
-              <span className="impact-detail">
-                {selectedNodeActionState.remoteSideEffects.map(r => r.eventKind).join(', ')}
-              </span>
-            </div>
-          )}
-          {(selectedNodeActionState.rollbackEligibility?.manualRepairReason || selectedNodeActionState.needsBackendCheck) && (
-            <div className="impact-row">
-              <span className="impact-label">Manual repair:</span>
-              <span className="impact-detail">{selectedNodeActionState.rollbackEligibility?.manualRepairReason || "Backend check required"}</span>
-            </div>
-          )}
         </div>
       )}
       {selectedNode && (
         <p className={nodeActionError ? "composer-action-message error" : "composer-action-message"}>
-          {nodeActionError ?? nodeActionStatus ?? actionAvailability.rollback.reason ?? "Rollback affects selected and downstream workflow state, not evidence/history."}
+          {nodeActionError ?? nodeActionStatus ?? (
+            action === "repair" ? "Repair modifies the node's result using the After checkpoint." :
+            action === "variant" ? "Variant attempts a new run starting from the Before checkpoint." :
+            action === "rollback" ? (actionAvailability.rollback.reason ?? "Rollback affects selected and downstream workflow state, not evidence/history.") :
+            "Select an action to continue."
+          )}
         </p>
       )}
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>

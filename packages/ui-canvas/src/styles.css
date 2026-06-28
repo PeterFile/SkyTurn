@@ -6053,29 +6053,86 @@ select:focus-visible,
 
 /* Composer Selection State UI */
 
-.composer-context-pill {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin-bottom: 6px;
-  padding: 4px 10px;
+.agent-node-target-badge {
+  display: inline-block;
+  padding: 2px 6px;
   border-radius: 4px;
-  background-color: #dbeafe;
-  color: #051d48;
-  font-size: 13px;
-  width: max-content;
-}
-
-.composer-context-pill .pill-title {
-  font-weight: 700;
-}
-
-.composer-context-pill .pill-meta {
-  font-size: 11px;
-  color: #475569;
+  background-color: var(--sk-cobalt, #051d48);
+  color: var(--sk-paper-white, #fff);
+  font-size: 10px;
+  font-weight: 800;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  margin-left: 8px;
 }
+
+.composer-context-header {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 12px;
+  background-color: var(--sk-surface-warm-muted, #f1f5f9);
+  border: 1px solid var(--sk-border-muted, #e2e8f0);
+  border-radius: 6px;
+  margin-bottom: 8px;
+}
+
+.context-label {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  color: var(--sk-text-legacy-muted, #64748b);
+}
+
+.context-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--sk-ink, #0f172a);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 250px;
+}
+
+.context-meta {
+  font-size: 11px;
+  color: var(--sk-ink-muted, #475569);
+  font-family: var(--sk-font-mono, monospace);
+}
+
+.composer-evidence-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.evidence-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background-color: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  color: #334155;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.evidence-chip.impact {
+  background-color: #fef08a;
+  border-color: #fde047;
+  color: #854d0e;
+}
+
+.evidence-chip.error {
+  background-color: #fecdd3;
+  border-color: #fda4af;
+  color: #9f1239;
+}
+
 
 .composer-actions {
   display: flex;
@@ -6120,42 +6177,4 @@ select:focus-visible,
 
 .composer-action-message.error {
   color: var(--sk-status-failed-text);
-}
-
-.composer-checkpoint-summary,
-.composer-impact-summary {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-bottom: 8px;
-  padding: 6px 10px;
-  border-radius: 4px;
-  background-color: var(--sk-surface-warm-muted);
-  font-size: 12px;
-  color: var(--sk-ink-muted);
-}
-
-.checkpoint-row,
-.impact-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.checkpoint-label,
-.impact-label {
-  font-weight: 700;
-  color: var(--sk-ink);
-  min-width: 50px;
-}
-
-.checkpoint-missing {
-  color: var(--sk-status-warning-text);
-  font-style: italic;
-}
-
-.checkpoint-detail,
-.impact-detail {
-  font-family: var(--sk-font-mono);
-  font-size: 11px;
 }
