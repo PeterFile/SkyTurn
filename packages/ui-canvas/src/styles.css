@@ -6345,17 +6345,95 @@ select:focus-visible,
   margin-left: 8px;
 }
 
-.composer-context-header {
-  display: flex;
-  flex-direction: row;
-  flex-wrap: wrap;
-  align-items: baseline;
+.canvas-stage.has-selected-node {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.canvas-stage.has-selected-node .react-flow {
+  grid-row: 1;
+  min-height: 0;
+}
+
+.canvas-stage.has-selected-node .canvas-composer-shell {
+  position: relative;
+  left: auto;
+  bottom: auto;
+  grid-row: 2;
+  justify-self: center;
+  width: min(700px, calc(100% - 56px));
+  margin: 0 auto 14px;
+  transform: none;
+}
+
+.canvas-stage.has-selected-node .composer-selected-dock {
+  gap: 3px;
+  margin-bottom: 6px;
+  padding: 5px 10px;
+  max-height: 54px;
+  overflow: hidden;
+}
+
+.canvas-stage.has-selected-node .composer-dock-header,
+.canvas-stage.has-selected-node .composer-dock-actions {
   gap: 8px;
-  padding: 8px 12px;
+}
+
+.canvas-stage.has-selected-node .composer-dock-actions {
+  flex-wrap: nowrap;
+}
+
+.canvas-stage.has-selected-node .canvas-composer {
+  grid-template-rows: 28px 32px;
+  gap: 5px;
+  min-height: 0;
+  padding: 10px 14px 8px;
+}
+
+.canvas-stage.has-selected-node .canvas-composer::after {
+  top: -10px;
+  height: 22px;
+}
+
+.composer-selected-dock {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
   background-color: var(--sk-surface-warm-muted, #f1f5f9);
   border: 1px solid var(--sk-border-muted, #e2e8f0);
   border-radius: 6px;
-  margin-bottom: 8px;
+  padding: 6px 10px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.composer-dock-header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.composer-dock-actions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.composer-context-header {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  margin-bottom: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
 }
 
 .context-label {
@@ -6363,6 +6441,7 @@ select:focus-visible,
   font-weight: 800;
   text-transform: uppercase;
   color: var(--sk-text-legacy-muted, #64748b);
+  white-space: nowrap;
 }
 
 .context-title {
@@ -6372,7 +6451,7 @@ select:focus-visible,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 250px;
+  max-width: 200px;
 }
 
 .context-meta {
@@ -6381,11 +6460,11 @@ select:focus-visible,
   font-family: var(--sk-font-mono, monospace);
 }
 
-.composer-evidence-chips {
+.composer-evidence-summary {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 8px;
+  gap: 4px;
+  justify-content: flex-end;
 }
 
 .evidence-chip {
@@ -6412,12 +6491,11 @@ select:focus-visible,
   color: #9f1239;
 }
 
-
 .composer-actions {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px;
-  margin-bottom: 8px;
+  margin-bottom: 0;
 }
 
 .action-chip {
@@ -6449,11 +6527,16 @@ select:focus-visible,
 }
 
 .composer-action-message {
-  margin: 0 0 8px;
   font-size: 12px;
-  color: var(--sk-ink-muted);
+  color: var(--sk-text-muted, #64748b);
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
 }
 
 .composer-action-message.error {
-  color: var(--sk-status-failed-text);
+  color: var(--sk-status-failed-text, #e11d48);
 }
