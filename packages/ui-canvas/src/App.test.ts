@@ -265,10 +265,15 @@ describe("UI source validation", () => {
     });
   });
 
-  it("includes visible copy for new session target selection", async () => {
+  it("includes visible copy for new session target selection and uses custom listbox controls", async () => {
     const appSource = await readSource("./App.tsx");
     expect(appSource).toContain("Develop directly on the selected branch.");
     expect(appSource).toContain("Create a candidate worktree from the selected branch.");
+
+    const sessionComposer = appSource.slice(appSource.indexOf("function SessionComposer("), appSource.indexOf("function formatRelativeTime("));
+    expect(sessionComposer).not.toContain("<select");
+    expect(sessionComposer).toContain("<CustomSelect");
+    expect(sessionComposer).toContain("options={[");
   });
 
   it("PlanView is a single-page editor instead of three simultaneous markdown articles", async () => {
@@ -277,6 +282,11 @@ describe("UI source validation", () => {
 
     expect(planView).toContain("Review one plan page at a time");
     expect(planView).toContain("Ask agent to revise this page");
+    expect(planView).toContain("disabled={!allApproved}");
+    expect(planView).toContain('setActiveSection("design")');
+    expect(planView).toContain('setActiveSection("tasks")');
+    expect(planView).not.toContain('changeActiveSection("design")');
+    expect(planView).not.toContain('changeActiveSection("tasks")');
     expect(planView).toContain("<textarea");
     expect(planView).not.toContain("markdown-grid");
     expect(planView).not.toContain("<article");
@@ -672,10 +682,11 @@ describe("Slice C UI behavior", () => {
   it("clicking a node selects it and does not open modal/details", async () => {
     const appSource = await readSource("./App.tsx");
     const nodeCard = appSource.slice(appSource.indexOf('className="agent-card-select"'), appSource.indexOf('className="evidence-marker"'));
-    expect(nodeCard).toContain('onClick={() => data.onSelect(node.id)}');
+    expect(nodeCard).toContain('event.stopPropagation()');
+    expect(nodeCard).toContain('data.onSelect(node.id)');
     expect(nodeCard).not.toContain('data.onInspect');
     expect(nodeCard).toContain('role="button"');
-    expect(nodeCard).toContain('aria-pressed={selected}');
+    expect(nodeCard).toContain('aria-pressed={composerSelected}');
   });
 
   it("clicking the node card More button opens modal/details", async () => {
@@ -694,14 +705,17 @@ describe("Slice C UI behavior", () => {
     expect(canvasView).toContain("setInspectedNodeId((current) => (current === nodeId ? current : null))");
   });
 
-  it("React Flow visual selection follows the selected composer node", async () => {
+  it("node visual target state follows the selected composer node without driving React Flow selection", async () => {
     const appSource = await readSource("./App.tsx");
     const nodesSource = appSource.slice(appSource.indexOf("const nodesSource"), appSource.indexOf("const edges ="));
     const mergeNodes = appSource.slice(appSource.indexOf("function mergeFlowNodeState"), appSource.indexOf("const AGENT_HANDLE_SIZE"));
     const reactFlow = appSource.slice(appSource.indexOf("<ReactFlow"), appSource.indexOf("<CanvasViewportController"));
-    expect(nodesSource).toContain("selected: node.id === selectedNode?.id");
-    expect(nodesSource).toContain("selectedNode?.id");
-    expect(mergeNodes).toContain("selected: node.selected");
+    expect(nodesSource).toContain("composerSelected: node.id === selectedNodeId");
+    expect(nodesSource).toContain("selectedNodeId");
+    expect(mergeNodes).toContain("return changed ? merged : current");
+    expect(mergeNodes).toContain("selected: existing.selected");
+    expect(reactFlow).toContain("onPaneClick={() => onSelectNode(null)}");
+    expect(reactFlow).not.toContain("onSelectionChange");
     expect(reactFlow).not.toContain('role="listbox"');
   });
 
@@ -759,11 +773,15 @@ describe("Slice C UI behavior", () => {
     const appSource = await readSource("./App.tsx");
     const composer = appSource.slice(appSource.indexOf('function CanvasComposer('));
     expect(composer).toContain('selectedNode && (');
+    expect(composer).toContain('className="composer-selected-dock"');
     expect(composer).toContain('className="composer-context-header"');
-    expect(composer).toContain('Node action target:');
+    expect(composer).toContain('Target:');
     expect(composer).toContain('className="context-title"');
     expect(appSource).toContain('className="agent-node-target-badge"');
     expect(appSource).toContain('Composer target');
+    expect(appSource).toContain('has-selected-node');
+    expect(appSource).toContain('shouldAutoFitCanvas(session.nodes) || Boolean(selectedNodeId)');
+    expect(appSource).toContain('selectedNodeId ?? "none"');
   });
 
   it("action chips change composer mode/placeholder", async () => {

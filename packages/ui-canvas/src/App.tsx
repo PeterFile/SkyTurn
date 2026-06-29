@@ -166,6 +166,7 @@ gsap.registerPlugin(useGSAP);
 
 type AgentFlowNode = FlowNode<{
   node: CanvasNode;
+  composerSelected: boolean;
   onInspect: (nodeId: string) => void;
   onSelect: (nodeId: string) => void;
 }, "agent">;
@@ -1534,63 +1535,70 @@ function SessionComposer({
         />
       </div>
       <div className="control-strip">
-        <button
-          className="paper-pin-btn"
-          type="button"
-          title="Focus prompt"
-          aria-label="Focus prompt"
-          onClick={() => textareaRef.current?.focus()}
-        >
-          <Plus size={14} />
-        </button>
-        <ProjectDropdown
-          projects={projects}
-          selectedProjectId={selectedProjectId}
-          onChange={onProjectChange}
-        />
-        <ModeSwitch mode={mode} onChange={onModeChange} compact />
-
-        <div className="target-selector-group">
-          <div className="target-selector-inner">
-            <span className="target-label" aria-hidden="true">Target:</span>
-            <select
-              value={executionTarget}
-              onChange={e => setExecutionTarget(e.target.value as "current_branch" | "new_worktree")}
-              className="target-select"
-              aria-label="Execution Target"
-            >
-              <option value="current_branch">Current branch</option>
-              <option value="new_worktree">New worktree</option>
-            </select>
-            <span className="target-divider" aria-hidden="true">|</span>
-            <span className="target-label" aria-hidden="true">Branch:</span>
-            <select
-              value={selectedBranch}
-              onChange={e => setSelectedBranch(e.target.value)}
-              className="target-select branch-select"
-              aria-label="Branch"
-            >
-              {branches.map(b => <option key={b} value={b}>{b}</option>)}
-              {!branches.includes(selectedBranch) && <option value={selectedBranch}>{selectedBranch}</option>}
-            </select>
-          </div>
-          <span className="target-selector-hint">
-            {executionTarget === "current_branch"
-              ? "Develop directly on the selected branch."
-              : "Create a candidate worktree from the selected branch."}
-          </span>
+        <div className="control-strip-row">
+          <button
+            className="paper-pin-btn"
+            type="button"
+            title="Focus prompt"
+            aria-label="Focus prompt"
+            onClick={() => textareaRef.current?.focus()}
+          >
+            <Plus size={14} />
+          </button>
+          <ProjectDropdown
+            projects={projects}
+            selectedProjectId={selectedProjectId}
+            onChange={onProjectChange}
+          />
+          <span className="session-panel-spacer" />
+          <ModeSwitch mode={mode} onChange={onModeChange} compact />
         </div>
+        <div className="control-strip-row">
+          <div className="target-selector-group">
+            <div className="target-selector-inner">
+              <span className="target-label" aria-hidden="true">Target:</span>
+              <CustomSelect
+                value={executionTarget}
+                onChange={e => setExecutionTarget(e as "current_branch" | "new_worktree")}
+                ariaLabel="Execution Target"
+                className="target-dropdown"
+                options={[
+                  { value: "current_branch", label: "Current branch" },
+                  { value: "new_worktree", label: "New worktree" }
+                ]}
+              />
+              <span className="target-divider" aria-hidden="true">|</span>
+              <span className="target-label" aria-hidden="true">Branch:</span>
+              <CustomSelect
+                value={selectedBranch}
+                onChange={e => setSelectedBranch(e)}
+                ariaLabel="Branch"
+                className="branch-dropdown"
+                options={
+                  branches.includes(selectedBranch)
+                    ? branches.map(b => ({ value: b, label: b }))
+                    : [...branches, selectedBranch].map(b => ({ value: b, label: b }))
+                }
+              />
+            </div>
+            <span className="target-selector-hint">
+              {executionTarget === "current_branch"
+                ? "Develop directly on the selected branch."
+                : "Create a candidate worktree from the selected branch."}
+            </span>
+          </div>
 
-        <span className="session-panel-spacer" />
-        <button
-          className="send-stamp-btn"
-          type="submit"
-          disabled={!canCreate}
-          title="Create"
-          aria-label="Create"
-        >
-          <ArrowUp size={18} strokeWidth={3} className="send-arrow" />
-        </button>
+          <span className="session-panel-spacer" />
+          <button
+            className="send-stamp-btn"
+            type="submit"
+            disabled={!canCreate}
+            title="Create"
+            aria-label="Create"
+          >
+            <ArrowUp size={18} strokeWidth={3} className="send-arrow" />
+          </button>
+        </div>
       </div>
     </form>
   );
@@ -1624,6 +1632,12 @@ function PlanView({
   const [activeSection, setActiveSection] = useState<PlanSectionKey>("requirements");
   const [agentInstruction, setAgentInstruction] = useState("");
   const [revisionStatus, setRevisionStatus] = useState<string | null>(null);
+  const [approvals, setApprovals] = useState<Record<PlanSectionKey, boolean>>({
+    requirements: false,
+    design: false,
+    tasks: false,
+  });
+
   const editorId = useId();
   const requestId = useId();
   const activeIndex = Math.max(0, PLAN_SECTION_STEPS.findIndex((step) => step.key === activeSection));
@@ -1631,10 +1645,47 @@ function PlanView({
   const activeText = session.plan[activeStep.key];
   const isDesktopShell = typeof window !== "undefined" && Boolean(window.devflow);
 
+  function canAccessSection(section: PlanSectionKey) {
+    if (section === "requirements") return true;
+    if (section === "design") return approvals.requirements;
+    if (section === "tasks") return approvals.requirements && approvals.design;
+    return false;
+  }
+
   function changeActiveSection(section: PlanSectionKey) {
+    if (!canAccessSection(section)) return;
     setActiveSection(section);
     setRevisionStatus(null);
   }
+
+  function handlePlanChange(section: PlanSectionKey, value: string) {
+    onPlanChange(section, value);
+    setApprovals((prev) => {
+      if (!prev[section]) return prev;
+      const next = { ...prev };
+      next[section] = false;
+      if (section === "requirements") {
+        next.design = false;
+        next.tasks = false;
+      } else if (section === "design") {
+        next.tasks = false;
+      }
+      return next;
+    });
+  }
+
+  function handleApprove() {
+    setApprovals((prev) => ({ ...prev, [activeStep.key]: true }));
+    if (activeStep.key === "requirements") {
+      setActiveSection("design");
+      setRevisionStatus(null);
+    } else if (activeStep.key === "design") {
+      setActiveSection("tasks");
+      setRevisionStatus(null);
+    }
+  }
+
+  const allApproved = approvals.requirements && approvals.design && approvals.tasks;
 
   function requestAgentRevision(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1653,7 +1704,7 @@ function PlanView({
     const currentText = activeText.trimEnd();
     const nextText = currentText ? `${currentText}\n\n${revisionNote}` : revisionNote;
 
-    onPlanChange(activeStep.key, nextText);
+    handlePlanChange(activeStep.key, nextText);
     setAgentInstruction("");
     setRevisionStatus(
       isDesktopShell
@@ -1670,7 +1721,11 @@ function PlanView({
           <h2>{session.title}</h2>
           <p>Review one plan page at a time.</p>
         </div>
-        <button className="primary-action compact-action" onClick={() => onConfirm(session)}>
+        <button
+          className="primary-action compact-action"
+          disabled={!allApproved}
+          onClick={() => onConfirm(session)}
+        >
           <Play size={16} />
           Convert to Canvas
         </button>
@@ -1681,18 +1736,23 @@ function PlanView({
           Step {activeIndex + 1} of {PLAN_SECTION_STEPS.length}
         </span>
         <div className="plan-step-buttons">
-          {PLAN_SECTION_STEPS.map((step, index) => (
-            <button
-              key={step.key}
-              className={step.key === activeStep.key ? "active" : ""}
-              type="button"
-              aria-current={step.key === activeStep.key ? "step" : undefined}
-              onClick={() => changeActiveSection(step.key)}
-            >
-              <span>{index + 1}</span>
-              {step.label}
-            </button>
-          ))}
+          {PLAN_SECTION_STEPS.map((step, index) => {
+            const isApproved = approvals[step.key];
+            const isAccessible = canAccessSection(step.key);
+            return (
+              <button
+                key={step.key}
+                className={step.key === activeStep.key ? "active" : ""}
+                type="button"
+                aria-current={step.key === activeStep.key ? "step" : undefined}
+                disabled={!isAccessible}
+                onClick={() => changeActiveSection(step.key)}
+              >
+                <span>{isApproved ? <CheckCircle2 size={12} /> : index + 1}</span>
+                {step.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -1711,13 +1771,20 @@ function PlanView({
               >
                 Back
               </button>
-              <button
-                type="button"
-                disabled={activeIndex === PLAN_SECTION_STEPS.length - 1}
-                onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key ?? activeStep.key)}
-              >
-                Next
-              </button>
+              {approvals[activeStep.key] ? (
+                <button
+                  type="button"
+                  disabled={activeIndex === PLAN_SECTION_STEPS.length - 1 || !canAccessSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key as PlanSectionKey)}
+                  onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key ?? activeStep.key)}
+                >
+                  Next
+                </button>
+              ) : (
+                <button className="plan-approve-button" type="button" onClick={handleApprove}>
+                  <CheckCircle2 size={16} />
+                  {activeStep.key === "tasks" ? "Approve tasks" : `Approve ${activeStep.label.toLowerCase()} / Continue`}
+                </button>
+              )}
             </div>
           </div>
           <label className="plan-editor-label" htmlFor={editorId}>
@@ -1727,7 +1794,7 @@ function PlanView({
             id={editorId}
             className="plan-editor"
             value={activeText}
-            onChange={(event) => onPlanChange(activeStep.key, event.currentTarget.value)}
+            onChange={(event) => handlePlanChange(activeStep.key, event.currentTarget.value)}
           />
         </div>
 
@@ -1796,9 +1863,10 @@ function CanvasView({
   onInspectNode: (nodeId: string) => void;
 }) {
   const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
-  const autoFitCanvas = shouldAutoFitCanvas(session.nodes);
-  const fitPadding = canvasFitPadding(session.nodes);
-  const viewportSignature = canvasViewportSignature(session.nodes);
+  const selectedNodeId = selectedNode?.id ?? null;
+  const autoFitCanvas = shouldAutoFitCanvas(session.nodes) || Boolean(selectedNodeId);
+  const fitPadding = selectedNodeId ? Math.max(canvasFitPadding(session.nodes), 0.4) : canvasFitPadding(session.nodes);
+  const viewportSignature = `${canvasViewportSignature(session.nodes)}:${selectedNodeId ?? "none"}`;
   const nodesSource = useMemo<AgentFlowNode[]>(
     () =>
       session.nodes.map((node) => ({
@@ -1806,13 +1874,12 @@ function CanvasView({
         type: "agent",
         position: node.position,
         draggable: true,
-        selected: node.id === selectedNode?.id,
         initialWidth: ENERGY_FRAME.width,
         initialHeight: ENERGY_FRAME.height,
         handles: agentNodeHandles(),
-        data: { node, onInspect: onInspectNode, onSelect: onSelectNode },
+        data: { node, composerSelected: node.id === selectedNodeId, onInspect: onInspectNode, onSelect: onSelectNode },
       })),
-    [onInspectNode, onSelectNode, selectedNode?.id, session.nodes],
+    [onInspectNode, onSelectNode, selectedNodeId, session.nodes],
   );
   const edges = useMemo<AgentFlowEdge[]>(
     () =>
@@ -1853,17 +1920,14 @@ function CanvasView({
   );
 
   return (
-    <section className="canvas-stage">
+    <section className={`canvas-stage ${selectedNode ? 'has-selected-node' : ''}`}>
       <ReactFlow
         nodes={flowNodes}
         edges={edges}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         onNodesChange={handleNodesChange}
-        onSelectionChange={useCallback(({ nodes }: { nodes: FlowNode[] }) => {
-          const selected = nodes.find((n) => n.selected);
-          onSelectNode(selected ? selected.id : null);
-        }, [onSelectNode])}
+        onPaneClick={() => onSelectNode(null)}
         defaultViewport={{ x: 0, y: 0, zoom: CANVAS_NODE_LAYOUT.singleNodeZoom }}
         minZoom={0.22}
         maxZoom={1.35}
@@ -1942,9 +2006,27 @@ function mergeFlowNodeState(current: AgentFlowNode[], next: AgentFlowNode[]): Ag
   if (current.length === 0) return next;
 
   const currentById = new Map(current.map((node) => [node.id, node]));
-  return next.map((node) => {
+  let changed = current.length !== next.length;
+  const merged = next.map((node) => {
     const existing = currentById.get(node.id);
-    if (!existing) return node;
+    if (!existing) {
+      changed = true;
+      return node;
+    }
+
+    const canReuseExisting =
+      existing.type === node.type &&
+      existing.draggable === node.draggable &&
+      existing.position.x === node.position.x &&
+      existing.position.y === node.position.y &&
+      existing.data.node === node.data.node &&
+      existing.data.composerSelected === node.data.composerSelected &&
+      existing.data.onInspect === node.data.onInspect &&
+      existing.data.onSelect === node.data.onSelect;
+
+    if (canReuseExisting) return existing;
+
+    changed = true;
 
     return {
       ...existing,
@@ -1952,10 +2034,12 @@ function mergeFlowNodeState(current: AgentFlowNode[], next: AgentFlowNode[]): Ag
       dragging: existing.dragging,
       height: existing.height,
       measured: existing.measured,
-      selected: node.selected,
+      selected: existing.selected,
       width: existing.width,
     };
   });
+
+  return changed ? merged : current;
 }
 
 const AGENT_HANDLE_SIZE = 9;
@@ -2088,8 +2172,9 @@ function AgentEdge({
   );
 }
 
-function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
+function AgentNode({ data }: NodeProps<AgentFlowNode>) {
   const node = data.node;
+  const composerSelected = data.composerSelected;
   const rootRef = useRef<HTMLDivElement | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const markerRef = useRef<HTMLSpanElement | null>(null);
@@ -2280,21 +2365,21 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
 
       gsap.killTweensOf([root, card, handles, menu]);
       gsap.set(root, {
-        "--paper-curl-opacity": selected ? 0.8 : 0,
-        "--paper-curl-x": selected ? "2px" : "0px",
-        "--paper-curl-y": selected ? "-1px" : "0px",
-        "--paper-curl-rotate": selected ? "1.4deg" : "0deg",
-        "--underlayer-peek": selected ? "4px" : "0px",
-        "--tape-shadow-y": selected ? "2px" : "0px",
-        "--tape-shadow-blur": selected ? "3px" : "0px",
+        "--paper-curl-opacity": composerSelected ? 0.8 : 0,
+        "--paper-curl-x": composerSelected ? "2px" : "0px",
+        "--paper-curl-y": composerSelected ? "-1px" : "0px",
+        "--paper-curl-rotate": composerSelected ? "1.4deg" : "0deg",
+        "--underlayer-peek": composerSelected ? "4px" : "0px",
+        "--tape-shadow-y": composerSelected ? "2px" : "0px",
+        "--tape-shadow-blur": composerSelected ? "3px" : "0px",
       });
       gsap.set(card, { y: 0, rotation: 0, scale: 1 });
       gsap.set(handles, {
-        autoAlpha: selected ? 1 : 0,
-        scale: selected ? 1 : 0.92,
+        autoAlpha: composerSelected ? 1 : 0,
+        scale: composerSelected ? 1 : 0.92,
         transformOrigin: "50% 50%",
       });
-      gsap.set(menu, { autoAlpha: selected ? 1 : 0.72 });
+      gsap.set(menu, { autoAlpha: composerSelected ? 1 : 0.72 });
 
       if (userPrefersReducedMotion()) {
         return;
@@ -2306,7 +2391,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
           "--paper-curl-x": "2px",
           "--paper-curl-y": "-1px",
           "--paper-curl-rotate": "1.4deg",
-          "--underlayer-peek": selected ? "5px" : "3px",
+          "--underlayer-peek": composerSelected ? "5px" : "3px",
           "--tape-shadow-y": "2px",
           "--tape-shadow-blur": "3px",
           duration: MOTION_DURATION.fast,
@@ -2338,13 +2423,13 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
 
       const deactivate = safe(() => {
         gsap.to(root, {
-          "--paper-curl-opacity": selected ? 0.8 : 0,
-          "--paper-curl-x": selected ? "2px" : "0px",
-          "--paper-curl-y": selected ? "-1px" : "0px",
-          "--paper-curl-rotate": selected ? "1.4deg" : "0deg",
-          "--underlayer-peek": selected ? "4px" : "0px",
-          "--tape-shadow-y": selected ? "2px" : "0px",
-          "--tape-shadow-blur": selected ? "3px" : "0px",
+          "--paper-curl-opacity": composerSelected ? 0.8 : 0,
+          "--paper-curl-x": composerSelected ? "2px" : "0px",
+          "--paper-curl-y": composerSelected ? "-1px" : "0px",
+          "--paper-curl-rotate": composerSelected ? "1.4deg" : "0deg",
+          "--underlayer-peek": composerSelected ? "4px" : "0px",
+          "--tape-shadow-y": composerSelected ? "2px" : "0px",
+          "--tape-shadow-blur": composerSelected ? "3px" : "0px",
           duration: MOTION_DURATION.fast,
           ease: "power2.out",
           overwrite: "auto",
@@ -2358,14 +2443,14 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
           overwrite: "auto",
         });
         gsap.to(handles, {
-          autoAlpha: selected ? 1 : 0,
-          scale: selected ? 1 : 0.92,
+          autoAlpha: composerSelected ? 1 : 0,
+          scale: composerSelected ? 1 : 0.92,
           duration: MOTION_DURATION.fast,
           ease: "power2.out",
           overwrite: "auto",
         });
         gsap.to(menu, {
-          autoAlpha: selected ? 1 : 0.72,
+          autoAlpha: composerSelected ? 1 : 0.72,
           duration: MOTION_DURATION.fast,
           ease: "power2.out",
           overwrite: "auto",
@@ -2384,7 +2469,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
         root.removeEventListener("focusout", deactivate);
       };
     },
-    { dependencies: [selected], scope: rootRef, revertOnUpdate: true },
+    { dependencies: [composerSelected], scope: rootRef, revertOnUpdate: true },
   );
 
 
@@ -2392,7 +2477,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
   return (
     <div
       ref={rootRef}
-      className={`agent-node-shell ${node.status}${selected ? " selected" : ""}${rollbackStatus ? ` rollback-${rollbackStatus}` : ""}`}
+      className={`agent-node-shell ${node.status}${composerSelected ? " selected" : ""}${rollbackStatus ? ` rollback-${rollbackStatus}` : ""}`}
       data-state={node.status}
       data-phase={runtime.phase}
       data-rollback-status={rollbackStatus || undefined}
@@ -2408,12 +2493,16 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
           className="agent-card-select"
           role="button"
           tabIndex={0}
-          aria-pressed={selected}
+          aria-pressed={composerSelected}
           aria-label={`Select ${node.title}: ${agentIdentityForNode(node)}. ${footer.primary}${footer.secondary ? ` ${footer.secondary}` : ""}. ${summary}`}
-          onClick={() => data.onSelect(node.id)}
+          onClick={(event) => {
+            event.stopPropagation();
+            data.onSelect(node.id);
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
+              event.stopPropagation();
               data.onSelect(node.id);
             }
           }}
@@ -2424,7 +2513,7 @@ function AgentNode({ data, selected }: NodeProps<AgentFlowNode>) {
           </span>
           <div className="agent-node-header">
             <span className="agent-node-eyebrow">{eyebrow}</span>
-            {selected && <span className="agent-node-target-badge">Composer target</span>}
+            {composerSelected && <span className="agent-node-target-badge">Composer target</span>}
           </div>
           <span className="agent-node-title">{node.title}</span>
           <div className="agent-node-meta-row">
@@ -4808,84 +4897,80 @@ function CanvasComposer({
       onPointerDown={(event) => event.stopPropagation()}
     >
       {selectedNode && (
-        <div className="composer-context-header">
-          <span className="context-label">Node action target:</span>
-          <span className="context-title">{selectedNode.title}</span>
-          <span className="context-meta">({selectedNode.status})</span>
+        <div className="composer-selected-dock">
+          <div className="composer-dock-header">
+            <div className="composer-context-header">
+              <span className="context-label">Target:</span>
+              <span className="context-title" title={selectedNode.title}>{selectedNode.title}</span>
+            </div>
+            {selectedNodeActionState && (
+              <div className="composer-evidence-summary">
+                {(selectedNodeActionState.checkpoints.hasBefore || selectedNodeActionState.checkpoints.hasAfter) && (
+                  <span className="evidence-chip" title={`Before Checkpoint: ${selectedNodeActionState.checkpoints.beforeCheckpointId ?? 'none'}\nAfter Checkpoint: ${selectedNodeActionState.checkpoints.afterCheckpointId ?? 'none'}`}>
+                    <Check size={12} /> {selectedNodeActionState.checkpoints.hasBefore && selectedNodeActionState.checkpoints.hasAfter ? '2 Checkpoints' : '1 Checkpoint'}
+                  </span>
+                )}
+                {selectedNodeActionState.rollbackEligibility?.affectedLaneIds && selectedNodeActionState.rollbackEligibility.affectedLaneIds.length > 0 && (
+                  <span className="evidence-chip impact" title={`Restores to ${selectedNodeActionState.rollbackEligibility.restoreCommitRef}. ${selectedNodeActionState.rollbackEligibility.affectedLaneIds.length} downstream nodes affected.`}>
+                    <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility.affectedLaneIds.length} downstream
+                  </span>
+                )}
+                {selectedNodeActionState.remoteSideEffects.length > 0 && (
+                  <span className="evidence-chip error" title={`Remote blockers: ${selectedNodeActionState.remoteSideEffects.length}`}>
+                    <AlertTriangle size={12} /> {selectedNodeActionState.remoteSideEffects.length} remote blockers
+                  </span>
+                )}
+                {(selectedNodeActionState.rollbackEligibility?.manualRepairReason || selectedNodeActionState.needsBackendCheck) && (
+                  <span className="evidence-chip error" title={selectedNodeActionState.rollbackEligibility?.manualRepairReason || "Backend check required"}>
+                    <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility?.manualRepairReason ? "Repair blocked" : "Check required"}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="composer-dock-actions">
+            <div className="composer-actions">
+              <button
+                type="button"
+                className={`action-chip ${action === "repair" ? "selected" : ""}`}
+                onClick={() => setAction("repair")}
+                aria-pressed={action === "repair"}
+                disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
+                title={actionAvailability.repair.reason ?? "Repair"}
+              >
+                Repair
+              </button>
+              <button
+                type="button"
+                className={`action-chip ${action === "variant" ? "selected" : ""}`}
+                onClick={() => setAction("variant")}
+                aria-pressed={action === "variant"}
+                disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
+                title={actionAvailability.variant.reason ?? "Variant"}
+              >
+                Variant
+              </button>
+              <button
+                type="button"
+                className={`action-chip ${action === "rollback" ? "selected" : ""}`}
+                onClick={() => setAction("rollback")}
+                aria-pressed={action === "rollback"}
+                disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
+                title={actionAvailability.rollback.reason ?? "Rollback"}
+              >
+                Rollback
+              </button>
+            </div>
+            <p className={nodeActionError ? "composer-action-message error" : "composer-action-message"}>
+              {nodeActionError ?? nodeActionStatus ?? (
+                action === "repair" ? "Repair modifies result via After checkpoint." :
+                action === "variant" ? "Variant attempts run from Before checkpoint." :
+                action === "rollback" ? (actionAvailability.rollback.reason ?? "Rollback affects node & downstream.") :
+                "Select action to continue."
+              )}
+            </p>
+          </div>
         </div>
-      )}
-      {selectedNode && selectedNodeActionState && (
-        <div className="composer-evidence-chips">
-          {selectedNodeActionState.checkpoints.hasBefore && (
-            <span className="evidence-chip" title={`Before: ${selectedNodeActionState.checkpoints.beforeCheckpointId}`}>
-              <Check size={12} /> Before Checkpoint
-            </span>
-          )}
-          {selectedNodeActionState.checkpoints.hasAfter && (
-            <span className="evidence-chip" title={`After: ${selectedNodeActionState.checkpoints.afterCheckpointId}`}>
-              <Check size={12} /> After Checkpoint
-            </span>
-          )}
-          {selectedNodeActionState.rollbackEligibility?.affectedLaneIds && selectedNodeActionState.rollbackEligibility.affectedLaneIds.length > 0 && (
-            <span className="evidence-chip impact" title={`Restores to ${selectedNodeActionState.rollbackEligibility.restoreCommitRef}`}>
-              <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility.affectedLaneIds.length} downstream nodes affected
-            </span>
-          )}
-          {selectedNodeActionState.remoteSideEffects.length > 0 && (
-            <span className="evidence-chip error">
-              <AlertTriangle size={12} /> Remote blockers: {selectedNodeActionState.remoteSideEffects.length}
-            </span>
-          )}
-          {(selectedNodeActionState.rollbackEligibility?.manualRepairReason || selectedNodeActionState.needsBackendCheck) && (
-            <span className="evidence-chip error">
-              <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility?.manualRepairReason || "Backend check required"}
-            </span>
-          )}
-        </div>
-      )}
-      {selectedNode && (
-        <div className="composer-actions">
-          <button
-            type="button"
-            className={`action-chip ${action === "repair" ? "selected" : ""}`}
-            onClick={() => setAction("repair")}
-            aria-pressed={action === "repair"}
-            disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
-            title={actionAvailability.repair.reason ?? "Repair"}
-          >
-            Repair
-          </button>
-          <button
-            type="button"
-            className={`action-chip ${action === "variant" ? "selected" : ""}`}
-            onClick={() => setAction("variant")}
-            aria-pressed={action === "variant"}
-            disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
-            title={actionAvailability.variant.reason ?? "Variant"}
-          >
-            Variant
-          </button>
-          <button
-            type="button"
-            className={`action-chip ${action === "rollback" ? "selected" : ""}`}
-            onClick={() => setAction("rollback")}
-            aria-pressed={action === "rollback"}
-            disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
-            title={actionAvailability.rollback.reason ?? "Rollback"}
-          >
-            Rollback
-          </button>
-        </div>
-      )}
-      {selectedNode && (
-        <p className={nodeActionError ? "composer-action-message error" : "composer-action-message"}>
-          {nodeActionError ?? nodeActionStatus ?? (
-            action === "repair" ? "Repair modifies the node's result using the After checkpoint." :
-            action === "variant" ? "Variant attempts a new run starting from the Before checkpoint." :
-            action === "rollback" ? (actionAvailability.rollback.reason ?? "Rollback affects selected and downstream workflow state, not evidence/history.") :
-            "Select an action to continue."
-          )}
-        </p>
       )}
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
         <input
@@ -4937,6 +5022,154 @@ function CanvasComposer({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function CustomSelect<T extends string>({
+  value,
+  options,
+  onChange,
+  ariaLabel,
+  className = "",
+}: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (value: T) => void;
+  ariaLabel: string;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const listboxRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const listboxId = useId();
+  const optionIdPrefix = useId();
+
+  const selectedIndex = Math.max(0, options.findIndex((o) => o.value === value));
+  const activeOption = options[activeIndex] ?? options[0];
+
+  useEffect(() => {
+    if (open) {
+      setActiveIndex(selectedIndex);
+    }
+  }, [open, selectedIndex]);
+
+  useEffect(() => {
+    if (!open) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [open]);
+
+  useGSAP(() => {
+    if (open && listboxRef.current && !userPrefersReducedMotion()) {
+      gsap.fromTo(
+        listboxRef.current,
+        { y: -10, opacity: 0, clipPath: "polygon(0 0, 100% 0, 100% 0, 0 0)" },
+        {
+          y: 0,
+          opacity: 1,
+          clipPath: "polygon(0 0, 100% 0, 99% 100%, 1% 100%)",
+          duration: 0.2,
+          ease: "power2.out",
+        },
+      );
+    }
+  }, [open]);
+
+  function openListbox(nextIndex = selectedIndex) {
+    if (options.length === 0) return;
+    setActiveIndex(nextIndex);
+    setOpen(true);
+  }
+
+  function moveActive(direction: 1 | -1) {
+    if (options.length === 0) return;
+    setActiveIndex((current) => (current + direction + options.length) % options.length);
+  }
+
+  function selectOption(val: T) {
+    onChange(val);
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
+
+  function handleTriggerKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (open && activeOption) {
+        selectOption(activeOption.value);
+      } else {
+        openListbox();
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!open) {
+        openListbox(event.key === "ArrowDown" ? selectedIndex : Math.max(0, selectedIndex - 1));
+        return;
+      }
+      moveActive(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+
+    if (event.key === "Escape" && open) {
+      event.preventDefault();
+      setOpen(false);
+    }
+  }
+
+  const selectedLabel = options.find((o) => o.value === value)?.label ?? value;
+
+  return (
+    <div className={`custom-select-dropdown ${open ? "open" : ""} ${className}`} ref={rootRef}>
+      <button
+        type="button"
+        className="custom-select-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listboxId : undefined}
+        aria-activedescendant={open && activeOption ? `${optionIdPrefix}-${activeOption.value}` : undefined}
+        aria-label={ariaLabel}
+        onClick={() => (open ? setOpen(false) : openListbox())}
+        onKeyDown={handleTriggerKeyDown}
+        ref={triggerRef}
+        disabled={options.length === 0}
+      >
+        <span className="custom-select-value">{selectedLabel}</span>
+        <ChevronDown size={14} className="chevron-icon" />
+      </button>
+      {open && (
+        <div id={listboxId} ref={listboxRef} className="custom-select-listbox" role="listbox" aria-label={ariaLabel}>
+          {options.map((option, index) => (
+            <button
+              key={option.value}
+              id={`${optionIdPrefix}-${option.value}`}
+              type="button"
+              role="option"
+              aria-selected={option.value === value}
+              className={[
+                "custom-select-option",
+                option.value === value ? "selected" : "",
+                index === activeIndex ? "active" : "",
+              ].filter(Boolean).join(" ")}
+              onMouseEnter={() => setActiveIndex(index)}
+              onClick={() => selectOption(option.value)}
+            >
+              {option.value === value && <span className="custom-select-indicator" />}
+              {option.label}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -5095,11 +5328,11 @@ function ModeSwitch({
   onChange: (mode: WorkflowMode) => void;
 }) {
   return (
-    <div className={`stamp-toggle ${compact ? "compact" : ""}`} role="group" aria-label="Mode">
-      <button className={`stamp-btn fast-stamp ${mode === "fast" ? "active" : ""}`} onClick={() => onChange("fast")} type="button">
+    <div className={`mode-segmented-switch ${compact ? "compact" : ""}`} role="group" aria-label="Mode">
+      <button className={`mode-segment-btn ${mode === "fast" ? "active" : ""}`} onClick={() => onChange("fast")} type="button">
         Fast
       </button>
-      <button className={`stamp-btn plan-stamp ${mode === "plan" ? "active" : ""}`} onClick={() => onChange("plan")} type="button">
+      <button className={`mode-segment-btn ${mode === "plan" ? "active" : ""}`} onClick={() => onChange("plan")} type="button">
         Plan
       </button>
     </div>
