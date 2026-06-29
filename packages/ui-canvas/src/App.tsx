@@ -1534,63 +1534,70 @@ function SessionComposer({
         />
       </div>
       <div className="control-strip">
-        <button
-          className="paper-pin-btn"
-          type="button"
-          title="Focus prompt"
-          aria-label="Focus prompt"
-          onClick={() => textareaRef.current?.focus()}
-        >
-          <Plus size={14} />
-        </button>
-        <ProjectDropdown
-          projects={projects}
-          selectedProjectId={selectedProjectId}
-          onChange={onProjectChange}
-        />
-        <ModeSwitch mode={mode} onChange={onModeChange} compact />
-
-        <div className="target-selector-group">
-          <div className="target-selector-inner">
-            <span className="target-label" aria-hidden="true">Target:</span>
-            <select
-              value={executionTarget}
-              onChange={e => setExecutionTarget(e.target.value as "current_branch" | "new_worktree")}
-              className="target-select"
-              aria-label="Execution Target"
-            >
-              <option value="current_branch">Current branch</option>
-              <option value="new_worktree">New worktree</option>
-            </select>
-            <span className="target-divider" aria-hidden="true">|</span>
-            <span className="target-label" aria-hidden="true">Branch:</span>
-            <select
-              value={selectedBranch}
-              onChange={e => setSelectedBranch(e.target.value)}
-              className="target-select branch-select"
-              aria-label="Branch"
-            >
-              {branches.map(b => <option key={b} value={b}>{b}</option>)}
-              {!branches.includes(selectedBranch) && <option value={selectedBranch}>{selectedBranch}</option>}
-            </select>
-          </div>
-          <span className="target-selector-hint">
-            {executionTarget === "current_branch"
-              ? "Develop directly on the selected branch."
-              : "Create a candidate worktree from the selected branch."}
-          </span>
+        <div className="control-strip-row">
+          <button
+            className="paper-pin-btn"
+            type="button"
+            title="Focus prompt"
+            aria-label="Focus prompt"
+            onClick={() => textareaRef.current?.focus()}
+          >
+            <Plus size={14} />
+          </button>
+          <ProjectDropdown
+            projects={projects}
+            selectedProjectId={selectedProjectId}
+            onChange={onProjectChange}
+          />
+          <span className="session-panel-spacer" />
+          <ModeSwitch mode={mode} onChange={onModeChange} compact />
         </div>
+        <div className="control-strip-row">
+          <div className="target-selector-group">
+            <div className="target-selector-inner">
+              <span className="target-label" aria-hidden="true">Target:</span>
+              <CustomSelect
+                value={executionTarget}
+                onChange={e => setExecutionTarget(e as "current_branch" | "new_worktree")}
+                ariaLabel="Execution Target"
+                className="target-dropdown"
+                options={[
+                  { value: "current_branch", label: "Current branch" },
+                  { value: "new_worktree", label: "New worktree" }
+                ]}
+              />
+              <span className="target-divider" aria-hidden="true">|</span>
+              <span className="target-label" aria-hidden="true">Branch:</span>
+              <CustomSelect
+                value={selectedBranch}
+                onChange={e => setSelectedBranch(e)}
+                ariaLabel="Branch"
+                className="branch-dropdown"
+                options={
+                  branches.includes(selectedBranch)
+                    ? branches.map(b => ({ value: b, label: b }))
+                    : [...branches, selectedBranch].map(b => ({ value: b, label: b }))
+                }
+              />
+            </div>
+            <span className="target-selector-hint">
+              {executionTarget === "current_branch"
+                ? "Develop directly on the selected branch."
+                : "Create a candidate worktree from the selected branch."}
+            </span>
+          </div>
 
-        <span className="session-panel-spacer" />
-        <button
-          className="send-stamp-btn"
-          type="submit"
-          disabled={!canCreate}
-          title="Create"
-          aria-label="Create"
-        >
-          <ArrowUp size={18} strokeWidth={3} className="send-arrow" />
-        </button>
+          <span className="session-panel-spacer" />
+          <button
+            className="send-stamp-btn"
+            type="submit"
+            disabled={!canCreate}
+            title="Create"
+            aria-label="Create"
+          >
+            <ArrowUp size={18} strokeWidth={3} className="send-arrow" />
+          </button>
+        </div>
       </div>
     </form>
   );
@@ -5000,6 +5007,154 @@ function CanvasComposer({
   );
 }
 
+function CustomSelect<T extends string>({
+  value,
+  options,
+  onChange,
+  ariaLabel,
+  className = "",
+}: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (value: T) => void;
+  ariaLabel: string;
+  className?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const listboxRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const listboxId = useId();
+  const optionIdPrefix = useId();
+
+  const selectedIndex = Math.max(0, options.findIndex((o) => o.value === value));
+  const activeOption = options[activeIndex] ?? options[0];
+
+  useEffect(() => {
+    if (open) {
+      setActiveIndex(selectedIndex);
+    }
+  }, [open, selectedIndex]);
+
+  useEffect(() => {
+    if (!open) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [open]);
+
+  useGSAP(() => {
+    if (open && listboxRef.current && !userPrefersReducedMotion()) {
+      gsap.fromTo(
+        listboxRef.current,
+        { y: -10, opacity: 0, clipPath: "polygon(0 0, 100% 0, 100% 0, 0 0)" },
+        {
+          y: 0,
+          opacity: 1,
+          clipPath: "polygon(0 0, 100% 0, 99% 100%, 1% 100%)",
+          duration: 0.2,
+          ease: "power2.out",
+        },
+      );
+    }
+  }, [open]);
+
+  function openListbox(nextIndex = selectedIndex) {
+    if (options.length === 0) return;
+    setActiveIndex(nextIndex);
+    setOpen(true);
+  }
+
+  function moveActive(direction: 1 | -1) {
+    if (options.length === 0) return;
+    setActiveIndex((current) => (current + direction + options.length) % options.length);
+  }
+
+  function selectOption(val: T) {
+    onChange(val);
+    setOpen(false);
+    triggerRef.current?.focus();
+  }
+
+  function handleTriggerKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (open && activeOption) {
+        selectOption(activeOption.value);
+      } else {
+        openListbox();
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!open) {
+        openListbox(event.key === "ArrowDown" ? selectedIndex : Math.max(0, selectedIndex - 1));
+        return;
+      }
+      moveActive(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+
+    if (event.key === "Escape" && open) {
+      event.preventDefault();
+      setOpen(false);
+    }
+  }
+
+  const selectedLabel = options.find((o) => o.value === value)?.label ?? value;
+
+  return (
+    <div className={`custom-select-dropdown ${open ? "open" : ""} ${className}`} ref={rootRef}>
+      <button
+        type="button"
+        className="custom-select-trigger"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listboxId : undefined}
+        aria-activedescendant={open && activeOption ? `${optionIdPrefix}-${activeOption.value}` : undefined}
+        aria-label={ariaLabel}
+        onClick={() => (open ? setOpen(false) : openListbox())}
+        onKeyDown={handleTriggerKeyDown}
+        ref={triggerRef}
+        disabled={options.length === 0}
+      >
+        <span className="custom-select-value">{selectedLabel}</span>
+        <ChevronDown size={14} className="chevron-icon" />
+      </button>
+      {open && (
+        <div id={listboxId} ref={listboxRef} className="custom-select-listbox" role="listbox" aria-label={ariaLabel}>
+          {options.map((option, index) => (
+            <button
+              key={option.value}
+              id={`${optionIdPrefix}-${option.value}`}
+              type="button"
+              role="option"
+              aria-selected={option.value === value}
+              className={[
+                "custom-select-option",
+                option.value === value ? "selected" : "",
+                index === activeIndex ? "active" : "",
+              ].filter(Boolean).join(" ")}
+              onMouseEnter={() => setActiveIndex(index)}
+              onClick={() => selectOption(option.value)}
+            >
+              {option.value === value && <span className="custom-select-indicator" />}
+              {option.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProjectDropdown({
   projects,
   selectedProjectId,
@@ -5154,11 +5309,11 @@ function ModeSwitch({
   onChange: (mode: WorkflowMode) => void;
 }) {
   return (
-    <div className={`stamp-toggle ${compact ? "compact" : ""}`} role="group" aria-label="Mode">
-      <button className={`stamp-btn fast-stamp ${mode === "fast" ? "active" : ""}`} onClick={() => onChange("fast")} type="button">
+    <div className={`mode-segmented-switch ${compact ? "compact" : ""}`} role="group" aria-label="Mode">
+      <button className={`mode-segment-btn ${mode === "fast" ? "active" : ""}`} onClick={() => onChange("fast")} type="button">
         Fast
       </button>
-      <button className={`stamp-btn plan-stamp ${mode === "plan" ? "active" : ""}`} onClick={() => onChange("plan")} type="button">
+      <button className={`mode-segment-btn ${mode === "plan" ? "active" : ""}`} onClick={() => onChange("plan")} type="button">
         Plan
       </button>
     </div>

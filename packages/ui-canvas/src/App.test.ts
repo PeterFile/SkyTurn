@@ -265,10 +265,15 @@ describe("UI source validation", () => {
     });
   });
 
-  it("includes visible copy for new session target selection", async () => {
+  it("includes visible copy for new session target selection and uses custom listbox controls", async () => {
     const appSource = await readSource("./App.tsx");
     expect(appSource).toContain("Develop directly on the selected branch.");
     expect(appSource).toContain("Create a candidate worktree from the selected branch.");
+
+    const sessionComposer = appSource.slice(appSource.indexOf("function SessionComposer("), appSource.indexOf("function formatRelativeTime("));
+    expect(sessionComposer).not.toContain("<select");
+    expect(sessionComposer).toContain("<CustomSelect");
+    expect(sessionComposer).toContain("options={[");
   });
 
   it("PlanView is a single-page editor instead of three simultaneous markdown articles", async () => {
