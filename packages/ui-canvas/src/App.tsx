@@ -1624,6 +1624,12 @@ function PlanView({
   const [activeSection, setActiveSection] = useState<PlanSectionKey>("requirements");
   const [agentInstruction, setAgentInstruction] = useState("");
   const [revisionStatus, setRevisionStatus] = useState<string | null>(null);
+  const [approvals, setApprovals] = useState<Record<PlanSectionKey, boolean>>({
+    requirements: false,
+    design: false,
+    tasks: false,
+  });
+
   const editorId = useId();
   const requestId = useId();
   const activeIndex = Math.max(0, PLAN_SECTION_STEPS.findIndex((step) => step.key === activeSection));
@@ -1631,10 +1637,47 @@ function PlanView({
   const activeText = session.plan[activeStep.key];
   const isDesktopShell = typeof window !== "undefined" && Boolean(window.devflow);
 
+  function canAccessSection(section: PlanSectionKey) {
+    if (section === "requirements") return true;
+    if (section === "design") return approvals.requirements;
+    if (section === "tasks") return approvals.requirements && approvals.design;
+    return false;
+  }
+
   function changeActiveSection(section: PlanSectionKey) {
+    if (!canAccessSection(section)) return;
     setActiveSection(section);
     setRevisionStatus(null);
   }
+
+  function handlePlanChange(section: PlanSectionKey, value: string) {
+    onPlanChange(section, value);
+    setApprovals((prev) => {
+      if (!prev[section]) return prev;
+      const next = { ...prev };
+      next[section] = false;
+      if (section === "requirements") {
+        next.design = false;
+        next.tasks = false;
+      } else if (section === "design") {
+        next.tasks = false;
+      }
+      return next;
+    });
+  }
+
+  function handleApprove() {
+    setApprovals((prev) => ({ ...prev, [activeStep.key]: true }));
+    if (activeStep.key === "requirements") {
+      setActiveSection("design");
+      setRevisionStatus(null);
+    } else if (activeStep.key === "design") {
+      setActiveSection("tasks");
+      setRevisionStatus(null);
+    }
+  }
+
+  const allApproved = approvals.requirements && approvals.design && approvals.tasks;
 
   function requestAgentRevision(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1653,7 +1696,7 @@ function PlanView({
     const currentText = activeText.trimEnd();
     const nextText = currentText ? `${currentText}\n\n${revisionNote}` : revisionNote;
 
-    onPlanChange(activeStep.key, nextText);
+    handlePlanChange(activeStep.key, nextText);
     setAgentInstruction("");
     setRevisionStatus(
       isDesktopShell
@@ -1670,7 +1713,11 @@ function PlanView({
           <h2>{session.title}</h2>
           <p>Review one plan page at a time.</p>
         </div>
-        <button className="primary-action compact-action" onClick={() => onConfirm(session)}>
+        <button
+          className="primary-action compact-action"
+          disabled={!allApproved}
+          onClick={() => onConfirm(session)}
+        >
           <Play size={16} />
           Convert to Canvas
         </button>
@@ -1681,18 +1728,23 @@ function PlanView({
           Step {activeIndex + 1} of {PLAN_SECTION_STEPS.length}
         </span>
         <div className="plan-step-buttons">
-          {PLAN_SECTION_STEPS.map((step, index) => (
-            <button
-              key={step.key}
-              className={step.key === activeStep.key ? "active" : ""}
-              type="button"
-              aria-current={step.key === activeStep.key ? "step" : undefined}
-              onClick={() => changeActiveSection(step.key)}
-            >
-              <span>{index + 1}</span>
-              {step.label}
-            </button>
-          ))}
+          {PLAN_SECTION_STEPS.map((step, index) => {
+            const isApproved = approvals[step.key];
+            const isAccessible = canAccessSection(step.key);
+            return (
+              <button
+                key={step.key}
+                className={step.key === activeStep.key ? "active" : ""}
+                type="button"
+                aria-current={step.key === activeStep.key ? "step" : undefined}
+                disabled={!isAccessible}
+                onClick={() => changeActiveSection(step.key)}
+              >
+                <span>{isApproved ? <CheckCircle2 size={12} /> : index + 1}</span>
+                {step.label}
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -1711,13 +1763,20 @@ function PlanView({
               >
                 Back
               </button>
-              <button
-                type="button"
-                disabled={activeIndex === PLAN_SECTION_STEPS.length - 1}
-                onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key ?? activeStep.key)}
-              >
-                Next
-              </button>
+              {approvals[activeStep.key] ? (
+                <button
+                  type="button"
+                  disabled={activeIndex === PLAN_SECTION_STEPS.length - 1 || !canAccessSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key as PlanSectionKey)}
+                  onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key ?? activeStep.key)}
+                >
+                  Next
+                </button>
+              ) : (
+                <button className="plan-approve-button" type="button" onClick={handleApprove}>
+                  <CheckCircle2 size={16} />
+                  {activeStep.key === "tasks" ? "Approve tasks" : `Approve ${activeStep.label.toLowerCase()} / Continue`}
+                </button>
+              )}
             </div>
           </div>
           <label className="plan-editor-label" htmlFor={editorId}>
@@ -1727,7 +1786,7 @@ function PlanView({
             id={editorId}
             className="plan-editor"
             value={activeText}
-            onChange={(event) => onPlanChange(activeStep.key, event.currentTarget.value)}
+            onChange={(event) => handlePlanChange(activeStep.key, event.currentTarget.value)}
           />
         </div>
 
