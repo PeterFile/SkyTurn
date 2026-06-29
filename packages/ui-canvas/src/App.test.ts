@@ -277,6 +277,11 @@ describe("UI source validation", () => {
 
     expect(planView).toContain("Review one plan page at a time");
     expect(planView).toContain("Ask agent to revise this page");
+    expect(planView).toContain("disabled={!allApproved}");
+    expect(planView).toContain('setActiveSection("design")');
+    expect(planView).toContain('setActiveSection("tasks")');
+    expect(planView).not.toContain('changeActiveSection("design")');
+    expect(planView).not.toContain('changeActiveSection("tasks")');
     expect(planView).toContain("<textarea");
     expect(planView).not.toContain("markdown-grid");
     expect(planView).not.toContain("<article");

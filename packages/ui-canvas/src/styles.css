@@ -531,6 +531,17 @@ h2 {
   font-weight: 800;
 }
 
+.plan-step-actions button.plan-approve-button {
+  background: var(--sk-info-light);
+  border-color: var(--sk-info);
+  color: var(--sk-info-dark);
+}
+
+.plan-step-buttons button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .plan-step-buttons button {
   justify-content: flex-start;
 }
