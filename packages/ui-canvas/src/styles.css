@@ -1074,16 +1074,31 @@ h2 {
 }
 
 .target-selector-inner {
+  position: relative;
+  isolation: isolate;
   display: flex;
   align-items: center;
   gap: 4px;
   height: 34px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.target-selector-inner::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
   background-color: #f8fafc;
   background-image: var(--sk-paper-white);
   box-shadow: 0 2px 5px rgba(5, 29, 72, 0.1), inset 0 0 0 1px rgba(5, 29, 72, 0.1);
   clip-path: polygon(1% 4%, 99% 0, 97% 96%, 0 100%);
-  padding: 0 10px;
-  font-size: 12px;
+  pointer-events: none;
+}
+
+.target-selector-inner > * {
+  position: relative;
+  z-index: 1;
 }
 
 .target-label {
@@ -1095,6 +1110,10 @@ h2 {
 .custom-select-dropdown {
   position: relative;
   display: inline-flex;
+}
+
+.custom-select-dropdown.open {
+  z-index: 90;
 }
 
 .custom-select-trigger {
@@ -5752,10 +5771,16 @@ select:focus-visible,
 }
 
 .control-strip-row {
+  position: relative;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 12px;
   width: 100%;
+}
+
+.control-strip-row:first-child {
+  z-index: 4;
 }
 
 .control-strip-row > * {
@@ -5851,6 +5876,10 @@ select:focus-visible,
   position: relative;
   flex: 0 1 min(240px, 34vw);
   min-width: 0;
+}
+
+.project-dropdown.open {
+  z-index: 90;
 }
 
 .project-dropdown-trigger {

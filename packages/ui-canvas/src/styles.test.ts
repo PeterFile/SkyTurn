@@ -130,6 +130,19 @@ describe("SkyTurn UI style tokens", () => {
     expect(styles).toContain("background-color: #083176");
   });
 
+  it("keeps New Session listboxes above the intake paper instead of clipping them", async () => {
+    const styles = await readSource("./styles.css");
+    const targetSelectorBlock = lastCssBlock(styles, ".target-selector-inner");
+    const customSelectOpenBlock = lastCssBlock(styles, ".custom-select-dropdown.open");
+    const projectDropdownOpenBlock = lastCssBlock(styles, ".project-dropdown.open");
+
+    expect(targetSelectorBlock).not.toContain("clip-path");
+    expect(styles).toContain(".target-selector-inner::before");
+    expect(styles).toContain(".control-strip-row:first-child");
+    expect(customSelectOpenBlock).toContain("z-index:");
+    expect(projectDropdownOpenBlock).toContain("z-index:");
+  });
+
   it("keeps node details as a transparent right-side drawer", async () => {
     const styles = await readSource("./styles.css");
     const drawerBlock = styles.slice(styles.indexOf("/* Right-side node detail drawer"));
