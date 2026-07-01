@@ -15,6 +15,7 @@ import {
   normalizeSessionTarget,
   type AgentDescriptor,
   type AgentKind,
+  type AgentTerminalSession,
   type AgentRun,
   type AgentWorkflowReadinessSummary,
   type CanvasNode,
@@ -27,6 +28,9 @@ import {
   type RunEvidence,
   type SessionTarget,
   type StartAgentRunInput,
+  type TerminalOutputStream,
+  type TerminalSessionEventDraft,
+  type TerminalSessionStatus,
   type WorkflowLedgerSummary,
   type WorkflowNodeCheckpoint,
   type WorkflowRollbackEligibility,
@@ -103,6 +107,92 @@ export interface FinalChangesetReconciliationRequest {
   target: SessionTarget;
   baselineRef?: string;
   runEvents?: RunEvent[];
+}
+
+export type TerminalUnsupportedReasonCode =
+  | "PTY_INTERACTIVE_DISABLED"
+  | "PTY_MANAGER_UNAVAILABLE";
+export type TerminalSnapshotUnavailableReasonCode = "TERMINAL_SESSION_NOT_FOUND";
+
+export interface TerminalStartInput {
+  projectRoot: string;
+  canvasSessionId: string;
+  runId: string;
+  agentKind: AgentKind;
+  cwd?: string;
+  commandLabel?: string;
+  rows?: number;
+  cols?: number;
+}
+
+export interface TerminalWriteInput {
+  terminalSessionId: string;
+  data: string;
+}
+
+export interface TerminalResizeInput {
+  terminalSessionId: string;
+  rows: number;
+  cols: number;
+}
+
+export interface TerminalCancelInput {
+  terminalSessionId: string;
+  reason?: string;
+}
+
+export interface TerminalSnapshotInput {
+  terminalSessionId: string;
+}
+
+export interface TerminalActionResult {
+  protocolVersion: number;
+  ok: boolean;
+  status: "accepted" | "unsupported" | "degraded";
+  terminalSessionId?: string;
+  reasonCode?: TerminalUnsupportedReasonCode;
+  message?: string;
+}
+
+export interface TerminalStartResult extends TerminalActionResult {
+  session?: AgentTerminalSession;
+}
+
+export interface TerminalSnapshotLine {
+  sequence: number;
+  text: string;
+  stream: TerminalOutputStream;
+  timestamp?: string;
+}
+
+export interface TerminalSnapshotResult {
+  protocolVersion: number;
+  terminalSessionId: string;
+  status: TerminalSessionStatus | "unavailable";
+  sequence: number;
+  rows: number;
+  cols: number;
+  cursor: {
+    row: number;
+    col: number;
+  };
+  lines: TerminalSnapshotLine[];
+  updatedAt?: string;
+  reasonCode?: TerminalUnsupportedReasonCode | TerminalSnapshotUnavailableReasonCode;
+  message?: string;
+}
+
+export type TerminalRendererEvent = TerminalSessionEventDraft & {
+  protocolVersion: number;
+};
+
+export interface TerminalApi {
+  start: (input: TerminalStartInput) => Promise<TerminalStartResult>;
+  write: (input: TerminalWriteInput) => Promise<TerminalActionResult>;
+  resize: (input: TerminalResizeInput) => Promise<TerminalActionResult>;
+  cancel: (input: TerminalCancelInput) => Promise<TerminalActionResult>;
+  snapshot: (input: TerminalSnapshotInput) => Promise<TerminalSnapshotResult>;
+  onEvent: (listener: (event: TerminalRendererEvent) => void) => () => void;
 }
 
 export interface WorkflowApi {
@@ -186,6 +276,7 @@ export interface DevflowApi {
   recordWorkflowRunResult: (projectRoot: string, input: WorkflowRunResultRecordRequest) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   workflow: WorkflowApi;
+  terminal: TerminalApi;
   getWorkflowEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
   pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => Promise<WorkflowDeliveryPushResult>;

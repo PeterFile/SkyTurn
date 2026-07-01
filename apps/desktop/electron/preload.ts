@@ -1,4 +1,28 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type {
+  TerminalActionResult,
+  TerminalCancelInput,
+  TerminalRendererEvent,
+  TerminalResizeInput,
+  TerminalSnapshotInput,
+  TerminalSnapshotResult,
+  TerminalStartInput,
+  TerminalStartResult,
+  TerminalWriteInput,
+} from "./terminalIpcContracts";
+
+const terminal = {
+  start: (input: TerminalStartInput): Promise<TerminalStartResult> => ipcRenderer.invoke("terminal:start", input),
+  write: (input: TerminalWriteInput): Promise<TerminalActionResult> => ipcRenderer.invoke("terminal:write", input),
+  resize: (input: TerminalResizeInput): Promise<TerminalActionResult> => ipcRenderer.invoke("terminal:resize", input),
+  cancel: (input: TerminalCancelInput): Promise<TerminalActionResult> => ipcRenderer.invoke("terminal:cancel", input),
+  snapshot: (input: TerminalSnapshotInput): Promise<TerminalSnapshotResult> => ipcRenderer.invoke("terminal:snapshot", input),
+  onEvent: (listener: (event: TerminalRendererEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, value: TerminalRendererEvent) => listener(value);
+    ipcRenderer.on("terminal:event", handler);
+    return () => ipcRenderer.removeListener("terminal:event", handler);
+  },
+};
 
 const workflow = {
   createSession: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:createSession", projectRoot, input),
@@ -62,6 +86,7 @@ contextBridge.exposeInMainWorld("devflow", {
   mergeWorkflowPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:merge", projectRoot, input),
   syncWorkflowMain: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:syncMain", projectRoot, input),
   workflow,
+  terminal,
   onRunEvent: (listener: (event: unknown) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value);
     ipcRenderer.on("run:event", handler);
