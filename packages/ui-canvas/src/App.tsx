@@ -47,6 +47,7 @@ import {
   Users,
   Upload,
   X,
+  Terminal,
 } from "lucide-react";
 import {
   Fragment,
@@ -71,7 +72,9 @@ import {
   saveWorkspaceState,
   type OpenProjectResult,
   type WorkspaceState,
+  type TerminalSnapshotResult,
 } from "@skyturn/persistence";
+import { formatTerminalTitle, formatTerminalBadge, formatTerminalMessage } from "./terminalInspector.js";
 import { convertPlanToCanvas, createFastCanvasSession, createPlanSession } from "@skyturn/planner";
 import {
   NODE_MODAL_TABS,
@@ -212,6 +215,7 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
+  const [terminalOpen, setTerminalOpen] = useState(false);
   const [selectedNodeActionState, setSelectedNodeActionState] = useState<SelectedNodeActionState | null>(null);
   const [agentReadiness, setAgentReadiness] = useState<AgentWorkflowReadinessSummary | null>(null);
   const [nodeActionBusy, setNodeActionBusy] = useState<Exclude<ComposerAction, null> | null>(null);
@@ -948,6 +952,8 @@ export default function App() {
       <div className="main-shell">
         <TopBar
           activeSession={activeSession}
+          terminalOpen={terminalOpen}
+          onToggleTerminal={() => setTerminalOpen(!terminalOpen)}
           onRenameSession={(sessionId, title) =>
             setWorkspace((current) => ({
               ...current,
@@ -1027,6 +1033,14 @@ export default function App() {
           onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
         />
       )}
+
+      {terminalOpen && activeSession?.kind === "canvas" && (
+        <TerminalInspector
+          session={activeSession}
+          terminalSessionId={(activeSession as CanvasSession & { hermesPlannerTerminalSessionId?: string }).hermesPlannerTerminalSessionId ?? null}
+          onClose={() => setTerminalOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -1052,10 +1066,14 @@ function Home({ onOpenProject }: { onOpenProject: () => void }) {
 
 function TopBar({
   activeSession,
+  terminalOpen,
+  onToggleTerminal,
   onRenameSession,
   onToggleNewTask,
 }: {
   activeSession: CanvasSessionTab | null;
+  terminalOpen: boolean;
+  onToggleTerminal: () => void;
   onRenameSession: (sessionId: string, title: string) => void;
   onToggleNewTask: () => void;
 }) {
@@ -1119,6 +1137,16 @@ function TopBar({
         )}
       </div>
       <div className="topbar-actions">
+        {activeSession && (
+          <button
+            className={`compact-action ${terminalOpen ? 'active' : ''}`}
+            onClick={onToggleTerminal}
+            title="Terminal Inspector"
+          >
+            <Terminal size={14} />
+            <span>Terminal</span>
+          </button>
+        )}
         <button
           className="new-tab-button icon-only"
           type="button"
@@ -5539,4 +5567,118 @@ async function openMockProject(): Promise<OpenProjectResult> {
       devflowPath: "/tmp/skyturn-demo/.devflow",
     },
   };
+}
+
+function TerminalInspector({
+  session,
+  terminalSessionId,
+  onClose
+}: {
+  session: CanvasSessionTab;
+  terminalSessionId: string | null;
+  onClose: () => void;
+}) {
+  const [snapshot, setSnapshot] = useState<TerminalSnapshotResult | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    if (!terminalSessionId) {
+      setSnapshot({
+        protocolVersion: 1,
+        terminalSessionId: "unbound",
+        status: "unavailable",
+        sequence: 0,
+        rows: 24,
+        cols: 80,
+        cursor: { row: 0, col: 0 },
+        lines: [{ sequence: 0, stream: "stderr", text: "No terminal session bound." }],
+      });
+      return;
+    }
+
+    if (window.devflow?.terminal) {
+      void window.devflow.terminal.snapshot({ terminalSessionId }).then((res) => {
+        if (active) setSnapshot(res);
+      }).catch((err: any) => {
+        if (active) {
+          setSnapshot({
+            protocolVersion: 1,
+            terminalSessionId,
+            status: "unavailable",
+            sequence: 0,
+            rows: 24,
+            cols: 80,
+            cursor: { row: 0, col: 0 },
+            lines: [{ sequence: 0, stream: "stderr", text: `Terminal error: ${err.message}` }],
+          });
+        }
+      });
+
+      const unsubscribe = window.devflow.terminal.onEvent((event) => {
+        if (event.terminalSessionId === terminalSessionId) {
+           void window.devflow!.terminal.snapshot({ terminalSessionId }).then(res => {
+             if (active) setSnapshot(res);
+           });
+        }
+      });
+      return () => {
+        active = false;
+        unsubscribe();
+      };
+    } else {
+      setSnapshot({
+        protocolVersion: 1,
+        terminalSessionId,
+        status: "waiting",
+        sequence: 1,
+        rows: 24,
+        cols: 80,
+        cursor: { row: 2, col: 0 },
+        lines: [
+          { sequence: 0, stream: "stdout", text: "Starting mock Hermes terminal session..." },
+          { sequence: 1, stream: "stdout", text: `Attached to session: ${terminalSessionId}` },
+        ],
+      });
+    }
+    return () => { active = false; };
+  }, [session.id, terminalSessionId]);
+
+  return (
+    <div className="terminal-inspector">
+      <header className="terminal-inspector-header">
+        <div className="terminal-inspector-title">
+          <Terminal size={14} />
+          <span>{formatTerminalTitle(snapshot)}</span>
+          <span className="terminal-inspector-badge">
+            {formatTerminalBadge(snapshot)}
+          </span>
+        </div>
+        <button className="icon-button" onClick={onClose} aria-label="Close terminal">
+          <X size={14} />
+        </button>
+      </header>
+      {formatTerminalMessage(snapshot) && (
+        <div className="terminal-inspector-message">
+          {formatTerminalMessage(snapshot)}
+        </div>
+      )}
+      <div className="terminal-inspector-body">
+        {snapshot?.lines.map((line, i) => (
+          <div key={i} className={`terminal-line stream-${line.stream}`}>
+            {line.text}
+          </div>
+        ))}
+        {!snapshot?.lines?.length && (
+          <div className="terminal-line stream-stderr">No terminal output available.</div>
+        )}
+      </div>
+      <div className="terminal-inspector-footer">
+        <input
+          className="terminal-inspector-input"
+          placeholder="Terminal is read-only in this mode..."
+          disabled
+        />
+      </div>
+    </div>
+  );
 }

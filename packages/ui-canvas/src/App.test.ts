@@ -1,5 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import { formatTerminalTitle, formatTerminalBadge, formatTerminalMessage } from "./terminalInspector.js";
+import type { TerminalSnapshotResult } from "@skyturn/persistence";
 import {
   REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
   selectedNodeActionAvailability,
@@ -1013,5 +1015,132 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     expect(appSource).toContain("selectedNodeActionState.remoteSideEffects.length");
     expect(appSource).toContain("selectedNodeActionState.rollbackEligibility?.manualRepairReason");
     expect(appSource).toContain("Backend check required");
+  });
+});
+
+describe("Terminal Inspector UI Helper", () => {
+  const mockSnapshot: TerminalSnapshotResult = {
+    protocolVersion: 1,
+    terminalSessionId: "session-123",
+    status: "running",
+    sequence: 42,
+    rows: 24,
+    cols: 80,
+    cursor: { row: 0, col: 0 },
+    lines: [],
+    message: "Test error",
+    reasonCode: "TERMINAL_SESSION_NOT_FOUND"
+  };
+
+  it("formats title correctly", () => {
+    expect(formatTerminalTitle(null)).toBe("Hermes Terminal");
+    expect(formatTerminalTitle(mockSnapshot)).toBe("Hermes Terminal (session-123)");
+  });
+
+  it("formats badge correctly", () => {
+    expect(formatTerminalBadge(null)).toBe("connecting...");
+    expect(formatTerminalBadge(mockSnapshot)).toBe("running [seq: 42]");
+  });
+
+  it("formats message correctly", () => {
+    expect(formatTerminalMessage(null)).toBeNull();
+    expect(formatTerminalMessage(mockSnapshot)).toBe("Test error (TERMINAL_SESSION_NOT_FOUND)");
+  });
+});
+
+describe("Terminal Inspector Source Code Analysis", () => {
+  it("terminal content defaults hidden and toggle wiring exists in TopBar", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("const [terminalOpen, setTerminalOpen] = useState(false);");
+    // Verify TopBar toggle wiring exists
+    expect(appSource).toContain("onToggleTerminal={() => setTerminalOpen(!terminalOpen)}");
+  });
+
+  it("Node Modal tabs still only Output/Changes/Context", async () => {
+    const appSource = await readSource("./App.tsx");
+    const modalTabs = appSource.slice(appSource.indexOf('<nav className="modal-tabs"'), appSource.indexOf('</nav>', appSource.indexOf('<nav className="modal-tabs"')));
+    // NODE_MODAL_TABS is used, and it shouldn't contain terminal tabs
+    expect(appSource).toContain("NODE_MODAL_TABS");
+    // Ensure we don't render terminal logs inside node modal
+    const modalBodyIndex = appSource.indexOf('<div className="modal-body">');
+    if (modalBodyIndex !== -1) {
+      const modalBody = appSource.slice(modalBodyIndex, appSource.indexOf('</section>', modalBodyIndex));
+      expect(modalBody).toContain('tab === "Output"');
+      expect(modalBody).toContain('tab === "Changes"');
+      expect(modalBody).toContain('tab === "Context"');
+      expect(modalBody).not.toContain('tab === "Logs"');
+      expect(modalBody).not.toContain('tab === "Terminal"');
+    }
+  });
+
+  it("selecting node does not auto-open terminal", async () => {
+    const appSource = await readSource("./App.tsx");
+    // Expect no effect that sets terminal open on node select unconditionally
+    expect(appSource).not.toMatch(/setSelectedNodeId\([^)]+\)[\s\S]*?setTerminalOpen\(true\)/);
+  });
+
+  it("renderer does not call terminal.start / terminal.write; read-only only", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).not.toContain("terminal.start");
+    expect(appSource).not.toContain("terminal.write");
+    expect(appSource).toContain("disabled");
+    expect(appSource).toContain("Terminal is read-only in this mode...");
+  });
+
+  it("Terminal Inspector placement avoids composer safe area and Node Modal overlaps it", async () => {
+    const styleSource = await readSource("./styles.css");
+    const terminalInspectorStyle = styleSource.slice(styleSource.indexOf(".terminal-inspector {"));
+
+    // Assert placement is top-right, avoiding bottom composer zone
+    expect(terminalInspectorStyle).toMatch(/top:\s*64px;/);
+    expect(terminalInspectorStyle).toMatch(/right:\s*20px;/);
+    expect(terminalInspectorStyle).toMatch(/bottom:\s*(1[8-9][0-9]|2[0-9]{2})px;/); // >= 180px inset
+
+    // Assert z-index logic allows modal to cover it and stays under composer
+    expect(terminalInspectorStyle).toMatch(/z-index:\s*7;/);
+    const modalBackdropStyle = styleSource.slice(styleSource.indexOf(".modal-backdrop {"));
+    expect(modalBackdropStyle).toMatch(/z-index:\s*20;/);
+  });
+
+  it("Terminal Inspector only renders for active session/canvas (not Project Start)", async () => {
+    const appSource = await readSource("./App.tsx");
+    // Ensure it renders scoped to activeSession canvas
+    expect(appSource).toMatch(/\{terminalOpen && activeSession\?.kind === "canvas" && \(\s*<TerminalInspector/);
+  });
+
+  it("source wiring uses activeSession.kind === 'canvas' before rendering inspector", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain('terminalOpen && activeSession?.kind === "canvas" && (');
+  });
+
+  it("terminal id resolver returns null when no binding exists", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain('terminalSessionId={(activeSession as CanvasSession & { hermesPlannerTerminalSessionId?: string }).hermesPlannerTerminalSessionId ?? null}');
+  });
+
+  it("terminal id resolver returns hermesPlannerTerminalSessionId when present, even if it differs from canvas session id", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain('terminalSessionId={(activeSession as CanvasSession & { hermesPlannerTerminalSessionId?: string }).hermesPlannerTerminalSessionId ?? null}');
+  });
+
+  it("source does not use session.id as terminalSessionId for snapshot/event filtering", async () => {
+    const appSource = await readSource("./App.tsx");
+    const inspectorSource = appSource.slice(appSource.indexOf("function TerminalInspector"));
+    expect(inspectorSource).not.toMatch(/terminalSessionId:\s*session\.id/);
+    expect(inspectorSource).not.toMatch(/event\.terminalSessionId === session\.id/);
+
+    // Ensure terminalSessionId is used correctly
+    expect(inspectorSource).toMatch(/\[.*terminalSessionId.*\]/);
+    expect(inspectorSource).toMatch(/snapshot\(\{\s*terminalSessionId\s*\}\)/);
+    expect(inspectorSource).toMatch(/event\.terminalSessionId === terminalSessionId/);
+  });
+
+  it("unbound state does not call snapshot/start/write", async () => {
+    const appSource = await readSource("./App.tsx");
+    const inspectorSource = appSource.slice(appSource.indexOf("function TerminalInspector"));
+    expect(inspectorSource).toMatch(/if \(!terminalSessionId\) \{/);
+    expect(inspectorSource).toMatch(/terminalSessionId: "unbound"/);
+    expect(appSource).not.toContain("terminal.start");
+    expect(appSource).not.toContain("terminal.write");
   });
 });
