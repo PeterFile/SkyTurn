@@ -678,6 +678,91 @@ test("workflow createSession persists a normalized session target", async () => 
   assert.match(main, /return \{ executionTarget: "current_branch", selectedBranch: "HEAD" \};/);
 });
 
+test("workflow create and append bind Hermes planner terminal only through main runtime", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const createSessionHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:createSession"'),
+    main.indexOf('ipcMain.handle("workflow:appendUserInput"'),
+  );
+  const appendHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:appendUserInput"'),
+    main.indexOf('ipcMain.handle("workflow:ledger"'),
+  );
+  const projectionBroadcaster = main.slice(
+    main.indexOf("function broadcastWorkflowProjection"),
+    main.indexOf("function broadcastTerminalEvent"),
+  );
+  const materializer = main.slice(
+    main.indexOf("function materializeRendererCanvasSession"),
+    main.indexOf("function assertWorkflowSessionId"),
+  );
+
+  assert.match(main, /createTerminalRuntime/);
+  assert.match(createSessionHandler, /terminalRuntime\.startHermesPlannerForWorkflowSession/);
+  assert.match(createSessionHandler, /materializeRendererCanvasSession/);
+  assert.match(appendHandler, /terminalRuntime\.sendWorkflowUserInput/);
+  assert.match(appendHandler, /materializeRendererCanvasSession/);
+  assert.match(projectionBroadcaster, /materializeRendererCanvasSession/);
+  assert.match(materializer, /augmentCanvasSessionWithHermesTerminal/);
+  assert.match(materializer, /terminalRuntime\.hermesPlannerTerminalSessionId/);
+  assert.doesNotMatch(createSessionHandler, /terminalRuntime\.start\(/);
+  assert.doesNotMatch(appendHandler, /terminalRuntime\.start|terminal:start/);
+});
+
+test("workflow create keeps generated SkyTurn opaque handles out of Hermes PTY resume", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const createSessionHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:createSession"'),
+    main.indexOf('ipcMain.handle("workflow:appendUserInput"'),
+  );
+
+  assert.match(createSessionHandler, /const inputOpaqueHandle = optionalText\(input\.opaqueHandle\)/);
+  assert.match(createSessionHandler, /const opaqueHandle = inputOpaqueHandle \?\? `skyturn-ipc:\$\{sessionId\}`/);
+  assert.match(createSessionHandler, /const hermesSessionHandle = explicitHermesSessionHandle\(inputOpaqueHandle\)/);
+  assert.match(createSessionHandler, /\.\.\.\(hermesSessionHandle \? \{ hermesSessionHandle \} : \{\}\)/);
+  assert.doesNotMatch(createSessionHandler, /hermesSessionHandle:\s*opaqueHandle/);
+  assert.match(main, /function explicitHermesSessionHandle\(value: unknown\): string \| undefined/);
+});
+
+test("workflow projection responses keep the Hermes planner terminal binding", async () => {
+  const helpers = await loadMainRendererCanvasSessionHelpers();
+  const store = {
+    materializeCanvasSession(sessionId) {
+      return { kind: "canvas", id: sessionId, nodes: [] };
+    },
+  };
+
+  assert.deepEqual(
+    toPlain(helpers.materializeRendererCanvasSession(store, "session-1")),
+    {
+      kind: "canvas",
+      id: "session-1",
+      nodes: [],
+      hermesPlannerTerminalSessionId: "hermes-planner-session-1",
+    },
+  );
+  assert.deepEqual(
+    toPlain(helpers.materializeRendererCanvasSession(store, "session-without-terminal")),
+    { kind: "canvas", id: "session-without-terminal", nodes: [] },
+  );
+});
+
+test("workflow renderer canvas session responses use the terminal-aware materializer", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const projectionHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:projection"'),
+    main.indexOf('ipcMain.handle("workflow:events"'),
+  );
+  const broadcaster = main.slice(
+    main.indexOf("function broadcastWorkflowProjection"),
+    main.indexOf("function broadcastTerminalEvent"),
+  );
+
+  assert.match(projectionHandler, /canvasSession:\s*materializeRendererCanvasSession\(store,\s*workflowSessionId\)/);
+  assert.match(broadcaster, /const canvasSession = materializeRendererCanvasSession\(store,\s*sessionId\)/);
+  assert.doesNotMatch(main, /canvasSession:\s*store\.materializeCanvasSession\(/);
+});
+
 test("Electron project memory IPC does not register arbitrary renderer paths", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const initHandler = main.match(/ipcMain\.handle\("project:initDevflow"[\s\S]*?\n\}\);/)?.[0] ?? "";
@@ -1977,6 +2062,27 @@ async function loadMainMergeGateHelpers() {
   return module.exports;
 }
 
+async function loadMainRendererCanvasSessionHelpers() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    'function isRecord(value) { return !!value && typeof value === "object" && !Array.isArray(value); }',
+    'const terminalRuntime = { hermesPlannerTerminalSessionId: (sessionId) => sessionId === "session-1" ? "hermes-planner-session-1" : null };',
+    extractFunction(main, "augmentCanvasSessionWithHermesTerminal"),
+    extractFunction(main, "materializeRendererCanvasSession"),
+    "module.exports = { materializeRendererCanvasSession };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.rendererCanvasSession.ts" });
+  return module.exports;
+}
+
 function extractFunction(source, name) {
   const start = source.indexOf(`function ${name}`);
   assert.ok(start >= 0, `missing function ${name}`);
@@ -2011,6 +2117,10 @@ function methodResultType(method) {
     mergePullRequest: "WorkflowPullRequestMergeResult",
     syncMain: "WorkflowDeliveryMainSyncResult",
   }[method];
+}
+
+function toPlain(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 function legacyMethodResultType(method) {

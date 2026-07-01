@@ -18,15 +18,14 @@ import {
   workflowStartInputError,
   type WorkflowIpcErrorCode,
 } from "./workflowIpcContracts";
+import { createTerminalRuntime } from "./terminalRuntime";
 import {
-  emptyTerminalSnapshot,
   normalizeTerminalIpcError,
   terminalCancelInputError,
   terminalIpcError,
   terminalResizeInputError,
   terminalSnapshotInputError,
   terminalStartInputError,
-  terminalUnsupportedResult,
   terminalWriteInputError,
   type TerminalActionResult,
   type TerminalCancelInput,
@@ -34,7 +33,6 @@ import {
   type TerminalResizeInput,
   type TerminalSnapshotInput,
   type TerminalSnapshotResult,
-  type TerminalSnapshotState,
   type TerminalStartInput,
   type TerminalStartResult,
   type TerminalWriteInput,
@@ -457,11 +455,15 @@ interface ManagedRollbackWorktree {
 const RUN_PROTOCOL_VERSION = 1;
 const openedProjectRoots = new Set<string>();
 let agentBridge: AgentBridgeHost | null = null;
-const terminalSnapshots = new Map<string, TerminalSnapshotState>();
 const workflowStores = new Map<string, WorkflowStoreHost>();
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
 const workflowSessionMutationLocks = new Map<string, Promise<void>>();
 let remoteSideEffectSequence = 0;
+const terminalRuntime = createTerminalRuntime({
+  protocolVersion: RUN_PROTOCOL_VERSION,
+  featureEnabled: terminalPtyFeatureEnabled,
+  broadcastEvent: broadcastTerminalEvent,
+});
 
 interface AgentBridgeHost {
   discoverAgents(): Promise<AgentDescriptor[]>;
@@ -639,44 +641,36 @@ ipcMain.handle("run:evidence", async (_event, projectRoot: string, runId: string
 ipcMain.handle("terminal:start", terminalHandler(async (input: unknown): Promise<TerminalStartResult> => {
   const normalized = assertTerminalStartInput(input);
   assertKnownProjectRoot(normalized.projectRoot);
-  return terminalUnsupportedResult(RUN_PROTOCOL_VERSION, terminalPtyFeatureEnabled());
+  return terminalRuntime.start(normalized);
 }));
 
 ipcMain.handle("terminal:write", terminalHandler(async (input: unknown): Promise<TerminalActionResult> => {
   const normalized = assertTerminalWriteInput(input);
-  return {
-    ...terminalUnsupportedResult(RUN_PROTOCOL_VERSION, terminalPtyFeatureEnabled()),
-    terminalSessionId: normalized.terminalSessionId,
-  };
+  return terminalRuntime.write(normalized);
 }));
 
 ipcMain.handle("terminal:resize", terminalHandler(async (input: unknown): Promise<TerminalActionResult> => {
   const normalized = assertTerminalResizeInput(input);
-  return {
-    ...terminalUnsupportedResult(RUN_PROTOCOL_VERSION, terminalPtyFeatureEnabled()),
-    terminalSessionId: normalized.terminalSessionId,
-  };
+  return terminalRuntime.resize(normalized);
 }));
 
 ipcMain.handle("terminal:cancel", terminalHandler(async (input: unknown): Promise<TerminalActionResult> => {
   const normalized = assertTerminalCancelInput(input);
-  return {
-    ...terminalUnsupportedResult(RUN_PROTOCOL_VERSION, terminalPtyFeatureEnabled()),
-    terminalSessionId: normalized.terminalSessionId,
-  };
+  return terminalRuntime.cancel(normalized);
 }));
 
 ipcMain.handle("terminal:snapshot", terminalHandler(async (input: unknown): Promise<TerminalSnapshotResult> => {
   const normalized = assertTerminalSnapshotInput(input);
-  const snapshot = terminalSnapshots.get(normalized.terminalSessionId);
-  if (!snapshot) return emptyTerminalSnapshot(RUN_PROTOCOL_VERSION, normalized.terminalSessionId);
-  return { protocolVersion: RUN_PROTOCOL_VERSION, ...snapshot };
+  return terminalRuntime.snapshot(normalized);
 }));
 
 ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, input: WorkflowSessionCreateInput) => {
   assertKnownProjectRoot(projectRoot);
   const sessionId = assertWorkflowSessionId(input.id ?? input.sessionId);
   const store = await getWorkflowStore(projectRoot);
+  const inputOpaqueHandle = optionalText(input.opaqueHandle);
+  const opaqueHandle = inputOpaqueHandle ?? `skyturn-ipc:${sessionId}`;
+  const hermesSessionHandle = explicitHermesSessionHandle(inputOpaqueHandle);
   const session = store.createWorkflowSession({
     id: sessionId,
     projectId: optionalText(input.projectId) ?? path.basename(projectRoot),
@@ -687,15 +681,23 @@ ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, inp
     plannerProfile: optionalText(input.plannerProfile) ?? "default",
     transport: normalizeHermesTransport(input.transport),
     processId: typeof input.processId === "number" ? input.processId : undefined,
-    opaqueHandle: optionalText(input.opaqueHandle) ?? `skyturn-ipc:${sessionId}`,
+    opaqueHandle,
     recoveryReason: optionalText(input.recoveryReason),
     now: optionalText(readField(input, "now")) ?? new Date().toISOString(),
+  });
+  const materializedSession = store.materializeCanvasSession(sessionId);
+  await terminalRuntime.startHermesPlannerForWorkflowSession({
+    projectRoot,
+    canvasSessionId: sessionId,
+    runId: `hermes-planner-${sessionId}`,
+    plannerSessionId: isRecord(materializedSession) ? optionalText(materializedSession.hermesPlannerSessionId) ?? undefined : undefined,
+    ...(hermesSessionHandle ? { hermesSessionHandle } : {}),
   });
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     session,
     projection: store.materializeFlowProjection(sessionId),
-    canvasSession: store.materializeCanvasSession(sessionId),
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 });
 
@@ -703,19 +705,21 @@ ipcMain.handle("workflow:appendUserInput", async (_event, projectRoot: string, i
   assertKnownProjectRoot(projectRoot);
   const sessionId = assertWorkflowSessionId(input.sessionId);
   const store = await getWorkflowStore(projectRoot);
+  const text = requireText(input.text, "workflow user input");
   const event = store.appendUserInput({
     sessionId,
     inputId: optionalText(input.inputId) ?? optionalText(input.idempotencyKey) ?? `input-${Date.now()}`,
-    text: requireText(input.text, "workflow user input"),
+    text,
     now: optionalText(input.now) ?? new Date().toISOString(),
   });
+  await terminalRuntime.sendWorkflowUserInput(sessionId, `${text}\n`);
   broadcastWorkflowProjection(projectRoot, sessionId, store);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     event,
     ledger: store.buildLedgerSummary(sessionId),
     projection: store.materializeFlowProjection(sessionId),
-    canvasSession: store.materializeCanvasSession(sessionId),
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 });
 
@@ -771,7 +775,7 @@ ipcMain.handle("workflow:applyIntent", async (_event, projectRoot: string, inten
     protocolVersion: RUN_PROTOCOL_VERSION,
     result,
     projection,
-    canvasSession: store.materializeCanvasSession(sessionId),
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 });
 
@@ -791,7 +795,7 @@ ipcMain.handle("workflow:scheduleReady", async (_event, projectRoot: string, ses
     protocolVersion: RUN_PROTOCOL_VERSION,
     result,
     projection: store.materializeFlowProjection(workflowSessionId),
-    canvasSession: store.materializeCanvasSession(workflowSessionId),
+    canvasSession: materializeRendererCanvasSession(store, workflowSessionId),
   };
 });
 
@@ -823,7 +827,7 @@ ipcMain.handle("workflow:recordRunResult", async (_event, projectRoot: string, i
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     projection,
-    canvasSession: store.materializeCanvasSession(sessionId),
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 });
 
@@ -834,7 +838,7 @@ ipcMain.handle("workflow:projection", workflowHandler(async (projectRoot: string
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     projection: store.materializeFlowProjection(workflowSessionId),
-    canvasSession: store.materializeCanvasSession(workflowSessionId),
+    canvasSession: materializeRendererCanvasSession(store, workflowSessionId),
   };
 }));
 
@@ -1036,7 +1040,7 @@ ipcMain.handle("workflow:repair:create", workflowHandler(async (projectRoot: str
     status: "requested",
     event: result.event,
     projection: result.projection,
-    canvasSession: store.materializeCanvasSession(normalized.sessionId),
+    canvasSession: materializeRendererCanvasSession(store, normalized.sessionId),
   };
 }));
 
@@ -1052,7 +1056,7 @@ ipcMain.handle("workflow:variant:create", workflowHandler(async (projectRoot: st
     status: "requested",
     event: result.event,
     projection: result.projection,
-    canvasSession: store.materializeCanvasSession(normalized.sessionId),
+    canvasSession: materializeRendererCanvasSession(store, normalized.sessionId),
   };
 }));
 
@@ -1085,7 +1089,7 @@ ipcMain.handle("workflow:userDecision:answer", workflowHandler(async (projectRoo
     protocolVersion: RUN_PROTOCOL_VERSION,
     event,
     projection,
-    canvasSession: store.materializeCanvasSession(sessionId),
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 }));
 
@@ -1774,7 +1778,7 @@ async function workflowStoreIdentity(projectRoot: string): Promise<string> {
 
 function broadcastWorkflowProjection(projectRoot: string, sessionId: string, store: WorkflowStoreHost): void {
   const projection = store.materializeFlowProjection(sessionId);
-  const canvasSession = store.materializeCanvasSession(sessionId);
+  const canvasSession = materializeRendererCanvasSession(store, sessionId);
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send("workflow:event", { projectRoot, sessionId, projection, canvasSession });
   }
@@ -1786,9 +1790,30 @@ function broadcastTerminalEvent(event: TerminalRendererEvent): void {
   }
 }
 
+function augmentCanvasSessionWithHermesTerminal(canvasSession: unknown, terminalSessionId: string | null): unknown {
+  if (!terminalSessionId || !isRecord(canvasSession) || canvasSession.kind !== "canvas") return canvasSession;
+  return {
+    ...canvasSession,
+    hermesPlannerTerminalSessionId: terminalSessionId,
+  };
+}
+
+function materializeRendererCanvasSession(store: WorkflowStoreHost, sessionId: string): unknown {
+  return augmentCanvasSessionWithHermesTerminal(
+    store.materializeCanvasSession(sessionId),
+    terminalRuntime.hermesPlannerTerminalSessionId(sessionId),
+  );
+}
+
 function assertWorkflowSessionId(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) throw new Error("Workflow sessionId is required.");
   return value;
+}
+
+function explicitHermesSessionHandle(value: unknown): string | undefined {
+  const handle = optionalText(value);
+  if (!handle || handle.startsWith("skyturn-ipc:")) return undefined;
+  return handle;
 }
 
 function assertRequiredText(value: unknown, message: string): string {
@@ -2250,7 +2275,7 @@ function workflowRollbackResponse(
     blockedReason,
     manualRepairRequired: result.manualRepairRequired === true || (isRecord(blockedReason) && blockedReason.manualRepairRequired === true),
     projection: store.materializeFlowProjection(sessionId),
-    canvasSession: store.materializeCanvasSession(sessionId),
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 }
 
@@ -2484,7 +2509,7 @@ function remoteSideEffectManualResolutionResponse(
     },
     manualRepairRequired: true,
     projection: store.materializeFlowProjection(sessionId),
-    canvasSession: store.materializeCanvasSession(sessionId),
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 }
 
@@ -2511,7 +2536,7 @@ function missingDeliveryPushEvidenceManualResolutionResponse(
     },
     manualRepairRequired: true,
     projection: store.materializeFlowProjection(sessionId),
-    canvasSession: store.materializeCanvasSession(sessionId),
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 }
 
