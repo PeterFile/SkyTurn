@@ -6569,3 +6569,100 @@ select:focus-visible,
 .composer-action-message.error {
   color: var(--sk-status-failed-text, #e11d48);
 }
+
+/* Terminal Inspector */
+.terminal-inspector {
+  position: absolute;
+  top: 64px;
+  right: 20px;
+  width: 500px;
+  max-width: calc(100vw - 320px);
+  bottom: 190px;
+  background: var(--sk-code-bg-warm, #1E1E1E);
+  color: var(--sk-code-text-warm, #E8E8E8);
+  border: 1px solid var(--sk-border-muted);
+  border-radius: var(--sk-radius-md);
+  box-shadow: 0 12px 32px var(--sk-shadow-warm-md, rgba(0, 0, 0, 0.2));
+  display: flex;
+  flex-direction: column;
+  z-index: 7;
+  overflow: hidden;
+}
+
+.terminal-inspector-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--sk-surface-warm-muted, #2a2a2a);
+  border-bottom: 1px solid var(--sk-border-muted);
+}
+
+.terminal-inspector-message {
+  padding: 6px 12px;
+  background: var(--sk-status-warning-soft, rgba(234, 179, 8, 0.15));
+  color: var(--sk-status-warning-text, #FACC15);
+  font-size: 12px;
+  border-bottom: 1px solid var(--sk-border-muted);
+}
+
+.terminal-inspector-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.terminal-inspector-badge {
+  background: var(--sk-accent-soft, rgba(255, 255, 255, 0.1));
+  color: var(--sk-accent, #7aa2f7);
+  padding: 2px 6px;
+  border-radius: var(--sk-radius-pill);
+  font-size: 10px;
+}
+
+.terminal-inspector-body {
+  flex: 1;
+  overflow: auto;
+  padding: 12px;
+  font-family: var(--sk-font-mono, monospace);
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.terminal-line {
+  margin: 0;
+  min-height: 18px;
+}
+.stream-stderr {
+  color: var(--sk-status-failed-legacy, #f7768e);
+}
+.stream-stdout {
+  color: inherit;
+}
+
+.terminal-inspector-footer {
+  padding: 8px 12px;
+  border-top: 1px solid var(--sk-border-muted);
+  background: var(--sk-surface-warm-muted, #2a2a2a);
+}
+
+.terminal-inspector-input {
+  width: 100%;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--sk-border-legacy, #444);
+  color: inherit;
+  border-radius: var(--sk-radius-sm);
+  padding: 6px 10px;
+  font-family: var(--sk-font-mono, monospace);
+  font-size: 12px;
+}
+
+.terminal-inspector-input:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
