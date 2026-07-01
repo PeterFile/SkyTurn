@@ -18,6 +18,27 @@ import {
   workflowStartInputError,
   type WorkflowIpcErrorCode,
 } from "./workflowIpcContracts";
+import {
+  emptyTerminalSnapshot,
+  normalizeTerminalIpcError,
+  terminalCancelInputError,
+  terminalIpcError,
+  terminalResizeInputError,
+  terminalSnapshotInputError,
+  terminalStartInputError,
+  terminalUnsupportedResult,
+  terminalWriteInputError,
+  type TerminalActionResult,
+  type TerminalCancelInput,
+  type TerminalRendererEvent,
+  type TerminalResizeInput,
+  type TerminalSnapshotInput,
+  type TerminalSnapshotResult,
+  type TerminalSnapshotState,
+  type TerminalStartInput,
+  type TerminalStartResult,
+  type TerminalWriteInput,
+} from "./terminalIpcContracts";
 
 const execFileAsync = promisify(execFile);
 
@@ -436,6 +457,7 @@ interface ManagedRollbackWorktree {
 const RUN_PROTOCOL_VERSION = 1;
 const openedProjectRoots = new Set<string>();
 let agentBridge: AgentBridgeHost | null = null;
+const terminalSnapshots = new Map<string, TerminalSnapshotState>();
 const workflowStores = new Map<string, WorkflowStoreHost>();
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
 const workflowSessionMutationLocks = new Map<string, Promise<void>>();
@@ -613,6 +635,43 @@ ipcMain.handle("run:evidence", async (_event, projectRoot: string, runId: string
     evidence: await bridge.getEvidence(projectRoot, runId),
   };
 });
+
+ipcMain.handle("terminal:start", terminalHandler(async (input: unknown): Promise<TerminalStartResult> => {
+  const normalized = assertTerminalStartInput(input);
+  assertKnownProjectRoot(normalized.projectRoot);
+  return terminalUnsupportedResult(RUN_PROTOCOL_VERSION, terminalPtyFeatureEnabled());
+}));
+
+ipcMain.handle("terminal:write", terminalHandler(async (input: unknown): Promise<TerminalActionResult> => {
+  const normalized = assertTerminalWriteInput(input);
+  return {
+    ...terminalUnsupportedResult(RUN_PROTOCOL_VERSION, terminalPtyFeatureEnabled()),
+    terminalSessionId: normalized.terminalSessionId,
+  };
+}));
+
+ipcMain.handle("terminal:resize", terminalHandler(async (input: unknown): Promise<TerminalActionResult> => {
+  const normalized = assertTerminalResizeInput(input);
+  return {
+    ...terminalUnsupportedResult(RUN_PROTOCOL_VERSION, terminalPtyFeatureEnabled()),
+    terminalSessionId: normalized.terminalSessionId,
+  };
+}));
+
+ipcMain.handle("terminal:cancel", terminalHandler(async (input: unknown): Promise<TerminalActionResult> => {
+  const normalized = assertTerminalCancelInput(input);
+  return {
+    ...terminalUnsupportedResult(RUN_PROTOCOL_VERSION, terminalPtyFeatureEnabled()),
+    terminalSessionId: normalized.terminalSessionId,
+  };
+}));
+
+ipcMain.handle("terminal:snapshot", terminalHandler(async (input: unknown): Promise<TerminalSnapshotResult> => {
+  const normalized = assertTerminalSnapshotInput(input);
+  const snapshot = terminalSnapshots.get(normalized.terminalSessionId);
+  if (!snapshot) return emptyTerminalSnapshot(RUN_PROTOCOL_VERSION, normalized.terminalSessionId);
+  return { protocolVersion: RUN_PROTOCOL_VERSION, ...snapshot };
+}));
 
 ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, input: WorkflowSessionCreateInput) => {
   assertKnownProjectRoot(projectRoot);
@@ -1718,6 +1777,12 @@ function broadcastWorkflowProjection(projectRoot: string, sessionId: string, sto
   const canvasSession = store.materializeCanvasSession(sessionId);
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send("workflow:event", { projectRoot, sessionId, projection, canvasSession });
+  }
+}
+
+function broadcastTerminalEvent(event: TerminalRendererEvent): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    window.webContents.send("terminal:event", event);
   }
 }
 
@@ -3074,6 +3139,52 @@ function workflowHandler<T extends unknown[], R>(
       throw normalizeWorkflowIpcError(error);
     }
   };
+}
+
+function terminalHandler<T extends unknown[], R>(
+  handler: (...args: T) => Promise<R> | R,
+): (_event: Electron.IpcMainInvokeEvent, ...args: T) => Promise<R> {
+  return async (_event, ...args) => {
+    try {
+      return await handler(...args);
+    } catch (error) {
+      throw normalizeTerminalIpcError(error);
+    }
+  };
+}
+
+function assertTerminalStartInput(input: unknown): TerminalStartInput {
+  const inputError = terminalStartInputError(input);
+  if (inputError) throw terminalIpcError(inputError, "Terminal start input is invalid.");
+  return input as TerminalStartInput;
+}
+
+function assertTerminalWriteInput(input: unknown): TerminalWriteInput {
+  const inputError = terminalWriteInputError(input);
+  if (inputError) throw terminalIpcError(inputError, "Terminal write input is invalid.");
+  return input as TerminalWriteInput;
+}
+
+function assertTerminalResizeInput(input: unknown): TerminalResizeInput {
+  const inputError = terminalResizeInputError(input);
+  if (inputError) throw terminalIpcError(inputError, "Terminal resize input is invalid.");
+  return input as TerminalResizeInput;
+}
+
+function assertTerminalCancelInput(input: unknown): TerminalCancelInput {
+  const inputError = terminalCancelInputError(input);
+  if (inputError) throw terminalIpcError(inputError, "Terminal cancel input is invalid.");
+  return input as TerminalCancelInput;
+}
+
+function assertTerminalSnapshotInput(input: unknown): TerminalSnapshotInput {
+  const inputError = terminalSnapshotInputError(input);
+  if (inputError) throw terminalIpcError(inputError, "Terminal snapshot input is invalid.");
+  return input as TerminalSnapshotInput;
+}
+
+function terminalPtyFeatureEnabled(): boolean {
+  return process.env.SKYTURN_ENABLE_PTY_INTERACTIVE === "1";
 }
 
 function workflowEventsOnly(events: unknown[]): unknown[] {
