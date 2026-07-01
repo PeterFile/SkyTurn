@@ -13,6 +13,7 @@ import type {
 } from "@skyturn/agent-runtime";
 import { agentAdapterContracts } from "@skyturn/agent-runtime";
 import {
+  DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS,
   RUN_EVENT_PROTOCOL_VERSION,
   type AgentDescriptor,
   type AgentKind,
@@ -21,10 +22,17 @@ import {
   type AgentRunStatus,
   type AgentSupportLevel,
   type AgentReadinessCategory,
+  type AgentTransportFeatureFlags,
+  type AgentTerminalSession,
+  type EvidenceCheck,
+  type HermesPlannerTransport,
   type RunEvent,
   type RunEvidence,
   type StartAgentRunInput,
   type StructuredRunChange,
+  type TerminalOutputStream,
+  type TerminalSessionEventDraft,
+  type TerminalSessionStatus,
 } from "@skyturn/project-core";
 import type { FlowEvent } from "@skyturn/workflow-kernel";
 
@@ -45,6 +53,9 @@ const maxStructuredChangeDiffBytes = 64_000;
 const codexAuthEnvNames = ["OPENAI_API_KEY"];
 const hermesAuthEnvNames = ["HERMES_API_KEY"];
 const codexAuthFileName = "auth.json";
+const defaultTerminalCols = 80;
+const defaultTerminalRows = 24;
+const defaultTerminalScrollbackBytes = 256_000;
 
 type CliFailureCategory =
   | "cli-missing"
@@ -107,6 +118,145 @@ export interface HermesCliAdapterOptions {
   extraArgs?: string[];
   pathValue?: string;
   source?: string;
+}
+
+export type HermesPlannerPtyContinuity = "resume-handle" | "process-level";
+
+export interface HermesPlannerPtyLaunchOptions {
+  executablePath?: string;
+  extraArgs?: string[];
+  source?: string;
+}
+
+export interface StartHermesPlannerPtySessionInput {
+  id?: string;
+  runId: string;
+  canvasSessionId: string;
+  plannerSessionId?: string;
+  plannerInputId?: string;
+  hermesSessionHandle?: string;
+  projectRoot: string;
+  worktreePath?: string;
+  cols?: number;
+  rows?: number;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface HermesPlannerPtySessionMetadata {
+  transport: HermesPlannerTransport;
+  continuity: HermesPlannerPtyContinuity;
+  degraded: boolean;
+  plannerSessionId: string | null;
+  plannerInputId: string | null;
+  opaqueHandle: string | null;
+  recoveryReason?: string;
+}
+
+export interface HermesPlannerPtyLaunch {
+  command: string;
+  args: string[];
+  cwd: string;
+  commandLabel: string;
+  metadata: HermesPlannerPtySessionMetadata;
+}
+
+export interface HermesPlannerPtySession {
+  terminalSession: AgentTerminalSession;
+  metadata: HermesPlannerPtySessionMetadata;
+}
+
+export interface PtyExitEvent {
+  exitCode: number | null;
+  signal: string | null;
+}
+
+export interface PtyDisposable {
+  dispose(): void;
+}
+
+export interface PtyProcess {
+  write(data: string): void;
+  resize(cols: number, rows: number): void;
+  kill(signal?: string): void;
+  onData(listener: (chunk: string) => void): PtyDisposable;
+  onStderr?(listener: (chunk: string) => void): PtyDisposable;
+  onExit(listener: (event: PtyExitEvent) => void): PtyDisposable;
+}
+
+export interface PtySpawnInput {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  cols: number;
+  rows: number;
+}
+
+export interface PtyProcessFactory {
+  spawn(input: PtySpawnInput): PtyProcess;
+}
+
+export interface StartPtyTerminalSessionInput {
+  id?: string;
+  runId: string;
+  canvasSessionId: string;
+  agentKind: AgentKind;
+  cwd: string;
+  command: string;
+  args?: string[];
+  commandLabel?: string;
+  cols?: number;
+  rows?: number;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface PtyTerminalSessionManagerOptions {
+  ptyFactory: PtyProcessFactory;
+  emitEvent?: (event: TerminalSessionEventDraft) => void | Promise<void>;
+  timeoutMs?: number;
+  killTimeoutMs?: number;
+  stallTelemetryMs?: number;
+  maxScrollbackBytes?: number;
+  env?: NodeJS.ProcessEnv;
+  now?: () => Date;
+}
+
+export interface TerminalScrollbackChunk {
+  timestamp: string;
+  stream: TerminalOutputStream;
+  text: string;
+}
+
+export interface TerminalSessionExitEvidence {
+  exitCode: number | null;
+  signal: string | null;
+  checks: EvidenceCheck[];
+}
+
+export interface PtyTerminalSessionManager {
+  startSession(input: StartPtyTerminalSessionInput): Promise<AgentTerminalSession>;
+  writeStdin(sessionId: string, data: string): Promise<void>;
+  resize(sessionId: string, size: { cols: number; rows: number }): Promise<void>;
+  cancelSession(sessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null>;
+  terminateSession(sessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null>;
+  getSession(sessionId: string): AgentTerminalSession | null;
+  getScrollback(sessionId: string): TerminalScrollbackChunk[];
+  getExitEvidence(sessionId: string): TerminalSessionExitEvidence | null;
+}
+
+export interface HermesPlannerPtyTransportOptions extends PtyTerminalSessionManagerOptions {
+  executablePath?: string;
+  extraArgs?: string[];
+  source?: string;
+  featureFlags?: AgentTransportFeatureFlags;
+}
+
+export interface HermesPlannerPtyTransport {
+  startSession(input: StartHermesPlannerPtySessionInput): Promise<HermesPlannerPtySession>;
+  sendUserInput(canvasSessionId: string, data: string): Promise<void>;
+  cancelSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null>;
+  terminateSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null>;
+  getSession(canvasSessionId: string): HermesPlannerPtySession | null;
 }
 
 export function createDiscoveryService(options: DiscoveryOptions = {}): DiscoveryService {
@@ -339,6 +489,605 @@ export async function loadRunEvents(projectRoot: string, runId: string): Promise
       .map((line) => JSON.parse(line) as RunEvent);
   } catch {
     return [];
+  }
+}
+
+type TerminalSessionEventInput =
+  | {
+      kind: "output";
+      stream: TerminalOutputStream;
+      text: string;
+      timestamp?: string;
+    }
+  | {
+      kind: "progress";
+      message: string;
+      timestamp?: string;
+    }
+  | {
+      kind: "lifecycle";
+      status: TerminalSessionStatus;
+      message?: string;
+      timestamp?: string;
+    };
+
+interface ManagedPtyTerminalSession {
+  session: AgentTerminalSession;
+  process: PtyProcess;
+  outputDisposables: PtyDisposable[];
+  exitDisposable: PtyDisposable | null;
+  scrollback: TerminalScrollbackChunk[];
+  scrollbackBytes: number;
+  eventQueue: Promise<void>;
+  timeoutTimer: NodeJS.Timeout | null;
+  stallTimer: NodeJS.Timeout | null;
+  killTimer: NodeJS.Timeout | null;
+  lastActivityAt: number;
+  finalized: boolean;
+  processExited: boolean;
+  exitEvidence: TerminalSessionExitEvidence | null;
+}
+
+export function createPtyTerminalSessionManager(
+  options: PtyTerminalSessionManagerOptions,
+): PtyTerminalSessionManager {
+  return new PtyTerminalSessionManagerImpl(options);
+}
+
+class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
+  private readonly sessions = new Map<string, ManagedPtyTerminalSession>();
+  private readonly timeoutMs: number;
+  private readonly killTimeoutMs: number;
+  private readonly stallTelemetryMs: number;
+  private readonly maxScrollbackBytes: number;
+
+  constructor(private readonly options: PtyTerminalSessionManagerOptions) {
+    this.timeoutMs = options.timeoutMs ?? defaultRunWatchdogTimeoutMs;
+    this.killTimeoutMs = options.killTimeoutMs ?? defaultKillTimeoutMs;
+    this.stallTelemetryMs = options.stallTelemetryMs ?? defaultStallTelemetryMs;
+    this.maxScrollbackBytes = options.maxScrollbackBytes ?? defaultTerminalScrollbackBytes;
+  }
+
+  async startSession(input: StartPtyTerminalSessionInput): Promise<AgentTerminalSession> {
+    const id = input.id ?? `terminal-${input.runId}`;
+    if (this.sessions.has(id)) throw new Error(`Terminal session already exists: ${id}`);
+    const cols = input.cols ?? defaultTerminalCols;
+    const rows = input.rows ?? defaultTerminalRows;
+    const ptyProcess = this.options.ptyFactory.spawn({
+      command: input.command,
+      args: input.args ?? [],
+      cwd: input.cwd,
+      env: { ...process.env, ...this.options.env, ...input.env },
+      cols,
+      rows,
+    });
+    const session: AgentTerminalSession = {
+      id,
+      runId: input.runId,
+      canvasSessionId: input.canvasSessionId,
+      agentKind: input.agentKind,
+      cwd: input.cwd,
+      commandLabel: input.commandLabel ?? input.command,
+      transport: "pty-interactive",
+      status: "starting",
+      createdAt: this.isoNow(),
+    };
+    const state: ManagedPtyTerminalSession = {
+      session,
+      process: ptyProcess,
+      outputDisposables: [],
+      exitDisposable: null,
+      scrollback: [],
+      scrollbackBytes: 0,
+      eventQueue: Promise.resolve(),
+      timeoutTimer: null,
+      stallTimer: null,
+      killTimer: null,
+      lastActivityAt: Date.now(),
+      finalized: false,
+      processExited: false,
+      exitEvidence: null,
+    };
+    this.sessions.set(id, state);
+    this.attachProcessListeners(state);
+    await this.enqueueTerminalEvent(state, { kind: "lifecycle", status: "starting" });
+    if (state.finalized) return { ...state.session };
+    this.updateStatus(state, "running");
+    await this.enqueueTerminalEvent(state, { kind: "lifecycle", status: "running" });
+    if (state.finalized) return { ...state.session };
+    this.markActivity(state);
+    this.startStallTelemetry(state);
+    this.startTimeout(state);
+    return { ...state.session };
+  }
+
+  async writeStdin(sessionId: string, data: string): Promise<void> {
+    const state = this.requireOpenSession(sessionId);
+    state.process.write(data);
+  }
+
+  async resize(sessionId: string, size: { cols: number; rows: number }): Promise<void> {
+    const state = this.requireOpenSession(sessionId);
+    if (size.cols <= 0 || size.rows <= 0) throw new Error("Terminal size must use positive cols and rows.");
+    state.process.resize(size.cols, size.rows);
+    await this.enqueueTerminalEvent(state, {
+      kind: "progress",
+      message: `resized to ${size.cols}x${size.rows}`,
+    });
+  }
+
+  async cancelSession(sessionId: string, reason = "Terminal cancelled"): Promise<TerminalSessionExitEvidence | null> {
+    const state = this.requireSession(sessionId);
+    if (state.finalized) return state.exitEvidence;
+    const evidence = this.finalizeSession(state, {
+      status: "cancelled",
+      message: reason,
+      evidence: {
+        exitCode: null,
+        signal: null,
+        checks: [
+          {
+            kind: "run-exit",
+            name: `${state.session.commandLabel} terminal exit`,
+            status: "skipped",
+            detail: reason,
+          },
+        ],
+      },
+    });
+    this.scheduleKill(state);
+    return evidence;
+  }
+
+  async terminateSession(sessionId: string, reason = "Terminal terminated"): Promise<TerminalSessionExitEvidence | null> {
+    const state = this.requireSession(sessionId);
+    if (state.finalized) return state.exitEvidence;
+    const evidence = this.finalizeSession(state, {
+      status: "failed",
+      message: reason,
+      evidence: {
+        exitCode: null,
+        signal: null,
+        checks: [
+          {
+            kind: "run-exit",
+            name: `${state.session.commandLabel} terminal exit`,
+            status: "failed",
+            detail: reason,
+          },
+        ],
+      },
+    });
+    this.scheduleKill(state);
+    return evidence;
+  }
+
+  getSession(sessionId: string): AgentTerminalSession | null {
+    const session = this.sessions.get(sessionId)?.session;
+    return session ? { ...session } : null;
+  }
+
+  getScrollback(sessionId: string): TerminalScrollbackChunk[] {
+    const state = this.requireSession(sessionId);
+    return state.scrollback.map((chunk) => ({ ...chunk }));
+  }
+
+  getExitEvidence(sessionId: string): TerminalSessionExitEvidence | null {
+    const evidence = this.requireSession(sessionId).exitEvidence;
+    return evidence
+      ? {
+          exitCode: evidence.exitCode,
+          signal: evidence.signal,
+          checks: evidence.checks.map((check) => ({ ...check })),
+        }
+      : null;
+  }
+
+  private attachProcessListeners(state: ManagedPtyTerminalSession): void {
+    state.outputDisposables.push(
+      state.process.onData((chunk) => {
+        this.captureOutput(state, "stdout", chunk);
+      }),
+    );
+    if (state.process.onStderr) {
+      state.outputDisposables.push(
+        state.process.onStderr((chunk) => {
+          this.captureOutput(state, "stderr", chunk);
+        }),
+      );
+    }
+    state.exitDisposable = state.process.onExit((event) => {
+      void this.handleProcessExit(state, event);
+    });
+  }
+
+  private captureOutput(state: ManagedPtyTerminalSession, stream: TerminalOutputStream, chunk: string): void {
+    if (state.finalized) return;
+    this.markActivity(state);
+    const text = redactSecretLikeText(chunk);
+    const timestamp = this.isoNow();
+    this.appendScrollback(state, { timestamp, stream, text });
+    void this.enqueueTerminalEvent(state, { kind: "output", stream, text, timestamp });
+  }
+
+  private async handleProcessExit(state: ManagedPtyTerminalSession, event: PtyExitEvent): Promise<void> {
+    state.processExited = true;
+    this.clearKillTimer(state);
+    if (state.finalized) {
+      this.disposeExitListener(state);
+      return;
+    }
+    const exitCode = typeof event.exitCode === "number" ? event.exitCode : null;
+    const signal = event.signal ?? null;
+    const passed = exitCode === 0;
+    await this.finalizeSession(state, {
+      status: passed ? "exited" : "failed",
+      evidence: {
+        exitCode,
+        signal,
+        checks: [
+          {
+            kind: "run-exit",
+            name: `${state.session.commandLabel} terminal exit`,
+            status: passed ? "passed" : "failed",
+            detail: formatExitDetail(exitCode, signal),
+          },
+        ],
+      },
+    });
+    this.disposeExitListener(state);
+  }
+
+  private async expireSession(state: ManagedPtyTerminalSession): Promise<void> {
+    if (state.finalized) return;
+    const evidence = this.finalizeSession(state, {
+      status: "timed-out",
+      message: `${state.session.commandLabel} terminal timed out after ${this.timeoutMs}ms`,
+      evidence: {
+        exitCode: null,
+        signal: null,
+        checks: [
+          {
+            kind: "run-timeout",
+            name: `${state.session.commandLabel} terminal watchdog`,
+            status: "failed",
+            detail: `timed out after ${this.timeoutMs}ms`,
+          },
+        ],
+      },
+    });
+    this.scheduleKill(state);
+    await evidence;
+  }
+
+  private async finalizeSession(
+    state: ManagedPtyTerminalSession,
+    input: {
+      status: TerminalSessionStatus;
+      message?: string;
+      evidence: TerminalSessionExitEvidence;
+    },
+  ): Promise<TerminalSessionExitEvidence> {
+    if (state.finalized) return state.exitEvidence ?? input.evidence;
+    state.finalized = true;
+    this.clearLifecycleTimers(state);
+    this.disposeOutputListeners(state);
+    state.exitEvidence = input.evidence;
+    this.updateStatus(state, input.status);
+    await this.enqueueTerminalEvent(state, {
+      kind: "lifecycle",
+      status: input.status,
+      ...(input.message ? { message: input.message } : {}),
+    });
+    return this.getExitEvidence(state.session.id) ?? input.evidence;
+  }
+
+  private startTimeout(state: ManagedPtyTerminalSession): void {
+    if (this.timeoutMs <= 0 || state.finalized) return;
+    state.timeoutTimer = setTimeout(() => {
+      void this.expireSession(state);
+    }, this.timeoutMs);
+    state.timeoutTimer.unref();
+  }
+
+  private startStallTelemetry(state: ManagedPtyTerminalSession): void {
+    if (this.stallTelemetryMs <= 0 || state.finalized) return;
+    state.stallTimer = setTimeout(() => {
+      void (async () => {
+        if (state.finalized) return;
+        const idleMs = Date.now() - state.lastActivityAt;
+        if (idleMs >= this.stallTelemetryMs) {
+          await this.enqueueTerminalEvent(state, {
+            kind: "progress",
+            message: `${state.session.commandLabel} terminal stalled after ${idleMs}ms without output.`,
+          });
+        }
+        this.startStallTelemetry(state);
+      })();
+    }, this.stallTelemetryMs);
+    state.stallTimer.unref();
+  }
+
+  private markActivity(state: ManagedPtyTerminalSession): void {
+    state.lastActivityAt = Date.now();
+  }
+
+  private scheduleKill(state: ManagedPtyTerminalSession): void {
+    if (state.processExited) return;
+    this.tryKill(state, "SIGTERM");
+    if (state.processExited) return;
+    if (state.killTimer) clearTimeout(state.killTimer);
+    state.killTimer = setTimeout(() => {
+      state.killTimer = null;
+      if (state.processExited) return;
+      this.tryKill(state, "SIGKILL");
+    }, this.killTimeoutMs);
+    state.killTimer.unref();
+  }
+
+  private clearLifecycleTimers(state: ManagedPtyTerminalSession): void {
+    if (state.timeoutTimer) clearTimeout(state.timeoutTimer);
+    if (state.stallTimer) clearTimeout(state.stallTimer);
+    state.timeoutTimer = null;
+    state.stallTimer = null;
+  }
+
+  private clearKillTimer(state: ManagedPtyTerminalSession): void {
+    if (state.killTimer) clearTimeout(state.killTimer);
+    state.killTimer = null;
+  }
+
+  private tryKill(state: ManagedPtyTerminalSession, signal: string): void {
+    try {
+      state.process.kill(signal);
+    } catch {
+      // PTY teardown is best-effort; terminal evidence is finalized separately.
+    }
+  }
+
+  private disposeOutputListeners(state: ManagedPtyTerminalSession): void {
+    for (const disposable of state.outputDisposables.splice(0)) {
+      disposable.dispose();
+    }
+  }
+
+  private disposeExitListener(state: ManagedPtyTerminalSession): void {
+    state.exitDisposable?.dispose();
+    state.exitDisposable = null;
+  }
+
+  private appendScrollback(state: ManagedPtyTerminalSession, chunk: TerminalScrollbackChunk): void {
+    if (this.maxScrollbackBytes <= 0) return;
+    let text = chunk.text;
+    let bytes = Buffer.byteLength(text);
+    if (bytes > this.maxScrollbackBytes) {
+      text = Buffer.from(text).subarray(-this.maxScrollbackBytes).toString("utf8");
+      bytes = Buffer.byteLength(text);
+    }
+    state.scrollback.push({ ...chunk, text });
+    state.scrollbackBytes += bytes;
+    while (state.scrollbackBytes > this.maxScrollbackBytes && state.scrollback.length > 0) {
+      const removed = state.scrollback.shift();
+      state.scrollbackBytes -= Buffer.byteLength(removed?.text ?? "");
+    }
+  }
+
+  private updateStatus(state: ManagedPtyTerminalSession, status: TerminalSessionStatus): void {
+    state.session = {
+      ...state.session,
+      status,
+      ...(isFinalTerminalSessionStatus(status) ? { endedAt: this.isoNow() } : {}),
+    };
+  }
+
+  private async emitTerminalEvent(
+    state: ManagedPtyTerminalSession,
+    input: TerminalSessionEventInput,
+  ): Promise<void> {
+    const event = {
+      ...input,
+      terminalSessionId: state.session.id,
+      runId: state.session.runId,
+      timestamp: input.timestamp ?? this.isoNow(),
+    } as TerminalSessionEventDraft;
+    try {
+      await this.options.emitEvent?.(event);
+    } catch {
+      // Terminal observers must not decide process lifecycle.
+    }
+  }
+
+  private enqueueTerminalEvent(state: ManagedPtyTerminalSession, input: TerminalSessionEventInput): Promise<void> {
+    state.eventQueue = state.eventQueue.then(
+      () => this.emitTerminalEvent(state, input),
+      () => this.emitTerminalEvent(state, input),
+    );
+    return state.eventQueue;
+  }
+
+  private requireOpenSession(sessionId: string): ManagedPtyTerminalSession {
+    const state = this.requireSession(sessionId);
+    if (state.finalized) throw new Error(`Terminal session is closed: ${sessionId}`);
+    return state;
+  }
+
+  private requireSession(sessionId: string): ManagedPtyTerminalSession {
+    const state = this.sessions.get(sessionId);
+    if (!state) throw new Error(`Unknown terminal session: ${sessionId}`);
+    return state;
+  }
+
+  private isoNow(): string {
+    return (this.options.now?.() ?? new Date()).toISOString();
+  }
+}
+
+export async function buildHermesPlannerPtyLaunch(
+  input: StartHermesPlannerPtySessionInput,
+  options: HermesPlannerPtyLaunchOptions = {},
+): Promise<HermesPlannerPtyLaunch> {
+  const cwd = await realpath(input.worktreePath || input.projectRoot);
+  const source = options.source ?? "skyturn";
+  const command = options.executablePath ?? "hermes";
+  const hasOpaqueHandle = Boolean(input.hermesSessionHandle);
+  const metadata: HermesPlannerPtySessionMetadata = hasOpaqueHandle
+    ? {
+        transport: "hermes_session_resume",
+        continuity: "resume-handle",
+        degraded: false,
+        plannerSessionId: input.plannerSessionId ?? null,
+        plannerInputId: input.plannerInputId ?? null,
+        opaqueHandle: input.hermesSessionHandle ?? null,
+      }
+    : {
+        transport: "hermes_live_chat",
+        continuity: "process-level",
+        degraded: true,
+        plannerSessionId: input.plannerSessionId ?? null,
+        plannerInputId: input.plannerInputId ?? null,
+        opaqueHandle: null,
+        recoveryReason:
+          "No stable Hermes resume handle was supplied; process-level continuity is limited to this live PTY process and SkyTurn state.",
+      };
+
+  return {
+    command,
+    args: makeHermesPlannerPtyArgs({
+      opaqueHandle: input.hermesSessionHandle,
+      extraArgs: options.extraArgs,
+      source,
+    }),
+    cwd,
+    commandLabel: "Hermes CLI PTY",
+    metadata,
+  };
+}
+
+export function createHermesPlannerPtyTransport(
+  options: HermesPlannerPtyTransportOptions,
+): HermesPlannerPtyTransport {
+  return new HermesPlannerPtyTransportImpl(options);
+}
+
+class HermesPlannerPtyTransportImpl implements HermesPlannerPtyTransport {
+  private readonly terminalManager: PtyTerminalSessionManager;
+  private readonly sessionsByCanvasSessionId = new Map<
+    string,
+    { terminalSessionId: string; metadata: HermesPlannerPtySessionMetadata }
+  >();
+
+  constructor(private readonly options: HermesPlannerPtyTransportOptions) {
+    this.terminalManager = createPtyTerminalSessionManager(options);
+  }
+
+  async startSession(input: StartHermesPlannerPtySessionInput): Promise<HermesPlannerPtySession> {
+    this.assertFeatureEnabled();
+    const existing = this.openSession(input.canvasSessionId);
+    if (existing) return existing;
+
+    const launch = await buildHermesPlannerPtyLaunch(input, {
+      executablePath: this.options.executablePath,
+      extraArgs: this.options.extraArgs,
+      source: this.options.source,
+    });
+    const terminalSession = await this.terminalManager.startSession({
+      id: input.id ?? `hermes-planner-${input.canvasSessionId}`,
+      runId: input.runId,
+      canvasSessionId: input.canvasSessionId,
+      agentKind: "hermes",
+      cwd: launch.cwd,
+      command: launch.command,
+      args: launch.args,
+      commandLabel: launch.commandLabel,
+      cols: input.cols,
+      rows: input.rows,
+      env: input.env,
+    });
+    this.sessionsByCanvasSessionId.set(input.canvasSessionId, {
+      terminalSessionId: terminalSession.id,
+      metadata: launch.metadata,
+    });
+    await this.emitPlannerMetadata(terminalSession, launch.metadata);
+    return { terminalSession, metadata: { ...launch.metadata } };
+  }
+
+  async sendUserInput(canvasSessionId: string, data: string): Promise<void> {
+    const session = this.requireOpenSession(canvasSessionId);
+    await this.terminalManager.writeStdin(session.terminalSession.id, data);
+  }
+
+  async cancelSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null> {
+    const session = this.requireSession(canvasSessionId);
+    return this.terminalManager.cancelSession(session.terminalSession.id, reason);
+  }
+
+  async terminateSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null> {
+    const session = this.requireSession(canvasSessionId);
+    return this.terminalManager.terminateSession(session.terminalSession.id, reason);
+  }
+
+  getSession(canvasSessionId: string): HermesPlannerPtySession | null {
+    const session = this.openSession(canvasSessionId);
+    if (session) return session;
+    this.sessionsByCanvasSessionId.delete(canvasSessionId);
+    return null;
+  }
+
+  private openSession(canvasSessionId: string): HermesPlannerPtySession | null {
+    const stored = this.sessionsByCanvasSessionId.get(canvasSessionId);
+    if (!stored) return null;
+    const terminalSession = this.terminalManager.getSession(stored.terminalSessionId);
+    if (!terminalSession || isFinalTerminalSessionStatus(terminalSession.status)) {
+      this.sessionsByCanvasSessionId.delete(canvasSessionId);
+      return null;
+    }
+    return {
+      terminalSession,
+      metadata: { ...stored.metadata },
+    };
+  }
+
+  private requireOpenSession(canvasSessionId: string): HermesPlannerPtySession {
+    const session = this.openSession(canvasSessionId);
+    if (!session) throw new Error(`No open Hermes planner PTY session for CanvasSession: ${canvasSessionId}`);
+    return session;
+  }
+
+  private requireSession(canvasSessionId: string): HermesPlannerPtySession {
+    const stored = this.sessionsByCanvasSessionId.get(canvasSessionId);
+    if (!stored) throw new Error(`Unknown Hermes planner PTY session for CanvasSession: ${canvasSessionId}`);
+    const terminalSession = this.terminalManager.getSession(stored.terminalSessionId);
+    if (!terminalSession) throw new Error(`Unknown Hermes planner terminal session: ${stored.terminalSessionId}`);
+    return {
+      terminalSession,
+      metadata: { ...stored.metadata },
+    };
+  }
+
+  private assertFeatureEnabled(): void {
+    const flags = this.options.featureFlags ?? DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS;
+    if (!flags.ptyInteractiveSessions) {
+      throw new Error("Hermes planner PTY transport is disabled by feature flag.");
+    }
+  }
+
+  private async emitPlannerMetadata(
+    terminalSession: AgentTerminalSession,
+    metadata: HermesPlannerPtySessionMetadata,
+  ): Promise<void> {
+    const message = metadata.degraded
+      ? `Hermes planner PTY started with process-level continuity: ${metadata.recoveryReason}`
+      : "Hermes planner PTY started with a stable Hermes resume handle.";
+    try {
+      await this.options.emitEvent?.({
+        kind: "progress",
+        terminalSessionId: terminalSession.id,
+        runId: terminalSession.runId,
+        message,
+      });
+    } catch {
+      // Planner metadata observers must not decide PTY lifecycle.
+    }
   }
 }
 
@@ -1484,6 +2233,10 @@ function isFinalRunStatus(status: AgentRunStatus): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled" || status === "timed-out";
 }
 
+function isFinalTerminalSessionStatus(status: TerminalSessionStatus): boolean {
+  return status === "exited" || status === "failed" || status === "cancelled" || status === "timed-out";
+}
+
 function isEvidenceCheck(value: unknown): value is NonNullable<RunEvidence["review"]> {
   if (!value || typeof value !== "object") return false;
   const candidate = value as { name?: unknown; kind?: unknown; status?: unknown };
@@ -1528,6 +2281,21 @@ function makeHermesChatArgs(input: {
     "-q",
     input.prompt,
     "--quiet",
+    "--source",
+    input.source,
+    ...(input.opaqueHandle ? ["--resume", input.opaqueHandle] : []),
+    ...(input.extraArgs ?? []),
+  ];
+}
+
+function makeHermesPlannerPtyArgs(input: {
+  opaqueHandle?: string;
+  extraArgs?: string[];
+  source: string;
+}): string[] {
+  return [
+    "chat",
+    "--cli",
     "--source",
     input.source,
     ...(input.opaqueHandle ? ["--resume", input.opaqueHandle] : []),
@@ -1783,7 +2551,7 @@ function getNestedString(value: Record<string, unknown>, key: string, nestedKey:
   return typeof nested[nestedKey] === "string" ? nested[nestedKey] : null;
 }
 
-function formatExitDetail(code: number | null, signal: NodeJS.Signals | null): string {
+function formatExitDetail(code: number | null, signal: NodeJS.Signals | string | null): string {
   if (typeof code === "number") return `exit ${code}`;
   if (signal) return `signal ${signal}`;
   return "process closed";
