@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentRun, RunEvent } from "@skyturn/project-core";
+import type { TerminalSessionEventDraft } from "@skyturn/project-core";
 import { reduceWorkflowEvents, type FlowEvent } from "@skyturn/workflow-kernel";
 
 import {
@@ -13,10 +14,14 @@ import {
   createDiscoveryService,
   createHermesCliAdapter,
   createMockAgentAdapter,
+  createPtyTerminalSessionManager,
   deriveEvidenceFromEvents,
   flowEventsFromAgentRun,
   loadRunEvents,
   readTaskOutput,
+  type PtyExitEvent,
+  type PtyProcess,
+  type PtyProcessFactory,
 } from "./index";
 
 const roots: string[] = [];
@@ -2210,6 +2215,448 @@ describe("agent bridge", () => {
   });
 });
 
+describe("PTY terminal session manager", () => {
+  it("starts a session and emits terminal lifecycle events", async () => {
+    const { events, manager } = makePtyManager();
+
+    const session = await manager.startSession(ptySessionInput());
+
+    expect(session).toMatchObject({
+      id: "terminal-run-pty-1",
+      runId: "run-pty-1",
+      canvasSessionId: "session-1",
+      agentKind: "codex",
+      cwd: "/repo",
+      commandLabel: "codex",
+      transport: "pty-interactive",
+      status: "running",
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "lifecycle",
+        terminalSessionId: session.id,
+        runId: "run-pty-1",
+        status: "starting",
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "lifecycle",
+        terminalSessionId: session.id,
+        runId: "run-pty-1",
+        status: "running",
+      }),
+    );
+  });
+
+  it("captures and redacts stdout and stderr chunks in terminal events and scrollback", async () => {
+    const { events, manager, pty } = makePtyManager();
+    const session = await manager.startSession(ptySessionInput());
+
+    pty.emitStdout("Bearer very-secret-token\n");
+    pty.emitStderr("OPENAI_API_KEY=sk-test-secret-token\n");
+    await waitForTerminalEvent(
+      events,
+      (event) => event.kind === "output" && event.stream === "stderr" && event.text === "OPENAI_API_KEY=[redacted]\n",
+    );
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "output",
+        terminalSessionId: session.id,
+        stream: "stdout",
+        text: "Bearer [redacted]\n",
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "output",
+        terminalSessionId: session.id,
+        stream: "stderr",
+        text: "OPENAI_API_KEY=[redacted]\n",
+      }),
+    );
+    const serialized = JSON.stringify({ events, scrollback: manager.getScrollback(session.id) });
+    expect(serialized).not.toContain("very-secret-token");
+    expect(serialized).not.toContain("sk-test-secret-token");
+  });
+
+  it("forwards stdin writes to the PTY process", async () => {
+    const { manager, pty } = makePtyManager();
+    const session = await manager.startSession(ptySessionInput());
+
+    await manager.writeStdin(session.id, "continue\n");
+
+    expect(pty.writes).toEqual(["continue\n"]);
+  });
+
+  it("forwards terminal resize dimensions to the PTY process", async () => {
+    const { manager, pty } = makePtyManager();
+    const session = await manager.startSession(ptySessionInput());
+
+    await manager.resize(session.id, { cols: 120, rows: 42 });
+
+    expect(pty.resizes).toEqual([{ cols: 120, rows: 42 }]);
+  });
+
+  it("cancels a session with terminal lifecycle and run-exit evidence skeleton", async () => {
+    const { events, manager, pty } = makePtyManager();
+    const session = await manager.startSession(ptySessionInput());
+
+    const evidence = await manager.cancelSession(session.id, "User stopped the terminal");
+
+    expect(pty.killedSignals).toContain("SIGTERM");
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "lifecycle",
+        terminalSessionId: session.id,
+        status: "cancelled",
+        message: "User stopped the terminal",
+      }),
+    );
+    expect(evidence).toEqual({
+      exitCode: null,
+      signal: null,
+      checks: [
+        {
+          kind: "run-exit",
+          name: "codex terminal exit",
+          status: "skipped",
+          detail: "User stopped the terminal",
+        },
+      ],
+    });
+  });
+
+  it("times out a session and kills the PTY process", async () => {
+    vi.useFakeTimers();
+    const { events, manager, pty } = makePtyManager({ timeoutMs: 250, killTimeoutMs: 50 });
+    const session = await manager.startSession(ptySessionInput());
+
+    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(pty.killedSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "lifecycle",
+        terminalSessionId: session.id,
+        status: "timed-out",
+      }),
+    );
+    expect(manager.getExitEvidence(session.id)).toEqual({
+      exitCode: null,
+      signal: null,
+      checks: [
+        {
+          kind: "run-timeout",
+          name: "codex terminal watchdog",
+          status: "failed",
+          detail: "timed out after 250ms",
+        },
+      ],
+    });
+  });
+
+  it("marks non-zero PTY exits as failed evidence", async () => {
+    const { events, manager, pty } = makePtyManager();
+    const session = await manager.startSession(ptySessionInput());
+
+    pty.emitExit({ exitCode: 2, signal: null });
+    await waitForTerminalEvent(events, (event) => event.kind === "lifecycle" && event.status === "failed");
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "lifecycle",
+        terminalSessionId: session.id,
+        status: "failed",
+      }),
+    );
+    expect(manager.getExitEvidence(session.id)).toEqual({
+      exitCode: 2,
+      signal: null,
+      checks: [
+        {
+          kind: "run-exit",
+          name: "codex terminal exit",
+          status: "failed",
+          detail: "exit 2",
+        },
+      ],
+    });
+  });
+
+  it("caps terminal scrollback bytes and evicts old chunks", async () => {
+    const { manager, pty } = makePtyManager({ maxScrollbackBytes: 10 });
+    const session = await manager.startSession(ptySessionInput());
+
+    pty.emitStdout("0123456789abcdef");
+
+    expect(manager.getScrollback(session.id).map((chunk) => chunk.text)).toEqual(["6789abcdef"]);
+
+    pty.emitStdout("XYZ");
+
+    expect(manager.getScrollback(session.id).map((chunk) => chunk.text)).toEqual(["XYZ"]);
+  });
+
+  it("orders queued output before final lifecycle events with async sinks", async () => {
+    const outputGate = deferred<void>();
+    const events: TerminalSessionEventDraft[] = [];
+    const { manager, pty } = makePtyManager({
+      emitEvent: async (event) => {
+        if (event.kind === "output") await outputGate.promise;
+        events.push(event);
+      },
+    });
+    const session = await manager.startSession(ptySessionInput());
+
+    pty.emitStdout("prior output\n");
+    pty.emitExit({ exitCode: 0, signal: null });
+    await flushAsyncEvents();
+
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: "lifecycle",
+        terminalSessionId: session.id,
+        status: "exited",
+      }),
+    );
+
+    outputGate.resolve();
+    await waitForTerminalEvent(events, (event) => event.kind === "lifecycle" && event.status === "exited");
+    pty.emitStdout("late output\n");
+    await flushAsyncEvents();
+
+    const outputIndex = events.findIndex((event) => event.kind === "output" && event.text === "prior output\n");
+    const finalIndex = events.findIndex((event) => event.kind === "lifecycle" && event.status === "exited");
+    expect(outputIndex).toBeGreaterThan(-1);
+    expect(finalIndex).toBeGreaterThan(outputIndex);
+    expect(events.slice(finalIndex + 1)).not.toContainEqual(
+      expect.objectContaining({
+        kind: "output",
+        terminalSessionId: session.id,
+      }),
+    );
+  });
+
+  it("keeps a synchronous PTY exit final while the starting lifecycle sink is blocked", async () => {
+    vi.useFakeTimers();
+    const startingGate = deferred<void>();
+    const startingSeen = deferred<void>();
+    const events: TerminalSessionEventDraft[] = [];
+    const { manager, pty } = makePtyManager({
+      timeoutMs: 250,
+      emitEvent: async (event) => {
+        events.push(event);
+        if (event.kind === "lifecycle" && event.status === "starting") {
+          startingSeen.resolve();
+          await startingGate.promise;
+        }
+      },
+    });
+    const startPromise = manager.startSession(ptySessionInput());
+
+    await startingSeen.promise;
+    pty.emitExit({ exitCode: 0, signal: null });
+    await flushMicrotasks();
+
+    expect(manager.getSession("terminal-run-pty-1")?.status).toBe("exited");
+
+    startingGate.resolve();
+    const session = await startPromise;
+    await flushMicrotasks();
+
+    const lifecycleStatuses = events
+      .filter((event) => event.kind === "lifecycle")
+      .map((event) => event.status);
+    const finalIndex = lifecycleStatuses.indexOf("exited");
+
+    expect(session.status).toBe("exited");
+    expect(manager.getSession(session.id)?.status).toBe("exited");
+    expect(finalIndex).toBeGreaterThan(-1);
+    expect(lifecycleStatuses.slice(finalIndex + 1)).not.toContain("running");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("treats cancel kill failures as best-effort", async () => {
+    vi.useFakeTimers();
+    const { manager, pty } = makePtyManager({ killTimeoutMs: 50 });
+    const session = await manager.startSession(ptySessionInput());
+    pty.throwOnKillSignals.add("SIGTERM");
+
+    await expect(manager.cancelSession(session.id, "User stopped the terminal")).resolves.toEqual({
+      exitCode: null,
+      signal: null,
+      checks: [
+        {
+          kind: "run-exit",
+          name: "codex terminal exit",
+          status: "skipped",
+          detail: "User stopped the terminal",
+        },
+      ],
+    });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(pty.killedSignals).toContain("SIGTERM");
+    expect(pty.killedSignals).toContain("SIGKILL");
+  });
+
+  it("treats timeout kill failures as best-effort", async () => {
+    vi.useFakeTimers();
+    const { manager, pty } = makePtyManager({ timeoutMs: 250, killTimeoutMs: 50 });
+    const session = await manager.startSession(ptySessionInput());
+    pty.throwOnKillSignals.add("SIGTERM");
+
+    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(pty.killedSignals).toContain("SIGTERM");
+    expect(pty.killedSignals).toContain("SIGKILL");
+    expect(manager.getExitEvidence(session.id)).toEqual({
+      exitCode: null,
+      signal: null,
+      checks: [
+        {
+          kind: "run-timeout",
+          name: "codex terminal watchdog",
+          status: "failed",
+          detail: "timed out after 250ms",
+        },
+      ],
+    });
+  });
+
+  it("clears SIGKILL escalation when the PTY exits after SIGTERM", async () => {
+    vi.useFakeTimers();
+    const { manager, pty } = makePtyManager({ killTimeoutMs: 50 });
+    const session = await manager.startSession(ptySessionInput());
+
+    await manager.cancelSession(session.id, "User stopped the terminal");
+    pty.emitExit({ exitCode: null, signal: "SIGTERM" });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(pty.killedSignals).toEqual(["SIGTERM"]);
+  });
+
+  it("does not schedule SIGKILL when SIGTERM synchronously closes the PTY", async () => {
+    vi.useFakeTimers();
+    const { events, manager, pty } = makePtyManager({ killTimeoutMs: 50 });
+    const session = await manager.startSession(ptySessionInput());
+    pty.exitOnKillSignals.set("SIGTERM", { exitCode: null, signal: "SIGTERM" });
+
+    const evidence = await manager.cancelSession(session.id, "User stopped the terminal");
+    await vi.advanceTimersByTimeAsync(50);
+    pty.emitStdout("late output\n");
+    await flushMicrotasks();
+
+    expect(pty.killedSignals).toEqual(["SIGTERM"]);
+    expect(manager.getSession(session.id)?.status).toBe("cancelled");
+    expect(evidence).toEqual({
+      exitCode: null,
+      signal: null,
+      checks: [
+        {
+          kind: "run-exit",
+          name: "codex terminal exit",
+          status: "skipped",
+          detail: "User stopped the terminal",
+        },
+      ],
+    });
+    expect(manager.getExitEvidence(session.id)).toEqual(evidence);
+    const lifecycleStatuses = events.filter((event) => event.kind === "lifecycle").map((event) => event.status);
+    const finalIndex = lifecycleStatuses.indexOf("cancelled");
+    const finalEventIndex = events.findIndex((event) => event.kind === "lifecycle" && event.status === "cancelled");
+    expect(finalIndex).toBeGreaterThan(-1);
+    expect(finalEventIndex).toBeGreaterThan(-1);
+    expect(lifecycleStatuses).not.toContain("failed");
+    expect(lifecycleStatuses).not.toContain("exited");
+    expect(lifecycleStatuses.slice(finalIndex + 1)).not.toContain("running");
+    expect(events.slice(finalEventIndex + 1)).not.toContainEqual(
+      expect.objectContaining({
+        kind: "output",
+        terminalSessionId: session.id,
+        text: "late output\n",
+      }),
+    );
+  });
+
+  it("keeps timeout evidence when SIGTERM synchronously closes the PTY", async () => {
+    vi.useFakeTimers();
+    const { events, manager, pty } = makePtyManager({ timeoutMs: 250, killTimeoutMs: 50 });
+    const session = await manager.startSession(ptySessionInput());
+    pty.exitOnKillSignals.set("SIGTERM", { exitCode: null, signal: "SIGTERM" });
+
+    await vi.advanceTimersByTimeAsync(250);
+    await vi.advanceTimersByTimeAsync(50);
+    pty.emitStdout("late output\n");
+    await flushMicrotasks();
+
+    const evidence = manager.getExitEvidence(session.id);
+    expect(pty.killedSignals).toEqual(["SIGTERM"]);
+    expect(manager.getSession(session.id)?.status).toBe("timed-out");
+    expect(evidence).toEqual({
+      exitCode: null,
+      signal: null,
+      checks: [
+        {
+          kind: "run-timeout",
+          name: "codex terminal watchdog",
+          status: "failed",
+          detail: "timed out after 250ms",
+        },
+      ],
+    });
+    const lifecycleStatuses = events.filter((event) => event.kind === "lifecycle").map((event) => event.status);
+    const finalIndex = lifecycleStatuses.indexOf("timed-out");
+    const finalEventIndex = events.findIndex((event) => event.kind === "lifecycle" && event.status === "timed-out");
+    expect(finalIndex).toBeGreaterThan(-1);
+    expect(finalEventIndex).toBeGreaterThan(-1);
+    expect(lifecycleStatuses).not.toContain("failed");
+    expect(lifecycleStatuses).not.toContain("exited");
+    expect(lifecycleStatuses.slice(finalIndex + 1)).not.toContain("running");
+    expect(events.slice(finalEventIndex + 1)).not.toContainEqual(
+      expect.objectContaining({
+        kind: "output",
+        terminalSessionId: session.id,
+        text: "late output\n",
+      }),
+    );
+  });
+
+  it("suppresses duplicate terminal events after process close", async () => {
+    const { events, manager, pty } = makePtyManager();
+    const session = await manager.startSession(ptySessionInput());
+
+    pty.emitExit({ exitCode: 0, signal: null });
+    pty.emitStdout("late output\n");
+    pty.emitExit({ exitCode: 1, signal: null });
+    await waitForTerminalEvent(events, (event) => event.kind === "lifecycle" && event.status === "exited");
+
+    expect(events.filter((event) => event.kind === "lifecycle" && event.status === "exited")).toHaveLength(1);
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        kind: "output",
+        terminalSessionId: session.id,
+        text: "late output\n",
+      }),
+    );
+    expect(manager.getExitEvidence(session.id)).toEqual({
+      exitCode: 0,
+      signal: null,
+      checks: [
+        {
+          kind: "run-exit",
+          name: "codex terminal exit",
+          status: "passed",
+          detail: "exit 0",
+        },
+      ],
+    });
+  });
+});
+
 async function makeTempRoot(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "skyturn-agent-bridge-"));
   roots.push(root);
@@ -2321,4 +2768,132 @@ function killPid(pid: number): void {
   } catch {
     // Already gone.
   }
+}
+
+function ptySessionInput() {
+  return {
+    runId: "run-pty-1",
+    canvasSessionId: "session-1",
+    agentKind: "codex" as const,
+    cwd: "/repo",
+    command: "codex",
+    commandLabel: "codex",
+    cols: 80,
+    rows: 24,
+  };
+}
+
+function makePtyManager(
+  options: {
+    timeoutMs?: number;
+    killTimeoutMs?: number;
+    maxScrollbackBytes?: number;
+    emitEvent?: (event: TerminalSessionEventDraft) => void | Promise<void>;
+  } = {},
+): {
+  events: TerminalSessionEventDraft[];
+  manager: ReturnType<typeof createPtyTerminalSessionManager>;
+  pty: FakePtyProcess;
+  factory: PtyProcessFactory;
+} {
+  const events: TerminalSessionEventDraft[] = [];
+  const pty = new FakePtyProcess();
+  const factory: PtyProcessFactory = {
+    spawn: vi.fn(() => pty),
+  };
+  const manager = createPtyTerminalSessionManager({
+    ptyFactory: factory,
+    emitEvent: options.emitEvent ?? (async (event) => {
+      events.push(event);
+    }),
+    ...options,
+  });
+  return { events, manager, pty, factory };
+}
+
+class FakePtyProcess implements PtyProcess {
+  readonly writes: string[] = [];
+  readonly resizes: Array<{ cols: number; rows: number }> = [];
+  readonly killedSignals: string[] = [];
+  readonly throwOnKillSignals = new Set<string>();
+  readonly exitOnKillSignals = new Map<string, PtyExitEvent>();
+  private readonly dataListeners = new Set<(chunk: string) => void>();
+  private readonly stderrListeners = new Set<(chunk: string) => void>();
+  private readonly exitListeners = new Set<(event: PtyExitEvent) => void>();
+
+  write(data: string): void {
+    this.writes.push(data);
+  }
+
+  resize(cols: number, rows: number): void {
+    this.resizes.push({ cols, rows });
+  }
+
+  kill(signal?: string): void {
+    const normalizedSignal = signal ?? "SIGTERM";
+    this.killedSignals.push(normalizedSignal);
+    if (this.throwOnKillSignals.has(normalizedSignal)) {
+      throw new Error(`kill failed for ${normalizedSignal}`);
+    }
+    const exitEvent = this.exitOnKillSignals.get(normalizedSignal);
+    if (exitEvent) this.emitExit(exitEvent);
+  }
+
+  onData(listener: (chunk: string) => void): { dispose(): void } {
+    this.dataListeners.add(listener);
+    return { dispose: () => this.dataListeners.delete(listener) };
+  }
+
+  onStderr(listener: (chunk: string) => void): { dispose(): void } {
+    this.stderrListeners.add(listener);
+    return { dispose: () => this.stderrListeners.delete(listener) };
+  }
+
+  onExit(listener: (event: PtyExitEvent) => void): { dispose(): void } {
+    this.exitListeners.add(listener);
+    return { dispose: () => this.exitListeners.delete(listener) };
+  }
+
+  emitStdout(chunk: string): void {
+    for (const listener of this.dataListeners) listener(chunk);
+  }
+
+  emitStderr(chunk: string): void {
+    for (const listener of this.stderrListeners) listener(chunk);
+  }
+
+  emitExit(event: PtyExitEvent): void {
+    for (const listener of this.exitListeners) listener(event);
+  }
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (reason?: unknown) => void } {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function waitForTerminalEvent(
+  events: TerminalSessionEventDraft[],
+  predicate: (event: TerminalSessionEventDraft) => boolean,
+): Promise<TerminalSessionEventDraft> {
+  const started = Date.now();
+  for (;;) {
+    const event = events.find(predicate);
+    if (event) return event;
+    if (Date.now() - started > 2_000) throw new Error("Timed out waiting for terminal event");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
+async function flushAsyncEvents(): Promise<void> {
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let i = 0; i < 5; i += 1) await Promise.resolve();
 }
