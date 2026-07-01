@@ -9,8 +9,9 @@ import vm from "node:vm";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
 
-test("Electron main exposes feature-gated terminal IPC without starting PTY processes", async () => {
+test("Electron main exposes feature-gated terminal IPC through terminal runtime", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const runtime = await readFile(join(root, "electron", "terminalRuntime.ts"), "utf8");
 
   for (const channel of [
     "terminal:start",
@@ -22,8 +23,11 @@ test("Electron main exposes feature-gated terminal IPC without starting PTY proc
     assert.match(main, new RegExp(`ipcMain\\.handle\\("${escapeRegExp(channel)}"`));
   }
 
-  assert.match(main, /terminalUnsupportedResult\(RUN_PROTOCOL_VERSION,\s*terminalPtyFeatureEnabled\(\)\)/);
-  assert.match(main, /const terminalSnapshots = new Map<string, TerminalSnapshotState>\(\)/);
+  assert.match(main, /createTerminalRuntime\(/);
+  assert.match(runtime, /terminalUnsupportedResult\(.*false\)/);
+  assert.match(runtime, /terminalUnsupportedResult\(.*true\)/);
+  assert.match(runtime, /createHermesPlannerPtyTransport/);
+  assert.match(runtime, /const snapshots = new Map<string, TerminalSnapshotState>\(\)/);
   assert.match(main, /window\.webContents\.send\("terminal:event", event\)/);
 
   const startHandler = main.slice(
@@ -32,7 +36,8 @@ test("Electron main exposes feature-gated terminal IPC without starting PTY proc
   );
   assert.match(startHandler, /assertTerminalStartInput\(input\)/);
   assert.match(startHandler, /assertKnownProjectRoot\(normalized\.projectRoot\)/);
-  assert.doesNotMatch(startHandler, /getAgentBridge|startRun|spawn|execFile|createHermes|createCodex|AgentBridge/);
+  assert.match(startHandler, /terminalRuntime\.start\(normalized\)/);
+  assert.doesNotMatch(startHandler, /startRun|spawn|execFile|createCodex/);
 });
 
 test("terminal IPC contracts validate input and return stable disabled snapshots", async () => {
