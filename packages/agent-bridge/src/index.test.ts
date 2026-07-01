@@ -13,6 +13,8 @@ import {
   createCodexCliAdapter,
   createDiscoveryService,
   createHermesCliAdapter,
+  buildHermesPlannerPtyLaunch,
+  createHermesPlannerPtyTransport,
   createMockAgentAdapter,
   createPtyTerminalSessionManager,
   deriveEvidenceFromEvents,
@@ -2213,6 +2215,230 @@ describe("agent bridge", () => {
       }),
     );
   });
+
+  it("builds Hermes planner PTY launch args for the interactive CLI mode", async () => {
+    const projectRoot = await makeTempRoot();
+
+    const launch = await buildHermesPlannerPtyLaunch(
+      {
+        runId: "run-hermes-pty-1",
+        canvasSessionId: "canvas-session-1",
+        plannerSessionId: "hermes-planner-session-1",
+        plannerInputId: "requirement-1",
+        projectRoot,
+        worktreePath: projectRoot,
+      },
+      {
+        executablePath: "/usr/local/bin/hermes",
+        source: "skyturn",
+      },
+    );
+
+    expect(launch).toMatchObject({
+      command: "/usr/local/bin/hermes",
+      cwd: await realpath(projectRoot),
+      commandLabel: "Hermes CLI PTY",
+      args: ["chat", "--cli", "--source", "skyturn"],
+      metadata: {
+        transport: "hermes_live_chat",
+        continuity: "process-level",
+        degraded: true,
+        plannerSessionId: "hermes-planner-session-1",
+        plannerInputId: "requirement-1",
+        opaqueHandle: null,
+      },
+    });
+    expect(launch.args).not.toContain("-q");
+    expect(launch.args).not.toContain("-z");
+    expect(launch.args).not.toContain("--yolo");
+    expect(launch.metadata.recoveryReason).toContain("process-level");
+  });
+
+  it("uses Hermes public session resume in PTY launch when an opaque handle is provided", async () => {
+    const projectRoot = await makeTempRoot();
+
+    const launch = await buildHermesPlannerPtyLaunch(
+      {
+        runId: "run-hermes-pty-resume",
+        canvasSessionId: "canvas-session-1",
+        plannerSessionId: "hermes-planner-session-1",
+        hermesSessionHandle: "opaque-hermes-session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+      },
+      {
+        executablePath: "/usr/local/bin/hermes",
+      },
+    );
+
+    expect(launch.args).toEqual([
+      "chat",
+      "--cli",
+      "--source",
+      "skyturn",
+      "--resume",
+      "opaque-hermes-session-1",
+    ]);
+    expect(launch.metadata).toMatchObject({
+      transport: "hermes_session_resume",
+      continuity: "resume-handle",
+      degraded: false,
+      opaqueHandle: "opaque-hermes-session-1",
+    });
+    expect(launch.metadata.recoveryReason).toBeUndefined();
+  });
+
+  it("keeps Hermes planner PTY transport disabled unless the feature flag is enabled", async () => {
+    const projectRoot = await makeTempRoot();
+    const factory: PtyProcessFactory = {
+      spawn: vi.fn(() => new FakePtyProcess()),
+    };
+    const transport = createHermesPlannerPtyTransport({
+      ptyFactory: factory,
+      executablePath: "hermes",
+    });
+
+    await expect(
+      transport.startSession({
+        runId: "run-hermes-pty-disabled",
+        canvasSessionId: "canvas-session-disabled",
+        projectRoot,
+        worktreePath: projectRoot,
+      }),
+    ).rejects.toThrow("disabled by feature flag");
+    expect(factory.spawn).not.toHaveBeenCalled();
+  });
+
+  it("keeps follow-up Hermes planner input on the same PTY session for one CanvasSession", async () => {
+    const projectRoot = await makeTempRoot();
+    const events: TerminalSessionEventDraft[] = [];
+    const pty = new FakePtyProcess();
+    const factory: PtyProcessFactory = {
+      spawn: vi.fn(() => pty),
+    };
+    const transport = createHermesPlannerPtyTransport({
+      ptyFactory: factory,
+      executablePath: "hermes",
+      featureFlags: { ptyInteractiveSessions: true },
+      emitEvent: async (event) => {
+        events.push(event);
+      },
+    });
+
+    const first = await transport.startSession({
+      runId: "run-hermes-pty-1",
+      canvasSessionId: "canvas-session-1",
+      plannerSessionId: "hermes-planner-session-1",
+      plannerInputId: "requirement-1",
+      projectRoot,
+      worktreePath: projectRoot,
+    });
+    await transport.sendUserInput("canvas-session-1", "Plan first requirement\n");
+    const second = await transport.startSession({
+      runId: "run-hermes-pty-2",
+      canvasSessionId: "canvas-session-1",
+      plannerSessionId: "hermes-planner-session-1",
+      plannerInputId: "requirement-2",
+      projectRoot,
+      worktreePath: projectRoot,
+    });
+    await transport.sendUserInput("canvas-session-1", "Plan follow-up requirement\n");
+
+    expect(factory.spawn).toHaveBeenCalledTimes(1);
+    expect(first.terminalSession.id).toBe(second.terminalSession.id);
+    expect(first.terminalSession.canvasSessionId).toBe("canvas-session-1");
+    expect(pty.writes).toEqual(["Plan first requirement\n", "Plan follow-up requirement\n"]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "progress",
+        terminalSessionId: first.terminalSession.id,
+        message: expect.stringContaining("process-level"),
+      }),
+    );
+  });
+
+  it("keeps Hermes planner PTY session when metadata progress observer rejects", async () => {
+    const projectRoot = await makeTempRoot();
+    const events: TerminalSessionEventDraft[] = [];
+    const pty = new FakePtyProcess();
+    const factory: PtyProcessFactory = {
+      spawn: vi.fn(() => pty),
+    };
+    const transport = createHermesPlannerPtyTransport({
+      ptyFactory: factory,
+      executablePath: "hermes",
+      featureFlags: { ptyInteractiveSessions: true },
+      emitEvent: async (event) => {
+        events.push(event);
+        if (event.kind === "progress" && event.message?.includes("Hermes planner PTY started")) {
+          throw new Error("observer failed");
+        }
+      },
+    });
+
+    const first = await transport.startSession({
+      runId: "run-hermes-pty-observer-1",
+      canvasSessionId: "canvas-session-observer",
+      plannerSessionId: "hermes-planner-session-observer",
+      plannerInputId: "requirement-1",
+      projectRoot,
+      worktreePath: projectRoot,
+    });
+
+    const stored = transport.getSession("canvas-session-observer");
+    const second = await transport.startSession({
+      runId: "run-hermes-pty-observer-2",
+      canvasSessionId: "canvas-session-observer",
+      plannerSessionId: "hermes-planner-session-observer",
+      plannerInputId: "requirement-2",
+      projectRoot,
+      worktreePath: projectRoot,
+    });
+
+    expect(first.terminalSession.status).toBe("running");
+    expect(stored?.terminalSession.id).toBe(first.terminalSession.id);
+    expect(second.terminalSession.id).toBe(first.terminalSession.id);
+    expect(factory.spawn).toHaveBeenCalledTimes(1);
+    expect(
+      events.filter((event) => event.kind === "progress" && event.message?.includes("Hermes planner PTY started")),
+    ).toHaveLength(1);
+  });
+
+  it("redacts Hermes planner PTY output chunks", async () => {
+    const projectRoot = await makeTempRoot();
+    const events: TerminalSessionEventDraft[] = [];
+    const pty = new FakePtyProcess();
+    const transport = createHermesPlannerPtyTransport({
+      ptyFactory: { spawn: vi.fn(() => pty) },
+      executablePath: "hermes",
+      featureFlags: { ptyInteractiveSessions: true },
+      emitEvent: async (event) => {
+        events.push(event);
+      },
+    });
+    const apiKey = "sk-hermes-pty-secret-token";
+
+    const session = await transport.startSession({
+      runId: "run-hermes-pty-secret",
+      canvasSessionId: "canvas-session-secret",
+      projectRoot,
+      worktreePath: projectRoot,
+    });
+    pty.emitStdout(`HERMES_API_KEY=${apiKey}\n`);
+    await waitForTerminalEvent(
+      events,
+      (event) => event.kind === "output" && event.terminalSessionId === session.terminalSession.id,
+    );
+
+    expect(JSON.stringify(events)).not.toContain(apiKey);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "output",
+        terminalSessionId: session.terminalSession.id,
+        text: "HERMES_API_KEY=[redacted]\n",
+      }),
+    );
+  });
 });
 
 describe("PTY terminal session manager", () => {
@@ -2356,6 +2582,30 @@ describe("PTY terminal session manager", () => {
         },
       ],
     });
+  });
+
+  it("emits stalled terminal progress before a PTY hard timeout", async () => {
+    vi.useFakeTimers();
+    const { events, manager, pty } = makePtyManager({
+      stallTelemetryMs: 50,
+      timeoutMs: 250,
+      killTimeoutMs: 50,
+    });
+    const session = await manager.startSession(ptySessionInput());
+
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "progress",
+        terminalSessionId: session.id,
+        message: expect.stringContaining("stalled"),
+      }),
+    );
+    expect(manager.getSession(session.id)?.status).toBe("running");
+
+    await manager.cancelSession(session.id, "test cleanup");
+    pty.emitExit({ exitCode: null, signal: "SIGTERM" });
   });
 
   it("marks non-zero PTY exits as failed evidence", async () => {
@@ -2787,6 +3037,7 @@ function makePtyManager(
   options: {
     timeoutMs?: number;
     killTimeoutMs?: number;
+    stallTelemetryMs?: number;
     maxScrollbackBytes?: number;
     emitEvent?: (event: TerminalSessionEventDraft) => void | Promise<void>;
   } = {},

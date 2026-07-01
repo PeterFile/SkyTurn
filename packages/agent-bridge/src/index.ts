@@ -13,6 +13,7 @@ import type {
 } from "@skyturn/agent-runtime";
 import { agentAdapterContracts } from "@skyturn/agent-runtime";
 import {
+  DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS,
   RUN_EVENT_PROTOCOL_VERSION,
   type AgentDescriptor,
   type AgentKind,
@@ -21,8 +22,10 @@ import {
   type AgentRunStatus,
   type AgentSupportLevel,
   type AgentReadinessCategory,
+  type AgentTransportFeatureFlags,
   type AgentTerminalSession,
   type EvidenceCheck,
+  type HermesPlannerTransport,
   type RunEvent,
   type RunEvidence,
   type StartAgentRunInput,
@@ -117,6 +120,51 @@ export interface HermesCliAdapterOptions {
   source?: string;
 }
 
+export type HermesPlannerPtyContinuity = "resume-handle" | "process-level";
+
+export interface HermesPlannerPtyLaunchOptions {
+  executablePath?: string;
+  extraArgs?: string[];
+  source?: string;
+}
+
+export interface StartHermesPlannerPtySessionInput {
+  id?: string;
+  runId: string;
+  canvasSessionId: string;
+  plannerSessionId?: string;
+  plannerInputId?: string;
+  hermesSessionHandle?: string;
+  projectRoot: string;
+  worktreePath?: string;
+  cols?: number;
+  rows?: number;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface HermesPlannerPtySessionMetadata {
+  transport: HermesPlannerTransport;
+  continuity: HermesPlannerPtyContinuity;
+  degraded: boolean;
+  plannerSessionId: string | null;
+  plannerInputId: string | null;
+  opaqueHandle: string | null;
+  recoveryReason?: string;
+}
+
+export interface HermesPlannerPtyLaunch {
+  command: string;
+  args: string[];
+  cwd: string;
+  commandLabel: string;
+  metadata: HermesPlannerPtySessionMetadata;
+}
+
+export interface HermesPlannerPtySession {
+  terminalSession: AgentTerminalSession;
+  metadata: HermesPlannerPtySessionMetadata;
+}
+
 export interface PtyExitEvent {
   exitCode: number | null;
   signal: string | null;
@@ -167,6 +215,7 @@ export interface PtyTerminalSessionManagerOptions {
   emitEvent?: (event: TerminalSessionEventDraft) => void | Promise<void>;
   timeoutMs?: number;
   killTimeoutMs?: number;
+  stallTelemetryMs?: number;
   maxScrollbackBytes?: number;
   env?: NodeJS.ProcessEnv;
   now?: () => Date;
@@ -193,6 +242,21 @@ export interface PtyTerminalSessionManager {
   getSession(sessionId: string): AgentTerminalSession | null;
   getScrollback(sessionId: string): TerminalScrollbackChunk[];
   getExitEvidence(sessionId: string): TerminalSessionExitEvidence | null;
+}
+
+export interface HermesPlannerPtyTransportOptions extends PtyTerminalSessionManagerOptions {
+  executablePath?: string;
+  extraArgs?: string[];
+  source?: string;
+  featureFlags?: AgentTransportFeatureFlags;
+}
+
+export interface HermesPlannerPtyTransport {
+  startSession(input: StartHermesPlannerPtySessionInput): Promise<HermesPlannerPtySession>;
+  sendUserInput(canvasSessionId: string, data: string): Promise<void>;
+  cancelSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null>;
+  terminateSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null>;
+  getSession(canvasSessionId: string): HermesPlannerPtySession | null;
 }
 
 export function createDiscoveryService(options: DiscoveryOptions = {}): DiscoveryService {
@@ -456,7 +520,9 @@ interface ManagedPtyTerminalSession {
   scrollbackBytes: number;
   eventQueue: Promise<void>;
   timeoutTimer: NodeJS.Timeout | null;
+  stallTimer: NodeJS.Timeout | null;
   killTimer: NodeJS.Timeout | null;
+  lastActivityAt: number;
   finalized: boolean;
   processExited: boolean;
   exitEvidence: TerminalSessionExitEvidence | null;
@@ -472,11 +538,13 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
   private readonly sessions = new Map<string, ManagedPtyTerminalSession>();
   private readonly timeoutMs: number;
   private readonly killTimeoutMs: number;
+  private readonly stallTelemetryMs: number;
   private readonly maxScrollbackBytes: number;
 
   constructor(private readonly options: PtyTerminalSessionManagerOptions) {
     this.timeoutMs = options.timeoutMs ?? defaultRunWatchdogTimeoutMs;
     this.killTimeoutMs = options.killTimeoutMs ?? defaultKillTimeoutMs;
+    this.stallTelemetryMs = options.stallTelemetryMs ?? defaultStallTelemetryMs;
     this.maxScrollbackBytes = options.maxScrollbackBytes ?? defaultTerminalScrollbackBytes;
   }
 
@@ -513,7 +581,9 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
       scrollbackBytes: 0,
       eventQueue: Promise.resolve(),
       timeoutTimer: null,
+      stallTimer: null,
       killTimer: null,
+      lastActivityAt: Date.now(),
       finalized: false,
       processExited: false,
       exitEvidence: null,
@@ -525,6 +595,8 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
     this.updateStatus(state, "running");
     await this.enqueueTerminalEvent(state, { kind: "lifecycle", status: "running" });
     if (state.finalized) return { ...state.session };
+    this.markActivity(state);
+    this.startStallTelemetry(state);
     this.startTimeout(state);
     return { ...state.session };
   }
@@ -631,6 +703,7 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
 
   private captureOutput(state: ManagedPtyTerminalSession, stream: TerminalOutputStream, chunk: string): void {
     if (state.finalized) return;
+    this.markActivity(state);
     const text = redactSecretLikeText(chunk);
     const timestamp = this.isoNow();
     this.appendScrollback(state, { timestamp, stream, text });
@@ -717,6 +790,28 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
     state.timeoutTimer.unref();
   }
 
+  private startStallTelemetry(state: ManagedPtyTerminalSession): void {
+    if (this.stallTelemetryMs <= 0 || state.finalized) return;
+    state.stallTimer = setTimeout(() => {
+      void (async () => {
+        if (state.finalized) return;
+        const idleMs = Date.now() - state.lastActivityAt;
+        if (idleMs >= this.stallTelemetryMs) {
+          await this.enqueueTerminalEvent(state, {
+            kind: "progress",
+            message: `${state.session.commandLabel} terminal stalled after ${idleMs}ms without output.`,
+          });
+        }
+        this.startStallTelemetry(state);
+      })();
+    }, this.stallTelemetryMs);
+    state.stallTimer.unref();
+  }
+
+  private markActivity(state: ManagedPtyTerminalSession): void {
+    state.lastActivityAt = Date.now();
+  }
+
   private scheduleKill(state: ManagedPtyTerminalSession): void {
     if (state.processExited) return;
     this.tryKill(state, "SIGTERM");
@@ -732,7 +827,9 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
 
   private clearLifecycleTimers(state: ManagedPtyTerminalSession): void {
     if (state.timeoutTimer) clearTimeout(state.timeoutTimer);
+    if (state.stallTimer) clearTimeout(state.stallTimer);
     state.timeoutTimer = null;
+    state.stallTimer = null;
   }
 
   private clearKillTimer(state: ManagedPtyTerminalSession): void {
@@ -822,6 +919,175 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
 
   private isoNow(): string {
     return (this.options.now?.() ?? new Date()).toISOString();
+  }
+}
+
+export async function buildHermesPlannerPtyLaunch(
+  input: StartHermesPlannerPtySessionInput,
+  options: HermesPlannerPtyLaunchOptions = {},
+): Promise<HermesPlannerPtyLaunch> {
+  const cwd = await realpath(input.worktreePath || input.projectRoot);
+  const source = options.source ?? "skyturn";
+  const command = options.executablePath ?? "hermes";
+  const hasOpaqueHandle = Boolean(input.hermesSessionHandle);
+  const metadata: HermesPlannerPtySessionMetadata = hasOpaqueHandle
+    ? {
+        transport: "hermes_session_resume",
+        continuity: "resume-handle",
+        degraded: false,
+        plannerSessionId: input.plannerSessionId ?? null,
+        plannerInputId: input.plannerInputId ?? null,
+        opaqueHandle: input.hermesSessionHandle ?? null,
+      }
+    : {
+        transport: "hermes_live_chat",
+        continuity: "process-level",
+        degraded: true,
+        plannerSessionId: input.plannerSessionId ?? null,
+        plannerInputId: input.plannerInputId ?? null,
+        opaqueHandle: null,
+        recoveryReason:
+          "No stable Hermes resume handle was supplied; process-level continuity is limited to this live PTY process and SkyTurn state.",
+      };
+
+  return {
+    command,
+    args: makeHermesPlannerPtyArgs({
+      opaqueHandle: input.hermesSessionHandle,
+      extraArgs: options.extraArgs,
+      source,
+    }),
+    cwd,
+    commandLabel: "Hermes CLI PTY",
+    metadata,
+  };
+}
+
+export function createHermesPlannerPtyTransport(
+  options: HermesPlannerPtyTransportOptions,
+): HermesPlannerPtyTransport {
+  return new HermesPlannerPtyTransportImpl(options);
+}
+
+class HermesPlannerPtyTransportImpl implements HermesPlannerPtyTransport {
+  private readonly terminalManager: PtyTerminalSessionManager;
+  private readonly sessionsByCanvasSessionId = new Map<
+    string,
+    { terminalSessionId: string; metadata: HermesPlannerPtySessionMetadata }
+  >();
+
+  constructor(private readonly options: HermesPlannerPtyTransportOptions) {
+    this.terminalManager = createPtyTerminalSessionManager(options);
+  }
+
+  async startSession(input: StartHermesPlannerPtySessionInput): Promise<HermesPlannerPtySession> {
+    this.assertFeatureEnabled();
+    const existing = this.openSession(input.canvasSessionId);
+    if (existing) return existing;
+
+    const launch = await buildHermesPlannerPtyLaunch(input, {
+      executablePath: this.options.executablePath,
+      extraArgs: this.options.extraArgs,
+      source: this.options.source,
+    });
+    const terminalSession = await this.terminalManager.startSession({
+      id: input.id ?? `hermes-planner-${input.canvasSessionId}`,
+      runId: input.runId,
+      canvasSessionId: input.canvasSessionId,
+      agentKind: "hermes",
+      cwd: launch.cwd,
+      command: launch.command,
+      args: launch.args,
+      commandLabel: launch.commandLabel,
+      cols: input.cols,
+      rows: input.rows,
+      env: input.env,
+    });
+    this.sessionsByCanvasSessionId.set(input.canvasSessionId, {
+      terminalSessionId: terminalSession.id,
+      metadata: launch.metadata,
+    });
+    await this.emitPlannerMetadata(terminalSession, launch.metadata);
+    return { terminalSession, metadata: { ...launch.metadata } };
+  }
+
+  async sendUserInput(canvasSessionId: string, data: string): Promise<void> {
+    const session = this.requireOpenSession(canvasSessionId);
+    await this.terminalManager.writeStdin(session.terminalSession.id, data);
+  }
+
+  async cancelSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null> {
+    const session = this.requireSession(canvasSessionId);
+    return this.terminalManager.cancelSession(session.terminalSession.id, reason);
+  }
+
+  async terminateSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null> {
+    const session = this.requireSession(canvasSessionId);
+    return this.terminalManager.terminateSession(session.terminalSession.id, reason);
+  }
+
+  getSession(canvasSessionId: string): HermesPlannerPtySession | null {
+    const session = this.openSession(canvasSessionId);
+    if (session) return session;
+    this.sessionsByCanvasSessionId.delete(canvasSessionId);
+    return null;
+  }
+
+  private openSession(canvasSessionId: string): HermesPlannerPtySession | null {
+    const stored = this.sessionsByCanvasSessionId.get(canvasSessionId);
+    if (!stored) return null;
+    const terminalSession = this.terminalManager.getSession(stored.terminalSessionId);
+    if (!terminalSession || isFinalTerminalSessionStatus(terminalSession.status)) {
+      this.sessionsByCanvasSessionId.delete(canvasSessionId);
+      return null;
+    }
+    return {
+      terminalSession,
+      metadata: { ...stored.metadata },
+    };
+  }
+
+  private requireOpenSession(canvasSessionId: string): HermesPlannerPtySession {
+    const session = this.openSession(canvasSessionId);
+    if (!session) throw new Error(`No open Hermes planner PTY session for CanvasSession: ${canvasSessionId}`);
+    return session;
+  }
+
+  private requireSession(canvasSessionId: string): HermesPlannerPtySession {
+    const stored = this.sessionsByCanvasSessionId.get(canvasSessionId);
+    if (!stored) throw new Error(`Unknown Hermes planner PTY session for CanvasSession: ${canvasSessionId}`);
+    const terminalSession = this.terminalManager.getSession(stored.terminalSessionId);
+    if (!terminalSession) throw new Error(`Unknown Hermes planner terminal session: ${stored.terminalSessionId}`);
+    return {
+      terminalSession,
+      metadata: { ...stored.metadata },
+    };
+  }
+
+  private assertFeatureEnabled(): void {
+    const flags = this.options.featureFlags ?? DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS;
+    if (!flags.ptyInteractiveSessions) {
+      throw new Error("Hermes planner PTY transport is disabled by feature flag.");
+    }
+  }
+
+  private async emitPlannerMetadata(
+    terminalSession: AgentTerminalSession,
+    metadata: HermesPlannerPtySessionMetadata,
+  ): Promise<void> {
+    const message = metadata.degraded
+      ? `Hermes planner PTY started with process-level continuity: ${metadata.recoveryReason}`
+      : "Hermes planner PTY started with a stable Hermes resume handle.";
+    try {
+      await this.options.emitEvent?.({
+        kind: "progress",
+        terminalSessionId: terminalSession.id,
+        runId: terminalSession.runId,
+        message,
+      });
+    } catch {
+      // Planner metadata observers must not decide PTY lifecycle.
+    }
   }
 }
 
@@ -2015,6 +2281,21 @@ function makeHermesChatArgs(input: {
     "-q",
     input.prompt,
     "--quiet",
+    "--source",
+    input.source,
+    ...(input.opaqueHandle ? ["--resume", input.opaqueHandle] : []),
+    ...(input.extraArgs ?? []),
+  ];
+}
+
+function makeHermesPlannerPtyArgs(input: {
+  opaqueHandle?: string;
+  extraArgs?: string[];
+  source: string;
+}): string[] {
+  return [
+    "chat",
+    "--cli",
     "--source",
     input.source,
     ...(input.opaqueHandle ? ["--resume", input.opaqueHandle] : []),
