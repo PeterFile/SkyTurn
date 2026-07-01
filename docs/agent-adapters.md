@@ -66,11 +66,11 @@ Hermes-style tool-level filesystem checkpoints can exist as a lower-level safety
 | Claude Code | `detected-only` | Executable discovery only. |
 | OpenClaw | `detected-only` | Executable discovery only. |
 
-## MVP Mocking
+## Mock And Real Run Boundaries
 
-The MVP uses planner mocks for Fast/Plan sessions and `agent-bridge` mock runs for durable run events.
+Browser/mock fallback paths still use planner mocks and `agent-bridge` mock runs for deterministic contract tests and non-desktop verification. Those paths are not evidence that a real local Agent executed.
 
-Real CLI calls belong inside `agent-bridge` adapters only. They must stay `experimental-run` until the CLI contract, event parsing, cancellation, persistence, and evidence mapping are covered by tests.
+The current desktop workflow path registers Hermes and Codex real adapters behind `experimental-run`. Real CLI calls belong inside `agent-bridge` adapters only, and they remain experimental until the CLI contract, auth/readiness, event parsing, cancellation, persistence, timeout handling, and evidence mapping are stable enough to treat as `supported-run`.
 
 Runtime failure events use stable categories where possible:
 
