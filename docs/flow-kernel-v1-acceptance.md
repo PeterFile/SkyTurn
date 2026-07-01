@@ -1,8 +1,8 @@
 # Flow Kernel v1 Acceptance
 
-Status: pass
+Status: historical pass
 
-Branch: `codex/flow-kernel-v1`
+Historical branch: `codex/flow-kernel-v1`. This document records the Flow Kernel v1 acceptance run; it is not a statement about the current checkout branch.
 
 ## Implementation Evidence
 

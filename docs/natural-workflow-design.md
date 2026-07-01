@@ -12,9 +12,9 @@
 
 截至当前代码，SkyTurn 已经能跑通真实的桌面开发闭环：打开本地 git 项目，底部输入需求，Hermes 产出 `WorkflowIntent`，Flow Kernel 编译成 lane/edge，SQLite 记录 workflow events，Electron main 通过 `agent-bridge` 启动 Hermes/Codex，终态由 `RunEvidence` 回写，画布从投影更新状态，`Changes` 页签可用结构化 live changes 和 git 对账展示变更。
 
-这个能力仍是实验路径，不是完整产品闭环。Hermes/Codex 适配器仍标为 `experimental-run`，不是 `supported-run`。当前代码已经把 managed worktree create/adopt/clean 桌面 IPC 接到真实 Node git-worktree service；New worktree 的非 planner run 可以先创建并绑定真实 managed worktree path；Electron UI 的用户决策回答会写入 SQLite `workflow.user_decision.answered`，browser/mock fallback 才直接改本地 canvas state；`Changes` 页签已经有显式 commit、push 和 create PR 操作，preload IPC 和 Electron main 会调用 Node-only git/GitHub helper。
+已经落地的主能力包括：SQLite workflow session / ledger / projection，Hermes ledger 注入，Hermes/Codex `experimental-run` 真实适配器，Current branch / New worktree 会话目标，用户决策回答写入 SQLite，节点详情三页签 `Output` / `Changes` / `Context`，Context 中的 run evidence，Changes 中的 live changes、git reconciliation、delivery commit / push / PR / exact-head checks / merge / sync / cleanup 显式动作，selected-node composer 的 repair / variant / rollback 操作，以及 rollback eligibility / apply 的 remote side-effect gate 和 local commit safety gate。
 
-仍未闭环的产品能力包括：把 worktree compare/adopt/clean 和 delivery lifecycle 作为默认主路径跑通完整产品体验，把运行失败后的自动修复和回归验证做成完整主路径，以及把 Hermes/Codex 适配器提升到 `supported-run`。当前代码已有显式的 CI exact-head check、merge request、post-merge sync 和 cleanup request 路径；这些仍是用户确认后的后续动作，不会由 PR 创建或 CI 通过自动触发。PR 创建现在只是交付事件和证据，不代表任务完成。
+这个能力仍是实验路径，不是完整产品闭环。Hermes/Codex 适配器仍标为 `experimental-run`，不是 `supported-run`。真实桌面 workflow 路径已经使用 SQLite projection，但 renderer 仍保留 browser/mock fallback 和局部 local state。worktree create/compare/adopt/clean 后端和 IPC 已经可用，但完整双轨比较、采纳、清理体验还不是默认主路径。失败后的 `ReplanFromEvidence` / repair / regression 已有内核和调度基础，但还没有形成完整 desktop 默认体验。PR 创建只是交付事件和证据，不代表任务完成；merge、post-merge sync、cleanup 必须由用户显式确认，不会由 PR 创建或 green checks 自动触发。
 
 下面各功能的“需求 / 落地方案 / 验收”保留产品目标；“现状”段落描述当前代码事实。不要把目标段落当作已经完成，也不要因为部分目标已实现就删除后续方向。
 
@@ -432,9 +432,9 @@ SkyTurn 要把节点当成可恢复的工作流边界。每次节点运行都有
 
 ### 现状
 
-当前代码已有节点弹窗、`RunEvidence`、SQLite workflow events、git changeset reconciliation、delivery commit/push/PR actions 和 managed worktree side effects。
+当前代码已有节点弹窗、`RunEvidence`、SQLite workflow events、git changeset reconciliation、delivery commit/push/PR actions 和 managed worktree side effects。选中节点已经绑定底部 composer scope，节点详情仍通过 **More** 打开且只有 `Output`、`Changes`、`Context`。selected-node composer 已经能基于投影和 checkpoint 状态显示 repair、variant、rollback 操作及 checkpoint / affected downstream / remote blocker / manual repair 摘要。
 
-本节定义的是待补齐的产品模型：node-scoped composer action、用户可见 before/after checkpoint、rollback cascade、remote side-effect gate 和 adapter thread/history 协调还不能被写成已完成能力。
+后端也已经有 rollback eligibility / apply IPC、cascade projection、remote side-effect blocker、in-flight remote mutation blocker、local commit / worktree / branch safety gate、rollback request/apply/reject 事件和 crash-window retry 处理。仍需继续收敛的是：把 renderer local fallback 迁出真实桌面主路径，把 adapter thread/history rollback 与 SkyTurn graph/filesystem rollback 分层记录做成默认体验，并持续打磨 repair / variant / rollback 的用户路径。
 
 ### 落地方案
 
@@ -610,157 +610,61 @@ Codex 产生结构化 patch/file-change 事件时，`Changes` 页签能显示 li
 
 打包检查必须证明 renderer bundle 没有 Node git/diff 实现和 native dependency。
 
-## 实现顺序
+## 当前状态路线图
 
-### 第一阶段：把事件账本接入 Hermes
+### 已完成或已接入主路径
 
-交付内容：
+- SQLite workflow session、events、lane / segment / evidence 存储、ledger summary、projection replay 和 `materializeCanvasSession`。
+- Hermes prompt 的 `sessionLedger` 注入，以及 Node 侧 ledger allowlist / 脱敏 / 长度限制。
+- Hermes / Codex CLI real adapters，仍标为 `experimental-run`。
+- Current branch 默认执行目标，New worktree 显式 opt-in，分支选择写入 session target。
+- 用户决策节点可投影为不可执行节点，Electron UI 回答会写入 `workflow.user_decision.answered`。
+- Node Modal 的 `Output` / `Changes` / `Context` 三页签；Context 显示 RunEvidence，Changes 显示 live changes、git reconciliation、mismatch、diff preview 和显式 delivery lifecycle。
+- Delivery commit、push、create PR、exact-head check、review gate、squash merge request、post-merge main sync 和 cleanup request 都是显式动作；PR 创建不完成任务。
+- selected-node composer 的 repair / variant / rollback 操作、checkpoint 摘要、rollback impact、remote blocker 和 manual repair 摘要。
+- Rollback backend 的 cascade projection、remote side-effect gate、in-flight remote mutation gate、local commit / branch / worktree safety gate、request-before-reset ordering 和 crash-window retry。
 
-- SQLite 工作流会话创建 IPC。
-- 用户输入写入工作流事件。
-- Node 侧 canonical projection，替代 renderer 从 `CanvasSession` 反推事实。
-- `workflow:ledger` 返回短账本。
-- `LedgerSanitizer` 对账本做 allowlist、脱敏和长度限制。
-- Hermes 提示词注入账本。
-- 刷新后能从事件流恢复基本投影。
+### 部分完成，仍需收敛
 
-验证重点：
+- 真实桌面 workflow 已经使用 SQLite projection，但 renderer 仍有 browser/mock fallback 和局部 local state。后续目标是让真实桌面主路径只消费 Node 侧事实源。
+- `ReplanFromEvidence`、repair successor、variant successor 和 regression 基础已经存在；失败后自动生成修复链还不是完整 desktop 默认体验。
+- Worktree create/compare/adopt/clean 后端和 IPC 已接入；双轨比较、采纳、清理还需要更完整的产品路径和 artifact/log/screenshot/port 隔离。
+- Changes live layer 已能消费结构化 run changes；Codex-style patch/file-change/turn-diff 覆盖面仍需要随真实 CLI 输出继续加固。
+- Hermes / Codex 适配器仍依赖本机 CLI、认证、输出格式和限流；短期只承诺 `experimental-run`。
 
-- 同一会话多次输入时，Hermes 收到连续上下文。
-- 重复事件不会重复生成图。
-- 账本不包含完整日志、完整变更差异、敏感配置。
-- renderer 不能绕过 Electron main 本地编译 intent 或调度 lane。
-- replay 投影不得重新执行 Hermes、Codex、git 或 worktree 操作。
+### 下一步优先级
 
-阶段一不做可选 worktree、真实 changeset 裁决 UI、自动修复链。先把唯一事实源打牢。
+1. 收敛真实桌面路径的事实源：减少 renderer 从 `CanvasSession` 反推事实、本地调度和本地 retry/position-only 状态。
+2. 把失败后的 repair / regression 做成默认主路径：原失败节点保留 failed，新增修复节点和回归验证节点，同一 evidence 不重复展开。
+3. 产品化 worktree compare/adopt/clean：使用现有节点详情和 Changes/Context surface，不新增 dashboard。
+4. 硬化 adapter readiness、timeout/cancel/retry、structured changes 和 ledger sanitizer，把 `experimental-run` 缓慢推进到可支持状态。
+5. 对 delivery remote path 做显式 disposable smoke。普通用户项目仍必须通过手动 commit / push / PR / checks / merge / sync / cleanup 操作，不能自动开 PR 或自动 cleanup。
 
-### 第二阶段：失败生成修复节点
-
-交付内容：
-
-- `ReplanFromEvidence` 编译出修复和回归验证节点。
-- 调度器允许修复节点从失败依赖启动。
-- 修复节点从可信 sandbox policy 获得写权限，提交权限仍然隔离。
-- UI 显示失败、修复、回归验证的链路。
-
-验证重点：
-
-- 原失败节点不被改写。
-- 修复节点不会重复生成。
-- 取消不触发自动修复。
-- 修复失败不会自动无限生成二级修复。
-
-### 第三阶段：用户决策节点
-
-交付内容：
-
-- `workflow.user_decision.answered` 事件。
-- 决策节点等待输入和完成投影，且决策节点不可执行。
-- UI 展示问题、建议、选项。
-- 用户选择写入事件流。
-
-验证重点：
-
-- 刷新后用户选择仍存在。
-- 决策未回答时下游节点不调度。
-- Hermes 不能绕过用户决策直接重写架构。
-- Electron main 拒绝启动决策节点。
-
-### 第四阶段：会话执行目标和可选工作树
-
-交付内容：
-
-- New Session 输入增加执行目标选择和分支选择。
-- Current branch 是默认执行目标，New worktree 是显式 opt-in。
-- New worktree 从用户选择的分支派生候选空间。
-- 候选采纳后才提升为正式分支、提交、合并或 PR。
-- 同一文件在不同候选工作树里允许并行。
-
-验证重点：
-
-- 默认会话不创建 managed worktree。
-- Current branch 模式使用当前项目工作区和用户选定分支。
-- New worktree 模式把分支选择作为 base。
-- 候选身份绑定到路径、gitdir、base 和当前 HEAD；转正后再绑定正式分支。
-- 清理只删除 SkyTurn 管理的工作树。
-- 每个变体有独立 artifact/log/screenshot 目录。
-
-### 第五阶段：节点检查点和回滚
-
-交付内容：
-
-- 节点选择只绑定底部输入框 scope，**More** 才打开详情。
-- node/run boundary 的 before/after checkpoint 事件和投影。
-- repair from after checkpoint、variant from before checkpoint、rollback selected node and downstream 三类节点动作。
-- rollback cascade 投影，保留证据和历史。
-- rolled-back / inactive 节点不可调度。
-- remote side-effect gate 和 local commit safety gate。
-- Codex thread/history rollback 与 SkyTurn graph/filesystem rollback 分层记录。
-
-验证重点：
-
-- 选中节点不打开详情。
-- **More** 才打开详情。
-- repair、variant、rollback 使用正确 checkpoint。
-- rollback 后证据仍可读，节点不可调度。
-- push、PR、merge、main sync 阻止 rollback。
-- local commit 需要 exact evidence 和用户确认。
-- rollback 不自动做 PR/branch/merge/main-sync cleanup。
-
-### 第六阶段：真实变更和裁决证据
-
-交付内容：
-
-- Codex-style 结构化 patch/file-change/turn-diff 事件进入 Changes live layer。
-- git 对账进入 Changes reconcile layer。
-- 裁决节点显示测试、构建、变更差异、性能测试和冲突检查。
-- 不再把模拟变更当真实证据。
-
-验证重点：
-
-- `Changes` 页签 live 状态来自结构化变更事件。
-- `Changes` 页签最终状态来自 git 对账。
-- 裁决节点不显示无来源结论。
-- 没有证据时显示未知。
-- 真实 git changeset 实现不进入 renderer bundle。
-
-## 需要修改的主要位置
-
-`packages/project-core/src/index.ts`
-
-扩展工作树、决策节点、node-scoped action、checkpoint reference、rollback state 和可信 runtime policy 类型。保留旧字段兼容，新增字段尽量可选。
-
-`packages/workflow-kernel/src/index.ts`
-
-扩展事件类型、决策回答、修复节点编译、checkpoint/rollback cascade、调度器依赖规则、投影 reducer。先统一 lane kind / semantic subtype 映射，避免 `implementation`、`coding`、`regression_check` 在不同包里含义漂移。
-
-`packages/orchestrator/src/index.ts`
-
-扩展 Hermes 提示词输入，把已脱敏事件账本注入规划提示词。不要让 orchestrator 自己读取 SQLite。
+## 后续主要修改位置
 
 `packages/persistence/src/workflowStore.ts`
 
-补齐 node/run checkpoint API、ledger builder、用户决策记录、事件回放、canonical projection、rollback safety gate、Node 侧调度入口和 side-effect 状态机。检查多会话下 lane 和 node 唯一约束，避免不同会话的 `node-1` 冲突。
+继续收敛 Node 侧 canonical projection、repair / variant / rollback replay、ledger summary、side-effect recovery 和多会话唯一性。不要让 renderer 成为事实源。
 
-`packages/ui-canvas/src/workflowRuntime.ts`
+`packages/workflow-kernel/src/index.ts`
 
-去掉从 `CanvasSession` 反推事实的主路径。保留 browser-safe 的启动请求、prompt 组装辅助和投影消费逻辑；调度、修复节点展开、checkpoint action、真实工作树路径和 sandbox policy 读取 Node 侧投影。
+继续维护 WorkflowIntent schema、replan / successor / gate / scheduler 规则、delivery gate 和 rollback projection。任何 merge-ready 或 schedulable 结论都必须来自明确 evidence。
 
-`packages/ui-canvas/src/App.tsx`
+`packages/ui-canvas/src/workflowRuntime.ts` 和 `packages/ui-canvas/src/App.tsx`
 
-显示不可执行决策节点、保持节点位置稳定、订阅工作流投影、切换真实 changeset 摘要数据。节点位置变化要写回事件流或明确的投影状态 API。选择节点只改变 bottom composer scope；节点详情只能由 **More** 打开。
+保留现有画布、节点、Node Modal 和 bottom composer surface。后续 UI 工作应消费投影与 typed preload API，不新增 evidence dashboard，不在 renderer 执行 git/fs/shell/SQLite。
 
-`packages/git-worktree/src/index.ts`
+`packages/agent-bridge/src/index.ts`
 
-保留接口、类型和 mock。不要在根入口增加真实 git 实现。
+继续硬化 Hermes/Codex real adapters 的 readiness、timeout、cancel、output parsing、structured changes 和 RunEvidence 映射。`experimental-run` 不应被文档或 UI 误写成 supported。
 
-`packages/git-worktree/src/node.ts` 或 Electron main 内部模块
+`packages/git-worktree/src/node.ts`
 
-增加仅 Node 侧运行的真实 worktree / changeset 实现，并通过 package export 或 IPC 保证 renderer 不能导入。
+继续维护 Node-only worktree、changeset、delivery、PR、merge、sync、cleanup 和 rollback filesystem safety。根入口继续只暴露 browser-safe contracts/mocks。
 
 `apps/desktop/electron/main.ts` 和 `apps/desktop/electron/preload.ts`
 
-维护工作流会话、ledger、Node 侧投影、调度、决策回答、节点 checkpoint/rollback、工作树创建、比较、采纳、清理和 delivery commit IPC。`preload` 只暴露窄接口，不暴露任意 git、shell 或 filesystem 能力。
+继续作为本机 side effect 和 workflow IPC 边界。新增能力必须保持窄 preload API、路径/身份校验、状态机事件和重启后可恢复。
 
 ## 测试和验收命令
 
