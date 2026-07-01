@@ -254,6 +254,7 @@ export interface HermesPlannerPtyTransportOptions extends PtyTerminalSessionMana
 export interface HermesPlannerPtyTransport {
   startSession(input: StartHermesPlannerPtySessionInput): Promise<HermesPlannerPtySession>;
   sendUserInput(canvasSessionId: string, data: string): Promise<void>;
+  resizeSession(canvasSessionId: string, size: { cols: number; rows: number }): Promise<void>;
   cancelSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null>;
   terminateSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null>;
   getSession(canvasSessionId: string): HermesPlannerPtySession | null;
@@ -1014,6 +1015,11 @@ class HermesPlannerPtyTransportImpl implements HermesPlannerPtyTransport {
   async sendUserInput(canvasSessionId: string, data: string): Promise<void> {
     const session = this.requireOpenSession(canvasSessionId);
     await this.terminalManager.writeStdin(session.terminalSession.id, data);
+  }
+
+  async resizeSession(canvasSessionId: string, size: { cols: number; rows: number }): Promise<void> {
+    const session = this.requireOpenSession(canvasSessionId);
+    await this.terminalManager.resize(session.terminalSession.id, size);
   }
 
   async cancelSession(canvasSessionId: string, reason?: string): Promise<TerminalSessionExitEvidence | null> {

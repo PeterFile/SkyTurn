@@ -2357,6 +2357,26 @@ describe("agent bridge", () => {
     );
   });
 
+  it("resizes the open Hermes planner PTY session by CanvasSession", async () => {
+    const projectRoot = await makeTempRoot();
+    const pty = new FakePtyProcess();
+    const transport = createHermesPlannerPtyTransport({
+      ptyFactory: { spawn: vi.fn(() => pty) },
+      executablePath: "hermes",
+      featureFlags: { ptyInteractiveSessions: true },
+    });
+
+    await transport.startSession({
+      runId: "run-hermes-pty-resize",
+      canvasSessionId: "canvas-session-resize",
+      projectRoot,
+      worktreePath: projectRoot,
+    });
+    await transport.resizeSession("canvas-session-resize", { cols: 132, rows: 43 });
+
+    expect(pty.resizes).toEqual([{ cols: 132, rows: 43 }]);
+  });
+
   it("keeps Hermes planner PTY session when metadata progress observer rejects", async () => {
     const projectRoot = await makeTempRoot();
     const events: TerminalSessionEventDraft[] = [];
