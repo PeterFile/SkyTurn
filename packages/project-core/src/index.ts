@@ -20,6 +20,17 @@ export type AgentSupportLevel = "mock-only" | "detected-only" | "experimental-ru
 export type AgentReadinessLevel = "unavailable" | "detected-only" | "experimental-run";
 export type AgentAuthReadinessStatus = "available" | "missing" | "unknown";
 export type AgentReadinessCategory = "cli-missing" | "auth-missing" | "auth-unknown" | "version-probe-failed";
+export type AgentTransportKind = "exec-json" | "pty-interactive";
+export type TerminalSessionStatus =
+  | "starting"
+  | "running"
+  | "waiting"
+  | "exited"
+  | "timed-out"
+  | "cancelled"
+  | "failed";
+export type TerminalSessionEventKind = "output" | "progress" | "lifecycle";
+export type TerminalOutputStream = "stdout" | "stderr";
 export type AgentCapability =
   | "chat"
   | "file-read"
@@ -101,6 +112,19 @@ export type FinalChangesetReconciliationStatus = "available" | "empty" | "failed
 
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
 export const RUN_EVENT_PROTOCOL_VERSION = 1;
+export const AGENT_TRANSPORT_KINDS: AgentTransportKind[] = ["exec-json", "pty-interactive"];
+export const TERMINAL_SESSION_STATUSES: TerminalSessionStatus[] = [
+  "starting",
+  "running",
+  "waiting",
+  "exited",
+  "timed-out",
+  "cancelled",
+  "failed",
+];
+export const DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS: AgentTransportFeatureFlags = {
+  ptyInteractiveSessions: false,
+};
 export const DEFAULT_SESSION_TARGET: SessionTarget = {
   executionTarget: "current_branch",
   selectedBranch: "HEAD",
@@ -142,6 +166,7 @@ export interface AgentDescriptor {
   status: AgentAvailabilityStatus;
   supportLevel: AgentSupportLevel;
   capabilities: AgentCapability[];
+  transportCapabilities?: AgentTransportCapabilities;
   configFiles: string[];
   readiness?: {
     level: AgentReadinessLevel;
@@ -157,6 +182,58 @@ export interface AgentDescriptor {
     categories: AgentReadinessCategory[];
   };
 }
+
+export interface AgentTransportCapabilities {
+  supportsExecJson: boolean;
+  supportsPtyInteractive: boolean;
+  supportsResume: boolean;
+  supportsStructuredEvents: boolean;
+}
+
+export interface AgentTransportFeatureFlags {
+  ptyInteractiveSessions: boolean;
+}
+
+export interface AgentTerminalSession {
+  id: string;
+  runId: string;
+  canvasSessionId: string;
+  agentKind: AgentKind;
+  cwd: string;
+  commandLabel: string;
+  transport: "pty-interactive";
+  status: TerminalSessionStatus;
+  createdAt: string;
+  endedAt?: string;
+}
+
+export interface TerminalSessionEventDraftBase {
+  terminalSessionId: string;
+  runId: string;
+  timestamp?: string;
+}
+
+export interface TerminalOutputChunkEventDraft extends TerminalSessionEventDraftBase {
+  kind: "output";
+  stream: TerminalOutputStream;
+  text: string;
+}
+
+export interface TerminalProgressEventDraft extends TerminalSessionEventDraftBase {
+  kind: "progress";
+  message: string;
+}
+
+export interface TerminalLifecycleEventDraft extends TerminalSessionEventDraftBase {
+  kind: "lifecycle";
+  status: TerminalSessionStatus;
+  message?: string;
+}
+
+export type TerminalSessionEventDraft =
+  | TerminalOutputChunkEventDraft
+  | TerminalProgressEventDraft
+  | TerminalLifecycleEventDraft;
 
 export type AgentWorkflowReadinessStatus = "ready" | "degraded" | "blocked" | "mock-only";
 export type AgentWorkflowRunSupport = "supported-run" | "experimental-run" | "mock-only" | "unavailable";
@@ -306,6 +383,7 @@ export interface AgentRun {
   projectRoot: string;
   worktreePath: string;
   agentKind: AgentKind;
+  transport?: AgentTransportKind;
   status: AgentRunStatus;
   startedAt: string;
   endedAt?: string;
@@ -322,6 +400,7 @@ export interface StartAgentRunInput {
   projectRoot: string;
   worktreePath: string;
   agentKind: AgentKind;
+  transport?: AgentTransportKind;
   sandbox?: AgentRunSandbox;
   prompt: string;
 }
@@ -893,6 +972,13 @@ export function hasConcreteRunEvidence(evidence: RunEvidence | null | undefined)
   if (evidence.artifacts.length > 0) return true;
   if (evidence.review?.status === "passed") return true;
   return evidence.checks.some((check) => check.status === "passed");
+}
+
+export function canUsePtyInteractiveTransport(
+  capabilities: AgentTransportCapabilities | null | undefined,
+  flags: AgentTransportFeatureFlags = DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS,
+): boolean {
+  return flags.ptyInteractiveSessions && capabilities?.supportsPtyInteractive === true;
 }
 
 export function makeHermesPlannerSessionId(sessionId: string): string {

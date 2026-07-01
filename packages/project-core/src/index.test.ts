@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AGENT_TRANSPORT_KINDS,
   AGENT_SUPPORT_LEVELS,
   EVIDENCE_CHECK_KINDS,
+  DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS,
   RUN_EVENT_PROTOCOL_VERSION,
+  TERMINAL_SESSION_STATUSES,
+  canUsePtyInteractiveTransport,
   normalizeSessionTarget,
   WORKFLOW_LANE_KINDS,
   deriveNodeStatusFromEvidence,
@@ -12,11 +16,14 @@ import {
   type FinalChangesetReconciliation,
   type AgentDescriptor,
   type AgentRun,
+  type AgentTerminalSession,
+  type AgentTransportCapabilities,
   type CanvasNode,
   type ChangesetEvidence,
   type EvidenceCheck,
   type RunEvent,
   type RunEvidence,
+  type TerminalSessionEventDraft,
   type UserDecisionAnsweredPayload,
   type UserDecisionRequestedPayload,
   type WorkflowLedgerSummary,
@@ -79,6 +86,98 @@ function agentDescriptor(input: Partial<AgentDescriptor> & Pick<AgentDescriptor,
 }
 
 describe("agent run contracts", () => {
+  it("publishes stable transport kinds and PTY terminal lifecycle states", () => {
+    const terminalSession: AgentTerminalSession = {
+      id: "terminal-session-1",
+      runId: "run-1",
+      canvasSessionId: "canvas-session-1",
+      agentKind: "codex",
+      cwd: "/repo",
+      commandLabel: "codex exec",
+      transport: "pty-interactive",
+      status: "waiting",
+      createdAt: "2026-07-01T00:00:00.000Z",
+    };
+
+    expect(AGENT_TRANSPORT_KINDS).toEqual(["exec-json", "pty-interactive"]);
+    expect(TERMINAL_SESSION_STATUSES).toEqual([
+      "starting",
+      "running",
+      "waiting",
+      "exited",
+      "timed-out",
+      "cancelled",
+      "failed",
+    ]);
+    expect(terminalSession.transport).toBe("pty-interactive");
+    expect(terminalSession.status).toBe("waiting");
+  });
+
+  it("keeps PTY interactive sessions disabled unless the feature flag and capability both allow it", () => {
+    const capabilities: AgentTransportCapabilities = {
+      supportsExecJson: true,
+      supportsPtyInteractive: true,
+      supportsResume: false,
+      supportsStructuredEvents: true,
+    };
+
+    expect(DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS.ptyInteractiveSessions).toBe(false);
+    expect(canUsePtyInteractiveTransport(capabilities)).toBe(false);
+    expect(canUsePtyInteractiveTransport(capabilities, { ptyInteractiveSessions: true })).toBe(true);
+    expect(
+      canUsePtyInteractiveTransport(
+        { ...capabilities, supportsPtyInteractive: false },
+        { ptyInteractiveSessions: true },
+      ),
+    ).toBe(false);
+  });
+
+  it("models terminal session draft events without making terminal text completion evidence", () => {
+    const output: TerminalSessionEventDraft = {
+      kind: "output",
+      terminalSessionId: "terminal-session-1",
+      runId: "run-1",
+      timestamp: "2026-07-01T00:00:00.000Z",
+      stream: "stdout",
+      text: "all done",
+    };
+    const lifecycle: TerminalSessionEventDraft = {
+      kind: "lifecycle",
+      terminalSessionId: "terminal-session-1",
+      runId: "run-1",
+      timestamp: "2026-07-01T00:00:01.000Z",
+      status: "exited",
+    };
+    const run: AgentRun = {
+      id: "run-1",
+      nodeId: "node-1",
+      sessionId: "session-1",
+      projectRoot: "/tmp/project",
+      worktreePath: "/tmp/project.worktrees/node-1",
+      agentKind: "codex",
+      status: "succeeded",
+      startedAt: "2026-07-01T00:00:00.000Z",
+      endedAt: "2026-07-01T00:00:01.000Z",
+    };
+    const evidence: RunEvidence = {
+      runId: "run-1",
+      status: "succeeded",
+      exitCode: null,
+      changesetId: null,
+      checks: [],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-07-01T00:00:01.000Z",
+    };
+
+    expect(output.kind).toBe("output");
+    expect(lifecycle.kind).toBe("lifecycle");
+    expect(hasConcreteRunEvidence(evidence)).toBe(false);
+    expect(deriveNodeStatusFromEvidence(run, evidence)).toBe("failed");
+  });
+
   it("summarizes experimental real-loop readiness without claiming supported-run", () => {
     const summary = summarizeAgentReadiness([
       agentDescriptor({

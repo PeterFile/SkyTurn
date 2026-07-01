@@ -3,6 +3,8 @@ import type {
   AgentDescriptor,
   AgentKind,
   AgentSupportLevel,
+  AgentTransportCapabilities,
+  AgentTransportFeatureFlags,
   CanvasSession,
   PlanSession,
   RunEvent,
@@ -15,7 +17,12 @@ export interface AgentAdapterContract {
   nativeConfigFiles: string[];
   supportLevel: AgentSupportLevel;
   capabilities: AgentCapability[];
+  transportCapabilities?: AgentTransportCapabilities;
 }
+
+export const DEFAULT_AGENT_RUNTIME_FEATURE_FLAGS: AgentTransportFeatureFlags = {
+  ptyInteractiveSessions: false,
+};
 
 export interface RunEventDraft {
   kind: RunEvent["kind"];
@@ -35,6 +42,13 @@ export interface LocalAgentAdapterContract extends AgentAdapterContract {
   detect(): Promise<AgentDescriptor>;
   startRun(input: StartAgentRunInput, sink: RunEventSink): Promise<AgentRunHandle>;
   send?(runId: string, message: string): Promise<void>;
+}
+
+export function canStartPtyInteractiveRun(
+  adapter: Pick<AgentAdapterContract, "transportCapabilities">,
+  flags: AgentTransportFeatureFlags = DEFAULT_AGENT_RUNTIME_FEATURE_FLAGS,
+): boolean {
+  return flags.ptyInteractiveSessions && adapter.transportCapabilities?.supportsPtyInteractive === true;
 }
 
 export interface HermesOrchestratorAdapter extends AgentAdapterContract {
