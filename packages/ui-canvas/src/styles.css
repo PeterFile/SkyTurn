@@ -6399,8 +6399,8 @@ select:focus-visible,
   gap: 3px;
   margin-bottom: 6px;
   padding: 5px 10px;
-  max-height: 54px;
-  overflow: hidden;
+  max-height: 118px;
+  overflow-y: auto;
 }
 
 .canvas-stage.has-selected-node .composer-dock-header,
@@ -6496,6 +6496,44 @@ select:focus-visible,
   justify-content: flex-end;
 }
 
+.composer-failure-summary {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.composer-failure-line {
+  display: grid;
+  grid-template-columns: 98px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+  margin: 0;
+  color: var(--sk-text-legacy-body, #334155);
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.composer-failure-line span {
+  color: var(--sk-text-legacy-muted, #64748b);
+  font-weight: 850;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.composer-failure-line strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--sk-ink, #0f172a);
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-failure-line.blocker strong {
+  color: var(--sk-status-failed-text, #9f1239);
+}
+
 .evidence-chip {
   display: inline-flex;
   align-items: center;
@@ -6568,6 +6606,40 @@ select:focus-visible,
 
 .composer-action-message.error {
   color: var(--sk-status-failed-text, #e11d48);
+}
+
+.node-failure-summary {
+  display: grid;
+  gap: 5px;
+  border-top: 1px solid var(--sk-border-muted);
+  border-bottom: 1px solid var(--sk-border-muted);
+  background: var(--sk-status-failed-bg);
+  padding: 9px 18px;
+}
+
+.node-failure-summary p {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+  min-width: 0;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.node-failure-summary span {
+  color: var(--sk-status-failed-text);
+  font-weight: 900;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.node-failure-summary strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--sk-text-strong);
+  font-weight: 700;
 }
 
 /* Terminal Inspector */

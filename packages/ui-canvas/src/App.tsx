@@ -978,6 +978,7 @@ export default function App() {
               composerValue={selectedNode ? nodeActionText : bottomGoal}
               composerDisabled={false}
               selectedNode={selectedNode}
+              selectedRunEvidence={selectedNode ? workspace.runEvidence?.[selectedNode.runId] ?? null : null}
               selectedNodeActionScopeKey={selectedNodeActionScopeKey}
               selectedNodeActionState={selectedNodeActionState}
               nodeActionBusy={nodeActionBusy}
@@ -1350,6 +1351,12 @@ export type ComposerAction = "repair" | "variant" | "rollback" | null;
 
 export const REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE =
   "This node or downstream has already pushed/created PR/merged. Use repair/revert PR flow instead.";
+
+const NODE_ACTION_IMPACT_COPY = {
+  repair: "Repair uses the after checkpoint.",
+  variant: "Variant uses the before checkpoint.",
+  rollback: "Rollback affects selected + downstream.",
+} satisfies Record<Exclude<ComposerAction, null>, string>;
 
 interface NodeActionAvailability {
   enabled: boolean;
@@ -1859,6 +1866,7 @@ function CanvasView({
   composerValue,
   composerDisabled,
   selectedNode,
+  selectedRunEvidence,
   selectedNodeActionScopeKey,
   selectedNodeActionState,
   nodeActionBusy,
@@ -1877,6 +1885,7 @@ function CanvasView({
   composerValue: string;
   composerDisabled: boolean;
   selectedNode: CanvasNode | null;
+  selectedRunEvidence: RunEvidence | null;
   selectedNodeActionScopeKey: string | null;
   selectedNodeActionState: SelectedNodeActionState | null;
   nodeActionBusy: Exclude<ComposerAction, null> | null;
@@ -1973,6 +1982,7 @@ function CanvasView({
         value={composerValue}
         disabled={composerDisabled}
         selectedNode={selectedNode}
+        selectedRunEvidence={selectedRunEvidence}
         selectedNodeActionScopeKey={selectedNodeActionScopeKey}
         selectedNodeActionState={selectedNodeActionState}
         nodeActionBusy={nodeActionBusy}
@@ -2741,6 +2751,8 @@ function NodeModal({
   const panelRef = useRef<HTMLElement | null>(null);
   const closingRef = useRef(false);
   const { contextSafe } = useGSAP({ scope: backdropRef });
+  const nodeFailureSummary = failureSummaryForNode(node, runEvidence);
+  const nodeLatestFailedCheck = latestFailedCheckForDisplay(runEvidence);
 
   useGSAP(
     () => {
@@ -2821,6 +2833,22 @@ function NodeModal({
             </button>
           ))}
         </nav>
+        {(nodeFailureSummary || nodeLatestFailedCheck) && (
+          <section className="node-failure-summary" aria-label="Failure summary">
+            {nodeFailureSummary && (
+              <p>
+                <span>Failure summary</span>
+                <strong>{nodeFailureSummary}</strong>
+              </p>
+            )}
+            {nodeLatestFailedCheck && (
+              <p>
+                <span>Last failed check</span>
+                <strong>{nodeLatestFailedCheck}</strong>
+              </p>
+            )}
+          </section>
+        )}
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
@@ -4462,6 +4490,49 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+export function latestFailedCheckForDisplay(runEvidence: RunEvidence | null | undefined): string | null {
+  if (!runEvidence) return null;
+  const failedCheck = [...runEvidence.checks].reverse().find((check) => check.status === "failed");
+  if (!failedCheck) return null;
+  const detail = optionalText(failedCheck.detail);
+  return `${failedCheck.name}: ${failedCheck.status}${detail ? ` - ${detail}` : ""}`;
+}
+
+function runEvidenceFailureReason(runEvidence: RunEvidence): string | null {
+  if (runEvidence.status === "timed-out") {
+    const timeoutReason =
+      runEvidence.errorReason ??
+      runEvidence.checks.find((check) => check.kind === "run-timeout" && typeof check.detail === "string")?.detail ??
+      null;
+    return `Timeout: ${timeoutReason ?? "run timed out"}`;
+  }
+  if (runEvidence.status === "cancelled" || runEvidence.cancelReason) {
+    return `Cancelled: ${runEvidence.cancelReason ?? "run cancelled"}`;
+  }
+  if (runEvidence.errorReason) return `Error: ${runEvidence.errorReason}`;
+  if (runEvidence.status !== "failed") return null;
+  const failedCheck = latestFailedCheckForDisplay(runEvidence);
+  if (failedCheck) return `Check failed: ${failedCheck}`;
+  if (runEvidence.exitCode !== null && runEvidence.exitCode !== 0) return `Exit code ${runEvidence.exitCode}`;
+  return null;
+}
+
+function runEvidenceIsTerminalFailure(runEvidence: RunEvidence | null | undefined): runEvidence is RunEvidence {
+  return !!runEvidence && (
+    runEvidence.status === "failed" ||
+    runEvidence.status === "timed-out" ||
+    runEvidence.status === "cancelled"
+  );
+}
+
+export function failureSummaryForNode(node: CanvasNode, runEvidence: RunEvidence | null | undefined): string | null {
+  const failedNode = node.status === "failed";
+  if (!failedNode && !runEvidenceIsTerminalFailure(runEvidence)) return null;
+  const evidenceReason = runEvidenceIsTerminalFailure(runEvidence) ? runEvidenceFailureReason(runEvidence) : null;
+  const fallbackReason = optionalText(node.progress);
+  return `Failed: ${evidenceReason ?? fallbackReason ?? "No terminal evidence reason recorded."}`;
+}
+
 export function runEvidenceFactsForDisplay(runEvidence: RunEvidence): Array<{ label: string; value: string }> {
   const facts = [
     { label: "Run status", value: runEvidence.status },
@@ -4480,17 +4551,8 @@ export function runEvidenceFactsForDisplay(runEvidence: RunEvidence): Array<{ la
     },
   ];
 
-  const timeoutReason = runEvidence.status === "timed-out"
-    ? runEvidence.errorReason ?? runEvidence.checks.find((check) => check.kind === "run-timeout" && typeof check.detail === "string")?.detail ?? null
-    : null;
-
-  if (timeoutReason) {
-    facts.push({ label: "Reason", value: `Timeout: ${timeoutReason}` });
-  } else if (runEvidence.errorReason) {
-    facts.push({ label: "Reason", value: `Error: ${runEvidence.errorReason}` });
-  } else if (runEvidence.cancelReason) {
-    facts.push({ label: "Reason", value: `Cancelled: ${runEvidence.cancelReason}` });
-  }
+  const reason = runEvidenceFailureReason(runEvidence);
+  if (reason) facts.push({ label: "Reason", value: reason });
 
   return facts;
 }
@@ -4837,6 +4899,7 @@ function CanvasComposer({
   value,
   disabled,
   selectedNode,
+  selectedRunEvidence,
   selectedNodeActionScopeKey,
   selectedNodeActionState,
   nodeActionBusy,
@@ -4850,6 +4913,7 @@ function CanvasComposer({
   value: string;
   disabled: boolean;
   selectedNode: CanvasNode | null;
+  selectedRunEvidence: RunEvidence | null;
   selectedNodeActionScopeKey: string | null;
   selectedNodeActionState: SelectedNodeActionState | null;
   nodeActionBusy: Exclude<ComposerAction, null> | null;
@@ -4875,6 +4939,11 @@ function CanvasComposer({
   }
 
   const actionAvailability = selectedNodeActionAvailability(selectedNodeActionState, workflowBackendAvailable);
+  const selectedFailureSummary = selectedNode ? failureSummaryForNode(selectedNode, selectedRunEvidence) : null;
+  const selectedLatestFailedCheck = latestFailedCheckForDisplay(selectedRunEvidence);
+  const rollbackBlocker = selectedNodeActionState?.blockedByRemoteSideEffect
+    ? REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE
+    : null;
   const displayedValue = value;
   const hasValue = displayedValue.trim().length > 0;
   const selectedActionAvailability = action ? actionAvailability[action] : null;
@@ -4956,6 +5025,28 @@ function CanvasComposer({
               </div>
             )}
           </div>
+          {(selectedFailureSummary || selectedLatestFailedCheck || rollbackBlocker) && (
+            <div className="composer-failure-summary" role="status">
+              {selectedFailureSummary && (
+                <p className="composer-failure-line">
+                  <span>Failure summary</span>
+                  <strong title={selectedFailureSummary}>{selectedFailureSummary}</strong>
+                </p>
+              )}
+              {selectedLatestFailedCheck && (
+                <p className="composer-failure-line">
+                  <span>Last failed check</span>
+                  <strong title={selectedLatestFailedCheck}>{selectedLatestFailedCheck}</strong>
+                </p>
+              )}
+              {rollbackBlocker && (
+                <p className="composer-failure-line blocker">
+                  <span>Rollback blocker</span>
+                  <strong title={rollbackBlocker}>{rollbackBlocker}</strong>
+                </p>
+              )}
+            </div>
+          )}
           <div className="composer-dock-actions">
             <div className="composer-actions">
               <button
@@ -4964,7 +5055,7 @@ function CanvasComposer({
                 onClick={() => setAction("repair")}
                 aria-pressed={action === "repair"}
                 disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
-                title={actionAvailability.repair.reason ?? "Repair"}
+                title={actionAvailability.repair.reason ?? NODE_ACTION_IMPACT_COPY.repair}
               >
                 Repair
               </button>
@@ -4974,7 +5065,7 @@ function CanvasComposer({
                 onClick={() => setAction("variant")}
                 aria-pressed={action === "variant"}
                 disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
-                title={actionAvailability.variant.reason ?? "Variant"}
+                title={actionAvailability.variant.reason ?? NODE_ACTION_IMPACT_COPY.variant}
               >
                 Variant
               </button>
@@ -4984,17 +5075,17 @@ function CanvasComposer({
                 onClick={() => setAction("rollback")}
                 aria-pressed={action === "rollback"}
                 disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
-                title={actionAvailability.rollback.reason ?? "Rollback"}
+                title={actionAvailability.rollback.reason ?? NODE_ACTION_IMPACT_COPY.rollback}
               >
                 Rollback
               </button>
             </div>
             <p className={nodeActionError ? "composer-action-message error" : "composer-action-message"}>
               {nodeActionError ?? nodeActionStatus ?? (
-                action === "repair" ? "Repair modifies result via After checkpoint." :
-                action === "variant" ? "Variant attempts run from Before checkpoint." :
-                action === "rollback" ? (actionAvailability.rollback.reason ?? "Rollback affects node & downstream.") :
-                "Select action to continue."
+                action === "repair" ? NODE_ACTION_IMPACT_COPY.repair :
+                action === "variant" ? NODE_ACTION_IMPACT_COPY.variant :
+                action === "rollback" ? (actionAvailability.rollback.reason ?? NODE_ACTION_IMPACT_COPY.rollback) :
+                rollbackBlocker ?? "Select action to continue."
               )}
             </p>
           </div>
