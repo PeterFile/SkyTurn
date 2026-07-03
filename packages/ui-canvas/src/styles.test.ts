@@ -191,7 +191,7 @@ describe("SkyTurn UI style tokens", () => {
     const persistenceSource = await readSource("../../persistence/src/index.ts");
 
     expect(appSource).toContain("reconcileFinalChangeset");
-    expect(appSource).toContain("No available change evidence.");
+    expect(appSource).toContain("No structured change evidence recorded.");
     expect(persistenceSource).toContain("reconcileFinalChangeset");
     expect(appSource).not.toContain("mockChangesetService");
     expect(appSource).not.toContain("createMockChangeset");
