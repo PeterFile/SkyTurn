@@ -200,6 +200,7 @@ async function persistWorkflowRunResult(
     if (evidence.status !== "succeeded") return null;
     if (
       typeof window.devflow.applyWorkflowIntent !== "function" ||
+      typeof window.devflow.recordWorkflowRunResult !== "function" ||
       typeof window.devflow.scheduleWorkflowReadyLanes !== "function"
     ) {
       return null;
@@ -207,13 +208,21 @@ async function persistWorkflowRunResult(
     const intent = parseHermesWorkflowIntent(outputFromEvents(events).join("\n"));
     if (!intent.ok) return null;
     if (intent.intent.sessionId !== session.id) return null;
+    const recorded = await window.devflow.recordWorkflowRunResult(project.rootPath, {
+      sessionId: session.id,
+      laneId: node.id,
+      segmentId: segmentIdForNode(session.id, node.id),
+      runId: node.runId,
+      agentKind: node.agent,
+      now,
+    });
     const applied = await window.devflow.applyWorkflowIntent(project.rootPath, intent.intent);
-    const schedulingPolicy = workflowSchedulingPolicyForSession(applied.canvasSession ?? session);
+    const schedulingPolicy = workflowSchedulingPolicyForSession(applied.canvasSession ?? recorded.canvasSession ?? session);
     const scheduled = await window.devflow.scheduleWorkflowReadyLanes(project.rootPath, session.id, {
       allowedParallelism: schedulingPolicy.allowedParallelism,
       now,
     });
-    return scheduled.canvasSession ?? applied.canvasSession ?? null;
+    return scheduled.canvasSession ?? applied.canvasSession ?? recorded.canvasSession ?? null;
   }
 
   if (!node.display?.meta.includes("flow-kernel") || node.executable === false) return null;
