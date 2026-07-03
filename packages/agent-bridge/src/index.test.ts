@@ -627,6 +627,102 @@ describe("agent bridge", () => {
     expect(evidence.exitCode).toBe(0);
   });
 
+  it("records verified expected Codex artifacts in RunEvidence", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        "const artifact = path.join(process.cwd(), '.devflow/acceptance/react-app.png');",
+        "fs.mkdirSync(path.dirname(artifact), { recursive: true });",
+        "fs.writeFileSync(artifact, 'png-bytes');",
+        "process.stdout.write('{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"captured screenshot\"}}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "lane-browser-screenshot",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Capture browser screenshot evidence",
+      expectedArtifacts: [".devflow/acceptance/react-app.png"],
+    });
+    await completed;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    expect(evidence.status).toBe("succeeded");
+    expect(evidence.artifacts).toEqual([".devflow/acceptance/react-app.png"]);
+  });
+
+  it("does not record missing, empty, or unsafe expected Codex artifacts", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const path = require('node:path');",
+        "const empty = path.join(process.cwd(), '.devflow/acceptance/empty.png');",
+        "const unsafe = path.join(process.cwd(), '.devflow/acceptance/token-secret.png');",
+        "fs.mkdirSync(path.dirname(empty), { recursive: true });",
+        "fs.writeFileSync(empty, '');",
+        "fs.writeFileSync(unsafe, 'png-bytes');",
+        "process.stdout.write('{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath: codexPath })],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "lane-browser-screenshot",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Capture browser screenshot evidence",
+      expectedArtifacts: [
+        ".devflow/acceptance/missing.png",
+        ".devflow/acceptance/empty.png",
+        ".devflow/acceptance/token-secret.png",
+      ],
+    });
+    await completed;
+
+    const events = await loadRunEvents(projectRoot, run.id);
+    const evidence = deriveEvidenceFromEvents(run, events);
+
+    expect(evidence.status).toBe("succeeded");
+    expect(evidence.artifacts).toEqual([]);
+  });
+
   it("fails Codex runs with cli-missing category when the executable is unavailable", async () => {
     const projectRoot = await makeTempRoot();
     await mkdir(join(projectRoot, ".git"));
