@@ -1,8 +1,10 @@
 # Flow Kernel v1 Acceptance
 
-Status: historical pass
+Status: historical pass. Use this as archived acceptance evidence, not as the current workflow capability map.
 
 Historical branch: `codex/flow-kernel-v1`. This document records the Flow Kernel v1 acceptance run; it is not a statement about the current checkout branch.
+
+For current code facts, use `README.md` and `docs/natural-workflow-design.md`, then verify the code paths under `packages/ui-canvas/src/App.tsx`, `packages/ui-canvas/src/workflowRuntime.ts`, `apps/desktop/electron/main.ts`, `apps/desktop/scripts/mvpWorkflowDemo.mjs`, and `packages/agent-bridge/src`. The real Hermes/Codex path is still `experimental-run`, not `supported-run`; mock/browser fallback remains development-test scaffolding, not real completion evidence.
 
 ## Implementation Evidence
 
