@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { normalizeSessionTarget } from "@skyturn/project-core";
+import { hasConcreteRunEvidence, normalizeSessionTarget } from "@skyturn/project-core";
 import type {
   AgentKind,
   CanvasNode,
@@ -779,6 +779,9 @@ export class WorkflowStore {
   recordRunResult(input: RecordRunResultInput): FlowProjection {
     const safeEvidence = sanitizeRunEvidence(input.evidence);
     const outputSummary = sanitizeWorkflowStoredText(input.outputSummary ?? resultSummaryFromEvidence(safeEvidence));
+    const lane = this.getLane(input.sessionId, input.laneId);
+    if (lane?.laneKind === "planner") return this.recordPlannerRunResult(input, safeEvidence, outputSummary);
+
     const status = flowStatusFromRunEvidence(input.evidence);
     const evidenceStatus = status === "succeeded" ? "passed" : input.evidence.status === "cancelled" ? "skipped" : "failed";
     const evidenceId = `evidence-${input.segmentId}`;
@@ -839,6 +842,89 @@ export class WorkflowStore {
       if (evidenceStatus === "failed") {
         this.requestRepairForFailedRunInTransaction(input.sessionId, input.laneId, evidenceId, input.now);
       }
+    });
+    tx();
+    return this.materializeFlowProjection(input.sessionId);
+  }
+
+  private recordPlannerRunResult(
+    input: RecordRunResultInput,
+    safeEvidence: RunEvidence,
+    outputSummary: string,
+  ): FlowProjection {
+    const status = flowStatusFromRunEvidence(safeEvidence);
+    const laneStatus: WorkflowLaneStatus = status === "succeeded" && hasConcreteRunEvidence(safeEvidence)
+      ? "completed"
+      : "failed";
+    const tx = this.db.transaction(() => {
+      this.ensureSegmentInTransaction({
+        sessionId: input.sessionId,
+        laneId: input.laneId,
+        segmentId: input.segmentId,
+        runId: input.runId,
+        agentKind: input.agentKind,
+        transport: "agent-bridge",
+        worktreePath: ".",
+        now: input.now,
+      });
+      this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "segment_output_delta",
+        source: input.agentKind,
+        laneId: input.laneId,
+        segmentId: input.segmentId,
+        idempotencyKey: `planner-segment:${input.segmentId}:output-summary`,
+        payload: { text: outputSummary },
+        now: input.now,
+      });
+      const evidenceEvent = this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "segment_evidence",
+        source: input.agentKind,
+        laneId: input.laneId,
+        segmentId: input.segmentId,
+        idempotencyKey: `planner-segment:${input.segmentId}:evidence`,
+        payload: { evidence: safeEvidence },
+        now: input.now,
+      });
+      this.statements.updateSegmentEvidence.run({
+        id: input.segmentId,
+        evidence_json: stableJson(safeEvidence),
+        exit_code: safeEvidence.exitCode ?? null,
+        error_reason: safeEvidence.errorReason ?? safeEvidence.cancelReason ?? null,
+      });
+      this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "segment_finished",
+        source: input.agentKind,
+        laneId: input.laneId,
+        segmentId: input.segmentId,
+        causationId: evidenceEvent.id,
+        idempotencyKey: `planner-segment:${input.segmentId}:finished`,
+        payload: {
+          status,
+          exitCode: safeEvidence.exitCode,
+          errorReason: safeEvidence.errorReason ?? safeEvidence.cancelReason ?? null,
+        },
+        now: input.now,
+      });
+      this.statements.finishSegment.run({
+        id: input.segmentId,
+        status,
+        ended_at: input.now,
+        exit_code: safeEvidence.exitCode ?? null,
+        error_reason: safeEvidence.errorReason ?? safeEvidence.cancelReason ?? null,
+      });
+      this.setLaneStatus(input.sessionId, input.laneId, laneStatus, input.now);
+      this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "lane_status_changed",
+        source: "workflow_store",
+        laneId: input.laneId,
+        causationId: evidenceEvent.id,
+        payload: { status: laneStatus, reason: "planner run evidence" },
+        now: input.now,
+      });
     });
     tx();
     return this.materializeFlowProjection(input.sessionId);
