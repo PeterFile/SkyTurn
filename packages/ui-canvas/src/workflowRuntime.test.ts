@@ -284,6 +284,23 @@ describe("workflow runtime event merging", () => {
       projection: {},
       canvasSession: session,
     }));
+    const recordWorkflowRunResult = vi.fn(async () => ({
+      protocolVersion: 1,
+      projection: {},
+      canvasSession: {
+        ...session,
+        nodes: session.nodes.map((item) =>
+          item.id === session.plannerNodeId
+            ? {
+                ...item,
+                status: "completed" as const,
+                progress: "Evidence ready",
+                runtime: { phase: "Completed" as const, message: "Evidence ready", action: "completed" },
+              }
+            : item,
+        ),
+      },
+    }));
     const scheduleWorkflowReadyLanes = vi.fn(async () => ({
       protocolVersion: 1,
       result: { readyLanes: [{ id: "lane-implementation" }] },
@@ -297,6 +314,7 @@ describe("workflow runtime event merging", () => {
         getRunEvidence,
         getWorkflowLedger,
         applyWorkflowIntent,
+        recordWorkflowRunResult,
         scheduleWorkflowReadyLanes,
       },
     });
@@ -305,6 +323,14 @@ describe("workflow runtime event merging", () => {
       const result = await startBridgeRun(project, session, node);
 
       expect(startAgentRun.mock.calls[0]?.[0].prompt).toContain("Decision: keep retry behavior explicit.");
+      expect(recordWorkflowRunResult).toHaveBeenCalledWith(project.rootPath, {
+        sessionId: session.id,
+        laneId: node.id,
+        segmentId: `segment-${session.id}-${node.id}`,
+        runId: node.runId,
+        agentKind: node.agent,
+        now: "2026-06-10T00:00:01.000Z",
+      });
       expect(applyWorkflowIntent).toHaveBeenCalledWith(project.rootPath, expect.objectContaining({ intentId: "intent-ledger-1" }));
       expect(scheduleWorkflowReadyLanes).toHaveBeenCalledWith(project.rootPath, session.id, expect.objectContaining({ allowedParallelism: 1 }));
       expect(result?.workflowSession?.nodes.map((item) => item.id)).toContain("lane-implementation");
@@ -482,7 +508,11 @@ describe("workflow runtime event merging", () => {
       projection: {},
       canvasSession: projectedSession,
     }));
-    const recordWorkflowRunResult = vi.fn();
+    const recordWorkflowRunResult = vi.fn(async () => ({
+      protocolVersion: 1,
+      projection: {},
+      canvasSession: session,
+    }));
     vi.stubGlobal("window", {
       devflow: {
         startAgentRun,
@@ -511,7 +541,14 @@ describe("workflow runtime event merging", () => {
         allowedParallelism: 1,
         now: "2026-06-10T00:00:03.000Z",
       });
-      expect(recordWorkflowRunResult).not.toHaveBeenCalled();
+      expect(recordWorkflowRunResult).toHaveBeenCalledWith(project.rootPath, {
+        sessionId: session.id,
+        laneId: node.id,
+        segmentId: `segment-${session.id}-${node.id}`,
+        runId: node.runId,
+        agentKind: node.agent,
+        now: "2026-06-10T00:00:03.000Z",
+      });
       expect(result?.workflowSession?.nodes.map((item) => item.id)).toContain("lane-implementation");
     } finally {
       vi.unstubAllGlobals();

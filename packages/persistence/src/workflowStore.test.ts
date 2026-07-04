@@ -2339,6 +2339,81 @@ describe("SQLite workflow store", () => {
     });
   });
 
+  it("materializes succeeded planner evidence on the root card after workflow lanes complete", async () => {
+    const store = await makeStore();
+    store.createWorkflowSession({
+      id: "session-1",
+      projectId: "project-1",
+      title: "Persisted workflow",
+      goal: "Implement event sourced workflow",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Hermes live chat handle was not available during test setup.",
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    const plannerEvidence = {
+      runId: "run-session-1-node-1",
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit 0" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:01.000Z",
+    } satisfies RunEvidence;
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "node-1",
+      segmentId: "segment-session-1-node-1",
+      runId: plannerEvidence.runId,
+      agentKind: "hermes",
+      outputSummary: "Planner produced a workflow intent and concrete run evidence.",
+      evidence: plannerEvidence,
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    declareCodeChangeWorkflow(store);
+    const completedLaneIds: string[] = [];
+    for (let index = 0; index < 8; index += 1) {
+      const scheduled = store.scheduleReadyLanes("session-1", {
+        allowedParallelism: 1,
+        now: `2026-06-14T00:00:${String(3 + index * 2).padStart(2, "0")}.000Z`,
+      });
+      if (scheduled.readyLanes.length === 0) break;
+      for (const lane of scheduled.readyLanes) {
+        completedLaneIds.push(lane.id);
+        store.recordRunResult(
+          runResultInput(
+            store,
+            lane.id,
+            "succeeded",
+            `2026-06-14T00:00:${String(4 + index * 2).padStart(2, "0")}.000Z`,
+          ),
+        );
+      }
+    }
+
+    const projection = store.materializeFlowProjection("session-1");
+    const canvas = store.materializeCanvasSession("session-1");
+    const planner = canvas?.nodes.find((node) => node.id === canvas.plannerNodeId);
+
+    expect(completedLaneIds).toEqual(["lane-implementation", "lane-validation", "lane-review", "lane-commit"]);
+    expect(projection.lanes.every((lane) => lane.status === "completed")).toBe(true);
+    expect(planner).toMatchObject({
+      id: "node-1",
+      agent: "hermes",
+      status: "completed",
+      progress: "Evidence ready",
+      runtime: { phase: "Completed" },
+      runId: plannerEvidence.runId,
+    });
+    expect(planner?.context.dependencies).toEqual([]);
+    expect(canvas?.edges.some((edge) => edge.target === canvas.plannerNodeId)).toBe(false);
+  });
+
   it.each(["lane-implementation", "lane-validation", "lane-review"] as const)(
     "records failed %s RunEvidence into one durable repair and regression chain",
     async (failedLaneId) => {
