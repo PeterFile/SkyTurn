@@ -626,11 +626,21 @@ Codex 产生结构化 patch/file-change 事件时，`Changes` 页签能显示 li
 
 ### 部分完成，仍需收敛
 
+- Current branch 真实循环已经能在项目根目录启动 Hermes/Codex、写回 `RunEvidence` 并做 git 对账，但它仍是实验路径；renderer 里的 browser/mock fallback 和局部 local state 不能作为完成事实。
+- Artifact evidence 已能进入 `RunEvidence` 并在 Context 展示，真实 MVP demo 也会捕获截图；但 artifact 的生成、登记和验收仍依赖具体 lane/script，还不是统一产品能力。
 - 真实桌面 workflow 已经使用 SQLite projection，但 renderer 仍有 browser/mock fallback 和局部 local state。后续目标是让真实桌面主路径只消费 Node 侧事实源。
 - `ReplanFromEvidence`、repair successor、variant successor 和 regression 基础已经存在；失败后自动生成修复链还不是完整 desktop 默认体验。
 - Worktree create/compare/adopt/clean 后端和 IPC 已接入；双轨比较、采纳、清理还需要更完整的产品路径和 artifact/log/screenshot/port 隔离。
 - Changes live layer 已能消费结构化 run changes；Codex-style patch/file-change/turn-diff 覆盖面仍需要随真实 CLI 输出继续加固。
 - Hermes / Codex 适配器仍依赖本机 CLI、认证、输出格式和限流；短期只承诺 `experimental-run`。
+
+### 未完成或非目标
+
+- 不做 IDE、文件标签页、内置代码编辑器、全局终端 dashboard 或 no-code workflow builder。
+- New worktree 不是默认主线；它只是在 New Session 里显式选择的候选执行空间。
+- PR 创建、green checks、merge、main sync 和 cleanup 不会自动串联执行。每一步都必须是用户显式动作，并通过 Electron main 的后端 gate。
+- Mock/browser fallback 只用于开发测试和非桌面验证，不能作为真实完成证据。
+- 真实 Hermes/Codex 路径叫 `experimental-run`。当前没有本地 agent adapter 可以写成 `supported-run`。
 
 ### 下一步优先级
 
