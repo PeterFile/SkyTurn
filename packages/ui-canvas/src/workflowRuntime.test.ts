@@ -1070,6 +1070,12 @@ describe("workflow runtime event merging", () => {
       "danger-full-access",
       "danger-full-access",
     ]);
+    expect(startAgentRun.mock.calls.map(([input]) => input.expectedArtifacts)).toEqual([
+      undefined,
+      undefined,
+      [".devflow/acceptance/react-app.png"],
+      undefined,
+    ]);
   });
 
   it("runs current-branch sessions in the project root even when node metadata has a candidate path", async () => {

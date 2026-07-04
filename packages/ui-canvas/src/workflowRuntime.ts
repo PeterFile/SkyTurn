@@ -19,6 +19,7 @@ import {
   type NodeRuntimeState,
   type RunEvent,
   type RunEvidence,
+  type StartAgentRunInput,
   type UserDecisionProjection,
   type WorkflowLedgerSummary,
   type WorkflowWorktreeIdentity,
@@ -64,6 +65,7 @@ export interface WorkflowSchedulingPolicy {
 const SERIAL_WORKFLOW_PARALLELISM = 1;
 const MAX_WORKFLOW_PARALLELISM = 4;
 const CURRENT_BRANCH_WORKTREE_KEY = "current_branch";
+const BROWSER_SCREENSHOT_ARTIFACT = ".devflow/acceptance/react-app.png";
 
 export async function startBridgeRun(
   project: ImportedProject,
@@ -90,6 +92,7 @@ export async function startBridgeRun(
     worktreePath,
     agentKind: node.agent,
     ...(sandbox ? { sandbox } : {}),
+    ...expectedArtifactsInputForNode(node),
     prompt: promptForNodeRun(session, node, ledger),
   });
   if (!result || !window.devflow) return null;
@@ -926,6 +929,13 @@ function codexLaneInstruction(laneKind: string, title = ""): string {
     return "Run the relevant verification command and report the exact result. Do not create a git commit in this lane.";
   }
   return "";
+}
+
+function expectedArtifactsInputForNode(node: CanvasNode): Pick<StartAgentRunInput, "expectedArtifacts"> | Record<string, never> {
+  if (node.agent !== "codex") return {};
+  const laneText = `${node.display?.meta[0] ?? ""} ${node.id} ${node.title}`.toLowerCase();
+  if (!/browser|screenshot/.test(laneText)) return {};
+  return { expectedArtifacts: [BROWSER_SCREENSHOT_ARTIFACT] };
 }
 
 function dependencyEvidenceForPrompt(session: CanvasSession, node: CanvasNode): string {

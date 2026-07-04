@@ -402,6 +402,7 @@ export interface StartAgentRunInput {
   agentKind: AgentKind;
   transport?: AgentTransportKind;
   sandbox?: AgentRunSandbox;
+  expectedArtifacts?: string[];
   prompt: string;
 }
 
