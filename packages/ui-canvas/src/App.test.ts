@@ -4,6 +4,7 @@ import { formatTerminalTitle, formatTerminalBadge, formatTerminalMessage } from 
 import type { TerminalSnapshotResult } from "@skyturn/persistence";
 import {
   REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
+  failureSummaryForNode,
   selectedNodeActionAvailability,
   rollbackLabelForNode,
   buildWorktreeAdoptionConfirmation,
@@ -14,6 +15,7 @@ import {
   deriveSessionTarget,
   hasAvailableChangeEvidence,
   hasFinalGitEvidence,
+  latestFailedCheckForDisplay,
   runEvidenceFactsForDisplay,
   summarizeWorktreeComparisonEvidence,
 } from "./App.js";
@@ -378,6 +380,48 @@ describe("UI source validation", () => {
       label: "Reason",
       value: "Cancelled: user stopped run",
     });
+  });
+
+  it("summarizes failed selected nodes from run evidence instead of output prose", () => {
+    expect(failureSummaryForNode(mockNode(), mockRunEvidence({
+      status: "failed",
+      exitCode: 1,
+      errorReason: "vitest failed",
+      checks: [{ kind: "test", name: "unit", status: "failed", detail: "2 failed" }],
+    }))).toBe("Failed: Error: vitest failed");
+
+    expect(failureSummaryForNode(mockNode(), mockRunEvidence({
+      status: "timed-out",
+      exitCode: null,
+      errorReason: null,
+      checks: [{ kind: "run-timeout", name: "watchdog", status: "failed", detail: "watchdog expired" }],
+    }))).toBe("Failed: Timeout: watchdog expired");
+
+    expect(failureSummaryForNode(mockNode(), mockRunEvidence({
+      status: "cancelled",
+      exitCode: null,
+      cancelReason: "user stopped run",
+      checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "failed", detail: "SIGTERM" }],
+    }))).toBe("Failed: Cancelled: user stopped run");
+
+    expect(failureSummaryForNode({
+      ...mockNode(),
+      status: "failed",
+      output: ["Agent says success"],
+      progress: "Typecheck failed",
+    }, null)).toBe("Failed: Typecheck failed");
+  });
+
+  it("shows the latest failed check as structured evidence", () => {
+    expect(latestFailedCheckForDisplay(mockRunEvidence({
+      checks: [
+        { kind: "test", name: "unit", status: "failed", detail: "2 failed" },
+        { kind: "build", name: "tsc", status: "failed", detail: "TS2322" },
+      ],
+    }))).toBe("tsc: failed - TS2322");
+    expect(latestFailedCheckForDisplay(mockRunEvidence({
+      checks: [{ kind: "test", name: "unit", status: "passed" }],
+    }))).toBeNull();
   });
 
   it("includes visible copy for new session target selection and uses custom listbox controls", async () => {
@@ -1111,6 +1155,27 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     expect(appSource).toContain("downstream nodes affected");
     expect(appSource).toContain("evidence-chip impact");
     expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.affectedLaneIds.length");
+  });
+
+  it("failed node selected shows failure summary, latest check, and action impact copy", async () => {
+    const appSource = await readSource("./App.tsx");
+    const composer = appSource.slice(appSource.indexOf("function CanvasComposer("), appSource.indexOf("function rollbackBlockedMessage"));
+    const modal = appSource.slice(appSource.indexOf("function NodeModal("), appSource.indexOf("function EditorLaunchMenu"));
+    expect(composer).toContain("failureSummaryForNode(selectedNode, selectedRunEvidence)");
+    expect(composer).toContain("latestFailedCheckForDisplay(selectedRunEvidence)");
+    expect(composer).toContain("Failure summary");
+    expect(composer).toContain("Last failed check");
+    expect(composer).toContain("NODE_ACTION_IMPACT_COPY.repair");
+    expect(composer).toContain("NODE_ACTION_IMPACT_COPY.variant");
+    expect(composer).toContain("NODE_ACTION_IMPACT_COPY.rollback");
+    expect(appSource).toContain("Repair uses the after checkpoint");
+    expect(appSource).toContain("Variant uses the before checkpoint");
+    expect(appSource).toContain("Rollback affects selected + downstream");
+    expect(composer).toContain("REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE");
+    expect(appSource).toContain(REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE);
+    expect(modal).toContain("failureSummaryForNode(node, runEvidence)");
+    expect(modal).toContain("latestFailedCheckForDisplay(runEvidence)");
+    expect(modal).toContain("node-failure-summary");
   });
 
   it("checkpoint summary renders checkpoint/restore commit/source", async () => {
