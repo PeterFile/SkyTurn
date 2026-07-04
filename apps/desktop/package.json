@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "node --test scripts/*.test.mjs",
     "demo:mvp": "node scripts/mvpWorkflowDemo.mjs",
+    "acceptance:new-session-ui": "node scripts/newSessionUiAcceptance.mjs",
     "smoke:github": "node scripts/deliveryGithubSmoke.mjs",
     "lint": "pnpm run typecheck"
   },
