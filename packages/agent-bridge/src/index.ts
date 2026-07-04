@@ -1,8 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { access, appendFile, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, isAbsolute, join, normalize } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 
 import type {
@@ -56,6 +56,8 @@ const codexAuthFileName = "auth.json";
 const defaultTerminalCols = 80;
 const defaultTerminalRows = 24;
 const defaultTerminalScrollbackBytes = 256_000;
+const expectedAcceptanceArtifactPrefix = ".devflow/acceptance/";
+const unsafeArtifactPathPattern = /(?:^|[./_-])(auth|credential|credentials|key|password|passwd|secret|token)(?:$|[./_-])/i;
 
 type CliFailureCategory =
   | "cli-missing"
@@ -1383,6 +1385,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
               },
             });
           }
+          const artifacts = await collectVerifiedExpectedArtifacts(input, workdir, exitCode);
           await emit({
             kind: "evidence",
             payload: {
@@ -1395,6 +1398,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
                   detail: formatExitDetail(code, signal),
                 },
               ],
+              ...(artifacts.length > 0 ? { artifacts } : {}),
             },
           });
           await emit({
@@ -1635,6 +1639,44 @@ function closeReadlineInterfaces(readers: Interface[]): void {
   for (const reader of readers) {
     reader.removeAllListeners("line");
     reader.close();
+  }
+}
+
+async function collectVerifiedExpectedArtifacts(
+  input: StartAgentRunInput,
+  workdir: string,
+  exitCode: number | null,
+): Promise<string[]> {
+  if (exitCode !== 0 || !Array.isArray(input.expectedArtifacts)) return [];
+  const artifacts: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of input.expectedArtifacts) {
+    const artifact = normalizeExpectedArtifactPath(candidate);
+    if (!artifact || seen.has(artifact)) continue;
+    if (!(await isNonEmptyFile(join(workdir, artifact)))) continue;
+    seen.add(artifact);
+    artifacts.push(artifact);
+  }
+  return artifacts;
+}
+
+function normalizeExpectedArtifactPath(candidate: unknown): string | null {
+  if (typeof candidate !== "string") return null;
+  const trimmed = candidate.trim();
+  if (!trimmed || trimmed.includes("\0") || isAbsolute(trimmed)) return null;
+  const artifact = normalize(trimmed).replaceAll("\\", "/");
+  if (artifact === ".." || artifact.startsWith("../")) return null;
+  if (!artifact.startsWith(expectedAcceptanceArtifactPrefix)) return null;
+  if (unsafeArtifactPathPattern.test(artifact)) return null;
+  return artifact;
+}
+
+async function isNonEmptyFile(path: string): Promise<boolean> {
+  try {
+    const artifact = await stat(path);
+    return artifact.isFile() && artifact.size > 0;
+  } catch {
+    return false;
   }
 }
 

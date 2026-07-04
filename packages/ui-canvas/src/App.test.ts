@@ -11,6 +11,7 @@ import {
   buildWorktreeCleanConfirmation,
   buildWorktreeDeleteBranchConfirmation,
   changeReviewSummary,
+  changeEvidenceFactsForDisplay,
   deriveSessionTarget,
   hasAvailableChangeEvidence,
   hasFinalGitEvidence,
@@ -19,6 +20,7 @@ import {
   summarizeWorktreeComparisonEvidence,
 } from "./App.js";
 import type { CanvasNode, Changeset, FinalChangesetReconciliation, RunEvidence } from "@skyturn/project-core";
+import type { DeliveryCommitSummary } from "./deliveryPanel.js";
 import type { SelectedNodeActionState } from "./nodeActionState.js";
 
 function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
@@ -242,11 +244,122 @@ describe("UI source validation", () => {
 
   it("formats succeeded run evidence without output logs", () => {
     expect(runEvidenceFactsForDisplay(mockRunEvidence())).toEqual([
+      { label: "Run ID", value: "run-1" },
       { label: "Run status", value: "succeeded" },
       { label: "Exit code", value: "0" },
-      { label: "Checks", value: "test: passed" },
+      { label: "Checks", value: "test [unit]: passed" },
       { label: "Artifacts", value: "2 (patch, screenshot)" },
     ]);
+  });
+
+  it("formats completed validation evidence with screenshot artifact paths", () => {
+    expect(
+      runEvidenceFactsForDisplay(mockRunEvidence({
+        checks: [
+          {
+            kind: "test",
+            name: "corepack pnpm --filter @skyturn/ui-canvas run test",
+            status: "passed",
+            detail: "118 tests passed",
+          },
+          {
+            kind: "build",
+            name: "ui-canvas build",
+            status: "passed",
+            detail: "tsc -p tsconfig.json",
+          },
+        ],
+        artifacts: ["artifacts/node-modal/context-screenshot.png"],
+      })),
+    ).toEqual([
+      { label: "Run ID", value: "run-1" },
+      { label: "Run status", value: "succeeded" },
+      { label: "Exit code", value: "0" },
+      {
+        label: "Checks",
+        value: "test [corepack pnpm --filter @skyturn/ui-canvas run test]: passed - 118 tests passed, build [ui-canvas build]: passed - tsc -p tsconfig.json",
+      },
+      { label: "Artifacts", value: "1 (artifacts/node-modal/context-screenshot.png)" },
+    ]);
+  });
+
+  it("formats commit node change evidence without output logs", () => {
+    const changeset: Changeset = {
+      id: "cs-commit",
+      files: ["packages/ui-canvas/src/App.tsx", "packages/ui-canvas/src/App.test.ts"],
+      diffStat: { added: 12, changed: 2, deleted: 3 },
+      patchPreview: "diff --git",
+      source: "git",
+      evidence: {
+        evidenceId: "ev-commit",
+        changesetId: "cs-commit",
+        source: "git",
+        status: "available",
+        files: ["packages/ui-canvas/src/App.tsx", "packages/ui-canvas/src/App.test.ts"],
+        diffStat: { added: 12, changed: 2, deleted: 3 },
+        patchPreviewTruncated: false,
+      },
+    };
+    const commitEvidence: DeliveryCommitSummary = {
+      commitSha: "abc123456789",
+      branch: "feat/node-modal-evidence-density",
+      subject: "feat(ui-canvas): clarify node completion evidence",
+    };
+
+    expect(changeEvidenceFactsForDisplay(null, changeset, commitEvidence)).toEqual([
+      { label: "Changeset status", value: "available" },
+      {
+        label: "Changed files",
+        value: "2 (packages/ui-canvas/src/App.tsx, packages/ui-canvas/src/App.test.ts)",
+      },
+      { label: "Diff stat", value: "+12 / -3 across 2 files" },
+      { label: "Repo state", value: "Git changes recorded" },
+      { label: "Commit", value: "abc1234 on feat/node-modal-evidence-density" },
+    ]);
+  });
+
+  it("formats clean repo changeset evidence as an explicit empty state", () => {
+    const changeset: Changeset = {
+      id: "cs-clean",
+      files: [],
+      diffStat: { added: 0, changed: 0, deleted: 0 },
+      patchPreview: "",
+      source: "git",
+      evidence: {
+        evidenceId: "ev-clean",
+        changesetId: "cs-clean",
+        source: "git",
+        status: "empty",
+        files: [],
+        diffStat: { added: 0, changed: 0, deleted: 0 },
+        patchPreviewTruncated: false,
+      },
+    };
+    const reconciliation: FinalChangesetReconciliation = {
+      status: "empty",
+      changeset,
+      metadata: {
+        source: "git",
+        executionTarget: "current_branch",
+        selectedBranch: "feat/node-modal-evidence-density",
+        baselineRef: "main",
+      },
+    };
+
+    expect(changeEvidenceFactsForDisplay(reconciliation, changeset, null)).toEqual([
+      { label: "Changeset status", value: "empty" },
+      { label: "Changed files", value: "None" },
+      { label: "Diff stat", value: "+0 / -0 across 0 files" },
+      { label: "Repo state", value: "Clean at collection" },
+    ]);
+  });
+
+  it("ChangesTab renders structured changeset facts in the existing Changes tab", async () => {
+    const appSource = await readSource("./App.tsx");
+    const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("export function changeReviewSummary("));
+    expect(changesTab).toContain("changeEvidenceFactsForDisplay(reconciliation, changeset, commitEvidence)");
+    expect(appSource).toContain('aria-label="Changeset evidence facts"');
+    expect(changesTab).not.toContain("node.output");
   });
 
   it("formats failed, timed-out, and cancelled run evidence reasons", () => {

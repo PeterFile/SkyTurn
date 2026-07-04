@@ -1067,6 +1067,32 @@ h2 {
   line-height: 1.45;
 }
 
+.changes-evidence-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  margin: 8px 0 0;
+}
+
+.changes-evidence-facts > div {
+  min-width: 0;
+}
+
+.changes-evidence-facts dt {
+  color: var(--sk-muted);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.changes-evidence-facts dd {
+  margin: 2px 0 0;
+  color: var(--sk-text-legacy);
+  font-size: 12px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
 .target-selector-group {
   display: flex;
   flex-direction: column;
@@ -6217,6 +6243,7 @@ select:focus-visible,
 
   .delivery-facts,
   .delivery-confirm-facts,
+  .changes-evidence-facts,
   .delivery-grid,
   .delivery-form-grid {
     grid-template-columns: 1fr;

@@ -3531,6 +3531,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
   if (!changeset) return <p>Loading changes...</p>;
 
   const hasGitEvidence = hasFinalGitEvidence(reconciliation, changeset);
+  const changeEvidenceFacts = changeEvidenceFactsForDisplay(reconciliation, changeset, commitEvidence);
   const devflow = window.devflow;
   const isCommitLane = node.laneKind === "commit";
   const busyAction: DeliveryBusyAction | null =
@@ -3587,17 +3588,14 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
             <p className="eyebrow">Source: {changeset.source}</p>
             <h3>Git changeset evidence</h3>
             <p>{reconciliation ? `Status: ${reconciliation.status}` : changeReviewSummary(node, changeset)}</p>
+            <ChangeEvidenceFacts facts={changeEvidenceFacts} />
           {reconciliation?.metadata && (
               <p className="metadata-summary">Target: {reconciliation.metadata.executionTarget} | Branch: {reconciliation.metadata.selectedBranch} | Base: {reconciliation.metadata.baselineRef || "N/A"}</p>
           )}
           </div>
         </header>
         <div className="changes-empty" role={changeset.evidence?.status === "failed" || reconciliation?.status === "failed" ? "alert" : undefined}>
-          {reconciliation?.status === "failed"
-            ? reconciliation.errorReason ?? "Unable to reconcile git changeset."
-            : changeset.evidence?.status === "failed"
-            ? changeset.evidence.errorReason ?? "Unable to collect git changeset evidence."
-            : "No available change evidence."}
+          {changeEvidenceEmptyMessage(reconciliation, changeset)}
         </div>
       </section>
     );
@@ -3628,6 +3626,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
           <p className="eyebrow">Source: {changeset.source}</p>
           <h3>Git changeset evidence</h3>
           <p>{reconciliation ? `Status: ${reconciliation.status}` : changeReviewSummary(node, changeset)}</p>
+          <ChangeEvidenceFacts facts={changeEvidenceFacts} />
           {reconciliation?.metadata && (
              <p className="metadata-summary">Target: {reconciliation.metadata.executionTarget} | Branch: {reconciliation.metadata.selectedBranch} | Base: {reconciliation.metadata.baselineRef || "N/A"}</p>
           )}
@@ -3738,11 +3737,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         <div className={diffShellClassName} dangerouslySetInnerHTML={{ __html: diffHtml }} />
       ) : (!hasGitEvidence && !reconciliation?.liveChanges) ? (
         <div className="changes-empty" role={changeset.evidence?.status === "failed" || reconciliation?.status === "failed" ? "alert" : undefined}>
-          {reconciliation?.status === "failed"
-            ? reconciliation.errorReason ?? "Unable to reconcile git changeset."
-            : changeset.evidence?.status === "failed"
-            ? changeset.evidence.errorReason ?? "Unable to collect git changeset evidence."
-            : "No available change evidence."}
+          {changeEvidenceEmptyMessage(reconciliation, changeset)}
         </div>
       ) : (
         <div className="changes-empty">No structured diff was available for this changeset.</div>
@@ -4130,6 +4125,82 @@ export function changeReviewSummary(node: CanvasNode, changeset: Changeset): str
   if (changeset.evidence?.status === "failed") return `${agent} has no usable git changeset for ${changeset.id}.`;
   if (changeset.evidence?.status === "unknown") return `${agent} has unknown change evidence for ${changeset.id}.`;
   return `${agent} produced ${changeset.id} from git: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
+}
+
+type EvidenceDisplayFact = { label: string; value: string };
+
+export function changeEvidenceFactsForDisplay(
+  reconciliation: FinalChangesetReconciliation | null,
+  changeset: Changeset,
+  commitEvidence: DeliveryCommitSummary | null,
+): EvidenceDisplayFact[] {
+  const status = reconciliation?.status ?? changeset.evidence?.status ?? "unknown";
+  const files = changeset.evidence?.files.length ? changeset.evidence.files : changeset.files;
+  const changedFileCount = changeset.diffStat.changed || files.length;
+  const fileLabel = changedFileCount === 1 ? "file" : "files";
+  const facts: EvidenceDisplayFact[] = [
+    { label: "Changeset status", value: status },
+    {
+      label: "Changed files",
+      value: files.length ? `${files.length} (${files.join(", ")})` : "None",
+    },
+    {
+      label: "Diff stat",
+      value: `+${changeset.diffStat.added} / -${changeset.diffStat.deleted} across ${changedFileCount} ${fileLabel}`,
+    },
+    { label: "Repo state", value: repoStateForChangeEvidence(status, reconciliation, changeset) },
+  ];
+
+  const commit = commitEvidenceForDisplay(commitEvidence);
+  if (commit) facts.push({ label: "Commit", value: commit });
+
+  return facts;
+}
+
+function ChangeEvidenceFacts({ facts }: { facts: EvidenceDisplayFact[] }) {
+  return (
+    <dl className="changes-evidence-facts" aria-label="Changeset evidence facts">
+      {facts.map((fact) => (
+        <div key={fact.label}>
+          <dt>{fact.label}</dt>
+          <dd>{fact.value}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+function repoStateForChangeEvidence(
+  status: string,
+  reconciliation: FinalChangesetReconciliation | null,
+  changeset: Changeset,
+): string {
+  if (status === "empty") return "Clean at collection";
+  if (status === "available" || status === "mismatch") return "Git changes recorded";
+  if (status === "failed") {
+    return reconciliation?.errorReason ?? changeset.evidence?.errorReason ?? "Collection failed";
+  }
+  return "Not recorded";
+}
+
+function commitEvidenceForDisplay(commitEvidence: DeliveryCommitSummary | null): string | null {
+  if (!commitEvidence) return null;
+  if (commitEvidence.commitSha && commitEvidence.branch) return `${shortSha(commitEvidence.commitSha)} on ${commitEvidence.branch}`;
+  if (commitEvidence.commitSha) return shortSha(commitEvidence.commitSha);
+  if (commitEvidence.branch) return commitEvidence.branch;
+  return commitEvidence.subject ?? null;
+}
+
+function changeEvidenceEmptyMessage(
+  reconciliation: FinalChangesetReconciliation | null,
+  changeset: Changeset,
+): string {
+  if (reconciliation?.status === "failed") return reconciliation.errorReason ?? "Unable to reconcile git changeset.";
+  if (changeset.evidence?.status === "failed") return changeset.evidence.errorReason ?? "Unable to collect git changeset evidence.";
+  if (reconciliation?.status === "empty" || changeset.evidence?.status === "empty") {
+    return "No git changes recorded; repository/worktree clean at collection.";
+  }
+  return "No structured change evidence recorded.";
 }
 
 export function hasAvailableChangeEvidence(changeset: Changeset): boolean {
@@ -4535,12 +4606,13 @@ export function failureSummaryForNode(node: CanvasNode, runEvidence: RunEvidence
 
 export function runEvidenceFactsForDisplay(runEvidence: RunEvidence): Array<{ label: string; value: string }> {
   const facts = [
+    { label: "Run ID", value: runEvidence.runId },
     { label: "Run status", value: runEvidence.status },
     ...(runEvidence.exitCode !== null ? [{ label: "Exit code", value: String(runEvidence.exitCode) }] : []),
     {
       label: "Checks",
       value: runEvidence.checks.length
-        ? runEvidence.checks.map((check) => `${check.kind}: ${check.status}`).join(", ")
+        ? runEvidence.checks.map((check) => `${check.kind} [${check.name}]: ${check.status}${check.detail ? ` - ${check.detail}` : ""}`).join(", ")
         : "None",
     },
     {
