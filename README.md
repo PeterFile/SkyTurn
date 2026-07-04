@@ -41,8 +41,36 @@ packages/
 - Node checkpoints: before/after checkpoints are user-visible workflow concepts at the node/run boundary. Node-scoped actions repair from the after checkpoint, create variants from the before checkpoint, or roll back the selected node and downstream nodes.
 - Session target: New Session exposes Current branch by default and New worktree as explicit opt-in.
 - Managed worktrees: desktop IPC calls `NodeGitWorktreeService` for create, adopt, and clean operations, and uses Node-side git evidence for compare.
-- Delivery actions: the node modal **Changes** tab exposes explicit commit, push, and create PR actions. The preload IPC and Electron main handlers call Node-only git/GitHub helpers. Commit records `workflow.commit.created`; push records `workflow.delivery.pushed`; PR creation records `workflow.pull_request.created`.
+- Delivery actions: the node modal **Changes** tab exposes explicit commit, push, create PR, exact-head check, squash merge request, post-merge main sync, and cleanup actions. The preload IPC and Electron main handlers call Node-only git/GitHub helpers. Commit records `workflow.commit.created`; push records `workflow.delivery.pushed`; PR creation records `workflow.pull_request.created`.
 - Project memory: `.devflow` under the imported project root.
+
+## Workflow Capability Map
+
+Implemented in the current code:
+
+- New Session has separate execution target and branch controls. Current branch is the default. New worktree is explicit opt-in.
+- Plan mode has gated Requirements, Design, and Tasks pages. Each page must be approved before the next one is accessible, and an approved plan can convert to a canvas.
+- The node modal has exactly three content tabs: **Output**, **Changes**, and **Context**. Selecting a node targets the bottom composer; details open from the node card **More** button.
+- **Context** displays node/session/worktree facts and `RunEvidence` facts, including status, exit code, checks, artifacts, and error/cancel/timeout reasons.
+- **Changes** can show structured live run changes, git-backed final reconciliation, mismatch state, sanitized `diff2html` preview, and explicit delivery actions.
+- Selected-node composer actions exist for repair, variant, and rollback. Repair starts from the after checkpoint, variant starts from the before checkpoint, and rollback targets the selected node plus downstream nodes.
+- Electron main owns workflow IPC, git/worktree side effects, delivery gates, rollback safety checks, and run evidence lookup. Renderer code does not execute git, shell, filesystem, or SQLite side effects.
+- Hermes and Codex real CLI adapters are wired through `agent-bridge` as `experimental-run`. The real path is `experimental-run`, not `supported-run`.
+
+Partial and still being hardened:
+
+- Current-branch real loop: runs against the imported project root and records real `RunEvidence`, but the desktop product path still has browser/mock fallback and local renderer state that must not become completion truth.
+- Artifact evidence: `RunEvidence` can carry artifacts and the MVP demo captures a screenshot artifact, but artifact capture/registration is still lane- and script-specific.
+- Failure-to-repair main path: kernel and selected-node foundations exist, but failed node to repair node to regression verification is not yet the default desktop loop.
+- Worktree product loop: create, compare, adopt, clean, and rollback backend boundaries exist, but New worktree is not the current mainline and the compare/adopt/cleanup experience is not complete.
+
+Not done or explicit non-goals:
+
+- SkyTurn is not an IDE, file-tab workspace, code editor, terminal dashboard, or general no-code workflow builder.
+- New worktree is not the default development path and should not be treated as the current mainline.
+- PR creation, green checks, merge, sync, and cleanup do not automatically chain. Each remote or destructive step needs an explicit user action and backend gate.
+- Mock/browser fallback is for deterministic development tests only. It is not real completion evidence.
+- No local adapter is documented as `supported-run`.
 
 ## Current Verification
 
