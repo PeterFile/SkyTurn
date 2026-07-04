@@ -276,7 +276,7 @@ function acceptanceFailureDiagnostic(input) {
   return failures.length > 0 ? failures.join(", ") : "unknown";
 }
 
-async function seedBlankReactProject(projectRoot) {
+export async function seedBlankReactProject(projectRoot) {
   await mkdir(join(projectRoot, "src"), { recursive: true });
   await mkdir(join(projectRoot, "scripts"), { recursive: true });
   await writeFile(join(projectRoot, ".gitignore"), ["node_modules", ".devflow", "dist", ""].join("\n"));
@@ -530,7 +530,7 @@ async function gitCommitCount(projectRoot) {
   return Number((await runCapture("git", ["rev-list", "--count", "HEAD"], projectRoot)).stdout.trim());
 }
 
-async function captureReactScreenshot(projectRoot, screenshotPath) {
+export async function captureReactScreenshot(projectRoot, screenshotPath) {
   await mkdir(dirname(screenshotPath), { recursive: true });
   const server = await createServer({
     root: projectRoot,
@@ -580,7 +580,7 @@ async function captureWithElectron(url, screenshotPath, projectRoot) {
   }
 }
 
-function workflowIntentsFromEvents(events) {
+export function workflowIntentsFromEvents(events) {
   return events.flatMap((event) => {
     if (event.kind !== "output" || typeof event.payload.text !== "string") return [];
     const parsed = parseHermesWorkflowIntent(event.payload.text);
@@ -588,7 +588,7 @@ function workflowIntentsFromEvents(events) {
   });
 }
 
-function runCapture(command, args, cwd, options = {}) {
+export function runCapture(command, args, cwd, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
@@ -614,7 +614,7 @@ function runCapture(command, args, cwd, options = {}) {
   });
 }
 
-function flowKernelGraphSummary(session, rootCardId) {
+export function flowKernelGraphSummary(session, rootCardId) {
   const generated = session.nodes.filter((node) => node.id === rootCardId || node.display?.meta.includes("flow-kernel"));
   const generatedIds = new Set(generated.map((node) => node.id));
   const generatedEdges = session.edges.filter((edge) => generatedIds.has(edge.source) && generatedIds.has(edge.target));
