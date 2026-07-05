@@ -1,3 +1,5 @@
+Status: archived planner-session refactor prompt. This file preserves the historical goal that led to stable `CanvasSession` planner identity and graph hygiene work. It is not a current bug report: current code has `hermesPlannerSessionId` / `plannerNodeId`, no `hermes -z` planner path, and real Hermes/Codex adapters still remain `experimental-run`. Re-audit current code before using any requirement below.
+
 /goal Refactor SkyTurn so one Canvas Session is continuously planned by the same Hermes planner session.
 
 Context:
@@ -7,7 +9,7 @@ Project -> Canvas Session Tab -> Canvas -> Workflow Card -> Node Modal.
 The desired product behavior is now:
 A Canvas Session has one durable Hermes planner session. When the user inserts a new requirement into the same canvas, SkyTurn must continue the same Hermes-agent planning session for that canvas, not create an unrelated Hermes one-shot planning run.
 
-Current issue:
+Historical issue at the time of this prompt:
 The bottom workflow input currently creates a new Hermes planning card/run for each requirement. The agent bridge currently starts Hermes with `hermes -z`, which is one-shot. This means repeated requirements in the same canvas are not planned by the same long Hermes session, and repeated planning can duplicate Codex implementation cards and Hermes verification cards.
 
 Product decision:

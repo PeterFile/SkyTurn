@@ -31,7 +31,7 @@ Descriptors may also include `readiness`:
 - `readiness.level: "detected-only"` means SkyTurn found the executable but has not registered an execution adapter for it.
 - `readiness.level: "experimental-run"` means SkyTurn registered a runnable adapter. This is still not `supported-run`.
 - `readiness.cli.version` comes from a bounded `--version` probe.
-- `readiness.auth.status` is `available` only when a credential is safely detectable from environment presence. SkyTurn does not read secrets or user config to prove auth.
+- `readiness.auth.status` is `available` only when a credential is safely detectable without exposing secret material. Environment variables can prove auth for configured agents. Codex can also be marked available from a local `auth.json` token shape under an injected config root, injected auth path, `$CODEX_HOME`, or the default Codex home. SkyTurn reads only enough shape to prove presence and does not return tokens, email, account IDs, or file contents. Hermes local auth remains `unknown` unless environment evidence is available.
 
 Each adapter is responsible for loading its own native context, for example:
 

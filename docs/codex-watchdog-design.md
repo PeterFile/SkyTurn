@@ -1,8 +1,12 @@
 # Agent Run Watchdog Design
 
-This document replaces the Codex-only watchdog framing. The first implementation
-target is still the local `agent-bridge` run path, but the watchdog must be
-agent-generic and cover both Codex CLI and Hermes CLI runs.
+Status: current architecture note. The generic agent run watchdog has landed in
+`packages/agent-bridge`; this file no longer describes an unimplemented follow-up
+task. Keep it aligned with code before using any section here as a new goal.
+
+This document replaces the Codex-only watchdog framing. The implemented local
+`agent-bridge` watchdog is agent-generic and covers both Codex CLI and Hermes CLI
+runs.
 
 ## Source facts
 
@@ -27,25 +31,27 @@ agent-generic and cover both Codex CLI and Hermes CLI runs.
     homes under `$HERMES_HOME` or `~/.hermes/profiles/<name>/`.
   - `hermes doctor` is read-only unless `--fix` is passed.
 - Existing SkyTurn facts:
-  - `createCodexCliAdapter()` has optional `timeoutMs` and stalled telemetry.
-  - `createHermesCliAdapter()` has no hard timeout and only sends `SIGTERM` on
-    cancel.
+  - `createCodexCliAdapter()` and `createHermesCliAdapter()` both use the shared
+    `AgentRunWatchdog` helper.
+  - Both adapters accept `timeoutMs`, `defaultWatchdogTimeoutMs`,
+    `killTimeoutMs`, and `stallTelemetryMs` construction options.
+  - Watchdog timeout emits terminal `RunEvidence` with `run-timeout` and final
+    `status: "timed-out"`.
+  - Timeout and cancellation terminate the process group with `SIGTERM`, then
+    second-stage `SIGKILL`.
+  - Stalled telemetry remains non-terminal progress.
   - `RunEvidence` drives node completion; agent prose does not.
-  - `AgentRunStatus` already includes `timed-out`.
-  - `EvidenceCheck.kind` currently does not include `run-timeout`, but the old
-    design and tests already expect that check kind. The contract must be fixed
-    before implementation.
+  - `AgentRunStatus` includes `timed-out`, and `EvidenceCheck.kind` includes
+    `run-timeout`.
 
 ## Problem
 
-Any local agent child process can hang. Today the Codex adapter only times out
-when an explicit `timeoutMs` is supplied, and the desktop path does not pass one.
-The Hermes adapter has no hard watchdog at all. A stuck `codex exec --json` or
-`hermes chat -q` process can therefore leave a SkyTurn node in `running` forever.
+Any local agent child process can hang. SkyTurn addresses this with a bounded
+adapter-level watchdog that emits terminal `RunEvidence` and final
+`status: "timed-out"` for local run adapters that own a child process.
 
-Stalled telemetry is useful, but it is not terminal evidence. SkyTurn needs a
-bounded adapter-level watchdog that emits terminal `RunEvidence` and final
-`status: "timed-out"` for every local run adapter that owns a child process.
+Stalled telemetry is useful, but it is not terminal evidence. A run only reaches
+a terminal timeout state through watchdog expiry.
 
 ## Constraints
 
@@ -73,11 +79,11 @@ bounded adapter-level watchdog that emits terminal `RunEvidence` and final
 - Do not add renderer shell, git, or filesystem execution.
 - Do not model Hermes gateway health as Codex CLI timeout behavior.
 
-## Design
+## Implemented design
 
-Add one shared `AgentRunWatchdog` helper inside `packages/agent-bridge`. Codex
-and Hermes adapters configure that helper with adapter-specific labels,
-activity sources, timeout budgets, and termination behavior.
+`packages/agent-bridge` has one shared `AgentRunWatchdog` helper. Codex and
+Hermes adapters configure that helper with adapter-specific labels, activity
+sources, timeout budgets, and termination behavior.
 
 The helper owns:
 
@@ -278,7 +284,7 @@ global console or service dashboard to the MVP.
 
 ## Acceptance tests
 
-Add or update tests before implementation:
+Current implementation should keep these tests green:
 
 - `EvidenceCheck.kind` accepts `run-timeout`.
 - Codex run without explicit `timeoutMs` times out through the default watchdog.
@@ -298,9 +304,11 @@ Add or update tests before implementation:
   fixture command/log output without mutating the system.
 - Hermes health probes redact credential-like values from diagnostics.
 
-## Implementation prompt
+## Historical implementation prompt
 
-Use this prompt for the follow-up implementation:
+The prompt below is archived. Do not use it as the current work item without
+first re-auditing the code, because the generic watchdog implementation has
+already landed.
 
 ```text
 In SkyTurn, replace the Codex-only watchdog design with a generic agent run watchdog described in docs/codex-watchdog-design.md.

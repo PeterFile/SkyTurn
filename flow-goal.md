@@ -1,3 +1,5 @@
+状态：历史实现 prompt，不是当前活跃需求或能力地图。本文件保留早期 Flow Kernel / SQLite workflow / Hermes planner continuity 目标；当前事实以 `README.md`、`docs/natural-workflow-design.md`、`docs/architecture.md` 和代码为准。不要直接执行本文件的“必须优先实现”或原生 Hermes 长会话要求，除非先重新审计当前 Hermes/SkyTurn transport 能力。
+
 你在 SkyTurn 仓库中实现“一个 SkyTurn 会话 = 一个持续 Hermes 主会话”的流式工作流内核。
 
 目标：
