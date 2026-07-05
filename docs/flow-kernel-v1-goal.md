@@ -1,6 +1,10 @@
 # Flow Kernel v1 Goal
 
-Use this full prompt as the active Codex goal for the Flow Kernel v1 milestone.
+Status: archived milestone prompt. Flow Kernel v1 has landed and evolved; this
+file is retained as the historical completion contract, not the current active
+Codex goal. For current capability and remaining work, use `README.md`,
+`docs/natural-workflow-design.md`, and `docs/flow-kernel-v1-acceptance.md`, then
+verify the live code paths.
 
 ```text
 /goal 在 /Volumes/HDD/MyStorage/Projects/SkyTurn 中完整交付 Flow Kernel v1：用户输入需求后，Hermes 只输出 WorkflowIntent，SkyTurn 确定性验证/编译 intent 为动态 DAG lanes/edges，SQLite event stream 成为唯一事实源，Agent Bridge 执行 segments，Canvas 实时投影开发过程。这个 Goal 只有在下面所有实现、集成、测试、真实场景验收、提交和证据报告全部完成后才算 complete；不要在设计稿、脚手架、mock-only demo、单个 milestone 或单个场景通过后结束。

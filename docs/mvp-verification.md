@@ -1,6 +1,6 @@
 # MVP Verification Plan
 
-Status: historical scaffold verification. This file records the original MVP build-out and early mock verification. It is not the current capability source. For current workflow/runtime facts, use `README.md`, `docs/natural-workflow-design.md`, `docs/flow-kernel-v1-acceptance.md`, and the code paths under `apps/desktop/electron`, `packages/persistence/src/workflowStore.ts`, `packages/workflow-kernel`, `packages/agent-bridge`, and `packages/git-worktree/src/node.ts`.
+Status: historical scaffold verification. This file records the original MVP build-out and early mock verification. It is not the current capability source. For current workflow/runtime facts, use `README.md`, `docs/natural-workflow-design.md`, `docs/flow-kernel-v1-acceptance.md`, and the code paths under `apps/desktop/electron`, `packages/persistence/src/workflowStore.ts`, `packages/workflow-kernel`, `packages/agent-bridge`, and `packages/git-worktree/src/node.ts`. Historical references below to clicking a node to open the modal are obsolete; current product behavior is that selecting a node binds the bottom composer, while node details open through the node card **More** button.
 
 ## Current State
 
@@ -57,7 +57,7 @@ Status: historical scaffold verification. This file records the original MVP bui
    - Status colors: completed green, failed red, retrying yellow, running animated three-color, pending neutral.
 
 10. Node modal
-    - Clicking a node opens a modal.
+    - Historical scaffold behavior: clicking a node opened a modal. Current product behavior uses selection for node-scoped composer actions and opens details through the node card **More** button.
     - Modal content tabs are exactly `Output`, `Changes`, and `Context`.
     - Actions: Stop, Retry, Reassign, Insert Before, Open Worktree in VSCode, Open Worktree in Cursor, Open Worktree in Zed.
     - Output streams only selected-node output.
@@ -120,7 +120,7 @@ Status: historical scaffold verification. This file records the original MVP bui
   - Home page has task input, Fast/Plan mode, and `Open Project`.
   - `Open Project` browser fallback imported `SkyTurn Demo` and created a Fast canvas session.
   - Canvas rendered `@xyflow/react` nodes and edges.
-  - Node click opened a modal with exactly `Output`, `Changes`, and `Context` content tabs.
+  - Historical scaffold behavior opened a modal from node click; current behavior opens node details through **More** while selection binds the bottom composer.
   - `Changes` showed mocked diff data through `ChangesetService`.
   - `Context` showed brief, session goal, dependencies, assigned agent, worktree path, branch, base commit, requirements/design/tasks source, and constraints.
   - `+ New Tab` created a Plan session with rendered Markdown sections and converted tasks into graph nodes.
