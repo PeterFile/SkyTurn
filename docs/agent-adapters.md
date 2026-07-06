@@ -68,13 +68,15 @@ Hermes-style tool-level filesystem checkpoints can exist as a lower-level safety
 
 There is no current `supported-run` local adapter. If a future doc says the real Hermes/Codex path is supported, it must point to updated code and validation that promoted the adapter level.
 
+Hermes planner PTY transport is a separate experimental transport boundary for planner status, inspection, and explicit takeover. It is not the Codex executor path, not a terminal dashboard, and not proof that a workflow node completed.
+
 ## Mock And Real Run Boundaries
 
 Browser/mock fallback paths still use planner mocks and `agent-bridge` mock runs for deterministic contract tests and non-desktop verification. Those paths are not evidence that a real local Agent executed.
 
 The current desktop workflow path registers Hermes and Codex real adapters behind `experimental-run`. Real CLI calls belong inside `agent-bridge` adapters only, and they remain experimental until the CLI contract, auth/readiness, event parsing, cancellation, persistence, timeout handling, structured changes, and evidence mapping are stable enough to treat as `supported-run`.
 
-Mock output, browser fallback state, or agent prose can help UI tests, but none of them can complete a real workflow node. Real completion must come from terminal run events, `RunEvidence`, git/worktree evidence, tests, checks, or other concrete verification evidence.
+Mock output, browser fallback state, agent prose, or terminal text can help UI tests and diagnosis, but none of them can complete a real workflow node. Real completion must come from `RunEvidence`, workflow events, git/worktree evidence, tests, checks, artifacts, review evidence, commit evidence, or other concrete verification evidence.
 
 Runtime failure events use stable categories where possible:
 

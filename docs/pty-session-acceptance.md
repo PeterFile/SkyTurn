@@ -2,15 +2,17 @@
 
 Status: PR7 acceptance record for the stacked PTY session slice. This document records the current verified behavior and boundary. It does not claim that SkyTurn has a production interactive PTY runtime.
 
+PTY is scoped to Hermes planner status, inspection, and explicit takeover transport. It is not a terminal dashboard, not a node completion source, and not the Codex default executor.
+
 ## Current architecture boundary
 
 `packages/project-core` and `packages/agent-runtime` define contracts and feature gates only. They expose transport types, terminal session/event shapes, adapter capabilities, and `ptyInteractiveSessions` gating. They do not spawn local processes, open PTYs, run git, or own UI state.
 
-`packages/agent-bridge` owns the PTY lifecycle when a PTY factory is injected. It defines `PtyProcessFactory`, creates `PtyTerminalSessionManager`, starts Hermes planner PTY transport, emits terminal lifecycle/output/progress events, redacts secret-like terminal text, and records terminal exit evidence for exit, cancel, timeout, and failure paths. It still does not do DAG orchestration.
+`packages/agent-bridge` owns the PTY lifecycle when a PTY factory is injected. It defines `PtyProcessFactory`, creates `PtyTerminalSessionManager`, starts Hermes planner PTY transport, emits terminal lifecycle/output/progress events, redacts secret-like terminal text, and records terminal exit evidence for exit, cancel, timeout, and failure paths. It still does not do DAG orchestration and does not replace `codex exec --json`.
 
 `apps/desktop/electron` owns the desktop terminal runtime, IPC, and workflow session binding. It exposes `terminal:start`, `terminal:write`, `terminal:resize`, `terminal:cancel`, `terminal:snapshot`, and `terminal:event`. It binds the Hermes planner terminal to the workflow `CanvasSession`, starts a planner terminal when the workflow session path can, and augments renderer-facing canvas sessions with `hermesPlannerTerminalSessionId` when a live terminal exists.
 
-The renderer `Terminal Inspector` is read-only and hidden by default. It only renders after the top bar toggle is used, only for an active canvas session, and only reads `terminal.snapshot` plus `terminal.onEvent`. Renderer code does not call `terminal.start` or `terminal.write`, and it does not put terminal logs inside node cards or node modal tabs.
+The renderer `Terminal Inspector` is read-only and hidden by default. It only renders after the top bar toggle is used, only for an active canvas session, and only reads `terminal.snapshot` plus `terminal.onEvent`. Renderer code does not call `terminal.start` or `terminal.write`, and it does not put terminal logs inside node cards or node modal tabs. Future takeover controls must stay explicit and planner-scoped.
 
 ## Verified behavior
 
@@ -118,7 +120,7 @@ Real interactive Hermes PTY needs a future backend such as `node-pty` or an equi
 
 ## Rollback and safety boundary
 
-Terminal text is not completion evidence. Node completion still comes from `RunEvidence`, checks, git changes, artifacts, or concrete verification evidence.
+Terminal text is not completion evidence. Node completion still comes from `RunEvidence`, workflow events, checks, git changes, artifacts, review evidence, commit evidence, or concrete verification evidence.
 
 Rollback keeps evidence and history readable. Rolled-back or inactive nodes are not schedulable, and rollback must preserve the event trail instead of deleting the past.
 
