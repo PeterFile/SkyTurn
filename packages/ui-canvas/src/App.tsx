@@ -2753,6 +2753,7 @@ function NodeModal({
   const { contextSafe } = useGSAP({ scope: backdropRef });
   const nodeFailureSummary = failureSummaryForNode(node, runEvidence);
   const nodeLatestFailedCheck = latestFailedCheckForDisplay(runEvidence);
+  const nodeLastEvidence = lastRunEvidenceForDisplay(runEvidence);
 
   useGSAP(
     () => {
@@ -2833,7 +2834,7 @@ function NodeModal({
             </button>
           ))}
         </nav>
-        {(nodeFailureSummary || nodeLatestFailedCheck) && (
+        {(nodeFailureSummary || nodeLatestFailedCheck || nodeLastEvidence) && (
           <section className="node-failure-summary" aria-label="Failure summary">
             {nodeFailureSummary && (
               <p>
@@ -2845,6 +2846,12 @@ function NodeModal({
               <p>
                 <span>Last failed check</span>
                 <strong>{nodeLatestFailedCheck}</strong>
+              </p>
+            )}
+            {nodeLastEvidence && (
+              <p>
+                <span>Last evidence</span>
+                <strong>{nodeLastEvidence}</strong>
               </p>
             )}
           </section>
@@ -4569,6 +4576,28 @@ export function latestFailedCheckForDisplay(runEvidence: RunEvidence | null | un
   return `${failedCheck.name}: ${failedCheck.status}${detail ? ` - ${detail}` : ""}`;
 }
 
+export function lastRunEvidenceForDisplay(runEvidence: RunEvidence | null | undefined): string | null {
+  if (!runEvidence) return null;
+  const latestCheck = runEvidence.checks[runEvidence.checks.length - 1];
+  return [
+    runEvidence.status,
+    runEvidence.exitCode !== null ? `exit ${runEvidence.exitCode}` : null,
+    latestCheck ? `${latestCheck.name} ${latestCheck.status}` : null,
+    runEvidence.completedAt ?? null,
+  ].filter((value): value is string => Boolean(value)).join("; ");
+}
+
+export function affectedDownstreamSummaryForDisplay(
+  state: SelectedNodeActionState | null | undefined,
+  selectedNodeId?: string | null,
+): string | null {
+  const affectedLaneIds = state?.rollbackEligibility?.affectedLaneIds ?? [];
+  const sourceLaneId = state?.rollbackPayload?.laneId ?? selectedNodeId ?? null;
+  const downstreamLaneIds = affectedLaneIds.filter((laneId) => laneId !== sourceLaneId && laneId !== selectedNodeId);
+  if (downstreamLaneIds.length === 0) return null;
+  return `${downstreamLaneIds.length} downstream: ${summarizeLaneIds(downstreamLaneIds)}`;
+}
+
 function runEvidenceFailureReason(runEvidence: RunEvidence): string | null {
   if (runEvidence.status === "timed-out") {
     const timeoutReason =
@@ -4602,6 +4631,12 @@ export function failureSummaryForNode(node: CanvasNode, runEvidence: RunEvidence
   const evidenceReason = runEvidenceIsTerminalFailure(runEvidence) ? runEvidenceFailureReason(runEvidence) : null;
   const fallbackReason = optionalText(node.progress);
   return `Failed: ${evidenceReason ?? fallbackReason ?? "No terminal evidence reason recorded."}`;
+}
+
+function summarizeLaneIds(laneIds: string[]): string {
+  const visible = laneIds.slice(0, 3);
+  const hidden = laneIds.length - visible.length;
+  return hidden > 0 ? `${visible.join(", ")}, +${hidden} more` : visible.join(", ");
 }
 
 export function runEvidenceFactsForDisplay(runEvidence: RunEvidence): Array<{ label: string; value: string }> {
@@ -5013,6 +5048,10 @@ function CanvasComposer({
   const actionAvailability = selectedNodeActionAvailability(selectedNodeActionState, workflowBackendAvailable);
   const selectedFailureSummary = selectedNode ? failureSummaryForNode(selectedNode, selectedRunEvidence) : null;
   const selectedLatestFailedCheck = latestFailedCheckForDisplay(selectedRunEvidence);
+  const selectedLastEvidence = lastRunEvidenceForDisplay(selectedRunEvidence);
+  const affectedDownstreamSummary = selectedNode
+    ? affectedDownstreamSummaryForDisplay(selectedNodeActionState, selectedNode.id)
+    : null;
   const rollbackBlocker = selectedNodeActionState?.blockedByRemoteSideEffect
     ? REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE
     : null;
@@ -5079,9 +5118,9 @@ function CanvasComposer({
                     <Check size={12} /> {selectedNodeActionState.checkpoints.hasBefore && selectedNodeActionState.checkpoints.hasAfter ? '2 Checkpoints' : '1 Checkpoint'}
                   </span>
                 )}
-                {selectedNodeActionState.rollbackEligibility?.affectedLaneIds && selectedNodeActionState.rollbackEligibility.affectedLaneIds.length > 0 && (
-                  <span className="evidence-chip impact" title={`Restores to ${selectedNodeActionState.rollbackEligibility.restoreCommitRef}. ${selectedNodeActionState.rollbackEligibility.affectedLaneIds.length} downstream nodes affected.`}>
-                    <AlertTriangle size={12} /> {selectedNodeActionState.rollbackEligibility.affectedLaneIds.length} downstream
+                {affectedDownstreamSummary && (
+                  <span className="evidence-chip impact" title={`Restores to ${selectedNodeActionState?.rollbackEligibility?.restoreCommitRef ?? "unknown"}. ${affectedDownstreamSummary}.`}>
+                    <AlertTriangle size={12} /> {affectedDownstreamSummary}
                   </span>
                 )}
                 {selectedNodeActionState.remoteSideEffects.length > 0 && (
@@ -5097,7 +5136,7 @@ function CanvasComposer({
               </div>
             )}
           </div>
-          {(selectedFailureSummary || selectedLatestFailedCheck || rollbackBlocker) && (
+          {(selectedFailureSummary || selectedLatestFailedCheck || selectedLastEvidence || rollbackBlocker || affectedDownstreamSummary) && (
             <div className="composer-failure-summary" role="status">
               {selectedFailureSummary && (
                 <p className="composer-failure-line">
@@ -5109,6 +5148,18 @@ function CanvasComposer({
                 <p className="composer-failure-line">
                   <span>Last failed check</span>
                   <strong title={selectedLatestFailedCheck}>{selectedLatestFailedCheck}</strong>
+                </p>
+              )}
+              {selectedLastEvidence && (
+                <p className="composer-failure-line">
+                  <span>Last evidence</span>
+                  <strong title={selectedLastEvidence}>{selectedLastEvidence}</strong>
+                </p>
+              )}
+              {affectedDownstreamSummary && (
+                <p className="composer-failure-line">
+                  <span>Downstream</span>
+                  <strong title={affectedDownstreamSummary}>{affectedDownstreamSummary}</strong>
                 </p>
               )}
               {rollbackBlocker && (

@@ -40,7 +40,6 @@ import {
   type FlowEventKind,
   type FlowLane,
   type FlowProjection,
-  type WorkflowIntent,
 } from "@skyturn/workflow-kernel";
 
 export type WorkflowLaneKind =
@@ -386,6 +385,13 @@ interface PreparedCheckpointSuccessorRequest {
   failedEvidence?: FlowEvidence;
   failedRunId?: string;
   failedEvidenceFallbackReason?: string;
+}
+
+interface PreparedRepairRegressionLane {
+  laneId: string;
+  semanticKey: string;
+  failedEvidenceId: string;
+  lane: Record<string, unknown>;
 }
 
 export interface SegmentEvidenceInput {
@@ -839,9 +845,6 @@ export class WorkflowStore {
         createdAt: input.now,
         idempotencyKey: `segment:${input.segmentId}:finished`,
       }, input.now);
-      if (evidenceStatus === "failed") {
-        this.requestRepairForFailedRunInTransaction(input.sessionId, input.laneId, evidenceId, input.now);
-      }
     });
     tx();
     return this.materializeFlowProjection(input.sessionId);
@@ -1299,6 +1302,10 @@ export class WorkflowStore {
     const tx = this.db.transaction(() => {
       const currentProjection = this.materializeFlowProjection(input.sessionId);
       const currentPrepared = prepareCheckpointSuccessorRequest(kind, input, currentProjection);
+      const existingForFailedEvidence = kind === "repair" && currentPrepared.failedEvidence
+        ? this.checkpointRepairFailedEvidenceResult(input.sessionId, currentPrepared.failedEvidence.id)
+        : null;
+      if (existingForFailedEvidence) return { kind: "existing" as const, existing: existingForFailedEvidence };
       const existing = this.checkpointSuccessorIdempotentResult(
         kind,
         input,
@@ -1320,6 +1327,10 @@ export class WorkflowStore {
         input.instruction,
         input.title,
       );
+      const regressionPayload = kind === "repair" && currentPrepared.failedEvidence
+        ? repairRegressionLanePayload(currentPrepared, input.instruction)
+        : null;
+      if (regressionPayload) this.assertRepairRegressionIdentityAvailable(currentPrepared, regressionPayload);
       const laneEvent = this.insertEventInTransaction({
         sessionId: input.sessionId,
         kind: "workflow.lane.declared",
@@ -1345,6 +1356,36 @@ export class WorkflowStore {
           now: input.now,
         })
       );
+      const regressionLaneEvent = regressionPayload
+        ? this.insertEventInTransaction({
+            sessionId: input.sessionId,
+            kind: "workflow.lane.declared",
+            source: "workflow-store",
+            laneId: regressionPayload.laneId,
+            idempotencyKey: `checkpoint-successor:${currentPrepared.intentId}:regression-lane:${regressionPayload.failedEvidenceId}`,
+            payload: { lane: regressionPayload.lane },
+            now: input.now,
+          })
+        : null;
+      if (regressionPayload && !regressionLaneEvent) {
+        throw new Error("repair regression lane could not be recorded.");
+      }
+      if (regressionPayload) {
+        edgeEvents.push(this.insertEventInTransaction({
+          sessionId: input.sessionId,
+          kind: "workflow.edge.declared",
+          source: "workflow-store",
+          idempotencyKey: `checkpoint-successor:${currentPrepared.intentId}:edge:${currentPrepared.successorLaneId}:${regressionPayload.laneId}`,
+          payload: {
+            edge: {
+              id: `edge-${currentPrepared.successorLaneId}-${regressionPayload.laneId}`,
+              sourceLaneId: currentPrepared.successorLaneId,
+              targetLaneId: regressionPayload.laneId,
+            },
+          },
+          now: input.now,
+        }));
+      }
       const event = this.insertEventInTransaction({
         sessionId: input.sessionId,
         kind: kind === "repair" ? "workflow.node.repair_requested" : "workflow.node.variant_requested",
@@ -1371,6 +1412,12 @@ export class WorkflowStore {
           ...(currentPrepared.failedEvidenceFallbackReason ? { failedEvidenceFallbackReason: currentPrepared.failedEvidenceFallbackReason } : {}),
           successorLaneId: currentPrepared.successorLaneId,
           successorSemanticKey: currentPrepared.successorSemanticKey,
+          ...(regressionPayload
+            ? {
+                regressionLaneId: regressionPayload.laneId,
+                regressionSemanticKey: regressionPayload.semanticKey,
+              }
+            : {}),
           ...(input.instruction ? { instruction: input.instruction } : {}),
         },
         now: input.now,
@@ -1442,6 +1489,37 @@ export class WorkflowStore {
     };
   }
 
+  private checkpointRepairFailedEvidenceResult(
+    sessionId: string,
+    failedEvidenceId: string,
+  ): WorkflowCheckpointSuccessorResult | null {
+    const existing = this.listEvents(sessionId).find((event) =>
+      event.kind === "workflow.node.repair_requested" &&
+      repairEventReferencesFailedEvidence(event, failedEvidenceId)
+    );
+    if (!existing) return null;
+
+    const intentId = optionalText(existing.payload.intentId);
+    if (!intentId) throw new Error("repair idempotent retry conflicts with an existing repair missing intent identity.");
+    const laneEvent = this.getEventByIdempotencyKey(sessionId, `checkpoint-successor:${intentId}:lane`);
+    if (!laneEvent || laneEvent.kind !== "workflow.lane.declared") {
+      throw new Error("repair idempotent retry conflicts with missing existing successor lane.");
+    }
+    const edgePrefix = `checkpoint-successor:${intentId}:edge:`;
+    const edgeEvents = this.listEvents(sessionId).filter((event) =>
+      event.kind === "workflow.edge.declared" &&
+      typeof event.idempotencyKey === "string" &&
+      event.idempotencyKey.startsWith(edgePrefix)
+    );
+    return {
+      status: "requested",
+      event: existing,
+      laneEvent,
+      edgeEvents,
+      projection: this.materializeFlowProjection(sessionId),
+    };
+  }
+
   private assertCheckpointSuccessorIdentityAvailable(
     kind: "repair" | "variant",
     prepared: PreparedCheckpointSuccessorRequest,
@@ -1467,6 +1545,16 @@ export class WorkflowStore {
     if (intentConflict?.successorSemanticKey === successorSemanticKey) {
       throw new Error(`${kind} successor semantic key already belongs to another checkpoint intent.`);
     }
+  }
+
+  private assertRepairRegressionIdentityAvailable(
+    prepared: PreparedCheckpointSuccessorRequest,
+    regression: PreparedRepairRegressionLane,
+  ): void {
+    const laneIdConflict = prepared.projection.lanes.find((item) => item.id === regression.laneId);
+    if (laneIdConflict) throw new Error("repair regression lane id already exists in this session.");
+    const semanticKeyConflict = prepared.projection.lanes.find((item) => item.semanticKey === regression.semanticKey);
+    if (semanticKeyConflict) throw new Error("repair regression semantic key already exists in this session.");
   }
 
   private requireKnownSession(sessionId: string): WorkflowSessionRecord {
@@ -1782,27 +1870,6 @@ export class WorkflowStore {
       payload: event.payload,
       now,
     });
-  }
-
-  private requestRepairForFailedRunInTransaction(
-    sessionId: string,
-    laneId: string,
-    evidenceId: string,
-    now: string,
-  ): void {
-    const projection = this.materializeFlowProjection(sessionId);
-    const lane = projection.lanes.find((item) => item.id === laneId);
-    const evidence = projection.evidence.find((item) => item.id === evidenceId && item.laneId === laneId);
-    if (!lane || lane.status !== "failed" || !shouldAutoRepairFailedLane(lane) || evidence?.status !== "failed") return;
-
-    const intent: WorkflowIntent = {
-      intentId: `auto-repair:${laneId}:${evidenceId}`,
-      sessionId,
-      operations: [{ type: "ReplanFromEvidence", laneId, evidenceId }],
-    };
-    const compiled = compileWorkflowIntent(intent, projection, createDefaultFlowPolicy(), now);
-    if (!compiled.ok) return;
-    for (const event of compiled.events) this.insertFlowEventInTransaction(event, now);
   }
 
   private projectEventInTransaction(event: WorkflowEventRecord): void {
@@ -2431,6 +2498,54 @@ function successorLanePayload(
   };
 }
 
+function repairRegressionLanePayload(
+  prepared: PreparedCheckpointSuccessorRequest,
+  instruction?: string,
+): PreparedRepairRegressionLane {
+  const failedEvidence = prepared.failedEvidence;
+  if (!failedEvidence) throw new Error("repair regression requires failed evidence.");
+  const laneId = `${prepared.successorLaneId}-regression`;
+  const semanticKey = `regression:${prepared.successorSemanticKey}:${failedEvidence.id}`;
+  return {
+    laneId,
+    semanticKey,
+    failedEvidenceId: failedEvidence.id,
+    lane: {
+      id: laneId,
+      semanticKey,
+      kind: "regression_check",
+      laneKind: "regression",
+      semanticSubtype: "regression_check",
+      title: `Validate ${prepared.lane.title}`,
+      brief: repairRegressionContextBrief(prepared, instruction),
+      agentKind: "codex",
+      status: "pending",
+      fileScopes: prepared.lane.fileScopes,
+      packageScopes: prepared.lane.packageScopes,
+      requiredEvidence: ["test"],
+      output: [
+        `Regression check for repair ${prepared.successorLaneId}.`,
+        `Source lane ${prepared.targetLaneId}; failed evidence ${failedEvidence.id}.`,
+        ...(failedEvidence.detail ? [`Failed detail ${failedEvidence.detail}.`] : []),
+      ],
+    },
+  };
+}
+
+function repairRegressionContextBrief(prepared: PreparedCheckpointSuccessorRequest, instruction?: string): string {
+  const failedEvidence = prepared.failedEvidence;
+  const trimmedInstruction = instruction?.trim();
+  return [
+    `Regression check after repair ${prepared.successorLaneId}.`,
+    `source lane ${prepared.targetLaneId}; source node ${prepared.checkpoint.nodeId}.`,
+    ...(prepared.checkpoint.runId ? [`source run ${prepared.checkpoint.runId}.`] : []),
+    ...(prepared.checkpoint.segmentId ? [`source segment ${prepared.checkpoint.segmentId}.`] : []),
+    ...(failedEvidence ? [`failed evidence ${failedEvidence.id}.`] : []),
+    ...(failedEvidence?.detail ? [`failed detail ${failedEvidence.detail}.`] : []),
+    ...(trimmedInstruction ? [`repair instruction ${trimmedInstruction}`] : []),
+  ].join(" ");
+}
+
 function checkpointSuccessorContextOutput(
   kind: "repair" | "variant",
   lane: FlowLane,
@@ -2470,6 +2585,12 @@ function checkpointSuccessorContextBrief(
     ...(failedEvidenceFallbackReason ? [failedEvidenceFallbackReason] : []),
     ...(trimmedInstruction ? [`instruction ${trimmedInstruction}`] : []),
   ].join(" ");
+}
+
+function repairEventReferencesFailedEvidence(event: WorkflowEventRecord, failedEvidenceId: string): boolean {
+  if (optionalText(event.payload.failedEvidenceId) === failedEvidenceId) return true;
+  const sourceEvidenceIds = event.payload.sourceEvidenceIds;
+  return Array.isArray(sourceEvidenceIds) && sourceEvidenceIds.some((value) => value === failedEvidenceId);
 }
 
 function failedEvidenceForCheckpoint(
@@ -2602,11 +2723,6 @@ function flowStatusFromRunEvidence(evidence: RunEvidence): "succeeded" | "failed
   if (evidence.status === "cancelled") return "cancelled";
   if (evidence.status === "timed-out") return "timed-out";
   return evidence.exitCode === 0 || evidence.status === "succeeded" ? "succeeded" : "failed";
-}
-
-function shouldAutoRepairFailedLane(lane: FlowLane): boolean {
-  if (lane.laneKind !== "implementation" && lane.laneKind !== "validation" && lane.laneKind !== "review") return false;
-  return lane.semanticSubtype !== "repair" && !lane.semanticKey.startsWith("repair:");
 }
 
 function resultSummaryFromEvidence(evidence: RunEvidence): string {

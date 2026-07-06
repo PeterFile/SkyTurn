@@ -15,7 +15,9 @@ import {
   deriveSessionTarget,
   hasAvailableChangeEvidence,
   hasFinalGitEvidence,
+  affectedDownstreamSummaryForDisplay,
   latestFailedCheckForDisplay,
+  lastRunEvidenceForDisplay,
   runEvidenceFactsForDisplay,
   summarizeWorktreeComparisonEvidence,
 } from "./App.js";
@@ -1152,9 +1154,19 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
 
   it("eligible rollback shows selected plus downstream summary", async () => {
     const appSource = await readSource("./App.tsx");
-    expect(appSource).toContain("downstream nodes affected");
+    expect(affectedDownstreamSummaryForDisplay(actionState({
+      rollbackEligibility: {
+        eligible: true,
+        targetLaneId: "lane-1",
+        checkpointId: "checkpoint-before-node",
+        restoreCommitRef: "base-sha",
+        affectedLaneIds: ["lane-1", "lane-2", "lane-3", "lane-4", "lane-5"],
+        reason: "Rollback eligible.",
+        blockingRemoteSideEffects: [],
+      },
+    }), "node-1")).toBe("4 downstream: lane-2, lane-3, lane-4, +1 more");
     expect(appSource).toContain("evidence-chip impact");
-    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.affectedLaneIds.length");
+    expect(appSource).toContain("affectedDownstreamSummaryForDisplay(selectedNodeActionState, selectedNode.id)");
   });
 
   it("failed node selected shows failure summary, latest check, and action impact copy", async () => {
@@ -1163,8 +1175,10 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     const modal = appSource.slice(appSource.indexOf("function NodeModal("), appSource.indexOf("function EditorLaunchMenu"));
     expect(composer).toContain("failureSummaryForNode(selectedNode, selectedRunEvidence)");
     expect(composer).toContain("latestFailedCheckForDisplay(selectedRunEvidence)");
+    expect(composer).toContain("lastRunEvidenceForDisplay(selectedRunEvidence)");
     expect(composer).toContain("Failure summary");
     expect(composer).toContain("Last failed check");
+    expect(composer).toContain("Last evidence");
     expect(composer).toContain("NODE_ACTION_IMPACT_COPY.repair");
     expect(composer).toContain("NODE_ACTION_IMPACT_COPY.variant");
     expect(composer).toContain("NODE_ACTION_IMPACT_COPY.rollback");
@@ -1175,7 +1189,13 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     expect(appSource).toContain(REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE);
     expect(modal).toContain("failureSummaryForNode(node, runEvidence)");
     expect(modal).toContain("latestFailedCheckForDisplay(runEvidence)");
+    expect(modal).toContain("lastRunEvidenceForDisplay(runEvidence)");
     expect(modal).toContain("node-failure-summary");
+    expect(lastRunEvidenceForDisplay(mockRunEvidence({
+      status: "failed",
+      exitCode: 1,
+      checks: [{ kind: "test", name: "unit", status: "failed", detail: "exit 1" }],
+    }))).toBe("failed; exit 1; unit failed; 2026-06-27T00:00:00.000Z");
   });
 
   it("checkpoint summary renders checkpoint/restore commit/source", async () => {
@@ -1184,7 +1204,7 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     expect(appSource).toContain("After Checkpoint");
     expect(appSource).toContain("selectedNodeActionState.checkpoints.beforeCheckpointId");
     expect(appSource).toContain("selectedNodeActionState.checkpoints.afterCheckpointId");
-    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.restoreCommitRef");
+    expect(appSource).toContain("selectedNodeActionState?.rollbackEligibility?.restoreCommitRef");
   });
 
   it("remote blocker/manual repair disables rollback and shows correct message", async () => {
