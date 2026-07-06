@@ -79,12 +79,14 @@ import { convertPlanToCanvas, createFastCanvasSession, createPlanSession } from 
 import {
   NODE_MODAL_TABS,
   deriveNodeStatusFromEvidence,
+  summarizeRunEvidence,
   type AgentKind,
   type AgentWorkflowReadinessSummary,
   type CanvasNode,
   type CanvasSession,
   type CanvasSessionTab,
   type Changeset,
+  type EvidenceSummaryFact,
   type FinalChangesetReconciliation,
   type ImportedProject,
   type NodeModalTab,
@@ -4127,34 +4129,14 @@ export function changeReviewSummary(node: CanvasNode, changeset: Changeset): str
   return `${agent} produced ${changeset.id} from git: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
 }
 
-type EvidenceDisplayFact = { label: string; value: string };
+type EvidenceDisplayFact = EvidenceSummaryFact;
 
 export function changeEvidenceFactsForDisplay(
   reconciliation: FinalChangesetReconciliation | null,
   changeset: Changeset,
   commitEvidence: DeliveryCommitSummary | null,
 ): EvidenceDisplayFact[] {
-  const status = reconciliation?.status ?? changeset.evidence?.status ?? "unknown";
-  const files = changeset.evidence?.files.length ? changeset.evidence.files : changeset.files;
-  const changedFileCount = changeset.diffStat.changed || files.length;
-  const fileLabel = changedFileCount === 1 ? "file" : "files";
-  const facts: EvidenceDisplayFact[] = [
-    { label: "Changeset status", value: status },
-    {
-      label: "Changed files",
-      value: files.length ? `${files.length} (${files.join(", ")})` : "None",
-    },
-    {
-      label: "Diff stat",
-      value: `+${changeset.diffStat.added} / -${changeset.diffStat.deleted} across ${changedFileCount} ${fileLabel}`,
-    },
-    { label: "Repo state", value: repoStateForChangeEvidence(status, reconciliation, changeset) },
-  ];
-
-  const commit = commitEvidenceForDisplay(commitEvidence);
-  if (commit) facts.push({ label: "Commit", value: commit });
-
-  return facts;
+  return summarizeRunEvidence({ reconciliation, changeset, commitEvidence }).changeFacts;
 }
 
 function ChangeEvidenceFacts({ facts }: { facts: EvidenceDisplayFact[] }) {
@@ -4168,27 +4150,6 @@ function ChangeEvidenceFacts({ facts }: { facts: EvidenceDisplayFact[] }) {
       ))}
     </dl>
   );
-}
-
-function repoStateForChangeEvidence(
-  status: string,
-  reconciliation: FinalChangesetReconciliation | null,
-  changeset: Changeset,
-): string {
-  if (status === "empty") return "Clean at collection";
-  if (status === "available" || status === "mismatch") return "Git changes recorded";
-  if (status === "failed") {
-    return reconciliation?.errorReason ?? changeset.evidence?.errorReason ?? "Collection failed";
-  }
-  return "Not recorded";
-}
-
-function commitEvidenceForDisplay(commitEvidence: DeliveryCommitSummary | null): string | null {
-  if (!commitEvidence) return null;
-  if (commitEvidence.commitSha && commitEvidence.branch) return `${shortSha(commitEvidence.commitSha)} on ${commitEvidence.branch}`;
-  if (commitEvidence.commitSha) return shortSha(commitEvidence.commitSha);
-  if (commitEvidence.branch) return commitEvidence.branch;
-  return commitEvidence.subject ?? null;
 }
 
 function changeEvidenceEmptyMessage(
@@ -4562,30 +4523,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function latestFailedCheckForDisplay(runEvidence: RunEvidence | null | undefined): string | null {
-  if (!runEvidence) return null;
-  const failedCheck = [...runEvidence.checks].reverse().find((check) => check.status === "failed");
-  if (!failedCheck) return null;
-  const detail = optionalText(failedCheck.detail);
-  return `${failedCheck.name}: ${failedCheck.status}${detail ? ` - ${detail}` : ""}`;
+  return summarizeRunEvidence({ runEvidence }).latestFailedCheck;
 }
 
 function runEvidenceFailureReason(runEvidence: RunEvidence): string | null {
-  if (runEvidence.status === "timed-out") {
-    const timeoutReason =
-      runEvidence.errorReason ??
-      runEvidence.checks.find((check) => check.kind === "run-timeout" && typeof check.detail === "string")?.detail ??
-      null;
-    return `Timeout: ${timeoutReason ?? "run timed out"}`;
-  }
-  if (runEvidence.status === "cancelled" || runEvidence.cancelReason) {
-    return `Cancelled: ${runEvidence.cancelReason ?? "run cancelled"}`;
-  }
-  if (runEvidence.errorReason) return `Error: ${runEvidence.errorReason}`;
-  if (runEvidence.status !== "failed") return null;
-  const failedCheck = latestFailedCheckForDisplay(runEvidence);
-  if (failedCheck) return `Check failed: ${failedCheck}`;
-  if (runEvidence.exitCode !== null && runEvidence.exitCode !== 0) return `Exit code ${runEvidence.exitCode}`;
-  return null;
+  return summarizeRunEvidence({ runEvidence }).reason;
 }
 
 function runEvidenceIsTerminalFailure(runEvidence: RunEvidence | null | undefined): runEvidence is RunEvidence {
@@ -4605,28 +4547,7 @@ export function failureSummaryForNode(node: CanvasNode, runEvidence: RunEvidence
 }
 
 export function runEvidenceFactsForDisplay(runEvidence: RunEvidence): Array<{ label: string; value: string }> {
-  const facts = [
-    { label: "Run ID", value: runEvidence.runId },
-    { label: "Run status", value: runEvidence.status },
-    ...(runEvidence.exitCode !== null ? [{ label: "Exit code", value: String(runEvidence.exitCode) }] : []),
-    {
-      label: "Checks",
-      value: runEvidence.checks.length
-        ? runEvidence.checks.map((check) => `${check.kind} [${check.name}]: ${check.status}${check.detail ? ` - ${check.detail}` : ""}`).join(", ")
-        : "None",
-    },
-    {
-      label: "Artifacts",
-      value: runEvidence.artifacts.length
-        ? `${runEvidence.artifacts.length} (${runEvidence.artifacts.join(", ")})`
-        : "None",
-    },
-  ];
-
-  const reason = runEvidenceFailureReason(runEvidence);
-  if (reason) facts.push({ label: "Reason", value: reason });
-
-  return facts;
+  return summarizeRunEvidence({ runEvidence }).runFacts;
 }
 
 function RunEvidenceFacts({ runEvidence }: { runEvidence: RunEvidence }) {
