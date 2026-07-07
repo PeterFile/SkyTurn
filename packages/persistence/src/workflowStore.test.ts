@@ -1168,7 +1168,7 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
-  it("requests checkpoint repair once with failed evidence context without inventing a regression lane", async () => {
+  it("requests checkpoint repair once with failed evidence context and a regression continuation", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
     seedStore(store);
@@ -1265,7 +1265,7 @@ describe("SQLite workflow store", () => {
       | undefined;
     const repairNode = canvasSession?.nodes.find((node) => node.id === "lane-implementation-manual-repair");
     const scheduledRepairNode = scheduledCanvasSession?.nodes.find((node) => node.id === "lane-implementation-manual-repair");
-    const regressionLanes = projection.lanes.filter((lane) => lane.semanticKey.startsWith("regression:manual:repair:lane-implementation"));
+    const regressionLane = projection.lanes.find((lane) => lane.id === "lane-implementation-manual-repair-regression");
     const failedEvidenceId = "evidence-segment-session-1-lane-implementation";
     store.close();
 
@@ -1287,8 +1287,10 @@ describe("SQLite workflow store", () => {
       sourceCheckpointId: "checkpoint-after-implementation",
       failedRunId: "run-session-1-lane-implementation",
     });
-    expect(firstRequest.event.payload).not.toHaveProperty("regressionLaneId");
-    expect(firstRequest.event.payload).not.toHaveProperty("regressionSemanticKey");
+    expect(firstRequest.event.payload).toMatchObject({
+      regressionLaneId: "lane-implementation-manual-repair-regression",
+      regressionSemanticKey: `regression:manual:repair:lane-implementation:${failedEvidenceId}`,
+    });
     expect(repairLane).toMatchObject({
       laneKind: "fix",
       semanticSubtype: "repair",
@@ -1309,14 +1311,70 @@ describe("SQLite workflow store", () => {
     expect(repairBrief).toContain("instruction Repair from the failed run evidence.");
     expect(scheduledRepairLane?.brief).toBe(repairBrief);
     expect(scheduledRepairNode?.context.brief).toBe(repairBrief);
-    expect(regressionLanes).toEqual([]);
+    expect(regressionLane).toMatchObject({
+      laneKind: "regression",
+      semanticSubtype: "regression_check",
+      requiredEvidence: ["test"],
+      runtimePolicy: {
+        source: "workflow_projection",
+        trusted: true,
+        sandbox: "read-only",
+      },
+    });
     expect(projection.edges).toEqual(expect.arrayContaining([
       expect.objectContaining({ sourceLaneId: "lane-implementation", targetLaneId: "lane-implementation-manual-repair" }),
+      expect.objectContaining({ sourceLaneId: "lane-implementation-manual-repair", targetLaneId: "lane-implementation-manual-repair-regression" }),
     ]));
-    expect(projection.edges.some((edge) => edge.sourceLaneId === "lane-implementation-manual-repair")).toBe(false);
     expect(scheduled.readyLanes.map((lane) => lane.id)).toContain("lane-implementation-manual-repair");
     expect(reopened.materializeFlowProjection("session-1")).toEqual(scheduledProjection);
     reopened.close();
+  });
+
+  it("does not create a second repair chain for the same failed evidence", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
+    appendFailedEvidence(
+      store,
+      "lane-implementation",
+      "segment-session-1-lane-implementation",
+      "evidence-segment-session-1-lane-implementation",
+      "exit 1",
+      "2026-06-14T00:00:10.000Z",
+      "run-session-1-lane-implementation",
+    );
+
+    const first = store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "manual-repair-intent-1",
+      successorLaneId: "lane-implementation-manual-repair",
+      successorSemanticKey: "manual:repair:lane-implementation",
+      instruction: "Repair from the failed run evidence.",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    const eventCountBeforeDuplicate = store.listEvents("session-1").length;
+
+    const duplicate = store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "manual-repair-intent-2",
+      successorLaneId: "lane-implementation-second-repair",
+      successorSemanticKey: "manual:repair:lane-implementation:second",
+      instruction: "Try another repair for the same evidence.",
+      now: "2026-06-14T00:00:21.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+
+    expect(duplicate.event.id).toBe(first.event.id);
+    expect(store.listEvents("session-1")).toHaveLength(eventCountBeforeDuplicate);
+    expect(projection.lanes.filter((lane) => lane.semanticSubtype === "repair")).toHaveLength(1);
+    expect(projection.lanes.filter((lane) => lane.semanticSubtype === "regression_check")).toHaveLength(1);
+    expect(projection.lanes.some((lane) => lane.id === "lane-implementation-second-repair")).toBe(false);
+    store.close();
   });
 
   it("uses failed evidence matching the selected repair checkpoint segment instead of newer lane failure", async () => {
@@ -2415,7 +2473,7 @@ describe("SQLite workflow store", () => {
   });
 
   it.each(["lane-implementation", "lane-validation", "lane-review"] as const)(
-    "records failed %s RunEvidence into one durable repair and regression chain",
+    "records failed %s RunEvidence without automatically creating a repair chain",
     async (failedLaneId) => {
       const store = await makeSeededStore();
       declareCodeChangeWorkflow(store);
@@ -2427,49 +2485,25 @@ describe("SQLite workflow store", () => {
 
       const projection = store.materializeFlowProjection("session-1");
       const evidenceId = `evidence-segment-session-1-${failedLaneId}`;
-      const fix = projection.lanes.find((lane) => lane.semanticKey === `repair:${failedLaneId}:${evidenceId}`);
-      const regression = projection.lanes.find((lane) => lane.semanticKey === `regression:${failedLaneId}:${evidenceId}`);
       const replanEvents = store
         .listEvents("session-1")
         .filter((event) => event.kind === "workflow.replan.requested" && event.payload.laneId === failedLaneId);
 
       expect(projection.lanes.find((lane) => lane.id === failedLaneId)?.status).toBe("failed");
-      expect(replanEvents).toHaveLength(1);
-      expect(fix).toMatchObject({
-        laneKind: "fix",
-        semanticSubtype: "repair",
-        runtimePolicy: {
-          source: "workflow_projection",
-          trusted: true,
-          sandbox: "workspace-write",
-        },
-      });
-      expect(regression).toMatchObject({
-        laneKind: "regression",
-        semanticSubtype: "regression_check",
-        runtimePolicy: {
-          source: "workflow_projection",
-          trusted: true,
-          sandbox: "read-only",
-        },
-      });
-      expect(projection.edges).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ sourceLaneId: failedLaneId, targetLaneId: fix?.id }),
-          expect.objectContaining({ sourceLaneId: fix?.id, targetLaneId: regression?.id }),
-        ]),
-      );
+      expect(replanEvents).toEqual([]);
+      expect(projection.lanes.find((lane) => lane.semanticKey === `repair:${failedLaneId}:${evidenceId}`)).toBeUndefined();
+      expect(projection.lanes.find((lane) => lane.semanticKey === `regression:${failedLaneId}:${evidenceId}`)).toBeUndefined();
 
       const scheduled = store.scheduleReadyLanes("session-1", {
         allowedParallelism: 3,
         now: "2026-06-14T00:00:11.000Z",
       });
 
-      expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual([fix?.id]);
+      expect(scheduled.readyLanes).toEqual([]);
     },
   );
 
-  it("does not auto-repair cancelled runs or failed repair lanes", async () => {
+  it("does not auto-trigger repair for cancelled runs or failed repair lanes", async () => {
     const cancelledStore = await makeSeededStore();
     declareCodeChangeWorkflow(cancelledStore);
     advanceCodeChangeWorkflowToLane(cancelledStore, "lane-implementation");
@@ -2484,24 +2518,32 @@ describe("SQLite workflow store", () => {
     const repairStore = await makeSeededStore();
     declareCodeChangeWorkflow(repairStore);
     advanceCodeChangeWorkflowToLane(repairStore, "lane-implementation");
+    recordCheckpoint(repairStore, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
     repairStore.recordRunResult(
       runResultInput(repairStore, "lane-implementation", "failed", "2026-06-14T00:00:10.000Z"),
     );
-    const firstRepair = repairStore
-      .materializeFlowProjection("session-1")
-      .lanes.find((lane) => lane.semanticKey.startsWith("repair:"));
+    repairStore.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "manual-repair-intent-1",
+      successorLaneId: "lane-implementation-manual-repair",
+      successorSemanticKey: "manual:repair:lane-implementation",
+      now: "2026-06-14T00:00:11.000Z",
+    });
+    const firstRepair = repairStore.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation-manual-repair");
     expect(firstRepair).toBeDefined();
     repairStore.scheduleReadyLanes("session-1", {
       allowedParallelism: 1,
-      now: "2026-06-14T00:00:11.000Z",
+      now: "2026-06-14T00:00:12.000Z",
     });
 
     repairStore.recordRunResult(
-      runResultInput(repairStore, firstRepair!.id, "failed", "2026-06-14T00:00:12.000Z"),
+      runResultInput(repairStore, firstRepair!.id, "failed", "2026-06-14T00:00:13.000Z"),
     );
 
     const afterRepairFailure = repairStore.materializeFlowProjection("session-1");
-    expect(repairStore.listEvents("session-1").filter((event) => event.kind === "workflow.replan.requested")).toHaveLength(1);
+    expect(repairStore.listEvents("session-1").filter((event) => event.kind === "workflow.replan.requested")).toEqual([]);
     expect(afterRepairFailure.lanes.filter((lane) => lane.semanticKey.startsWith(`repair:${firstRepair!.id}:`))).toEqual([]);
   });
 

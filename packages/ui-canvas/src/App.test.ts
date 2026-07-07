@@ -1,6 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
-import { formatTerminalTitle, formatTerminalBadge, formatTerminalMessage } from "./terminalInspector.js";
+import {
+  formatTerminalTitle,
+  formatTerminalBadge,
+  formatTerminalMessage,
+  plannerSessionStatusForSnapshot,
+} from "./terminalInspector.js";
 import type { TerminalSnapshotResult } from "@skyturn/persistence";
 import {
   REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
@@ -15,7 +20,9 @@ import {
   deriveSessionTarget,
   hasAvailableChangeEvidence,
   hasFinalGitEvidence,
+  affectedDownstreamSummaryForDisplay,
   latestFailedCheckForDisplay,
+  lastRunEvidenceForDisplay,
   runEvidenceFactsForDisplay,
   summarizeWorktreeComparisonEvidence,
 } from "./App.js";
@@ -1160,9 +1167,19 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
 
   it("eligible rollback shows selected plus downstream summary", async () => {
     const appSource = await readSource("./App.tsx");
-    expect(appSource).toContain("downstream nodes affected");
+    expect(affectedDownstreamSummaryForDisplay(actionState({
+      rollbackEligibility: {
+        eligible: true,
+        targetLaneId: "lane-1",
+        checkpointId: "checkpoint-before-node",
+        restoreCommitRef: "base-sha",
+        affectedLaneIds: ["lane-1", "lane-2", "lane-3", "lane-4", "lane-5"],
+        reason: "Rollback eligible.",
+        blockingRemoteSideEffects: [],
+      },
+    }), "node-1")).toBe("4 downstream: lane-2, lane-3, lane-4, +1 more");
     expect(appSource).toContain("evidence-chip impact");
-    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.affectedLaneIds.length");
+    expect(appSource).toContain("affectedDownstreamSummaryForDisplay(selectedNodeActionState, selectedNode.id)");
   });
 
   it("failed node selected shows failure summary, latest check, and action impact copy", async () => {
@@ -1171,8 +1188,10 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     const modal = appSource.slice(appSource.indexOf("function NodeModal("), appSource.indexOf("function EditorLaunchMenu"));
     expect(composer).toContain("failureSummaryForNode(selectedNode, selectedRunEvidence)");
     expect(composer).toContain("latestFailedCheckForDisplay(selectedRunEvidence)");
+    expect(composer).toContain("lastRunEvidenceForDisplay(selectedRunEvidence)");
     expect(composer).toContain("Failure summary");
     expect(composer).toContain("Last failed check");
+    expect(composer).toContain("Last evidence");
     expect(composer).toContain("NODE_ACTION_IMPACT_COPY.repair");
     expect(composer).toContain("NODE_ACTION_IMPACT_COPY.variant");
     expect(composer).toContain("NODE_ACTION_IMPACT_COPY.rollback");
@@ -1183,7 +1202,13 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     expect(appSource).toContain(REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE);
     expect(modal).toContain("failureSummaryForNode(node, runEvidence)");
     expect(modal).toContain("latestFailedCheckForDisplay(runEvidence)");
+    expect(modal).toContain("lastRunEvidenceForDisplay(runEvidence)");
     expect(modal).toContain("node-failure-summary");
+    expect(lastRunEvidenceForDisplay(mockRunEvidence({
+      status: "failed",
+      exitCode: 1,
+      checks: [{ kind: "test", name: "unit", status: "failed", detail: "exit 1" }],
+    }))).toBe("failed; exit 1; unit failed; 2026-06-27T00:00:00.000Z");
   });
 
   it("checkpoint summary renders checkpoint/restore commit/source", async () => {
@@ -1192,7 +1217,7 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     expect(appSource).toContain("After Checkpoint");
     expect(appSource).toContain("selectedNodeActionState.checkpoints.beforeCheckpointId");
     expect(appSource).toContain("selectedNodeActionState.checkpoints.afterCheckpointId");
-    expect(appSource).toContain("selectedNodeActionState.rollbackEligibility.restoreCommitRef");
+    expect(appSource).toContain("selectedNodeActionState?.rollbackEligibility?.restoreCommitRef");
   });
 
   it("remote blocker/manual repair disables rollback and shows correct message", async () => {
@@ -1232,14 +1257,52 @@ describe("Terminal Inspector UI Helper", () => {
     expect(formatTerminalMessage(null)).toBeNull();
     expect(formatTerminalMessage(mockSnapshot)).toBe("Test error (TERMINAL_SESSION_NOT_FOUND)");
   });
+
+  it("maps planner status from PTY snapshot metadata without reading terminal text", () => {
+    const status = plannerSessionStatusForSnapshot("session-123", {
+      ...mockSnapshot,
+      status: "running",
+      lines: [
+        { sequence: 1, stream: "stdout", text: "failed completed blocked" },
+      ],
+    });
+
+    expect(status).toEqual({
+      label: "Running",
+      tone: "running",
+      detail: "PTY lifecycle: running",
+      inspectable: true,
+    });
+  });
+
+  it("reports degraded planner status when no PTY session is bound", () => {
+    expect(plannerSessionStatusForSnapshot(null, null)).toEqual({
+      label: "Unavailable",
+      tone: "degraded",
+      detail: "No Hermes planner PTY session is bound.",
+      inspectable: false,
+    });
+  });
+
+  it("maps terminal lifecycle states to lightweight planner status chrome", () => {
+    expect(plannerSessionStatusForSnapshot("session-123", { ...mockSnapshot, status: "starting", message: undefined, reasonCode: undefined }).label).toBe("Planning");
+    expect(plannerSessionStatusForSnapshot("session-123", { ...mockSnapshot, status: "waiting", message: undefined, reasonCode: undefined }).label).toBe("Waiting");
+    expect(plannerSessionStatusForSnapshot("session-123", { ...mockSnapshot, status: "exited", message: undefined, reasonCode: undefined }).label).toBe("Inspectable");
+    expect(plannerSessionStatusForSnapshot("session-123", { ...mockSnapshot, status: "failed", message: undefined, reasonCode: undefined }).label).toBe("Blocked");
+    expect(plannerSessionStatusForSnapshot("session-123", { ...mockSnapshot, status: "unavailable", message: undefined, reasonCode: undefined }).label).toBe("Unavailable");
+  });
 });
 
 describe("Terminal Inspector Source Code Analysis", () => {
-  it("terminal content defaults hidden and toggle wiring exists in TopBar", async () => {
+  it("terminal content defaults hidden and planner status owns the inspector affordance", async () => {
     const appSource = await readSource("./App.tsx");
     expect(appSource).toContain("const [terminalOpen, setTerminalOpen] = useState(false);");
-    // Verify TopBar toggle wiring exists
-    expect(appSource).toContain("onToggleTerminal={() => setTerminalOpen(!terminalOpen)}");
+    expect(appSource).toContain("onOpenPlannerInspector={() => setTerminalOpen(true)}");
+
+    const topBarSource = appSource.slice(appSource.indexOf("function TopBar"), appSource.indexOf("function Sidebar"));
+    expect(topBarSource).not.toContain("terminalOpen");
+    expect(topBarSource).not.toContain("onToggleTerminal");
+    expect(topBarSource).not.toContain("<Terminal");
   });
 
   it("Node Modal tabs still only Output/Changes/Context", async () => {
@@ -1301,32 +1364,43 @@ describe("Terminal Inspector Source Code Analysis", () => {
 
   it("terminal id resolver returns null when no binding exists", async () => {
     const appSource = await readSource("./App.tsx");
-    expect(appSource).toContain('terminalSessionId={(activeSession as CanvasSession & { hermesPlannerTerminalSessionId?: string }).hermesPlannerTerminalSessionId ?? null}');
+    expect(appSource).toContain("function plannerTerminalSessionId(session: CanvasSession): string | null");
+    expect(appSource).toContain("terminalSessionId={plannerTerminalSessionId(activeSession)}");
   });
 
   it("terminal id resolver returns hermesPlannerTerminalSessionId when present, even if it differs from canvas session id", async () => {
     const appSource = await readSource("./App.tsx");
-    expect(appSource).toContain('terminalSessionId={(activeSession as CanvasSession & { hermesPlannerTerminalSessionId?: string }).hermesPlannerTerminalSessionId ?? null}');
+    expect(appSource).toContain("hermesPlannerTerminalSessionId?: unknown");
+    expect(appSource).toContain("typeof value === \"string\" && value.trim().length > 0 ? value : null");
   });
 
   it("source does not use session.id as terminalSessionId for snapshot/event filtering", async () => {
     const appSource = await readSource("./App.tsx");
-    const inspectorSource = appSource.slice(appSource.indexOf("function TerminalInspector"));
+    const inspectorSource = appSource.slice(appSource.indexOf("function useTerminalSnapshot"));
     expect(inspectorSource).not.toMatch(/terminalSessionId:\s*session\.id/);
     expect(inspectorSource).not.toMatch(/event\.terminalSessionId === session\.id/);
 
     // Ensure terminalSessionId is used correctly
     expect(inspectorSource).toMatch(/\[.*terminalSessionId.*\]/);
-    expect(inspectorSource).toMatch(/snapshot\(\{\s*terminalSessionId\s*\}\)/);
-    expect(inspectorSource).toMatch(/event\.terminalSessionId === terminalSessionId/);
+    expect(inspectorSource).toContain("terminalApi.snapshot({ terminalSessionId: boundTerminalSessionId })");
+    expect(inspectorSource).toContain("event.terminalSessionId === boundTerminalSessionId");
   });
 
   it("unbound state does not call snapshot/start/write", async () => {
     const appSource = await readSource("./App.tsx");
-    const inspectorSource = appSource.slice(appSource.indexOf("function TerminalInspector"));
-    expect(inspectorSource).toMatch(/if \(!terminalSessionId\) \{/);
-    expect(inspectorSource).toMatch(/terminalSessionId: "unbound"/);
+    const snapshotSource = appSource.slice(appSource.indexOf("function unboundTerminalSnapshot"));
+    expect(snapshotSource).toContain('terminalSessionId: "unbound"');
+    expect(snapshotSource).toContain("No terminal session bound.");
     expect(appSource).not.toContain("terminal.start");
     expect(appSource).not.toContain("terminal.write");
+  });
+
+  it("planner status is root-card chrome and opens the existing hidden inspector", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("plannerSessionStatusForSnapshot");
+    expect(appSource).toContain("plannerStatus: node.id === session.plannerNodeId ? plannerStatus : null");
+    expect(appSource).toContain("planner-session-status");
+    expect(appSource).toContain("onOpenPlannerInspector");
+    expect(appSource).toContain("setTerminalOpen(true)");
   });
 });

@@ -36,6 +36,7 @@ packages/
 - Workflow source of truth: SQLite workflow events under `.devflow/skyturn-workflow.sqlite`, exposed through Electron main / Node-only persistence APIs.
 - Orchestration: Hermes produces `WorkflowIntent`; `workflow-kernel` validates, compiles, gates, schedules, and projects lanes/edges.
 - Agent bridge: Hermes and Codex CLI have real `experimental-run` adapters; run status is derived from `RunEvidence`, not agent prose.
+- PTY transport: experimental Hermes planner status/inspect/takeover transport only. It is not a terminal dashboard, not completion evidence, and not the Codex default executor.
 - Changes: the node modal `Changes` tab can use structured live Codex change events plus git-backed final reconciliation.
 - Node interaction: selecting a node only binds the bottom composer to node-scoped actions. Details open through the node card **More** button, not selection.
 - Node checkpoints: before/after checkpoints are user-visible workflow concepts at the node/run boundary. Node-scoped actions repair from the after checkpoint, create variants from the before checkpoint, or roll back the selected node and downstream nodes.
@@ -46,6 +47,14 @@ packages/
 
 ## Workflow Capability Map
 
+Status terms in this document are strict:
+
+- Implemented: code exists in the current checkout for the stated product path.
+- Partial: code exists, but the product path still has fallback, missing UX, or hardening gaps.
+- Experimental-run: a real local CLI can run, but the path depends on local credentials, CLI behavior, output stability, and failure handling that are not yet support-grade.
+- Mock/degraded fallback: deterministic development or unavailable-runtime fallback. It is not real workflow completion evidence.
+- Non-goal: do not design toward it for this MVP.
+
 Implemented in the current code:
 
 - New Session has separate execution target and branch controls. Current branch is the default. New worktree is explicit opt-in.
@@ -55,14 +64,16 @@ Implemented in the current code:
 - **Changes** can show structured live run changes, git-backed final reconciliation, mismatch state, sanitized `diff2html` preview, and explicit delivery actions.
 - Selected-node composer actions exist for repair, variant, and rollback. Repair starts from the after checkpoint, variant starts from the before checkpoint, and rollback targets the selected node plus downstream nodes.
 - Electron main owns workflow IPC, git/worktree side effects, delivery gates, rollback safety checks, and run evidence lookup. Renderer code does not execute git, shell, filesystem, or SQLite side effects.
+- Completion evidence comes from `RunEvidence`, workflow events, git/worktree reconciliation, checks, artifacts, review evidence, and commit evidence. Agent prose and terminal text are output only.
 - Hermes and Codex real CLI adapters are wired through `agent-bridge` as `experimental-run`. The real path is `experimental-run`, not `supported-run`.
 
 Partial and still being hardened:
 
-- Current-branch real loop: runs against the imported project root and records real `RunEvidence`, but the desktop product path still has browser/mock fallback and local renderer state that must not become completion truth.
+- Current-branch real loop: Current branch is the default main path, runs against the imported project root, and records real `RunEvidence`, but the desktop product path still has browser/mock fallback and local renderer state that must not become completion truth.
 - Artifact evidence: `RunEvidence` can carry artifacts and the MVP demo captures a screenshot artifact, but artifact capture/registration is still lane- and script-specific.
 - Failure-to-repair main path: kernel and selected-node foundations exist, but failed node to repair node to regression verification is not yet the default desktop loop.
 - Worktree product loop: create, compare, adopt, clean, and rollback backend boundaries exist, but New worktree is not the current mainline and the compare/adopt/cleanup experience is not complete.
+- PTY planner transport: contracts, feature gates, IPC, snapshots, and fake-factory tests exist, but the default desktop runtime has no production PTY factory.
 
 Not done or explicit non-goals:
 
@@ -72,9 +83,16 @@ Not done or explicit non-goals:
 - Mock/browser fallback is for deterministic development tests only. It is not real completion evidence.
 - No local adapter is documented as `supported-run`.
 
-## Current Verification
+## Four-Track Delivery Plan
 
-The real Hermes-to-Codex path has passed `pnpm --filter @skyturn/desktop run demo:mvp` on this machine, and the Electron UI has run a real workflow against a temporary git project. These paths depend on local Hermes/Codex credentials and remain `experimental-run`, not `supported-run`.
+1. Current branch main path: make the imported project root and selected branch the default development path. Keep reducing renderer fallback until the desktop path consumes Node-side projection, `RunEvidence`, git reconciliation, and workflow events as facts.
+2. Failure repair and regression: productize the path from failed node to repair node to regression verification. Failed nodes keep evidence and history; repair starts from the after checkpoint, variant starts from the before checkpoint, and rollback covers the selected node plus downstream nodes behind safety gates.
+3. New worktree candidate path: keep New worktree as explicit opt-in for variants and double-track validation. Compare, adopt, and clean must stay behind managed worktree identity checks, artifact/log isolation, and user confirmation.
+4. Explicit delivery gates: commit, push, PR creation, exact-head checks, merge request, post-merge main sync, and cleanup stay separate actions. Checks success must not auto-merge, merge must not auto-sync or auto-clean, and cleanup must not delete branches by default.
+
+## Verification Surfaces
+
+The real Hermes-to-Codex acceptance path is `pnpm --filter @skyturn/desktop run demo:mvp`. Historical runs have passed on this machine, but do not report a current PR as verified unless that command completes with evidence-backed success for the checkout being reviewed. This path depends on local Hermes/Codex credentials and remains `experimental-run`, not `supported-run`.
 
 Browser-only and mock paths still exist for development and tests. Desktop `workflow:worktree:create`, `workflow:worktree:adopt`, and `workflow:worktree:clean` now call `@skyturn/git-worktree/node` and record terminal workflow events from real git/filesystem side effects. The current worktree adopt UI asks for confirmation and sends `strategy: "merge"`; cherry-pick exists in backend contracts but is not exposed in the UI. The full product UI for comparing, adopting, and cleaning managed worktrees is still not complete.
 

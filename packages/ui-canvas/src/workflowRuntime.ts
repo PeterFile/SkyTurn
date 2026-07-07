@@ -150,11 +150,14 @@ export function applyCompletedBridgeRunPersistenceResult(
   result: CompletedBridgeRunPersistenceResult,
 ): WorkspaceState {
   const withEvents = mergeRunEventsIntoWorkspace(workspace, runId, result.events);
+  const workflowSession = result.workflowSession
+    ? applyTerminalEvidenceToWorkflowSession(result.workflowSession, runId, result.evidence)
+    : null;
   return {
     ...withEvents,
-    sessions: result.workflowSession
+    sessions: workflowSession
       ? withEvents.sessions.map((session) =>
-          session.id === result.workflowSession?.id ? result.workflowSession : session,
+          session.id === workflowSession.id ? workflowSession : session,
         )
       : withEvents.sessions,
     runEvidence: { ...withEvents.runEvidence, [runId]: result.evidence },
@@ -163,11 +166,14 @@ export function applyCompletedBridgeRunPersistenceResult(
 
 export function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRunResult): WorkspaceState {
   const withEvents = mergeRunEventsIntoWorkspace(workspace, result.run.id, result.events);
-  if (result.workflowSession) {
+  const workflowSession = result.workflowSession
+    ? applyTerminalEvidenceToWorkflowSession(result.workflowSession, result.run.id, result.evidence, result.run.nodeId)
+    : null;
+  if (workflowSession) {
     return {
       ...withEvents,
       sessions: withEvents.sessions.map((session) =>
-        session.id === result.workflowSession?.id ? result.workflowSession : session,
+        session.id === workflowSession.id ? workflowSession : session,
       ),
       runs: { ...withEvents.runs, [result.run.id]: result.run },
       runEvidence: { ...withEvents.runEvidence, [result.run.id]: result.evidence },
@@ -225,7 +231,8 @@ async function persistWorkflowRunResult(
       allowedParallelism: schedulingPolicy.allowedParallelism,
       now,
     });
-    return scheduled.canvasSession ?? applied.canvasSession ?? recorded.canvasSession ?? null;
+    const workflowSession = scheduled.canvasSession ?? applied.canvasSession ?? recorded.canvasSession ?? null;
+    return workflowSession ? applyTerminalEvidenceToSessionNode(workflowSession, node.id, evidence) : null;
   }
 
   if (!node.display?.meta.includes("flow-kernel") || node.executable === false) return null;
@@ -249,7 +256,18 @@ async function persistWorkflowRunResult(
     allowedParallelism: schedulingPolicy.allowedParallelism,
     now,
   });
-  return scheduled.canvasSession ?? recorded.canvasSession ?? null;
+  const workflowSession = scheduled.canvasSession ?? recorded.canvasSession ?? null;
+  return workflowSession ? applyTerminalEvidenceToSessionNode(workflowSession, node.id, evidence) : null;
+}
+
+function applyTerminalEvidenceToWorkflowSession(
+  session: CanvasSession,
+  runId: string,
+  evidence: RunEvidence,
+  nodeId?: string,
+): CanvasSession {
+  const target = session.nodes.find((node) => node.id === nodeId || node.runId === runId);
+  return target ? applyTerminalEvidenceToSessionNode(session, target.id, evidence) : session;
 }
 
 function applyTerminalEvidenceToSessionNode(
@@ -258,7 +276,8 @@ function applyTerminalEvidenceToSessionNode(
   evidence: RunEvidence,
 ): CanvasSession {
   if (!isFinalRunStatus(evidence.status)) return session;
-  const status: CanvasNode["status"] = evidence.status === "succeeded" ? "completed" : "failed";
+  const status: CanvasNode["status"] =
+    evidence.status === "succeeded" && hasConcreteRunEvidence(evidence) ? "completed" : "failed";
   return {
     ...session,
     nodes: session.nodes.map((node) => (node.id === nodeId ? { ...node, status } : node)),
