@@ -52,6 +52,7 @@ export interface DeliveryPanelInput {
   mergeConfirmed: boolean;
   mergeComplete: boolean;
   syncComplete: boolean;
+  syncConfirmed: boolean;
   cleanupExplicitlyAllowed: boolean;
   cleanupConfirmed: boolean;
   deleteBranch: boolean;
@@ -60,10 +61,20 @@ export interface DeliveryPanelInput {
 }
 
 export type DeliveryStepStatus = "ready" | "blocked" | "done" | "stale" | "pending";
+export type DeliveryGateKey = "commit" | "push" | "pr" | "checks" | "review" | "merge" | "sync" | "cleanup" | "delete-branch";
+export type DeliveryGateStatus = DeliveryStepStatus | "safe";
 
 export interface DeliveryStepState {
   status: DeliveryStepStatus;
   blockedMessage?: string;
+}
+
+export interface DeliveryGateCopy {
+  key: DeliveryGateKey;
+  label: string;
+  status: DeliveryGateStatus;
+  summary: string;
+  detail?: string;
 }
 
 export interface DeliveryPanelState {
@@ -87,6 +98,7 @@ export interface DeliveryPanelState {
   mergeStep: DeliveryStepState;
   syncStep: DeliveryStepState;
   cleanupStep: DeliveryStepState;
+  gateList: DeliveryGateCopy[];
 }
 
 export interface DeliveryLifecycleHydrationOptions {
@@ -111,6 +123,7 @@ export function buildDeliveryPanelState(input: DeliveryPanelInput): DeliveryPane
   const expectedHeadSha = input.checks?.expectedHeadSha;
 
   const isStaleChecks = !!expectedHeadSha && !!headSha && headSha !== expectedHeadSha;
+  const hasExactHeadCheckTarget = !!expectedHeadSha && !!headSha;
 
   const exactHeadChecksPassed =
     input.checks?.checkStatus === "passing" &&
@@ -181,8 +194,11 @@ export function buildDeliveryPanelState(input: DeliveryPanelInput): DeliveryPane
     } else if (input.checks.checkStatus === "failing") {
       checkStep.status = "blocked";
       checkStep.blockedMessage = "checks failing";
-    } else if (input.checks.checkStatus === "passing") {
+    } else if (input.checks.checkStatus === "passing" && hasExactHeadCheckTarget) {
       checkStep.status = "done";
+    } else if (input.checks.checkStatus === "passing") {
+      checkStep.status = "blocked";
+      checkStep.blockedMessage = "checks missing exact head";
     } else {
       checkStep.status = "pending";
       checkStep.blockedMessage = "checks pending";
@@ -201,8 +217,11 @@ export function buildDeliveryPanelState(input: DeliveryPanelInput): DeliveryPane
       reviewStep.blockedMessage = "review changes requested";
     } else if (input.checks.reviewStatus === "approved") {
       reviewStep.status = "done";
-    } else {
+    } else if (input.checks.reviewStatus === "pending") {
       reviewStep.status = "ready";
+    } else {
+      reviewStep.status = "blocked";
+      reviewStep.blockedMessage = "review evidence missing";
     }
   }
 
@@ -235,7 +254,14 @@ export function buildDeliveryPanelState(input: DeliveryPanelInput): DeliveryPane
   if (input.syncComplete) {
     syncStep.status = "done";
   } else if (input.mergeComplete) {
-    syncStep.status = input.busyAction === "sync" ? "pending" : "ready";
+    if (input.busyAction === "sync") {
+      syncStep.status = "pending";
+    } else if (input.syncConfirmed) {
+      syncStep.status = "ready";
+    } else {
+      syncStep.status = "blocked";
+      syncStep.blockedMessage = "sync not confirmed";
+    }
   } else {
     syncStep.status = "blocked";
     syncStep.blockedMessage = "merge not complete";
@@ -246,6 +272,9 @@ export function buildDeliveryPanelState(input: DeliveryPanelInput): DeliveryPane
       cleanupStep.status = "pending";
     } else if (input.cleanupConfirmed && !deleteBranchBlocked) {
       cleanupStep.status = "ready";
+    } else if (deleteBranchBlocked) {
+      cleanupStep.status = "blocked";
+      cleanupStep.blockedMessage = "delete branch not confirmed";
     } else {
       cleanupStep.status = "blocked";
       cleanupStep.blockedMessage = "cleanup not confirmed";
@@ -275,7 +304,370 @@ export function buildDeliveryPanelState(input: DeliveryPanelInput): DeliveryPane
     mergeStep,
     syncStep,
     cleanupStep,
+    gateList: buildDeliveryGateList(input, {
+      commitStep,
+      pushStep,
+      prStep,
+      checkStep,
+      reviewStep,
+      mergeStep,
+      syncStep,
+      cleanupStep,
+    }),
   };
+}
+
+function buildDeliveryGateList(
+  input: DeliveryPanelInput,
+  steps: {
+    commitStep: DeliveryStepState;
+    pushStep: DeliveryStepState;
+    prStep: DeliveryStepState;
+    checkStep: DeliveryStepState;
+    reviewStep: DeliveryStepState;
+    mergeStep: DeliveryStepState;
+    syncStep: DeliveryStepState;
+    cleanupStep: DeliveryStepState;
+  },
+): DeliveryGateCopy[] {
+  return [
+    commitGateCopy(input, steps.commitStep),
+    pushGateCopy(input, steps.pushStep),
+    pullRequestGateCopy(input, steps.prStep),
+    checksGateCopy(input, steps.checkStep),
+    reviewGateCopy(input, steps.reviewStep),
+    mergeGateCopy(steps.mergeStep),
+    syncGateCopy(steps.syncStep),
+    cleanupGateCopy(input, steps.cleanupStep),
+    deleteBranchGateCopy(input),
+  ];
+}
+
+function commitGateCopy(input: DeliveryPanelInput, step: DeliveryStepState): DeliveryGateCopy {
+  if (input.commitEvidence) {
+    return {
+      key: "commit",
+      label: "Local commit",
+      status: "done",
+      summary: `Local commit recorded: ${shortSha(input.commitEvidence.commitSha)}.`,
+    };
+  }
+  if (step.status === "ready") {
+    return {
+      key: "commit",
+      label: "Local commit",
+      status: "ready",
+      summary: "Ready to create a local commit from verified git changes.",
+    };
+  }
+  return {
+    key: "commit",
+    label: "Local commit",
+    status: step.status,
+    summary: step.status === "pending" ? "Creating local commit..." : "Blocked until verified git changes are available.",
+  };
+}
+
+function pushGateCopy(input: DeliveryPanelInput, step: DeliveryStepState): DeliveryGateCopy {
+  if (input.pullRequest) {
+    return {
+      key: "push",
+      label: "Push branch",
+      status: "blocked",
+      summary: `Push is closed because PR #${input.pullRequest.number} already exists.`,
+    };
+  }
+  if (step.status === "done") {
+    return {
+      key: "push",
+      label: "Push branch",
+      status: "done",
+      summary: `Pushed ${input.pushEvidence?.remote ?? "remote"}/${input.pushEvidence?.branch ?? "branch"} at ${shortSha(input.pushEvidence?.commitSha)}.`,
+    };
+  }
+  if (step.status === "ready") {
+    return {
+      key: "push",
+      label: "Push branch",
+      status: "ready",
+      summary: `Ready to push ${input.commitEvidence?.branch ?? "branch"} for commit ${shortSha(input.commitEvidence?.commitSha)}.`,
+    };
+  }
+  return {
+    key: "push",
+    label: "Push branch",
+    status: step.status,
+    summary: step.status === "pending" ? "Pushing delivery branch..." : "Blocked until local commit evidence exists.",
+  };
+}
+
+function pullRequestGateCopy(input: DeliveryPanelInput, step: DeliveryStepState): DeliveryGateCopy {
+  if (input.pullRequest) {
+    return {
+      key: "pr",
+      label: "Pull request",
+      status: "done",
+      summary: `PR #${input.pullRequest.number} created. This is delivery evidence, not task completion.`,
+    };
+  }
+  if (step.status === "ready") {
+    return {
+      key: "pr",
+      label: "Pull request",
+      status: "ready",
+      summary: `Ready to create a PR from pushed branch ${input.pushEvidence?.branch ?? "branch"}.`,
+    };
+  }
+  return {
+    key: "pr",
+    label: "Pull request",
+    status: step.status,
+    summary: step.status === "pending" ? "Creating pull request..." : "Blocked until branch push evidence exists.",
+  };
+}
+
+function checksGateCopy(input: DeliveryPanelInput, step: DeliveryStepState): DeliveryGateCopy {
+  if (!input.pullRequest) {
+    return {
+      key: "checks",
+      label: "Exact-head checks",
+      status: "blocked",
+      summary: "Blocked until PR is created.",
+    };
+  }
+  if (!input.checks && step.status === "ready") {
+    return {
+      key: "checks",
+      label: "Exact-head checks",
+      status: "ready",
+      summary: "Ready to check exact PR head before merge.",
+    };
+  }
+  const checkedSha = shortSha(input.checks?.expectedHeadSha);
+  const headSha = shortSha(input.pullRequest.headSha);
+  if (step.status === "stale") {
+    return {
+      key: "checks",
+      label: "Exact-head checks",
+      status: "stale",
+      summary: `Checks are stale: checked ${checkedSha}, PR head is ${headSha}.`,
+    };
+  }
+  if (input.checks?.checkStatus === "failing") {
+    return {
+      key: "checks",
+      label: "Exact-head checks",
+      status: "blocked",
+      summary: `Checks failed for ${checkedSha}; merge is blocked.`,
+    };
+  }
+  if (step.status === "done") {
+    return {
+      key: "checks",
+      label: "Exact-head checks",
+      status: "done",
+      summary: `Exact-head checks passed for ${checkedSha}. Green checks do not auto-merge.`,
+    };
+  }
+  if (input.checks?.checkStatus === "pending") {
+    return {
+      key: "checks",
+      label: "Exact-head checks",
+      status: "pending",
+      summary: `Checks are pending for ${checkedSha}; re-check before merge.`,
+    };
+  }
+  return {
+    key: "checks",
+    label: "Exact-head checks",
+    status: step.status,
+    summary: step.status === "pending" ? "Checking exact PR head..." : "Blocked until exact PR head can be verified.",
+  };
+}
+
+function reviewGateCopy(input: DeliveryPanelInput, step: DeliveryStepState): DeliveryGateCopy {
+  if (!input.pullRequest) {
+    return {
+      key: "review",
+      label: "Review gate",
+      status: "blocked",
+      summary: "Blocked until PR is created.",
+    };
+  }
+  if (!input.checks) {
+    return {
+      key: "review",
+      label: "Review gate",
+      status: "blocked",
+      summary: "Blocked until PR checks are refreshed.",
+    };
+  }
+  if (step.status === "stale") {
+    return {
+      key: "review",
+      label: "Review gate",
+      status: "stale",
+      summary: "Review gate is stale until exact-head checks are refreshed.",
+    };
+  }
+  if (input.checks.reviewStatus === "changes_requested") {
+    return {
+      key: "review",
+      label: "Review gate",
+      status: "blocked",
+      summary: "Review requested changes; merge is blocked.",
+    };
+  }
+  if (input.checks.reviewStatus === "approved") {
+    return {
+      key: "review",
+      label: "Review gate",
+      status: "done",
+      summary: "Review gate approved.",
+    };
+  }
+  if (input.checks.reviewStatus === "pending") {
+    return {
+      key: "review",
+      label: "Review gate",
+      status: "ready",
+      summary: "Review gate is pending; no requested changes are recorded.",
+    };
+  }
+  return {
+    key: "review",
+    label: "Review gate",
+    status: "blocked",
+    summary: "Review gate evidence is missing.",
+  };
+}
+
+function mergeGateCopy(step: DeliveryStepState): DeliveryGateCopy {
+  if (step.status === "done") {
+    return {
+      key: "merge",
+      label: "Squash merge",
+      status: "done",
+      summary: "PR merged. Sync and cleanup remain separate explicit actions.",
+    };
+  }
+  if (step.status === "ready") {
+    return {
+      key: "merge",
+      label: "Squash merge",
+      status: "ready",
+      summary: "Explicit squash merge confirmation is complete.",
+    };
+  }
+  if (step.blockedMessage === "merge not confirmed") {
+    return {
+      key: "merge",
+      label: "Squash merge",
+      status: "blocked",
+      summary: "Manual gate: confirm PR number, exact head SHA, and squash title.",
+    };
+  }
+  return {
+    key: "merge",
+    label: "Squash merge",
+    status: step.status,
+    summary: step.status === "pending" ? "Merging pull request..." : "Blocked until PR, exact-head checks, mergeability, and review gate pass.",
+  };
+}
+
+function syncGateCopy(step: DeliveryStepState): DeliveryGateCopy {
+  if (step.status === "done") {
+    return {
+      key: "sync",
+      label: "Sync main",
+      status: "done",
+      summary: "Main branch synced after merge.",
+    };
+  }
+  if (step.status === "ready") {
+    return {
+      key: "sync",
+      label: "Sync main",
+      status: "ready",
+      summary: "Ready to sync main after merge.",
+    };
+  }
+  if (step.blockedMessage === "sync not confirmed") {
+    return {
+      key: "sync",
+      label: "Sync main",
+      status: "blocked",
+      summary: "Manual gate: confirm post-merge main sync.",
+    };
+  }
+  return {
+    key: "sync",
+    label: "Sync main",
+    status: step.status,
+    summary: step.status === "pending" ? "Syncing main..." : "Blocked until merge completes.",
+  };
+}
+
+function cleanupGateCopy(input: DeliveryPanelInput, step: DeliveryStepState): DeliveryGateCopy {
+  if (step.status === "ready") {
+    return {
+      key: "cleanup",
+      label: "Cleanup",
+      status: "ready",
+      summary: "Ready to clean managed worktree.",
+    };
+  }
+  if (step.blockedMessage === "delete branch not confirmed") {
+    return {
+      key: "cleanup",
+      label: "Cleanup",
+      status: "blocked",
+      summary: "Blocked until branch deletion has second confirmation.",
+    };
+  }
+  if ((input.mergeComplete || input.syncComplete || input.cleanupExplicitlyAllowed) && !input.cleanupConfirmed) {
+    return {
+      key: "cleanup",
+      label: "Cleanup",
+      status: "blocked",
+      summary: "Manual gate: confirm cleanup after merge or sync.",
+    };
+  }
+  return {
+    key: "cleanup",
+    label: "Cleanup",
+    status: step.status,
+    summary: step.status === "pending" ? "Cleaning managed worktree..." : "Blocked until merge/sync completes or cleanup is explicitly allowed.",
+  };
+}
+
+function deleteBranchGateCopy(input: DeliveryPanelInput): DeliveryGateCopy {
+  if (!input.deleteBranch) {
+    return {
+      key: "delete-branch",
+      label: "Delete branch",
+      status: "safe",
+      summary: "Branch deletion is off by default.",
+    };
+  }
+  if (!input.deleteBranchConfirmed) {
+    return {
+      key: "delete-branch",
+      label: "Delete branch",
+      status: "blocked",
+      summary: "Branch deletion needs a second explicit confirmation.",
+    };
+  }
+  return {
+    key: "delete-branch",
+    label: "Delete branch",
+    status: "ready",
+    summary: "Branch deletion explicitly confirmed.",
+  };
+}
+
+function shortSha(value?: string): string {
+  return value ? value.slice(0, 7) : "None";
 }
 
 export function hydrateDeliveryLifecycleFromWorkflowEvents(

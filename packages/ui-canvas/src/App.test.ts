@@ -607,6 +607,14 @@ describe("UI source validation", () => {
     expect(panel).toContain('disabled={createPrDisabled}');
   });
 
+  it("DeliveryLifecyclePanel renders the explicit delivery gate checklist", async () => {
+    const appSource = await readSource("./App.tsx");
+    const panel = appSource.slice(appSource.indexOf("function DeliveryLifecyclePanel("), appSource.indexOf("function shortSha("));
+    expect(panel).toContain('aria-label="Delivery gate checklist"');
+    expect(panel).toContain("state.gateList.map");
+    expect(panel).toContain("deliveryGateStatusLabel");
+  });
+
   it("ChangesTab clears stale PR checks when PR status refresh starts or fails", async () => {
     const appSource = await readSource("./App.tsx");
     const handleCheckPrStatus = appSource.slice(appSource.indexOf("async function handleCheckPrStatus()"), appSource.indexOf("async function handleMergePullRequest()"));

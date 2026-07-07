@@ -150,6 +150,7 @@ import {
   hydrateDeliveryLifecycleFromWorkflowEvents,
   type DeliveryBusyAction,
   type DeliveryCommitSummary,
+  type DeliveryGateStatus,
   type DeliveryPanelState,
   type DeliveryPullRequestChecks,
   type DeliveryPullRequestSummary,
@@ -3084,6 +3085,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
   const [mergeTitle, setMergeTitle] = useState("");
   const [mergeConfirmed, setMergeConfirmed] = useState(false);
   const [syncStatus, setSyncStatus] = useState<"idle" | "syncing" | "synced" | string>("idle");
+  const [syncConfirmed, setSyncConfirmed] = useState(false);
   const [cleanupStatus, setCleanupStatus] = useState<"idle" | "cleaning" | "cleaned" | string>("idle");
   const [cleanupExplicitlyAllowed, setCleanupExplicitlyAllowed] = useState(false);
   const [cleanupConfirmed, setCleanupConfirmed] = useState(false);
@@ -3114,6 +3116,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     setMergeTitle("");
     setMergeConfirmed(false);
     setSyncStatus("idle");
+    setSyncConfirmed(false);
     setCleanupStatus("idle");
     setCleanupExplicitlyAllowed(false);
     setCleanupConfirmed(false);
@@ -3136,6 +3139,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       setPrChecks(null);
       setMergeStatus("idle");
       setSyncStatus("idle");
+      setSyncConfirmed(false);
       return;
     }
     let active = true;
@@ -3155,6 +3159,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       setPrCheckStatus(restored.checks ? `checks: ${restored.checks.checkStatus}` : "idle");
       setMergeStatus(restored.mergeComplete ? "merged" : "idle");
       setSyncStatus(restored.syncComplete ? "synced" : "idle");
+      setSyncConfirmed(restored.syncComplete);
       setMergeTitle(restored.pullRequest?.title ?? "");
     });
     return () => {
@@ -3292,6 +3297,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         setPrChecks(null);
         setMergeStatus("idle");
         setSyncStatus("idle");
+        setSyncConfirmed(false);
         setCleanupStatus("idle");
         setPrTitle(subject);
         setRefreshVersion(v => v + 1);
@@ -3496,6 +3502,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       });
       if (result.status === "merged") {
         setMergeStatus("merged");
+        setSyncConfirmed(false);
         setMergeConfirmOpen(false);
       } else {
         setMergeStatus("error");
@@ -3512,6 +3519,10 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     if (!devflow?.workflow?.syncMain || !prEvidence) return;
     if (mergeStatus !== "merged") {
       setDeliveryError("Cannot sync: merge has not completed.");
+      return;
+    }
+    if (!syncConfirmed) {
+      setDeliveryError("Cannot sync: post-merge main sync must be explicitly confirmed.");
       return;
     }
 
@@ -3623,6 +3634,7 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     mergeConfirmed,
     mergeComplete: mergeStatus === "merged",
     syncComplete: syncStatus === "synced",
+    syncConfirmed,
     cleanupExplicitlyAllowed,
     cleanupConfirmed,
     deleteBranch,
@@ -3771,6 +3783,8 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         mergeStatus={mergeStatus}
         onMerge={handleMergePullRequest}
         syncStatus={syncStatus}
+        syncConfirmed={syncConfirmed}
+        onSyncConfirmedChange={setSyncConfirmed}
         onSync={handlePostMergeSync}
         cleanupStatus={cleanupStatus}
         cleanupExplicitlyAllowed={cleanupExplicitlyAllowed}
@@ -3848,6 +3862,8 @@ function DeliveryLifecyclePanel({
   mergeStatus,
   onMerge,
   syncStatus,
+  syncConfirmed,
+  onSyncConfirmedChange,
   onSync,
   cleanupStatus,
   cleanupExplicitlyAllowed,
@@ -3903,6 +3919,8 @@ function DeliveryLifecyclePanel({
   mergeStatus: string;
   onMerge: () => void;
   syncStatus: string;
+  syncConfirmed: boolean;
+  onSyncConfirmedChange: (value: boolean) => void;
   onSync: () => void;
   cleanupStatus: string;
   cleanupExplicitlyAllowed: boolean;
@@ -3984,6 +4002,19 @@ function DeliveryLifecyclePanel({
           PR created is not complete. CI exact-head green is required before ready for merge.
         </p>
       )}
+
+      <ol className="delivery-gate-list" aria-label="Delivery gate checklist">
+        {state.gateList.map((gate) => (
+          <li className={`delivery-gate-item ${gate.status}`} key={gate.key}>
+            <span className="delivery-gate-status">{deliveryGateStatusLabel(gate.status)}</span>
+            <span className="delivery-gate-copy">
+              <strong>{gate.label}</strong>
+              <span>{gate.summary}</span>
+              {gate.detail && <small>{gate.detail}</small>}
+            </span>
+          </li>
+        ))}
+      </ol>
 
       {error && <div className="delivery-alert" role="alert">{error}</div>}
 
@@ -4093,6 +4124,15 @@ function DeliveryLifecyclePanel({
             </div>
           )}
 
+          <label className="delivery-check">
+            <input
+              type="checkbox"
+              checked={syncConfirmed}
+              disabled={syncStatus === "synced"}
+              onChange={(event) => onSyncConfirmedChange(event.target.checked)}
+            />
+            <span>Confirm post-merge main sync.</span>
+          </label>
           <button className="changes-tool-button" type="button" disabled={!state.canSync} onClick={onSync}>
             <RefreshCw size={15} aria-hidden="true" />
             <span>{syncStatus === "syncing" ? "Syncing..." : "Request post-merge sync"}</span>
@@ -4143,6 +4183,15 @@ function DeliveryLifecyclePanel({
       </div>
     </section>
   );
+}
+
+function deliveryGateStatusLabel(status: DeliveryGateStatus): string {
+  if (status === "done") return "Done";
+  if (status === "ready") return "Ready";
+  if (status === "pending") return "Pending";
+  if (status === "stale") return "Stale";
+  if (status === "safe") return "Default";
+  return "Blocked";
 }
 
 function shortSha(value?: string): string {
