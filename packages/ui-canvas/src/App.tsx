@@ -74,7 +74,13 @@ import {
   type WorkspaceState,
   type TerminalSnapshotResult,
 } from "@skyturn/persistence";
-import { formatTerminalTitle, formatTerminalBadge, formatTerminalMessage } from "./terminalInspector.js";
+import {
+  formatTerminalTitle,
+  formatTerminalBadge,
+  formatTerminalMessage,
+  plannerSessionStatusForSnapshot,
+  type PlannerSessionStatusChrome,
+} from "./terminalInspector.js";
 import { convertPlanToCanvas, createFastCanvasSession, createPlanSession } from "@skyturn/planner";
 import {
   NODE_MODAL_TABS,
@@ -172,7 +178,9 @@ gsap.registerPlugin(useGSAP);
 type AgentFlowNode = FlowNode<{
   node: CanvasNode;
   composerSelected: boolean;
+  plannerStatus: PlannerSessionStatusChrome | null;
   onInspect: (nodeId: string) => void;
+  onOpenPlannerInspector: () => void;
   onSelect: (nodeId: string) => void;
 }, "agent">;
 
@@ -954,8 +962,6 @@ export default function App() {
       <div className="main-shell">
         <TopBar
           activeSession={activeSession}
-          terminalOpen={terminalOpen}
-          onToggleTerminal={() => setTerminalOpen(!terminalOpen)}
           onRenameSession={(sessionId, title) =>
             setWorkspace((current) => ({
               ...current,
@@ -986,11 +992,13 @@ export default function App() {
               nodeActionBusy={nodeActionBusy}
               nodeActionError={nodeActionError}
               nodeActionStatus={nodeActionStatus}
+              plannerTerminalSessionId={plannerTerminalSessionId(activeSession)}
               workflowBackendAvailable={!!window.devflow?.workflow}
               onComposerChange={selectedNode ? setNodeActionText : setBottomGoal}
               onComposerSubmit={appendRequirementNode}
               onComposerStop={stopActiveRun}
               onNodePositionsChange={updateActiveNodePositions}
+              onOpenPlannerInspector={() => setTerminalOpen(true)}
               onSelectNode={(nodeId) => {
                 setSelectedNodeId(nodeId);
                 setInspectedNodeId((current) => (current === nodeId ? current : null));
@@ -1040,7 +1048,7 @@ export default function App() {
       {terminalOpen && activeSession?.kind === "canvas" && (
         <TerminalInspector
           session={activeSession}
-          terminalSessionId={(activeSession as CanvasSession & { hermesPlannerTerminalSessionId?: string }).hermesPlannerTerminalSessionId ?? null}
+          terminalSessionId={plannerTerminalSessionId(activeSession)}
           onClose={() => setTerminalOpen(false)}
         />
       )}
@@ -1069,14 +1077,10 @@ function Home({ onOpenProject }: { onOpenProject: () => void }) {
 
 function TopBar({
   activeSession,
-  terminalOpen,
-  onToggleTerminal,
   onRenameSession,
   onToggleNewTask,
 }: {
   activeSession: CanvasSessionTab | null;
-  terminalOpen: boolean;
-  onToggleTerminal: () => void;
   onRenameSession: (sessionId: string, title: string) => void;
   onToggleNewTask: () => void;
 }) {
@@ -1140,16 +1144,6 @@ function TopBar({
         )}
       </div>
       <div className="topbar-actions">
-        {activeSession && (
-          <button
-            className={`compact-action ${terminalOpen ? 'active' : ''}`}
-            onClick={onToggleTerminal}
-            title="Terminal Inspector"
-          >
-            <Terminal size={14} />
-            <span>Terminal</span>
-          </button>
-        )}
         <button
           className="new-tab-button icon-only"
           type="button"
@@ -1874,11 +1868,13 @@ function CanvasView({
   nodeActionBusy,
   nodeActionError,
   nodeActionStatus,
+  plannerTerminalSessionId,
   workflowBackendAvailable,
   onComposerChange,
   onComposerSubmit,
   onComposerStop,
   onNodePositionsChange,
+  onOpenPlannerInspector,
   onSelectNode,
   onInspectNode,
 }: {
@@ -1893,16 +1889,23 @@ function CanvasView({
   nodeActionBusy: Exclude<ComposerAction, null> | null;
   nodeActionError: string | null;
   nodeActionStatus: string | null;
+  plannerTerminalSessionId: string | null;
   workflowBackendAvailable: boolean;
   onComposerChange: (value: string) => void;
   onComposerSubmit: (action?: ComposerAction) => void;
   onComposerStop: () => void;
   onNodePositionsChange: (updates: CanvasNodePositionUpdate[]) => void;
+  onOpenPlannerInspector: () => void;
   onSelectNode: (nodeId: string | null) => void;
   onInspectNode: (nodeId: string) => void;
 }) {
   const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
   const selectedNodeId = selectedNode?.id ?? null;
+  const plannerSnapshot = useTerminalSnapshot(plannerTerminalSessionId, session.id);
+  const plannerStatus = useMemo(
+    () => plannerSessionStatusForSnapshot(plannerTerminalSessionId, plannerSnapshot),
+    [plannerSnapshot, plannerTerminalSessionId],
+  );
   const autoFitCanvas = shouldAutoFitCanvas(session.nodes) || Boolean(selectedNodeId);
   const fitPadding = selectedNodeId ? Math.max(canvasFitPadding(session.nodes), 0.4) : canvasFitPadding(session.nodes);
   const viewportSignature = `${canvasViewportSignature(session.nodes)}:${selectedNodeId ?? "none"}`;
@@ -1916,9 +1919,16 @@ function CanvasView({
         initialWidth: ENERGY_FRAME.width,
         initialHeight: ENERGY_FRAME.height,
         handles: agentNodeHandles(),
-        data: { node, composerSelected: node.id === selectedNodeId, onInspect: onInspectNode, onSelect: onSelectNode },
+        data: {
+          node,
+          composerSelected: node.id === selectedNodeId,
+          plannerStatus: node.id === session.plannerNodeId ? plannerStatus : null,
+          onInspect: onInspectNode,
+          onOpenPlannerInspector,
+          onSelect: onSelectNode,
+        },
       })),
-    [onInspectNode, onSelectNode, selectedNodeId, session.nodes],
+    [onInspectNode, onOpenPlannerInspector, onSelectNode, plannerStatus, selectedNodeId, session.nodes, session.plannerNodeId],
   );
   const edges = useMemo<AgentFlowEdge[]>(
     () =>
@@ -2061,7 +2071,9 @@ function mergeFlowNodeState(current: AgentFlowNode[], next: AgentFlowNode[]): Ag
       existing.position.y === node.position.y &&
       existing.data.node === node.data.node &&
       existing.data.composerSelected === node.data.composerSelected &&
+      existing.data.plannerStatus === node.data.plannerStatus &&
       existing.data.onInspect === node.data.onInspect &&
+      existing.data.onOpenPlannerInspector === node.data.onOpenPlannerInspector &&
       existing.data.onSelect === node.data.onSelect;
 
     if (canReuseExisting) return existing;
@@ -2215,6 +2227,7 @@ function AgentEdge({
 function AgentNode({ data }: NodeProps<AgentFlowNode>) {
   const node = data.node;
   const composerSelected = data.composerSelected;
+  const plannerStatus = data.plannerStatus;
   const rootRef = useRef<HTMLDivElement | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const markerRef = useRef<HTMLSpanElement | null>(null);
@@ -2556,6 +2569,12 @@ function AgentNode({ data }: NodeProps<AgentFlowNode>) {
             {composerSelected && <span className="agent-node-target-badge">Composer target</span>}
           </div>
           <span className="agent-node-title">{node.title}</span>
+          {plannerStatus && (
+            <PlannerSessionStatus
+              status={plannerStatus}
+              onOpen={data.onOpenPlannerInspector}
+            />
+          )}
           <div className="agent-node-meta-row">
             <div className="agent-identity-pill">
               <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
@@ -2607,6 +2626,37 @@ function nodeMetadataForNode(node: CanvasNode): string {
   const dependencyCount = node.context.dependencies.length;
   const dependencyLabel = dependencyCount === 1 ? "1 dependency" : `${dependencyCount} dependencies`;
   return `${node.id} · ${dependencyLabel}`;
+}
+
+function PlannerSessionStatus({
+  status,
+  onOpen,
+}: {
+  status: PlannerSessionStatusChrome;
+  onOpen: () => void;
+}) {
+  return (
+    <div className={`planner-session-status ${status.tone}`} aria-label={`Hermes planner session ${status.label}`} title={status.detail}>
+      <span className="planner-session-dot" aria-hidden="true" />
+      <span className="planner-session-label">{status.label}</span>
+      <span className="planner-session-detail">{status.detail}</span>
+      {status.inspectable && (
+        <button
+          className="planner-session-inspect nodrag"
+          type="button"
+          title="Open planner inspector"
+          aria-label="Open planner inspector"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpen();
+          }}
+        >
+          <Eye size={12} aria-hidden="true" />
+          <span>Inspect</span>
+        </button>
+      )}
+    </div>
+  );
 }
 
 function AgentStreamPreview({ line, nodeId }: { line: StreamingLogLine; nodeId: string }) {
@@ -5653,6 +5703,85 @@ async function openMockProject(): Promise<OpenProjectResult> {
   };
 }
 
+function plannerTerminalSessionId(session: CanvasSession): string | null {
+  const value = (session as CanvasSession & { hermesPlannerTerminalSessionId?: unknown }).hermesPlannerTerminalSessionId;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function useTerminalSnapshot(terminalSessionId: string | null, sessionId: string): TerminalSnapshotResult | null {
+  const [snapshot, setSnapshot] = useState<TerminalSnapshotResult | null>(null);
+
+  useEffect(() => {
+    let active = true;
+
+    if (!terminalSessionId) {
+      setSnapshot(null);
+      return () => {
+        active = false;
+      };
+    }
+
+    const boundTerminalSessionId = terminalSessionId;
+    const terminal = window.devflow?.terminal;
+    if (!terminal) {
+      setSnapshot(unavailableTerminalSnapshot(boundTerminalSessionId, "Terminal backend is unavailable."));
+      return () => {
+        active = false;
+      };
+    }
+    const terminalApi = terminal;
+
+    function refreshSnapshot() {
+      void terminalApi.snapshot({ terminalSessionId: boundTerminalSessionId }).then((result) => {
+        if (active) setSnapshot(result);
+      }).catch((error: unknown) => {
+        if (!active) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setSnapshot(unavailableTerminalSnapshot(boundTerminalSessionId, `Terminal error: ${message}`));
+      });
+    }
+
+    refreshSnapshot();
+    const unsubscribe = terminalApi.onEvent((event) => {
+      if (event.terminalSessionId === boundTerminalSessionId) refreshSnapshot();
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [sessionId, terminalSessionId]);
+
+  return snapshot;
+}
+
+function unavailableTerminalSnapshot(terminalSessionId: string, message: string): TerminalSnapshotResult {
+  return {
+    protocolVersion: 1,
+    terminalSessionId,
+    status: "unavailable",
+    sequence: 0,
+    rows: 0,
+    cols: 0,
+    cursor: { row: 0, col: 0 },
+    lines: [],
+    message,
+  };
+}
+
+function unboundTerminalSnapshot(): TerminalSnapshotResult {
+  return {
+    protocolVersion: 1,
+    terminalSessionId: "unbound",
+    status: "unavailable",
+    sequence: 0,
+    rows: 24,
+    cols: 80,
+    cursor: { row: 0, col: 0 },
+    lines: [{ sequence: 0, stream: "stderr", text: "No terminal session bound." }],
+  };
+}
+
 function TerminalInspector({
   session,
   terminalSessionId,
@@ -5662,70 +5791,8 @@ function TerminalInspector({
   terminalSessionId: string | null;
   onClose: () => void;
 }) {
-  const [snapshot, setSnapshot] = useState<TerminalSnapshotResult | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    if (!terminalSessionId) {
-      setSnapshot({
-        protocolVersion: 1,
-        terminalSessionId: "unbound",
-        status: "unavailable",
-        sequence: 0,
-        rows: 24,
-        cols: 80,
-        cursor: { row: 0, col: 0 },
-        lines: [{ sequence: 0, stream: "stderr", text: "No terminal session bound." }],
-      });
-      return;
-    }
-
-    if (window.devflow?.terminal) {
-      void window.devflow.terminal.snapshot({ terminalSessionId }).then((res) => {
-        if (active) setSnapshot(res);
-      }).catch((err: any) => {
-        if (active) {
-          setSnapshot({
-            protocolVersion: 1,
-            terminalSessionId,
-            status: "unavailable",
-            sequence: 0,
-            rows: 24,
-            cols: 80,
-            cursor: { row: 0, col: 0 },
-            lines: [{ sequence: 0, stream: "stderr", text: `Terminal error: ${err.message}` }],
-          });
-        }
-      });
-
-      const unsubscribe = window.devflow.terminal.onEvent((event) => {
-        if (event.terminalSessionId === terminalSessionId) {
-           void window.devflow!.terminal.snapshot({ terminalSessionId }).then(res => {
-             if (active) setSnapshot(res);
-           });
-        }
-      });
-      return () => {
-        active = false;
-        unsubscribe();
-      };
-    } else {
-      setSnapshot({
-        protocolVersion: 1,
-        terminalSessionId,
-        status: "waiting",
-        sequence: 1,
-        rows: 24,
-        cols: 80,
-        cursor: { row: 2, col: 0 },
-        lines: [
-          { sequence: 0, stream: "stdout", text: "Starting mock Hermes terminal session..." },
-          { sequence: 1, stream: "stdout", text: `Attached to session: ${terminalSessionId}` },
-        ],
-      });
-    }
-    return () => { active = false; };
-  }, [session.id, terminalSessionId]);
+  const liveSnapshot = useTerminalSnapshot(terminalSessionId, session.id);
+  const snapshot = terminalSessionId ? liveSnapshot : unboundTerminalSnapshot();
 
   return (
     <div className="terminal-inspector">
