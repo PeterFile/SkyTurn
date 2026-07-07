@@ -19,6 +19,8 @@ const require = createRequire(import.meta.url);
 const desktopRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const waitTimeoutMs = Number(process.env.SKYTURN_NEW_SESSION_UI_WAIT_TIMEOUT_MS ?? 25 * 60 * 1_000);
 const pollIntervalMs = Number(process.env.SKYTURN_NEW_SESSION_UI_POLL_MS ?? 2_000);
+const commandOutputLimitBytes = Number(process.env.SKYTURN_NEW_SESSION_UI_OUTPUT_LIMIT_BYTES ?? 4_000);
+const expectedChangedFiles = ["src/App.css", "src/App.jsx"];
 
 const requirement = [
   "Turn this fresh blank React app into a visible SkyTurn delivery status screen.",
@@ -44,7 +46,9 @@ export async function runNewSessionUiAcceptance() {
 
   try {
     await demo.seedBlankReactProject(projectRoot);
+    const baselineCommitSha = await gitHeadSha(demo, projectRoot);
     const expectedVerifyScriptHash = await fileSha256(join(projectRoot, "scripts", "verify.mjs"));
+    const expectedCaptureScriptHash = await fileSha256(join(projectRoot, "scripts", "capture-screenshot.mjs"));
     const project = makeImportedProject(projectRoot);
     const workspacePath = await preseedWorkspaceState(userData, project);
 
@@ -55,6 +59,9 @@ export async function runNewSessionUiAcceptance() {
         ...emptyAcceptanceResult(projectRoot, readinessPreflight.readiness),
         ...failure,
         projectRoot,
+        baselineCommitSha,
+        headCommitSha: baselineCommitSha,
+        commitSha: baselineCommitSha,
         userData,
         workspacePath,
       }, null, 2));
@@ -68,6 +75,9 @@ export async function runNewSessionUiAcceptance() {
     } catch (error) {
       console.log(JSON.stringify({
         ...emptyAcceptanceResult(projectRoot, readinessPreflight.readiness),
+        baselineCommitSha,
+        headCommitSha: baselineCommitSha,
+        commitSha: baselineCommitSha,
         failure: {
           code: "ELECTRON_LAUNCH_FAILED",
           message: "Electron did not reach the renderer automation target.",
@@ -85,46 +95,65 @@ export async function runNewSessionUiAcceptance() {
         await assertPreseededProjectLoaded(cdp, project.rootPath);
         await fillTextareaAndClickCreate(cdp, requirement);
         const workspace = await waitForWorkflowCompletion({
+          baselineCommitSha,
           workspacePath,
           projectRoot,
           graphSummary: demo.flowKernelGraphSummary,
+          readiness: readinessPreflight.readiness,
         });
         const session = activeCanvasSession(workspace);
         const verification = await collectFinalVerification({
+          baselineCommitSha,
           demo,
+          expectedCaptureScriptHash,
           expectedVerifyScriptHash,
           projectRoot,
           session,
           workspace,
         });
-        const ok = verification.ok;
+        const mockFallback = mockFallbackForReadiness(readinessPreflight.readiness);
+        const ok = verification.ok && mockFallback === false;
         cleanupProject = cleanupProject && ok;
 
         console.log(JSON.stringify({
           ok,
+          mockFallback,
           readiness: readinessPreflight.readiness,
           failure: ok
             ? null
             : {
                 code: "NEW_SESSION_UI_ACCEPTANCE_FAILED",
                 message: "Real Electron New Session UI acceptance predicates did not all pass.",
-                diagnostic: verification.diagnostic,
+                diagnostic: [verification.diagnostic, mockFallback === false ? null : "mock-fallback-enabled"]
+                  .filter(Boolean)
+                  .join(", "),
               },
           projectRoot,
           userData,
           workspacePath,
           sessionId: session?.id ?? null,
+          sessionTarget: verification.sessionTarget,
           requirement,
           laneStatuses: laneStatuses(session),
           runEvidence: runEvidenceSummary(workspace),
+          agentRunEvidence: agentRunEvidenceSummary(session, workspace),
           screenshot: {
             path: verification.screenshotPath,
             bytes: verification.screenshotBytes,
           },
+          verificationCommand: verification.verificationCommand,
           verificationScript: verification.verificationScript,
+          captureScript: verification.captureScript,
+          verificationScriptHashUnchanged: verification.verificationScript.unchanged,
+          captureScriptHashUnchanged: verification.captureScript.unchanged,
           commitCount: verification.commitCount,
+          deliveryCommitCount: verification.deliveryCommitCount,
+          commitSha: verification.commitSha,
+          baselineCommitSha: verification.baselineCommitSha,
+          headCommitSha: verification.headCommitSha,
           changedFiles: verification.changedFiles,
-          expectedChangedFiles: verification.expectedChangedFiles,
+          allChangedFilesSinceBaseline: verification.changedFiles,
+          expectedChangedFiles,
           unexpectedChangedFiles: verification.unexpectedChangedFiles,
           missingChangedFiles: verification.missingChangedFiles,
           gitStatus: verification.gitStatus,
@@ -136,8 +165,21 @@ export async function runNewSessionUiAcceptance() {
         cdp.close();
       }
     } catch (error) {
+      if (error instanceof WorkflowTerminalFailureError) {
+        console.log(JSON.stringify({
+          ...error.result,
+          userData,
+          workspacePath,
+        }, null, 2));
+        process.exitCode = 1;
+        return;
+      }
+      const headCommitSha = await gitHeadShaOrNull(projectRoot);
       console.log(JSON.stringify({
         ...emptyAcceptanceResult(projectRoot, readinessPreflight.readiness),
+        baselineCommitSha,
+        headCommitSha,
+        commitSha: headCommitSha,
         failure: {
           code: "RENDERER_AUTOMATION_FAILED",
           message: "Electron renderer automation failed before workflow completion.",
@@ -325,7 +367,7 @@ async function assertPreseededProjectLoaded(cdp, projectRoot) {
   }
 }
 
-async function waitForWorkflowCompletion({ workspacePath, projectRoot, graphSummary }) {
+async function waitForWorkflowCompletion({ baselineCommitSha, workspacePath, projectRoot, graphSummary, readiness }) {
   const deadline = Date.now() + waitTimeoutMs;
   let lastWorkspace = null;
   while (Date.now() < deadline) {
@@ -336,6 +378,19 @@ async function waitForWorkflowCompletion({ workspacePath, projectRoot, graphSumm
       const flowNodes = session.nodes.filter((node) => node.display?.meta?.includes("flow-kernel"));
       const graph = graphSummary(session, session.plannerNodeId);
       const commitCount = await gitCommitCount(projectRoot).catch(() => 0);
+      const terminalFailure = terminalWorkflowFailure(session, workspace);
+      if (terminalFailure) {
+        const headCommitSha = await gitHeadShaOrNull(projectRoot);
+        throw new WorkflowTerminalFailureError(workflowTerminalFailureResult({
+          baselineCommitSha,
+          headCommitSha,
+          projectRoot,
+          readiness,
+          terminalFailure,
+          workspacePath,
+          workspace,
+        }));
+      }
       const hasTerminalEvidence = Object.values(workspace.runEvidence ?? {}).some((evidence) =>
         evidence && typeof evidence === "object" &&
         ["succeeded", "failed", "cancelled", "timed-out"].includes(evidence.status),
@@ -350,28 +405,47 @@ async function waitForWorkflowCompletion({ workspacePath, projectRoot, graphSumm
   throw new Error(`Timed out waiting for New Session workflow completion after ${waitTimeoutMs}ms. Last workspace: ${summarizeWorkspace(lastWorkspace)}`);
 }
 
-async function collectFinalVerification({ demo, expectedVerifyScriptHash, projectRoot, session, workspace }) {
+async function collectFinalVerification({ baselineCommitSha, demo, expectedCaptureScriptHash, expectedVerifyScriptHash, projectRoot, session, workspace }) {
   const verifyScriptPath = join(projectRoot, "scripts", "verify.mjs");
-  const testResult = await demo.runCapture(process.execPath, ["scripts/verify.mjs"], projectRoot, { allowFailure: true });
+  const captureScriptPath = join(projectRoot, "scripts", "capture-screenshot.mjs");
   const actualVerifyScriptHash = await fileSha256(verifyScriptPath);
+  const actualCaptureScriptHash = await fileSha256(captureScriptPath);
   const verifyScriptUnchanged = actualVerifyScriptHash === expectedVerifyScriptHash;
+  const captureScriptUnchanged = actualCaptureScriptHash === expectedCaptureScriptHash;
+  const verifyCommand = `${process.execPath} scripts/verify.mjs`;
   const screenshotPath = join(projectRoot, ".devflow", "acceptance", "react-app.png");
-  await demo.captureReactScreenshot(projectRoot, screenshotPath);
-  const screenshotBytes = (await stat(screenshotPath)).size;
+  const captureCommand = `${process.execPath} scripts/capture-screenshot.mjs ${screenshotPath}`;
+  const testResult = verifyScriptUnchanged
+    ? await demo.runCapture(process.execPath, ["scripts/verify.mjs"], projectRoot, { allowFailure: true })
+    : skippedCommandResult("fixed verification script hash changed");
+  const captureResult = captureScriptUnchanged
+    ? await demo.runCapture(process.execPath, ["scripts/capture-screenshot.mjs", screenshotPath], projectRoot, { allowFailure: true })
+    : skippedCommandResult("fixed capture script hash changed");
+  const screenshotBytes = captureResult.code === 0
+    ? await fileSizeOrZero(screenshotPath)
+    : 0;
   const commitCount = await gitCommitCount(projectRoot);
-  const changedFiles = commitCount > 1
-    ? (await demo.runCapture("git", ["diff", "--name-only", "HEAD~1..HEAD"], projectRoot)).stdout.split("\n").filter(Boolean)
-    : [];
-  const allowedChangedFiles = ["src/App.css", "src/App.jsx"];
-  const unexpectedChangedFiles = changedFiles.filter((file) => !allowedChangedFiles.includes(file));
-  const missingChangedFiles = allowedChangedFiles.filter((file) => !changedFiles.includes(file));
-  const gitStatus = (await demo.runCapture("git", ["status", "--short"], projectRoot)).stdout.trim();
+  const deliveryFiles = await collectDeliveryFileRange({ baselineCommitSha, demo, projectRoot });
+  const {
+    changedFiles,
+    deliveryCommitCount,
+    headCommitSha,
+    missingChangedFiles,
+    unexpectedChangedFiles,
+  } = deliveryFiles;
+  const commitSha = headCommitSha;
+  const gitStatusValue = (await demo.runCapture("git", ["status", "--short"], projectRoot)).stdout.trim();
+  const gitStatus = { clean: gitStatusValue === "", value: gitStatusValue };
   const appSource = await readFile(join(projectRoot, "src", "App.jsx"), "utf8");
   const graph = session ? demo.flowKernelGraphSummary(session, session.plannerNodeId) : null;
   const flowNodes = session?.nodes.filter((node) => node.display?.meta?.includes("flow-kernel")) ?? [];
   const runEvidenceValues = Object.values(workspace.runEvidence ?? {});
+  const sessionTarget = session?.target ?? null;
+  const hasHermesEvidence = hasSuccessfulRunEvidenceForAgent(session, workspace, "hermes");
+  const hasCodexEvidence = hasSuccessfulRunEvidenceForAgent(session, workspace, "codex");
   const ok =
     !!session &&
+    sessionTarget?.executionTarget === "current_branch" &&
     flowNodes.length > 0 &&
     flowNodes.every((node) => node.status === "completed") &&
     graph.connected &&
@@ -379,16 +453,27 @@ async function collectFinalVerification({ demo, expectedVerifyScriptHash, projec
     graph.rootDependencyIds.length === 0 &&
     graph.rootIncomingEdgeIds.length === 0 &&
     testResult.code === 0 &&
+    captureResult.code === 0 &&
     screenshotBytes > 1_000 &&
     verifyScriptUnchanged &&
+    captureScriptUnchanged &&
     commitCount > 1 &&
+    deliveryCommitCount > 0 &&
+    typeof baselineCommitSha === "string" &&
+    baselineCommitSha.length === 40 &&
+    typeof commitSha === "string" &&
+    commitSha.length === 40 &&
+    typeof headCommitSha === "string" &&
+    headCommitSha.length === 40 &&
     unexpectedChangedFiles.length === 0 &&
     missingChangedFiles.length === 0 &&
     changedFiles.includes("src/App.jsx") &&
-    gitStatus === "" &&
+    gitStatus.clean &&
     appSource.includes("SkyTurn delivery complete") &&
     appSource.includes("Hermes -> Codex") &&
     appSource.includes("Ready for verification") &&
+    hasHermesEvidence &&
+    hasCodexEvidence &&
     runEvidenceValues.some((evidence) => evidence.checks?.some((check) => check.status === "passed"));
 
   return {
@@ -398,11 +483,20 @@ async function collectFinalVerification({ demo, expectedVerifyScriptHash, projec
       : acceptanceFailureDiagnostic({
           appSource,
           changedFiles,
+          captureResult,
+          captureScriptUnchanged,
           commitCount,
+          commitSha,
+          deliveryCommitCount,
+          baselineCommitSha,
+          headCommitSha,
           flowNodes,
           gitStatus,
           graph,
+          hasCodexEvidence,
+          hasHermesEvidence,
           runEvidenceValues,
+          sessionTarget,
           screenshotBytes,
           testResult,
           verifyScriptUnchanged,
@@ -415,11 +509,32 @@ async function collectFinalVerification({ demo, expectedVerifyScriptHash, projec
       expectedSha256: expectedVerifyScriptHash,
       actualSha256: actualVerifyScriptHash,
     },
+    captureScript: {
+      path: captureScriptPath,
+      unchanged: captureScriptUnchanged,
+      expectedSha256: expectedCaptureScriptHash,
+      actualSha256: actualCaptureScriptHash,
+    },
+    verificationCommand: {
+      verify: {
+        command: verifyCommand,
+        ...boundedCommandOutput(testResult, commandOutputLimitBytes),
+      },
+      captureScreenshot: {
+        command: captureCommand,
+        ...boundedCommandOutput(captureResult, commandOutputLimitBytes),
+      },
+    },
+    sessionTarget,
     screenshotPath,
     screenshotBytes,
     commitCount,
+    deliveryCommitCount,
+    commitSha,
+    baselineCommitSha,
+    headCommitSha,
     changedFiles,
-    expectedChangedFiles: allowedChangedFiles,
+    allChangedFilesSinceBaseline: changedFiles,
     unexpectedChangedFiles,
     missingChangedFiles,
     gitStatus,
@@ -429,6 +544,7 @@ async function collectFinalVerification({ demo, expectedVerifyScriptHash, projec
 
 function acceptanceFailureDiagnostic(input) {
   const failures = [];
+  if (input.sessionTarget?.executionTarget !== "current_branch") failures.push("not-current-branch-target");
   if (input.flowNodes.length === 0) failures.push("no-flow-kernel-lanes");
   if (input.flowNodes.some((node) => node.status !== "completed")) failures.push("flow-not-completed");
   if (!input.graph?.connected) failures.push("graph-disconnected");
@@ -436,20 +552,77 @@ function acceptanceFailureDiagnostic(input) {
   if ((input.graph?.rootDependencyIds ?? []).length > 0) failures.push("planner-root-has-dependencies");
   if ((input.graph?.rootIncomingEdgeIds ?? []).length > 0) failures.push("planner-root-has-incoming-edges");
   if (input.testResult.code !== 0) failures.push(`verify-exit-${input.testResult.code}`);
+  if (input.captureResult.code !== 0) failures.push(`capture-exit-${input.captureResult.code}`);
   if (!input.verifyScriptUnchanged) failures.push("verification-script-changed");
+  if (!input.captureScriptUnchanged) failures.push("capture-script-changed");
   if ((input.unexpectedChangedFiles ?? []).length > 0) failures.push(`unexpected-delivery-files:${input.unexpectedChangedFiles.join("|")}`);
   if ((input.missingChangedFiles ?? []).length > 0) failures.push(`missing-delivery-files:${input.missingChangedFiles.join("|")}`);
   if (input.screenshotBytes <= 1_000) failures.push("screenshot-too-small");
   if (input.commitCount <= 1) failures.push("no-delivery-commit");
+  if (input.deliveryCommitCount <= 0) failures.push("no-delivery-commit-since-baseline");
+  if (typeof input.baselineCommitSha !== "string" || input.baselineCommitSha.length !== 40) failures.push("missing-baseline-sha");
+  if (typeof input.commitSha !== "string" || input.commitSha.length !== 40) failures.push("missing-commit-sha");
+  if (typeof input.headCommitSha !== "string" || input.headCommitSha.length !== 40) failures.push("missing-head-sha");
   if (!input.changedFiles.includes("src/App.jsx")) failures.push("app-file-not-changed");
-  if (input.gitStatus !== "") failures.push("git-status-not-clean");
+  if (!input.gitStatus.clean) failures.push("git-status-not-clean");
   if (!input.appSource.includes("SkyTurn delivery complete")) failures.push("missing-delivery-text");
   if (!input.appSource.includes("Hermes -> Codex")) failures.push("missing-agent-chain-text");
   if (!input.appSource.includes("Ready for verification")) failures.push("missing-verification-text");
+  if (!input.hasHermesEvidence) failures.push("missing-hermes-run-evidence");
+  if (!input.hasCodexEvidence) failures.push("missing-codex-run-evidence");
   if (!input.runEvidenceValues.some((evidence) => evidence.checks?.some((check) => check.status === "passed"))) {
     failures.push("no-passed-run-evidence-check");
   }
   return failures.length > 0 ? failures.join(", ") : "unknown";
+}
+
+async function collectDeliveryFileRange({ baselineCommitSha, demo, projectRoot }) {
+  const headCommitSha = await gitHeadSha(demo, projectRoot);
+  const deliveryCommitCount = Number((await demo.runCapture(
+    "git",
+    ["rev-list", "--count", `${baselineCommitSha}..HEAD`],
+    projectRoot,
+  )).stdout.trim());
+  const changedFilesSinceBaseline = deliveryCommitCount > 0
+    ? (await demo.runCapture(
+        "git",
+        ["log", "--name-only", "--format=", `${baselineCommitSha}..HEAD`],
+        projectRoot,
+      )).stdout.split("\n").filter(Boolean)
+    : [];
+
+  return {
+    deliveryCommitCount,
+    ...deliveryFileRangeVerification({
+      baselineCommitSha,
+      headCommitSha,
+      changedFilesSinceBaseline,
+      expectedChangedFiles,
+    }),
+  };
+}
+
+export function deliveryFileRangeVerification({
+  baselineCommitSha,
+  headCommitSha,
+  changedFilesSinceBaseline,
+  expectedChangedFiles: expectedFiles,
+}) {
+  const changedFiles = uniqueSortedStrings(changedFilesSinceBaseline);
+  const expected = uniqueSortedStrings(expectedFiles);
+  const unexpectedChangedFiles = changedFiles.filter((file) => !expected.includes(file));
+  const missingChangedFiles = expected.filter((file) => !changedFiles.includes(file));
+
+  return {
+    ok: unexpectedChangedFiles.length === 0 && missingChangedFiles.length === 0,
+    baselineCommitSha,
+    headCommitSha,
+    changedFiles,
+    expectedChangedFiles: expected,
+    allChangedFilesSinceBaseline: changedFiles,
+    unexpectedChangedFiles,
+    missingChangedFiles,
+  };
 }
 
 function activeCanvasSession(workspace) {
@@ -478,29 +651,181 @@ function runEvidenceSummary(workspace) {
     Object.entries(workspace?.runEvidence ?? {}).map(([runId, evidence]) => [
       runId,
       {
+        runId: evidence.runId,
         status: evidence.status,
         exitCode: evidence.exitCode,
         checks: evidence.checks,
         artifacts: evidence.artifacts,
         errorReason: evidence.errorReason,
         cancelReason: evidence.cancelReason,
+        completedAt: evidence.completedAt,
       },
     ]),
+  );
+}
+
+function agentRunEvidenceSummary(session, workspace) {
+  const result = { hermes: [], codex: [] };
+  for (const node of laneStatuses(session)) {
+    if (node.agent !== "hermes" && node.agent !== "codex") continue;
+    const evidence = workspace?.runEvidence?.[node.runId] ?? null;
+    result[node.agent].push({
+      nodeId: node.id,
+      runId: node.runId,
+      evidenceRunId: evidence?.runId ?? null,
+      laneStatus: node.status,
+      evidenceStatus: evidence?.status ?? null,
+      exitCode: evidence?.exitCode ?? null,
+      passedChecks: evidence?.checks?.filter((check) => check.status === "passed").map((check) => ({
+        kind: check.kind,
+        name: check.name,
+      })) ?? [],
+      hasExpectedCliExit: hasSuccessfulCliExitEvidence(node, evidence),
+    });
+  }
+  return result;
+}
+
+export function hasSuccessfulRunEvidenceForAgent(session, workspace, agent) {
+  return laneStatuses(session).some((node) =>
+    node.agent === agent &&
+    hasSuccessfulCliExitEvidence(node, workspace?.runEvidence?.[node.runId] ?? null),
+  );
+}
+
+function hasSuccessfulCliExitEvidence(node, evidence) {
+  if (!evidence || evidence.runId !== node.runId) return false;
+  if (evidence.status !== "succeeded" || evidence.exitCode !== 0) return false;
+  const expectedName = node.agent === "hermes"
+    ? "Hermes CLI exit"
+    : node.agent === "codex"
+      ? "Codex CLI exit"
+      : null;
+  if (!expectedName) return false;
+  return (evidence.checks ?? []).some((check) =>
+    check?.kind === "run-exit" &&
+    check.status === "passed" &&
+    typeof check.name === "string" &&
+    check.name.includes(expectedName),
   );
 }
 
 function emptyAcceptanceResult(projectRoot, readiness) {
   return {
     ok: false,
+    mockFallback: mockFallbackForReadiness(readiness),
     readiness,
     projectRoot,
     sessionId: null,
+    sessionTarget: null,
     laneStatuses: [],
     runEvidence: {},
+    agentRunEvidence: { hermes: [], codex: [] },
+    latestWorkspace: null,
     screenshot: { path: null, bytes: 0 },
+    verificationCommand: {
+      verify: {
+        command: `${process.execPath} scripts/verify.mjs`,
+        ...boundedCommandOutput(skippedCommandResult("not run"), commandOutputLimitBytes),
+      },
+      captureScreenshot: {
+        command: `${process.execPath} scripts/capture-screenshot.mjs`,
+        ...boundedCommandOutput(skippedCommandResult("not run"), commandOutputLimitBytes),
+      },
+    },
+    verificationScript: null,
+    captureScript: null,
+    verificationScriptHashUnchanged: null,
+    captureScriptHashUnchanged: null,
     commitCount: 0,
+    deliveryCommitCount: 0,
+    commitSha: null,
+    baselineCommitSha: null,
+    headCommitSha: null,
     changedFiles: [],
+    allChangedFilesSinceBaseline: [],
+    expectedChangedFiles,
+    unexpectedChangedFiles: [],
+    missingChangedFiles: expectedChangedFiles,
+    gitStatus: { clean: null, value: null },
   };
+}
+
+export function workflowTerminalFailureResult({
+  baselineCommitSha = null,
+  headCommitSha = null,
+  projectRoot,
+  readiness,
+  terminalFailure = null,
+  workspacePath,
+  workspace,
+}) {
+  const session = activeCanvasSession(workspace);
+  const sessionTarget = session?.target ?? null;
+  return {
+    ...emptyAcceptanceResult(projectRoot, readiness),
+    failure: {
+      code: "WORKFLOW_RUN_FAILED",
+      message: "Workflow reached terminal agent failure evidence before completion.",
+      diagnostic: terminalFailure?.diagnostic ?? workflowFailureDiagnostic(session, workspace),
+    },
+    workspacePath,
+    sessionId: session?.id ?? null,
+    sessionTarget,
+    laneStatuses: laneStatuses(session),
+    runEvidence: runEvidenceSummary(workspace),
+    agentRunEvidence: agentRunEvidenceSummary(session, workspace),
+    latestWorkspace: workspace ?? null,
+    baselineCommitSha,
+    headCommitSha,
+    commitSha: headCommitSha,
+  };
+}
+
+class WorkflowTerminalFailureError extends Error {
+  constructor(result) {
+    super(result.failure?.diagnostic ?? result.failure?.message ?? "Workflow terminal failure.");
+    this.name = "WorkflowTerminalFailureError";
+    this.result = result;
+  }
+}
+
+function terminalWorkflowFailure(session, workspace) {
+  const lanes = laneStatuses(session);
+  const failedNode = lanes.find((node) => node.status === "failed");
+  if (failedNode) {
+    return {
+      diagnostic: `node-failed:${failedNode.id}:${failedNode.runId}`,
+      node: failedNode,
+      evidence: workspace?.runEvidence?.[failedNode.runId] ?? null,
+    };
+  }
+
+  for (const node of lanes) {
+    const evidence = workspace?.runEvidence?.[node.runId] ?? null;
+    if (isTerminalFailureEvidence(evidence)) {
+      return {
+        diagnostic: `run-evidence-${evidence.status}:${node.id}:${node.runId}`,
+        node,
+        evidence,
+      };
+    }
+  }
+  return null;
+}
+
+function workflowFailureDiagnostic(session, workspace) {
+  const terminalFailure = terminalWorkflowFailure(session, workspace);
+  return terminalFailure?.diagnostic ?? "workflow-terminal-failure";
+}
+
+function isTerminalFailureEvidence(evidence) {
+  return !!evidence && ["failed", "cancelled", "timed-out"].includes(evidence.status);
+}
+
+function mockFallbackForReadiness(readiness) {
+  const value = readiness?.checks?.mockFallback;
+  return typeof value === "boolean" ? value : "unknown";
 }
 
 async function readWorkspaceFile(workspacePath) {
@@ -514,6 +839,69 @@ async function readWorkspaceFile(workspacePath) {
 async function gitCommitCount(projectRoot) {
   const demo = await loadDemoHelpers();
   return Number((await demo.runCapture("git", ["rev-list", "--count", "HEAD"], projectRoot)).stdout.trim());
+}
+
+async function gitHeadSha(demo, projectRoot) {
+  return (await demo.runCapture("git", ["rev-parse", "HEAD"], projectRoot)).stdout.trim();
+}
+
+async function gitHeadShaOrNull(projectRoot) {
+  try {
+    const demo = await loadDemoHelpers();
+    return await gitHeadSha(demo, projectRoot);
+  } catch {
+    return null;
+  }
+}
+
+async function fileSizeOrZero(filePath) {
+  try {
+    return (await stat(filePath)).size;
+  } catch {
+    return 0;
+  }
+}
+
+function skippedCommandResult(reason) {
+  return {
+    code: null,
+    stdout: "",
+    stderr: reason,
+    skipped: true,
+  };
+}
+
+export function boundedCommandOutput(result, limitBytes = commandOutputLimitBytes) {
+  const stdout = boundedText(result.stdout ?? "", limitBytes);
+  const stderr = boundedText(result.stderr ?? "", limitBytes);
+  return {
+    code: result.code ?? null,
+    stdout: stdout.value,
+    stderr: stderr.value,
+    stdoutBytes: stdout.bytes,
+    stderrBytes: stderr.bytes,
+    stdoutTruncated: stdout.truncated,
+    stderrTruncated: stderr.truncated,
+    ...(result.skipped === true ? { skipped: true } : {}),
+  };
+}
+
+function boundedText(value, limitBytes) {
+  const text = String(value);
+  const bytes = Buffer.byteLength(text);
+  if (bytes <= limitBytes) {
+    return { value: text, bytes, truncated: false };
+  }
+  return {
+    value: Buffer.from(text).subarray(0, limitBytes).toString("utf8").replace(/\uFFFD$/, ""),
+    bytes,
+    truncated: true,
+  };
+}
+
+function uniqueSortedStrings(values) {
+  return [...new Set((values ?? []).filter((value) => typeof value === "string" && value.length > 0))]
+    .sort((left, right) => left.localeCompare(right));
 }
 
 function summarizeWorkspace(workspace) {
