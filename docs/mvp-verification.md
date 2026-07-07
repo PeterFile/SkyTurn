@@ -2,7 +2,7 @@
 
 Status: historical scaffold verification. This file records the original MVP build-out and early mock verification. It is not the current capability source. For current workflow/runtime facts, use `README.md`, `docs/natural-workflow-design.md`, `docs/flow-kernel-v1-acceptance.md`, and the code paths under `apps/desktop/electron`, `packages/persistence/src/workflowStore.ts`, `packages/workflow-kernel`, `packages/agent-bridge`, and `packages/git-worktree/src/node.ts`. Historical references below to clicking a node to open the modal are obsolete; current product behavior is that selecting a node binds the bottom composer, while node details open through the node card **More** button.
 
-## Current State
+## Historical Scaffold State
 
 - Repository contents inspected on 2026-06-10.
 - Existing files before implementation: `AGENTS.md`, `goal.md`.
@@ -83,7 +83,7 @@ Status: historical scaffold verification. This file records the original MVP bui
     - Run production build.
     - Start the app locally and inspect the rendered UI.
 
-## Verification Matrix
+## Historical Verification Matrix
 
 | Requirement | Evidence Target | Status |
 | --- | --- | --- |
