@@ -966,6 +966,51 @@ export interface Changeset {
   evidence?: ChangesetEvidence;
 }
 
+export interface EvidenceSummaryFact {
+  label: string;
+  value: string;
+}
+
+export interface EvidenceCommitSummary {
+  commitSha?: string;
+  branch?: string;
+  worktreePath?: string;
+  subject?: string;
+}
+
+export type EvidenceRepoState = "clean" | "dirty" | "failed" | "unknown";
+
+export interface RunEvidenceSummaryInput {
+  runEvidence?: RunEvidence | null;
+  changeset?: Changeset | null;
+  reconciliation?: FinalChangesetReconciliation | null;
+  commitEvidence?: EvidenceCommitSummary | null;
+  expectedArtifacts?: string[];
+}
+
+export interface RunEvidenceSummary {
+  run: {
+    id: string | null;
+    status: AgentRunStatus | "unknown";
+    exitCode: number | null;
+  };
+  reason: string | null;
+  latestFailedCheck: string | null;
+  checkSummary: string;
+  artifactSummary: string;
+  reviewSummary: string | null;
+  runFacts: EvidenceSummaryFact[];
+  changes: {
+    changesetId: string | null;
+    status: ChangesetEvidenceStatus | FinalChangesetReconciliationStatus | "unknown";
+    files: string[];
+    diffStat: Changeset["diffStat"];
+    repoState: EvidenceRepoState;
+    repoStateSummary: string;
+  };
+  changeFacts: EvidenceSummaryFact[];
+}
+
 export function hasConcreteRunEvidence(evidence: RunEvidence | null | undefined): boolean {
   if (!evidence) return false;
   if (evidence.exitCode === 0) return true;
@@ -973,6 +1018,168 @@ export function hasConcreteRunEvidence(evidence: RunEvidence | null | undefined)
   if (evidence.artifacts.length > 0) return true;
   if (evidence.review?.status === "passed") return true;
   return evidence.checks.some((check) => check.status === "passed");
+}
+
+export function summarizeRunEvidence(input: RunEvidenceSummaryInput = {}): RunEvidenceSummary {
+  const runEvidence = input.runEvidence ?? null;
+  const checks = runEvidence?.checks ?? [];
+  const reviewSummary = runEvidence?.review ? formatEvidenceCheck(runEvidence.review) : null;
+  const artifactPaths = runEvidence?.artifacts.length ? runEvidence.artifacts : input.expectedArtifacts ?? [];
+  const artifactSummary = formatArtifacts(
+    artifactPaths,
+    runEvidence?.artifacts.length ? "recorded" : input.expectedArtifacts?.length ? "expected" : "none",
+  );
+  const reason = runEvidence ? runEvidenceReason(runEvidence) : null;
+  const latestFailedCheck = latestFailedCheckSummary(checks);
+  const changes = summarizeChangeEvidence(input.reconciliation ?? null, input.changeset ?? null);
+  const changeFacts = changeFactsForSummary(changes, input.commitEvidence ?? null);
+  const runFacts: EvidenceSummaryFact[] = [
+    { label: "Run ID", value: runEvidence?.runId ?? "None" },
+    { label: "Run status", value: runEvidence?.status ?? "unknown" },
+    ...(runEvidence?.exitCode !== null && runEvidence?.exitCode !== undefined
+      ? [{ label: "Exit code", value: String(runEvidence.exitCode) }]
+      : []),
+    { label: "Checks", value: formatChecks(checks) },
+    { label: "Artifacts", value: artifactSummary },
+    ...(reviewSummary ? [{ label: "Review", value: reviewSummary }] : []),
+    ...(reason ? [{ label: "Reason", value: reason }] : []),
+  ];
+
+  return {
+    run: {
+      id: runEvidence?.runId ?? null,
+      status: runEvidence?.status ?? "unknown",
+      exitCode: runEvidence?.exitCode ?? null,
+    },
+    reason,
+    latestFailedCheck,
+    checkSummary: formatChecks(checks),
+    artifactSummary,
+    reviewSummary,
+    runFacts,
+    changes,
+    changeFacts,
+  };
+}
+
+function summarizeChangeEvidence(
+  reconciliation: FinalChangesetReconciliation | null,
+  changesetInput: Changeset | null,
+): RunEvidenceSummary["changes"] {
+  const changeset = reconciliation?.changeset ?? changesetInput;
+  const status = reconciliation?.status ?? changeset?.evidence?.status ?? "unknown";
+  const files = changeset ? (changeset.evidence?.files.length ? changeset.evidence.files : changeset.files) : [];
+  const diffStat = changeset?.diffStat ?? { added: 0, changed: 0, deleted: 0 };
+  const repoStateSummary = repoStateSummaryForChangeEvidence(status, reconciliation, changeset);
+
+  return {
+    changesetId: changeset?.id ?? changeset?.evidence?.changesetId ?? null,
+    status,
+    files,
+    diffStat,
+    repoState: repoStateForChangeEvidence(status),
+    repoStateSummary,
+  };
+}
+
+function changeFactsForSummary(
+  changes: RunEvidenceSummary["changes"],
+  commitEvidence: EvidenceCommitSummary | null,
+): EvidenceSummaryFact[] {
+  const changedFileCount = changes.diffStat.changed || changes.files.length;
+  const fileLabel = changedFileCount === 1 ? "file" : "files";
+  const facts: EvidenceSummaryFact[] = [
+    { label: "Changeset status", value: changes.status },
+    {
+      label: "Changed files",
+      value: changes.files.length ? `${changes.files.length} (${changes.files.join(", ")})` : "None",
+    },
+    {
+      label: "Diff stat",
+      value: `+${changes.diffStat.added} / -${changes.diffStat.deleted} across ${changedFileCount} ${fileLabel}`,
+    },
+    { label: "Repo state", value: changes.repoStateSummary },
+  ];
+  const commit = commitEvidenceSummary(commitEvidence);
+  if (commit) facts.push({ label: "Commit", value: commit });
+  return facts;
+}
+
+function repoStateForChangeEvidence(
+  status: ChangesetEvidenceStatus | FinalChangesetReconciliationStatus | "unknown",
+): EvidenceRepoState {
+  if (status === "empty") return "clean";
+  if (status === "available" || status === "mismatch") return "dirty";
+  if (status === "failed") return "failed";
+  return "unknown";
+}
+
+function repoStateSummaryForChangeEvidence(
+  status: ChangesetEvidenceStatus | FinalChangesetReconciliationStatus | "unknown",
+  reconciliation: FinalChangesetReconciliation | null,
+  changeset: Changeset | null,
+): string {
+  if (status === "empty") return "Clean at collection";
+  if (status === "available" || status === "mismatch") return "Git changes recorded";
+  if (status === "failed") return reconciliation?.errorReason ?? changeset?.evidence?.errorReason ?? "Collection failed";
+  return "Not recorded";
+}
+
+function runEvidenceReason(runEvidence: RunEvidence): string | null {
+  if (runEvidence.status === "timed-out") {
+    const timeoutReason =
+      runEvidence.errorReason ??
+      runEvidence.checks.find((check) => check.kind === "run-timeout" && typeof check.detail === "string")?.detail ??
+      null;
+    return `Timeout: ${timeoutReason ?? "run timed out"}`;
+  }
+  if (runEvidence.status === "cancelled" || runEvidence.cancelReason) {
+    return `Cancelled: ${runEvidence.cancelReason ?? "run cancelled"}`;
+  }
+  if (runEvidence.errorReason) return `Error: ${runEvidence.errorReason}`;
+  if (runEvidence.status !== "failed") return null;
+  const failedCheck = latestFailedCheckSummary(runEvidence.checks);
+  if (failedCheck) return `Check failed: ${failedCheck}`;
+  if (runEvidence.exitCode !== null && runEvidence.exitCode !== 0) return `Exit code ${runEvidence.exitCode}`;
+  return null;
+}
+
+function latestFailedCheckSummary(checks: EvidenceCheck[]): string | null {
+  const failedCheck = [...checks].reverse().find((check) => check.status === "failed");
+  if (!failedCheck) return null;
+  const detail = cleanEvidenceText(failedCheck.detail);
+  return `${failedCheck.name}: ${failedCheck.status}${detail ? ` - ${detail}` : ""}`;
+}
+
+function formatChecks(checks: EvidenceCheck[]): string {
+  return checks.length ? checks.map(formatEvidenceCheck).join(", ") : "None";
+}
+
+function formatEvidenceCheck(check: EvidenceCheck): string {
+  const detail = cleanEvidenceText(check.detail);
+  return `${check.kind} [${check.name}]: ${check.status}${detail ? ` - ${detail}` : ""}`;
+}
+
+function formatArtifacts(paths: string[], source: "recorded" | "expected" | "none"): string {
+  if (!paths.length || source === "none") return "None";
+  const label = source === "expected" ? " expected" : "";
+  return `${paths.length}${label} (${paths.join(", ")})`;
+}
+
+function commitEvidenceSummary(commitEvidence: EvidenceCommitSummary | null): string | null {
+  if (!commitEvidence) return null;
+  if (commitEvidence.commitSha && commitEvidence.branch) return `${shortEvidenceSha(commitEvidence.commitSha)} on ${commitEvidence.branch}`;
+  if (commitEvidence.commitSha) return shortEvidenceSha(commitEvidence.commitSha);
+  if (commitEvidence.branch) return commitEvidence.branch;
+  return cleanEvidenceText(commitEvidence.subject);
+}
+
+function shortEvidenceSha(value: string): string {
+  return value.slice(0, 7);
+}
+
+function cleanEvidenceText(value: string | null | undefined): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 export function canUsePtyInteractiveTransport(
