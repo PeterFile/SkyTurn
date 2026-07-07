@@ -74,17 +74,25 @@ import {
   type WorkspaceState,
   type TerminalSnapshotResult,
 } from "@skyturn/persistence";
-import { formatTerminalTitle, formatTerminalBadge, formatTerminalMessage } from "./terminalInspector.js";
+import {
+  formatTerminalTitle,
+  formatTerminalBadge,
+  formatTerminalMessage,
+  plannerSessionStatusForSnapshot,
+  type PlannerSessionStatusChrome,
+} from "./terminalInspector.js";
 import { convertPlanToCanvas, createFastCanvasSession, createPlanSession } from "@skyturn/planner";
 import {
   NODE_MODAL_TABS,
   deriveNodeStatusFromEvidence,
+  summarizeRunEvidence,
   type AgentKind,
   type AgentWorkflowReadinessSummary,
   type CanvasNode,
   type CanvasSession,
   type CanvasSessionTab,
   type Changeset,
+  type EvidenceSummaryFact,
   type FinalChangesetReconciliation,
   type ImportedProject,
   type NodeModalTab,
@@ -170,7 +178,9 @@ gsap.registerPlugin(useGSAP);
 type AgentFlowNode = FlowNode<{
   node: CanvasNode;
   composerSelected: boolean;
+  plannerStatus: PlannerSessionStatusChrome | null;
   onInspect: (nodeId: string) => void;
+  onOpenPlannerInspector: () => void;
   onSelect: (nodeId: string) => void;
 }, "agent">;
 
@@ -952,8 +962,6 @@ export default function App() {
       <div className="main-shell">
         <TopBar
           activeSession={activeSession}
-          terminalOpen={terminalOpen}
-          onToggleTerminal={() => setTerminalOpen(!terminalOpen)}
           onRenameSession={(sessionId, title) =>
             setWorkspace((current) => ({
               ...current,
@@ -984,11 +992,13 @@ export default function App() {
               nodeActionBusy={nodeActionBusy}
               nodeActionError={nodeActionError}
               nodeActionStatus={nodeActionStatus}
+              plannerTerminalSessionId={plannerTerminalSessionId(activeSession)}
               workflowBackendAvailable={!!window.devflow?.workflow}
               onComposerChange={selectedNode ? setNodeActionText : setBottomGoal}
               onComposerSubmit={appendRequirementNode}
               onComposerStop={stopActiveRun}
               onNodePositionsChange={updateActiveNodePositions}
+              onOpenPlannerInspector={() => setTerminalOpen(true)}
               onSelectNode={(nodeId) => {
                 setSelectedNodeId(nodeId);
                 setInspectedNodeId((current) => (current === nodeId ? current : null));
@@ -1038,7 +1048,7 @@ export default function App() {
       {terminalOpen && activeSession?.kind === "canvas" && (
         <TerminalInspector
           session={activeSession}
-          terminalSessionId={(activeSession as CanvasSession & { hermesPlannerTerminalSessionId?: string }).hermesPlannerTerminalSessionId ?? null}
+          terminalSessionId={plannerTerminalSessionId(activeSession)}
           onClose={() => setTerminalOpen(false)}
         />
       )}
@@ -1067,14 +1077,10 @@ function Home({ onOpenProject }: { onOpenProject: () => void }) {
 
 function TopBar({
   activeSession,
-  terminalOpen,
-  onToggleTerminal,
   onRenameSession,
   onToggleNewTask,
 }: {
   activeSession: CanvasSessionTab | null;
-  terminalOpen: boolean;
-  onToggleTerminal: () => void;
   onRenameSession: (sessionId: string, title: string) => void;
   onToggleNewTask: () => void;
 }) {
@@ -1138,16 +1144,6 @@ function TopBar({
         )}
       </div>
       <div className="topbar-actions">
-        {activeSession && (
-          <button
-            className={`compact-action ${terminalOpen ? 'active' : ''}`}
-            onClick={onToggleTerminal}
-            title="Terminal Inspector"
-          >
-            <Terminal size={14} />
-            <span>Terminal</span>
-          </button>
-        )}
         <button
           className="new-tab-button icon-only"
           type="button"
@@ -1872,11 +1868,13 @@ function CanvasView({
   nodeActionBusy,
   nodeActionError,
   nodeActionStatus,
+  plannerTerminalSessionId,
   workflowBackendAvailable,
   onComposerChange,
   onComposerSubmit,
   onComposerStop,
   onNodePositionsChange,
+  onOpenPlannerInspector,
   onSelectNode,
   onInspectNode,
 }: {
@@ -1891,16 +1889,23 @@ function CanvasView({
   nodeActionBusy: Exclude<ComposerAction, null> | null;
   nodeActionError: string | null;
   nodeActionStatus: string | null;
+  plannerTerminalSessionId: string | null;
   workflowBackendAvailable: boolean;
   onComposerChange: (value: string) => void;
   onComposerSubmit: (action?: ComposerAction) => void;
   onComposerStop: () => void;
   onNodePositionsChange: (updates: CanvasNodePositionUpdate[]) => void;
+  onOpenPlannerInspector: () => void;
   onSelectNode: (nodeId: string | null) => void;
   onInspectNode: (nodeId: string) => void;
 }) {
   const nodeById = useMemo(() => new Map(session.nodes.map((node) => [node.id, node])), [session.nodes]);
   const selectedNodeId = selectedNode?.id ?? null;
+  const plannerSnapshot = useTerminalSnapshot(plannerTerminalSessionId, session.id);
+  const plannerStatus = useMemo(
+    () => plannerSessionStatusForSnapshot(plannerTerminalSessionId, plannerSnapshot),
+    [plannerSnapshot, plannerTerminalSessionId],
+  );
   const autoFitCanvas = shouldAutoFitCanvas(session.nodes) || Boolean(selectedNodeId);
   const fitPadding = selectedNodeId ? Math.max(canvasFitPadding(session.nodes), 0.4) : canvasFitPadding(session.nodes);
   const viewportSignature = `${canvasViewportSignature(session.nodes)}:${selectedNodeId ?? "none"}`;
@@ -1914,9 +1919,16 @@ function CanvasView({
         initialWidth: ENERGY_FRAME.width,
         initialHeight: ENERGY_FRAME.height,
         handles: agentNodeHandles(),
-        data: { node, composerSelected: node.id === selectedNodeId, onInspect: onInspectNode, onSelect: onSelectNode },
+        data: {
+          node,
+          composerSelected: node.id === selectedNodeId,
+          plannerStatus: node.id === session.plannerNodeId ? plannerStatus : null,
+          onInspect: onInspectNode,
+          onOpenPlannerInspector,
+          onSelect: onSelectNode,
+        },
       })),
-    [onInspectNode, onSelectNode, selectedNodeId, session.nodes],
+    [onInspectNode, onOpenPlannerInspector, onSelectNode, plannerStatus, selectedNodeId, session.nodes, session.plannerNodeId],
   );
   const edges = useMemo<AgentFlowEdge[]>(
     () =>
@@ -2059,7 +2071,9 @@ function mergeFlowNodeState(current: AgentFlowNode[], next: AgentFlowNode[]): Ag
       existing.position.y === node.position.y &&
       existing.data.node === node.data.node &&
       existing.data.composerSelected === node.data.composerSelected &&
+      existing.data.plannerStatus === node.data.plannerStatus &&
       existing.data.onInspect === node.data.onInspect &&
+      existing.data.onOpenPlannerInspector === node.data.onOpenPlannerInspector &&
       existing.data.onSelect === node.data.onSelect;
 
     if (canReuseExisting) return existing;
@@ -2213,6 +2227,7 @@ function AgentEdge({
 function AgentNode({ data }: NodeProps<AgentFlowNode>) {
   const node = data.node;
   const composerSelected = data.composerSelected;
+  const plannerStatus = data.plannerStatus;
   const rootRef = useRef<HTMLDivElement | null>(null);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const markerRef = useRef<HTMLSpanElement | null>(null);
@@ -2554,6 +2569,12 @@ function AgentNode({ data }: NodeProps<AgentFlowNode>) {
             {composerSelected && <span className="agent-node-target-badge">Composer target</span>}
           </div>
           <span className="agent-node-title">{node.title}</span>
+          {plannerStatus && (
+            <PlannerSessionStatus
+              status={plannerStatus}
+              onOpen={data.onOpenPlannerInspector}
+            />
+          )}
           <div className="agent-node-meta-row">
             <div className="agent-identity-pill">
               <span ref={statusDotRef} className="agent-dot status-dot" aria-hidden="true" />
@@ -2605,6 +2626,37 @@ function nodeMetadataForNode(node: CanvasNode): string {
   const dependencyCount = node.context.dependencies.length;
   const dependencyLabel = dependencyCount === 1 ? "1 dependency" : `${dependencyCount} dependencies`;
   return `${node.id} · ${dependencyLabel}`;
+}
+
+function PlannerSessionStatus({
+  status,
+  onOpen,
+}: {
+  status: PlannerSessionStatusChrome;
+  onOpen: () => void;
+}) {
+  return (
+    <div className={`planner-session-status ${status.tone}`} aria-label={`Hermes planner session ${status.label}`} title={status.detail}>
+      <span className="planner-session-dot" aria-hidden="true" />
+      <span className="planner-session-label">{status.label}</span>
+      <span className="planner-session-detail">{status.detail}</span>
+      {status.inspectable && (
+        <button
+          className="planner-session-inspect nodrag"
+          type="button"
+          title="Open planner inspector"
+          aria-label="Open planner inspector"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpen();
+          }}
+        >
+          <Eye size={12} aria-hidden="true" />
+          <span>Inspect</span>
+        </button>
+      )}
+    </div>
+  );
 }
 
 function AgentStreamPreview({ line, nodeId }: { line: StreamingLogLine; nodeId: string }) {
@@ -4134,34 +4186,14 @@ export function changeReviewSummary(node: CanvasNode, changeset: Changeset): str
   return `${agent} produced ${changeset.id} from git: ${changeset.diffStat.changed} ${fileLabel} ready for review.`;
 }
 
-type EvidenceDisplayFact = { label: string; value: string };
+type EvidenceDisplayFact = EvidenceSummaryFact;
 
 export function changeEvidenceFactsForDisplay(
   reconciliation: FinalChangesetReconciliation | null,
   changeset: Changeset,
   commitEvidence: DeliveryCommitSummary | null,
 ): EvidenceDisplayFact[] {
-  const status = reconciliation?.status ?? changeset.evidence?.status ?? "unknown";
-  const files = changeset.evidence?.files.length ? changeset.evidence.files : changeset.files;
-  const changedFileCount = changeset.diffStat.changed || files.length;
-  const fileLabel = changedFileCount === 1 ? "file" : "files";
-  const facts: EvidenceDisplayFact[] = [
-    { label: "Changeset status", value: status },
-    {
-      label: "Changed files",
-      value: files.length ? `${files.length} (${files.join(", ")})` : "None",
-    },
-    {
-      label: "Diff stat",
-      value: `+${changeset.diffStat.added} / -${changeset.diffStat.deleted} across ${changedFileCount} ${fileLabel}`,
-    },
-    { label: "Repo state", value: repoStateForChangeEvidence(status, reconciliation, changeset) },
-  ];
-
-  const commit = commitEvidenceForDisplay(commitEvidence);
-  if (commit) facts.push({ label: "Commit", value: commit });
-
-  return facts;
+  return summarizeRunEvidence({ reconciliation, changeset, commitEvidence }).changeFacts;
 }
 
 function ChangeEvidenceFacts({ facts }: { facts: EvidenceDisplayFact[] }) {
@@ -4175,27 +4207,6 @@ function ChangeEvidenceFacts({ facts }: { facts: EvidenceDisplayFact[] }) {
       ))}
     </dl>
   );
-}
-
-function repoStateForChangeEvidence(
-  status: string,
-  reconciliation: FinalChangesetReconciliation | null,
-  changeset: Changeset,
-): string {
-  if (status === "empty") return "Clean at collection";
-  if (status === "available" || status === "mismatch") return "Git changes recorded";
-  if (status === "failed") {
-    return reconciliation?.errorReason ?? changeset.evidence?.errorReason ?? "Collection failed";
-  }
-  return "Not recorded";
-}
-
-function commitEvidenceForDisplay(commitEvidence: DeliveryCommitSummary | null): string | null {
-  if (!commitEvidence) return null;
-  if (commitEvidence.commitSha && commitEvidence.branch) return `${shortSha(commitEvidence.commitSha)} on ${commitEvidence.branch}`;
-  if (commitEvidence.commitSha) return shortSha(commitEvidence.commitSha);
-  if (commitEvidence.branch) return commitEvidence.branch;
-  return commitEvidence.subject ?? null;
 }
 
 function changeEvidenceEmptyMessage(
@@ -4569,11 +4580,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function latestFailedCheckForDisplay(runEvidence: RunEvidence | null | undefined): string | null {
-  if (!runEvidence) return null;
-  const failedCheck = [...runEvidence.checks].reverse().find((check) => check.status === "failed");
-  if (!failedCheck) return null;
-  const detail = optionalText(failedCheck.detail);
-  return `${failedCheck.name}: ${failedCheck.status}${detail ? ` - ${detail}` : ""}`;
+  return summarizeRunEvidence({ runEvidence }).latestFailedCheck;
 }
 
 export function lastRunEvidenceForDisplay(runEvidence: RunEvidence | null | undefined): string | null {
@@ -4599,22 +4606,7 @@ export function affectedDownstreamSummaryForDisplay(
 }
 
 function runEvidenceFailureReason(runEvidence: RunEvidence): string | null {
-  if (runEvidence.status === "timed-out") {
-    const timeoutReason =
-      runEvidence.errorReason ??
-      runEvidence.checks.find((check) => check.kind === "run-timeout" && typeof check.detail === "string")?.detail ??
-      null;
-    return `Timeout: ${timeoutReason ?? "run timed out"}`;
-  }
-  if (runEvidence.status === "cancelled" || runEvidence.cancelReason) {
-    return `Cancelled: ${runEvidence.cancelReason ?? "run cancelled"}`;
-  }
-  if (runEvidence.errorReason) return `Error: ${runEvidence.errorReason}`;
-  if (runEvidence.status !== "failed") return null;
-  const failedCheck = latestFailedCheckForDisplay(runEvidence);
-  if (failedCheck) return `Check failed: ${failedCheck}`;
-  if (runEvidence.exitCode !== null && runEvidence.exitCode !== 0) return `Exit code ${runEvidence.exitCode}`;
-  return null;
+  return summarizeRunEvidence({ runEvidence }).reason;
 }
 
 function runEvidenceIsTerminalFailure(runEvidence: RunEvidence | null | undefined): runEvidence is RunEvidence {
@@ -4640,28 +4632,7 @@ function summarizeLaneIds(laneIds: string[]): string {
 }
 
 export function runEvidenceFactsForDisplay(runEvidence: RunEvidence): Array<{ label: string; value: string }> {
-  const facts = [
-    { label: "Run ID", value: runEvidence.runId },
-    { label: "Run status", value: runEvidence.status },
-    ...(runEvidence.exitCode !== null ? [{ label: "Exit code", value: String(runEvidence.exitCode) }] : []),
-    {
-      label: "Checks",
-      value: runEvidence.checks.length
-        ? runEvidence.checks.map((check) => `${check.kind} [${check.name}]: ${check.status}${check.detail ? ` - ${check.detail}` : ""}`).join(", ")
-        : "None",
-    },
-    {
-      label: "Artifacts",
-      value: runEvidence.artifacts.length
-        ? `${runEvidence.artifacts.length} (${runEvidence.artifacts.join(", ")})`
-        : "None",
-    },
-  ];
-
-  const reason = runEvidenceFailureReason(runEvidence);
-  if (reason) facts.push({ label: "Reason", value: reason });
-
-  return facts;
+  return summarizeRunEvidence({ runEvidence }).runFacts;
 }
 
 function RunEvidenceFacts({ runEvidence }: { runEvidence: RunEvidence }) {
@@ -5783,6 +5754,85 @@ async function openMockProject(): Promise<OpenProjectResult> {
   };
 }
 
+function plannerTerminalSessionId(session: CanvasSession): string | null {
+  const value = (session as CanvasSession & { hermesPlannerTerminalSessionId?: unknown }).hermesPlannerTerminalSessionId;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function useTerminalSnapshot(terminalSessionId: string | null, sessionId: string): TerminalSnapshotResult | null {
+  const [snapshot, setSnapshot] = useState<TerminalSnapshotResult | null>(null);
+
+  useEffect(() => {
+    let active = true;
+
+    if (!terminalSessionId) {
+      setSnapshot(null);
+      return () => {
+        active = false;
+      };
+    }
+
+    const boundTerminalSessionId = terminalSessionId;
+    const terminal = window.devflow?.terminal;
+    if (!terminal) {
+      setSnapshot(unavailableTerminalSnapshot(boundTerminalSessionId, "Terminal backend is unavailable."));
+      return () => {
+        active = false;
+      };
+    }
+    const terminalApi = terminal;
+
+    function refreshSnapshot() {
+      void terminalApi.snapshot({ terminalSessionId: boundTerminalSessionId }).then((result) => {
+        if (active) setSnapshot(result);
+      }).catch((error: unknown) => {
+        if (!active) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setSnapshot(unavailableTerminalSnapshot(boundTerminalSessionId, `Terminal error: ${message}`));
+      });
+    }
+
+    refreshSnapshot();
+    const unsubscribe = terminalApi.onEvent((event) => {
+      if (event.terminalSessionId === boundTerminalSessionId) refreshSnapshot();
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [sessionId, terminalSessionId]);
+
+  return snapshot;
+}
+
+function unavailableTerminalSnapshot(terminalSessionId: string, message: string): TerminalSnapshotResult {
+  return {
+    protocolVersion: 1,
+    terminalSessionId,
+    status: "unavailable",
+    sequence: 0,
+    rows: 0,
+    cols: 0,
+    cursor: { row: 0, col: 0 },
+    lines: [],
+    message,
+  };
+}
+
+function unboundTerminalSnapshot(): TerminalSnapshotResult {
+  return {
+    protocolVersion: 1,
+    terminalSessionId: "unbound",
+    status: "unavailable",
+    sequence: 0,
+    rows: 24,
+    cols: 80,
+    cursor: { row: 0, col: 0 },
+    lines: [{ sequence: 0, stream: "stderr", text: "No terminal session bound." }],
+  };
+}
+
 function TerminalInspector({
   session,
   terminalSessionId,
@@ -5792,70 +5842,8 @@ function TerminalInspector({
   terminalSessionId: string | null;
   onClose: () => void;
 }) {
-  const [snapshot, setSnapshot] = useState<TerminalSnapshotResult | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    if (!terminalSessionId) {
-      setSnapshot({
-        protocolVersion: 1,
-        terminalSessionId: "unbound",
-        status: "unavailable",
-        sequence: 0,
-        rows: 24,
-        cols: 80,
-        cursor: { row: 0, col: 0 },
-        lines: [{ sequence: 0, stream: "stderr", text: "No terminal session bound." }],
-      });
-      return;
-    }
-
-    if (window.devflow?.terminal) {
-      void window.devflow.terminal.snapshot({ terminalSessionId }).then((res) => {
-        if (active) setSnapshot(res);
-      }).catch((err: any) => {
-        if (active) {
-          setSnapshot({
-            protocolVersion: 1,
-            terminalSessionId,
-            status: "unavailable",
-            sequence: 0,
-            rows: 24,
-            cols: 80,
-            cursor: { row: 0, col: 0 },
-            lines: [{ sequence: 0, stream: "stderr", text: `Terminal error: ${err.message}` }],
-          });
-        }
-      });
-
-      const unsubscribe = window.devflow.terminal.onEvent((event) => {
-        if (event.terminalSessionId === terminalSessionId) {
-           void window.devflow!.terminal.snapshot({ terminalSessionId }).then(res => {
-             if (active) setSnapshot(res);
-           });
-        }
-      });
-      return () => {
-        active = false;
-        unsubscribe();
-      };
-    } else {
-      setSnapshot({
-        protocolVersion: 1,
-        terminalSessionId,
-        status: "waiting",
-        sequence: 1,
-        rows: 24,
-        cols: 80,
-        cursor: { row: 2, col: 0 },
-        lines: [
-          { sequence: 0, stream: "stdout", text: "Starting mock Hermes terminal session..." },
-          { sequence: 1, stream: "stdout", text: `Attached to session: ${terminalSessionId}` },
-        ],
-      });
-    }
-    return () => { active = false; };
-  }, [session.id, terminalSessionId]);
+  const liveSnapshot = useTerminalSnapshot(terminalSessionId, session.id);
+  const snapshot = terminalSessionId ? liveSnapshot : unboundTerminalSnapshot();
 
   return (
     <div className="terminal-inspector">

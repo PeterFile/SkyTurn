@@ -76,6 +76,179 @@ test("New Session UI acceptance keeps the verification script as fixed evidence"
   }
 });
 
+test("New Session UI acceptance reports required real-run acceptance fields", async () => {
+  const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
+
+  assert.match(source, /mockFallback/);
+  assert.match(source, /sessionTarget/);
+  assert.match(source, /verificationCommand/);
+  assert.match(source, /commitSha/);
+  assert.match(source, /gitStatus/);
+  assert.match(source, /clean/);
+  assert.match(source, /verificationScriptHashUnchanged/);
+  assert.match(source, /captureScriptHashUnchanged/);
+  assert.match(source, /unexpectedChangedFiles/);
+});
+
+test("New Session UI acceptance guards both fixed validation scripts by checksum", async () => {
+  const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
+
+  assert.match(source, /expectedVerifyScriptHash/);
+  assert.match(source, /expectedCaptureScriptHash/);
+  assert.match(source, /actualVerifyScriptHash/);
+  assert.match(source, /actualCaptureScriptHash/);
+  assert.match(source, /captureScriptHashUnchanged/);
+});
+
+test("New Session UI acceptance success requires current branch and real Hermes plus Codex evidence", async () => {
+  const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
+
+  assert.match(source, /sessionTarget\?\.executionTarget === "current_branch"/);
+  assert.match(source, /hasSuccessfulRunEvidenceForAgent\(session, workspace, "hermes"\)/);
+  assert.match(source, /hasSuccessfulRunEvidenceForAgent\(session, workspace, "codex"\)/);
+});
+
+test("New Session UI acceptance bounds verification command output", async () => {
+  const { boundedCommandOutput } = await import("./newSessionUiAcceptance.mjs");
+  const summary = boundedCommandOutput({
+    code: 7,
+    stdout: "a".repeat(5200),
+    stderr: "b".repeat(5201),
+  }, 128);
+
+  assert.equal(summary.code, 7);
+  assert.equal(summary.stdout.length, 128);
+  assert.equal(summary.stderr.length, 128);
+  assert.equal(summary.stdoutBytes, 5200);
+  assert.equal(summary.stderrBytes, 5201);
+  assert.equal(summary.stdoutTruncated, true);
+  assert.equal(summary.stderrTruncated, true);
+});
+
+test("New Session UI acceptance rejects unexpected files from any delivery commit since baseline", async () => {
+  const { deliveryFileRangeVerification } = await import("./newSessionUiAcceptance.mjs");
+  const baselineCommitSha = "a".repeat(40);
+  const headCommitSha = "b".repeat(40);
+
+  const result = deliveryFileRangeVerification({
+    baselineCommitSha,
+    headCommitSha,
+    changedFilesSinceBaseline: [
+      "src/App.jsx",
+      "package.json",
+      "src/App.css",
+      "src/App.jsx",
+    ],
+    expectedChangedFiles: ["src/App.css", "src/App.jsx"],
+  });
+
+  assert.equal(result.baselineCommitSha, baselineCommitSha);
+  assert.equal(result.headCommitSha, headCommitSha);
+  assert.deepEqual(result.changedFiles, ["package.json", "src/App.css", "src/App.jsx"]);
+  assert.deepEqual(result.unexpectedChangedFiles, ["package.json"]);
+  assert.deepEqual(result.missingChangedFiles, []);
+  assert.equal(result.ok, false);
+});
+
+test("New Session UI acceptance collects delivery files from baseline range, not the last commit", async () => {
+  const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
+
+  assert.match(source, /baselineCommitSha/);
+  assert.doesNotMatch(source, /HEAD~1\.\.HEAD/);
+});
+
+test("New Session UI acceptance returns structured failed workflow result with latest evidence", async () => {
+  const { workflowTerminalFailureResult } = await import("./newSessionUiAcceptance.mjs");
+  const failedEvidence = {
+    runId: "run-codex-1",
+    status: "failed",
+    exitCode: 1,
+    changesetId: null,
+    checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "failed", detail: "exit 1" }],
+    artifacts: [],
+    review: null,
+    errorReason: "tests failed",
+    cancelReason: null,
+    completedAt: "2026-07-06T00:00:00.000Z",
+  };
+  const workspace = {
+    activeSessionId: "session-1",
+    sessions: [{
+      id: "session-1",
+      kind: "canvas",
+      plannerNodeId: "node-hermes",
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+      nodes: [{
+        id: "node-codex",
+        runId: "run-codex-1",
+        agent: "codex",
+        title: "Implement UI",
+        status: "failed",
+        display: { meta: ["flow-kernel", "implementation"] },
+      }],
+    }],
+    runEvidence: { "run-codex-1": failedEvidence },
+  };
+
+  const result = workflowTerminalFailureResult({
+    projectRoot: "/tmp/project",
+    readiness: { status: "ready", checks: { mockFallback: false } },
+    workspacePath: "/tmp/workspace.json",
+    workspace,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure.code, "WORKFLOW_RUN_FAILED");
+  assert.equal(result.projectRoot, "/tmp/project");
+  assert.equal(result.workspacePath, "/tmp/workspace.json");
+  assert.equal(result.latestWorkspace, workspace);
+  assert.equal(result.runEvidence["run-codex-1"].status, "failed");
+  assert.equal(result.runEvidence["run-codex-1"].exitCode, 1);
+  assert.equal(result.agentRunEvidence.codex[0].runId, "run-codex-1");
+  assert.equal(result.agentRunEvidence.codex[0].evidenceRunId, "run-codex-1");
+  assert.deepEqual(result.laneStatuses.map((node) => node.status), ["failed"]);
+});
+
+test("New Session UI acceptance agent evidence requires matching runId and CLI exit check", async () => {
+  const { hasSuccessfulRunEvidenceForAgent } = await import("./newSessionUiAcceptance.mjs");
+  const session = {
+    plannerNodeId: "node-hermes",
+    nodes: [{
+      id: "node-hermes",
+      runId: "run-hermes-1",
+      agent: "hermes",
+      title: "Plan workflow",
+      status: "completed",
+      display: { meta: ["flow-kernel", "planner"] },
+    }],
+  };
+  const baseEvidence = {
+    runId: "run-hermes-1",
+    status: "succeeded",
+    exitCode: 0,
+    changesetId: null,
+    checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit 0" }],
+    artifacts: [],
+    review: null,
+    errorReason: null,
+    cancelReason: null,
+    completedAt: "2026-07-06T00:00:00.000Z",
+  };
+
+  assert.equal(hasSuccessfulRunEvidenceForAgent(session, {
+    runEvidence: { "run-hermes-1": { ...baseEvidence, runId: "run-stale" } },
+  }, "hermes"), false);
+  assert.equal(hasSuccessfulRunEvidenceForAgent(session, {
+    runEvidence: { "run-hermes-1": { ...baseEvidence, checks: [{ kind: "test", name: "unit", status: "passed" }] } },
+  }, "hermes"), false);
+  assert.equal(hasSuccessfulRunEvidenceForAgent(session, {
+    runEvidence: { "run-hermes-1": { ...baseEvidence, checks: [{ kind: "run-exit", name: "Mock adapter exit", status: "passed" }] } },
+  }, "hermes"), false);
+  assert.equal(hasSuccessfulRunEvidenceForAgent(session, {
+    runEvidence: { "run-hermes-1": baseEvidence },
+  }, "hermes"), true);
+});
+
 test("New Session UI acceptance reports and cleans Electron launch failures", async () => {
   const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
 

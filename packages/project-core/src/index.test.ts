@@ -12,6 +12,7 @@ import {
   WORKFLOW_LANE_KINDS,
   deriveNodeStatusFromEvidence,
   hasConcreteRunEvidence,
+  summarizeRunEvidence,
   summarizeAgentReadiness,
   type FinalChangesetReconciliation,
   type AgentDescriptor,
@@ -82,6 +83,22 @@ function agentDescriptor(input: Partial<AgentDescriptor> & Pick<AgentDescriptor,
     capabilities: input.capabilities ?? ["chat"],
     configFiles: input.configFiles ?? [],
     ...(input.readiness !== undefined ? { readiness: input.readiness } : {}),
+  };
+}
+
+function runEvidence(overrides: Partial<RunEvidence> = {}): RunEvidence {
+  return {
+    runId: "run-1",
+    status: "succeeded",
+    exitCode: 0,
+    changesetId: null,
+    checks: [],
+    artifacts: [],
+    review: null,
+    errorReason: null,
+    cancelReason: null,
+    completedAt: "2026-07-01T00:00:00.000Z",
+    ...overrides,
   };
 }
 
@@ -403,6 +420,119 @@ describe("agent run contracts", () => {
     expect(Object.keys(stableNodeStatusContract).sort()).toEqual(["completed", "failed", "pending", "retrying", "running"]);
     expect(hasConcreteRunEvidence(evidence)).toBe(false);
     expect(status).toBe("failed");
+  });
+
+  it("summarizes empty run evidence without inventing facts", () => {
+    const summary = summarizeRunEvidence({});
+
+    expect(summary.run.status).toBe("unknown");
+    expect(summary.run.exitCode).toBeNull();
+    expect(summary.reason).toBeNull();
+    expect(summary.checkSummary).toBe("None");
+    expect(summary.artifactSummary).toBe("None");
+    expect(summary.changeFacts).toEqual([
+      { label: "Changeset status", value: "unknown" },
+      { label: "Changed files", value: "None" },
+      { label: "Diff stat", value: "+0 / -0 across 0 files" },
+      { label: "Repo state", value: "Not recorded" },
+    ]);
+  });
+
+  it("summarizes partial run evidence from structured fields only", () => {
+    const summary = summarizeRunEvidence({
+      runEvidence: runEvidence({
+        status: "running",
+        exitCode: null,
+        checks: [{ kind: "test", name: "unit", status: "passed", detail: "1 passed" }],
+        artifacts: [],
+      }),
+    });
+
+    expect(summary.runFacts).toEqual([
+      { label: "Run ID", value: "run-1" },
+      { label: "Run status", value: "running" },
+      { label: "Checks", value: "test [unit]: passed - 1 passed" },
+      { label: "Artifacts", value: "None" },
+    ]);
+    expect(summary.latestFailedCheck).toBeNull();
+  });
+
+  it("summarizes failed, cancelled, and timed-out reasons", () => {
+    expect(summarizeRunEvidence({
+      runEvidence: runEvidence({
+        status: "failed",
+        exitCode: 1,
+        errorReason: "tests failed",
+      }),
+    }).reason).toBe("Error: tests failed");
+
+    expect(summarizeRunEvidence({
+      runEvidence: runEvidence({
+        status: "cancelled",
+        exitCode: null,
+        cancelReason: "user stopped run",
+      }),
+    }).reason).toBe("Cancelled: user stopped run");
+
+    expect(summarizeRunEvidence({
+      runEvidence: runEvidence({
+        status: "timed-out",
+        exitCode: null,
+        checks: [{ kind: "run-timeout", name: "watchdog", status: "failed", detail: "watchdog expired" }],
+      }),
+    }).reason).toBe("Timeout: watchdog expired");
+  });
+
+  it("summarizes artifact evidence from run evidence or explicit expected artifacts", () => {
+    expect(summarizeRunEvidence({
+      runEvidence: runEvidence({ artifacts: [".devflow/output.md"] }),
+      expectedArtifacts: [".devflow/expected.md"],
+    }).artifactSummary).toBe("1 (.devflow/output.md)");
+
+    expect(summarizeRunEvidence({
+      expectedArtifacts: [".devflow/expected.md"],
+    }).artifactSummary).toBe("1 expected (.devflow/expected.md)");
+  });
+
+  it("summarizes commit, changed-file, repo-state, and review evidence", () => {
+    const summary = summarizeRunEvidence({
+      runEvidence: runEvidence({
+        review: { kind: "review", name: "Architecture review", status: "passed", detail: "no blockers" },
+      }),
+      changeset: {
+        id: "changeset-1",
+        files: ["src/index.ts"],
+        diffStat: { added: 3, changed: 1, deleted: 1 },
+        patchPreview: "diff --git",
+        source: "git",
+        evidence: {
+          evidenceId: "changeset-evidence-1",
+          changesetId: "changeset-1",
+          source: "git",
+          status: "available",
+          files: ["src/index.ts"],
+          diffStat: { added: 3, changed: 1, deleted: 1 },
+          patchPreviewTruncated: false,
+        },
+      },
+      commitEvidence: {
+        commitSha: "abcdef1234567890",
+        branch: "feat/evidence",
+      },
+    });
+
+    expect(summary.reviewSummary).toBe("review [Architecture review]: passed - no blockers");
+    expect(summary.runFacts).toContainEqual({
+      label: "Review",
+      value: "review [Architecture review]: passed - no blockers",
+    });
+    expect(summary.changeFacts).toEqual([
+      { label: "Changeset status", value: "available" },
+      { label: "Changed files", value: "1 (src/index.ts)" },
+      { label: "Diff stat", value: "+3 / -1 across 1 file" },
+      { label: "Repo state", value: "Git changes recorded" },
+      { label: "Commit", value: "abcdef1 on feat/evidence" },
+    ]);
   });
 
   it("exports canonical workflow lane semantics for natural flow contracts", () => {

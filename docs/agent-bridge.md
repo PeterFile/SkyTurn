@@ -65,7 +65,7 @@ The Codex adapter follows the Hermes `skills/autonomous-ai-agents/codex` boundar
 
 - Run inside a git repository.
 - Use `codex exec` for one-shot tasks.
-- Keep long-running interactive/PTTY orchestration out of the MVP bridge.
+- Keep long-running interactive/PTY orchestration out of the MVP bridge.
 - Do not treat missing `OPENAI_API_KEY` alone as missing auth, because Codex CLI may use its own OAuth cache.
 
 SkyTurn uses the non-interactive JSONL path:
@@ -82,8 +82,17 @@ Codex stdout is parsed as newline-delimited JSON when possible. `item.completed`
 
 For code-change display, the adapter should prefer structured Codex change events over text. The design target follows Codex TUI: patch/file-change events and per-turn diff events feed the live Changes view, while git-backed reconciliation supplies final changeset evidence.
 
+## PTY Boundary
+
+PTY transport is scoped to Hermes planner status, inspection, and explicit takeover. It is not the Codex default executor, not a global terminal dashboard, and not a completion source.
+
+The default executor paths remain non-interactive adapters: Hermes uses `hermes chat -q`, and Codex uses `codex exec --json`. Without a stable Hermes opaque handle, Hermes continuity is replay recovery from SkyTurn workflow events and checkpoints, not the same native Hermes session.
+
+Terminal text is runtime output only. Completion still comes from `RunEvidence`, workflow events, git/worktree reconciliation, checks, artifacts, review evidence, or commit evidence.
+
 ## Roadmap
 
 - Done: contracts, bridge skeleton, mock runs, discovery with `supportLevel`, durable event log, docs.
 - Done: Hermes and Codex CLI real adapters behind `experimental-run` for the desktop workflow path.
-- Next: harden adapters toward `supported-run`, improve resume/continuation behavior, and move multi-window/shared process concerns behind an independent lightweight bridge process.
+- Partial: PTY contracts, feature-gated Hermes planner transport, snapshots, redaction, timeout/cancel evidence, and fake-factory tests.
+- Next: harden adapters toward `supported-run`, improve resume/continuation behavior, keep PTY limited to planner inspect/takeover, and move multi-window/shared process concerns behind an independent lightweight bridge process.

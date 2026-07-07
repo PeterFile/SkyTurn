@@ -5,6 +5,7 @@ import type { AgentRun, CanvasNode, CanvasSession, ImportedProject, RunEvent, Ru
 
 import * as WorkflowRuntime from "./workflowRuntime.js";
 import {
+  applyBridgeRunResult,
   buildPromptForNodeRun,
   claimCompletedBridgeRunPersistence,
   mergeRunEventsIntoWorkspace,
@@ -554,6 +555,66 @@ describe("workflow runtime event merging", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it.each([
+    ["planner root", "node-1", "hermes", "succeeded", "completed"],
+    ["planner root", "node-1", "hermes", "failed", "failed"],
+    ["planner root", "node-1", "hermes", "cancelled", "failed"],
+    ["planner root", "node-1", "hermes", "timed-out", "failed"],
+    ["executor node", "lane-implementation", "codex", "succeeded", "completed"],
+    ["executor node", "lane-implementation", "codex", "failed", "failed"],
+    ["executor node", "lane-implementation", "codex", "cancelled", "failed"],
+    ["executor node", "lane-implementation", "codex", "timed-out", "failed"],
+  ] as const)(
+    "keeps %s status from terminal run evidence instead of stale optimistic session state on %s",
+    (_label, nodeId, agentKind, runStatus, expectedStatus) => {
+      const executor = makeNode({
+        id: "lane-implementation",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-implementation",
+        meta: ["implementation", "lane-implementation", "flow-kernel"],
+      });
+      const session = makeSession([executor]);
+      const runId = nodeId === "node-1" ? "run-session-1-node-1" : "run-session-1-lane-implementation";
+      const staleOptimisticSession: CanvasSession = {
+        ...session,
+        nodes: session.nodes.map((node) =>
+          node.id === nodeId
+            ? {
+                ...node,
+                status: "running",
+                progress: "Optimistic local state",
+                runtime: { phase: "Executing", message: "Optimistic local state", action: "running" },
+              }
+            : node,
+        ),
+      };
+      const evidence = runEvidenceFor(runId, runStatus);
+
+      const next = applyBridgeRunResult(makeWorkspace([executor]), {
+        run: {
+          id: runId,
+          nodeId,
+          sessionId: session.id,
+          projectRoot: "/tmp/project",
+          worktreePath: "/tmp/project",
+          agentKind,
+          status: runStatus,
+          startedAt: "2026-06-10T00:00:00.000Z",
+          endedAt: "2026-06-10T00:00:01.000Z",
+        },
+        events: runEventsForEvidence(runId, evidence),
+        evidence,
+        workflowSession: staleOptimisticSession,
+      });
+
+      const nextSession = next.sessions[0] as CanvasSession;
+      const node = nextSession.nodes.find((candidate) => candidate.id === nodeId);
+      expect(node?.status).toBe(expectedStatus);
+      expect(next.runEvidence[runId]?.status).toBe(runStatus);
+    },
+  );
 
   it("claims completed bridge run persistence once per run", () => {
     const workspace = makeWorkspace();
@@ -2147,4 +2208,44 @@ function event(
     payload,
     timestamp: `2026-06-10T00:00:0${seq}.000Z`,
   };
+}
+
+function runEvidenceFor(runId: string, status: RunEvidence["status"]): RunEvidence {
+  const succeeded = status === "succeeded";
+  const cancelled = status === "cancelled";
+  const timedOut = status === "timed-out";
+  return {
+    runId,
+    status,
+    exitCode: succeeded ? 0 : status === "failed" ? 1 : null,
+    changesetId: null,
+    checks: [
+      {
+        kind: timedOut ? "run-timeout" : "run-exit",
+        name: timedOut ? "Run timeout" : "Agent CLI exit",
+        status: succeeded ? "passed" : cancelled ? "skipped" : "failed",
+        detail: succeeded ? "exit 0" : `${status}`,
+      },
+    ],
+    artifacts: [],
+    review: null,
+    errorReason: status === "failed" || timedOut ? `${status}` : null,
+    cancelReason: cancelled ? "user cancelled" : null,
+    completedAt: "2026-06-10T00:00:01.000Z",
+  };
+}
+
+function runEventsForEvidence(runId: string, evidence: RunEvidence): RunEvent[] {
+  return [
+    event(runId, 1, "evidence", {
+      exitCode: evidence.exitCode,
+      checks: evidence.checks,
+      artifacts: evidence.artifacts,
+    }),
+    event(runId, 2, "status", {
+      status: evidence.status,
+      exitCode: evidence.exitCode,
+      reason: evidence.cancelReason ?? undefined,
+    }),
+  ];
 }
