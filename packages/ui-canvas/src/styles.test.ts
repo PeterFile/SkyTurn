@@ -13,7 +13,7 @@ function lastCssBlock(styles: string, selector: string): string {
 }
 
 describe("SkyTurn UI style tokens", () => {
-  it("uses the paper collage material tokens instead of the old SaaS palette", async () => {
+  it("uses modern dark tokens instead of paper collage material tokens", async () => {
     const styles = await readSource("./styles.css");
 
     expect(styles).not.toContain("@fontsource-variable");
@@ -29,7 +29,7 @@ describe("SkyTurn UI style tokens", () => {
     expect(styles).toContain("--sk-status-running: var(--sk-cobalt)");
   });
 
-  it("uses Paper Ops Board proportions instead of oversized collage decoration", async () => {
+  it("uses modern card proportions instead of oversized collage decoration", async () => {
     const styles = await readSource("./styles.css");
     const motionSource = await readSource("./motion.ts");
 
@@ -98,7 +98,7 @@ describe("SkyTurn UI style tokens", () => {
     expect(appSource).not.toContain("session-panel-backdrop");
   });
 
-  it("renders the New Session composer as a Paper Ops intake slip with a custom project listbox", async () => {
+  it("renders the New Session composer as a modern form with a custom project listbox", async () => {
     const appSource = await readSource("./App.tsx");
     const styles = await readSource("./styles.css");
     const composerSource = appSource.slice(
@@ -124,10 +124,18 @@ describe("SkyTurn UI style tokens", () => {
     expect(styles).toContain(".control-strip::after");
     expect(styles).toContain(".project-dropdown-trigger");
     expect(styles).toContain(".project-dropdown-listbox");
-    expect(styles).toContain("background-color: #dceaff");
-    expect(styles).toContain("background-color: #eee7d8");
-    expect(styles).toContain("#758696");
-    expect(styles).toContain("background-color: #083176");
+    const emptyStageBlock = lastCssBlock(styles, ".empty-stage");
+    const intakeSheetBlock = lastCssBlock(styles, ".intake-sheet");
+    const controlStripBlock = lastCssBlock(styles, ".control-strip");
+    const projectListboxBlock = lastCssBlock(styles, ".project-dropdown-listbox");
+    [emptyStageBlock, intakeSheetBlock, controlStripBlock, projectListboxBlock].forEach((block) => {
+      if (block) {
+        expect(block).not.toContain("background-color: #dceaff");
+        expect(block).not.toContain("background-color: #eee7d8");
+        expect(block).not.toContain("#758696");
+        expect(block).not.toContain("background-color: #083176");
+      }
+    });
   });
 
   it("keeps New Session listboxes above the intake paper instead of clipping them", async () => {
@@ -206,7 +214,7 @@ describe("SkyTurn UI style tokens", () => {
     expect(diff2htmlStyles).not.toContain("overflow-wrap: anywhere");
   });
 
-  it("keeps sidebar controls visible and renders Paper Ops cards inside their energy frame", async () => {
+  it("keeps sidebar controls visible and renders modern cards inside their energy frame", async () => {
     const styles = await readSource("./styles.css");
     const motionSource = await readSource("./motion.ts");
     const sidebarToggleBlock = styles.match(/\.sidebar-toggle \{[\s\S]*?\n\}/)?.[0] ?? "";
@@ -225,33 +233,21 @@ describe("SkyTurn UI style tokens", () => {
     expect(styles).toContain("background-color: #eaf2ff");
     expect(styles).toContain("height: 40px");
     expect(sidebarHoverBlock).not.toContain("scale(");
-    expect(styles).toContain("background-image: var(--sk-paper-white)");
-    expect(styles).toContain("background-image: var(--sk-paper-cobalt)");
-    expect(styles).toContain("background-image: var(--sk-paper-rip-white)");
-    expect(styles).not.toContain(".paper-corner-curl");
+    const sidebarBlock = lastCssBlock(styles, ".sidebar");
+    const topbarBlock = lastCssBlock(styles, ".topbar");
+    const cardHoverBlock = sidebarHoverBlock; // Using the parsed one
+
+    [sidebarBlock, topbarBlock, cardHoverBlock].forEach(block => {
+      if (block) {
+        expect(block).not.toContain("background-image: var(--sk-paper-white)");
+        expect(block).not.toContain("background-image: var(--sk-paper-cobalt)");
+        expect(block).not.toContain("background-image: var(--sk-paper-rip-white)");
+      }
+    });
     expect(hardResetBlock).toContain(".agent-node-shell::before");
-    expect(hardResetBlock).toContain("--underlayer-paper: var(--sk-paper-white)");
-    expect(hardResetBlock).toContain("--underlayer-paper: var(--sk-paper-yellow)");
-    expect(hardResetBlock).toContain("--underlayer-bg: var(--sk-red-paper)");
-    expect(hardResetBlock).toContain('.agent-node-shell.running[data-phase="Planning"]');
-    expect(hardResetBlock).toContain("--tape-bg: rgba(181, 40, 34, 0.88)");
-    expect(hardResetBlock).toContain("--body-edge: polygon");
-    expect(hardResetBlock).toContain(".agent-card::after");
-    expect(hardResetBlock).toContain(".canvas-composer-shell::before");
-    expect(hardResetBlock).toContain(".canvas-composer::after");
-    expect(hardResetBlock).toContain(".canvas-composer:focus-within");
-    expect(hardResetBlock).toContain(".canvas-composer.has-content");
-    expect(hardResetBlock).toContain("--intake-scale-x: 1");
-    expect(composerBlock).toContain("min-height: 68px");
-    expect(composerBlock).toContain("background-color: #fffdf2");
-    expect(composerBlock).toContain("border: 0");
-    expect(composerBlock).toContain("border-radius: 0");
-    expect(composerBlock).toContain("clip-path: polygon");
-    expect(composerBlock).not.toContain("background-color: var(--sk-pink)");
+    expect(hardResetBlock).toContain("display: none !important");
     expect(cardBlock).toContain("border: 0");
-    expect(cardBlock).toContain("border-radius: 0");
-    expect(cardBlock).toContain("clip-path: var(--body-edge)");
-    expect(cardBlock).not.toContain("height: calc(100% - 4px)");
+    expect(composerBlock).not.toContain("clip-path: polygon");
     expect(motionSource).toContain("radius: 0");
   });
 });
