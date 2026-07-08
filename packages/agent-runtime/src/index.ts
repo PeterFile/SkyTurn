@@ -73,6 +73,13 @@ export const agentAdapterContracts: AgentAdapterContract[] = [
     capabilities: ["chat", "file-read", "file-write", "shell", "mcp", "worktree"],
   },
   {
+    kind: "agy",
+    label: "Antigravity CLI",
+    nativeConfigFiles: [],
+    supportLevel: "detected-only",
+    capabilities: ["chat"],
+  },
+  {
     kind: "gemini",
     label: "Gemini",
     nativeConfigFiles: ["GEMINI.md"],

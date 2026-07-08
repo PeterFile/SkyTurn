@@ -1,6 +1,6 @@
 export type WorkflowMode = "fast" | "plan";
 export type SessionKind = "plan" | "canvas";
-export type AgentKind = "hermes" | "codex" | "gemini" | "claude-code" | "openclaw";
+export type AgentKind = "hermes" | "codex" | "agy" | "gemini" | "claude-code" | "openclaw";
 export type NodeStatus = "pending" | "running" | "retrying" | "completed" | "failed";
 export type NodeRollbackStatus = "rolled_back" | "inactive" | "rejected";
 export type NodeLifecyclePhase =

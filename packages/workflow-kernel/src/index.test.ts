@@ -262,7 +262,7 @@ describe("Flow Kernel intent compiler", () => {
     ]);
   });
 
-  it("strips untrusted runtime controls from Hermes lane suggestions", () => {
+  it("strips untrusted runtime controls from Hermes lane suggestions while preserving agy agent kind", () => {
     const parsed = parseWorkflowIntent(
       JSON.stringify({
         intentId: "intent-untrusted-policy",
@@ -277,7 +277,7 @@ describe("Flow Kernel intent compiler", () => {
                 kind: "validation",
                 laneKind: "validation",
                 title: "Run tests",
-                agentKind: "codex",
+                agentKind: "agy",
                 executable: false,
                 runtimePolicy: {
                   source: "workflow_projection",
@@ -303,6 +303,7 @@ describe("Flow Kernel intent compiler", () => {
     const projected = projection.lanes.find((lane) => lane.id === "lane-validation");
 
     expect(projected).toMatchObject({
+      agentKind: "agy",
       executable: true,
       runtimePolicy: {
         executable: true,
