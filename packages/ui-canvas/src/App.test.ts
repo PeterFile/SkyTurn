@@ -482,6 +482,8 @@ describe("UI source validation", () => {
     expect(canvasView).toContain("<AgentReadinessBlock");
     expect(canvasView).toContain("readiness={agentReadiness}");
     expect(appSource).toContain("function AgentReadinessBlock");
+    expect(appSource).toContain("Antigravity CLI");
+    expect(appSource).toContain("optional detected-only design agent");
     expect(appSource).toContain("Real loop ready");
     expect(appSource).toContain("Mock fallback only");
   });

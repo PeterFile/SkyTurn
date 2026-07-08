@@ -241,6 +241,7 @@ export type AgentWorkflowReadinessCheckStatus = "ready" | "missing" | "unknown";
 export type AgentWorkflowReadinessReason =
   | "hermes-cli-missing"
   | "codex-cli-missing"
+  | "agy-cli-missing"
   | "hermes-auth-missing"
   | "codex-auth-missing"
   | "hermes-auth-unknown"
@@ -252,6 +253,7 @@ export type AgentWorkflowReadinessReason =
 export interface AgentWorkflowReadinessChecks {
   hermesCli: AgentWorkflowReadinessCheckStatus;
   codexCli: AgentWorkflowReadinessCheckStatus;
+  agyCli: AgentWorkflowReadinessCheckStatus;
   hermesAuth: AgentAuthReadinessStatus;
   codexAuth: AgentAuthReadinessStatus;
   mockFallback: boolean;
@@ -268,9 +270,11 @@ export interface AgentWorkflowReadinessSummary {
 export function summarizeAgentReadiness(agents: readonly AgentDescriptor[]): AgentWorkflowReadinessSummary {
   const hermes = agentByKind(agents, "hermes");
   const codex = agentByKind(agents, "codex");
+  const agy = agentByKind(agents, "agy");
   const checks: AgentWorkflowReadinessChecks = {
     hermesCli: agentCliCheck(hermes),
     codexCli: agentCliCheck(codex),
+    agyCli: agentCliCheck(agy),
     hermesAuth: agentAuthCheck(hermes),
     codexAuth: agentAuthCheck(codex),
     mockFallback: agents.some((agent) => agent.supportLevel === "mock-only"),
@@ -279,6 +283,7 @@ export function summarizeAgentReadiness(agents: readonly AgentDescriptor[]): Age
 
   if (checks.hermesCli === "missing") reasons.push("hermes-cli-missing");
   if (checks.codexCli === "missing") reasons.push("codex-cli-missing");
+  if (checks.agyCli === "missing") reasons.push("agy-cli-missing");
   if (checks.hermesAuth === "missing") reasons.push("hermes-auth-missing");
   if (checks.codexAuth === "missing") reasons.push("codex-auth-missing");
   if (checks.hermesAuth === "unknown") reasons.push("hermes-auth-unknown");
@@ -295,7 +300,10 @@ export function summarizeAgentReadiness(agents: readonly AgentDescriptor[]): Age
     return {
       status: "mock-only",
       runSupport: "mock-only",
-      message: "Mock fallback only; install and authenticate Hermes and Codex for real workflow runs.",
+      message: agentReadinessMessage(
+        "Mock fallback only; install and authenticate Hermes and Codex for real workflow runs.",
+        checks,
+      ),
       reasons: uniqueReadinessReasons(reasons),
       checks,
     };
@@ -308,7 +316,7 @@ export function summarizeAgentReadiness(agents: readonly AgentDescriptor[]): Age
     return {
       status: "blocked",
       runSupport: "unavailable",
-      message: blockedAgentReadinessMessage(checks),
+      message: agentReadinessMessage(blockedAgentReadinessMessage(checks), checks),
       reasons: uniqueReadinessReasons(reasons),
       checks,
     };
@@ -318,7 +326,10 @@ export function summarizeAgentReadiness(agents: readonly AgentDescriptor[]): Age
     return {
       status: "blocked",
       runSupport: "unavailable",
-      message: "Hermes and Codex CLI readiness could not be verified for real workflow runs.",
+      message: agentReadinessMessage(
+        "Hermes and Codex CLI readiness could not be verified for real workflow runs.",
+        checks,
+      ),
       reasons: uniqueReadinessReasons(reasons),
       checks,
     };
@@ -328,7 +339,10 @@ export function summarizeAgentReadiness(agents: readonly AgentDescriptor[]): Age
     return {
       status: "degraded",
       runSupport: realExperimental ? "experimental-run" : "supported-run",
-      message: "Real loop available in experimental mode; verify agent auth before relying on long runs.",
+      message: agentReadinessMessage(
+        "Real loop available in experimental mode; verify agent auth before relying on long runs.",
+        checks,
+      ),
       reasons: uniqueReadinessReasons(reasons),
       checks,
     };
@@ -337,7 +351,7 @@ export function summarizeAgentReadiness(agents: readonly AgentDescriptor[]): Age
   return {
     status: "ready",
     runSupport: "supported-run",
-    message: "Real loop ready.",
+    message: agentReadinessMessage("Real loop ready.", checks),
     reasons: uniqueReadinessReasons(reasons),
     checks,
   };
@@ -368,6 +382,11 @@ function blockedAgentReadinessMessage(checks: AgentWorkflowReadinessChecks): str
   if (checks.hermesAuth === "missing") return "Hermes auth missing; authenticate Hermes before starting real planner runs.";
   if (checks.codexAuth === "missing") return "Codex auth missing; authenticate Codex before starting real executor runs.";
   return "Agent readiness blocked.";
+}
+
+function agentReadinessMessage(message: string, checks: AgentWorkflowReadinessChecks): string {
+  if (checks.agyCli !== "missing") return message;
+  return `${message} Antigravity CLI optional detected-only design agent not detected.`;
 }
 
 function uniqueReadinessReasons(reasons: AgentWorkflowReadinessReason[]): AgentWorkflowReadinessReason[] {
