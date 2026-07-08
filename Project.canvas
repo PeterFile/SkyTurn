@@ -1,0 +1,361 @@
+{
+  "nodes": [
+    {
+      "id": "0000000000000001",
+      "type": "group",
+      "x": 0,
+      "y": 0,
+      "width": 720,
+      "height": 360,
+      "label": "① Goal",
+      "color": "6"
+    },
+    {
+      "id": "0000000000000002",
+      "type": "group",
+      "x": 760,
+      "y": 0,
+      "width": 920,
+      "height": 360,
+      "label": "② System Structure",
+      "color": "5"
+    },
+    {
+      "id": "0000000000000003",
+      "type": "group",
+      "x": 0,
+      "y": 420,
+      "width": 1680,
+      "height": 420,
+      "label": "③ Current Work",
+      "color": "3"
+    },
+    {
+      "id": "0000000000000004",
+      "type": "group",
+      "x": 0,
+      "y": 900,
+      "width": 820,
+      "height": 420,
+      "label": "④ Evidence",
+      "color": "4"
+    },
+    {
+      "id": "0000000000000005",
+      "type": "group",
+      "x": 860,
+      "y": 900,
+      "width": 820,
+      "height": 420,
+      "label": "⑤ Risks & Decisions",
+      "color": "1"
+    },
+    {
+      "id": "1000000000000001",
+      "type": "text",
+      "x": 40,
+      "y": 60,
+      "width": 620,
+      "height": 220,
+      "color": "6",
+      "text": "Goal: SkyTurn evidence-backed desktop workflow\nSuccess: user task -> canvas plan -> agent runs -> validation/artifacts -> explicit delivery gates\nConstraints: desktop, canvas-first, not IDE/file tabs/global terminal\nTruth: RunEvidence, git/worktree state, tests, artifacts, workflow events"
+    },
+    {
+      "id": "1000000000000002",
+      "type": "text",
+      "x": 800,
+      "y": 50,
+      "width": 260,
+      "height": 150,
+      "color": "5",
+      "text": "Module: Desktop App & IPC\nRole: Electron shell, preload API, backend gates\nInputs: user project, workflow actions\nOutputs: safe IPC and persisted events"
+    },
+    {
+      "id": "1000000000000003",
+      "type": "text",
+      "x": 1080,
+      "y": 50,
+      "width": 260,
+      "height": 150,
+      "color": "5",
+      "text": "Module: UI Canvas\nRole: @xyflow canvas, compact nodes, Node Modal\nInputs: projected sessions, runs, evidence\nOutputs: Output/Changes/Context UX"
+    },
+    {
+      "id": "1000000000000004",
+      "type": "text",
+      "x": 1360,
+      "y": 50,
+      "width": 260,
+      "height": 150,
+      "color": "5",
+      "text": "Module: Workflow Kernel\nRole: validate intents, compile lanes, schedule DAG\nInputs: Hermes WorkflowIntent, dependencies\nOutputs: cards, edges, lane execution policy"
+    },
+    {
+      "id": "1000000000000005",
+      "type": "text",
+      "x": 800,
+      "y": 220,
+      "width": 260,
+      "height": 150,
+      "color": "5",
+      "text": "Module: Agent Runtime & Bridge\nRole: adapter contracts, discovery, run lifecycle\nInputs: Hermes/Codex requests, sandbox policy\nOutputs: RunEvidence and event streams"
+    },
+    {
+      "id": "1000000000000006",
+      "type": "text",
+      "x": 1080,
+      "y": 220,
+      "width": 260,
+      "height": 150,
+      "color": "5",
+      "text": "Module: Persistence & Evidence\nRole: SQLite workflow store and projections\nInputs: run, git, delivery, artifact events\nOutputs: materialized workflow truth"
+    },
+    {
+      "id": "1000000000000007",
+      "type": "text",
+      "x": 1360,
+      "y": 220,
+      "width": 260,
+      "height": 150,
+      "color": "5",
+      "text": "Module: Git Worktree & Delivery\nRole: local git evidence and explicit remote gates\nInputs: branch/worktree/PR actions\nOutputs: commits, checks, merge/sync/cleanup evidence"
+    },
+    {
+      "id": "1000000000000008",
+      "type": "text",
+      "x": 680,
+      "y": 500,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Adopt Project Canvas OS\nState: Verify\nOwner: Hermes\nDepends: live repo inspection\nEvidence: Canvas OS bootstrap validation\nRisk: live checkout vs recalled memory divergence"
+    },
+    {
+      "id": "1000000000000009",
+      "type": "text",
+      "x": 430,
+      "y": 500,
+      "width": 360,
+      "height": 210,
+      "color": "6",
+      "text": "Task: Harden current-branch real loop\nState: Proposed\nOwner: Hermes/Codex\nDepends: Workflow Kernel, Agent Bridge, Persistence\nEvidence: README capability map\nRisk: experimental-run and fallback boundaries"
+    },
+    {
+      "id": "1000000000000010",
+      "type": "text",
+      "x": 820,
+      "y": 500,
+      "width": 360,
+      "height": 210,
+      "color": "6",
+      "text": "Task: Productize failure repair regression\nState: Proposed\nOwner: Hermes/Codex\nDepends: failed-node evidence and checkpoints\nEvidence: README four-track plan\nRisk: repair must not hide failed evidence"
+    },
+    {
+      "id": "1000000000000011",
+      "type": "text",
+      "x": 1210,
+      "y": 500,
+      "width": 360,
+      "height": 210,
+      "color": "6",
+      "text": "Task: Harden explicit delivery gates\nState: Proposed\nOwner: Hermes/Codex\nDepends: git evidence, PR exact-head checks\nEvidence: README delivery surfaces\nRisk: remote side effects need explicit user gates"
+    },
+    {
+      "id": "1000000000000012",
+      "type": "text",
+      "x": 40,
+      "y": 980,
+      "width": 360,
+      "height": 200,
+      "color": "4",
+      "text": "Evidence: Live repo baseline\ncommit: 1fc533c feat(ui-canvas): clarify explicit delivery gates\ntest: git status --short --branch -> ## main...origin/main\nartifact: README.md current scope and capability map"
+    },
+    {
+      "id": "1000000000000013",
+      "type": "text",
+      "x": 430,
+      "y": 980,
+      "width": 360,
+      "height": 200,
+      "color": "4",
+      "text": "Evidence: Canvas OS bootstrap validation\ntest: project_canvas_os.py validate --strict -> OK nodes=22 edges=15 warnings=0\naudit: project_canvas_os.py audit --strict -> OK README.md and Project.canvas\nartifact: Project.canvas and .agents/canvas-protocol.md"
+    },
+    {
+      "id": "1000000000000014",
+      "type": "text",
+      "x": 900,
+      "y": 970,
+      "width": 360,
+      "height": 190,
+      "color": "1",
+      "text": "Risk: Recalled history differs from live git\nImpact: stale memory can overstate project capability\nMitigation: trust git status, README, tests, and Canvas evidence\nStatus: Open"
+    },
+    {
+      "id": "1000000000000015",
+      "type": "text",
+      "x": 1290,
+      "y": 970,
+      "width": 360,
+      "height": 190,
+      "color": "1",
+      "text": "Risk: Real agent path is experimental-run\nImpact: local credentials/CLI drift can break demos\nMitigation: verify with demo:mvp before product claims\nStatus: Open"
+    },
+    {
+      "id": "1000000000000016",
+      "type": "text",
+      "x": 900,
+      "y": 1180,
+      "width": 360,
+      "height": 160,
+      "color": "4",
+      "text": "Decision: Use Project Canvas OS\nRationale: README + Project.canvas are the project state entrypoints\nImpact: no progress-doc sprawl; evidence cards carry truth handles"
+    },
+    {
+      "id": "1000000000000017",
+      "type": "text",
+      "x": 1290,
+      "y": 1180,
+      "width": 360,
+      "height": 160,
+      "color": "4",
+      "text": "Decision: Preserve product boundary\nRationale: SkyTurn is desktop workflow, not IDE or terminal dashboard\nImpact: Canvas stays dominant; details stay in Node Modal tabs"
+    }
+  ],
+  "edges": [
+    {
+      "id": "2000000000000001",
+      "fromNode": "1000000000000001",
+      "fromSide": "right",
+      "toNode": "1000000000000002",
+      "toSide": "left",
+      "toEnd": "arrow",
+      "label": "defines"
+    },
+    {
+      "id": "2000000000000002",
+      "fromNode": "1000000000000001",
+      "fromSide": "right",
+      "toNode": "1000000000000003",
+      "toSide": "left",
+      "toEnd": "arrow",
+      "label": "defines"
+    },
+    {
+      "id": "2000000000000003",
+      "fromNode": "1000000000000001",
+      "fromSide": "right",
+      "toNode": "1000000000000004",
+      "toSide": "left",
+      "toEnd": "arrow",
+      "label": "defines"
+    },
+    {
+      "id": "2000000000000004",
+      "fromNode": "1000000000000004",
+      "fromSide": "bottom",
+      "toNode": "1000000000000009",
+      "toSide": "top",
+      "toEnd": "arrow",
+      "label": "enables"
+    },
+    {
+      "id": "2000000000000005",
+      "fromNode": "1000000000000005",
+      "fromSide": "bottom",
+      "toNode": "1000000000000009",
+      "toSide": "top",
+      "toEnd": "arrow",
+      "label": "runs"
+    },
+    {
+      "id": "2000000000000006",
+      "fromNode": "1000000000000006",
+      "fromSide": "bottom",
+      "toNode": "1000000000000009",
+      "toSide": "top",
+      "toEnd": "arrow",
+      "label": "proves"
+    },
+    {
+      "id": "2000000000000007",
+      "fromNode": "1000000000000007",
+      "fromSide": "bottom",
+      "toNode": "1000000000000011",
+      "toSide": "top",
+      "toEnd": "arrow",
+      "label": "gates"
+    },
+
+    {
+      "id": "2000000000000009",
+      "fromNode": "1000000000000012",
+      "fromSide": "right",
+      "toNode": "1000000000000009",
+      "toSide": "left",
+      "toEnd": "arrow",
+      "label": "baseline"
+    },
+    {
+      "id": "2000000000000010",
+      "fromNode": "1000000000000012",
+      "fromSide": "right",
+      "toNode": "1000000000000010",
+      "toSide": "left",
+      "toEnd": "arrow",
+      "label": "baseline"
+    },
+    {
+      "id": "2000000000000011",
+      "fromNode": "1000000000000012",
+      "fromSide": "right",
+      "toNode": "1000000000000011",
+      "toSide": "left",
+      "toEnd": "arrow",
+      "label": "baseline"
+    },
+    {
+      "id": "2000000000000012",
+      "fromNode": "1000000000000014",
+      "fromSide": "left",
+      "toNode": "1000000000000008",
+      "toSide": "right",
+      "toEnd": "arrow",
+      "label": "risk"
+    },
+    {
+      "id": "2000000000000013",
+      "fromNode": "1000000000000015",
+      "fromSide": "left",
+      "toNode": "1000000000000009",
+      "toSide": "right",
+      "toEnd": "arrow",
+      "label": "risk"
+    },
+    {
+      "id": "2000000000000014",
+      "fromNode": "1000000000000016",
+      "fromSide": "top",
+      "toNode": "1000000000000001",
+      "toSide": "bottom",
+      "toEnd": "arrow",
+      "label": "operates"
+    },
+    {
+      "id": "2000000000000015",
+      "fromNode": "1000000000000017",
+      "fromSide": "top",
+      "toNode": "1000000000000001",
+      "toSide": "bottom",
+      "toEnd": "arrow",
+      "label": "constrains"
+    },
+    {
+      "id": "4054c54373573560",
+      "fromNode": "1000000000000008",
+      "toNode": "1000000000000013",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    }
+  ]
+}

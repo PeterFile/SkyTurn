@@ -2,6 +2,13 @@
 
 SkyTurn is a desktop development workflow platform for canvas-first task orchestration.
 
+## Project State
+
+- Human entrypoints: `README.md` and `Project.canvas`.
+- `README.md` is the project contract. `Project.canvas` is the evidence-backed project cognition map.
+- Agent mutation rules live in `.agents/canvas-protocol.md`; do not create progress, summary, handoff, or status-doc sprawl.
+- Git, tests, artifacts, workflow events, and `RunEvidence` remain the fact source. Canvas cards point to facts; they do not replace them.
+
 ## Commands
 
 ```bash
