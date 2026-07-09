@@ -12,6 +12,7 @@ describe("agent runtime adapters", () => {
     expect(agentAdapterContracts.map((adapter) => adapter.kind)).toEqual([
       "hermes",
       "codex",
+      "agy",
       "gemini",
       "claude-code",
       "openclaw",

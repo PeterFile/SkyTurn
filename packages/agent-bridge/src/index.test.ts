@@ -46,6 +46,28 @@ describe("agent bridge", () => {
     expect(codex?.supportLevel).toBe("detected-only");
   });
 
+  it("discovers missing Antigravity CLI as unavailable detected-only coverage", async () => {
+    const discovery = createDiscoveryService({ pathValue: "", env: {}, codexConfigRoot: null });
+
+    const agents = await discovery.discover();
+    const agy = agents.find((agent) => agent.kind === "agy");
+
+    expect(agy).toMatchObject({
+      kind: "agy",
+      label: "Antigravity CLI",
+      executablePath: null,
+      version: null,
+      status: "missing",
+      supportLevel: "detected-only",
+      readiness: {
+        level: "unavailable",
+        cli: { available: false, path: null, version: null },
+        auth: { status: "unknown" },
+        categories: ["cli-missing"],
+      },
+    });
+  });
+
   it("discovers executables but keeps unverified CLI support detected-only", async () => {
     const root = await makeTempRoot();
     const bin = join(root, "codex");
@@ -58,6 +80,38 @@ describe("agent bridge", () => {
     expect(codex?.status).toBe("available");
     expect(codex?.executablePath).toBe(bin);
     expect(codex?.supportLevel).toBe("detected-only");
+  });
+
+  it("discovers fake Antigravity CLI path and version without run support", async () => {
+    const root = await makeTempRoot();
+    const agyPath = join(root, "agy");
+    await writeFile(
+      agyPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"--version\" ]; then echo \"agy 1.2.3\"; exit 0; fi",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const discovery = createDiscoveryService({ pathValue: root, env: {}, codexConfigRoot: null });
+
+    const agents = await discovery.discover();
+    const agy = agents.find((agent) => agent.kind === "agy");
+
+    expect(agy).toMatchObject({
+      kind: "agy",
+      status: "available",
+      executablePath: agyPath,
+      version: "agy 1.2.3",
+      supportLevel: "detected-only",
+      readiness: {
+        level: "detected-only",
+        cli: { available: true, path: agyPath, version: "agy 1.2.3" },
+        auth: { status: "unknown" },
+        categories: [],
+      },
+    });
   });
 
   it("reports registered runnable adapters as experimental-run during discovery", async () => {
@@ -80,6 +134,25 @@ describe("agent bridge", () => {
     expect(hermes?.status).toBe("available");
     expect(hermes?.supportLevel).toBe("experimental-run");
     expect(hermes?.executablePath).toBe(hermesPath);
+  });
+
+  it("does not route Antigravity CLI runs through the Codex fallback adapter", async () => {
+    const projectRoot = await makeTempRoot();
+    const bridge = new AgentBridge({
+      adapters: [createMockAgentAdapter()],
+    });
+
+    await expect(
+      bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: "node-agy",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: join(projectRoot, ".worktrees/node-agy"),
+        agentKind: "agy",
+        prompt: "Design only.",
+      }),
+    ).rejects.toThrow("No local adapter registered for agy");
   });
 
   it("reports Codex CLI version and env-auth readiness without promoting stable support", async () => {

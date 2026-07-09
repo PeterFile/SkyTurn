@@ -22,12 +22,19 @@ import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace, sandboxForNodeRun }
 
 const require = createRequire(import.meta.url);
 const desktopRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const waitTimeoutMs = Number(process.env.SKYTURN_DEMO_WAIT_TIMEOUT_MS ?? 20 * 60 * 1_000);
+const defaultDemoWaitTimeoutMs = 20 * 60 * 1_000;
+const defaultDemoAgentWatchdogTimeoutMs = 8 * 60 * 1_000;
+const demoTimeouts = demoTimeoutsFromEnv(process.env);
+const waitTimeoutMs = demoTimeouts.waitTimeoutMs;
+const agentWatchdogTimeoutMs = demoTimeouts.agentWatchdogTimeoutMs;
 const maxWorkflowRuns = Number(process.env.SKYTURN_DEMO_MAX_RUNS ?? 12);
 
 export async function runMvpWorkflowDemo() {
   const bridge = new AgentBridge({
-    adapters: [createHermesCliAdapter(), createCodexCliAdapter()],
+    adapters: [
+      createHermesCliAdapter({ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs }),
+      createCodexCliAdapter({ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs }),
+    ],
   });
 
   const readinessPreflight = await demoReadinessPreflight(bridge);
@@ -223,6 +230,22 @@ if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   });
 }
 
+export function demoTimeoutsFromEnv(env = process.env) {
+  const waitMs = positiveIntegerEnv(env.SKYTURN_DEMO_WAIT_TIMEOUT_MS, defaultDemoWaitTimeoutMs);
+  const latestAgentEvidenceMs = Math.max(1_000, waitMs - 5_000);
+  const defaultAgentMs = Math.min(defaultDemoAgentWatchdogTimeoutMs, latestAgentEvidenceMs);
+  const requestedAgentMs = positiveIntegerEnv(env.SKYTURN_DEMO_AGENT_TIMEOUT_MS, defaultAgentMs);
+  return {
+    waitTimeoutMs: waitMs,
+    agentWatchdogTimeoutMs: Math.min(requestedAgentMs, latestAgentEvidenceMs),
+  };
+}
+
+function positiveIntegerEnv(value, fallback) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export async function demoReadinessPreflight(bridge, summarize = summarizeAgentReadiness) {
   const agents = await bridge.discoverAgents();
   const readiness = summarize(agents);
@@ -349,11 +372,14 @@ export async function seedBlankReactProject(projectRoot) {
   await writeFile(join(projectRoot, "scripts", "verify.mjs"), [
     "import assert from 'node:assert/strict';",
     "import { readFile } from 'node:fs/promises';",
+    "import { fileURLToPath } from 'node:url';",
+    "import { build } from 'vite';",
     "",
     "const app = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8');",
     "assert.match(app, /SkyTurn delivery complete/);",
     "assert.match(app, /Hermes -> Codex/);",
     "assert.match(app, /Ready for verification/);",
+    "await build({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'silent', build: { write: false } });",
     "console.log('SkyTurn React delivery verification passed');",
     "",
   ].join("\n"));
