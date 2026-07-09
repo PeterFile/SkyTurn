@@ -3438,6 +3438,8 @@ function agentLabel(agent: AgentKind): string {
       return "Hermes";
     case "codex":
       return "Codex";
+    case "agy":
+      return "Antigravity";
     case "gemini":
       return "Gemini";
     case "claude-code":
