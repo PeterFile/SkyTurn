@@ -12,6 +12,12 @@ function lastCssBlock(styles: string, selector: string): string {
   return matches.at(-1) ?? "";
 }
 
+function lastCssRuleForSelector(styles: string, selector: string): string {
+  const rules = Array.from(styles.matchAll(/(?:^|\n)([^{}]+) \{([\s\S]*?)\n\}/g));
+  const matches = rules.filter((match) => match[1].split(",").map((part) => part.trim()).includes(selector));
+  return matches.at(-1)?.[0] ?? "";
+}
+
 describe("SkyTurn UI style tokens", () => {
   it("uses modern dark tokens instead of paper collage material tokens", async () => {
     const styles = await readSource("./styles.css");
@@ -249,5 +255,58 @@ describe("SkyTurn UI style tokens", () => {
     expect(cardBlock).toContain("border: 0");
     expect(composerBlock).not.toContain("clip-path: polygon");
     expect(motionSource).toContain("radius: 0");
+  });
+
+  it("renders node/canvas evidence surfaces with modern dark neutral tokens", async () => {
+    const styles = await readSource("./styles.css");
+    const finalSurfaceSection = styles.slice(styles.indexOf("/* Final modern node/evidence surfaces. */"));
+    const selectors = [
+      ".canvas-stage",
+      ".agent-node-shell",
+      ".agent-card",
+      ".agent-node-menu",
+      ".agent-status-pill",
+      ".runtime-phase-pill",
+      ".evidence-marker",
+      ".node-modal",
+      ".modal-header",
+      ".tab-list",
+      ".tab-button",
+      ".output-panel",
+      ".context-panel",
+      ".changes-review",
+      ".diff2html-shell",
+      ".canvas-composer",
+      ".canvas-composer-shell",
+    ];
+
+    for (const selector of selectors) {
+      const block = lastCssRuleForSelector(styles, selector);
+      expect(block).toBeTruthy();
+      expect(block).not.toContain("var(--sk-paper");
+      expect(block).not.toContain("clip-path: polygon");
+    }
+
+    expect(finalSurfaceSection).toContain("#111111");
+    expect(finalSurfaceSection).toContain("#1f1f20");
+    expect(finalSurfaceSection).toContain("#2b2b2c");
+    expect(finalSurfaceSection).toContain("#3a3a3a");
+    expect(finalSurfaceSection).toContain("#e5e5e5");
+    expect(finalSurfaceSection).toContain("#9ca3af");
+    expect(finalSurfaceSection).not.toContain("var(--sk-paper");
+    expect(finalSurfaceSection).not.toContain("clip-path: polygon");
+
+    const hiddenPseudoSelectors = [
+      ".agent-node-shell::before",
+      ".agent-node-shell::after",
+      ".agent-card::before",
+      ".agent-card::after",
+    ];
+
+    for (const selector of hiddenPseudoSelectors) {
+      const block = lastCssRuleForSelector(styles, selector);
+      expect(block).toBeTruthy();
+      expect(block).toContain("display: none");
+    }
   });
 });
