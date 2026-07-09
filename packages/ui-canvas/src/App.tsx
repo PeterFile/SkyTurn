@@ -1311,8 +1311,18 @@ function AgentReadinessBlock({
 }) {
   if (!readiness) return null;
   const details = [
-    `Hermes CLI ${readiness.checks.hermesCli}; auth ${readiness.checks.hermesAuth}`,
-    `Codex CLI ${readiness.checks.codexCli}; auth ${readiness.checks.codexAuth}`,
+    {
+      label: `Hermes CLI ${readiness.checks.hermesCli}`,
+      value: `auth ${readiness.checks.hermesAuth}`,
+    },
+    {
+      label: `Codex CLI ${readiness.checks.codexCli}`,
+      value: `auth ${readiness.checks.codexAuth}`,
+    },
+    {
+      label: `Antigravity CLI ${readiness.checks.agyCli}`,
+      value: "optional detected-only design agent",
+    },
   ];
   const className = ["agent-readiness-block", readiness.status, compact ? "compact" : ""].filter(Boolean).join(" ");
 
@@ -1326,9 +1336,9 @@ function AgentReadinessBlock({
       {!compact && (
         <dl className="agent-readiness-facts">
           {details.map((detail) => (
-            <div key={detail}>
-              <dt>{detail.split(";")[0]}</dt>
-              <dd>{detail.split("; ")[1]}</dd>
+            <div key={detail.label}>
+              <dt>{detail.label}</dt>
+              <dd>{detail.value}</dd>
             </div>
           ))}
         </dl>
