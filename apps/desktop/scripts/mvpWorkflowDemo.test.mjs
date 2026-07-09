@@ -77,6 +77,36 @@ test("MVP demo keeps degraded readiness running and reports readiness in final J
   assert.match(source, /readiness:\s*readinessPreflight\.readiness/);
 });
 
+test("MVP demo bounds agent watchdogs before the workflow wait timeout", async () => {
+  const { demoTimeoutsFromEnv } = await loadReadinessHelpers();
+
+  assert.deepEqual(demoTimeoutsFromEnv({ SKYTURN_DEMO_WAIT_TIMEOUT_MS: "60000" }), {
+    waitTimeoutMs: 60000,
+    agentWatchdogTimeoutMs: 55000,
+  });
+  assert.deepEqual(
+    demoTimeoutsFromEnv({ SKYTURN_DEMO_WAIT_TIMEOUT_MS: "60000", SKYTURN_DEMO_AGENT_TIMEOUT_MS: "10000" }),
+    {
+      waitTimeoutMs: 60000,
+      agentWatchdogTimeoutMs: 10000,
+    },
+  );
+  assert.deepEqual(
+    demoTimeoutsFromEnv({ SKYTURN_DEMO_WAIT_TIMEOUT_MS: "60000", SKYTURN_DEMO_AGENT_TIMEOUT_MS: "90000" }),
+    {
+      waitTimeoutMs: 60000,
+      agentWatchdogTimeoutMs: 55000,
+    },
+  );
+});
+
+test("MVP demo passes bounded watchdogs into Hermes and Codex adapters", async () => {
+  const source = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
+
+  assert.match(source, /createHermesCliAdapter\(\{ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs \}\)/);
+  assert.match(source, /createCodexCliAdapter\(\{ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs \}\)/);
+});
+
 test("MVP demo readiness preflight runs before workflow node execution", async () => {
   const source = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
   const preflightIndex = source.indexOf("const readinessPreflight = await demoReadinessPreflight(bridge)");
@@ -100,6 +130,7 @@ test("MVP demo module loads through real workspace exports", async () => {
 async function loadReadinessHelpers() {
   const demoModule = await import("./mvpWorkflowDemo.mjs");
   return {
+    demoTimeoutsFromEnv: demoModule.demoTimeoutsFromEnv,
     demoReadinessPreflight: demoModule.demoReadinessPreflight,
     readinessFailureResult: demoModule.readinessFailureResult,
   };
