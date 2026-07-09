@@ -372,11 +372,14 @@ export async function seedBlankReactProject(projectRoot) {
   await writeFile(join(projectRoot, "scripts", "verify.mjs"), [
     "import assert from 'node:assert/strict';",
     "import { readFile } from 'node:fs/promises';",
+    "import { fileURLToPath } from 'node:url';",
+    "import { build } from 'vite';",
     "",
     "const app = await readFile(new URL('../src/App.jsx', import.meta.url), 'utf8');",
     "assert.match(app, /SkyTurn delivery complete/);",
     "assert.match(app, /Hermes -> Codex/);",
     "assert.match(app, /Ready for verification/);",
+    "await build({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'silent' });",
     "console.log('SkyTurn React delivery verification passed');",
     "",
   ].join("\n"));

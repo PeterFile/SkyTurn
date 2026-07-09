@@ -107,6 +107,13 @@ test("MVP demo passes bounded watchdogs into Hermes and Codex adapters", async (
   assert.match(source, /createCodexCliAdapter\(\{ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs \}\)/);
 });
 
+test("MVP demo verification script checks renderable Vite output", async () => {
+  const source = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
+
+  assert.match(source, /import \{ build \} from 'vite';/);
+  assert.match(source, /await build\(\{ root: fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\), logLevel: 'silent' \}\);/);
+});
+
 test("MVP demo readiness preflight runs before workflow node execution", async () => {
   const source = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
   const preflightIndex = source.indexOf("const readinessPreflight = await demoReadinessPreflight(bridge)");
