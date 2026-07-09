@@ -41,6 +41,7 @@ export { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/project-core";
 const commandCandidates: Record<AgentKind, string[]> = {
   hermes: ["hermes"],
   codex: ["codex"],
+  agy: ["agy"],
   gemini: ["gemini"],
   "claude-code": ["claude", "claude-code"],
   openclaw: ["openclaw"],
@@ -320,7 +321,8 @@ export class AgentBridge {
   }
 
   async startRun(input: StartAgentRunInput): Promise<AgentRun> {
-    const adapter = this.adapters.get(input.agentKind) ?? this.adapters.get("codex");
+    const fallbackAdapter = input.agentKind === "agy" ? undefined : this.adapters.get("codex");
+    const adapter = this.adapters.get(input.agentKind) ?? fallbackAdapter;
     if (!adapter) throw new Error(`No local adapter registered for ${input.agentKind}`);
 
     const now = new Date().toISOString();

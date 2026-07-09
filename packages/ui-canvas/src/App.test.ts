@@ -472,6 +472,21 @@ describe("UI source validation", () => {
     expect(healthEffect).not.toContain("window.devflow.discoverAgents()");
   });
 
+  it("starts every running or retrying workflow node instead of only the active node", async () => {
+    const appSource = await readSource("./App.tsx");
+    const bridgeStartEffect = appSource.slice(
+      appSource.indexOf("for (const node of activeSession.nodes)"),
+      appSource.indexOf("}, [activeProject, activeSession]);"),
+    );
+
+    expect(bridgeStartEffect).toContain("for (const node of activeSession.nodes)");
+    expect(bridgeStartEffect).toContain('node.status !== "running" && node.status !== "retrying"');
+    expect(bridgeStartEffect).toContain("startedBridgeRuns.current.has(node.runId)");
+    expect(bridgeStartEffect).toContain("startBridgeRun(activeProject, activeSession, node)");
+    expect(bridgeStartEffect).not.toContain("selectedNode");
+    expect(bridgeStartEffect).not.toContain("activeSession.activeNodeId");
+  });
+
   it("renders compact agent readiness near session creation and canvas composer", async () => {
     const appSource = await readSource("./App.tsx");
     const projectStart = appSource.slice(appSource.indexOf("function ProjectStartPage"), appSource.indexOf("export type ComposerAction"));
@@ -482,6 +497,8 @@ describe("UI source validation", () => {
     expect(canvasView).toContain("<AgentReadinessBlock");
     expect(canvasView).toContain("readiness={agentReadiness}");
     expect(appSource).toContain("function AgentReadinessBlock");
+    expect(appSource).toContain("Antigravity CLI");
+    expect(appSource).toContain("optional detected-only design agent");
     expect(appSource).toContain("Real loop ready");
     expect(appSource).toContain("Mock fallback only");
   });

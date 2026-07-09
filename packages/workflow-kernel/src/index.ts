@@ -3403,7 +3403,14 @@ function isWorkflowLaneKind(value: unknown): value is WorkflowLaneKind {
 }
 
 function isAgentKind(value: unknown): value is AgentKind {
-  return value === "hermes" || value === "codex" || value === "gemini" || value === "claude-code" || value === "openclaw";
+  return (
+    value === "hermes" ||
+    value === "codex" ||
+    value === "gemini" ||
+    value === "claude-code" ||
+    value === "openclaw" ||
+    value === "agy"
+  );
 }
 
 function isAgentRunSandbox(value: unknown): value is AgentRunSandbox {
