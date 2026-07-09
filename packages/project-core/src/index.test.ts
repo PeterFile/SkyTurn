@@ -213,11 +213,41 @@ describe("agent run contracts", () => {
     expect(summary.runSupport).toBe("experimental-run");
     expect(summary.checks.hermesCli).toBe("ready");
     expect(summary.checks.codexCli).toBe("ready");
+    expect(summary.checks.agyCli).toBe("missing");
     expect(summary.checks.hermesAuth).toBe("unknown");
     expect(summary.checks.codexAuth).toBe("available");
     expect(summary.reasons).toContain("hermes-auth-unknown");
     expect(summary.reasons).toContain("experimental-run");
     expect(summary.reasons).not.toContain("supported-run");
+  });
+
+  it("keeps the real loop ready when optional Antigravity CLI is missing", () => {
+    const summary = summarizeAgentReadiness([
+      agentDescriptor({
+        kind: "hermes",
+        supportLevel: "supported-run",
+        readiness: readiness({ auth: "available" }),
+      }),
+      agentDescriptor({
+        kind: "codex",
+        supportLevel: "supported-run",
+        readiness: readiness({ auth: "available" }),
+      }),
+      agentDescriptor({
+        kind: "agy",
+        label: "Antigravity CLI",
+        status: "missing",
+        executablePath: null,
+        supportLevel: "detected-only",
+        readiness: readiness({ cliAvailable: false, auth: "unknown", categories: ["cli-missing"] }),
+      }),
+    ]);
+
+    expect(summary.status).toBe("ready");
+    expect(summary.runSupport).toBe("supported-run");
+    expect(summary.checks.agyCli).toBe("missing");
+    expect(summary.reasons).toContain("agy-cli-missing");
+    expect(summary.message).toContain("Antigravity CLI optional detected-only");
   });
 
   it("blocks real workflow runs when the Codex CLI is missing", () => {
@@ -239,6 +269,7 @@ describe("agent run contracts", () => {
     expect(summary.status).toBe("blocked");
     expect(summary.runSupport).toBe("unavailable");
     expect(summary.checks.codexCli).toBe("missing");
+    expect(summary.checks.agyCli).toBe("missing");
     expect(summary.reasons).toContain("codex-cli-missing");
     expect(summary.message).toContain("Codex CLI missing");
   });
@@ -256,6 +287,7 @@ describe("agent run contracts", () => {
 
     expect(summary.status).toBe("mock-only");
     expect(summary.runSupport).toBe("mock-only");
+    expect(summary.checks.agyCli).toBe("missing");
     expect(summary.checks.mockFallback).toBe(true);
     expect(summary.reasons).toContain("mock-only-fallback");
     expect(summary.message).toContain("Mock fallback only");
@@ -278,6 +310,7 @@ describe("agent run contracts", () => {
     expect(summary.status).toBe("blocked");
     expect(summary.checks.hermesAuth).toBe("missing");
     expect(summary.checks.codexAuth).toBe("unknown");
+    expect(summary.checks.agyCli).toBe("missing");
     expect(summary.reasons).toContain("hermes-auth-missing");
     expect(summary.reasons).toContain("codex-auth-unknown");
   });

@@ -3,6 +3,7 @@ import type { AgentKind, CanvasNode, NodeRuntimeState, NodeStatus } from "@skytu
 const AGENT_LABELS: Record<AgentKind, string> = {
   hermes: "Hermes",
   codex: "Codex",
+  agy: "Antigravity",
   gemini: "Gemini",
   "claude-code": "ClaudeCode",
   openclaw: "OpenClaw",
