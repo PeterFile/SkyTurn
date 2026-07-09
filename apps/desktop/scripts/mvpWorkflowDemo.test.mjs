@@ -111,7 +111,7 @@ test("MVP demo verification script checks renderable Vite output", async () => {
   const source = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
 
   assert.match(source, /import \{ build \} from 'vite';/);
-  assert.match(source, /await build\(\{ root: fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\), logLevel: 'silent' \}\);/);
+  assert.match(source, /await build\(\{ root: fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\), logLevel: 'silent', build: \{ write: false \} \}\);/);
 });
 
 test("MVP demo readiness preflight runs before workflow node execution", async () => {

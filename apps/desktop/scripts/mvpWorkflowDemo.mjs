@@ -379,7 +379,7 @@ export async function seedBlankReactProject(projectRoot) {
     "assert.match(app, /SkyTurn delivery complete/);",
     "assert.match(app, /Hermes -> Codex/);",
     "assert.match(app, /Ready for verification/);",
-    "await build({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'silent' });",
+    "await build({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'silent', build: { write: false } });",
     "console.log('SkyTurn React delivery verification passed');",
     "",
   ].join("\n"));
