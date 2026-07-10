@@ -14,7 +14,10 @@ function lastCssBlock(styles: string, selector: string): string {
 
 function lastCssRuleForSelector(styles: string, selector: string): string {
   const rules = Array.from(styles.matchAll(/(?:^|\n)([^{}]+) \{([\s\S]*?)\n\}/g));
-  const matches = rules.filter((match) => match[1].split(",").map((part) => part.trim()).includes(selector));
+  const matches = rules.filter((match) => {
+    const selectorText = match[1].replace(/\/\*[\s\S]*?\*\//g, "");
+    return selectorText.split(",").map((part) => part.trim()).includes(selector);
+  });
   return matches.at(-1)?.[0] ?? "";
 }
 
@@ -24,24 +27,16 @@ describe("SkyTurn UI style tokens", () => {
 
     expect(styles).not.toContain("@fontsource-variable");
     expect(styles).not.toContain("Space Grotesk");
-    expect(styles).toContain("--sk-paper-base: #f4f0e3");
-    expect(styles).toContain("--sk-cobalt: #0e53c9");
-    expect(styles).toContain("--sk-yellow: #fff127");
-    expect(styles).toContain("--sk-pink: #ff9ed1");
-    expect(styles).toContain('--sk-paper-white: url("./assets/paper/paper-white.webp")');
-    expect(styles).toContain('--sk-paper-rip-white: url("./assets/paper/paper-rip-white.webp")');
-    expect(styles).toContain('--sk-paper-sidebar-edge: url("./assets/paper/paper-sidebar-edge.png")');
-    expect(styles).toContain("--sk-accent: var(--sk-cobalt)");
-    expect(styles).toContain("--sk-status-running: var(--sk-cobalt)");
+    expect(styles).toContain("--sk-bg: #151515");
+    expect(styles).toContain("--sk-surface: #202021");
+    expect(styles).toContain("--sk-text: #f2f2f2");
+    expect(styles).toContain("--sk-accent: #a78bfa");
   });
 
   it("uses modern card proportions instead of oversized collage decoration", async () => {
     const styles = await readSource("./styles.css");
     const motionSource = await readSource("./motion.ts");
 
-    expect(styles).toContain("--sk-ui-texture-opacity: 0.15");
-    expect(styles).toContain("--node-texture-shield");
-    expect(styles).toContain("linear-gradient(var(--node-texture-shield), var(--node-texture-shield)), var(--node-paper)");
     expect(styles).toContain("--agent-card-width: 440px");
     expect(styles).toContain("--agent-card-height: auto");
     expect(styles).toContain("grid-template-columns: 232px minmax(0, 1fr)");
@@ -56,8 +51,6 @@ describe("SkyTurn UI style tokens", () => {
     expect(appSource).toContain('data-state={node.status}');
     expect(appSource).toContain("data-phase={runtime.phase}");
     expect(appSource).toContain('className="evidence-marker"');
-    expect(appSource).toContain('"--tape-press": 1');
-    expect(appSource).toContain('"--ink-absorb-opacity": node.status === "running" ? 0.12 : 0.07');
     expect(appSource).toContain('<Eye size={19} strokeWidth={2.6} />');
     expect(appSource).toContain('return "var(--sk-edge-active)"');
     expect(appSource).toContain('return "var(--sk-status-running)"');
@@ -144,7 +137,7 @@ describe("SkyTurn UI style tokens", () => {
     });
   });
 
-  it("keeps New Session listboxes above the intake paper instead of clipping them", async () => {
+  it("keeps New Session listboxes above the intake form instead of clipping them", async () => {
     const styles = await readSource("./styles.css");
     const targetSelectorBlock = lastCssBlock(styles, ".target-selector-inner");
     const customSelectOpenBlock = lastCssBlock(styles, ".custom-select-dropdown.open");
@@ -225,9 +218,9 @@ describe("SkyTurn UI style tokens", () => {
     const motionSource = await readSource("./motion.ts");
     const sidebarToggleBlock = styles.match(/\.sidebar-toggle \{[\s\S]*?\n\}/)?.[0] ?? "";
     const sidebarHoverBlock = styles.match(/\.sidebar-project-row:hover,[\s\S]*?\.sidebar-settings:hover \{[\s\S]*?\n\}/)?.[0] ?? "";
-    const hardResetBlock = styles.slice(styles.indexOf("/* Evidence-board paper construction hard reset. */"));
+    const hardResetBlock = styles.slice(styles.lastIndexOf("/* Neutral modern workflow styles. */"));
     const cardBlock = lastCssBlock(styles, ".agent-card");
-    const composerBlock = lastCssBlock(styles, ".canvas-composer");
+    const composerBlock = lastCssRuleForSelector(styles, ".canvas-composer");
 
     expect(styles).toContain("sidebar-toggle-label");
     expect(sidebarToggleBlock).toContain("position: absolute");
@@ -259,13 +252,16 @@ describe("SkyTurn UI style tokens", () => {
 
   it("renders node/canvas evidence surfaces with modern dark neutral tokens", async () => {
     const styles = await readSource("./styles.css");
-    const finalSurfaceSection = styles.slice(styles.indexOf("/* Final modern node/evidence surfaces. */"));
+    expect(styles).not.toContain('url("./assets/paper/');
+    const finalSurfaceSection = styles.slice(styles.lastIndexOf("/* Neutral modern workflow styles. */"));
     const selectors = [
       ".canvas-stage",
       ".agent-node-shell",
       ".agent-card",
       ".agent-node-menu",
-      ".agent-status-pill",
+      ".agent-status-chip",
+      ".agent-identity-pill",
+      ".agent-footer",
       ".runtime-phase-pill",
       ".evidence-marker",
       ".node-modal",
@@ -283,24 +279,35 @@ describe("SkyTurn UI style tokens", () => {
     for (const selector of selectors) {
       const block = lastCssRuleForSelector(styles, selector);
       expect(block).toBeTruthy();
-      expect(block).not.toContain("var(--sk-paper");
+      expect(block).not.toContain("var(--sk-paper-white)");
       expect(block).not.toContain("clip-path: polygon");
     }
 
-    expect(finalSurfaceSection).toContain("#111111");
-    expect(finalSurfaceSection).toContain("#1f1f20");
-    expect(finalSurfaceSection).toContain("#2b2b2c");
-    expect(finalSurfaceSection).toContain("#3a3a3a");
-    expect(finalSurfaceSection).toContain("#e5e5e5");
-    expect(finalSurfaceSection).toContain("#9ca3af");
-    expect(finalSurfaceSection).not.toContain("var(--sk-paper");
+    expect(finalSurfaceSection).toContain("#151515");
+    expect(finalSurfaceSection).toContain("#1b1b1c");
+    expect(finalSurfaceSection).toContain("#202021");
+    expect(finalSurfaceSection).toContain("#2a2a2b");
+    expect(finalSurfaceSection).toContain("#343435");
+    expect(finalSurfaceSection).toContain("#f2f2f2");
+    expect(finalSurfaceSection).toContain("#8a8a91");
     expect(finalSurfaceSection).not.toContain("clip-path: polygon");
+    expect(styles).toContain(".canvas-stage.has-selected-node .canvas-composer-shell {\n  transform: none !important;\n}");
 
     const hiddenPseudoSelectors = [
       ".agent-node-shell::before",
       ".agent-node-shell::after",
       ".agent-card::before",
       ".agent-card::after",
+      ".sidebar::after",
+      ".node-modal::before",
+      ".node-modal::after",
+      ".canvas-composer-shell::before",
+      ".canvas-composer::after",
+      ".intake-sheet::before",
+      ".control-strip::before",
+      ".control-strip::after",
+      ".target-selector-inner::before",
+      ".project-dropdown-listbox::before"
     ];
 
     for (const selector of hiddenPseudoSelectors) {
