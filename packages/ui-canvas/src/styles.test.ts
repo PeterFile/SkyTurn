@@ -142,12 +142,20 @@ describe("SkyTurn UI style tokens", () => {
     const targetSelectorBlock = lastCssBlock(styles, ".target-selector-inner");
     const customSelectOpenBlock = lastCssBlock(styles, ".custom-select-dropdown.open");
     const projectDropdownOpenBlock = lastCssBlock(styles, ".project-dropdown.open");
+    const customSelectListboxBlock = lastCssRuleForSelector(styles, ".custom-select-listbox");
+    const customSelectActiveBlock = lastCssRuleForSelector(styles, ".custom-select-option.active");
+    const projectOptionActiveBlock = lastCssRuleForSelector(styles, ".project-option.active");
 
     expect(targetSelectorBlock).not.toContain("clip-path");
     expect(styles).toContain(".target-selector-inner::before");
     expect(styles).toContain(".control-strip-row:first-child");
     expect(customSelectOpenBlock).toContain("z-index:");
     expect(projectDropdownOpenBlock).toContain("z-index:");
+    expect(customSelectListboxBlock).toContain("background: var(--sk-surface) !important");
+    expect(customSelectListboxBlock).toContain("clip-path: none !important");
+    expect(customSelectListboxBlock).not.toContain("var(--sk-paper");
+    expect(customSelectActiveBlock).toContain("background: var(--sk-white) !important");
+    expect(projectOptionActiveBlock).toContain("background: var(--sk-white) !important");
   });
 
   it("keeps node details as a transparent right-side drawer", async () => {
@@ -254,6 +262,9 @@ describe("SkyTurn UI style tokens", () => {
     const styles = await readSource("./styles.css");
     expect(styles).not.toContain('url("./assets/paper/');
     const finalSurfaceSection = styles.slice(styles.lastIndexOf("/* Neutral modern workflow styles. */"));
+    const modalActionHoverBlock = lastCssRuleForSelector(styles, ".modal-actions button:hover:not(:disabled)");
+    const targetBadgeBlock = lastCssRuleForSelector(styles, ".agent-node-target-badge");
+    const selectedActionBlock = lastCssRuleForSelector(styles, ".action-chip.selected");
     const selectors = [
       ".canvas-stage",
       ".agent-node-shell",
@@ -290,7 +301,15 @@ describe("SkyTurn UI style tokens", () => {
     expect(finalSurfaceSection).toContain("#343435");
     expect(finalSurfaceSection).toContain("#f2f2f2");
     expect(finalSurfaceSection).toContain("#8a8a91");
+    expect(finalSurfaceSection).toContain("--sk-status-completed-text: #7dd3a8");
+    expect(finalSurfaceSection).toContain("--sk-status-failed-text: #ff8a80");
+    expect(finalSurfaceSection).toContain("--sk-status-retrying: #f0b76b");
     expect(finalSurfaceSection).not.toContain("clip-path: polygon");
+    expect(finalSurfaceSection).not.toContain("color: var(--sk-paper-white");
+    expect(modalActionHoverBlock).toContain("background: var(--sk-white) !important");
+    expect(modalActionHoverBlock).toContain("color: var(--sk-text) !important");
+    expect(targetBadgeBlock).toContain("color: #111111 !important");
+    expect(selectedActionBlock).toContain("color: #111111 !important");
     expect(styles).toContain(".canvas-stage.has-selected-node .canvas-composer-shell {\n  transform: none !important;\n}");
 
     const hiddenPseudoSelectors = [
