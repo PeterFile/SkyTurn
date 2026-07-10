@@ -6942,6 +6942,10 @@ select:focus-visible,
   --sk-status-completed-legacy: #3f7f5f;
   --sk-status-failed-legacy: #b4534a;
   --sk-status-retrying-legacy: #a16207;
+  --sk-status-completed-text: #7dd3a8;
+  --sk-status-failed-text: #ff8a80;
+  --sk-status-retrying: #f0b76b;
+  --sk-status-failed-bg: rgba(220, 38, 38, 0.12);
   --sk-status-running: #a78bfa;
   --node-texture-shield: transparent;
   --node-paper: none;
@@ -7347,6 +7351,65 @@ select:focus-visible,
 }
 
 .modal-tabs button.active {
+  border-color: var(--sk-accent) !important;
+  background: var(--sk-accent) !important;
+  color: #111111 !important;
+}
+
+.custom-select-listbox {
+  border: 1px solid var(--sk-border) !important;
+  border-radius: 8px !important;
+  background: var(--sk-surface) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  clip-path: none !important;
+  color: var(--sk-text) !important;
+}
+
+.custom-select-option,
+.project-option {
+  border-radius: 6px !important;
+  background: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  clip-path: none !important;
+  color: var(--sk-text) !important;
+}
+
+.custom-select-option.active,
+.custom-select-option:hover,
+.project-option.active,
+.project-option:hover {
+  background: var(--sk-white) !important;
+  color: var(--sk-text) !important;
+}
+
+.custom-select-option.selected,
+.project-option.selected {
+  background: var(--sk-border-muted) !important;
+}
+
+.custom-select-indicator,
+.project-option-indicator {
+  border-radius: 2px !important;
+  background: var(--sk-accent) !important;
+  background-image: none !important;
+  clip-path: none !important;
+}
+
+.modal-actions button:hover:not(:disabled),
+.changes-tool-button:hover:not(:disabled),
+.changes-menu-item:hover:not(:disabled),
+.decision-options button:hover:not(:disabled),
+.editor-menu-trigger:hover:not(:disabled),
+.editor-menu-item:hover:not(:disabled) {
+  background: var(--sk-white) !important;
+  background-image: none !important;
+  color: var(--sk-text) !important;
+}
+
+.agent-node-target-badge,
+.action-chip.selected {
   border-color: var(--sk-accent) !important;
   background: var(--sk-accent) !important;
   color: #111111 !important;
