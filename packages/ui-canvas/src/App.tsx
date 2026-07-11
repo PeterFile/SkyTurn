@@ -119,7 +119,7 @@ import {
 } from "./motion.js";
 import {
   applyCanvasNodePositionUpdates,
-  positionUpdatesFromNodeChanges,
+  finalCanvasNodePositionUpdate,
   type CanvasNodePositionUpdate,
 } from "./canvasState.js";
 import {
@@ -459,21 +459,53 @@ export default function App() {
   }, [activeProject?.rootPath, activeSession?.id, activeSession?.kind, activeSession?.updatedAt, selectedNode]);
 
   const activeCanvasSessionId = activeSession?.kind === "canvas" ? activeSession.id : null;
-  const updateActiveNodePositions = useCallback(
-    (updates: CanvasNodePositionUpdate[]) => {
-      if (!activeCanvasSessionId || updates.length === 0) return;
+  const commitActiveNodePosition = useCallback(
+    async (update: CanvasNodePositionUpdate) => {
+      if (!activeCanvasSessionId) throw new Error("Canvas session is unavailable.");
       const updatedAt = new Date().toISOString();
+      const workflow = window.devflow?.workflow;
+
+      if (workflow && activeProject) {
+        const updateId = crypto.randomUUID();
+        const persistPosition = () => workflow.updateNodePosition(activeProject.rootPath, {
+          sessionId: activeCanvasSessionId,
+          updateId,
+          nodeId: update.id,
+          position: update.position,
+        });
+        let result: Awaited<ReturnType<typeof persistPosition>>;
+        try {
+          result = await persistPosition();
+        } catch {
+          result = await persistPosition();
+        }
+        const persistedSession = result.canvasSession;
+        if (!persistedSession || persistedSession.id !== activeCanvasSessionId) {
+          throw new Error("Saved canvas session was not returned.");
+        }
+        if (!persistedSession.nodes.some((node) => node.id === update.id)) {
+          throw new Error("Saved canvas node was not returned.");
+        }
+
+        setWorkspace((current) => ({
+          ...current,
+          sessions: current.sessions.map((session) =>
+            session.id === activeCanvasSessionId ? persistedSession : session,
+          ),
+        }));
+        return;
+      }
 
       setWorkspace((current) => ({
         ...current,
         sessions: current.sessions.map((session) => {
           if (session.id !== activeCanvasSessionId || session.kind !== "canvas") return session;
-          const nodes = applyCanvasNodePositionUpdates(session.nodes, updates);
+          const nodes = applyCanvasNodePositionUpdates(session.nodes, [update]);
           return nodes === session.nodes ? session : { ...session, nodes, updatedAt };
         }),
       }));
     },
-    [activeCanvasSessionId],
+    [activeCanvasSessionId, activeProject],
   );
 
   async function importProject(initialGoal = "", initialMode: WorkflowMode = "fast") {
@@ -998,7 +1030,7 @@ export default function App() {
               onComposerChange={selectedNode ? setNodeActionText : setBottomGoal}
               onComposerSubmit={appendRequirementNode}
               onComposerStop={stopActiveRun}
-              onNodePositionsChange={updateActiveNodePositions}
+              onNodePositionCommit={commitActiveNodePosition}
               onOpenPlannerInspector={() => setTerminalOpen(true)}
               onSelectNode={(nodeId) => {
                 setSelectedNodeId(nodeId);
@@ -1884,7 +1916,7 @@ function CanvasView({
   onComposerChange,
   onComposerSubmit,
   onComposerStop,
-  onNodePositionsChange,
+  onNodePositionCommit,
   onOpenPlannerInspector,
   onSelectNode,
   onInspectNode,
@@ -1905,7 +1937,7 @@ function CanvasView({
   onComposerChange: (value: string) => void;
   onComposerSubmit: (action?: ComposerAction) => void;
   onComposerStop: () => void;
-  onNodePositionsChange: (updates: CanvasNodePositionUpdate[]) => void;
+  onNodePositionCommit: (update: CanvasNodePositionUpdate) => Promise<void>;
   onOpenPlannerInspector: () => void;
   onSelectNode: (nodeId: string | null) => void;
   onInspectNode: (nodeId: string) => void;
@@ -1965,6 +1997,7 @@ function CanvasView({
     [nodeById, session.edges],
   );
   const [flowNodes, setFlowNodes, onFlowNodesChange] = useNodesState<AgentFlowNode>(nodesSource);
+  const [positionSaveError, setPositionSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     setFlowNodes((current) => mergeFlowNodeState(current, nodesSource));
@@ -1973,10 +2006,28 @@ function CanvasView({
   const handleNodesChange = useCallback(
     (changes: NodeChange<AgentFlowNode>[]) => {
       onFlowNodesChange(changes);
-      const updates = positionUpdatesFromNodeChanges(changes);
-      if (updates.length > 0) onNodePositionsChange(updates);
     },
-    [onFlowNodesChange, onNodePositionsChange],
+    [onFlowNodesChange],
+  );
+
+  const handleNodeDragStop = useCallback(
+    async (_event: MouseEvent | TouchEvent, node: AgentFlowNode) => {
+      setPositionSaveError(null);
+      try {
+        await onNodePositionCommit(finalCanvasNodePositionUpdate(node));
+      } catch {
+        const persistedNode = session.nodes.find((candidate) => candidate.id === node.id);
+        if (persistedNode) {
+          setFlowNodes((current) => current.map((candidate) =>
+            candidate.id === node.id
+              ? { ...candidate, position: persistedNode.position, dragging: false }
+              : candidate,
+          ));
+        }
+        setPositionSaveError("Couldn’t save node position. Restored the last saved position.");
+      }
+    },
+    [onNodePositionCommit, session.nodes, setFlowNodes],
   );
 
   return (
@@ -1987,6 +2038,7 @@ function CanvasView({
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         onNodesChange={handleNodesChange}
+        onNodeDragStop={handleNodeDragStop}
         onPaneClick={() => onSelectNode(null)}
         defaultViewport={{ x: 0, y: 0, zoom: CANVAS_NODE_LAYOUT.singleNodeZoom }}
         minZoom={0.22}
@@ -2000,6 +2052,7 @@ function CanvasView({
         />
         <Controls showInteractive={false} />
       </ReactFlow>
+      {positionSaveError && <div className="canvas-position-save-error" role="alert">{positionSaveError}</div>}
       <AgentReadinessBlock readiness={agentReadiness} compact />
       <CanvasComposer
         value={composerValue}
