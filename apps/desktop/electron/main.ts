@@ -1966,6 +1966,8 @@ function deliveryLifecycleFactsForRenderer(event: Record<string, unknown> & { ki
   const payload = isRecord(event.payload) ? event.payload : {};
   const evidence = isRecord(payload.evidence) ? payload.evidence : {};
   const laneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+  const review = rendererSafePullRequestReview(payload.review) ?? rendererSafePullRequestReview(evidence.review);
+  const gate = rendererSafePullRequestGate(payload.gate) ?? rendererSafePullRequestGate(evidence.gate);
 
   switch (event.kind) {
     case "workflow.commit.created":
@@ -2004,6 +2006,8 @@ function deliveryLifecycleFactsForRenderer(event: Record<string, unknown> & { ki
         ...(optionalText(payload.headSha) ?? optionalText(evidence.headSha) ? { headSha: (optionalText(payload.headSha) ?? optionalText(evidence.headSha))! } : {}),
         ...(optionalText(payload.status) ?? optionalText(evidence.status) ? { status: (optionalText(payload.status) ?? optionalText(evidence.status))! } : {}),
         checks: rendererSafePullRequestChecks(payload.checks ?? evidence.checks),
+        ...(review ? { review } : {}),
+        ...(gate ? { gate } : {}),
       };
     case "workflow.pull_request.merged":
       return {
@@ -2042,6 +2046,19 @@ function rendererSafePullRequestChecks(value: unknown): Array<Record<string, unk
       };
     })
     .filter((check): check is Record<string, unknown> => check !== null);
+}
+
+function rendererSafePullRequestReview(value: unknown): { status: string } | null {
+  if (!isRecord(value)) return null;
+  const status = optionalText(value.status);
+  return status === "approved" || status === "changes_requested" || status === "pending" || status === "unknown"
+    ? { status }
+    : null;
+}
+
+function rendererSafePullRequestGate(value: unknown): { mergeable: boolean } | null {
+  if (!isRecord(value) || typeof value.mergeable !== "boolean") return null;
+  return { mergeable: value.mergeable };
 }
 
 function workflowEventSummary(kind: string): string {

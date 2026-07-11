@@ -358,6 +358,61 @@ test("workflow events expose renderer-safe delivery lifecycle facts without raw 
   assert.doesNotMatch(deliveryFactsHelper, /worktreePath|command|commands|stdout|stderr|rawStdout/);
 });
 
+test("workflow checks projection preserves only renderer-safe review and mergeability facts", async () => {
+  const { redactWorkflowEventForRenderer } = await loadMainDeliveryRendererHelpers();
+  const projected = toPlain(redactWorkflowEventForRenderer({
+    id: "event-checks-1",
+    sessionId: "session-1",
+    seq: 4,
+    kind: "workflow.pull_request.checks_recorded",
+    source: "electron-main",
+    laneId: "lane-pr",
+    createdAt: "2026-07-11T00:00:00.000Z",
+    payload: {
+      laneId: "lane-pr",
+      prNumber: 42,
+      url: "https://example.test/pull/42",
+      headSha: "sha-b",
+      status: "passed",
+      checks: [{
+        name: "Build and test",
+        status: "passed",
+        link: "https://example.test/checks/1",
+        detail: "must stay private",
+      }],
+      review: {
+        status: "approved",
+        reviewer: "octocat",
+        detail: "private review comment",
+      },
+      gate: {
+        headSha: "sha-b",
+        checksStatus: "passed",
+        reviewStatus: "approved",
+        state: "OPEN",
+        mergeable: true,
+      },
+      evidence: {
+        command: { stdout: "raw gh output", stderr: "secret" },
+        summary: "agent prose",
+      },
+    },
+  }));
+
+  assert.deepEqual(projected.payload.delivery, {
+    kind: "checks",
+    laneId: "lane-pr",
+    prNumber: 42,
+    url: "https://example.test/pull/42",
+    headSha: "sha-b",
+    status: "passed",
+    checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/1" }],
+    review: { status: "approved" },
+    gate: { mergeable: true },
+  });
+  assert.doesNotMatch(JSON.stringify(projected), /octocat|private review comment|raw gh output|secret|agent prose/);
+});
+
 test("workflow delivery push validates session, commit lane, worktree, and commit evidence before git push", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const deliveryPushHandler = main.slice(
@@ -2080,6 +2135,35 @@ async function loadMainRendererCanvasSessionHelpers() {
   }).outputText;
   const module = { exports: {} };
   vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.rendererCanvasSession.ts" });
+  return module.exports;
+}
+
+async function loadMainDeliveryRendererHelpers() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    extractFunction(main, "positiveInteger"),
+    extractFunction(main, "optionalText"),
+    extractFunction(main, "isRecord"),
+    main.slice(
+      main.indexOf("function deliveryLifecycleFactsForRenderer"),
+      main.indexOf("function workflowEventSummary"),
+    ),
+    extractFunction(main, "workflowEventSummary"),
+    main.slice(
+      main.indexOf("function redactWorkflowEventForRenderer"),
+      main.indexOf("function deliveryLifecycleFactsForRenderer"),
+    ),
+    "module.exports = { redactWorkflowEventForRenderer };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.deliveryRenderer.ts" });
   return module.exports;
 }
 
