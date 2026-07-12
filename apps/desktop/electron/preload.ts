@@ -17,6 +17,12 @@ import type {
   TerminalStartResult,
   TerminalWriteInput,
 } from "./terminalIpcContracts";
+import type {
+  WorkflowInsertBeforeRequest,
+  WorkflowInsertBeforeResult,
+  WorkflowPendingInsertBeforeRequest,
+  WorkflowPendingInsertBeforeResult,
+} from "@skyturn/persistence" with { "resolution-mode": "import" };
 
 const terminal = {
   start: (input: TerminalStartInput): Promise<TerminalStartResult> => ipcRenderer.invoke("terminal:start", input),
@@ -52,6 +58,12 @@ const workflow = {
   getEvents: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:events", projectRoot, sessionId),
   reassignLane,
   getCheckpoints: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:checkpoints", projectRoot, input),
+  getPendingInsertBeforeRequest: (
+    projectRoot: string,
+    input: WorkflowPendingInsertBeforeRequest,
+  ): Promise<WorkflowPendingInsertBeforeResult> => ipcRenderer.invoke("workflow:insertBefore:pending", projectRoot, input),
+  insertBefore: (projectRoot: string, input: WorkflowInsertBeforeRequest): Promise<WorkflowInsertBeforeResult> =>
+    ipcRenderer.invoke("workflow:insertBefore", projectRoot, input),
   getRollbackEligibility: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:rollback:eligibility", projectRoot, input),
   applyRollback: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:rollback:apply", projectRoot, input),
   requestRepair: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:repair:create", projectRoot, input),

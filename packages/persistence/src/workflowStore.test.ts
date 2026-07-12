@@ -10,7 +10,13 @@ import {
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
 import type { RunEvidence, WorkflowWorktreeIdentity } from "@skyturn/project-core";
-import type { FlowEventKind, WorkflowIntent } from "@skyturn/workflow-kernel";
+import {
+  compileInsertClarificationBefore,
+  scheduleReadyLanes,
+  type FlowEvent,
+  type FlowEventKind,
+  type WorkflowIntent,
+} from "@skyturn/workflow-kernel";
 
 const roots: string[] = [];
 
@@ -20,6 +26,416 @@ afterEach(async () => {
 });
 
 describe("SQLite workflow store", () => {
+  it("rejects a ready insert-before target and preserves the graph across restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    const target = store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-validation");
+    expect(target).toBeDefined();
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane-validation:ready",
+      payload: { lane: { ...target, status: "ready" } },
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    const before = store.materializeFlowProjection("session-1");
+
+    expect(() => store.insertClarificationBefore({
+      sessionId: "session-1", targetLaneId: "lane-validation", requestId: "reject-ready", now: "2026-06-14T00:00:03.000Z",
+    })).toThrow(/eligible pending lane/i);
+    expect(store.materializeFlowProjection("session-1")).toEqual(before);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(before);
+    expect(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-validation")?.status).toBe("ready");
+    reopened.close();
+  });
+
+  it("rejects conflicting insert-before requestId without changing the graph", async () => {
+    const store = createWorkflowStore({ projectRoot: await makeTempRoot() });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    store.insertClarificationBefore({ sessionId: "session-1", targetLaneId: "lane-validation", requestId: "same-request", now: "2026-06-14T00:00:03.000Z" });
+    const before = store.materializeFlowProjection("session-1");
+    expect(() => store.insertClarificationBefore({ sessionId: "session-1", targetLaneId: "lane-review", requestId: "same-request", now: "2026-06-14T00:00:04.000Z" })).toThrow(/conflicts/i);
+    expect(store.materializeFlowProjection("session-1")).toEqual(before);
+    store.close();
+  });
+
+  it.each(["append", "projection"] as const)("rolls back insert-before when %s validation fails", async (failure) => {
+    let armed = false;
+    const store = createWorkflowStore({
+      projectRoot: await makeTempRoot(),
+      faultInjection: {
+        beforeInsertBeforeAppend: () => { if (armed && failure === "append") throw new Error("injected append failure"); },
+        afterInsertBeforeProjection: () => { if (armed && failure === "projection") throw new Error("injected projection failure"); },
+      },
+    });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    const before = store.materializeFlowProjection("session-1");
+    armed = true;
+    expect(() => store.insertClarificationBefore({ sessionId: "session-1", targetLaneId: "lane-validation", requestId: `fail-${failure}`, now: "2026-06-14T00:00:03.000Z" })).toThrow(`injected ${failure} failure`);
+    armed = false;
+    expect(store.materializeFlowProjection("session-1")).toEqual(before);
+    store.close();
+  });
+
+  it("recovers the authoritative graph on identical retry after response delivery fails", async () => {
+    const store = createWorkflowStore({ projectRoot: await makeTempRoot() });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    const request = { sessionId: "session-1", targetLaneId: "lane-validation", requestId: "response-retry", now: "2026-06-14T00:00:03.000Z" };
+    const committed = store.insertClarificationBefore(request);
+    expect(() => { throw new Error("injected response failure"); }).toThrow("injected response failure");
+    const retry = store.insertClarificationBefore({ ...request, now: "2026-06-14T00:00:04.000Z" });
+    expect(retry.event.id).toBe(committed.event.id);
+    expect(retry.projection).toEqual(committed.projection);
+    expect(retry.canvasSession).toEqual(committed.canvasSession);
+    store.close();
+  });
+
+  it("reuses target A's durable insert request after a lost response and a target B request", async () => {
+    const store = createWorkflowStore({ projectRoot: await makeTempRoot() });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+
+    const firstA = store.insertClarificationBefore({
+      sessionId: "session-1",
+      targetLaneId: "lane-validation",
+      requestId: "target-a-original",
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.insertClarificationBefore({
+      sessionId: "session-1",
+      targetLaneId: "lane-review",
+      requestId: "target-b-original",
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    const retryA = store.insertClarificationBefore({
+      sessionId: "session-1",
+      targetLaneId: "lane-validation",
+      requestId: "target-a-after-switch",
+      now: "2026-06-14T00:00:05.000Z",
+    });
+
+    expect(retryA.event.id).toBe(firstA.event.id);
+    expect(retryA.event.payload.requestId).toBe("target-a-original");
+    expect(insertBeforeEventsForTarget(store, "lane-validation")).toHaveLength(1);
+    expect(insertBeforeEventsForTarget(store, "lane-review")).toHaveLength(1);
+    expect(retryA.projection.lanes.filter((lane) => lane.id === firstA.lane.id)).toHaveLength(1);
+    store.close();
+  });
+
+  it("reuses a pending durable insert request after the request tracker and SQLite store restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    const first = store.insertClarificationBefore({
+      sessionId: "session-1",
+      targetLaneId: "lane-validation",
+      requestId: "before-renderer-restart",
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const retry = reopened.insertClarificationBefore({
+      sessionId: "session-1",
+      targetLaneId: "lane-validation",
+      requestId: "after-renderer-restart",
+      now: "2026-06-14T00:00:04.000Z",
+    });
+
+    expect(retry.event.id).toBe(first.event.id);
+    expect(retry.event.payload.requestId).toBe("before-renderer-restart");
+    expect(insertBeforeEventsForTarget(reopened, "lane-validation")).toHaveLength(1);
+    expect(retry.projection.lanes.filter((lane) => lane.id === first.lane.id)).toHaveLength(1);
+    reopened.close();
+  });
+
+  it("persists insert-before topology idempotently across restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+
+    const first = store.insertClarificationBefore({
+      sessionId: "session-1",
+      targetLaneId: "lane-validation",
+      requestId: "insert-before-validation-1",
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    const duplicate = store.insertClarificationBefore({
+      sessionId: "session-1",
+      targetLaneId: "lane-validation",
+      requestId: "insert-before-validation-1",
+      now: "2026-06-14T00:00:04.000Z",
+    });
+
+    expect(duplicate.event.id).toBe(first.event.id);
+    expect(first.projection.lanes.filter((lane) => lane.id === first.lane.id)).toHaveLength(1);
+    expect(first.projection.edges.map((edge) => [edge.sourceLaneId, edge.targetLaneId])).toContainEqual([
+      "lane-implementation",
+      first.lane.id,
+    ]);
+    expect(first.projection.edges.map((edge) => [edge.sourceLaneId, edge.targetLaneId])).toContainEqual([
+      first.lane.id,
+      "lane-validation",
+    ]);
+    expect(first.projection.edges.map((edge) => [edge.sourceLaneId, edge.targetLaneId])).not.toContainEqual([
+      "lane-implementation",
+      "lane-validation",
+    ]);
+    const planner = first.canvasSession?.nodes.find((node) => node.id === first.canvasSession?.plannerNodeId);
+    expect(planner?.context.dependencies).toEqual([]);
+    expect(first.canvasSession?.edges.some((edge) => edge.target === planner?.id)).toBe(false);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(first.projection);
+    const restartedCanvasSession = reopened.materializeCanvasSession("session-1");
+    expect(restartedCanvasSession).toEqual(first.canvasSession);
+    const restartedPlanner = restartedCanvasSession?.nodes.find((node) => node.id === restartedCanvasSession.plannerNodeId);
+    const restartedTarget = restartedCanvasSession?.nodes.find((node) => node.id === "lane-validation");
+    expect(restartedPlanner?.context.dependencies).toEqual([]);
+    expect(restartedCanvasSession?.edges.some((edge) => edge.target === restartedPlanner?.id)).toBe(false);
+    expect(restartedTarget?.context.dependencies).toEqual([first.lane.id]);
+    expect(restartedTarget?.status).toBe("pending");
+    reopened.close();
+  });
+
+  it("preserves a ReplanFromEvidence Repair chain and scheduling across SQLite reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    store.recordRunResult(runResultInput(store, "lane-implementation", "failed", "2026-06-14T00:00:07.000Z"));
+    const evidenceId = "evidence-segment-session-1-lane-implementation";
+    const replan = store.applyWorkflowIntent({
+      intentId: "intent-replan-insert-before",
+      sessionId: "session-1",
+      operations: [{ type: "ReplanFromEvidence", laneId: "lane-implementation", evidenceId }],
+    }, "2026-06-14T00:00:08.000Z");
+    expect(replan.ok).toBe(true);
+
+    const before = store.materializeFlowProjection("session-1");
+    const repair = before.lanes.find((lane) => lane.semanticKey === `repair:lane-implementation:${evidenceId}`);
+    const regression = before.lanes.find((lane) => lane.semanticKey === `regression:lane-implementation:${evidenceId}`);
+    expect(repair).toBeDefined();
+    expect(regression).toBeDefined();
+    if (!repair || !regression) throw new Error("ReplanFromEvidence did not create its repair chain.");
+    expect(scheduleReadyLanes(before, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([repair.id]);
+
+    const inserted = store.insertClarificationBefore({
+      sessionId: "session-1",
+      targetLaneId: repair.id,
+      requestId: "persist-replan-repair",
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    const expectedRepairEdges = [
+      {
+        id: `edge-implementation-${repair.id.replace(/^lane-/, "")}`,
+        sourceLaneId: "lane-implementation",
+        targetLaneId: repair.id,
+      },
+      {
+        id: `edge-${repair.id.replace(/^lane-/, "")}-${regression.id.replace(/^lane-/, "")}`,
+        sourceLaneId: repair.id,
+        targetLaneId: regression.id,
+      },
+      {
+        id: `edge-${inserted.lane.id}-${repair.id}`,
+        sourceLaneId: inserted.lane.id,
+        targetLaneId: repair.id,
+      },
+    ];
+    expect(inserted.projection.edges.filter((edge) =>
+      edge.targetLaneId === repair.id ||
+      edge.sourceLaneId === repair.id
+    )).toEqual(expectedRepairEdges);
+    expect(scheduleReadyLanes(inserted.projection, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([inserted.lane.id]);
+    const insertedEdges = structuredClone(inserted.projection.edges);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const replayed = reopened.materializeFlowProjection("session-1");
+    expect(replayed.edges).toEqual(insertedEdges);
+    expect(scheduleReadyLanes(replayed, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([inserted.lane.id]);
+    reopened.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: inserted.lane.id,
+      segmentId: `segment-${inserted.lane.id}`,
+      idempotencyKey: `evidence:${inserted.lane.id}:completed`,
+      payload: {
+        laneId: inserted.lane.id,
+        segmentId: `segment-${inserted.lane.id}`,
+        evidence: {
+          id: `evidence-${inserted.lane.id}`,
+          kind: "run-exit",
+          status: "passed",
+          checks: ["run-exit:succeeded"],
+          artifacts: [],
+        },
+      },
+      now: "2026-06-14T00:00:10.000Z",
+    });
+    const completed = reopened.materializeFlowProjection("session-1");
+    expect(completed.edges).toEqual(insertedEdges);
+    expect(scheduleReadyLanes(completed, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([repair.id]);
+    reopened.close();
+
+    const completedReopen = createWorkflowStore({ projectRoot });
+    const completedReplay = completedReopen.materializeFlowProjection("session-1");
+    expect(completedReplay.edges).toEqual(insertedEdges);
+    expect(scheduleReadyLanes(completedReplay, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([repair.id]);
+    completedReopen.close();
+  });
+
+  it.each([
+    ["null idempotency key", null, "restart-envelope"],
+    ["wrong idempotency key", "insert-before:wrong-request", "restart-envelope"],
+    ["envelope and payload request mismatch", "insert-before:restart-envelope", "other-request"],
+  ])("fails closed after SQLite restart with insert-before %s", async (_label, idempotencyKey, payloadRequestId) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    const before = store.materializeFlowProjection("session-1");
+    const compiled = compileInsertClarificationBefore(before, {
+      sessionId: "session-1", targetLaneId: "lane-validation", requestId: "restart-envelope",
+    }, "2026-06-14T00:00:03.000Z");
+    appendCompiledFlowEvent(store, {
+      ...compiled.event,
+      idempotencyKey,
+      payload: { ...compiled.event.payload, requestId: payloadRequestId },
+    });
+    expect(store.listEvents("session-1").at(-1)).toMatchObject({
+      kind: "workflow.lane.inserted_before",
+      idempotencyKey,
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(() => reopened.materializeFlowProjection("session-1")).toThrow(/insert-before replay/i);
+    expect(() => reopened.insertClarificationBefore({
+      sessionId: "session-1", targetLaneId: "lane-validation", requestId: "restart-envelope", now: "2026-06-14T00:00:04.000Z",
+    })).toThrow(/insert-before replay|conflicts/i);
+    reopened.close();
+  });
+
+  it.each([
+    ["source", (event: FlowEvent) => { event.source = "hermes"; }],
+    ["brief", (event: FlowEvent) => { insertBeforeLanePayload(event).brief = "Injected instructions"; }],
+    ["output", (event: FlowEvent) => { insertBeforeLanePayload(event).output = ["Injected prompt context"]; }],
+    ["side effects", (event: FlowEvent) => {
+      (insertBeforeLanePayload(event).runtimePolicy as Record<string, unknown>).sideEffects = ["git"];
+    }],
+  ] as const)("fails closed after SQLite reopen with non-canonical insert-before %s", async (_label, mutate) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    const before = store.materializeFlowProjection("session-1");
+    const compiled = compileInsertClarificationBefore(before, {
+      sessionId: "session-1",
+      targetLaneId: "lane-validation",
+      requestId: "restart-canonical-payload",
+    }, "2026-06-14T00:00:03.000Z");
+    const tampered = structuredClone(compiled.event);
+    mutate(tampered);
+    appendCompiledFlowEvent(store, tampered);
+    expect(before.lanes.some((lane) => lane.id === compiled.lane.id)).toBe(false);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(() => reopened.materializeFlowProjection("session-1")).toThrow(/insert-before replay/i);
+    reopened.close();
+  });
+
+  it("returns the durable insert-before mutation for the same request after SQLite restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const request = {
+      sessionId: "session-1", targetLaneId: "lane-validation", requestId: "restart-retry", now: "2026-06-14T00:00:03.000Z",
+    };
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    const first = store.insertClarificationBefore(request);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const retry = reopened.insertClarificationBefore({ ...request, now: "2026-06-14T00:00:04.000Z" });
+    expect(retry.event.id).toBe(first.event.id);
+    expect(retry.projection).toEqual(first.projection);
+    expect(retry.canvasSession).toEqual(first.canvasSession);
+    reopened.close();
+  });
+
+  it.each(["planner pollution", "retained edge ID collision"] as const)(
+    "fails closed after SQLite restart with preexisting %s before insert-before replay",
+    async (failure) => {
+      const projectRoot = await makeTempRoot();
+      const store = createWorkflowStore({ projectRoot });
+      seedStore(store);
+      declareCodeChangeWorkflow(store);
+      if (failure === "planner pollution") {
+        store.appendWorkflowEvent({
+          sessionId: "session-1",
+          kind: "workflow.lane.declared",
+          source: "test",
+          idempotencyKey: "lane:planner-replay-pollution",
+          payload: {
+            lane: { id: "lane-planner", semanticKey: "planner:session-1", kind: "planner", title: "Planner", agentKind: "hermes", status: "pending" },
+          },
+          now: "2026-06-14T00:00:02.500Z",
+        });
+      }
+      const request = {
+        sessionId: "session-1",
+        targetLaneId: "lane-validation",
+        requestId: `restart-${failure.replaceAll(" ", "-")}`,
+      };
+      const compiled = compileInsertClarificationBefore(
+        store.materializeFlowProjection("session-1"),
+        request,
+        "2026-06-14T00:00:03.000Z",
+      );
+      const generatedEdgeId = (compiled.event.payload.edges as Array<{ id: string }>)[0].id;
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind: "workflow.edge.declared",
+        source: "test",
+        idempotencyKey: `malformed:${failure}`,
+        payload: {
+          edge: failure === "planner pollution"
+            ? { id: "edge-implementation-planner", sourceLaneId: "lane-implementation", targetLaneId: "lane-planner" }
+            : { id: generatedEdgeId, sourceLaneId: "lane-implementation", targetLaneId: "lane-review" },
+        },
+        now: "2026-06-14T00:00:04.000Z",
+      });
+      appendCompiledFlowEvent(store, compiled.event);
+      store.close();
+
+      const reopened = createWorkflowStore({ projectRoot });
+      expect(() => reopened.materializeFlowProjection("session-1")).toThrow(
+        failure === "planner pollution" ? /planner|intake/i : /edge ID.*conflict/i,
+      );
+      expect(() => reopened.materializeCanvasSession("session-1")).toThrow(
+        failure === "planner pollution" ? /planner|intake/i : /edge ID.*conflict/i,
+      );
+      reopened.close();
+    },
+  );
+
   it("initializes the SQLite schema in .devflow and applies migrations idempotently", async () => {
     const projectRoot = await makeTempRoot();
     const first = createWorkflowStore({ projectRoot });
@@ -3569,6 +3985,30 @@ function declareCodeChangeWorkflow(store: ReturnType<typeof createWorkflowStore>
       { type: "ProposeLanes" },
     ],
   }, "2026-06-14T00:00:02.000Z");
+}
+
+function appendCompiledFlowEvent(store: ReturnType<typeof createWorkflowStore>, event: FlowEvent): void {
+  store.appendWorkflowEvent({
+    sessionId: event.sessionId,
+    kind: event.kind,
+    source: event.source,
+    idempotencyKey: event.idempotencyKey,
+    payload: event.payload,
+    now: event.createdAt,
+  });
+}
+
+function insertBeforeEventsForTarget(
+  store: ReturnType<typeof createWorkflowStore>,
+  targetLaneId: string,
+) {
+  return store.listEvents("session-1").filter((event) =>
+    event.kind === "workflow.lane.inserted_before" && event.payload.targetLaneId === targetLaneId
+  );
+}
+
+function insertBeforeLanePayload(event: FlowEvent): Record<string, unknown> {
+  return event.payload.lane as Record<string, unknown>;
 }
 
 function declareCompletedImplementationWithUpstream(store: ReturnType<typeof createWorkflowStore>): void {

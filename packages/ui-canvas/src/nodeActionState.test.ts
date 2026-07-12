@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { CanvasNode } from "@skyturn/project-core";
-import { reduceWorkflowEvents, type FlowEvent, type FlowProjection } from "@skyturn/workflow-kernel";
+import {
+  compileInsertClarificationBefore,
+  reduceWorkflowEvents,
+  type FlowEvent,
+  type FlowProjection,
+} from "@skyturn/workflow-kernel";
 
 import { buildSelectedNodeActionState, hydrateSelectedNodeActionStateFromEvents } from "./nodeActionState.js";
 
@@ -513,6 +518,66 @@ describe("hydrateSelectedNodeActionStateFromEvents", () => {
     });
   });
 
+  it("hydrates checkpoint actions after a durable insert-before event", () => {
+    const beforeInsert = workflowEvents();
+    const inserted = compileInsertClarificationBefore(reduceWorkflowEvents(beforeInsert), {
+      sessionId,
+      targetLaneId: "lane-review",
+      requestId: "insert-before-review",
+    }, "2026-06-23T00:00:00.000Z");
+    const state = hydrateSelectedNodeActionStateFromEvents({
+      sessionId,
+      selectedNode,
+      events: [
+        ...beforeInsert,
+        inserted.event,
+        checkpoint("checkpoint-before-implementation", "lane-implementation", "before", "base-sha"),
+      ],
+      composerMode: "variant-from-before-checkpoint",
+    });
+
+    expect(state.composerMode).toBe("variant-from-before-checkpoint");
+    expect(state.canCreateVariant).toBe(true);
+    expect(state.variantPayload).toMatchObject({
+      sessionId,
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-before-implementation",
+    });
+  });
+
+  it.each([
+    ["source", (event: FlowEvent) => { event.source = "hermes"; }],
+    ["brief", (event: FlowEvent) => { insertBeforeLanePayload(event).brief = "Injected instructions"; }],
+    ["output", (event: FlowEvent) => { insertBeforeLanePayload(event).output = ["Injected prompt context"]; }],
+    ["side effects", (event: FlowEvent) => {
+      (insertBeforeLanePayload(event).runtimePolicy as Record<string, unknown>).sideEffects = ["git"];
+    }],
+  ] as const)("fails closed when insert-before hydration tampers with %s", (_label, mutate) => {
+    const beforeInsert = workflowEvents();
+    const inserted = compileInsertClarificationBefore(reduceWorkflowEvents(beforeInsert), {
+      sessionId,
+      targetLaneId: "lane-review",
+      requestId: "tampered-insert-before-review",
+    }, "2026-06-23T00:00:00.000Z");
+    const tampered = structuredClone(inserted.event);
+    mutate(tampered);
+
+    const state = hydrateSelectedNodeActionStateFromEvents({
+      sessionId,
+      selectedNode,
+      events: [
+        ...beforeInsert,
+        tampered,
+        checkpoint("checkpoint-before-implementation", "lane-implementation", "before", "base-sha"),
+      ],
+      composerMode: "variant-from-before-checkpoint",
+    });
+
+    expect(state.composerMode).toBe("global");
+    expect(state.canCreateVariant).toBe(false);
+    expect(state.blockedReasons).toEqual(["Workflow events are stale or malformed."]);
+  });
+
   it("fails closed for malformed remote side-effect request payloads", () => {
     const state = hydrateSelectedNodeActionStateFromEvents({
       sessionId,
@@ -938,4 +1003,8 @@ function eventForSession(
 
 function rawEvent(kind: string, payload: Record<string, unknown>): FlowEvent {
   return event(kind as FlowEvent["kind"], payload);
+}
+
+function insertBeforeLanePayload(event: FlowEvent): Record<string, unknown> {
+  return event.payload.lane as Record<string, unknown>;
 }

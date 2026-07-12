@@ -24,6 +24,8 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:projection",
     "workflow:events",
     "workflow:checkpoints",
+    "workflow:insertBefore:pending",
+    "workflow:insertBefore",
     "workflow:rollback:eligibility",
     "workflow:rollback:apply",
     "workflow:repair:create",
@@ -53,6 +55,7 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(main, /recordRunResult/);
   assert.match(main, /materializeFlowProjection/);
   assert.match(main, /listNodeCheckpoints/);
+  assert.match(main, /insertClarificationBefore/);
   assert.match(main, /getNodeRollbackEligibility/);
   assert.match(main, /applyNodeRollback/);
   assert.match(main, /requestNodeRepair/);
@@ -893,6 +896,8 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "getWorkflowProjection",
     "getWorkflowEvents",
     "getCheckpoints",
+    "getPendingInsertBeforeRequest",
+    "insertBefore",
     "getRollbackEligibility",
     "applyRollback",
     "requestRepair",
@@ -909,6 +914,8 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "getEvents",
     "reassignLane",
     "getCheckpoints",
+    "getPendingInsertBeforeRequest",
+    "insertBefore",
     "getRollbackEligibility",
     "applyRollback",
     "requestRepair",
@@ -1078,6 +1085,64 @@ test("workflow lane reassignment public contract is typed and returns the author
   assert.match(contract, /kind:\s*"workflow\.lane\.reassigned"/);
   assert.match(contract, /previousAgentKind:\s*AgentKind/);
   assert.match(contract, /canvasSession:\s*CanvasSession/);
+});
+
+test("workflow insert-before contract is narrow and returns authoritative lane identity", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const request = persistence.slice(
+    persistence.indexOf("export interface WorkflowInsertBeforeRequest"),
+    persistence.indexOf("export interface WorkflowInsertBeforeResult"),
+  );
+  const result = persistence.slice(
+    persistence.indexOf("export interface WorkflowInsertBeforeResult"),
+    persistence.indexOf("export interface WorkflowRunResultRecordRequest"),
+  );
+
+  assert.match(request, /sessionId:\s*string/);
+  assert.match(request, /targetLaneId:\s*string/);
+  assert.match(request, /requestId:\s*string/);
+  assert.doesNotMatch(request, /runtimePolicy|executable|sandbox|agentKind/);
+  assert.match(result, /status:\s*"inserted"/);
+  assert.match(result, /laneId:\s*string/);
+  assert.match(result, /canvasSession:\s*CanvasSession \| null/);
+});
+
+test("workflow insert-before pending identity is resolved only by Electron backend truth", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const handler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:insertBefore:pending"'),
+    main.indexOf('ipcMain.handle("workflow:insertBefore"'),
+  );
+
+  assert.match(handler, /assertKnownProjectRoot\(projectRoot\)/);
+  assert.match(handler, /assertKnownWorkflowCanvasSession\(store,\s*sessionId\)/);
+  assert.match(handler, /findPendingInsertBeforeRequest/);
+  assert.doesNotMatch(handler, /fs\.|better-sqlite3|materializeFlowProjection/);
+});
+
+test("workflow insert-before response survives post-commit broadcast failure", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const handler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:insertBefore"'),
+    main.indexOf('ipcMain.handle("workflow:rollback:eligibility"'),
+  );
+  assert.match(handler, /try\s*\{[\s\S]*broadcastWorkflowProjection[\s\S]*\}\s*catch/);
+  assert.match(handler, /result\.canvasSession/);
+  assert.doesNotMatch(handler, /canvasSession:\s*materializeRendererCanvasSession/);
+});
+
+test("workflow insert-before response preserves the Hermes planner terminal binding", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const handler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:insertBefore"'),
+    main.indexOf('ipcMain.handle("workflow:rollback:eligibility"'),
+  );
+
+  assert.match(
+    handler,
+    /canvasSession:\s*augmentCanvasSessionWithHermesTerminal\(\s*result\.canvasSession,\s*terminalRuntime\.hermesPlannerTerminalSessionId\(sessionId\),?\s*\)/,
+  );
+  assert.doesNotMatch(handler, /canvasSession:\s*materializeRendererCanvasSession/);
 });
 
 test("workflow adopt and clean public type contracts return terminal statuses", async () => {

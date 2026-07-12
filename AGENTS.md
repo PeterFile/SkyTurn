@@ -106,6 +106,9 @@
 - Repair remains available from any valid after checkpoint regardless of succeeded, failed, cancelled, or timed-out RunEvidence. Exact failed evidence may enrich repair context and add a regression lane, but it is not a Repair gate.
 - Persist run recovery, start reconciliation, and checkpoint failures as audit-only workflow events; exclude them from `FlowProjection.events` so fault history cannot invalidate the executable projection.
 - Treat Hermes `WorkflowIntent` lane suggestions as untrusted at the parse boundary; strip `runtimePolicy` and `executable` from external lane payloads and derive execution policy inside the workflow kernel.
+- Persist graph topology mutations through validated workflow events and return an authoritative CanvasSession over desktop IPC; insert-before must fail unavailable when that backend is absent and must never mutate topology in the renderer.
+- Insert-before must retain target-specific dependency exceptions on the original successor and add clarification as a separate gate; this includes checkpoint successors and trusted failed-evidence Repair lanes.
+- Keep `FlowEventKind` additions that can reach node-action projections synchronized with `packages/ui-canvas/src/nodeActionState.ts` or checkpoint actions will fail closed.
 - `packages/workflow-kernel` must stay browser-safe and pure; Node/SQLite acceptance belongs in backend-side packages such as `packages/persistence`.
 - `pnpm flow-kernel:acceptance` must cover both kernel scenario execution and SQLite event-stream replay; do not reduce it to static JSON snapshots or mock-only projection checks.
 - Update this file only for reusable project knowledge, not story-specific notes.

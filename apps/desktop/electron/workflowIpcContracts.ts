@@ -11,6 +11,8 @@ export const WORKFLOW_IPC_CHANNELS = {
   projection: "workflow:projection",
   events: "workflow:events",
   checkpoints: "workflow:checkpoints",
+  pendingInsertBefore: "workflow:insertBefore:pending",
+  insertBefore: "workflow:insertBefore",
   rollbackEligibility: "workflow:rollback:eligibility",
   rollbackApply: "workflow:rollback:apply",
   repairCreate: "workflow:repair:create",

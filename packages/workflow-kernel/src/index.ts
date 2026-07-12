@@ -252,6 +252,7 @@ export type FlowEventKind =
   | "workflow.lane.declared"
   | "workflow.lane.reassigned"
   | "workflow.edge.declared"
+  | "workflow.lane.inserted_before"
   | "workflow.segment.started"
   | "workflow.segment.output_delta"
   | "workflow.segment.finished"
@@ -296,6 +297,17 @@ export interface FlowEvent {
   payload: Record<string, unknown>;
   createdAt: string;
   idempotencyKey: string | null;
+}
+
+export interface InsertClarificationBeforeRequest {
+  sessionId: string;
+  targetLaneId: string;
+  requestId: string;
+}
+
+export interface InsertClarificationBeforeResult {
+  event: FlowEvent;
+  lane: FlowLane;
 }
 
 export interface FlowProjection {
@@ -666,11 +678,14 @@ export function evaluateGate(projection: FlowProjection, operation: WorkflowInte
     return blocked("Hermes cannot set completed; completion requires evidence.");
   }
   if (operation.type === "DeclareEdge") {
+    const source = projection.lanes.find((lane) => lane.id === operation.sourceLaneId);
     const target = projection.lanes.find((lane) => lane.id === operation.targetLaneId);
+    if (!source) return blocked("DeclareEdge requires an existing source lane; missing source lane.");
     if (operation.sourceLaneId === operation.targetLaneId) return blocked("Edge would create a cycle.");
     if (target?.kind === "planner" || target?.kind === "intake" || /planner|intake/.test(operation.targetLaneId)) {
       return blocked("Planner/intake lanes cannot have incoming edges.");
     }
+    if (!target) return blocked("DeclareEdge requires an existing target lane; missing target lane.");
     if (createsCycle(projection.edges, operation.sourceLaneId, operation.targetLaneId)) return blocked("Edge would create a cycle.");
   }
   if (operation.type === "StartImplementation") {
@@ -710,6 +725,85 @@ export function evaluateGate(projection: FlowProjection, operation: WorkflowInte
     if (lane.status !== "failed") return blocked("Replan requires the source lane to remain failed.");
   }
   return { allowed: true, reason: "allowed" };
+}
+
+export function compileInsertClarificationBefore(
+  projection: FlowProjection,
+  request: InsertClarificationBeforeRequest,
+  now: string,
+): InsertClarificationBeforeResult {
+  if (request.sessionId !== projection.sessionId) throw new Error("Insert-before session does not match projection.");
+  if (!isValidInsertRequestId(request.requestId)) throw new Error("Insert-before requestId is invalid.");
+  assertCompleteGraphHygiene(projection, "Insert-before existing graph");
+  const target = projection.lanes.find((lane) => lane.id === request.targetLaneId);
+  if (!isEligibleInsertBeforeTarget(target)) {
+    throw new Error("Insert-before target must be an eligible pending lane.");
+  }
+
+  const identity = clarificationLaneIdentity(request.sessionId, request.requestId);
+  const laneId = identity.id;
+  if (projection.lanes.some((lane) => lane.id === laneId)) throw new Error("Insert-before lane identity conflicts with an existing lane.");
+  const lane = normalizeLane({
+    id: laneId,
+    semanticKey: identity.semanticKey,
+    kind: "clarification",
+    laneKind: "design",
+    semanticSubtype: "clarification",
+    title: "Clarify dependency",
+    brief: "Clarify constraints before the selected task runs.",
+    agentKind: "hermes",
+    status: "pending",
+  });
+  const incoming = projection.edges.filter((edge) => edge.targetLaneId === target.id);
+  for (const edge of incoming) {
+    if (!projection.lanes.some((lane) => lane.id === edge.sourceLaneId)) {
+      throw new Error(`Insert-before prerequisite references missing source lane ${edge.sourceLaneId}.`);
+    }
+  }
+  const preservedIncomingEdgeIds = new Set(
+    incoming
+      .filter((edge) => isInsertBeforePreservedDependency(projection, target, edge.sourceLaneId))
+      .map((edge) => edge.id),
+  );
+  const replacedIncoming = incoming.filter((edge) => !preservedIncomingEdgeIds.has(edge.id));
+  const retainedEdges = projection.edges.filter(
+    (edge) => edge.targetLaneId !== target.id || preservedIncomingEdgeIds.has(edge.id),
+  );
+  const rewiredEdges = [
+    ...[...new Set(replacedIncoming.map((edge) => edge.sourceLaneId))].map((sourceLaneId) => ({
+      id: `edge-${sourceLaneId}-${lane.id}`,
+      sourceLaneId,
+      targetLaneId: lane.id,
+    })),
+    { id: `edge-${lane.id}-${target.id}`, sourceLaneId: lane.id, targetLaneId: target.id },
+  ];
+  assertNoRetainedEdgeIdCollisions(retainedEdges, rewiredEdges, "Insert-before edge ID conflict");
+  let validationProjection = { ...projection, lanes: [...projection.lanes, lane], edges: retainedEdges };
+  for (const edge of rewiredEdges) {
+    const gate = evaluateGate(validationProjection, {
+      type: "DeclareEdge",
+      sourceLaneId: edge.sourceLaneId,
+      targetLaneId: edge.targetLaneId,
+    });
+    if (!gate.allowed) throw new Error(`Insert-before edge rejected: ${gate.reason}`);
+    validationProjection = { ...validationProjection, edges: [...validationProjection.edges, edge] };
+  }
+  assertCompleteGraphHygiene(validationProjection, "Insert-before candidate graph");
+
+  const event = makeEvent(projection, {
+    kind: "workflow.lane.inserted_before",
+    source: "workflow-kernel",
+    idempotencyKey: `insert-before:${request.requestId}`,
+    payload: {
+      requestId: request.requestId,
+      targetLaneId: target.id,
+      lane,
+      replacedIncomingEdgeIds: replacedIncoming.map((edge) => edge.id),
+      edges: rewiredEdges,
+    },
+    now,
+  });
+  return { event, lane };
 }
 
 export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleReadyLanesInput): FlowLane[] {
@@ -1337,6 +1431,14 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
     if (event.kind === "workflow.edge.declared" && isRecord(event.payload.edge)) {
       upsertEdge(projection, normalizeEdge(event.payload.edge));
     }
+    if (event.kind === "workflow.lane.inserted_before") {
+      const { insertedLane, replacedIncomingEdgeIds, edges } = parseInsertBeforeReplayPayload(projection, event);
+      declaredLaneStatuses.set(insertedLane.id, insertedLane.status);
+      upsertLane(projection, insertedLane);
+      const replacedEdgeIds = new Set(replacedIncomingEdgeIds);
+      projection.edges = projection.edges.filter((edge) => !replacedEdgeIds.has(edge.id));
+      for (const edge of edges) upsertEdge(projection, edge);
+    }
     if (event.kind === "workflow.segment.started" && isRecord(event.payload.segment)) {
       const segment = normalizeSegment(event.payload.segment);
       upsertSegment(projection, segment);
@@ -1461,6 +1563,179 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
 
   refreshProjectionNodes(projection);
   return projection;
+}
+
+function parseInsertBeforeReplayPayload(
+  projection: FlowProjection,
+  event: FlowEvent,
+): { insertedLane: FlowLane; replacedIncomingEdgeIds: string[]; edges: FlowEdge[] } {
+  const payload = event.payload;
+  assertCompleteGraphHygiene(projection, "Invalid insert-before replay existing graph");
+  if (event.source !== "workflow-kernel") throw new Error("Invalid insert-before replay source.");
+  if (typeof payload.requestId !== "string" || !isValidInsertRequestId(payload.requestId)) {
+    throw new Error("Invalid insert-before replay requestId.");
+  }
+  if (event.idempotencyKey !== `insert-before:${payload.requestId}`) {
+    throw new Error("Invalid insert-before replay idempotency key.");
+  }
+  if (!isRecord(payload.lane)) throw new Error("Invalid insert-before replay lane.");
+  if (typeof payload.targetLaneId !== "string" || payload.targetLaneId.length === 0) {
+    throw new Error("Invalid insert-before replay target.");
+  }
+  if (!Array.isArray(payload.edges)) throw new Error("Invalid insert-before replay edges.");
+  const replacedIncomingEdgeIds = parseUniqueStringArray(
+    payload.replacedIncomingEdgeIds,
+    "Invalid insert-before replay replaced incoming edge IDs.",
+  );
+  const insertedLane = normalizeLane(payload.lane);
+  const targetLaneId = payload.targetLaneId;
+  const target = projection.lanes.find((lane) => lane.id === targetLaneId);
+  if (!isEligibleInsertBeforeTarget(target)) throw new Error("Invalid insert-before replay target.");
+  let canonicalPayload: Record<string, unknown>;
+  try {
+    canonicalPayload = compileInsertClarificationBefore(projection, {
+      sessionId: projection.sessionId,
+      targetLaneId,
+      requestId: payload.requestId,
+    }, event.createdAt).event.payload;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid insert-before replay payload: ${reason}`);
+  }
+  if (!exactJsonEqual(payload, canonicalPayload)) throw new Error("Invalid insert-before replay canonical payload.");
+  if (projection.lanes.some((lane) => lane.id === insertedLane.id)) throw new Error("Invalid insert-before replay lane identity.");
+  const expectedIdentity = clarificationLaneIdentity(projection.sessionId, payload.requestId);
+  const runtimePolicy = payload.lane.runtimePolicy;
+  if (
+    insertedLane.id !== expectedIdentity.id ||
+    insertedLane.semanticKey !== expectedIdentity.semanticKey ||
+    payload.lane.kind !== "clarification" ||
+    payload.lane.laneKind !== "design" ||
+    payload.lane.semanticSubtype !== "clarification" ||
+    payload.lane.nodeKind !== "agent_task" ||
+    payload.lane.agentKind !== "hermes" ||
+    payload.lane.status !== "pending" ||
+    payload.lane.executable !== true ||
+    payload.lane.rollbackStatus !== undefined ||
+    !isRecord(runtimePolicy) ||
+    runtimePolicy.executable !== true ||
+    runtimePolicy.sandbox !== "read-only"
+  ) {
+    throw new Error("Invalid insert-before replay clarification lane.");
+  }
+  const incoming = projection.edges.filter((edge) => edge.targetLaneId === targetLaneId);
+  const preservedIncomingEdgeIds = new Set(
+    incoming
+      .filter((edge) => isInsertBeforePreservedDependency(projection, target, edge.sourceLaneId))
+      .map((edge) => edge.id),
+  );
+  const replacedIncoming = incoming.filter((edge) => !preservedIncomingEdgeIds.has(edge.id));
+  assertExactStringSet(
+    replacedIncomingEdgeIds,
+    replacedIncoming.map((edge) => edge.id),
+    "Invalid insert-before replay replaced incoming edge IDs.",
+  );
+  const edges = payload.edges.map((value) => parseInsertBeforeReplayEdge(value));
+  if (new Set(edges.map((edge) => edge.id)).size !== edges.length) {
+    throw new Error("Invalid insert-before replay duplicate edge ID.");
+  }
+
+  const prerequisiteEdges = edges.filter(
+    (edge) => edge.targetLaneId === insertedLane.id && edge.sourceLaneId !== insertedLane.id,
+  );
+  assertExactStringSet(
+    prerequisiteEdges.map((edge) => edge.sourceLaneId),
+    [...new Set(replacedIncoming.map((edge) => edge.sourceLaneId))],
+    "Invalid insert-before replay prerequisite edges.",
+  );
+  const targetEdges = edges.filter(
+    (edge) => edge.sourceLaneId === insertedLane.id && edge.targetLaneId === targetLaneId,
+  );
+  if (targetEdges.length !== 1 || edges.length !== prerequisiteEdges.length + 1) {
+    throw new Error("Invalid insert-before replay edge topology.");
+  }
+
+  const candidate = {
+    ...projection,
+    lanes: [...projection.lanes, insertedLane],
+    edges: projection.edges.filter((edge) => !replacedIncomingEdgeIds.includes(edge.id)),
+  };
+  assertNoRetainedEdgeIdCollisions(candidate.edges, edges, "Invalid insert-before replay edge ID conflict");
+  let working = candidate;
+  for (const edge of edges) {
+    const gate = evaluateGate(working, { type: "DeclareEdge", sourceLaneId: edge.sourceLaneId, targetLaneId: edge.targetLaneId });
+    if (!gate.allowed) throw new Error(`Invalid insert-before replay edge: ${gate.reason}`);
+    working = { ...working, edges: [...working.edges, edge] };
+  }
+  assertCompleteGraphHygiene(working, "Invalid insert-before replay candidate graph");
+  return { insertedLane, replacedIncomingEdgeIds, edges };
+}
+
+function exactJsonEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((value, index) => exactJsonEqual(value, right[index]));
+  }
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const leftKeys = Object.keys(left).sort();
+  const rightKeys = Object.keys(right).sort();
+  if (leftKeys.length !== rightKeys.length || leftKeys.some((key, index) => key !== rightKeys[index])) return false;
+  return leftKeys.every((key) => exactJsonEqual(left[key], right[key]));
+}
+
+function assertCompleteGraphHygiene(projection: FlowProjection, context: string): void {
+  const lanesById = new Map(projection.lanes.map((lane) => [lane.id, lane]));
+  const edgesById = new Map<string, FlowEdge>();
+  for (const edge of projection.edges) {
+    if (!lanesById.has(edge.sourceLaneId)) throw new Error(`${context} references missing source lane ${edge.sourceLaneId}.`);
+    const target = lanesById.get(edge.targetLaneId);
+    if (!target) throw new Error(`${context} references missing target lane ${edge.targetLaneId}.`);
+    if (target.kind === "planner" || target.kind === "intake" || /planner|intake/.test(edge.targetLaneId)) {
+      throw new Error(`${context} cannot target planner/intake lane ${edge.targetLaneId}.`);
+    }
+    const existing = edgesById.get(edge.id);
+    if (existing && (existing.sourceLaneId !== edge.sourceLaneId || existing.targetLaneId !== edge.targetLaneId)) {
+      throw new Error(`${context} has edge ID conflict ${edge.id}.`);
+    }
+    edgesById.set(edge.id, edge);
+  }
+}
+
+function assertNoRetainedEdgeIdCollisions(retainedEdges: FlowEdge[], newEdges: FlowEdge[], context: string): void {
+  const retainedById = new Map(retainedEdges.map((edge) => [edge.id, edge]));
+  for (const edge of newEdges) {
+    const retained = retainedById.get(edge.id);
+    if (retained && (retained.sourceLaneId !== edge.sourceLaneId || retained.targetLaneId !== edge.targetLaneId)) {
+      throw new Error(`${context}: ${edge.id}.`);
+    }
+  }
+}
+
+function parseInsertBeforeReplayEdge(value: unknown): FlowEdge {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" || value.id.length === 0 ||
+    typeof value.sourceLaneId !== "string" || value.sourceLaneId.length === 0 ||
+    typeof value.targetLaneId !== "string" || value.targetLaneId.length === 0
+  ) {
+    throw new Error("Invalid insert-before replay edge.");
+  }
+  return normalizeEdge(value);
+}
+
+function parseUniqueStringArray(value: unknown, message: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || item.length === 0)) {
+    throw new Error(message);
+  }
+  if (new Set(value).size !== value.length) throw new Error(message);
+  return value;
+}
+
+function assertExactStringSet(actual: string[], expected: string[], message: string): void {
+  if (new Set(actual).size !== actual.length || actual.length !== expected.length) throw new Error(message);
+  const expectedSet = new Set(expected);
+  if (actual.some((value) => !expectedSet.has(value))) throw new Error(message);
 }
 
 function compileOperation(
@@ -3191,6 +3466,11 @@ function isRollbackSuccessorDependency(projection: FlowProjection, lane: FlowLan
   });
 }
 
+function isInsertBeforePreservedDependency(projection: FlowProjection, lane: FlowLane, dependencyId: string): boolean {
+  return isRollbackSuccessorDependency(projection, lane, dependencyId) ||
+    isTrustedFailedRepairDependency(projection, lane, dependencyId);
+}
+
 function checkpointIntentTargetsLane(
   projection: FlowProjection,
   intent: WorkflowCheckpointIntent,
@@ -3343,6 +3623,35 @@ function createsCycle(edges: FlowEdge[], sourceLaneId: string, targetLaneId: str
     return false;
   };
   return [...outgoing.keys()].some(visit);
+}
+
+function isEligibleInsertBeforeTarget(target: FlowLane | undefined): target is FlowLane {
+  if (!target) return false;
+  if (target.status !== "pending") return false;
+  if (target.rollbackStatus) return false;
+  if (!target.executable || target.nodeKind === "user_decision") return false;
+  return !/planner|intake/.test(target.kind);
+}
+
+function isValidInsertRequestId(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function stableIdentifier(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function clarificationLaneIdentity(sessionId: string, requestId: string): { id: string; semanticKey: string } {
+  const identifier = stableIdentifier(`${sessionId}:${requestId}`);
+  return {
+    id: `lane-clarification-${identifier}`,
+    semanticKey: `clarification:${identifier}`,
+  };
 }
 
 function blocked(reason: string): GateResult {
