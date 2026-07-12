@@ -603,7 +603,7 @@ test("workflow delivery commit validates a commit lane before creating git commi
   );
   const helperSource = main.slice(
     main.indexOf("function assertWorkflowDeliveryCommitLane"),
-    main.indexOf("async function collectChangesetEvidenceForWorktree"),
+    main.indexOf("async function assertComparedWorktreeBelongsToProject"),
   );
 
   const canvasIndex = deliveryCommitHandler.indexOf("assertKnownWorkflowCanvasSession");
@@ -629,7 +629,7 @@ test("workflow delivery commit resolves commit worktree from CanvasSession befor
   );
   const helperSource = main.slice(
     main.indexOf("async function resolveDeliveryCommitWorktreePath"),
-    main.indexOf("async function collectChangesetEvidenceForWorktree"),
+    main.indexOf("async function assertComparedWorktreeBelongsToProject"),
   );
 
   const laneGuardIndex = deliveryCommitHandler.indexOf("assertWorkflowDeliveryCommitLane(store, sessionId, laneId)");
@@ -841,6 +841,100 @@ test("workflow createWorktree public type contract returns created status", asyn
 
   assert.match(createWorktreeContract, /status:\s*"created"/);
   assert.doesNotMatch(createWorktreeContract, /status:\s*"requested"/);
+});
+
+test("workflow compareWorktrees uses IDs only and resolves durable session identities", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const preload = await readFile(join(root, "electron", "preload.ts"), "utf8");
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const compareHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:worktree:compare"'),
+    main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
+  );
+  const compareContract = persistence.slice(
+    persistence.indexOf("compareWorktrees:"),
+    persistence.indexOf("adoptWorktree:"),
+  );
+
+  assert.match(compareContract, /input:\s*WorktreeComparisonRequest/);
+  assert.match(compareContract, /comparison:\s*VariantComparisonEvidence/);
+  assert.doesNotMatch(compareContract, /comparison:\s*unknown/);
+  assert.match(compareHandler, /compareWorkflowWorktrees/);
+  assert.match(preload, /parseWorktreeComparisonRequest\(input\)/);
+  assert.match(preload, /parseVariantComparisonEvidence/);
+
+  const renderer = await readFile(join(root, "..", "..", "packages", "ui-canvas", "src", "App.tsx"), "utf8");
+  const handleCompare = renderer.slice(renderer.indexOf("const handleCompare"), renderer.indexOf("const handleAdopt"));
+  assert.match(handleCompare, /sessionId:\s*session\.id/);
+  assert.match(handleCompare, /leftWorktreeId:\s*node\.worktree\.worktreeId/);
+  assert.match(handleCompare, /rightWorktreeId:\s*otherNode\.worktree\.worktreeId/);
+  assert.doesNotMatch(handleCompare, /\bleft:\s*node\.worktree|\bright:\s*otherNode\.worktree|realPath|repoRoot|branchName|headCommit/);
+});
+
+test("workflow compare runtime rejects untrusted identities and sanitizes unknown failures", async () => {
+  const runtime = await loadWorktreeComparisonRuntime();
+  const validEvents = [createdWorktreeEvent("session-1", "worktree-left", "variant-left"), createdWorktreeEvent("session-1", "worktree-right", "variant-right")];
+  const validInput = { sessionId: "session-1", leftWorktreeId: "worktree-left", rightWorktreeId: "worktree-right" };
+
+  for (const events of [
+    [createdWorktreeEvent("session-other", "worktree-left", "variant-left"), validEvents[1]],
+    [createdWorktreeEvent("session-1", "forged-left", "variant-left"), validEvents[1]],
+    [...validEvents, { sessionId: "session-1", kind: "workflow.worktree.cleaned", payload: { worktreeId: "worktree-left" } }],
+    [createdWorktreeEvent("session-1", "worktree-left", "variant-left", "/other-project"), validEvents[1]],
+  ]) {
+    const harness = comparisonHarness(events);
+    await assert.rejects(runtime.compareWorkflowWorktrees(harness.dependencies, "/project", validInput), /SKYTURN_WORKFLOW_IPC_ERROR:(INVALID_INPUT|UNKNOWN_PROJECT):/);
+    assert.equal(harness.compareCalls.length, 0);
+  }
+
+  for (const failure of [new Error("import failed at /secret/repo"), new Error("service failed at /secret/worktree")]) {
+    const harness = comparisonHarness(validEvents, failure);
+    await assert.rejects(runtime.compareWorkflowWorktrees(harness.dependencies, "/project", validInput), (error) => {
+      assert.equal(error.message, "SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT: Worktree comparison failed.");
+      assert.doesNotMatch(error.message, /secret|repo|worktree$/);
+      return true;
+    });
+  }
+
+  const spoofed = comparisonHarness(
+    validEvents,
+    new Error("SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT: failed at /secret/spoofed-worktree"),
+  );
+  await assert.rejects(runtime.compareWorkflowWorktrees(spoofed.dependencies, "/project", validInput), (error) => {
+    assert.equal(error.message, "SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT: Worktree comparison failed.");
+    assert.doesNotMatch(error.message, /secret|spoofed-worktree/);
+    return true;
+  });
+});
+
+test("workflow compare runtime performs a valid side-effect-free comparison and rejects malformed results", async () => {
+  const runtime = await loadWorktreeComparisonRuntime();
+  const events = [createdWorktreeEvent("session-1", "worktree-left", "variant-left"), createdWorktreeEvent("session-1", "worktree-right", "variant-right")];
+  const input = { sessionId: "session-1", leftWorktreeId: "worktree-left", rightWorktreeId: "worktree-right" };
+  const harness = comparisonHarness(events);
+
+  const result = await runtime.compareWorkflowWorktrees(harness.dependencies, "/project", input);
+  assert.equal(result.comparison.comparisonId, "comparison-left-right");
+  assert.equal(harness.compareCalls.length, 1);
+  assert.equal(harness.serviceOptions.length, 1);
+  assert.equal(harness.serviceOptions[0], undefined);
+
+  const malformed = comparisonHarness(events, null, { comparisonId: 42, variants: [] });
+  await assert.rejects(runtime.compareWorkflowWorktrees(malformed.dependencies, "/project", input), {
+    message: "SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT: Worktree comparison failed.",
+  });
+
+  const failedEvidence = validComparisonEvidence();
+  failedEvidence.variants = [{
+    variantId: "variant-left",
+    worktreeId: "worktree-left",
+    changeset: { status: "failed", errorReason: "fatal at /secret/worktree" },
+    metrics: [{ kind: "diff-summary", detail: "fatal at /secret/worktree" }],
+  }];
+  const failed = comparisonHarness(events, null, failedEvidence);
+  const sanitized = await runtime.compareWorkflowWorktrees(failed.dependencies, "/project", input);
+  assert.equal(sanitized.comparison.variants[0].changeset.errorReason, "Git changeset collection failed.");
+  assert.equal(sanitized.comparison.variants[0].metrics[0].detail, "Git changeset collection failed.");
 });
 
 test("workflow adopt and clean public type contracts return terminal statuses", async () => {
@@ -2036,6 +2130,108 @@ async function loadWorkflowIpcContracts() {
   const module = { exports: {} };
   vm.runInNewContext(output, { module, exports: module.exports }, { filename: "workflowIpcContracts.ts" });
   return module.exports;
+}
+
+async function loadWorktreeComparisonRuntime() {
+  const source = await readFile(join(root, "electron", "worktreeComparisonRuntime.ts"), "utf8");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  const workflowContracts = {
+    WORKFLOW_IPC_ERROR_PREFIX: "SKYTURN_WORKFLOW_IPC_ERROR",
+    workflowIpcError(code, message) {
+      return new Error(`SKYTURN_WORKFLOW_IPC_ERROR:${code}: ${message}`);
+    },
+  };
+  vm.runInNewContext(output, {
+    Error,
+    module,
+    exports: module.exports,
+    require(specifier) {
+      if (specifier === "./workflowIpcContracts") return workflowContracts;
+      return require(specifier);
+    },
+  }, { filename: "worktreeComparisonRuntime.ts" });
+  return module.exports;
+}
+
+function createdWorktreeEvent(sessionId, worktreeId, variantId, repoRoot = "/project") {
+  const realPath = `${repoRoot}.worktrees/${worktreeId}`;
+  return {
+    sessionId,
+    kind: "workflow.worktree.created",
+    payload: {
+      worktree: {
+        worktreeId,
+        variantId,
+        path: realPath,
+        realPath,
+        gitdir: `${repoRoot}/.git/worktrees/${worktreeId}`,
+        repoRoot,
+        branchName: `skyturn/${sessionId}/${variantId}`,
+        baseCommit: "base-commit",
+        headCommit: "head-commit",
+        parentLaneId: `lane-${variantId}`,
+      },
+    },
+  };
+}
+
+function comparisonHarness(events, failure = null, comparison = validComparisonEvidence()) {
+  const compareCalls = [];
+  const serviceOptions = [];
+  const dependencies = {
+    assertKnownProjectRoot() {},
+    async getWorkflowStore() {
+      return {
+        materializeCanvasSession(sessionId) {
+          return sessionId === "session-1" ? { id: sessionId } : null;
+        },
+        listEvents() {
+          return events;
+        },
+      };
+    },
+    async loadGitWorktreeModule() {
+      if (failure?.message.startsWith("import")) throw failure;
+      return {
+        parseWorktreeComparisonRequest(value) {
+          return value;
+        },
+        parseVariantComparisonEvidence(value) {
+          if (typeof value?.comparisonId !== "string") throw new Error("invalid result at /secret/result");
+          return value;
+        },
+        createNodeGitWorktreeService(options) {
+          serviceOptions.push(options);
+          if (failure && !failure.message.startsWith("import")) throw failure;
+          return {
+            async compareVariants(value) {
+              compareCalls.push(value);
+              return comparison;
+            },
+          };
+        },
+      };
+    },
+    async canonicalPath(value) {
+      return value;
+    },
+  };
+  return { dependencies, compareCalls, serviceOptions };
+}
+
+function validComparisonEvidence() {
+  return {
+    comparisonId: "comparison-left-right",
+    collectedAt: "2026-07-12T00:00:00.000Z",
+    variants: [],
+  };
 }
 
 async function loadMainMergeGateHelpers() {

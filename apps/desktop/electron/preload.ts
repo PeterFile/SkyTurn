@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { WorktreeComparisonRequest } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
 import type {
   TerminalActionResult,
   TerminalCancelInput,
@@ -40,7 +41,22 @@ const workflow = {
   requestVariant: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:variant:create", projectRoot, input),
   answerUserDecision: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:userDecision:answer", projectRoot, input),
   createWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:create", projectRoot, input),
-  compareWorktrees: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:compare", projectRoot, input),
+  compareWorktrees: async (projectRoot: string, input: WorktreeComparisonRequest) => {
+    const {
+      INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR,
+      parseVariantComparisonEvidence,
+      parseWorktreeComparisonRequest,
+    } = await import("@skyturn/git-worktree");
+    const request = parseWorktreeComparisonRequest(input);
+    const result: unknown = await ipcRenderer.invoke("workflow:worktree:compare", projectRoot, request);
+    if (!isRecord(result) || typeof result.protocolVersion !== "number") {
+      throw new Error(INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
+    }
+    return {
+      protocolVersion: result.protocolVersion,
+      comparison: parseVariantComparisonEvidence(result.comparison),
+    };
+  },
   adoptWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:adopt", projectRoot, input),
   cleanWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:clean", projectRoot, input),
   createDeliveryCommit: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:commit", projectRoot, input),
@@ -52,6 +68,10 @@ const workflow = {
   getChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset", projectRoot, input),
   reconcileFinalChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset:reconcileFinal", projectRoot, input),
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
 
 contextBridge.exposeInMainWorld("devflow", {
   openProject: () => ipcRenderer.invoke("project:open"),

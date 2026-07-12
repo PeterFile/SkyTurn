@@ -6,7 +6,14 @@ import type {
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
-import { GIT_WORKTREE_CONTRACT_VERSION, createMockChangeset, mockWorktreeService } from "./index";
+import {
+  GIT_WORKTREE_CONTRACT_VERSION,
+  INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR,
+  createMockChangeset,
+  mockWorktreeService,
+  parseVariantComparisonEvidence,
+  parseWorktreeComparisonRequest,
+} from "./index";
 import type {
   ChangesetEvidenceService,
   RecordedAdjudicationEvidence,
@@ -16,6 +23,123 @@ import type {
 import { buildAdjudicationMetrics } from "./index";
 
 describe("git worktree services", () => {
+  it("accepts only the three ID fields in a worktree comparison request", () => {
+    expect(parseWorktreeComparisonRequest({
+      sessionId: "session-1",
+      leftWorktreeId: "worktree-left",
+      rightWorktreeId: "worktree-right",
+    })).toEqual({
+      sessionId: "session-1",
+      leftWorktreeId: "worktree-left",
+      rightWorktreeId: "worktree-right",
+    });
+
+    for (const malformed of [
+      null,
+      { sessionId: "session-1", leftWorktreeId: "worktree-left" },
+      { sessionId: "session-1", leftWorktreeId: "worktree-left", rightWorktreeId: "../right" },
+      { sessionId: "session-1", leftWorktreeId: "worktree-left", rightWorktreeId: "worktree-right", repoRoot: "/forged" },
+    ]) {
+      expect(() => parseWorktreeComparisonRequest(malformed)).toThrow("Invalid worktree comparison request.");
+    }
+  });
+
+  it("validates complete variant comparison evidence with a fixed safe error", () => {
+    const evidence = {
+      comparisonId: "comparison-left-right",
+      collectedAt: "2026-07-12T00:00:00.000Z",
+      variants: [{
+        variantId: "variant-left",
+        worktreeId: "worktree-left",
+        changeset: {
+          evidenceId: "evidence-left",
+          changesetId: "changeset-left",
+          source: "git",
+          status: "available",
+          files: ["src/index.ts"],
+          diffStat: { added: 1, changed: 0, deleted: 0 },
+          patchPreviewTruncated: false,
+        },
+        metrics: [{
+          kind: "diff-summary",
+          label: "Diff summary",
+          status: "recorded",
+          source: "recorded",
+          detail: "+1 / -0 across 1 file",
+        }],
+      }],
+    };
+
+    expect(parseVariantComparisonEvidence(evidence)).toEqual(evidence);
+    for (const malformed of [
+      null,
+      { ...evidence, comparisonId: 42 },
+      { ...evidence, variants: [{ ...evidence.variants[0], metrics: [{ kind: "forged" }] }] },
+      { ...evidence, variants: [{ ...evidence.variants[0], changeset: { status: "available", files: [42] } }] },
+    ]) {
+      expect(() => parseVariantComparisonEvidence(malformed)).toThrow(INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
+    }
+  });
+
+  it("reconstructs comparison evidence without unknown fields at any nested layer", () => {
+    const evidence = {
+      comparisonId: "comparison-left-right",
+      collectedAt: "2026-07-12T00:00:00.000Z",
+      hostPath: "/secret/comparison",
+      variants: [{
+        variantId: "variant-left",
+        worktreeId: "worktree-left",
+        repoRoot: "/secret/variant",
+        changeset: {
+          evidenceId: "evidence-left",
+          changesetId: "changeset-left",
+          source: "git",
+          status: "available",
+          files: ["src/index.ts"],
+          diffStat: { added: 1, changed: 0, deleted: 0, hostPath: "/secret/stat" },
+          patchPreviewTruncated: false,
+          repoRoot: "/secret/changeset",
+        },
+        metrics: [{
+          kind: "diff-summary",
+          label: "Diff summary",
+          status: "recorded",
+          source: "recorded",
+          detail: "+1 / -0 across 1 file",
+          worktreePath: "/secret/metric",
+        }],
+      }],
+    };
+
+    const parsed = parseVariantComparisonEvidence(evidence);
+
+    expect(parsed).toEqual({
+      comparisonId: "comparison-left-right",
+      collectedAt: "2026-07-12T00:00:00.000Z",
+      variants: [{
+        variantId: "variant-left",
+        worktreeId: "worktree-left",
+        changeset: {
+          evidenceId: "evidence-left",
+          changesetId: "changeset-left",
+          source: "git",
+          status: "available",
+          files: ["src/index.ts"],
+          diffStat: { added: 1, changed: 0, deleted: 0 },
+          patchPreviewTruncated: false,
+        },
+        metrics: [{
+          kind: "diff-summary",
+          label: "Diff summary",
+          status: "recorded",
+          source: "recorded",
+          detail: "+1 / -0 across 1 file",
+        }],
+      }],
+    });
+    expect(parsed).not.toBe(evidence);
+  });
+
   it("versions the root contract ABI", () => {
     expect(GIT_WORKTREE_CONTRACT_VERSION).toBe(1);
   });

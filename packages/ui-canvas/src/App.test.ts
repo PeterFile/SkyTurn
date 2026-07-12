@@ -7,6 +7,7 @@ import {
   plannerSessionStatusForSnapshot,
 } from "./terminalInspector.js";
 import type { TerminalSnapshotResult } from "@skyturn/persistence";
+import type { VariantComparisonEvidence } from "@skyturn/git-worktree";
 import {
   REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
   failureSummaryForNode,
@@ -794,7 +795,7 @@ describe("UI source validation", () => {
   });
 
   it("formats worktree comparison evidence without rendering raw JSON", async () => {
-    const summary = summarizeWorktreeComparisonEvidence({
+    const comparison: VariantComparisonEvidence = {
       comparisonId: "comparison-a-b",
       collectedAt: "2026-06-22T07:20:00.000Z",
       variants: [
@@ -802,20 +803,24 @@ describe("UI source validation", () => {
           variantId: "variant-a",
           worktreeId: "wt-a",
           changeset: {
+            evidenceId: "changeset-evidence-wt-a",
+            changesetId: "changeset-wt-a",
+            source: "git",
             status: "available",
             files: ["src/a.ts", "src/b.ts"],
             diffStat: { added: 12, changed: 2, deleted: 3 },
             patchPreviewTruncated: false,
           },
           metrics: [
-            { kind: "test", label: "Tests", status: "passed", detail: "vitest --run" },
-            { kind: "build", label: "Build", status: "failed", detail: "tsc failed" },
-            { kind: "diff-summary", label: "Diff summary", status: "recorded", detail: "+12 / -3 across 2 files" },
-            { kind: "conflict-check", label: "Conflict check", status: "passed", detail: "No conflicts detected." },
+            { kind: "test", label: "Tests", status: "passed", source: "recorded", detail: "vitest --run" },
+            { kind: "build", label: "Build", status: "failed", source: "recorded", detail: "tsc failed" },
+            { kind: "diff-summary", label: "Diff summary", status: "recorded", source: "recorded", detail: "+12 / -3 across 2 files" },
+            { kind: "conflict-check", label: "Conflict check", status: "passed", source: "recorded", detail: "No conflicts detected." },
           ],
         },
       ],
-    });
+    };
+    const summary = summarizeWorktreeComparisonEvidence(comparison);
 
     expect(summary.variants).toEqual([
       expect.objectContaining({
@@ -835,6 +840,16 @@ describe("UI source validation", () => {
     const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
     expect(worktreeActions).not.toContain("JSON.stringify(compareResult");
     expect(worktreeActions).toContain("worktree-comparison-grid");
+  });
+
+  it("formats only the typed comparison value validated by preload", async () => {
+    const appSource = await readSource("./App.tsx");
+    const formatter = appSource.slice(
+      appSource.indexOf("export function summarizeWorktreeComparisonEvidence"),
+      appSource.indexOf("export function buildWorktreeAdoptionConfirmation"),
+    );
+
+    expect(formatter).not.toMatch(/asRecord|textValue|stringArray|as \(value: unknown\)/);
   });
 
   it("builds explicit merge-only adoption confirmation copy", () => {

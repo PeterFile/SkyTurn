@@ -180,6 +180,37 @@ export interface VariantComparisonInput {
   recordedEvidence?: Partial<Record<string, RecordedAdjudicationEvidence>>;
 }
 
+export interface WorktreeComparisonRequest {
+  sessionId: string;
+  leftWorktreeId: string;
+  rightWorktreeId: string;
+}
+
+export const INVALID_WORKTREE_COMPARISON_REQUEST_ERROR = "Invalid worktree comparison request.";
+export const INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR = "Invalid worktree comparison evidence.";
+
+const WORKTREE_COMPARISON_REQUEST_KEYS = ["leftWorktreeId", "rightWorktreeId", "sessionId"] as const;
+const WORKTREE_COMPARISON_TOKEN = /^[A-Za-z0-9._-]+$/;
+
+export function parseWorktreeComparisonRequest(value: unknown): WorktreeComparisonRequest {
+  if (!isRuntimeRecord(value)) throw new Error(INVALID_WORKTREE_COMPARISON_REQUEST_ERROR);
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== WORKTREE_COMPARISON_REQUEST_KEYS.length ||
+    keys.some((key, index) => key !== WORKTREE_COMPARISON_REQUEST_KEYS[index]) ||
+    !isComparisonToken(value.sessionId) ||
+    !isComparisonToken(value.leftWorktreeId) ||
+    !isComparisonToken(value.rightWorktreeId)
+  ) {
+    throw new Error(INVALID_WORKTREE_COMPARISON_REQUEST_ERROR);
+  }
+  return {
+    sessionId: value.sessionId,
+    leftWorktreeId: value.leftWorktreeId,
+    rightWorktreeId: value.rightWorktreeId,
+  };
+}
+
 export interface VariantComparisonEvidence {
   comparisonId: string;
   variants: Array<{
@@ -189,6 +220,22 @@ export interface VariantComparisonEvidence {
     metrics: AdjudicationMetric[];
   }>;
   collectedAt: string;
+}
+
+export function parseVariantComparisonEvidence(value: unknown): VariantComparisonEvidence {
+  if (!isVariantComparisonEvidence(value)) {
+    throw new Error(INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
+  }
+  return {
+    comparisonId: value.comparisonId,
+    collectedAt: value.collectedAt,
+    variants: value.variants.map((variant) => ({
+      variantId: variant.variantId,
+      worktreeId: variant.worktreeId,
+      changeset: reconstructChangesetEvidence(variant.changeset),
+      metrics: variant.metrics.map(reconstructAdjudicationMetric),
+    })),
+  };
 }
 
 export interface ManagedWorktreeService {
@@ -240,6 +287,129 @@ export interface RecordedAdjudicationEvidence {
 }
 
 const MAX_ADJUDICATION_DETAIL_LENGTH = 1000;
+
+const ADJUDICATION_METRIC_KINDS = new Set<AdjudicationMetricKind>([
+  "test",
+  "build",
+  "typecheck",
+  "artifact",
+  "changed-file-count",
+  "diff-summary",
+  "performance-output",
+  "conflict-check",
+]);
+const ADJUDICATION_METRIC_STATUSES = new Set<AdjudicationMetricStatus>([
+  "passed",
+  "failed",
+  "skipped",
+  "recorded",
+  "unknown",
+  "equivalent",
+]);
+
+function isVariantComparisonEvidence(value: unknown): value is VariantComparisonEvidence {
+  return isRuntimeRecord(value) &&
+    isNonEmptyRuntimeString(value.comparisonId) &&
+    isNonEmptyRuntimeString(value.collectedAt) &&
+    Array.isArray(value.variants) &&
+    value.variants.every(isVariantComparisonEntry);
+}
+
+function reconstructChangesetEvidence(value: ChangesetEvidence): ChangesetEvidence {
+  return {
+    evidenceId: value.evidenceId,
+    changesetId: value.changesetId,
+    source: value.source,
+    status: value.status,
+    files: [...value.files],
+    diffStat: {
+      added: value.diffStat.added,
+      changed: value.diffStat.changed,
+      deleted: value.diffStat.deleted,
+    },
+    patchPreviewTruncated: value.patchPreviewTruncated,
+    ...(value.worktreeId !== undefined ? { worktreeId: value.worktreeId } : {}),
+    ...(value.collectedAt !== undefined ? { collectedAt: value.collectedAt } : {}),
+    ...(value.artifactPaths !== undefined ? { artifactPaths: [...value.artifactPaths] } : {}),
+    ...(value.errorReason !== undefined ? { errorReason: value.errorReason } : {}),
+  };
+}
+
+function reconstructAdjudicationMetric(value: AdjudicationMetric): AdjudicationMetric {
+  return {
+    kind: value.kind,
+    label: value.label,
+    status: value.status,
+    source: value.source,
+    ...(value.value !== undefined ? { value: value.value } : {}),
+    ...(value.detail !== undefined ? { detail: value.detail } : {}),
+    ...(value.artifactPaths !== undefined ? { artifactPaths: [...value.artifactPaths] } : {}),
+  };
+}
+
+function isVariantComparisonEntry(value: unknown): value is VariantComparisonEvidence["variants"][number] {
+  return isRuntimeRecord(value) &&
+    isNonEmptyRuntimeString(value.variantId) &&
+    isNonEmptyRuntimeString(value.worktreeId) &&
+    isChangesetEvidence(value.changeset) &&
+    Array.isArray(value.metrics) &&
+    value.metrics.every(isAdjudicationMetric);
+}
+
+function isChangesetEvidence(value: unknown): value is ChangesetEvidence {
+  if (!isRuntimeRecord(value)) return false;
+  return isNonEmptyRuntimeString(value.evidenceId) &&
+    isNonEmptyRuntimeString(value.changesetId) &&
+    (value.source === "mock" || value.source === "git") &&
+    (value.status === "available" || value.status === "empty" || value.status === "failed" || value.status === "unknown") &&
+    isStringArray(value.files) &&
+    isDiffStat(value.diffStat) &&
+    typeof value.patchPreviewTruncated === "boolean" &&
+    isOptionalRuntimeString(value.worktreeId) &&
+    isOptionalRuntimeString(value.collectedAt) &&
+    (value.artifactPaths === undefined || isStringArray(value.artifactPaths)) &&
+    isOptionalRuntimeString(value.errorReason);
+}
+
+function isAdjudicationMetric(value: unknown): value is AdjudicationMetric {
+  if (!isRuntimeRecord(value)) return false;
+  return typeof value.kind === "string" &&
+    ADJUDICATION_METRIC_KINDS.has(value.kind as AdjudicationMetricKind) &&
+    isNonEmptyRuntimeString(value.label) &&
+    typeof value.status === "string" &&
+    ADJUDICATION_METRIC_STATUSES.has(value.status as AdjudicationMetricStatus) &&
+    value.source === "recorded" &&
+    (value.value === undefined || typeof value.value === "string" || typeof value.value === "number") &&
+    isOptionalRuntimeString(value.detail) &&
+    (value.artifactPaths === undefined || isStringArray(value.artifactPaths));
+}
+
+function isDiffStat(value: unknown): value is Changeset["diffStat"] {
+  return isRuntimeRecord(value) &&
+    typeof value.added === "number" && Number.isFinite(value.added) &&
+    typeof value.changed === "number" && Number.isFinite(value.changed) &&
+    typeof value.deleted === "number" && Number.isFinite(value.deleted);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isComparisonToken(value: unknown): value is string {
+  return isNonEmptyRuntimeString(value) && WORKTREE_COMPARISON_TOKEN.test(value);
+}
+
+function isNonEmptyRuntimeString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isOptionalRuntimeString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === "string";
+}
+
+function isRuntimeRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
 
 export interface EditorAdapter {
   openWorktree(editor: EditorKind, worktreePath: string): Promise<{ ok: boolean; message: string }>;
