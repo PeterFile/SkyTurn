@@ -603,6 +603,25 @@ describe("UI source validation", () => {
     expect(fnBody.slice(devflowCheck, fallbackUpdate)).toContain("return;");
   });
 
+  it("implements reassignNode with desktop write-through and authoritative session replacement", async () => {
+    const appSource = await readSource("./App.tsx");
+    const fnBody = appSource.slice(appSource.indexOf("function reassignNode"), appSource.indexOf("function insertBefore"));
+
+    expect(fnBody).toContain("window.devflow.workflow.reassignLane(");
+    expect(fnBody).toContain("const requestId = crypto.randomUUID()");
+    expect(fnBody).toContain("requestId,");
+    expect(fnBody).toContain("sessionId: activeSession.id");
+    expect(fnBody).toContain("laneId: nodeId");
+    expect(fnBody).toContain("agentKind: nextAgent");
+    expect(fnBody).toContain("const { canvasSession } = result");
+    expect(fnBody).toContain("setWorkspace((current) =>");
+
+    expect(fnBody).toContain('setNodeActionError("Workflow backend unavailable.")');
+    expect(fnBody).toContain(".catch((error)");
+    expect(fnBody).not.toContain("updateNode(nodeId");
+    expect(fnBody).not.toContain("Task reassigned to");
+  });
+
   it("ChangesTab calls createDeliveryCommit without renderer shell imports", async () => {
     const appSource = await readSource("./App.tsx");
     const handleCommit = appSource.slice(appSource.indexOf("async function handleCommit()"), appSource.indexOf("if (!changeset) return <p>Loading changes...</p>;"));

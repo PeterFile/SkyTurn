@@ -875,14 +875,31 @@ export default function App() {
 
   function reassignNode(nodeId: string) {
     const order: AgentKind[] = ["hermes", "codex", "gemini", "claude-code", "openclaw"];
-    updateNode(nodeId, (node) => {
-      const nextAgent = order[(order.indexOf(node.agent) + 1) % order.length];
-      return {
-        ...node,
-        agent: nextAgent,
-        progress: `Reassigned to ${nextAgent}`,
-        output: [...node.output, `Task reassigned to ${nextAgent}.`],
-      };
+    if (!activeSession || activeSession.kind !== "canvas") return;
+    const node = activeSession.nodes.find((item) => item.id === nodeId);
+    if (!node) return;
+    const nextAgent = order[(order.indexOf(node.agent) + 1) % order.length];
+
+    if (!window.devflow || !activeProject) {
+      setNodeActionError("Workflow backend unavailable.");
+      return;
+    }
+
+    setNodeActionError(null);
+    const requestId = crypto.randomUUID();
+    void window.devflow.workflow.reassignLane(activeProject.rootPath, {
+      requestId,
+      sessionId: activeSession.id,
+      laneId: nodeId,
+      agentKind: nextAgent,
+    }).then((result) => {
+      const { canvasSession } = result;
+      setWorkspace((current) => ({
+        ...current,
+        sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
+      }));
+    }).catch((error) => {
+      setNodeActionError(error instanceof Error ? error.message : "Failed to reassign workflow lane.");
     });
   }
 

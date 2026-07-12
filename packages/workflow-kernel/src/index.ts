@@ -248,6 +248,7 @@ export type FlowEventKind =
   | "workflow.intent.accepted"
   | "workflow.intent.rejected"
   | "workflow.lane.declared"
+  | "workflow.lane.reassigned"
   | "workflow.edge.declared"
   | "workflow.segment.started"
   | "workflow.segment.output_delta"
@@ -1320,6 +1321,16 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
       declaredLaneStatuses.set(normalizedLane.id, normalizedLane.status);
       upsertLane(projection, normalizedLane);
       restoreRollbackSuccessorsForRequestedIntents(projection, declaredLaneStatuses);
+    }
+    if (
+      event.kind === "workflow.lane.reassigned" &&
+      typeof event.payload.laneId === "string" &&
+      isAgentKind(event.payload.agentKind)
+    ) {
+      const agentKind = event.payload.agentKind;
+      projection.lanes = projection.lanes.map((lane) =>
+        lane.id === event.payload.laneId ? { ...lane, agentKind } : lane
+      );
     }
     if (event.kind === "workflow.edge.declared" && isRecord(event.payload.edge)) {
       upsertEdge(projection, normalizeEdge(event.payload.edge));

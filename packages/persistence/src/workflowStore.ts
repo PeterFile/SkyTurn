@@ -287,6 +287,20 @@ export interface ScheduleReadyWorkflowLanesResult {
   projection: FlowProjection;
 }
 
+export interface WorkflowLaneReassignmentInput {
+  requestId: string;
+  sessionId: string;
+  laneId: string;
+  agentKind: AgentKind;
+  now: string;
+}
+
+export interface WorkflowLaneReassignmentResult {
+  event: WorkflowEventRecord;
+  projection: FlowProjection;
+  canvasSession: CanvasSession;
+}
+
 export interface RecordRunResultInput {
   sessionId: string;
   laneId: string;
@@ -823,6 +837,71 @@ export class WorkflowStore {
       readyLanes: scheduled,
       projection: this.materializeFlowProjection(sessionId),
     };
+  }
+
+  reassignWorkflowLane(input: WorkflowLaneReassignmentInput): WorkflowLaneReassignmentResult {
+    const requestId = requireWorkflowIdentifier(input.requestId, "requestId");
+    const sessionId = requireWorkflowIdentifier(input.sessionId, "sessionId");
+    const laneId = requireWorkflowIdentifier(input.laneId, "laneId");
+    const session = this.requireKnownSession(sessionId);
+    const agentKind = requireWorkflowReassignmentAgent(input.agentKind);
+    const idempotencyKey = `lane-reassign:${requestId}`;
+    const existing = this.getEventByIdempotencyKey(sessionId, idempotencyKey);
+    if (existing) {
+      if (
+        existing.kind !== "workflow.lane.reassigned" ||
+        existing.laneId !== laneId ||
+        existing.payload.requestId !== requestId ||
+        existing.payload.laneId !== laneId ||
+        existing.payload.agentKind !== agentKind ||
+        !requireOptionalAgent(existing.payload.previousAgentKind)
+      ) {
+        throw new Error(`Workflow reassignment requestId conflict: ${requestId}.`);
+      }
+      const currentProjection = this.materializeFlowProjection(sessionId);
+      const currentCanvasSession = this.materializeCanvasSession(sessionId);
+      if (!currentCanvasSession) throw new Error(`Workflow session is not known: ${sessionId}.`);
+      return { event: existing, projection: currentProjection, canvasSession: currentCanvasSession };
+    }
+    const projection = this.materializeFlowProjection(sessionId);
+
+    if (laneId === session.plannerLaneId || this.getLane(sessionId, laneId)?.laneKind === "planner") {
+      throw new Error("Workflow planner root cannot be reassigned.");
+    }
+    if (projection.userDecisions.some((decision) => decision.decisionId === laneId)) {
+      throw new Error("Workflow user decision nodes cannot be reassigned.");
+    }
+    const lane = projection.lanes.find((item) => item.id === laneId);
+    if (!lane) throw new Error(`Unknown workflow lane ${laneId}.`);
+    if (lane.rollbackStatus === "rolled_back" || lane.rollbackStatus === "inactive") {
+      throw new Error("Rolled back or inactive workflow lanes cannot be reassigned.");
+    }
+    if (!lane.executable || lane.nodeKind !== "agent_task") {
+      throw new Error("Only executable workflow lanes can be reassigned.");
+    }
+    if (lane.status !== "pending" && lane.status !== "ready") {
+      throw new Error(`Workflow lane in ${lane.status} state cannot be reassigned.`);
+    }
+    if (lane.agentKind === agentKind) throw new Error(`Workflow lane is already assigned to ${agentKind}.`);
+
+    const event = this.appendWorkflowEvent({
+      sessionId,
+      kind: "workflow.lane.reassigned",
+      source: "user",
+      laneId,
+      idempotencyKey,
+      payload: {
+        requestId,
+        laneId,
+        previousAgentKind: lane.agentKind,
+        agentKind,
+      },
+      now: input.now,
+    });
+    const nextProjection = this.materializeFlowProjection(sessionId);
+    const canvasSession = this.materializeCanvasSession(sessionId);
+    if (!canvasSession) throw new Error(`Workflow session is not known: ${sessionId}.`);
+    return { event, projection: nextProjection, canvasSession };
   }
 
   recordRunResult(input: RecordRunResultInput): FlowProjection {
@@ -3474,6 +3553,29 @@ function requireAgent(value: unknown): AgentKind {
     return value;
   }
   throw new Error("Workflow card agent is not supported.");
+}
+
+function requireWorkflowReassignmentAgent(value: unknown): AgentKind {
+  if (value === "hermes" || value === "codex" || value === "gemini" || value === "claude-code" || value === "openclaw") {
+    return value;
+  }
+  throw new Error("Workflow reassignment agentKind is not supported.");
+}
+
+function requireOptionalAgent(value: unknown): AgentKind | null {
+  try {
+    return requireWorkflowReassignmentAgent(value);
+  } catch {
+    return null;
+  }
+}
+
+function requireWorkflowIdentifier(value: unknown, field: string): string {
+  const identifier = typeof value === "string" ? value.trim() : "";
+  if (!identifier || !/^[A-Za-z0-9._:-]+$/.test(identifier)) {
+    throw new Error(`Workflow reassignment ${field} is invalid.`);
+  }
+  return identifier;
 }
 
 function cleanId(value: unknown): string | null {

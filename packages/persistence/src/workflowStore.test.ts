@@ -226,6 +226,219 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it.each([false, true])(
+    "preserves dependency scheduling and the reassigned agent with restart=%s",
+    async (restart) => {
+      const projectRoot = await makeTempRoot();
+      let store = createWorkflowStore({ projectRoot });
+      seedStore(store);
+      declareCodeChangeWorkflow(store);
+      const beforeProjection = store.materializeFlowProjection("session-1");
+      const beforeLane = beforeProjection.lanes.find((lane) => lane.id === "lane-validation");
+      const beforeNode = store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-validation");
+      const beforeEdges = beforeProjection.edges;
+
+      const result = store.reassignWorkflowLane({
+        requestId: "reassign-validation-gemini",
+        sessionId: "session-1",
+        laneId: "lane-validation",
+        agentKind: "gemini",
+        now: "2026-06-14T00:00:03.000Z",
+      });
+
+      expect(result.event).toMatchObject({
+        kind: "workflow.lane.reassigned",
+        source: "user",
+        laneId: "lane-validation",
+        payload: {
+          laneId: "lane-validation",
+          previousAgentKind: "codex",
+          agentKind: "gemini",
+        },
+      });
+      expect(result.projection.lanes.find((lane) => lane.id === "lane-validation")).toEqual({
+        ...beforeLane,
+        agentKind: "gemini",
+      });
+      expect(result.canvasSession.nodes.find((node) => node.id === "lane-validation")).toEqual({
+        ...beforeNode,
+        agent: "gemini",
+        display: {
+          ...beforeNode?.display,
+          agentLabel: "Gemini",
+        },
+      });
+      expect(result.projection.edges).toEqual(beforeEdges);
+      expect(store.scheduleReadyLanes("session-1", {
+        allowedParallelism: 2,
+        now: "2026-06-14T00:00:04.000Z",
+      }).readyLanes.map((lane) => [lane.id, lane.agentKind])).toEqual([["lane-implementation", "codex"]]);
+      if (restart) {
+        store.close();
+        store = createWorkflowStore({ projectRoot });
+        expect(store.materializeFlowProjection("session-1").edges).toEqual(beforeEdges);
+        expect(store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-validation")?.agentKind).toBe("gemini");
+      }
+      store.recordRunResult(runResultInput(store, "lane-implementation", "succeeded", "2026-06-14T00:00:05.000Z"));
+      expect(store.scheduleReadyLanes("session-1", {
+        allowedParallelism: 2,
+        now: "2026-06-14T00:00:06.000Z",
+      }).readyLanes.map((lane) => [lane.id, lane.agentKind])).toEqual([["lane-validation", "gemini"]]);
+      expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-validation")?.agent).toBe("gemini");
+      store.close();
+    },
+  );
+
+  it("returns the authoritative result for an identical reassignment retry without appending an event", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    const request = {
+      requestId: "reassign-implementation-gemini",
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      agentKind: "gemini" as const,
+      now: "2026-06-14T00:00:03.000Z",
+    };
+
+    const first = store.reassignWorkflowLane(request);
+    const retried = store.reassignWorkflowLane({ ...request, now: "2026-06-14T00:00:04.000Z" });
+
+    expect(retried.event).toEqual(first.event);
+    expect(retried.projection.lanes.find((lane) => lane.id === request.laneId)?.agentKind).toBe("gemini");
+    expect(store.listEvents(request.sessionId).filter((event) => event.kind === "workflow.lane.reassigned")).toHaveLength(1);
+    store.close();
+  });
+
+  it("fails closed when a reassignment requestId is reused with a conflicting payload", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    store.reassignWorkflowLane({
+      requestId: "reassign-implementation",
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      agentKind: "gemini",
+      now: "2026-06-14T00:00:03.000Z",
+    });
+
+    expect(() => store.reassignWorkflowLane({
+      requestId: "reassign-implementation",
+      sessionId: "session-1",
+      laneId: "lane-validation",
+      agentKind: "claude-code",
+      now: "2026-06-14T00:00:04.000Z",
+    })).toThrow(/requestId.*conflict/i);
+    expect(store.listEvents("session-1").filter((event) => event.kind === "workflow.lane.reassigned")).toHaveLength(1);
+    store.close();
+  });
+
+  it("does not reverse a later reassignment when an old request is replayed after restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    const oldRequest = {
+      requestId: "reassign-implementation-gemini",
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      agentKind: "gemini" as const,
+      now: "2026-06-14T00:00:03.000Z",
+    };
+    store.reassignWorkflowLane(oldRequest);
+    store.reassignWorkflowLane({ ...oldRequest, requestId: "reassign-implementation-claude", agentKind: "claude-code", now: "2026-06-14T00:00:04.000Z" });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const replayed = reopened.reassignWorkflowLane({ ...oldRequest, now: "2026-06-14T00:00:05.000Z" });
+
+    expect(replayed.event.payload).toMatchObject({ previousAgentKind: "codex", agentKind: "gemini" });
+    expect(replayed.projection.lanes.find((lane) => lane.id === oldRequest.laneId)?.agentKind).toBe("claude-code");
+    expect(replayed.canvasSession.nodes.find((node) => node.id === oldRequest.laneId)?.agent).toBe("claude-code");
+    expect(reopened.listEvents(oldRequest.sessionId).filter((event) => event.kind === "workflow.lane.reassigned")).toHaveLength(2);
+    reopened.close();
+  });
+
+  it("rejects reassignment for non-lanes and unsupported agents", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.user_decision.requested",
+      source: "test",
+      payload: { decisionId: "decision-1", prompt: "Choose", options: ["Continue"], reason: "Need input" },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+
+    expect(() => store.reassignWorkflowLane({ requestId: "request-1", sessionId: "", laneId: "lane-implementation", agentKind: "gemini", now: "2026-06-14T00:00:04.000Z" })).toThrow(/sessionId/i);
+    expect(() => store.reassignWorkflowLane({ requestId: "request-2", sessionId: "session-1", laneId: "", agentKind: "gemini", now: "2026-06-14T00:00:04.000Z" })).toThrow(/laneId/i);
+    expect(() => store.reassignWorkflowLane({ requestId: "request-3", sessionId: "session-1", laneId: "../lane-implementation", agentKind: "gemini", now: "2026-06-14T00:00:04.000Z" })).toThrow(/laneId/i);
+    expect(() => store.reassignWorkflowLane({ requestId: "request-4", sessionId: "session-1", laneId: "node-1", agentKind: "gemini", now: "2026-06-14T00:00:04.000Z" })).toThrow(/planner/i);
+    expect(() => store.reassignWorkflowLane({ requestId: "request-5", sessionId: "session-1", laneId: "decision-1", agentKind: "gemini", now: "2026-06-14T00:00:04.000Z" })).toThrow(/user decision/i);
+    expect(() => store.reassignWorkflowLane({ requestId: "request-6", sessionId: "session-1", laneId: "missing", agentKind: "gemini", now: "2026-06-14T00:00:04.000Z" })).toThrow(/unknown/i);
+    expect(() => store.reassignWorkflowLane({ requestId: "request-7", sessionId: "session-1", laneId: "lane-implementation", agentKind: "agy", now: "2026-06-14T00:00:04.000Z" })).toThrow(/agentKind/i);
+
+    store.close();
+  });
+
+  it.each(["running", "waiting_input", "completed", "failed", "blocked"] as const)(
+    "rejects reassignment for a lane in %s state",
+    async (status) => {
+      const store = await makeSeededStore();
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind: "workflow.lane.declared",
+        source: "test",
+        payload: {
+          lane: {
+            id: "lane-target",
+            semanticKey: "target",
+            kind: "implementation",
+            title: "Target",
+            agentKind: "codex",
+            status,
+          },
+        },
+        now: "2026-06-14T00:00:03.000Z",
+      });
+
+      expect(() => store.reassignWorkflowLane({
+        requestId: `reject-${status}`,
+        sessionId: "session-1",
+        laneId: "lane-target",
+        agentKind: "gemini",
+        now: "2026-06-14T00:00:04.000Z",
+      })).toThrow(new RegExp(status, "i"));
+      store.close();
+    },
+  );
+
+  it.each(["rolled_back", "inactive"] as const)("rejects reassignment for a %s lane", async (rollbackStatus) => {
+    const rolledBackStore = await makeSeededStore();
+    declareCodeChangeWorkflow(rolledBackStore);
+    recordCheckpoint(rolledBackStore, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    rolledBackStore.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.node.rollback_applied",
+      source: "test",
+      laneId: "lane-implementation",
+      payload: {
+        requestId: "rollback-lane-implementation",
+        laneId: "lane-implementation",
+        checkpointId: "checkpoint-before-implementation",
+        localRollbackSafe: true,
+      },
+      now: "2026-06-14T00:00:06.000Z",
+    });
+    const laneId = rollbackStatus === "rolled_back" ? "lane-implementation" : "lane-validation";
+    expect(() => rolledBackStore.reassignWorkflowLane({
+      requestId: `reject-${rollbackStatus}`,
+      sessionId: "session-1",
+      laneId,
+      agentKind: "gemini",
+      now: "2026-06-14T00:00:07.000Z",
+    })).toThrow(/rolled back|inactive/i);
+    rolledBackStore.close();
+  });
+
   it("materializes the SQLite planner root before any WorkflowIntent projection nodes exist", async () => {
     const store = await makeStore();
 

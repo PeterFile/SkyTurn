@@ -2,6 +2,8 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { WorktreeComparisonRequest } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
 import type {
   WorkflowApi,
+  WorkflowLaneReassignRequest,
+  WorkflowLaneReassignResult,
   WorkflowNodePositionUpdateRequest,
 } from "@skyturn/persistence" with { "resolution-mode": "import" };
 import type {
@@ -29,6 +31,14 @@ const terminal = {
   },
 };
 
+const reassignWorkflowLane = (
+  projectRoot: string,
+  input: WorkflowLaneReassignRequest,
+): Promise<WorkflowLaneReassignResult> =>
+  ipcRenderer.invoke("workflow:lane:reassign", projectRoot, input) as Promise<WorkflowLaneReassignResult>;
+
+const reassignLane: WorkflowApi["reassignLane"] = reassignWorkflowLane;
+
 const workflow = {
   createSession: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:createSession", projectRoot, input),
   appendUserInput: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:appendUserInput", projectRoot, input),
@@ -40,6 +50,7 @@ const workflow = {
     ipcRenderer.invoke("workflow:nodePosition:update", projectRoot, input),
   getProjection: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:projection", projectRoot, sessionId),
   getEvents: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:events", projectRoot, sessionId),
+  reassignLane,
   getCheckpoints: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:checkpoints", projectRoot, input),
   getRollbackEligibility: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:rollback:eligibility", projectRoot, input),
   applyRollback: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:rollback:apply", projectRoot, input),

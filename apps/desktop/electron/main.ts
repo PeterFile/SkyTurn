@@ -90,6 +90,13 @@ interface WorkflowRecordRunResultInput {
   now?: unknown;
 }
 
+interface WorkflowLaneReassignInput {
+  requestId?: unknown;
+  sessionId?: unknown;
+  laneId?: unknown;
+  agentKind?: unknown;
+}
+
 interface WorkflowFinalChangesetInput {
   node?: unknown;
   target?: unknown;
@@ -483,6 +490,7 @@ interface WorkflowStoreHost {
   applyNodeRollback(input: unknown): WorkflowRollbackResultLike;
   requestNodeRepair(input: unknown): WorkflowCheckpointSuccessorResultLike;
   requestNodeVariant(input: unknown): WorkflowCheckpointSuccessorResultLike;
+  reassignWorkflowLane(input: unknown): { event: unknown; projection: unknown; canvasSession: unknown };
   close(): void;
 }
 
@@ -859,6 +867,29 @@ ipcMain.handle("workflow:events", workflowHandler(async (projectRoot: string, se
     events: store.listEvents(workflowSessionId)
       .filter(isWorkflowEventRecord)
       .map(redactWorkflowEventForRenderer),
+  };
+}));
+
+ipcMain.handle("workflow:lane:reassign", workflowHandler(async (projectRoot: string, input: WorkflowLaneReassignInput) => {
+  assertKnownProjectRoot(projectRoot);
+  const sessionId = assertWorkflowSessionId(input?.sessionId);
+  const requestId = assertRequiredText(input?.requestId, "Workflow reassignment requestId is required.");
+  const laneId = assertRequiredText(input?.laneId, "Workflow laneId is required.");
+  const agentKind = assertWorkflowAgentKind(input?.agentKind);
+  const store = await getWorkflowStore(projectRoot);
+  const result = store.reassignWorkflowLane({
+    requestId,
+    sessionId,
+    laneId,
+    agentKind,
+    now: new Date().toISOString(),
+  });
+  broadcastWorkflowProjection(projectRoot, sessionId, store);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    event: result.event,
+    projection: result.projection,
+    canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 }));
 

@@ -29,6 +29,7 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:repair:create",
     "workflow:variant:create",
     "workflow:userDecision:answer",
+    "workflow:lane:reassign",
     "workflow:worktree:create",
     "workflow:worktree:compare",
     "workflow:worktree:adopt",
@@ -56,6 +57,7 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(main, /applyNodeRollback/);
   assert.match(main, /requestNodeRepair/);
   assert.match(main, /requestNodeVariant/);
+  assert.match(main, /reassignWorkflowLane/);
   assert.match(main, /isTrustedPlannerRootStartInput/);
   assert.match(main, /assertExecutableStartInput/);
   assert.match(main, /rejectMissingWorkflowProjectionNode/);
@@ -88,6 +90,16 @@ test("Electron main owns natural workflow IPC channels", async () => {
     main.indexOf('ipcMain.handle("workflow:checkpoints"'),
     main.indexOf('ipcMain.handle("workflow:rollback:eligibility"'),
   );
+
+  const reassignHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:lane:reassign"'),
+    main.indexOf('ipcMain.handle("workflow:checkpoints"'),
+  );
+  assert.match(reassignHandler, /assertKnownProjectRoot\(projectRoot\)/);
+  assert.match(reassignHandler, /requestId/);
+  assert.match(reassignHandler, /reassignWorkflowLane/);
+  assert.match(reassignHandler, /broadcastWorkflowProjection/);
+  assert.match(reassignHandler, /materializeRendererCanvasSession/);
   assert.match(checkpointHandler, /assertKnownProjectRoot\(projectRoot\)/);
   assert.match(checkpointHandler, /assertWorkflowSessionId/);
   assert.match(checkpointHandler, /assertKnownWorkflowCanvasSession/);
@@ -857,6 +869,7 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "updateNodePosition",
     "getProjection",
     "getEvents",
+    "reassignLane",
     "getCheckpoints",
     "getRollbackEligibility",
     "applyRollback",
@@ -1011,6 +1024,22 @@ test("workflow compare runtime performs a valid side-effect-free comparison and 
   const sanitized = await runtime.compareWorkflowWorktrees(failed.dependencies, "/project", input);
   assert.equal(sanitized.comparison.variants[0].changeset.errorReason, "Git changeset collection failed.");
   assert.equal(sanitized.comparison.variants[0].metrics[0].detail, "Git changeset collection failed.");
+});
+
+test("workflow lane reassignment public contract is typed and returns the authoritative canvas", async () => {
+  const persistence = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const contract = persistence.slice(
+    persistence.indexOf("export interface WorkflowLaneReassignRequest"),
+    persistence.indexOf("export type WorkflowRollbackBlockCode"),
+  );
+
+  assert.match(contract, /sessionId:\s*string/);
+  assert.match(contract, /requestId:\s*string/);
+  assert.match(contract, /laneId:\s*string/);
+  assert.match(contract, /agentKind:\s*AgentKind/);
+  assert.match(contract, /kind:\s*"workflow\.lane\.reassigned"/);
+  assert.match(contract, /previousAgentKind:\s*AgentKind/);
+  assert.match(contract, /canvasSession:\s*CanvasSession/);
 });
 
 test("workflow adopt and clean public type contracts return terminal statuses", async () => {
