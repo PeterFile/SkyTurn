@@ -56,7 +56,10 @@ describe("buildSelectedNodeActionState", () => {
     const state = buildSelectedNodeActionState({
       sessionId,
       selectedNode,
-      projection: projection(checkpoint("checkpoint-after-implementation", "lane-implementation", "after", "head-sha")),
+      projection: projection(
+        ...terminalRunEvents("lane-implementation", "failed"),
+        checkpoint("checkpoint-after-implementation", "lane-implementation", "after", "head-sha"),
+      ),
       composerMode: "repair-selected-node-from-after-checkpoint",
     });
 
@@ -71,6 +74,87 @@ describe("buildSelectedNodeActionState", () => {
       successorLaneId: "lane-implementation-repair",
       successorSemanticKey: "repair:lane-implementation:manual",
     });
+  });
+
+  it("disables variants from a dirty before checkpoint", () => {
+    const state = buildSelectedNodeActionState({
+      sessionId,
+      selectedNode,
+      projection: projection(
+        checkpoint("checkpoint-before-implementation", "lane-implementation", "before", "base-sha", sessionId, "dirty"),
+      ),
+      composerMode: "variant-from-before-checkpoint",
+    });
+
+    expect(state.composerMode).toBe("global");
+    expect(state.canCreateVariant).toBe(false);
+    expect(state.variantPayload).toBeNull();
+  });
+
+  it.each(["succeeded", "cancelled", "timed-out"] as const)(
+    "keeps repair available for %s terminal evidence",
+    (status) => {
+      const state = buildSelectedNodeActionState({
+        sessionId,
+        selectedNode,
+        projection: projection(
+          ...terminalRunEvents("lane-implementation", status),
+          checkpoint("checkpoint-after-implementation", "lane-implementation", "after", "head-sha"),
+        ),
+        composerMode: "repair-selected-node-from-after-checkpoint",
+      });
+
+      expect(state.composerMode).toBe("repair-selected-node-from-after-checkpoint");
+      expect(state.canCreateRepair).toBe(true);
+      expect(state.repairPayload).toMatchObject({
+        checkpointId: "checkpoint-after-implementation",
+        successorLaneId: "lane-implementation-repair",
+      });
+    },
+  );
+
+  it("keeps repair available when failed terminal evidence does not match the after checkpoint run", () => {
+    const mismatchedCheckpoint = checkpoint(
+      "checkpoint-after-implementation",
+      "lane-implementation",
+      "after",
+      "head-sha",
+    );
+    const checkpointPayload = mismatchedCheckpoint.payload.checkpoint as Record<string, unknown>;
+    checkpointPayload.runId = "run-other";
+    const state = buildSelectedNodeActionState({
+      sessionId,
+      selectedNode,
+      projection: projection(...terminalRunEvents("lane-implementation", "failed"), mismatchedCheckpoint),
+      composerMode: "repair-selected-node-from-after-checkpoint",
+    });
+
+    expect(state.composerMode).toBe("repair-selected-node-from-after-checkpoint");
+    expect(state.canCreateRepair).toBe(true);
+    expect(state.repairPayload).toMatchObject({ checkpointId: "checkpoint-after-implementation" });
+  });
+
+  it("keeps node actions available when durable fault audit is excluded from projection events", () => {
+    const flowProjection = projection(
+      checkpoint("checkpoint-before-implementation", "lane-implementation", "before", "base-sha"),
+    );
+    const state = buildSelectedNodeActionState({
+      sessionId,
+      selectedNode,
+      projection: {
+        ...flowProjection,
+        auditEvents: [
+          rawEvent("workflow.run.recovery_failed", { status: "failed" }),
+          rawEvent("workflow.run.start_reconciliation_failed", { status: "failed" }),
+          rawEvent("workflow.node.checkpoint_failed", { status: "failed" }),
+        ],
+      },
+      composerMode: "variant-from-before-checkpoint",
+    });
+
+    expect(state.composerMode).toBe("variant-from-before-checkpoint");
+    expect(state.canCreateVariant).toBe(true);
+    expect(state.variantPayload).not.toBeNull();
   });
 
   it("fails closed when the projection belongs to another session", () => {
@@ -735,7 +819,10 @@ function checkpoint(
   phase: "before" | "after",
   headCommit: string,
   checkpointSessionId = sessionId,
+  worktreeState: "clean" | "dirty" = "clean",
 ): FlowEvent {
+  const runId = `run-${laneId}`;
+  const segmentId = `segment-${laneId}`;
   return event("workflow.node.checkpoint_recorded", {
     checkpoint: {
       id,
@@ -744,12 +831,63 @@ function checkpoint(
       laneId,
       phase,
       executionTarget: "new_worktree",
+      runId,
+      segmentId,
+      worktreeState,
       headCommit,
       createdAt: "2026-06-23T00:00:00.000Z",
       source: "agent_bridge",
-      evidenceRefs: [{ kind: "run", id: `run-${laneId}` }],
+      evidenceRefs: [
+        { kind: "run", id: runId },
+        { kind: "segment", id: segmentId },
+        ...(phase === "after" ? [{ kind: "evidence", id: `evidence-${segmentId}` }] : []),
+      ],
     },
   });
+}
+
+function terminalRunEvents(
+  laneId: string,
+  status: "succeeded" | "failed" | "cancelled" | "timed-out",
+): FlowEvent[] {
+  const runId = `run-${laneId}`;
+  const segmentId = `segment-${laneId}`;
+  return [
+    event("workflow.segment.started", {
+      segment: { id: segmentId, laneId, runId, status: "running", exitCode: null },
+    }),
+    event("workflow.evidence.recorded", {
+      laneId,
+      segmentId,
+      evidence: {
+        id: `evidence-${segmentId}`,
+        laneId,
+        segmentId,
+        kind: "run",
+        status: status === "succeeded" ? "passed" : "failed",
+        checks: [],
+        artifacts: [],
+        runEvidence: {
+          runId,
+          status,
+          exitCode: status === "succeeded" ? 0 : 1,
+          changesetId: null,
+          checks: [],
+          artifacts: [],
+          review: null,
+          errorReason: status === "failed" ? "failed" : null,
+          cancelReason: status === "cancelled" ? "cancelled" : null,
+          completedAt: "2026-06-23T00:00:01.000Z",
+        },
+      },
+    }),
+    event("workflow.segment.finished", {
+      laneId,
+      segmentId,
+      status,
+      exitCode: status === "succeeded" ? 0 : 1,
+    }),
+  ];
 }
 
 function node(id: string): CanvasNode {

@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -29,6 +29,12 @@ import {
 const roots: string[] = [];
 const testDefaultWatchdogTimeoutMs = 250;
 
+async function appendRunEventForTest(projectRoot: string, event: RunEvent): Promise<void> {
+  const directory = join(projectRoot, ".devflow", "runs", event.runId);
+  await mkdir(directory, { recursive: true });
+  await appendFile(join(directory, "events.ndjson"), `${JSON.stringify(event)}\n`, "utf8");
+}
+
 afterEach(async () => {
   vi.useRealTimers();
   await Promise.all(roots.map((root) => rm(root, { force: true, recursive: true })));
@@ -36,6 +42,316 @@ afterEach(async () => {
 });
 
 describe("agent bridge", () => {
+  it("single-flights concurrent starts for one explicit run id", async () => {
+    const projectRoot = await makeTempRoot();
+    const baseAdapter = createMockAgentAdapter({ holdOpen: true });
+    let starts = 0;
+    const bridge = new AgentBridge({
+      adapters: [{
+        ...baseAdapter,
+        async startRun(input, sink) {
+          const claim = await readFile(
+            join(projectRoot, ".devflow", "runs", input.runId, "start-claim.json"),
+            "utf8",
+          );
+          expect(JSON.parse(claim)).toMatchObject({
+            runId: input.runId,
+            nodeId: input.nodeId,
+            sessionId: input.sessionId,
+            agentKind: input.agentKind,
+            startFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+          });
+          expect(claim).not.toContain(input.prompt);
+          expect(claim).not.toContain(input.hermesSessionHandle!);
+          starts += 1;
+          return baseAdapter.startRun(input, sink);
+        },
+      }],
+    });
+    const input = {
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: "run-explicit-single-flight",
+      nodeId: "node-single-flight",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex" as const,
+      hermesSessionHandle: "resume-secret-single-flight",
+      prompt: "Start once with prompt-secret-single-flight",
+    };
+
+    const [first, duplicate] = await Promise.all([
+      bridge.startRun(input),
+      bridge.startRun(input),
+    ]);
+
+    expect(first).toEqual(duplicate);
+    expect(starts).toBe(1);
+    expect(bridge.listRuns()).toEqual([expect.objectContaining({
+      id: input.runId,
+      status: "running",
+    })]);
+    await bridge.cancelRun(input.runId, "test cleanup");
+  });
+
+  it.each([
+    ["sandbox", "danger-full-access"],
+    ["prompt", "Run a different instruction"],
+    ["expectedArtifacts", [".devflow/acceptance/other.png"]],
+    ["plannerSessionId", "planner-session-other"],
+    ["plannerInputId", "planner-input-other"],
+    ["hermesSessionHandle", "resume-handle-other"],
+    ["transport", "pty-interactive"],
+  ] as const)("rejects a concurrent explicit run id with conflicting %s semantics", async (field, conflictingValue) => {
+    const projectRoot = await makeTempRoot();
+    const baseAdapter = createMockAgentAdapter({ holdOpen: true });
+    let starts = 0;
+    const bridge = new AgentBridge({
+      adapters: [{
+        ...baseAdapter,
+        async startRun(input, sink) {
+          starts += 1;
+          return baseAdapter.startRun(input, sink);
+        },
+      }],
+    });
+    const input = {
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: "run-explicit-identity",
+      nodeId: "node-original",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex" as const,
+      sandbox: "workspace-write" as const,
+      expectedArtifacts: [".devflow/acceptance/react-app.png"],
+      plannerSessionId: "planner-session-1",
+      plannerInputId: "planner-input-1",
+      hermesSessionHandle: "resume-handle-1",
+      transport: "exec-json" as const,
+      prompt: "Start once",
+    };
+
+    const first = bridge.startRun(input);
+    await expect(bridge.startRun({ ...input, [field]: conflictingValue })).rejects.toThrow(/different identity/i);
+    await first;
+    expect(starts).toBe(1);
+    await bridge.cancelRun(input.runId, "test cleanup");
+  });
+
+  it("rejects a durable non-terminal explicit run claim after restart without relaunching", async () => {
+    const projectRoot = await makeTempRoot();
+    const input = {
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: "run-explicit-restart-claim",
+      nodeId: "node-restart-claim",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex" as const,
+      prompt: "Keep the first process active",
+    };
+    const activeBridge = new AgentBridge({
+      adapters: [createMockAgentAdapter({ holdOpen: true })],
+    });
+    await activeBridge.startRun(input);
+    const eventsBeforeRestart = await loadRunEvents(projectRoot, input.runId);
+    let restartedLaunches = 0;
+    const baseAdapter = createMockAgentAdapter({ holdOpen: true });
+    const restartedBridge = new AgentBridge({
+      adapters: [{
+        ...baseAdapter,
+        async startRun(nextInput, sink) {
+          restartedLaunches += 1;
+          return baseAdapter.startRun(nextInput, sink);
+        },
+      }],
+    });
+
+    await expect(restartedBridge.startRun(input)).rejects.toThrow(/already (active|claimed)|non-terminal/i);
+    expect(restartedLaunches).toBe(0);
+    expect(await loadRunEvents(projectRoot, input.runId)).toEqual(eventsBeforeRestart);
+    await activeBridge.cancelRun(input.runId, "test cleanup");
+  });
+
+  it.each([
+    ["sandbox", "danger-full-access"],
+    ["prompt", "Run a different instruction after restart"],
+    ["expectedArtifacts", [".devflow/acceptance/other.png"]],
+    ["plannerSessionId", "planner-session-other"],
+    ["plannerInputId", "planner-input-other"],
+    ["hermesSessionHandle", "resume-handle-other"],
+    ["transport", "pty-interactive"],
+  ] as const)("rejects a durable run claim with conflicting %s semantics after restart", async (field, conflictingValue) => {
+    const projectRoot = await makeTempRoot();
+    const input = {
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: `run-explicit-restart-${field}`,
+      nodeId: "node-restart-fingerprint",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex" as const,
+      sandbox: "workspace-write" as const,
+      expectedArtifacts: [".devflow/acceptance/react-app.png"],
+      plannerSessionId: "planner-session-1",
+      plannerInputId: "planner-input-1",
+      hermesSessionHandle: "resume-handle-1",
+      transport: "exec-json" as const,
+      prompt: "Keep the first process active",
+    };
+    const activeBridge = new AgentBridge({
+      adapters: [createMockAgentAdapter({ holdOpen: true })],
+    });
+    await activeBridge.startRun(input);
+    let restartedLaunches = 0;
+    const baseAdapter = createMockAgentAdapter({ holdOpen: true });
+    const restartedBridge = new AgentBridge({
+      adapters: [{
+        ...baseAdapter,
+        async startRun(nextInput, sink) {
+          restartedLaunches += 1;
+          return baseAdapter.startRun(nextInput, sink);
+        },
+      }],
+    });
+
+    await expect(restartedBridge.startRun({ ...input, [field]: conflictingValue })).rejects.toThrow(/different identity/i);
+    expect(restartedLaunches).toBe(0);
+    await activeBridge.cancelRun(input.runId, "test cleanup");
+  });
+
+  for (const failedKind of ["evidence", "error", "status"] as const) {
+    it(`fails closed when ${failedKind} event persistence fails during adapter start`, async () => {
+      const projectRoot = await makeTempRoot();
+      const bridge = new AgentBridge({
+        appendEvent: async (root, event) => {
+          if (event.kind === failedKind) throw new Error(`${failedKind} append failed`);
+          await appendRunEventForTest(root, event);
+        },
+        adapters: [{
+          ...createMockAgentAdapter(),
+          async startRun(_input, sink) {
+            await sink.emit({
+              kind: failedKind,
+              payload: failedKind === "status"
+                ? { status: "failed", reason: "adapter failed" }
+                : failedKind === "error"
+                  ? { message: "adapter failed", category: "start-failed" }
+                  : { exitCode: null, checks: [] },
+            });
+            throw new Error("adapter failed");
+          },
+        }],
+      });
+      const input = {
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        runId: `run-${failedKind}-append-failed`,
+        nodeId: "node-start-failed",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "codex" as const,
+        prompt: "Start failure",
+      };
+
+      await expect(bridge.startRun(input)).rejects.toThrow(`${failedKind} append failed`);
+      expect(bridge.listRuns()).toContainEqual(expect.objectContaining({ id: input.runId, status: "failed" }));
+      await expect(bridge.getEvidence(projectRoot, input.runId)).resolves.toMatchObject({
+        runId: input.runId,
+        status: "failed",
+        errorReason: `${failedKind} append failed`,
+      });
+
+      const reopened = new AgentBridge({ adapters: [createMockAgentAdapter()] });
+      await expect(reopened.startRun(input)).rejects.toThrow(/already terminal/i);
+      expect(reopened.listRuns()).toContainEqual(expect.objectContaining({ id: input.runId, status: "failed" }));
+    });
+  }
+
+  it("persists one terminal failed result when adapter start throws", async () => {
+    const projectRoot = await makeTempRoot();
+    let starts = 0;
+    const bridge = new AgentBridge({
+      adapters: [{
+        ...createMockAgentAdapter(),
+        async startRun() {
+          starts += 1;
+          throw new Error("spawn failed");
+        },
+      }],
+    });
+
+    await expect(bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: "run-start-failed",
+      nodeId: "node-start-failed",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Start failure",
+    })).rejects.toThrow("spawn failed");
+    await expect(bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: "run-start-failed",
+      nodeId: "node-start-failed",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Start failure",
+    })).rejects.toThrow(/already terminal/i);
+
+    const events = await loadRunEvents(projectRoot, "run-start-failed");
+    expect(events).toEqual([
+      expect.objectContaining({
+        kind: "status",
+        payload: expect.objectContaining({
+          status: "failed",
+          errorReason: "spawn failed",
+          checks: [expect.objectContaining({ kind: "run-exit", status: "failed" })],
+        }),
+      }),
+    ]);
+    expect(starts).toBe(1);
+    expect(bridge.listRuns()).toContainEqual(expect.objectContaining({
+      id: "run-start-failed",
+      status: "failed",
+    }));
+    await expect(bridge.getEvidence(projectRoot, "run-start-failed")).resolves.toMatchObject({
+      runId: "run-start-failed",
+      status: "failed",
+      errorReason: "spawn failed",
+    });
+  });
+
+  it("persists a terminal failed result when no adapter is registered", async () => {
+    const projectRoot = await makeTempRoot();
+    const bridge = new AgentBridge({ adapters: [] });
+
+    await expect(bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: "run-missing-adapter",
+      nodeId: "node-missing-adapter",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "agy",
+      prompt: "Missing adapter",
+    })).rejects.toThrow("No local adapter registered for agy");
+
+    expect(bridge.listRuns()).toContainEqual(expect.objectContaining({
+      id: "run-missing-adapter",
+      status: "failed",
+    }));
+    await expect(bridge.getEvidence(projectRoot, "run-missing-adapter")).resolves.toMatchObject({
+      runId: "run-missing-adapter",
+      status: "failed",
+      errorReason: "No local adapter registered for agy",
+    });
+  });
+
   it("discovers missing real agents without claiming run support", async () => {
     const discovery = createDiscoveryService({ pathValue: "", env: {}, codexConfigRoot: null });
 

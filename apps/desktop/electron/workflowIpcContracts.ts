@@ -112,12 +112,25 @@ export interface TrustedPlannerRootStartStore {
 
 export function isTrustedPlannerRootStartInput(input: unknown, store: TrustedPlannerRootStartStore): boolean {
   if (!isRecord(input)) return false;
-  if (!isNonEmptyString(input.sessionId) || !isNonEmptyString(input.nodeId)) return false;
+  if (
+    !isNonEmptyString(input.sessionId) ||
+    !isNonEmptyString(input.nodeId) ||
+    !isNonEmptyString(input.runId) ||
+    input.agentKind !== "hermes" ||
+    !isNonEmptyString(input.plannerSessionId) ||
+    input.plannerInputId !== input.runId
+  ) {
+    return false;
+  }
 
   const canvasSession = store.materializeCanvasSession(input.sessionId);
   if (!isRecord(canvasSession)) return false;
   if (canvasSession.plannerNodeId !== input.nodeId) return false;
+  if (canvasSession.hermesPlannerSessionId !== input.plannerSessionId) return false;
   if (!Array.isArray(canvasSession.nodes)) return false;
+  if (Array.isArray(canvasSession.edges) && canvasSession.edges.some((edge) => isRecord(edge) && edge.target === input.nodeId)) {
+    return false;
+  }
 
   const plannerNode = canvasSession.nodes.find((node) =>
     isRecord(node) && node.id === input.nodeId
@@ -127,7 +140,9 @@ export function isTrustedPlannerRootStartInput(input: unknown, store: TrustedPla
   if (plannerNode.nodeKind === "user_decision") return false;
   if (plannerNode.executable === false) return false;
   if (isRecord(plannerNode.runtimePolicy) && plannerNode.runtimePolicy.executable === false) return false;
-  return plannerNode.status === "running" || plannerNode.status === "retrying";
+  if (!isRecord(plannerNode.context) || !Array.isArray(plannerNode.context.dependencies)) return false;
+  if (plannerNode.context.dependencies.length > 0) return false;
+  return new Set(["running", "retrying", "completed", "failed"]).has(String(plannerNode.status));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

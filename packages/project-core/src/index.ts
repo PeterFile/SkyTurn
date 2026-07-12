@@ -90,6 +90,7 @@ export type WorkflowVariantAdoptionStrategy = "merge" | "cherry-pick";
 export type WorkflowVariantAdoptionStatus = "requested" | "adopted" | "failed" | "rejected";
 export type WorkflowNodeCheckpointPhase = "before" | "after";
 export type WorkflowNodeCheckpointSource = "agent_bridge" | "workflow_kernel" | "backend" | "user";
+export type WorkflowCheckpointWorktreeState = "clean" | "dirty";
 export type WorkflowCheckpointEvidenceRefKind = "run" | "segment" | "evidence" | "changeset" | "artifact" | "commit";
 export type WorkflowRemoteSideEffectEventKind =
   | "workflow.delivery.pushed"
@@ -596,6 +597,8 @@ export interface WorkflowNodeCheckpoint {
   executionTarget: SessionExecutionTarget;
   worktreeId?: string;
   worktreePath?: string;
+  branchName?: string;
+  worktreeState?: WorkflowCheckpointWorktreeState;
   baseCommit?: string;
   headCommit?: string;
   createdAt: string;

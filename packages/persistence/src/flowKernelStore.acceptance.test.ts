@@ -1,3 +1,7 @@
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { runFlowKernelAcceptanceScenarios } from "@skyturn/workflow-kernel/acceptance";
@@ -64,4 +68,136 @@ describe("Flow Kernel SQLite acceptance", () => {
       ]),
     );
   }, 30_000);
+
+  it("replays an eligible after checkpoint for a failed executable run without duplicating completion", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-failed-run-checkpoint-"));
+    const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: "session-failed-run",
+      projectId: "project-failed-run",
+      title: "Failed run checkpoint",
+      goal: "Preserve the failed run state for repair.",
+      mode: "fast",
+      plannerProfile: "acceptance",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Acceptance fixture.",
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-failed-run",
+      kind: "workflow.lane.declared",
+      source: "acceptance",
+      idempotencyKey: "lane:implementation",
+      payload: {
+        lane: {
+          id: "lane-implementation",
+          semanticKey: "implementation",
+          kind: "implementation",
+          title: "Implement change",
+          agentKind: "codex",
+          status: "running",
+        },
+      },
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-failed-run",
+      kind: "workflow.segment.started",
+      source: "workflow-scheduler",
+      idempotencyKey: "segment:failed:started",
+      payload: {
+        laneId: "lane-implementation",
+        segment: {
+          id: "segment-failed",
+          laneId: "lane-implementation",
+          runId: "run-failed",
+          status: "running",
+          exitCode: null,
+        },
+      },
+      now: "2026-06-14T00:00:02.000Z",
+    });
+    const evidence = {
+      runId: "run-failed",
+      status: "failed" as const,
+      exitCode: 1,
+      changesetId: "changeset-failed",
+      checks: [{ kind: "run-exit" as const, name: "Agent run exit", status: "failed" as const }],
+      artifacts: [],
+      review: null,
+      errorReason: "exit 1",
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:03.000Z",
+    };
+    const result = {
+      sessionId: "session-failed-run",
+      laneId: "lane-implementation",
+      segmentId: "segment-failed",
+      runId: "run-failed",
+      agentKind: "codex" as const,
+      evidence,
+      now: evidence.completedAt,
+    };
+    store.recordRunCheckpoint({
+      sessionId: "session-failed-run",
+      nodeId: "lane-implementation",
+      laneId: "lane-implementation",
+      runId: "run-failed",
+      segmentId: "segment-failed",
+      phase: "before",
+      executionTarget: "current_branch",
+      worktreePath: projectRoot,
+      branchName: "HEAD",
+      headCommit: "b".repeat(40),
+      worktreeState: "clean",
+      evidenceRefs: [
+        { kind: "run", id: "run-failed" },
+        { kind: "segment", id: "segment-failed" },
+      ],
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    store.recordRunResult(result);
+    store.recordRunResult(result);
+    const checkpoint = {
+      sessionId: "session-failed-run",
+      nodeId: "lane-implementation",
+      laneId: "lane-implementation",
+      runId: "run-failed",
+      segmentId: "segment-failed",
+      phase: "after" as const,
+      executionTarget: "current_branch" as const,
+      worktreePath: projectRoot,
+      branchName: "HEAD",
+      headCommit: "c".repeat(40),
+      worktreeState: "dirty" as const,
+      evidenceRefs: [
+        { kind: "run" as const, id: "run-failed" },
+        { kind: "evidence" as const, id: "evidence-segment-failed" },
+        { kind: "changeset" as const, id: "changeset-failed" },
+      ],
+      now: "2026-06-14T00:00:04.000Z",
+    };
+    store.recordRunCheckpoint(checkpoint);
+    store.recordRunCheckpoint(checkpoint);
+
+    const projection = store.materializeFlowProjection("session-failed-run");
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(store.listNodeCheckpoints({ sessionId: "session-failed-run", runId: "run-failed", phase: "after" })).toHaveLength(1);
+    expect(store.requestNodeRepair({
+      sessionId: "session-failed-run",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint:run-failed:after",
+      intentId: "repair-failed-run",
+      successorLaneId: "lane-repair",
+      successorSemanticKey: "repair:failed-run",
+      now: "2026-06-14T00:00:05.000Z",
+    }).event.kind).toBe("workflow.node.repair_requested");
+    store.close();
+
+    const replayed = createWorkflowStore({ projectRoot });
+    expect(replayed.materializeFlowProjection("session-failed-run").checkpoints).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "checkpoint:run-failed:after", worktreeState: "dirty" })]),
+    );
+    replayed.close();
+  });
 });

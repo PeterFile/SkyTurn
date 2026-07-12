@@ -144,6 +144,21 @@ const patchPreviewLimit = 24 * 1024;
 const defaultMaxPatchPreviewBytes = 64 * 1024;
 const defaultMaxGitOutputBytes = 1024 * 1024;
 
+export const SKYTURN_VOLATILE_GIT_PATHS = [
+  ".devflow/skyturn-workflow.sqlite",
+  ".devflow/skyturn-workflow.sqlite-wal",
+  ".devflow/skyturn-workflow.sqlite-shm",
+  ".devflow/runs/**",
+  ".devflow/tasks/**/output.md",
+] as const;
+
+const skyturnGitEvidencePathspecs = [
+  ".",
+  ...SKYTURN_VOLATILE_GIT_PATHS.map((path) =>
+    path.includes("**") ? `:(top,glob,exclude)${path}` : `:(top,exclude)${path}`
+  ),
+];
+
 export class GitCommandError extends Error {
   readonly stderr: string;
 
@@ -590,6 +605,27 @@ export async function getGitBranchFacts(repoRoot: string): Promise<GitBranchFact
   };
 }
 
+export interface GitCheckpointSnapshot {
+  branchName: string;
+  headCommit: string;
+  worktreeState: "clean" | "dirty";
+}
+
+export async function getGitCheckpointSnapshot(repoRoot: string): Promise<GitCheckpointSnapshot> {
+  await assertGitWorktree(repoRoot);
+  const [branch, head, status] = await Promise.all([
+    runGit(repoRoot, ["branch", "--show-current"]),
+    runGit(repoRoot, ["rev-parse", "--verify", "HEAD^{commit}"]),
+    git(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all", "--", ...skyturnGitEvidencePathspecs]),
+  ]);
+  if (status.truncated) throw new Error("Git status output exceeded the checkpoint evidence limit.");
+  return {
+    branchName: branch.stdout,
+    headCommit: head.stdout.toLowerCase(),
+    worktreeState: status.stdout.trim() ? "dirty" : "clean",
+  };
+}
+
 export async function evaluateRollbackWorktreeState(input: RollbackWorktreeInput): Promise<RollbackWorktreeState> {
   const restoreCommitRef = input.restoreCommitRef;
   const expectedHeadCommit = input.expectedHeadCommit;
@@ -640,7 +676,11 @@ export async function evaluateRollbackWorktreeState(input: RollbackWorktreeInput
     });
   }
 
-  const dirtyStatus = await runGit(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all", "--"], { allowFailure: true });
+  const dirtyStatus = await runGit(
+    worktreePath,
+    ["status", "--porcelain=v1", "--untracked-files=all", "--", ...skyturnGitEvidencePathspecs],
+    { allowFailure: true },
+  );
   if (dirtyStatus.exitCode !== 0) {
     return rollbackManualRepair("dirty_worktree", "Worktree clean status could not be verified.", {
       worktreePath,
@@ -724,7 +764,10 @@ export async function createDeliveryCommit(input: DeliveryCommitInput): Promise<
   const body = typeof input.body === "string" && input.body.trim().length > 0 ? input.body.trim() : undefined;
   const worktreePath = await resolveDeliveryWorktreePath(input.projectRoot, input.worktreePath);
   const files = await normalizeDeliveryFileList(worktreePath, input.files);
-  const statusLines = parseStatusLines((await git(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all", "--"])).stdout);
+  const statusLines = parseStatusLines((await git(
+    worktreePath,
+    ["status", "--porcelain=v1", "--untracked-files=all", "--", ...skyturnGitEvidencePathspecs],
+  )).stdout);
   const changedFiles = new Set(filesFromStatus(statusLines));
   const missingFromChangeset = files.filter((file) => !changedFiles.has(file));
   if (missingFromChangeset.length > 0) {
@@ -1475,7 +1518,13 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
     try {
       const repoRoot = await this.resolveRepoRoot(node);
       await assertGitWorktree(repoRoot);
-      const status = await git(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all", "--"]);
+      const status = await git(repoRoot, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        ...skyturnGitEvidencePathspecs,
+      ]);
       if (status.truncated) throw new Error("Git status output exceeded the changeset evidence limit.");
       const statusLines = parseStatusLines(status.stdout);
       const files = filesFromStatus(statusLines);
@@ -1516,12 +1565,24 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
       const repoRoot = await this.resolveRepoRoot(input.node);
       await assertGitWorktree(repoRoot);
       await verifyGitRef(repoRoot, baselineRef);
-      const status = await git(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all", "--"]);
+      const status = await git(repoRoot, [
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--",
+        ...skyturnGitEvidencePathspecs,
+      ]);
       if (status.truncated) throw new Error("Git status output exceeded the changeset evidence limit.");
       const statusLines = parseStatusLines(status.stdout);
       const untrackedFiles = untrackedFilesFromStatus(statusLines);
       const files = unionSorted([
-        ...stringLines((await git(repoRoot, ["diff", "--name-only", baselineRef, "--"])).stdout),
+        ...stringLines((await git(repoRoot, [
+          "diff",
+          "--name-only",
+          baselineRef,
+          "--",
+          ...skyturnGitEvidencePathspecs,
+        ])).stdout),
         ...filesFromStatus(statusLines),
       ]);
       const diffStat = files.length === 0
@@ -1590,11 +1651,23 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
       const diffRange = `${worktree.baseCommit}..${worktree.headCommit}`;
       const repoRoot = await realpath(worktree.realPath);
       await assertGitWorktree(repoRoot);
-      const files = stringLines((await git(repoRoot, ["diff", "--name-only", diffRange, "--"])).stdout);
-      const numstat = (await git(repoRoot, ["diff", "--numstat", diffRange, "--"])).stdout;
+      const files = stringLines((await git(repoRoot, [
+        "diff",
+        "--name-only",
+        diffRange,
+        "--",
+        ...skyturnGitEvidencePathspecs,
+      ])).stdout);
+      const numstat = (await git(repoRoot, [
+        "diff",
+        "--numstat",
+        diffRange,
+        "--",
+        ...skyturnGitEvidencePathspecs,
+      ])).stdout;
       const patch = await git(
         repoRoot,
-        ["diff", "--no-ext-diff", diffRange, "--"],
+        ["diff", "--no-ext-diff", diffRange, "--", ...skyturnGitEvidencePathspecs],
         { maxBytes: this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes },
       );
       return {
@@ -1931,7 +2004,13 @@ async function ensureAncestor(repoRoot: string, baseCommit: string, headCommit: 
 }
 
 async function assertCleanWorktree(cwd: string, label: string): Promise<void> {
-  const status = (await runGit(cwd, ["status", "--porcelain=v1", "--untracked-files=all", "--"])).stdout;
+  const status = (await runGit(cwd, [
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+    "--",
+    ...skyturnGitEvidencePathspecs,
+  ])).stdout;
   if (status.trim()) throw new Error(`${label} has uncommitted changes.`);
 }
 
@@ -2286,13 +2365,13 @@ async function diffPreviewForRepo(
 
 async function diffTextAgainstRef(repoRoot: string, baselineRef: string, diffArgs: string[]): Promise<string> {
   validateGitRef(baselineRef);
-  const args = ["diff", ...diffArgs, baselineRef, "--"];
+  const args = ["diff", ...diffArgs, baselineRef, "--", ...skyturnGitEvidencePathspecs];
   try {
     const result = await git(repoRoot, args);
     return result.stdout;
   } catch {
-    const unstaged = await git(repoRoot, ["diff", ...diffArgs, "--"]);
-    const staged = await git(repoRoot, ["diff", "--cached", ...diffArgs, "--"]);
+    const unstaged = await git(repoRoot, ["diff", ...diffArgs, "--", ...skyturnGitEvidencePathspecs]);
+    const staged = await git(repoRoot, ["diff", "--cached", ...diffArgs, "--", ...skyturnGitEvidencePathspecs]);
     return `${staged.stdout}${unstaged.stdout}`;
   }
 }
@@ -2304,11 +2383,11 @@ async function diffTextAgainstRefBounded(
   maxBytes: number,
 ): Promise<{ stdout: string; truncated: boolean }> {
   validateGitRef(baselineRef);
-  const args = ["diff", ...diffArgs, baselineRef, "--"];
+  const args = ["diff", ...diffArgs, baselineRef, "--", ...skyturnGitEvidencePathspecs];
   try {
     return await git(repoRoot, args, { maxBytes });
   } catch {
-    return git(repoRoot, ["diff", ...diffArgs, "--"], { maxBytes });
+    return git(repoRoot, ["diff", ...diffArgs, "--", ...skyturnGitEvidencePathspecs], { maxBytes });
   }
 }
 

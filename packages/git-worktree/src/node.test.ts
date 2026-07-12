@@ -18,6 +18,7 @@ import {
   mergeDeliveryPullRequest,
   pushDeliveryBranch,
   getGitBranchFacts,
+  SKYTURN_VOLATILE_GIT_PATHS,
   resetRollbackWorktreeToCommit,
   syncDeliveryMain,
   type ManagedWorktreeWorkflowEvent,
@@ -1834,6 +1835,16 @@ describe("GitChangesetService", () => {
     expect(facts.currentBranch).toBe("feature/api");
     expect(facts.branches).toContain("main");
     expect(facts.branches).toContain("feature/api");
+  });
+
+  it("defines only SkyTurn-generated volatile .devflow paths as Git evidence exclusions", () => {
+    expect(SKYTURN_VOLATILE_GIT_PATHS).toEqual([
+      ".devflow/skyturn-workflow.sqlite",
+      ".devflow/skyturn-workflow.sqlite-wal",
+      ".devflow/skyturn-workflow.sqlite-shm",
+      ".devflow/runs/**",
+      ".devflow/tasks/**/output.md",
+    ]);
   });
 
   it("uses HEAD as the current branch fallback for detached checkouts", async () => {
