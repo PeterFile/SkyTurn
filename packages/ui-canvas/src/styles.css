@@ -7429,3 +7429,14 @@ select:focus-visible,
   background: var(--sk-accent) !important;
   color: #111111 !important;
 }
+
+.new-session-intake:has(.session-panel-input:focus-visible) {
+  box-shadow: 0 0 0 1px var(--sk-accent) !important;
+}
+
+.new-session-intake .session-panel-input:focus,
+.new-session-intake .session-panel-input:focus-visible {
+  outline: none !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
