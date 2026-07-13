@@ -30,6 +30,41 @@ const stableFlowLaneStatusContract: Record<FlowLaneStatus, true> = {
 };
 
 describe("Flow Kernel intent compiler", () => {
+  it("replays an explicit lane reassignment without changing lane execution facts", () => {
+    const declared = event("workflow.lane.declared", {
+      lane: {
+        ...lane("lane-implementation", "implementation", ["src/**"], ["@skyturn/ui-canvas"]),
+        semanticKey: "implementation:ui",
+        runtimePolicy: {
+          source: "workflow_projection",
+          trusted: true,
+          executable: true,
+          sandbox: "workspace-write",
+          sideEffects: ["filesystem", "process"],
+          reason: "Derived from implementation lane kind.",
+        },
+      },
+    });
+    const before = reduceWorkflowEvents([declared]);
+    const reassigned = reduceWorkflowEvents([
+      declared,
+      event("workflow.lane.reassigned", {
+        laneId: "lane-implementation",
+        previousAgentKind: "codex",
+        agentKind: "gemini",
+      }),
+    ]);
+
+    expect(reassigned.lanes[0]).toEqual({
+      ...before.lanes[0],
+      agentKind: "gemini",
+    });
+    expect(reassigned.edges).toEqual(before.edges);
+    expect(reassigned.segments).toEqual(before.segments);
+    expect(reassigned.evidence).toEqual(before.evidence);
+    expect(reassigned.worktrees).toEqual(before.worktrees);
+  });
+
   it("accepts WorkflowIntent JSON and rejects Hermes UI mutations or self-completion", () => {
     const accepted = parseWorkflowIntent(
       JSON.stringify({

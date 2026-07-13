@@ -65,6 +65,32 @@ export interface WorkflowNodePositionUpdateRequest {
   position: CanvasNode["position"];
 }
 
+export interface WorkflowLaneReassignRequest {
+  requestId: string;
+  sessionId: string;
+  laneId: string;
+  agentKind: AgentKind;
+}
+
+export interface WorkflowLaneReassignedEvent {
+  kind: "workflow.lane.reassigned";
+  source: "user";
+  laneId: string;
+  payload: {
+    requestId: string;
+    laneId: string;
+    previousAgentKind: AgentKind;
+    agentKind: AgentKind;
+  };
+}
+
+export interface WorkflowLaneReassignResult {
+  protocolVersion: number;
+  event: WorkflowLaneReassignedEvent;
+  projection: unknown;
+  canvasSession: CanvasSession;
+}
+
 export type WorkflowRollbackBlockCode =
   | "remote_side_effect"
   | "in_flight_remote_side_effect"
@@ -214,6 +240,7 @@ export interface WorkflowApi {
   updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) => Promise<{ protocolVersion: number; event: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   getProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
+  reassignLane: (projectRoot: string, input: WorkflowLaneReassignRequest) => Promise<WorkflowLaneReassignResult>;
   getCheckpoints: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; checkpoints: WorkflowNodeCheckpoint[] }>;
   getRollbackEligibility: (projectRoot: string, input: unknown) => Promise<{
     protocolVersion: number;
