@@ -71,8 +71,43 @@ jobs:
       - name: Test
         run: pnpm exec turbo run test ${{ steps.turbo-filter.outputs.value }}
 
+      - name: Verify flow kernel acceptance selection
+        shell: bash
+        run: |
+          acceptance_plan="$(mktemp)"
+          pnpm --silent run flow-kernel:acceptance --dry=json > "$acceptance_plan"
+          node --input-type=module - "$acceptance_plan" <<'NODE'
+          import assert from "node:assert/strict";
+          import { readFile } from "node:fs/promises";
+
+          const plan = JSON.parse(await readFile(process.argv[2], "utf8"));
+          const executableAcceptanceTasks = new Set(
+            plan.tasks
+              .filter(
+                (task) =>
+                  task.task === "flow-kernel:acceptance" &&
+                  task.command !== "<NONEXISTENT>",
+              )
+              .map((task) => task.taskId),
+          );
+          const requiredAcceptanceTasks = [
+            "@skyturn/workflow-kernel#flow-kernel:acceptance",
+            "@skyturn/persistence#flow-kernel:acceptance",
+          ];
+
+          for (const taskId of requiredAcceptanceTasks) {
+            assert.ok(
+              executableAcceptanceTasks.has(taskId),
+              `Missing executable acceptance task: ${taskId}`,
+            );
+          }
+          console.log(
+            `Verified acceptance tasks: ${requiredAcceptanceTasks.join(", ")}`,
+          );
+          NODE
+
       - name: Flow kernel acceptance
-        run: pnpm exec turbo run flow-kernel:acceptance ${{ steps.turbo-filter.outputs.value }}
+        run: pnpm run flow-kernel:acceptance --force
 
       - name: Save Turbo cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.restore-turbo-cache.outputs.cache-hit != 'true'
