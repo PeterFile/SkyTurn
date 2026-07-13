@@ -13,6 +13,7 @@ import type { AgentDescriptor, WorkflowWorktreeIdentity } from "@skyturn/project
 import {
   isTrustedPlannerRootStartInput,
   normalizeWorkflowIpcError,
+  normalizeWorkflowNodePositionUpdate,
   rejectMissingWorkflowProjectionNode,
   workflowIpcError,
   workflowStartInputError,
@@ -473,6 +474,7 @@ interface WorkflowStoreHost {
   applyWorkflowIntent(intent: unknown, now: string): unknown;
   scheduleReadyLanes(sessionId: string, input: unknown): unknown;
   recordRunResult(input: unknown): unknown;
+  recordCanvasNodePosition(input: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
@@ -819,6 +821,23 @@ ipcMain.handle("workflow:recordRunResult", async (_event, projectRoot: string, i
     canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 });
+
+ipcMain.handle("workflow:nodePosition:update", workflowHandler(async (projectRoot: string, input: unknown) => {
+  assertKnownProjectRoot(projectRoot);
+  const normalized = normalizeWorkflowNodePositionUpdate(input);
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, normalized.sessionId);
+  const event = store.recordCanvasNodePosition({
+    ...normalized,
+    now: new Date().toISOString(),
+  });
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    event,
+    projection: store.materializeFlowProjection(normalized.sessionId),
+    canvasSession: materializeRendererCanvasSession(store, normalized.sessionId),
+  };
+}));
 
 ipcMain.handle("workflow:projection", workflowHandler(async (projectRoot: string, sessionId: string) => {
   assertKnownProjectRoot(projectRoot);
@@ -1950,6 +1969,8 @@ function deliveryLifecycleFactsForRenderer(event: Record<string, unknown> & { ki
   const payload = isRecord(event.payload) ? event.payload : {};
   const evidence = isRecord(payload.evidence) ? payload.evidence : {};
   const laneId = optionalText(event.laneId) ?? optionalText(payload.laneId);
+  const review = rendererSafePullRequestReview(payload.review) ?? rendererSafePullRequestReview(evidence.review);
+  const gate = rendererSafePullRequestGate(payload.gate) ?? rendererSafePullRequestGate(evidence.gate);
 
   switch (event.kind) {
     case "workflow.commit.created":
@@ -1988,6 +2009,8 @@ function deliveryLifecycleFactsForRenderer(event: Record<string, unknown> & { ki
         ...(optionalText(payload.headSha) ?? optionalText(evidence.headSha) ? { headSha: (optionalText(payload.headSha) ?? optionalText(evidence.headSha))! } : {}),
         ...(optionalText(payload.status) ?? optionalText(evidence.status) ? { status: (optionalText(payload.status) ?? optionalText(evidence.status))! } : {}),
         checks: rendererSafePullRequestChecks(payload.checks ?? evidence.checks),
+        ...(review ? { review } : {}),
+        ...(gate ? { gate } : {}),
       };
     case "workflow.pull_request.merged":
       return {
@@ -2026,6 +2049,19 @@ function rendererSafePullRequestChecks(value: unknown): Array<Record<string, unk
       };
     })
     .filter((check): check is Record<string, unknown> => check !== null);
+}
+
+function rendererSafePullRequestReview(value: unknown): { status: string } | null {
+  if (!isRecord(value)) return null;
+  const status = optionalText(value.status);
+  return status === "approved" || status === "changes_requested" || status === "pending" || status === "unknown"
+    ? { status }
+    : null;
+}
+
+function rendererSafePullRequestGate(value: unknown): { mergeable: boolean } | null {
+  if (!isRecord(value) || typeof value.mergeable !== "boolean") return null;
+  return { mergeable: value.mergeable };
 }
 
 function workflowEventSummary(kind: string): string {

@@ -95,6 +95,55 @@ describe("deriveSessionTarget", () => {
   });
 });
 
+describe("canvas node position persistence", () => {
+  it("keeps pointer-move positions local and commits workspace state only on drag stop", async () => {
+    const appSource = await readSource("./App.tsx");
+    const moveHandler = appSource.slice(
+      appSource.indexOf("const handleNodesChange"),
+      appSource.indexOf("const handleNodeDragStop"),
+    );
+    const stopHandler = appSource.slice(
+      appSource.indexOf("const handleNodeDragStop"),
+      appSource.indexOf("return (", appSource.indexOf("const handleNodeDragStop")),
+    );
+
+    expect(moveHandler).toContain("onFlowNodesChange(changes)");
+    expect(moveHandler).not.toContain("onNodePositionCommit");
+    expect(moveHandler).not.toContain("setWorkspace");
+    expect(stopHandler).toContain("await onNodePositionCommit(finalCanvasNodePositionUpdate(node))");
+    expect(stopHandler.match(/onNodePositionCommit\(/g)).toHaveLength(1);
+  });
+
+  it("reports a bounded save error and restores the persisted position when IPC fails", async () => {
+    const appSource = await readSource("./App.tsx");
+    const stopHandler = appSource.slice(
+      appSource.indexOf("const handleNodeDragStop"),
+      appSource.indexOf("return (", appSource.indexOf("const handleNodeDragStop")),
+    );
+    const canvasView = appSource.slice(
+      appSource.indexOf("function CanvasView("),
+      appSource.indexOf("function CanvasViewportController"),
+    );
+
+    expect(stopHandler).toContain("catch");
+    expect(stopHandler).toContain("persistedNode.position");
+    expect(canvasView).toContain('role="alert"');
+    expect(canvasView).toContain("positionSaveError");
+  });
+
+  it("retries an ambiguous IPC failure once with the same idempotency key", async () => {
+    const appSource = await readSource("./App.tsx");
+    const commitHandler = appSource.slice(
+      appSource.indexOf("const commitActiveNodePosition"),
+      appSource.indexOf("async function importProject"),
+    );
+
+    expect(commitHandler).toContain("const updateId = crypto.randomUUID()");
+    expect(commitHandler).toContain("const persistPosition = () => workflow.updateNodePosition");
+    expect(commitHandler.match(/await persistPosition\(\)/g)).toHaveLength(2);
+  });
+});
+
 describe("changes logic", () => {
   const node = mockNode("codex");
 
@@ -432,15 +481,29 @@ describe("UI source validation", () => {
     }))).toBeNull();
   });
 
-  it("includes visible copy for new session target selection and uses custom listbox controls", async () => {
+  it("keeps essential new-session controls while removing secondary intake hints", async () => {
     const appSource = await readSource("./App.tsx");
-    expect(appSource).toContain("Develop directly on the selected branch.");
-    expect(appSource).toContain("Create a candidate worktree from the selected branch.");
 
     const sessionComposer = appSource.slice(appSource.indexOf("function SessionComposer("), appSource.indexOf("function formatRelativeTime("));
     expect(sessionComposer).not.toContain("<select");
     expect(sessionComposer).toContain("<CustomSelect");
     expect(sessionComposer).toContain("options={[");
+    expect(sessionComposer).not.toContain("paper-pin-btn");
+    expect(sessionComposer).not.toContain("Focus prompt");
+    expect(sessionComposer).not.toContain("target-selector-hint");
+    expect(sessionComposer).not.toContain("Develop directly on the selected branch.");
+    expect(sessionComposer).not.toContain("Create a candidate worktree from the selected branch.");
+    expect(sessionComposer).toContain("<ProjectDropdown");
+    expect(sessionComposer).toContain("<ModeSwitch");
+    expect(sessionComposer).toContain('ariaLabel="Execution Target"');
+    expect(sessionComposer).toContain('ariaLabel="Branch"');
+    expect(sessionComposer).toContain('title="Create"');
+
+    const projectDropdown = appSource.slice(appSource.indexOf("function ProjectDropdown("), appSource.indexOf("function ModeSwitch("));
+    const modeSwitch = appSource.slice(appSource.indexOf("function ModeSwitch("), appSource.indexOf("function StatusLight("));
+    expect(projectDropdown).toContain('aria-label="Project"');
+    expect(modeSwitch).toContain("Fast");
+    expect(modeSwitch).toContain("Plan");
   });
 
   it("PlanView is a single-page editor instead of three simultaneous markdown articles", async () => {
@@ -488,13 +551,13 @@ describe("UI source validation", () => {
     expect(bridgeStartEffect).not.toContain("activeSession.activeNodeId");
   });
 
-  it("renders compact agent readiness near session creation and canvas composer", async () => {
+  it("renders compact agent readiness near canvas composer but not on start page", async () => {
     const appSource = await readSource("./App.tsx");
-    const projectStart = appSource.slice(appSource.indexOf("function ProjectStartPage"), appSource.indexOf("export type ComposerAction"));
+    const projectStart = appSource.slice(appSource.indexOf("function ProjectStartPage"), appSource.indexOf("function AgentReadinessBlock"));
     const canvasView = appSource.slice(appSource.indexOf("function CanvasView("), appSource.indexOf("function CanvasViewportController"));
 
-    expect(projectStart).toContain("<AgentReadinessBlock");
-    expect(projectStart).toContain("readiness={agentReadiness}");
+    expect(projectStart).not.toContain("<AgentReadinessBlock");
+    expect(projectStart).not.toContain("agentReadiness");
     expect(canvasView).toContain("<AgentReadinessBlock");
     expect(canvasView).toContain("readiness={agentReadiness}");
     expect(appSource).toContain("function AgentReadinessBlock");

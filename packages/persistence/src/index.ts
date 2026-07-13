@@ -58,6 +58,13 @@ export interface WorkflowRunResultRecordRequest {
   now: string;
 }
 
+export interface WorkflowNodePositionUpdateRequest {
+  sessionId: string;
+  updateId: string;
+  nodeId: string;
+  position: CanvasNode["position"];
+}
+
 export type WorkflowRollbackBlockCode =
   | "remote_side_effect"
   | "in_flight_remote_side_effect"
@@ -204,6 +211,7 @@ export interface WorkflowApi {
   applyIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   scheduleReady: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   recordRunResult: (projectRoot: string, input: WorkflowRunResultRecordRequest) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
+  updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) => Promise<{ protocolVersion: number; event: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   getProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   getCheckpoints: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; checkpoints: WorkflowNodeCheckpoint[] }>;

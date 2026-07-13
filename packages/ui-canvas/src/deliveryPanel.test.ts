@@ -483,32 +483,60 @@ describe("hydrateDeliveryLifecycleFromWorkflowEvents", () => {
       expectedHeadSha: "sha-b",
       mergeable: true,
     });
+    const panelState = buildDeliveryPanelState(input({
+      commitEvidence: restored.commitEvidence,
+      pushEvidence: restored.pushEvidence,
+      pullRequest: restored.pullRequest,
+      checks: restored.checks,
+      mergeTitle: "feat(workflow): ship slice c",
+      mergeConfirmed: true,
+      mergeComplete: restored.mergeComplete,
+      syncComplete: restored.syncComplete,
+    }));
+    expect(panelState.exactHeadChecksPassed).toBe(true);
+    expect(panelState.mergeReady).toBe(true);
     expect(restored.mergeComplete).toBe(true);
     expect(restored.syncComplete).toBe(true);
   });
 
-  it("does not treat PR creation or stale checks as merge readiness", () => {
+  it("keeps renderer-safe hydrated checks blocked when their exact head is stale after restart", () => {
     const restored = hydrateDeliveryLifecycleFromWorkflowEvents([
       {
         kind: "workflow.commit.created",
         payload: {
-          laneId: "lane-commit",
-          evidence: { commitSha: "sha-new", branch: "feature/slice-c" },
+          redacted: true,
+          delivery: { kind: "commit", laneId: "lane-commit", commitSha: "sha-new", branch: "feature/slice-c" },
         },
       },
       {
         kind: "workflow.pull_request.created",
         payload: {
-          laneId: "lane-pr",
-          commitLaneId: "lane-commit",
-          evidence: { number: 42, url: "https://example.test/pull/42", commitSha: "sha-new" },
+          redacted: true,
+          delivery: {
+            kind: "pull_request",
+            laneId: "lane-pr",
+            commitLaneId: "lane-commit",
+            prNumber: 42,
+            url: "https://example.test/pull/42",
+            headSha: "sha-new",
+          },
         },
       },
       {
         kind: "workflow.pull_request.checks_recorded",
         payload: {
-          laneId: "lane-pr",
-          evidence: { status: "passed", number: 42, url: "https://example.test/pull/42", headSha: "sha-old", checks: [] },
+          redacted: true,
+          delivery: {
+            kind: "checks",
+            laneId: "lane-pr",
+            prNumber: 42,
+            url: "https://example.test/pull/42",
+            status: "passed",
+            headSha: "sha-old",
+            checks: [],
+            review: { status: "approved" },
+            gate: { mergeable: true },
+          },
         },
       },
     ], { commitLaneId: "lane-commit", pullRequestLaneId: "lane-pr" });
@@ -525,7 +553,14 @@ describe("hydrateDeliveryLifecycleFromWorkflowEvents", () => {
     }));
 
     expect(restored.pullRequest).not.toBeNull();
+    expect(restored.checks).toEqual({
+      checkStatus: "passing",
+      reviewStatus: "approved",
+      expectedHeadSha: "sha-old",
+      mergeable: true,
+    });
     expect(panelState.prCreatedCompletesTask).toBe(false);
+    expect(panelState.exactHeadChecksPassed).toBe(false);
     expect(panelState.mergeReady).toBe(false);
     expect(panelState.canMerge).toBe(false);
   });

@@ -20,6 +20,7 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:applyIntent",
     "workflow:scheduleReady",
     "workflow:recordRunResult",
+    "workflow:nodePosition:update",
     "workflow:projection",
     "workflow:events",
     "workflow:checkpoints",
@@ -356,6 +357,61 @@ test("workflow events expose renderer-safe delivery lifecycle facts without raw 
   assert.match(deliveryFactsHelper, /kind:\s*"merge"/);
   assert.match(deliveryFactsHelper, /kind:\s*"main_synced"/);
   assert.doesNotMatch(deliveryFactsHelper, /worktreePath|command|commands|stdout|stderr|rawStdout/);
+});
+
+test("workflow checks projection preserves only renderer-safe review and mergeability facts", async () => {
+  const { redactWorkflowEventForRenderer } = await loadMainDeliveryRendererHelpers();
+  const projected = toPlain(redactWorkflowEventForRenderer({
+    id: "event-checks-1",
+    sessionId: "session-1",
+    seq: 4,
+    kind: "workflow.pull_request.checks_recorded",
+    source: "electron-main",
+    laneId: "lane-pr",
+    createdAt: "2026-07-11T00:00:00.000Z",
+    payload: {
+      laneId: "lane-pr",
+      prNumber: 42,
+      url: "https://example.test/pull/42",
+      headSha: "sha-b",
+      status: "passed",
+      checks: [{
+        name: "Build and test",
+        status: "passed",
+        link: "https://example.test/checks/1",
+        detail: "must stay private",
+      }],
+      review: {
+        status: "approved",
+        reviewer: "octocat",
+        detail: "private review comment",
+      },
+      gate: {
+        headSha: "sha-b",
+        checksStatus: "passed",
+        reviewStatus: "approved",
+        state: "OPEN",
+        mergeable: true,
+      },
+      evidence: {
+        command: { stdout: "raw gh output", stderr: "secret" },
+        summary: "agent prose",
+      },
+    },
+  }));
+
+  assert.deepEqual(projected.payload.delivery, {
+    kind: "checks",
+    laneId: "lane-pr",
+    prNumber: 42,
+    url: "https://example.test/pull/42",
+    headSha: "sha-b",
+    status: "passed",
+    checks: [{ name: "Build and test", status: "passed", link: "https://example.test/checks/1" }],
+    review: { status: "approved" },
+    gate: { mergeable: true },
+  });
+  assert.doesNotMatch(JSON.stringify(projected), /octocat|private review comment|raw gh output|secret|agent prose/);
 });
 
 test("workflow delivery push validates session, commit lane, worktree, and commit evidence before git push", async () => {
@@ -798,6 +854,7 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "applyIntent",
     "scheduleReady",
     "recordRunResult",
+    "updateNodePosition",
     "getProjection",
     "getEvents",
     "getCheckpoints",
@@ -830,6 +887,25 @@ test("preload exposes narrow natural workflow wrappers", async () => {
   assert.doesNotMatch(preload, /ipcRenderer\s*:/);
   assert.doesNotMatch(preload, /return\s+ipcRenderer/);
   assert.doesNotMatch(preload, /execFile|spawn|shell|fs\./);
+});
+
+test("preload position update wrapper is compile-time checked against WorkflowApi", async () => {
+  const preloadSource = await readFile(new URL("../electron/preload.ts", import.meta.url), "utf8");
+  assert.match(preloadSource, /WorkflowApi,[\s\S]*WorkflowNodePositionUpdateRequest,[\s\S]*resolution-mode/);
+  assert.match(preloadSource, /input: WorkflowNodePositionUpdateRequest/);
+  assert.match(preloadSource, /satisfies WorkflowApi/);
+});
+
+test("node position IPC returns the authoritative session without a duplicate renderer broadcast", async () => {
+  const mainSource = await readFile(new URL("../electron/main.ts", import.meta.url), "utf8");
+  const handler = mainSource.slice(
+    mainSource.indexOf('ipcMain.handle("workflow:nodePosition:update"'),
+    mainSource.indexOf('ipcMain.handle("workflow:projection"'),
+  );
+
+  assert.match(handler, /recordCanvasNodePosition/);
+  assert.match(handler, /canvasSession: materializeRendererCanvasSession/);
+  assert.doesNotMatch(handler, /broadcastWorkflowProjection/);
 });
 
 test("workflow createWorktree public type contract returns created status", async () => {
@@ -2034,7 +2110,33 @@ test("workflow IPC contract errors are recognizable and block decision nodes", a
     false,
   );
   assert.equal(contracts.WORKFLOW_IPC_CHANNELS.worktreeCreate, "workflow:worktree:create");
+  assert.equal(contracts.WORKFLOW_IPC_CHANNELS.updateNodePosition, "workflow:nodePosition:update");
   assert.equal(contracts.WORKFLOW_IPC_CHANNELS.deliveryCommit, "workflow:delivery:commit");
+  assert.deepEqual(
+    toPlain(contracts.normalizeWorkflowNodePositionUpdate({
+      sessionId: " session-1 ",
+      updateId: " drag-1 ",
+      nodeId: " node-1 ",
+      position: { x: 12.5, y: -3 },
+    })),
+    {
+      sessionId: "session-1",
+      updateId: "drag-1",
+      nodeId: "node-1",
+      position: { x: 12.5, y: -3 },
+    },
+  );
+  for (const input of [
+    { sessionId: "", updateId: "drag-1", nodeId: "node-1", position: { x: 1, y: 2 } },
+    { sessionId: "session-1", updateId: "drag-1", nodeId: "", position: { x: 1, y: 2 } },
+    { sessionId: "session-1", updateId: "drag-1", nodeId: "node-1", position: { x: Infinity, y: 2 } },
+    { sessionId: "session-1", updateId: "drag-1", nodeId: "node-1", position: { x: 1_000_001, y: 2 } },
+  ]) {
+    assert.throws(
+      () => contracts.normalizeWorkflowNodePositionUpdate(input),
+      /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT/,
+    );
+  }
   assert.equal(
     contracts.formatWorkflowIpcError("DELIVERY_REJECTED", "Commit rejected."),
     "SKYTURN_WORKFLOW_IPC_ERROR:DELIVERY_REJECTED: Commit rejected.",
@@ -2276,6 +2378,35 @@ async function loadMainRendererCanvasSessionHelpers() {
   }).outputText;
   const module = { exports: {} };
   vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.rendererCanvasSession.ts" });
+  return module.exports;
+}
+
+async function loadMainDeliveryRendererHelpers() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    extractFunction(main, "positiveInteger"),
+    extractFunction(main, "optionalText"),
+    extractFunction(main, "isRecord"),
+    main.slice(
+      main.indexOf("function deliveryLifecycleFactsForRenderer"),
+      main.indexOf("function workflowEventSummary"),
+    ),
+    extractFunction(main, "workflowEventSummary"),
+    main.slice(
+      main.indexOf("function redactWorkflowEventForRenderer"),
+      main.indexOf("function deliveryLifecycleFactsForRenderer"),
+    ),
+    "module.exports = { redactWorkflowEventForRenderer };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.deliveryRenderer.ts" });
   return module.exports;
 }
 
