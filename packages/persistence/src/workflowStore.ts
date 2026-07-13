@@ -25,6 +25,7 @@ import type {
   WorkflowRollbackEligibility,
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
+import type { WorkflowNodePositionUpdateRequest } from "./index.js";
 import {
   compileWorkflowIntent,
   createDefaultFlowPolicy,
@@ -76,6 +77,7 @@ export type WorkflowEventKind =
   | "hermes_output_delta"
   | "node_declared"
   | "node_patched"
+  | "canvas_node_position_updated"
   | "edge_declared"
   | "gate_opened"
   | "gate_blocked"
@@ -257,6 +259,10 @@ export interface AppendUserInput {
   sessionId: string;
   inputId: string;
   text: string;
+  now: string;
+}
+
+export interface RecordCanvasNodePositionInput extends WorkflowNodePositionUpdateRequest {
   now: string;
 }
 
@@ -701,6 +707,43 @@ export class WorkflowStore {
       source: "user",
       idempotencyKey: `user-input:${input.inputId}`,
       payload: { inputId: input.inputId, text: input.text },
+      now: input.now,
+    });
+  }
+
+  recordCanvasNodePosition(input: RecordCanvasNodePositionInput): WorkflowEventRecord {
+    const sessionId = requireIdentifier(input.sessionId, "sessionId");
+    const updateId = requireIdentifier(input.updateId, "updateId");
+    const nodeId = requireIdentifier(input.nodeId, "nodeId");
+    const position = requireCanvasPosition(input.position);
+    const canvasSession = this.materializeCanvasSession(sessionId);
+    if (!canvasSession) throw new Error(`Workflow session is not known: ${sessionId}.`);
+    if (!canvasSession.nodes.some((node) => node.id === nodeId)) {
+      throw new Error(`Workflow canvas node is not known: ${nodeId}.`);
+    }
+
+    const idempotencyKey = `canvas-node-position:${updateId}`;
+    const existing = this.getEventByIdempotencyKey(sessionId, idempotencyKey);
+    if (existing) {
+      const existingPosition = canvasPositionFromPayload(existing.payload);
+      if (
+        existing.kind !== "canvas_node_position_updated" ||
+        existing.payload.nodeId !== nodeId ||
+        !existingPosition ||
+        existingPosition.x !== position.x ||
+        existingPosition.y !== position.y
+      ) {
+        throw new Error(`Canvas node position updateId was already used with different input: ${updateId}.`);
+      }
+      return existing;
+    }
+
+    return this.appendWorkflowEvent({
+      sessionId,
+      kind: "canvas_node_position_updated",
+      source: "renderer",
+      idempotencyKey,
+      payload: { nodeId, position },
       now: input.now,
     });
   }
@@ -1227,7 +1270,10 @@ export class WorkflowStore {
     if (!session) return null;
     const flowProjection = this.materializeFlowProjection(sessionId);
     if (flowProjection.lanes.length > 0 || flowProjection.userDecisions.length > 0) {
-      return this.materializeFlowCanvasSession(session, flowProjection);
+      return this.applyPersistedCanvasNodePositions(
+        sessionId,
+        this.materializeFlowCanvasSession(session, flowProjection),
+      );
     }
     const lanes = this.listLanes(sessionId).filter((lane) => !lane.archived);
     const edges = (this.statements.listEdges.all(sessionId) as EdgeRow[]).map((row) => ({
@@ -1239,7 +1285,7 @@ export class WorkflowStore {
     const nodes = lanes.map((lane, index) =>
       this.materializeNode(session, lane, index, worktreesByLaneId.get(lane.id) ?? worktreesByLaneId.get(lane.nodeId)),
     );
-    return {
+    return this.applyPersistedCanvasNodePositions(sessionId, {
       id: session.id,
       projectId: session.projectId,
       title: session.title,
@@ -1254,6 +1300,18 @@ export class WorkflowStore {
       nodes,
       edges,
       activeNodeId: nodes.find((node) => node.status === "running" || node.status === "retrying")?.id ?? null,
+    });
+  }
+
+  private applyPersistedCanvasNodePositions(sessionId: string, canvasSession: CanvasSession): CanvasSession {
+    const positions = latestCanvasNodePositions(this.listEvents(sessionId));
+    if (positions.size === 0) return canvasSession;
+    return {
+      ...canvasSession,
+      nodes: canvasSession.nodes.map((node) => {
+        const position = positions.get(node.id);
+        return position ? { ...node, position } : node;
+      }),
     };
   }
 
@@ -3361,6 +3419,46 @@ function requireText(value: unknown, field: string): string {
     throw new Error(`Workflow card ${field} must be a non-empty string.`);
   }
   return value.trim();
+}
+
+const MAX_CANVAS_COORDINATE = 1_000_000;
+
+function requireIdentifier(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0 || value.trim().length > 200) {
+    throw new Error(`Workflow canvas ${field} must be a non-empty string of at most 200 characters.`);
+  }
+  return value.trim();
+}
+
+function requireCanvasPosition(value: unknown): CanvasNode["position"] {
+  if (!isRecord(value) || !Number.isFinite(value.x) || !Number.isFinite(value.y)) {
+    throw new Error("Workflow canvas coordinates must be finite numbers.");
+  }
+  const x = Number(value.x);
+  const y = Number(value.y);
+  if (Math.abs(x) > MAX_CANVAS_COORDINATE || Math.abs(y) > MAX_CANVAS_COORDINATE) {
+    throw new Error(`Workflow canvas coordinates must be within ${MAX_CANVAS_COORDINATE}.`);
+  }
+  return { x, y };
+}
+
+function canvasPositionFromPayload(payload: Record<string, unknown>): CanvasNode["position"] | null {
+  try {
+    return requireCanvasPosition(payload.position);
+  } catch {
+    return null;
+  }
+}
+
+function latestCanvasNodePositions(events: WorkflowEventRecord[]): Map<string, CanvasNode["position"]> {
+  const positions = new Map<string, CanvasNode["position"]>();
+  for (const event of events) {
+    if (event.kind !== "canvas_node_position_updated") continue;
+    if (typeof event.payload.nodeId !== "string" || event.payload.nodeId.length === 0) continue;
+    const position = canvasPositionFromPayload(event.payload);
+    if (position) positions.set(event.payload.nodeId, position);
+  }
+  return positions;
 }
 
 function optionalText(value: unknown): string | null {

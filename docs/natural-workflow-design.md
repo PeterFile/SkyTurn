@@ -528,7 +528,9 @@ rollback 不会自动关闭 PR、删除 remote branch、merge、sync main 或删
 
 UI 已经订阅 Electron 的 `workflow:event` 广播并拉取 `workflow:projection`。`mergeRunEventsIntoWorkspace` 仍负责 run event 对 UI 的即时反馈和 browser fallback。
 
-缺口是节点位置和部分用户动作仍是本地 state；节点短句也还偏保守，未完全由结构化 workflow/action 字段驱动。
+节点拖动过程只更新 renderer 临时状态，拖动结束才通过 typed Electron IPC 写入 SQLite `canvas_node_position_updated` 事件。重启后的投影会回放 planner、lane 和 user-decision 节点的最新位置；IPC 保存失败时，画布显示错误并恢复该节点最后持久化的位置。
+
+缺口是部分用户动作仍是本地 state；节点短句也还偏保守，未完全由结构化 workflow/action 字段驱动。
 
 ### 落地方案
 
@@ -536,7 +538,7 @@ UI 已经订阅 Electron 的 `workflow:event` 广播并拉取 `workflow:projecti
 
 进度短句只使用安全字段，例如阶段、动作、命令名、检查名。不要把 stderr 原文、提示词、完整 JSON、完整日志塞进节点卡片。
 
-节点位置要稳定。Node 侧投影重新生成时，应优先保留已有节点位置；只有新节点才使用自动布局。用户拖动节点后，渲染进程写入位置更新事件，不能只改本地内存。
+节点位置要稳定。Node 侧投影重新生成时，优先回放已有节点位置；只有新节点才使用自动布局。用户拖动节点时只在 drag stop 写入位置更新事件，不能在 pointer move 时持续写 SQLite。
 
 边的状态由目标节点状态决定。运行中的目标节点让边流动，失败节点让边显示中断，完成节点让边静止。
 
@@ -625,12 +627,13 @@ Codex 产生结构化 patch/file-change 事件时，`Changes` 页签能显示 li
 - Current branch 默认执行目标，New worktree 显式 opt-in，分支选择写入 session target。
 - Current branch 真实循环可以在项目根目录启动 Hermes/Codex、写回 `RunEvidence` 并做 git 对账。
 - 用户决策节点可投影为不可执行节点，Electron UI 回答会写入 `workflow.user_decision.answered`。
+- planner、lane 和用户决策节点的位置在 drag stop 通过 typed Electron IPC 写入 SQLite 事件，重启后可回放；保存失败会显示错误并恢复最后持久化的位置。
 - Node Modal 的 `Output` / `Changes` / `Context` 三页签；Context 显示 RunEvidence，Changes 显示 live changes、git reconciliation、mismatch 和 diff preview。
 
 仍需收敛：
 
 - 真实桌面 workflow 已经使用 SQLite projection，但 renderer 仍有 browser/mock fallback 和局部 local state。
-- 后续目标是让真实桌面主路径只消费 Node 侧事实源，减少 renderer 从 `CanvasSession` 反推事实、本地调度和本地 retry/position-only 状态。
+- 后续目标是让真实桌面主路径只消费 Node 侧事实源，减少 renderer 从 `CanvasSession` 反推事实、本地调度和本地 retry 状态。
 
 ### 轨道二：失败修复和回归
 

@@ -520,6 +520,111 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("replays the latest persisted planner, lane, and decision node positions after restart", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.applyWorkflowIntent({
+      intentId: "intent-position-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Persist canvas layout" },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["frontend-ui"] } },
+        { type: "ProposeLanes" },
+        {
+          type: "RequestUserDecision",
+          decisionId: "decision-layout",
+          prompt: "Keep this layout?",
+          options: ["Keep", "Reset"],
+          reason: "The user arranged the workflow.",
+        },
+      ],
+    }, "2026-06-14T00:00:03.000Z");
+
+    const laneId = store.materializeFlowProjection("session-1").lanes[0]!.id;
+    const updates = [
+      { updateId: "drag-planner", nodeId: "node-1", position: { x: 11, y: 22 } },
+      { updateId: "drag-lane", nodeId: laneId, position: { x: 333, y: 444 } },
+      { updateId: "drag-decision", nodeId: "decision-layout", position: { x: 555, y: 666 } },
+      { updateId: "drag-lane-latest", nodeId: laneId, position: { x: 777, y: 888 } },
+    ] as const;
+    for (const [index, update] of updates.entries()) {
+      store.recordCanvasNodePosition({
+        sessionId: "session-1",
+        ...update,
+        now: `2026-06-14T00:00:0${index + 4}.000Z`,
+      });
+    }
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "canvas_node_position_updated",
+      source: "test",
+      idempotencyKey: "malformed-position-event",
+      payload: { nodeId: laneId, position: { x: 1_000_001, y: 999 } },
+      now: "2026-06-14T00:00:08.000Z",
+    });
+    const duplicate = store.recordCanvasNodePosition({
+      sessionId: "session-1",
+      ...updates[3],
+      now: "2026-06-14T00:00:09.000Z",
+    });
+    const beforeRestart = store.materializeCanvasSession("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const afterRestart = reopened.materializeCanvasSession("session-1");
+    const positions = Object.fromEntries(afterRestart!.nodes.map((node) => [node.id, node.position]));
+    const positionEvents = reopened.listEvents("session-1").filter((event) => event.kind === "canvas_node_position_updated");
+
+    expect(duplicate.id).toBe(positionEvents[3]?.id);
+    expect(positionEvents).toHaveLength(5);
+    expect(afterRestart).toEqual(beforeRestart);
+    expect(positions).toMatchObject({
+      "node-1": { x: 11, y: 22 },
+      [laneId]: { x: 777, y: 888 },
+      "decision-layout": { x: 555, y: 666 },
+    });
+    expect(afterRestart?.nodes.find((node) => node.id === "node-1")?.context.dependencies).toEqual([]);
+    expect(afterRestart?.edges.some((edge) => edge.target === "node-1")).toBe(false);
+    reopened.close();
+  });
+
+  it("rejects unknown nodes and invalid canvas coordinates without recording events", async () => {
+    const store = await makeSeededStore();
+    const eventCount = store.listEvents("session-1").length;
+
+    expect(() => store.recordCanvasNodePosition({
+      sessionId: "missing-session",
+      updateId: "drag-unknown-session",
+      nodeId: "node-1",
+      position: { x: 1, y: 2 },
+      now: "2026-06-14T00:00:03.000Z",
+    })).toThrow(/session.*not known/i);
+    expect(() => store.recordCanvasNodePosition({
+      sessionId: "session-1",
+      updateId: "drag-unknown",
+      nodeId: "missing-node",
+      position: { x: 1, y: 2 },
+      now: "2026-06-14T00:00:04.000Z",
+    })).toThrow(/node.*not known/i);
+    expect(() => store.recordCanvasNodePosition({
+      sessionId: "session-1",
+      updateId: "drag-invalid",
+      nodeId: "node-1",
+      position: { x: Number.POSITIVE_INFINITY, y: 2 },
+      now: "2026-06-14T00:00:05.000Z",
+    })).toThrow(/finite|coordinate/i);
+    expect(() => store.recordCanvasNodePosition({
+      sessionId: "session-1",
+      updateId: "drag-out-of-range",
+      nodeId: "node-1",
+      position: { x: 1_000_001, y: 2 },
+      now: "2026-06-14T00:00:06.000Z",
+    })).toThrow(/range|coordinate/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCount);
+    store.close();
+  });
+
   it("persists accepted WorkflowIntent events and replays a deterministic Flow Kernel projection after restart", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });

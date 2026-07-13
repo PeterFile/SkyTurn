@@ -1,5 +1,9 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
+  WorkflowApi,
+  WorkflowNodePositionUpdateRequest,
+} from "@skyturn/persistence" with { "resolution-mode": "import" };
+import type {
   TerminalActionResult,
   TerminalCancelInput,
   TerminalRendererEvent,
@@ -31,6 +35,8 @@ const workflow = {
   applyIntent: (projectRoot: string, intent: unknown) => ipcRenderer.invoke("workflow:applyIntent", projectRoot, intent),
   scheduleReady: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:scheduleReady", projectRoot, input),
   recordRunResult: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:recordRunResult", projectRoot, input),
+  updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) =>
+    ipcRenderer.invoke("workflow:nodePosition:update", projectRoot, input),
   getProjection: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:projection", projectRoot, sessionId),
   getEvents: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:events", projectRoot, sessionId),
   getCheckpoints: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:checkpoints", projectRoot, input),
@@ -51,7 +57,7 @@ const workflow = {
   syncMain: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:syncMain", projectRoot, input),
   getChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset", projectRoot, input),
   reconcileFinalChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset:reconcileFinal", projectRoot, input),
-};
+} satisfies WorkflowApi;
 
 contextBridge.exposeInMainWorld("devflow", {
   openProject: () => ipcRenderer.invoke("project:open"),
