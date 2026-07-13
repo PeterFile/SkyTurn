@@ -431,15 +431,29 @@ describe("UI source validation", () => {
     }))).toBeNull();
   });
 
-  it("includes visible copy for new session target selection and uses custom listbox controls", async () => {
+  it("keeps essential new-session controls while removing secondary intake hints", async () => {
     const appSource = await readSource("./App.tsx");
-    expect(appSource).toContain("Develop directly on the selected branch.");
-    expect(appSource).toContain("Create a candidate worktree from the selected branch.");
 
     const sessionComposer = appSource.slice(appSource.indexOf("function SessionComposer("), appSource.indexOf("function formatRelativeTime("));
     expect(sessionComposer).not.toContain("<select");
     expect(sessionComposer).toContain("<CustomSelect");
     expect(sessionComposer).toContain("options={[");
+    expect(sessionComposer).not.toContain("paper-pin-btn");
+    expect(sessionComposer).not.toContain("Focus prompt");
+    expect(sessionComposer).not.toContain("target-selector-hint");
+    expect(sessionComposer).not.toContain("Develop directly on the selected branch.");
+    expect(sessionComposer).not.toContain("Create a candidate worktree from the selected branch.");
+    expect(sessionComposer).toContain("<ProjectDropdown");
+    expect(sessionComposer).toContain("<ModeSwitch");
+    expect(sessionComposer).toContain('ariaLabel="Execution Target"');
+    expect(sessionComposer).toContain('ariaLabel="Branch"');
+    expect(sessionComposer).toContain('title="Create"');
+
+    const projectDropdown = appSource.slice(appSource.indexOf("function ProjectDropdown("), appSource.indexOf("function ModeSwitch("));
+    const modeSwitch = appSource.slice(appSource.indexOf("function ModeSwitch("), appSource.indexOf("function StatusLight("));
+    expect(projectDropdown).toContain('aria-label="Project"');
+    expect(modeSwitch).toContain("Fast");
+    expect(modeSwitch).toContain("Plan");
   });
 
   it("PlanView is a single-page editor instead of three simultaneous markdown articles", async () => {
@@ -487,13 +501,13 @@ describe("UI source validation", () => {
     expect(bridgeStartEffect).not.toContain("activeSession.activeNodeId");
   });
 
-  it("renders compact agent readiness near session creation and canvas composer", async () => {
+  it("renders compact agent readiness near canvas composer but not on start page", async () => {
     const appSource = await readSource("./App.tsx");
-    const projectStart = appSource.slice(appSource.indexOf("function ProjectStartPage"), appSource.indexOf("export type ComposerAction"));
+    const projectStart = appSource.slice(appSource.indexOf("function ProjectStartPage"), appSource.indexOf("function AgentReadinessBlock"));
     const canvasView = appSource.slice(appSource.indexOf("function CanvasView("), appSource.indexOf("function CanvasViewportController"));
 
-    expect(projectStart).toContain("<AgentReadinessBlock");
-    expect(projectStart).toContain("readiness={agentReadiness}");
+    expect(projectStart).not.toContain("<AgentReadinessBlock");
+    expect(projectStart).not.toContain("agentReadiness");
     expect(canvasView).toContain("<AgentReadinessBlock");
     expect(canvasView).toContain("readiness={agentReadiness}");
     expect(appSource).toContain("function AgentReadinessBlock");

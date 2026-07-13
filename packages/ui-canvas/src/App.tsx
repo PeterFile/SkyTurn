@@ -1017,7 +1017,6 @@ export default function App() {
               mode={newTaskMode}
               projects={workspace.projects}
               selectedProjectId={resolvedNewTaskProjectId}
-              agentReadiness={agentReadiness}
               onGoalChange={setNewTaskGoal}
               onModeChange={setNewTaskMode}
               onProjectChange={setNewTaskProjectId}
@@ -1264,7 +1263,6 @@ function ProjectStartPage({
   mode,
   projects,
   selectedProjectId,
-  agentReadiness,
   onGoalChange,
   onModeChange,
   onProjectChange,
@@ -1274,7 +1272,6 @@ function ProjectStartPage({
   mode: WorkflowMode;
   projects: ImportedProject[];
   selectedProjectId: string | null;
-  agentReadiness: AgentWorkflowReadinessSummary | null;
   onGoalChange: (goal: string) => void;
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
@@ -1284,7 +1281,6 @@ function ProjectStartPage({
     <section className="empty-stage">
       <div className="project-start-page">
         <h1 className="project-start-title">What should we build in SkyTurn?</h1>
-        <AgentReadinessBlock readiness={agentReadiness} />
         <SessionComposer
           variant="inline"
           goal={goal}
@@ -1578,15 +1574,6 @@ function SessionComposer({
       </div>
       <div className="control-strip">
         <div className="control-strip-row">
-          <button
-            className="paper-pin-btn"
-            type="button"
-            title="Focus prompt"
-            aria-label="Focus prompt"
-            onClick={() => textareaRef.current?.focus()}
-          >
-            <Plus size={14} />
-          </button>
           <ProjectDropdown
             projects={projects}
             selectedProjectId={selectedProjectId}
@@ -1623,11 +1610,6 @@ function SessionComposer({
                 }
               />
             </div>
-            <span className="target-selector-hint">
-              {executionTarget === "current_branch"
-                ? "Develop directly on the selected branch."
-                : "Create a candidate worktree from the selected branch."}
-            </span>
           </div>
 
           <span className="session-panel-spacer" />
