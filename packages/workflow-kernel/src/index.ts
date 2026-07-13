@@ -1,6 +1,7 @@
 import type {
   AgentKind,
   AgentRunSandbox,
+  RunEvidence,
   ChangesetEvidence,
   NodeStatus,
   UserDecisionAction,
@@ -196,6 +197,7 @@ export interface FlowEvidence {
   checks: string[];
   artifacts: string[];
   detail?: string;
+  runEvidence?: RunEvidence;
 }
 
 export type FlowEvidenceStatus = "passed" | "failed" | "skipped" | "pending";
@@ -2080,6 +2082,7 @@ function normalizeEvidence(value: Record<string, unknown>, laneId: string, segme
     checks: stringArray(value.checks),
     artifacts: stringArray(value.artifacts),
     ...(typeof value.detail === "string" ? { detail: value.detail } : {}),
+    ...(isRecord(value.runEvidence) ? { runEvidence: value.runEvidence as unknown as RunEvidence } : {}),
   };
 }
 
@@ -2104,6 +2107,8 @@ function normalizeNodeCheckpoint(
   const segmentId = existing?.segmentId ?? stringValue(value.segmentId);
   const worktreeId = existing?.worktreeId ?? stringValue(value.worktreeId);
   const worktreePath = existing?.worktreePath ?? stringValue(value.worktreePath);
+  const branchName = existing?.branchName ?? stringValue(value.branchName);
+  const worktreeState = existing?.worktreeState ?? normalizeCheckpointWorktreeState(value.worktreeState);
   const baseCommit = existing?.baseCommit ?? stringValue(value.baseCommit);
   const headCommit = existing?.headCommit ?? stringValue(value.headCommit);
   const evidenceRefs = Array.isArray(value.evidenceRefs) ? normalizeCheckpointEvidenceRefs(value.evidenceRefs) : [];
@@ -2118,12 +2123,18 @@ function normalizeNodeCheckpoint(
     executionTarget: executionTarget ?? "current_branch",
     ...(worktreeId ? { worktreeId } : {}),
     ...(worktreePath ? { worktreePath } : {}),
+    ...(branchName ? { branchName } : {}),
+    ...(worktreeState ? { worktreeState } : {}),
     ...(baseCommit ? { baseCommit } : {}),
     ...(headCommit ? { headCommit } : {}),
     createdAt: existing?.createdAt ?? stringValue(value.createdAt) ?? event.createdAt,
     source: existing?.source ?? (isCheckpointSource(value.source) ? value.source : "workflow_kernel"),
     evidenceRefs: mergeCheckpointEvidenceRefs(existing?.evidenceRefs ?? [], evidenceRefs),
   };
+}
+
+function normalizeCheckpointWorktreeState(value: unknown): WorkflowNodeCheckpoint["worktreeState"] | undefined {
+  return value === "clean" || value === "dirty" ? value : undefined;
 }
 
 function upsertNodeCheckpoint(
@@ -2413,6 +2424,9 @@ function validateRollbackCheckpoint(
   }
   if (checkpoint.phase !== "before") {
     return { checkpoint, reason: "Rollback requires a before checkpoint." };
+  }
+  if (checkpoint.worktreeState === "dirty") {
+    return { checkpoint, reason: "Rollback requires a restorable clean before checkpoint." };
   }
   if (!checkpoint.laneId) {
     return { checkpoint, reason: "Rollback requires a matching checkpoint for the target lane." };

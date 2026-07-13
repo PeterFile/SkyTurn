@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { access, appendFile, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, normalize } from "node:path";
 import { createInterface, type Interface } from "node:readline";
@@ -22,6 +23,7 @@ import {
   type AgentRunStatus,
   type AgentSupportLevel,
   type AgentReadinessCategory,
+  type AgentTransportKind,
   type AgentTransportFeatureFlags,
   type AgentTerminalSession,
   type EvidenceCheck,
@@ -93,9 +95,116 @@ export interface AgentBridgeOptions {
   pathValue?: string;
   codexConfigRoot?: string | null;
   codexAuthFilePath?: string | null;
+  appendEvent?: (projectRoot: string, event: RunEvent) => Promise<void>;
 }
 
 export type CodexCliSandbox = AgentRunSandbox;
+
+export class OwnedAgentRunStartError extends Error {
+  readonly durableRunClaimOwned = true;
+  readonly cause: unknown;
+  readonly terminalPersistenceError?: unknown;
+
+  constructor(cause: unknown, terminalPersistenceError?: unknown) {
+    super(errorMessage(cause));
+    this.name = "OwnedAgentRunStartError";
+    this.cause = cause;
+    this.terminalPersistenceError = terminalPersistenceError;
+  }
+}
+
+export interface AgentRunStartFingerprintInput {
+  protocolVersion: unknown;
+  runId?: unknown;
+  nodeId: unknown;
+  sessionId: unknown;
+  plannerSessionId?: unknown;
+  plannerInputId?: unknown;
+  hermesSessionHandle?: unknown;
+  projectRoot: unknown;
+  worktreePath: unknown;
+  agentKind: unknown;
+  transport?: unknown;
+  sandbox?: unknown;
+  expectedArtifacts?: unknown;
+  prompt: unknown;
+}
+
+export function createAgentRunStartFingerprint(input: AgentRunStartFingerprintInput): string {
+  const projectRootInput = fingerprintRequiredString(input.projectRoot, "projectRoot");
+  const worktreePathInput = fingerprintRequiredString(input.worktreePath, "worktreePath");
+  const projectRoot = realpathSync(projectRootInput);
+  const worktreePath = realpathSync(worktreePathInput);
+  const semantics = {
+    version: 1,
+    protocolVersion: fingerprintProtocolVersion(input.protocolVersion),
+    projectRoot,
+    sessionId: fingerprintRequiredString(input.sessionId, "sessionId"),
+    nodeId: fingerprintRequiredString(input.nodeId, "nodeId"),
+    runId: fingerprintOptionalString(input.runId, "runId"),
+    agentKind: fingerprintAgentKind(input.agentKind),
+    transport: fingerprintTransport(input.transport),
+    worktreePath,
+    sandbox: fingerprintSandbox(input.sandbox),
+    prompt: fingerprintRequiredString(input.prompt, "prompt", true),
+    expectedArtifacts: fingerprintExpectedArtifacts(input.expectedArtifacts),
+    plannerSessionId: fingerprintOptionalString(input.plannerSessionId, "plannerSessionId"),
+    plannerInputId: fingerprintOptionalString(input.plannerInputId, "plannerInputId"),
+    hermesSessionHandle: fingerprintOptionalString(input.hermesSessionHandle, "hermesSessionHandle"),
+  };
+  return createHash("sha256").update(JSON.stringify(semantics), "utf8").digest("hex");
+}
+
+function fingerprintProtocolVersion(value: unknown): number {
+  if (value !== RUN_EVENT_PROTOCOL_VERSION) throw new Error("Run start fingerprint protocolVersion is invalid.");
+  return RUN_EVENT_PROTOCOL_VERSION;
+}
+
+function fingerprintRequiredString(value: unknown, field: string, allowEmpty = false): string {
+  if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
+    throw new Error(`Run start fingerprint ${field} is invalid.`);
+  }
+  return value;
+}
+
+function fingerprintOptionalString(value: unknown, field: string): string | null {
+  if (value === undefined || value === null) return null;
+  return fingerprintRequiredString(value, field);
+}
+
+function fingerprintExpectedArtifacts(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.length > 0)) {
+    throw new Error("Run start fingerprint expectedArtifacts is invalid.");
+  }
+  return value.map((item) => normalize(item));
+}
+
+function fingerprintAgentKind(value: unknown): AgentKind {
+  if (
+    value === "hermes" ||
+    value === "codex" ||
+    value === "agy" ||
+    value === "gemini" ||
+    value === "claude-code" ||
+    value === "openclaw"
+  ) {
+    return value;
+  }
+  throw new Error("Run start fingerprint agentKind is invalid.");
+}
+
+function fingerprintTransport(value: unknown): AgentTransportKind | null {
+  if (value === undefined || value === null) return null;
+  if (value === "exec-json" || value === "pty-interactive") return value;
+  throw new Error("Run start fingerprint transport is invalid.");
+}
+
+function fingerprintSandbox(value: unknown): AgentRunSandbox | null {
+  if (value === undefined || value === null) return null;
+  if (value === "read-only" || value === "workspace-write" || value === "danger-full-access") return value;
+  throw new Error("Run start fingerprint sandbox is invalid.");
+}
 
 export interface CodexCliAdapterOptions {
   executablePath?: string;
@@ -293,7 +402,10 @@ export class AgentBridge {
   private readonly discovery: DiscoveryService;
   private readonly runs = new Map<string, AgentRun>();
   private readonly handles = new Map<string, AgentRunHandle>();
+  private readonly startFlights = new Map<string, { fingerprint: string; promise: Promise<AgentRun> }>();
+  private readonly runStartFingerprints = new Map<string, string>();
   private readonly listeners = new Set<(event: RunEvent) => void>();
+  private readonly appendEvent: (projectRoot: string, event: RunEvent) => Promise<void>;
 
   constructor(options: AgentBridgeOptions = {}) {
     this.adapters = new Map((options.adapters ?? [createMockAgentAdapter()]).map((adapter) => [adapter.kind, adapter]));
@@ -302,6 +414,7 @@ export class AgentBridge {
       codexConfigRoot: options.codexConfigRoot,
       codexAuthFilePath: options.codexAuthFilePath,
     });
+    this.appendEvent = options.appendEvent ?? appendRunEvent;
   }
 
   async discoverAgents(): Promise<AgentDescriptor[]> {
@@ -320,11 +433,43 @@ export class AgentBridge {
     return () => this.listeners.delete(listener);
   }
 
-  async startRun(input: StartAgentRunInput): Promise<AgentRun> {
-    const fallbackAdapter = input.agentKind === "agy" ? undefined : this.adapters.get("codex");
-    const adapter = this.adapters.get(input.agentKind) ?? fallbackAdapter;
-    if (!adapter) throw new Error(`No local adapter registered for ${input.agentKind}`);
+  startRun(input: StartAgentRunInput): Promise<AgentRun> {
+    if (!input.runId) return this.startRunOnce(input);
+    let fingerprint: string;
+    try {
+      fingerprint = createAgentRunStartFingerprint(input);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const inFlight = this.startFlights.get(input.runId);
+    if (inFlight) {
+      if (inFlight.fingerprint !== fingerprint) {
+        return Promise.reject(new Error(`Run ${input.runId} is already claimed with different identity.`));
+      }
+      return inFlight.promise;
+    }
+    const existing = this.runs.get(input.runId);
+    if (existing) {
+      const existingFingerprint = this.runStartFingerprints.get(input.runId);
+      if (existingFingerprint && existingFingerprint !== fingerprint) {
+        return Promise.reject(new Error(`Run ${input.runId} is already claimed with different identity.`));
+      }
+      if (isFinalRunStatus(existing.status)) {
+        return Promise.reject(new Error(`Run ${input.runId} is already terminal (${existing.status}).`));
+      }
+      return Promise.resolve(existing);
+    }
 
+    const flight = this.startRunOnce(input, fingerprint);
+    this.startFlights.set(input.runId, { fingerprint, promise: flight });
+    void flight.then(
+      () => this.clearStartFlight(input.runId!, flight),
+      () => this.clearStartFlight(input.runId!, flight),
+    );
+    return flight;
+  }
+
+  private async startRunOnce(input: StartAgentRunInput, explicitFingerprint?: string): Promise<AgentRun> {
     const now = new Date().toISOString();
     const runId = input.runId ?? (await nextAttemptRunId(input.projectRoot, input.sessionId, input.nodeId, this.runs));
     const run: AgentRun = {
@@ -339,14 +484,66 @@ export class AgentBridge {
       status: "running",
       startedAt: now,
     };
+    const persistedEvents = await loadRunEventsStrict(run.projectRoot, run.id);
+    const persisted = deriveEvidenceFromEvents(run, persistedEvents);
+    if (persistedEvents.length > 0) {
+      await assertDurableRunStartFingerprint(run.projectRoot, run.id, explicitFingerprint);
+      if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
+      this.runs.set(run.id, {
+        ...run,
+        status: persisted.status,
+        ...(persisted.completedAt ? { endedAt: persisted.completedAt } : {}),
+      });
+      if (isFinalRunStatus(persisted.status)) {
+        throw new Error(`Run ${run.id} is already terminal (${persisted.status}).`);
+      }
+      throw new Error(`Run ${run.id} is already active or durably claimed.`);
+    }
+    const claimed = input.runId
+      ? await claimExplicitRunStart(run, explicitFingerprint ?? createAgentRunStartFingerprint(input))
+      : true;
+    if (!claimed) {
+      await assertDurableRunStartFingerprint(run.projectRoot, run.id, explicitFingerprint);
+      throw new Error(`Run ${run.id} is already active or durably claimed.`);
+    }
+    if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
     this.runs.set(run.id, run);
 
     const sink: RunEventSink = {
       emit: (event) => this.recordEvent(run.id, event),
     };
-    const handle = await adapter.startRun({ ...input, runId: run.id }, sink);
+    let handle: AgentRunHandle;
+    try {
+      const fallbackAdapter = input.agentKind === "agy" ? undefined : this.adapters.get("codex");
+      const adapter = this.adapters.get(input.agentKind) ?? fallbackAdapter;
+      if (!adapter) throw new Error(`No local adapter registered for ${input.agentKind}`);
+      handle = await adapter.startRun({ ...input, runId: run.id }, sink);
+    } catch (error) {
+      const message = errorMessage(error);
+      let terminalPersistenceError: unknown;
+      try {
+        const persisted = deriveEvidenceFromEvents(run, await loadRunEvents(run.projectRoot, run.id));
+        if (isFinalRunStatus(persisted.status)) {
+          this.runs.set(run.id, {
+            ...run,
+            status: persisted.status,
+            ...(persisted.completedAt ? { endedAt: persisted.completedAt } : {}),
+          });
+        } else {
+          await this.failRunStart(run, message);
+        }
+      } catch (persistenceError) {
+        terminalPersistenceError = persistenceError;
+      }
+      throw new OwnedAgentRunStartError(error, terminalPersistenceError);
+    }
     this.handles.set(run.id, handle);
     return this.runs.get(run.id) ?? run;
+  }
+
+  private clearStartFlight(runId: string, flight: Promise<AgentRun>): void {
+    if (this.startFlights.get(runId)?.promise !== flight) return;
+    this.startFlights.delete(runId);
   }
 
   async send(runId: string, message: string): Promise<void> {
@@ -386,7 +583,7 @@ export class AgentBridge {
 
   async getEvidence(projectRoot: string, runId: string): Promise<RunEvidence> {
     const run = this.runs.get(runId) ?? makePersistedRun(projectRoot, runId);
-    const events = await loadRunEvents(projectRoot, runId);
+    const events = await loadRunEventsStrict(projectRoot, runId);
     return deriveEvidenceFromEvents(run, events);
   }
 
@@ -401,7 +598,7 @@ export class AgentBridge {
       kind: draft.kind,
       payload: draft.payload,
     };
-    await appendRunEvent(run.projectRoot, event);
+    await this.appendEvent(run.projectRoot, event);
     if (event.kind === "output") await writeTaskOutputFromEvents(run.projectRoot, run.nodeId, runId);
     this.updateRunFromEvent(run, event);
     for (const listener of this.listeners) {
@@ -424,6 +621,42 @@ export class AgentBridge {
       status,
       endedAt: isFinalRunStatus(status) ? event.timestamp : run.endedAt,
     });
+  }
+
+  private async failRunStart(run: AgentRun, message: string): Promise<void> {
+    const timestamp = new Date().toISOString();
+    this.runs.set(run.id, { ...run, status: "failed", endedAt: timestamp });
+    const payload = {
+      status: "failed",
+      reason: message,
+      errorReason: message,
+      category: "start-failed",
+      exitCode: null,
+      checks: [{ kind: "run-exit", name: "Agent start", status: "failed", detail: message }],
+    };
+    try {
+      await this.recordEvent(run.id, { kind: "status", payload, timestamp });
+      return;
+    } catch {
+      const events = await loadRunEvents(run.projectRoot, run.id);
+      if (events.some(isFinalStatusEvent)) return;
+      const event: RunEvent = {
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        runId: run.id,
+        seq: events.length + 1,
+        timestamp,
+        kind: "status",
+        payload,
+      };
+      await appendRunEvent(run.projectRoot, event);
+      for (const listener of this.listeners) {
+        try {
+          listener(event);
+        } catch {
+          // Listener failures must not affect durable run state.
+        }
+      }
+    }
   }
 }
 
@@ -495,6 +728,19 @@ export async function loadRunEvents(projectRoot: string, runId: string): Promise
   } catch {
     return [];
   }
+}
+
+async function loadRunEventsStrict(projectRoot: string, runId: string): Promise<RunEvent[]> {
+  if (!await hasRunEvents(projectRoot, runId)) return [];
+  const value = await readFile(runEventsPath(projectRoot, runId), "utf8");
+  return value
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const event = JSON.parse(line) as RunEvent;
+      if (!event || event.runId !== runId) throw new Error(`Run evidence identity mismatch for ${runId}.`);
+      return event;
+    });
 }
 
 type TerminalSessionEventInput =
@@ -1711,6 +1957,10 @@ export function deriveEvidenceFromEvents(run: AgentRun, events: RunEvent[]): Run
           status === "cancelled" && typeof event.payload.reason === "string" ? event.payload.reason : cancelReason;
         completedAt = isFinalRunStatus(status) ? event.timestamp : completedAt;
       }
+      if (status === "failed" && typeof event.payload.errorReason === "string") {
+        errorReason = event.payload.errorReason;
+      }
+      if (Array.isArray(event.payload.checks)) checks.push(...(event.payload.checks as RunEvidence["checks"]));
     }
     if (event.kind === "error") {
       status = "failed";
@@ -2236,7 +2486,7 @@ async function nextAttemptRunId(
   const base = makeRunId(sessionId, nodeId);
   for (let attempt = 1; ; attempt += 1) {
     const candidate = attempt === 1 ? base : `${base}-attempt-${attempt}`;
-    if (!runs.has(candidate) && !(await hasRunEvents(projectRoot, candidate))) return candidate;
+    if (!runs.has(candidate) && !(await hasRunState(projectRoot, candidate))) return candidate;
   }
 }
 
@@ -2249,6 +2499,73 @@ async function hasRunEvents(projectRoot: string, runId: string): Promise<boolean
   }
 }
 
+async function hasRunState(projectRoot: string, runId: string): Promise<boolean> {
+  return await hasRunEvents(projectRoot, runId) || await hasRunStartClaim(projectRoot, runId);
+}
+
+async function claimExplicitRunStart(run: AgentRun, startFingerprint: string): Promise<boolean> {
+  const directory = join(run.projectRoot, ".devflow", "runs", run.id);
+  await mkdir(directory, { recursive: true });
+  try {
+    await writeFile(
+      runStartClaimPath(run.projectRoot, run.id),
+      `${JSON.stringify({
+        runId: run.id,
+        nodeId: run.nodeId,
+        sessionId: run.sessionId,
+        agentKind: run.agentKind,
+        startFingerprint,
+        startedAt: run.startedAt,
+      })}\n`,
+      { encoding: "utf8", flag: "wx", mode: 0o600 },
+    );
+    return true;
+  } catch (error) {
+    if (isFileExistsError(error)) return false;
+    throw error;
+  }
+}
+
+async function assertDurableRunStartFingerprint(
+  projectRoot: string,
+  runId: string,
+  fingerprint: string | undefined,
+): Promise<void> {
+  if (!fingerprint) return;
+  const durableFingerprint = await loadDurableRunStartFingerprint(projectRoot, runId);
+  if (durableFingerprint && durableFingerprint !== fingerprint) {
+    throw new Error(`Run ${runId} is already claimed with different identity.`);
+  }
+}
+
+async function loadDurableRunStartFingerprint(projectRoot: string, runId: string): Promise<string | null> {
+  try {
+    const value = JSON.parse(await readFile(runStartClaimPath(projectRoot, runId), "utf8")) as unknown;
+    if (!value || typeof value !== "object" || !("startFingerprint" in value)) return null;
+    const fingerprint = (value as { startFingerprint?: unknown }).startFingerprint;
+    return typeof fingerprint === "string" && /^[a-f0-9]{64}$/.test(fingerprint) ? fingerprint : null;
+  } catch {
+    return null;
+  }
+}
+
+async function hasRunStartClaim(projectRoot: string, runId: string): Promise<boolean> {
+  try {
+    await access(runStartClaimPath(projectRoot, runId), fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runStartClaimPath(projectRoot: string, runId: string): string {
+  return join(projectRoot, ".devflow", "runs", runId, "start-claim.json");
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+
 function makePersistedRun(projectRoot: string, runId: string): AgentRun {
   return {
     id: runId,
@@ -2257,7 +2574,7 @@ function makePersistedRun(projectRoot: string, runId: string): AgentRun {
     projectRoot,
     worktreePath: projectRoot,
     agentKind: "codex",
-    status: "failed",
+    status: "running",
     startedAt: new Date(0).toISOString(),
   };
 }

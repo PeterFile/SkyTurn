@@ -77,7 +77,29 @@ test("Electron main owns natural workflow IPC channels", async () => {
   );
   assert.match(recordRunResultHandler, /bridge\.getEvidence\(projectRoot,\s*runId\)/);
   assert.match(recordRunResultHandler, /bridge\.loadEvents\(projectRoot,\s*runId\)/);
+  assert.match(recordRunResultHandler, /enrichTerminalWorkflowRun/);
+  assert.ok(
+    recordRunResultHandler.indexOf("store.recordRunResult") < recordRunResultHandler.indexOf("enrichTerminalWorkflowRun"),
+    "terminal RunEvidence must be persisted before optional git reconciliation",
+  );
+  assert.match(recordRunResultHandler, /recordRunCheckpointFailure/);
   assert.doesNotMatch(recordRunResultHandler, /store\.recordRunResult\(input\)/);
+
+  const workflowStoreFactory = main.slice(
+    main.indexOf("async function getWorkflowStore"),
+    main.indexOf("async function workflowStoreIdentity"),
+  );
+  assert.match(workflowStoreFactory, /recoverTerminalWorkflowRuns/);
+  const recoverySource = await readFile(join(root, "electron", "workflowRunRecovery.ts"), "utf8");
+  assert.match(recoverySource, /store\.listRunningSegments\(\)/);
+  assert.match(recoverySource, /store\.listPendingRunCheckpointEnrichments\(\)/);
+  assert.match(recoverySource, /bridge\.getEvidence\(projectRoot,\s*segment\.runId\)/);
+  const agentBridgeFactory = main.slice(
+    main.indexOf("async function getAgentBridge"),
+    main.indexOf("async function getWorkflowStore"),
+  );
+  assert.match(agentBridgeFactory, /reconcileTerminalRunEvent/);
+  assert.match(main, /event\.kind !== "status"/);
 
   const workflowEventsHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:events"'),
@@ -729,7 +751,7 @@ test("workflow delivery commit passes explicit mismatch acceptance to git servic
   assert.match(deliveryCommitHandler, /\.\.\.\(acceptMismatch \? \{ acceptMismatch \} : \{\}\)/);
 });
 
-test("workflow createSession persists a normalized session target", async () => {
+test("workflow createSession resolves and persists the authoritative current branch target", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const createInput = main.slice(
     main.indexOf("interface WorkflowSessionCreateInput"),
@@ -741,9 +763,25 @@ test("workflow createSession persists a normalized session target", async () => 
   );
 
   assert.match(createInput, /target\?:\s*unknown/);
-  assert.match(createSessionHandler, /target:\s*normalizeWorkflowSessionTarget\(input\.target\)/);
+  assert.match(createSessionHandler, /const target = await resolveAuthoritativeWorkflowSessionTarget\(projectRoot, input\.target\)/);
+  assert.match(createSessionHandler, /target,/);
   assert.match(main, /function normalizeWorkflowSessionTarget\(value: unknown\): FinalSessionTarget/);
   assert.match(main, /return \{ executionTarget: "current_branch", selectedBranch: "HEAD" \};/);
+});
+
+test("workflow checkpoint resolution persists a legacy HEAD branch before identity validation", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const resolver = main.slice(
+    main.indexOf("async function resolveExecutableRunIdentity"),
+    main.indexOf("function isExecutableCheckpointLane"),
+  );
+  const persistenceIndex = resolver.indexOf("resolveAuthoritativeStoredCurrentBranchTarget");
+  const canvasIndex = resolver.indexOf("store.materializeCanvasSession");
+  const branchValidationIndex = resolver.indexOf("Workflow run branch mismatch");
+
+  assert.ok(persistenceIndex >= 0, "checkpoint resolution must persist legacy HEAD targets");
+  assert.ok(canvasIndex > persistenceIndex, "checkpoint resolution must rematerialize the authoritative target");
+  assert.ok(branchValidationIndex > canvasIndex, "checkpoint branch validation must use persisted authority");
 });
 
 test("workflow create and append bind Hermes planner terminal only through main runtime", async () => {
@@ -2174,18 +2212,28 @@ test("workflow IPC contract errors are recognizable and block decision nodes", a
 
 test("run start guard trusts only the SQLite planner root CanvasSession fallback", async () => {
   const contracts = await loadWorkflowIpcContracts();
-  const input = { sessionId: "session-1", nodeId: "node-1" };
+  const input = {
+    sessionId: "session-1",
+    nodeId: "node-1",
+    runId: "run-session-1-node-1-20260713090000",
+    agentKind: "hermes",
+    plannerSessionId: "hermes-session-1",
+    plannerInputId: "run-session-1-node-1-20260713090000",
+  };
   const store = {
     materializeCanvasSession(sessionId) {
       assert.equal(sessionId, "session-1");
       return {
         id: "session-1",
         plannerNodeId: "node-1",
+        hermesPlannerSessionId: "hermes-session-1",
+        edges: [],
         nodes: [
           {
             id: "node-1",
             agent: "hermes",
-            status: "running",
+            status: "completed",
+            context: { dependencies: [] },
           },
         ],
       };
@@ -2194,6 +2242,35 @@ test("run start guard trusts only the SQLite planner root CanvasSession fallback
 
   assert.equal(contracts.rejectMissingWorkflowProjectionNode(input, 1), true);
   assert.equal(contracts.isTrustedPlannerRootStartInput(input, store), true);
+});
+
+test("run start guard rejects planner starts without concrete turn identity or graph hygiene", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const validInput = {
+    sessionId: "session-1",
+    nodeId: "node-1",
+    runId: "run-session-1-node-1-20260713090000",
+    agentKind: "hermes",
+    plannerSessionId: "hermes-session-1",
+    plannerInputId: "run-session-1-node-1-20260713090000",
+  };
+  const makeStore = (overrides = {}) => ({
+    materializeCanvasSession() {
+      return {
+        plannerNodeId: "node-1",
+        hermesPlannerSessionId: "hermes-session-1",
+        edges: [],
+        nodes: [{ id: "node-1", agent: "hermes", status: "completed", context: { dependencies: [] } }],
+        ...overrides,
+      };
+    },
+  });
+
+  assert.equal(contracts.isTrustedPlannerRootStartInput({ ...validInput, plannerInputId: "" }, makeStore()), false);
+  assert.equal(contracts.isTrustedPlannerRootStartInput({ ...validInput, plannerSessionId: "other" }, makeStore()), false);
+  assert.equal(contracts.isTrustedPlannerRootStartInput(validInput, makeStore({
+    edges: [{ id: "edge-1", source: "node-2", target: "node-1" }],
+  })), false);
 });
 
 test("run start guard keeps rejecting missing non-planner projection nodes", async () => {

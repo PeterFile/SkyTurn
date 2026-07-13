@@ -21,6 +21,9 @@ import {
 } from "./workflowIpcContracts";
 import { compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
 import { createTerminalRuntime } from "./terminalRuntime";
+import { compensateFailedWorkflowRun, recoverTerminalWorkflowRuns } from "./workflowRunRecovery";
+import { createRunStartHandler, type TrustedRunStartIdentity } from "./runStartHandler";
+import { resolveCurrentBranchRunBaseline } from "./workflowCheckpointRuntime";
 import {
   normalizeTerminalIpcError,
   terminalCancelInputError,
@@ -233,6 +236,41 @@ interface FlowProjectionLike {
     decisionId?: string;
     executable: boolean;
   }>;
+  lanes: Array<{
+    id: string;
+    laneKind?: string;
+    agentKind?: string;
+    executable?: boolean;
+  }>;
+  segments: Array<{
+    id: string;
+    laneId: string;
+    runId: string;
+    status: string;
+  }>;
+}
+
+interface ExecutableRunIdentity {
+  sessionId: string;
+  nodeId: string;
+  laneId: string;
+  segmentId: string;
+  runId: string;
+  agentKind: string;
+  executionTarget: "current_branch" | "new_worktree";
+  worktreeId?: string;
+  worktreePath: string;
+  branchName: string;
+  headCommit: string;
+  worktreeState: "clean" | "dirty";
+  baselineRef?: string;
+  node: Record<string, unknown>;
+  target: Record<string, unknown>;
+}
+
+interface ReconciledRunChangeset {
+  evidence: Record<string, unknown>;
+  collectedAt: string;
 }
 
 interface WorkflowDeliveryFlowProjectionLike {
@@ -453,6 +491,7 @@ const RUN_PROTOCOL_VERSION = 1;
 const openedProjectRoots = new Set<string>();
 let agentBridge: AgentBridgeHost | null = null;
 const workflowStores = new Map<string, WorkflowStoreHost>();
+const workflowStoreInitializations = new Map<string, Promise<WorkflowStoreHost>>();
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
 const workflowSessionMutationLocks = new Map<string, Promise<void>>();
 let remoteSideEffectSequence = 0;
@@ -481,10 +520,36 @@ interface WorkflowStoreHost {
   applyWorkflowIntent(intent: unknown, now: string): unknown;
   scheduleReadyLanes(sessionId: string, input: unknown): unknown;
   recordRunResult(input: unknown): unknown;
+  claimPlannerRunStart(input: unknown): {
+    segment: {
+      sessionId: string;
+      laneId: string;
+      segmentId: string;
+      runId: string;
+      agentKind: string;
+    };
+    created: boolean;
+  };
+  resolveCurrentBranchTarget(input: unknown): unknown;
   recordCanvasNodePosition(input: unknown): unknown;
+  recordRunCheckpoint(input: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
+  listRunningSegments(): Array<{
+    sessionId: string;
+    laneId: string;
+    segmentId: string;
+    runId: string;
+    agentKind: string;
+  }>;
+  listPendingRunCheckpointEnrichments(): Array<{
+    sessionId: string;
+    laneId: string;
+    segmentId: string;
+    runId: string;
+    agentKind: string;
+  }>;
   listNodeCheckpoints(input: unknown): unknown[];
   getNodeRollbackEligibility(input: unknown): WorkflowRollbackEligibilityLike;
   applyNodeRollback(input: unknown): WorkflowRollbackResultLike;
@@ -594,11 +659,62 @@ ipcMain.handle("agent:health", async () => {
   };
 });
 
+const runStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
+  resolveIdentity: trustedRunStartIdentity,
+  acquireStore: (identity) => getWorkflowStore(identity.projectRoot),
+  reopenStore: reopenWorkflowStore,
+  assertStartInput: async (input, store) => {
+    await assertExecutableStartInput(input, store);
+    await assertTrustedScheduledRunStartIdentity(input, store);
+  },
+  claimUnscheduledStart: (input, store, identity) => {
+    if (!isTrustedPlannerRootStartInput(input, store)) return null;
+    return store.claimPlannerRunStart({
+      ...identity,
+      agentKind: assertWorkflowAgentKind(input.agentKind),
+      worktreePath: input.worktreePath,
+      now: new Date().toISOString(),
+    });
+  },
+  prepareBeforeCheckpoint: async (input, store) => {
+    if (!isExecutableCheckpointLane(store, input.sessionId, input.nodeId)) return false;
+    const identity = await resolveExecutableRunIdentity(input, "before", store);
+    const changeset = await reconcileRunChangeset(input.projectRoot, identity, []);
+    const stableIdentity = await verifyRunGitIdentityAtCheckpoint(identity);
+    const changesetEvidenceId = recordRunChangesetEvidence(store, stableIdentity, "before", changeset);
+    store.recordRunCheckpoint(runCheckpointInput(stableIdentity, "before", changesetEvidenceId, new Date().toISOString()));
+    return true;
+  },
+  startRun: async (input) => (await getAgentBridge()).startRun(input),
+  reconcileTerminal: async (store, segment, identity) => {
+    await reconcileTerminalWorkflowRun(store, await getAgentBridge(), identity.projectRoot, segment);
+  },
+  compensateTerminal: compensateFailedWorkflowRun,
+  recordReconciliationFailure: (store, segment, error) => {
+    store.appendWorkflowEvent({
+      sessionId: segment.sessionId,
+      kind: "workflow.run.start_reconciliation_failed",
+      source: "electron-main",
+      laneId: segment.laneId,
+      segmentId: segment.segmentId,
+      idempotencyKey: `run-start:${segment.runId}:reconciliation-failed`,
+      payload: { runId: segment.runId, status: "failed", reason: sanitizeSnippet(error instanceof Error ? error.message : String(error)) },
+      now: new Date().toISOString(),
+    });
+  },
+  enrichAfterCheckpoint: async (store, segment, identity) => {
+    await enrichTerminalWorkflowRun(store, await getAgentBridge().catch(() => null), identity.projectRoot, segment);
+  },
+  recordBeforeCheckpointFailure: (store, segment, error) => recordRunCheckpointFailure(store, {
+    ...segment, phase: "before", error, now: new Date().toISOString(),
+  }),
+  recordAfterCheckpointFailure: (store, segment, error) => recordRunCheckpointFailure(store, {
+    ...segment, phase: "after", error, now: new Date().toISOString(),
+  }),
+});
+
 ipcMain.handle("run:start", async (_event, input: StartAgentRunInput) => {
-  assertKnownProjectRoot(input.projectRoot);
-  await assertExecutableStartInput(input);
-  const bridge = await getAgentBridge();
-  const run = await bridge.startRun(input);
+  const run = await runStartHandler(input);
   return { protocolVersion: RUN_PROTOCOL_VERSION, run };
 });
 
@@ -670,13 +786,14 @@ ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, inp
   const inputOpaqueHandle = optionalText(input.opaqueHandle);
   const opaqueHandle = inputOpaqueHandle ?? `skyturn-ipc:${sessionId}`;
   const hermesSessionHandle = explicitHermesSessionHandle(inputOpaqueHandle);
+  const target = await resolveAuthoritativeWorkflowSessionTarget(projectRoot, input.target);
   const session = store.createWorkflowSession({
     id: sessionId,
     projectId: optionalText(input.projectId) ?? path.basename(projectRoot),
     title: optionalText(input.title) ?? "Workflow session",
     goal: requireText(input.goal, "workflow session goal"),
     mode: input.mode === "plan" ? "plan" : "fast",
-    target: normalizeWorkflowSessionTarget(input.target),
+    target,
     plannerProfile: optionalText(input.plannerProfile) ?? "default",
     transport: normalizeHermesTransport(input.transport),
     processId: typeof input.processId === "number" ? input.processId : undefined,
@@ -811,8 +928,9 @@ ipcMain.handle("workflow:recordRunResult", async (_event, projectRoot: string, i
     bridge.loadEvents(projectRoot, runId),
     bridge.getEvidence(projectRoot, runId),
   ]);
+  assertTerminalRunEvidence(evidence, runId);
   const store = await getWorkflowStore(projectRoot);
-  const projection = store.recordRunResult({
+  store.recordRunResult({
     sessionId,
     laneId,
     segmentId,
@@ -822,6 +940,14 @@ ipcMain.handle("workflow:recordRunResult", async (_event, projectRoot: string, i
     evidence,
     now,
   });
+  if (isExecutableCheckpointLane(store, sessionId, laneId)) {
+    try {
+      await enrichTerminalWorkflowRun(store, bridge, projectRoot, { sessionId, laneId, segmentId, runId, agentKind }, events, evidence);
+    } catch (error) {
+      recordRunCheckpointFailure(store, { sessionId, laneId, segmentId, runId, phase: "after", error, now });
+    }
+  }
+  const projection = store.materializeFlowProjection(sessionId);
   broadcastWorkflowProjection(projectRoot, sessionId, store);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
@@ -1790,20 +1916,153 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
       for (const window of BrowserWindow.getAllWindows()) {
         window.webContents.send("run:event", event);
       }
+      void reconcileTerminalRunEvent(bridge, event);
     });
     agentBridge = bridge;
   }
   return agentBridge;
 }
 
+async function reconcileTerminalRunEvent(bridge: AgentBridgeHost, event: unknown): Promise<void> {
+  if (!isRecord(event) || event.kind !== "status" || !isRecord(event.payload)) return;
+  const runId = optionalText(event.runId);
+  const status = optionalText(event.payload.status);
+  if (!runId || !status || !new Set(["succeeded", "failed", "cancelled", "timed-out"]).has(status)) return;
+  const liveRun = bridge.listRuns().find((run) => isRecord(run) && run.id === runId);
+  const liveProjectRoot = isRecord(liveRun) ? optionalText(liveRun.projectRoot) : null;
+  if (!liveProjectRoot) return;
+  const projectRoot = await workflowStoreIdentity(liveProjectRoot);
+  const store = workflowStores.get(projectRoot);
+  const segment = store?.listRunningSegments().find((item) => item.runId === runId);
+  if (!store || !segment) return;
+  try {
+    await reconcileTerminalWorkflowRun(store, bridge, projectRoot, segment);
+  } catch (error) {
+    store.appendWorkflowEvent({
+      sessionId: segment.sessionId,
+      kind: "workflow.run.recovery_failed",
+      source: "electron-main",
+      laneId: segment.laneId,
+      segmentId: segment.segmentId,
+      idempotencyKey: `run-live-recovery:${segment.runId}:failed`,
+      payload: { runId: segment.runId, status: "failed", reason: sanitizeSnippet(error instanceof Error ? error.message : String(error)) },
+      now: new Date().toISOString(),
+    });
+    return;
+  }
+  try {
+    await enrichTerminalWorkflowRun(store, bridge, projectRoot, segment);
+  } catch (error) {
+    recordRunCheckpointFailure(store, {
+      ...segment,
+      phase: "after",
+      error,
+      now: new Date().toISOString(),
+    });
+  }
+  broadcastWorkflowProjection(projectRoot, segment.sessionId, store);
+}
+
 async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost> {
   const storeIdentity = await workflowStoreIdentity(projectRoot);
   const existing = workflowStores.get(storeIdentity);
   if (existing) return existing;
+  const pending = workflowStoreInitializations.get(storeIdentity);
+  if (pending) return pending;
+  const initialization = Promise.resolve().then(async () => {
+    const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+    const store = createWorkflowStore({ projectRoot: storeIdentity }) as WorkflowStoreHost;
+    try {
+      const bridge = await getAgentBridge();
+      await recoverTerminalWorkflowRuns(
+        storeIdentity,
+        store,
+        bridge,
+        summarizeRunOutput,
+        undefined,
+        (segment) => enrichTerminalWorkflowRun(store, bridge, storeIdentity, segment),
+      );
+      workflowStores.set(storeIdentity, store);
+      return store;
+    } catch (error) {
+      if (workflowStores.get(storeIdentity) === store) workflowStores.delete(storeIdentity);
+      try {
+        store.close();
+      } catch {
+        // Preserve the initialization failure.
+      }
+      throw error;
+    }
+  });
+  workflowStoreInitializations.set(storeIdentity, initialization);
+  try {
+    return await initialization;
+  } finally {
+    if (workflowStoreInitializations.get(storeIdentity) === initialization) {
+      workflowStoreInitializations.delete(storeIdentity);
+    }
+  }
+}
+
+async function reopenWorkflowStore(identity: TrustedRunStartIdentity): Promise<WorkflowStoreHost> {
+  const storeIdentity = await workflowStoreIdentity(identity.projectRoot);
   const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
-  const store = createWorkflowStore({ projectRoot: storeIdentity }) as WorkflowStoreHost;
-  workflowStores.set(storeIdentity, store);
-  return store;
+  return createWorkflowStore({ projectRoot: storeIdentity }) as WorkflowStoreHost;
+}
+
+async function reconcileTerminalWorkflowRun(
+  store: WorkflowStoreHost,
+  bridge: AgentBridgeHost,
+  projectRoot: string,
+  segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
+  knownEvidence?: unknown,
+): Promise<void> {
+  const [events, evidence] = await Promise.all([
+    bridge.loadEvents(projectRoot, segment.runId),
+    knownEvidence === undefined ? bridge.getEvidence(projectRoot, segment.runId) : Promise.resolve(knownEvidence),
+  ]);
+  assertTerminalRunEvidence(evidence, segment.runId);
+  store.recordRunResult({
+    sessionId: segment.sessionId,
+    laneId: segment.laneId,
+    segmentId: segment.segmentId,
+    runId: segment.runId,
+    agentKind: assertWorkflowAgentKind(segment.agentKind),
+    outputSummary: summarizeRunOutput(events),
+    evidence,
+    now: optionalText(readField(evidence, "completedAt")) ?? new Date().toISOString(),
+  });
+}
+
+async function enrichTerminalWorkflowRun(
+  store: WorkflowStoreHost,
+  bridge: AgentBridgeHost | null,
+  projectRoot: string,
+  segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
+  knownEvents?: unknown[],
+  knownEvidence?: unknown,
+): Promise<void> {
+  if (!isExecutableCheckpointLane(store, segment.sessionId, segment.laneId)) return;
+  const events = knownEvents ?? (bridge ? await bridge.loadEvents(projectRoot, segment.runId) : []);
+  const identity = await resolveExecutableRunIdentity({
+    projectRoot,
+    sessionId: segment.sessionId,
+    nodeId: segment.laneId,
+    runId: segment.runId,
+    agentKind: assertWorkflowAgentKind(segment.agentKind),
+  }, "after", store);
+  if (segment.segmentId !== identity.segmentId) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow result segment identity mismatch.");
+  }
+  const changeset = await reconcileRunChangeset(projectRoot, identity, events);
+  const stableIdentity = await verifyRunGitIdentityAtCheckpoint(identity);
+  const changesetEvidenceId = recordRunChangesetEvidence(store, stableIdentity, "after", changeset);
+  store.recordRunCheckpoint(runCheckpointInput(
+    stableIdentity,
+    "after",
+    changesetEvidenceId,
+    optionalText(readField(knownEvidence, "completedAt")) ?? new Date().toISOString(),
+  ));
 }
 
 async function workflowStoreIdentity(projectRoot: string): Promise<string> {
@@ -1933,6 +2192,37 @@ function normalizeFinalSessionTarget(value: Record<string, unknown>): FinalSessi
 function normalizeWorkflowSessionTarget(value: unknown): FinalSessionTarget {
   if (!isRecord(value)) return { executionTarget: "current_branch", selectedBranch: "HEAD" };
   return normalizeFinalSessionTarget(value);
+}
+
+async function resolveAuthoritativeWorkflowSessionTarget(
+  projectRoot: string,
+  value: unknown,
+): Promise<FinalSessionTarget> {
+  const target = normalizeWorkflowSessionTarget(value);
+  if (target.executionTarget !== "current_branch" || target.selectedBranch !== "HEAD") return target;
+  return { ...target, selectedBranch: await readCurrentBranch(projectRoot) };
+}
+
+async function resolveAuthoritativeStoredCurrentBranchTarget(
+  store: WorkflowStoreHost,
+  projectRoot: string,
+  sessionId: string,
+): Promise<void> {
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  if (!isRecord(canvasSession) || !isRecord(canvasSession.target)) return;
+  if (canvasSession.target.executionTarget !== "current_branch" || canvasSession.target.selectedBranch !== "HEAD") return;
+  store.resolveCurrentBranchTarget({
+    sessionId,
+    branchName: await readCurrentBranch(projectRoot),
+    now: new Date().toISOString(),
+  });
+}
+
+async function readCurrentBranch(projectRoot: string): Promise<string> {
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const branchName = (await runGit(realProjectRoot, ["branch", "--show-current"])).trim();
+  if (!branchName) throw workflowIpcError("INVALID_INPUT", "Workflow current branch target cannot use detached HEAD.");
+  return branchName;
 }
 
 function structuredRunChangesFromValue(value: unknown): StructuredRunChange[] {
@@ -3183,14 +3473,76 @@ function sanitizeWorkspaceStateForKnownProjects(state: unknown): unknown {
   };
 }
 
-async function assertExecutableStartInput(input: StartAgentRunInput): Promise<void> {
+async function trustedRunStartIdentity(input: StartAgentRunInput): Promise<TrustedRunStartIdentity> {
+  assertKnownProjectRoot(input.projectRoot);
+  const sessionId = assertWorkflowSessionId(input.sessionId);
+  const laneId = assertRequiredText(input.nodeId, "Workflow nodeId is required.");
+  const runId = assertRequiredText(input.runId, "Workflow runId is required.");
+  const agentKind = assertWorkflowAgentKind(input.agentKind);
+  const worktreePath = assertRequiredText(input.worktreePath, "Workflow worktreePath is required.");
+  const { createAgentRunStartFingerprint } = await import("@skyturn/agent-bridge");
+  const startFingerprint = createAgentRunStartFingerprint({
+    protocolVersion: input.protocolVersion,
+    runId: input.runId,
+    nodeId: input.nodeId,
+    sessionId: input.sessionId,
+    plannerSessionId: input.plannerSessionId,
+    plannerInputId: input.plannerInputId,
+    hermesSessionHandle: input.hermesSessionHandle,
+    projectRoot: input.projectRoot,
+    worktreePath: input.worktreePath,
+    agentKind: input.agentKind,
+    transport: input.transport,
+    sandbox: input.sandbox,
+    expectedArtifacts: input.expectedArtifacts,
+    prompt: input.prompt,
+  });
+  return {
+    projectRoot: input.projectRoot,
+    sessionId,
+    laneId,
+    runId,
+    agentKind,
+    worktreePath,
+    startFingerprint,
+    ...(optionalText(input.plannerSessionId) ? { plannerSessionId: optionalText(input.plannerSessionId)! } : {}),
+    ...(optionalText(input.plannerInputId) ? { plannerInputId: optionalText(input.plannerInputId)! } : {}),
+    ...(optionalText(input.hermesSessionHandle) ? { hermesSessionHandle: optionalText(input.hermesSessionHandle)! } : {}),
+    ...(optionalText(input.transport) ? { transport: optionalText(input.transport)! } : {}),
+  };
+}
+
+async function assertTrustedScheduledRunStartIdentity(
+  input: StartAgentRunInput,
+  store: WorkflowStoreHost,
+): Promise<void> {
+  if (isExecutableCheckpointLane(store, input.sessionId, input.nodeId)) {
+    await resolveExecutableRunIdentity(input, "before", store);
+    return;
+  }
+  if (!isTrustedPlannerRootStartInput(input, store)) return;
+  const projectRoot = await fs.realpath(input.projectRoot);
+  const worktreePath = await fs.realpath(assertRequiredText(input.worktreePath, "Workflow worktreePath is required."));
+  const canvasSession = store.materializeCanvasSession(assertWorkflowSessionId(input.sessionId));
+  const plannerNode = isRecord(canvasSession) && Array.isArray(canvasSession.nodes)
+    ? canvasSession.nodes.find((node) => isRecord(node) && node.id === input.nodeId)
+    : null;
+  const recordedPath = isRecord(plannerNode) && isRecord(plannerNode.worktree)
+    ? optionalText(plannerNode.worktree.realPath) ?? optionalText(plannerNode.worktree.path)
+    : null;
+  const expectedPath = recordedPath ? await resolveChangesetWorktreePath(projectRoot, recordedPath) : projectRoot;
+  if (worktreePath !== expectedPath) {
+    throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Workflow planner worktree path does not match backend state.");
+  }
+}
+
+async function assertExecutableStartInput(input: StartAgentRunInput, store: WorkflowStoreHost): Promise<void> {
   const inputError = workflowStartInputError(input);
   if (inputError === "NON_EXECUTABLE_NODE") {
     throw workflowIpcError("NON_EXECUTABLE_NODE", "Workflow projection node is not executable.");
   }
   if (inputError) throw workflowIpcError(inputError, "Workflow run start requires both sessionId and nodeId.");
   if (!input.sessionId || !input.nodeId) return;
-  const store = await getWorkflowStore(input.projectRoot);
   const workflowEventCount = store.listEvents(input.sessionId).length;
   const projection = store.materializeFlowProjection(input.sessionId) as FlowProjectionLike;
   const projectedNode = projection.projectionNodes.find((node) =>
@@ -3203,6 +3555,252 @@ async function assertExecutableStartInput(input: StartAgentRunInput): Promise<vo
     if (isTrustedPlannerRootStartInput(input, store)) return;
     throw workflowIpcError("INVALID_INPUT", "Workflow projection node is not known.");
   }
+}
+
+async function resolveExecutableRunIdentity(
+  input: StartAgentRunInput,
+  phase: "before" | "after",
+  knownStore?: WorkflowStoreHost,
+): Promise<ExecutableRunIdentity> {
+  const sessionId = assertWorkflowSessionId(input.sessionId);
+  const nodeId = assertRequiredText(input.nodeId, "Workflow nodeId is required.");
+  const runId = assertRequiredText(input.runId, "Workflow runId is required.");
+  const agentKind = assertWorkflowAgentKind(input.agentKind);
+  const store = knownStore ?? await getWorkflowStore(input.projectRoot);
+  await resolveAuthoritativeStoredCurrentBranchTarget(store, input.projectRoot, sessionId);
+  const projection = store.materializeFlowProjection(sessionId) as FlowProjectionLike;
+  const lane = projection.lanes.find((item) => item.id === nodeId);
+  if (!lane || lane.laneKind === "planner" || lane.executable === false) {
+    throw workflowIpcError("NON_EXECUTABLE_NODE", "Run checkpoints require an executable workflow lane.");
+  }
+  if (lane.agentKind !== agentKind) throw workflowIpcError("INVALID_INPUT", "Workflow run agent identity mismatch.");
+  const segment = projection.segments.find((item) => item.laneId === lane.id && item.runId === runId);
+  if (!segment) throw workflowIpcError("INVALID_INPUT", "Workflow run segment identity mismatch.");
+  if (phase === "before" && segment.status !== "running") {
+    throw workflowIpcError("INVALID_INPUT", "Workflow run segment is not scheduled for start.");
+  }
+
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  if (!isRecord(canvasSession) || !Array.isArray(canvasSession.nodes) || !isRecord(canvasSession.target)) {
+    throw workflowIpcError("UNKNOWN_SESSION", `Workflow session is not known: ${sessionId}.`);
+  }
+  const node = canvasSession.nodes.find((item) => isRecord(item) && item.id === nodeId);
+  if (!isRecord(node) || !isRecord(node.worktree)) throw workflowIpcError("INVALID_INPUT", "Workflow run worktree identity is unavailable.");
+  const realProjectRoot = await fs.realpath(input.projectRoot);
+  const executionTarget = canvasSession.target.executionTarget;
+  if (executionTarget !== "current_branch" && executionTarget !== "new_worktree") {
+    throw workflowIpcError("INVALID_INPUT", "Workflow execution target is invalid.");
+  }
+  const recordedWorktreeId = optionalText(node.worktree.worktreeId);
+  const recordedRealPath = optionalText(node.worktree.realPath);
+  if (executionTarget === "current_branch" && recordedWorktreeId) {
+    throw workflowIpcError("INVALID_INPUT", "Current branch workflow must not reference a managed worktree.");
+  }
+  if (executionTarget === "new_worktree" && (!recordedWorktreeId || !recordedRealPath)) {
+    throw workflowIpcError("INVALID_INPUT", "New worktree workflow requires a created managed worktree identity.");
+  }
+  const expectedPath = executionTarget === "current_branch"
+    ? realProjectRoot
+    : await resolveChangesetWorktreePath(realProjectRoot, recordedRealPath!);
+  const suppliedPath = optionalText(input.worktreePath);
+  if (suppliedPath) {
+    const resolvedSuppliedPath = await resolveChangesetWorktreePath(realProjectRoot, suppliedPath);
+    if (resolvedSuppliedPath !== expectedPath) throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Workflow run worktree path does not match backend state.");
+  }
+  const topLevel = await fs.realpath((await runGit(expectedPath, ["rev-parse", "--show-toplevel"])).trim());
+  if (topLevel !== expectedPath) throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Workflow run path is not the recorded git worktree root.");
+  const { getGitCheckpointSnapshot } = await import("@skyturn/git-worktree/node");
+  const snapshot = await getGitCheckpointSnapshot(expectedPath);
+  const branchName = snapshot.branchName;
+  const expectedBranch = optionalText(node.worktree.branchName) ?? optionalText(canvasSession.target.selectedBranch);
+  if (!branchName || !expectedBranch || branchName !== expectedBranch) {
+    throw workflowIpcError("INVALID_INPUT", `Workflow run branch mismatch: expected ${expectedBranch ?? "recorded branch"}, got ${branchName || "detached HEAD"}.`);
+  }
+  const headCommit = snapshot.headCommit;
+  if (!isFullCommitSha(headCommit)) throw workflowIpcError("INVALID_INPUT", "Workflow run HEAD is not a full commit SHA.");
+  const baselineRef = executionTarget === "current_branch"
+    ? resolveCurrentBranchRunBaseline(store, {
+        sessionId,
+        laneId: lane.id,
+        segmentId: segment.id,
+        runId,
+        phase,
+        headCommit,
+      })
+    : undefined;
+  return {
+    sessionId,
+    nodeId,
+    laneId: lane.id,
+    segmentId: segment.id,
+    runId,
+    agentKind,
+    executionTarget,
+    ...(recordedWorktreeId ? { worktreeId: recordedWorktreeId } : {}),
+    worktreePath: expectedPath,
+    branchName,
+    headCommit,
+    worktreeState: snapshot.worktreeState,
+    ...(baselineRef ? { baselineRef } : {}),
+    node: {
+      ...node,
+      worktree: { ...node.worktree, path: expectedPath, realPath: expectedPath, branchName },
+    },
+    target: canvasSession.target,
+  };
+}
+
+function isExecutableCheckpointLane(
+  store: WorkflowStoreHost,
+  sessionId: unknown,
+  nodeId: unknown,
+): boolean {
+  if (typeof sessionId !== "string" || !sessionId.trim() || typeof nodeId !== "string" || !nodeId.trim()) return false;
+  const projection = store.materializeFlowProjection(sessionId) as FlowProjectionLike;
+  const lane = projection.lanes.find((item) => item.id === nodeId);
+  return Boolean(lane && lane.laneKind !== "planner" && lane.executable !== false);
+}
+
+function assertTerminalRunEvidence(evidence: unknown, runId: string): void {
+  if (!isRecord(evidence) || evidence.runId !== runId) {
+    throw workflowIpcError("INVALID_INPUT", "RunEvidence identity does not match the workflow run.");
+  }
+  if (!isTerminalRunEvidence(evidence, runId)) {
+    throw workflowIpcError("INVALID_INPUT", "RunEvidence is not terminal.");
+  }
+}
+
+function isTerminalRunEvidence(evidence: unknown, runId: string): boolean {
+  return isRecord(evidence) &&
+    evidence.runId === runId &&
+    new Set(["succeeded", "failed", "cancelled", "timed-out"]).has(String(evidence.status));
+}
+
+async function verifyRunGitIdentityAtCheckpoint(identity: ExecutableRunIdentity): Promise<ExecutableRunIdentity> {
+  const { getGitCheckpointSnapshot } = await import("@skyturn/git-worktree/node");
+  const { branchName, headCommit, worktreeState } = await getGitCheckpointSnapshot(identity.worktreePath);
+  if (branchName !== identity.branchName || headCommit !== identity.headCommit || worktreeState !== identity.worktreeState) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow run git identity changed during checkpoint reconciliation.");
+  }
+  return { ...identity, branchName, headCommit, worktreeState };
+}
+
+async function reconcileRunChangeset(
+  projectRoot: string,
+  identity: ExecutableRunIdentity,
+  runEvents: unknown[],
+): Promise<ReconciledRunChangeset> {
+  const { createGitChangesetService } = await import("@skyturn/git-worktree/node");
+  const service = createGitChangesetService({ repoRoot: await fs.realpath(projectRoot) });
+  type ReconcileInput = Parameters<typeof service.reconcileFinalChangeset>[0];
+  const reconciliation = await service.reconcileFinalChangeset({
+    node: identity.node as unknown as ReconcileInput["node"],
+    target: identity.target as unknown as ReconcileInput["target"],
+    ...(identity.baselineRef ? { baselineRef: identity.baselineRef } : {}),
+    liveChanges: liveChangesFromRunEvents(runEvents) as ReconcileInput["liveChanges"],
+  });
+  const evidence = reconciliation.changeset.evidence;
+  if (!evidence || (identity.worktreeState === "dirty" && evidence.status !== "available")) {
+    throw workflowIpcError("INVALID_INPUT", "Dirty workflow run state lacks concrete changeset evidence.");
+  }
+  return {
+    evidence: evidence as unknown as Record<string, unknown>,
+    collectedAt: evidence.collectedAt ?? new Date().toISOString(),
+  };
+}
+
+function recordRunChangesetEvidence(
+  store: WorkflowStoreHost,
+  identity: ExecutableRunIdentity,
+  phase: "before" | "after",
+  changeset: ReconciledRunChangeset,
+): string {
+  const evidenceId = `changeset-evidence:${identity.runId}:${phase}`;
+  const evidence = { ...changeset.evidence, evidenceId, collectedAt: changeset.collectedAt };
+  const idempotencyKey = `checkpoint-changeset:${identity.runId}:${phase}`;
+  const existing = store.listEvents(identity.sessionId).find((event) =>
+    isRecord(event) && event.idempotencyKey === idempotencyKey
+  );
+  if (isRecord(existing) && isRecord(existing.payload) && isRecord(existing.payload.evidence)) {
+    const existingEvidence = existing.payload.evidence;
+    const comparableEvidence = typeof existingEvidence.collectedAt === "string"
+      ? { ...evidence, collectedAt: existingEvidence.collectedAt }
+      : evidence;
+    if (stableJson(existingEvidence) !== stableJson(comparableEvidence)) {
+      throw workflowIpcError("INVALID_INPUT", "Run changeset evidence mismatch for existing run phase.");
+    }
+    return evidenceId;
+  }
+  store.appendWorkflowEvent({
+    sessionId: identity.sessionId,
+    kind: "workflow.changeset.evidence_recorded",
+    source: "backend",
+    laneId: identity.laneId,
+    segmentId: identity.segmentId,
+    idempotencyKey,
+    payload: { laneId: identity.laneId, segmentId: identity.segmentId, evidence },
+    now: changeset.collectedAt,
+  });
+  return evidenceId;
+}
+
+function runCheckpointInput(
+  identity: ExecutableRunIdentity,
+  phase: "before" | "after",
+  changesetEvidenceId: string,
+  now: string,
+): Record<string, unknown> {
+  return {
+    sessionId: identity.sessionId,
+    nodeId: identity.nodeId,
+    laneId: identity.laneId,
+    runId: identity.runId,
+    segmentId: identity.segmentId,
+    phase,
+    executionTarget: identity.executionTarget,
+    ...(identity.worktreeId ? { worktreeId: identity.worktreeId } : {}),
+    worktreePath: identity.worktreePath,
+    branchName: identity.branchName,
+    headCommit: identity.headCommit,
+    worktreeState: identity.worktreeState,
+    evidenceRefs: [
+      { kind: "run", id: identity.runId },
+      { kind: "segment", id: identity.segmentId },
+      { kind: "changeset", id: changesetEvidenceId },
+      ...(phase === "after" ? [{ kind: "evidence", id: `evidence-${identity.segmentId}` }] : []),
+    ],
+    now,
+  };
+}
+
+function recordRunCheckpointFailure(
+  store: WorkflowStoreHost,
+  input: {
+    sessionId: string;
+    laneId: string;
+    segmentId: string;
+    runId: string;
+    phase: "before" | "after";
+    error: unknown;
+    now: string;
+  },
+): void {
+  store.appendWorkflowEvent({
+    sessionId: input.sessionId,
+    kind: "workflow.node.checkpoint_failed",
+    source: "electron-main",
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    idempotencyKey: `checkpoint:${input.runId}:${input.phase}:failed`,
+    payload: {
+      runId: input.runId,
+      phase: input.phase,
+      status: "failed",
+      terminalRunPreserved: true,
+      reason: sanitizeSnippet(input.error instanceof Error ? input.error.message : String(input.error)),
+    },
+    now: input.now,
+  });
 }
 
 function workflowHandler<T extends unknown[], R>(
@@ -4116,25 +4714,18 @@ async function gitExitCode(repoRoot: string, args: string[]): Promise<number> {
 
 async function collectGitChangeset(projectRoot: string, worktreePath: string, changesetId: string): Promise<GitChangesetLike> {
   const readablePath = await assertReadableGitPath(projectRoot, worktreePath);
-  const [status, numstat, cachedNumstat, patch, cachedPatch] = await Promise.all([
-    runGit(readablePath, ["status", "--porcelain=v1"]),
-    runGit(readablePath, ["diff", "--numstat", "--"]),
-    runGit(readablePath, ["diff", "--cached", "--numstat", "--"]),
-    runGit(readablePath, ["diff", "--"]),
-    runGit(readablePath, ["diff", "--cached", "--"]),
-  ]);
-  const files = uniqueStrings([...filesFromPorcelain(status), ...filesFromNumstat(numstat), ...filesFromNumstat(cachedNumstat)]);
-  const stat = sumNumstat([numstat, cachedNumstat]);
-  const patchPreview = truncatePatch([patch, cachedPatch].filter(Boolean).join("\n"));
+  const { createGitChangesetService } = await import("@skyturn/git-worktree/node");
+  const service = createGitChangesetService({ repoRoot: await fs.realpath(projectRoot) });
+  type ChangesetNode = Parameters<typeof service.getChangeset>[0];
+  const changeset = await service.getChangeset({
+    changesetId,
+    worktree: { path: readablePath },
+  } as unknown as ChangesetNode);
   return {
-    id: changesetId,
-    files,
-    diffStat: {
-      added: stat.added,
-      changed: files.length,
-      deleted: stat.deleted,
-    },
-    patchPreview,
+    id: changeset.id,
+    files: changeset.files,
+    diffStat: changeset.diffStat,
+    patchPreview: changeset.patchPreview,
     source: "git",
   };
 }
@@ -4142,39 +4733,6 @@ async function collectGitChangeset(projectRoot: string, worktreePath: string, ch
 async function runGit(worktreePath: string, args: string[]): Promise<string> {
   const result = await execFileAsync("git", ["-C", worktreePath, ...args], { maxBuffer: 2_000_000 });
   return String(result.stdout);
-}
-
-function filesFromPorcelain(output: string): string[] {
-  return output
-    .split("\n")
-    .map((line) => line.slice(3).trim())
-    .filter(Boolean)
-    .map((file) => file.includes(" -> ") ? file.split(" -> ").at(-1) ?? file : file);
-}
-
-function filesFromNumstat(output: string): string[] {
-  return output
-    .split("\n")
-    .map((line) => line.split("\t").at(2)?.trim() ?? "")
-    .filter(Boolean);
-}
-
-function sumNumstat(outputs: string[]): { added: number; deleted: number } {
-  let added = 0;
-  let deleted = 0;
-  for (const output of outputs) {
-    for (const line of output.split("\n")) {
-      const [rawAdded, rawDeleted] = line.split("\t");
-      added += parseNumstatCount(rawAdded);
-      deleted += parseNumstatCount(rawDeleted);
-    }
-  }
-  return { added, deleted };
-}
-
-function parseNumstatCount(value: string | undefined): number {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function uniqueStrings(values: string[]): string[] {
@@ -4321,6 +4879,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+function stableJson(value: unknown): string {
+  return JSON.stringify(sortJson(value));
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortJson(value[key])]));
+}
+
 app.whenReady().then(createMainWindow);
 
 app.on("window-all-closed", () => {
@@ -4337,4 +4905,5 @@ app.on("activate", () => {
 function closeWorkflowStores(): void {
   for (const store of workflowStores.values()) store.close();
   workflowStores.clear();
+  workflowStoreInitializations.clear();
 }

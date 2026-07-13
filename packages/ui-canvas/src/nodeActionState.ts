@@ -155,7 +155,7 @@ export function buildSelectedNodeActionState(input: BuildSelectedNodeActionState
 
   const canRollback = !!rollbackEligibility?.eligible && !needsBackendCheck && !blockedByRemoteSideEffect;
   const canCreateRepair = !!afterCheckpoint;
-  const canCreateVariant = !!beforeCheckpoint;
+  const canCreateVariant = !!beforeCheckpoint && beforeCheckpoint.worktreeState !== "dirty";
   const rollbackPayload = canRollback && beforeCheckpoint
     ? withOptionalTime({
         sessionId,
@@ -164,7 +164,7 @@ export function buildSelectedNodeActionState(input: BuildSelectedNodeActionState
         checkpointId: beforeCheckpoint.id,
       }, input.now)
     : null;
-  const repairPayload = afterCheckpoint
+  const repairPayload = canCreateRepair && afterCheckpoint
     ? successorPayload({
         kind: "repair",
         sessionId,
@@ -175,7 +175,7 @@ export function buildSelectedNodeActionState(input: BuildSelectedNodeActionState
         now: input.now,
       })
     : null;
-  const variantPayload = beforeCheckpoint
+  const variantPayload = canCreateVariant && beforeCheckpoint
     ? successorPayload({
         kind: "variant",
         sessionId,

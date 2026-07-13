@@ -1,6 +1,6 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -29,7 +29,7 @@ describe("SQLite workflow store", () => {
 
     const second = createWorkflowStore({ projectRoot });
 
-    expect(first.databasePath).toBe(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    expect(first.databasePath).toBe(join(await realpath(projectRoot), ".devflow", "skyturn-workflow.sqlite"));
     expect(pragmas.journalMode).toBe("wal");
     expect(pragmas.foreignKeys).toBe(1);
     expect(firstMigrations).toEqual([1, 2]);
@@ -76,6 +76,34 @@ describe("SQLite workflow store", () => {
     ]);
   });
 
+  it("atomically grants planner segment ownership to only one SQLite store", async () => {
+    const projectRoot = await makeTempRoot();
+    const seed = createWorkflowStore({ projectRoot });
+    seedStore(seed);
+    seed.close();
+    const stores = [
+      createWorkflowStore({ projectRoot }),
+      createWorkflowStore({ projectRoot }),
+    ];
+    const input = {
+      sessionId: "session-1",
+      laneId: "node-1",
+      runId: "run-session-1-node-1-concurrent",
+      agentKind: "hermes" as const,
+      worktreePath: projectRoot,
+      now: "2026-07-13T01:00:01.000Z",
+    };
+
+    const claims = await Promise.all(stores.map((store) => Promise.resolve().then(() => store.claimPlannerRunStart(input))));
+
+    expect(claims.map((claim) => claim.created).sort()).toEqual([false, true]);
+    expect(claims[0]?.segment).toEqual(claims[1]?.segment);
+    expect(stores[0]?.listEvents("session-1").filter((event) =>
+      event.idempotencyKey === `planner-run:${input.runId}:lane-running`
+    )).toHaveLength(1);
+    stores.forEach((store) => store.close());
+  });
+
   it("persists default current branch session target facts", async () => {
     const store = await makeStore();
 
@@ -106,6 +134,46 @@ describe("SQLite workflow store", () => {
       selectedBranch: "HEAD",
     });
     expect(started?.payload.target).toEqual(session.target);
+  });
+
+  it("resolves an omitted legacy HEAD target durably before checkpoint validation", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    expect(store.getWorkflowSession("session-1")?.target.selectedBranch).toBe("HEAD");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const resolved = reopened.resolveCurrentBranchTarget({
+      sessionId: "session-1",
+      branchName: "codex/persist-run-checkpoints",
+      now: "2026-07-13T01:00:00.000Z",
+    });
+    const checkpoint = reopened.recordRunCheckpoint({
+      sessionId: "session-1",
+      nodeId: "lane-implementation",
+      laneId: "lane-implementation",
+      runId: "run-session-1-lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      phase: "before",
+      executionTarget: "current_branch",
+      worktreePath: projectRoot,
+      branchName: "codex/persist-run-checkpoints",
+      headCommit: "a".repeat(40),
+      worktreeState: "clean",
+      evidenceRefs: [{ kind: "run", id: "run-session-1-lane-implementation" }],
+      now: "2026-07-13T01:00:01.000Z",
+    });
+
+    expect(resolved.target).toEqual({
+      executionTarget: "current_branch",
+      selectedBranch: "codex/persist-run-checkpoints",
+    });
+    expect(reopened.materializeCanvasSession("session-1")?.target).toEqual(resolved.target);
+    expect(checkpoint.branchName).toBe("codex/persist-run-checkpoints");
+    reopened.close();
   });
 
   it("persists new worktree target metadata without claiming a created worktree", async () => {
@@ -945,6 +1013,298 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("records backend run checkpoints idempotently and rejects identity drift", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    const input = {
+      sessionId: "session-1",
+      nodeId: "lane-implementation",
+      laneId: "lane-implementation",
+      runId: "run-session-1-lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      phase: "before" as const,
+      executionTarget: "current_branch" as const,
+      worktreePath: projectRoot,
+      branchName: "HEAD",
+      headCommit: "a".repeat(40),
+      worktreeState: "dirty" as const,
+      evidenceRefs: [
+        { kind: "run" as const, id: "run-session-1-lane-implementation" },
+        { kind: "changeset" as const, id: "changeset-session-1-lane-implementation" },
+      ],
+      now: "2026-06-14T00:00:03.000Z",
+    };
+
+    const dirtyBefore = store.recordRunCheckpoint(input);
+    expect(store.getNodeRollbackEligibility({
+      sessionId: "session-1",
+      laneId: input.laneId,
+      checkpointId: dirtyBefore.id,
+      localRollbackSafe: true,
+    })).toMatchObject({ eligible: false, reason: expect.stringMatching(/restorable clean before checkpoint/i) });
+    expect(() => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: input.laneId,
+      checkpointId: dirtyBefore.id,
+      intentId: "variant-dirty-before",
+      successorLaneId: "lane-dirty-variant",
+      successorSemanticKey: "variant:dirty-before",
+      now: "2026-06-14T00:00:03.500Z",
+    })).toThrow(/restorable clean before checkpoint/i);
+
+    store.recordRunResult(runResultInput(store, input.laneId, "failed", "2026-06-14T00:00:04.000Z"));
+    const afterInput = { ...input, phase: "after" as const, now: "2026-06-14T00:00:05.000Z" };
+    const first = store.recordRunCheckpoint(afterInput);
+    const duplicate = store.recordRunCheckpoint(afterInput);
+    expect(first).toEqual(duplicate);
+    expect(store.listEvents("session-1").filter((event) => event.kind === "workflow.node.checkpoint_recorded")).toHaveLength(2);
+    expect(store.listNodeCheckpoints({ sessionId: "session-1", runId: input.runId, phase: "after" })).toEqual([
+      expect.objectContaining({
+        id: `checkpoint:${input.runId}:after`,
+        branchName: input.branchName,
+        headCommit: input.headCommit,
+        worktreeState: "dirty",
+        evidenceRefs: expect.arrayContaining([{ kind: "changeset", id: "changeset-session-1-lane-implementation" }]),
+      }),
+    ]);
+    expect(() => store.recordRunCheckpoint({ ...afterInput, headCommit: "b".repeat(40) })).toThrow(/checkpoint identity mismatch/i);
+    expect(() => store.recordRunCheckpoint({ ...afterInput, worktreePath: `${projectRoot}-drifted` })).toThrow(/current branch.*project root/i);
+    expect(() => store.recordRunCheckpoint({ ...afterInput, branchName: "other-branch" })).toThrow(/current branch.*selected branch/i);
+    expect(() => store.recordRunCheckpoint({ ...input, worktreeId: "unexpected-worktree" })).toThrow(/current branch.*worktree id/i);
+    expect(() => store.recordRunCheckpoint({ ...input, worktreePath: `${projectRoot}-other` })).toThrow(/current branch.*project root/i);
+    expect(() => store.recordRunCheckpoint({ ...input, branchName: "wrong-selected-branch" })).toThrow(/current branch.*selected branch/i);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listNodeCheckpoints({ sessionId: "session-1", runId: input.runId, phase: "after" })).toEqual([
+      expect.objectContaining({ id: `checkpoint:${input.runId}:after`, headCommit: input.headCommit }),
+    ]);
+    reopened.close();
+  });
+
+  it("persists run fault audit events without replaying them into FlowProjection", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    recordCheckpoint(store, "checkpoint-before-implementation", "lane-implementation", "before", "base-sha");
+    const projectionBeforeAudit = store.materializeFlowProjection("session-1");
+    const faultKinds = [
+      "workflow.run.recovery_failed",
+      "workflow.run.start_reconciliation_failed",
+      "workflow.node.checkpoint_failed",
+    ] as const;
+
+    for (const [index, kind] of faultKinds.entries()) {
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind,
+        source: "test",
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        idempotencyKey: `fault-audit:${index}`,
+        payload: { runId: "run-session-1-lane-implementation", status: "failed", reason: kind },
+        now: `2026-06-14T00:00:2${index}.000Z`,
+      });
+    }
+
+    expect(store.listEvents("session-1").filter((event) => faultKinds.includes(event.kind as typeof faultKinds[number])))
+      .toHaveLength(3);
+    expect(store.materializeFlowProjection("session-1")).toEqual(projectionBeforeAudit);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listEvents("session-1").filter((event) => faultKinds.includes(event.kind as typeof faultKinds[number])))
+      .toHaveLength(3);
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(projectionBeforeAudit);
+    reopened.close();
+  });
+
+  it("canonicalizes project-root and current-branch checkpoint path aliases", async () => {
+    const realProjectRoot = await makeTempRoot();
+    const aliasParent = await makeTempRoot();
+    const projectAlias = join(aliasParent, "project-alias");
+    await symlink(realProjectRoot, projectAlias, "dir");
+    const store = createWorkflowStore({ projectRoot: projectAlias });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    const input = {
+      sessionId: "session-1",
+      nodeId: "lane-implementation",
+      laneId: "lane-implementation",
+      runId: "run-session-1-lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      phase: "before" as const,
+      executionTarget: "current_branch" as const,
+      worktreePath: realProjectRoot,
+      branchName: "HEAD",
+      headCommit: "a".repeat(40),
+      worktreeState: "clean" as const,
+      evidenceRefs: [{ kind: "run" as const, id: "run-session-1-lane-implementation" }],
+      now: "2026-06-14T00:00:03.000Z",
+    };
+
+    expect(store.recordRunCheckpoint(input)).toMatchObject({ worktreePath: await realpath(realProjectRoot) });
+    store.close();
+  });
+
+  it("requires checkpoints to match the managed new-worktree identity", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store, {
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "origin/main",
+    });
+    declareCodeChangeWorkflow(store);
+    const worktreePath = `${projectRoot}/.devflow/worktrees/lane-implementation`;
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.worktree.created",
+      source: "git-worktree",
+      idempotencyKey: "worktree:lane-implementation:created",
+      payload: {
+        worktree: {
+          worktreeId: "worktree-session-1-lane-implementation",
+          variantId: "lane-implementation",
+          path: worktreePath,
+          realPath: worktreePath,
+          gitdir: `${projectRoot}/.git/worktrees/lane-implementation`,
+          repoRoot: projectRoot,
+          branchName: "skyturn/session-1/lane-implementation",
+          baseCommit: "a".repeat(40),
+          headCommit: "a".repeat(40),
+          parentLaneId: "lane-implementation",
+        },
+      },
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    const input = {
+      sessionId: "session-1",
+      nodeId: "lane-implementation",
+      laneId: "lane-implementation",
+      runId: "run-session-1-lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      phase: "before" as const,
+      executionTarget: "new_worktree" as const,
+      worktreeId: "worktree-session-1-lane-implementation",
+      worktreePath,
+      branchName: "skyturn/session-1/lane-implementation",
+      headCommit: "a".repeat(40),
+      worktreeState: "clean" as const,
+      evidenceRefs: [{ kind: "run" as const, id: "run-session-1-lane-implementation" }],
+      now: "2026-06-14T00:00:03.000Z",
+    };
+
+    expect(store.recordRunCheckpoint(input)).toMatchObject({ worktreeId: input.worktreeId, worktreePath, branchName: input.branchName });
+    expect(() => store.recordRunCheckpoint({ ...input, worktreeId: undefined })).toThrow(/new worktree.*worktree id/i);
+    expect(() => store.recordRunCheckpoint({ ...input, worktreeId: "wrong" })).toThrow(/managed worktree identity/i);
+    expect(() => store.recordRunCheckpoint({ ...input, worktreePath: `${worktreePath}-wrong` })).toThrow(/managed worktree identity/i);
+    expect(() => store.recordRunCheckpoint({ ...input, branchName: "wrong" })).toThrow(/managed worktree identity/i);
+    store.close();
+  });
+
+  it.each(["succeeded", "cancelled", "timed-out"] as const)(
+    "keeps checkpoint repair compatible for %s terminal RunEvidence",
+    async (status) => {
+      const projectRoot = await makeTempRoot();
+      const store = createWorkflowStore({ projectRoot });
+      seedStore(store);
+      declareCodeChangeWorkflow(store);
+      advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+      const runId = "run-session-1-lane-implementation";
+      const segmentId = "segment-session-1-lane-implementation";
+      const checkpointIdentity = {
+        sessionId: "session-1",
+        nodeId: "lane-implementation",
+        laneId: "lane-implementation",
+        runId,
+        segmentId,
+        executionTarget: "current_branch" as const,
+        worktreePath: projectRoot,
+        branchName: "HEAD",
+        headCommit: "d".repeat(40),
+        worktreeState: "clean" as const,
+        evidenceRefs: [
+          { kind: "run" as const, id: runId },
+          { kind: "segment" as const, id: segmentId },
+        ],
+      };
+      store.recordRunCheckpoint({
+        ...checkpointIdentity,
+        phase: "before",
+        now: "2026-06-14T00:00:03.000Z",
+      });
+      store.recordRunResult(runResultInput(store, "lane-implementation", status, "2026-06-14T00:00:04.000Z"));
+      store.recordRunCheckpoint({
+        ...checkpointIdentity,
+        phase: "after",
+        evidenceRefs: [
+          ...checkpointIdentity.evidenceRefs,
+          { kind: "evidence" as const, id: `evidence-${segmentId}` },
+        ],
+        now: "2026-06-14T00:00:05.000Z",
+      });
+
+      const repair = store.requestNodeRepair({
+        sessionId: "session-1",
+        laneId: "lane-implementation",
+        checkpointId: `checkpoint:${runId}:after`,
+        now: "2026-06-14T00:00:06.000Z",
+      });
+      expect(repair.event.payload).toMatchObject({
+        failedEvidenceFallbackReason: expect.stringContaining("No failed evidence matched"),
+      });
+      expect(repair.event.payload).not.toHaveProperty("sourceEvidenceIds");
+      expect(repair.projection.lanes.filter((lane) => lane.semanticSubtype === "repair")).toHaveLength(1);
+      expect(repair.projection.lanes.filter((lane) => lane.semanticSubtype === "regression_check")).toHaveLength(0);
+      store.close();
+    },
+  );
+
+  it.each(["cancelled", "timed-out"] as const)(
+    "reconciles a crashed running segment as durable %s evidence after restart",
+    async (status) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listRunningSegments()).toEqual([
+      expect.objectContaining({
+        sessionId: "session-1",
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        runId: "run-session-1-lane-implementation",
+        status: "running",
+      }),
+    ]);
+    reopened.recordRunResult(runResultInput(
+      reopened,
+      "lane-implementation",
+      status,
+      "2026-06-14T00:00:10.000Z",
+    ));
+    reopened.close();
+
+    const reconciled = createWorkflowStore({ projectRoot });
+    expect(reconciled.listRunningSegments()).toEqual([]);
+    expect(reconciled.materializeFlowProjection("session-1").segments).toContainEqual(
+      expect.objectContaining({ id: "segment-session-1-lane-implementation", status }),
+    );
+    reconciled.close();
+    },
+  );
+
   it("replays crash-window rollback recovery from requested to applied", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
@@ -1445,6 +1805,8 @@ describe("SQLite workflow store", () => {
     const store = createWorkflowStore({ projectRoot });
     seedStore(store);
     declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    store.recordRunResult(runResultInput(store, "lane-implementation", "failed", "2026-06-14T00:00:07.000Z"));
     recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
 
     const repair = store.requestNodeRepair({
@@ -1528,6 +1890,18 @@ describe("SQLite workflow store", () => {
           checks: ["run-exit:Agent run exit:failed"],
           artifacts: [],
           detail: "exit 1",
+          runEvidence: {
+            runId: "run-session-1-lane-implementation",
+            status: "failed",
+            exitCode: 1,
+            changesetId: null,
+            checks: [{ kind: "run-exit", name: "Agent run exit", status: "failed" }],
+            artifacts: [],
+            review: null,
+            errorReason: "exit 1",
+            cancelReason: null,
+            completedAt: "2026-06-14T00:00:10.000Z",
+          },
         },
       },
       now: "2026-06-14T00:00:10.000Z",
@@ -1766,7 +2140,7 @@ describe("SQLite workflow store", () => {
     expect(repairBrief).not.toContain("new failure detail");
   });
 
-  it("does not attach failed evidence referenced by a checkpoint when selected run and segment do not match", async () => {
+  it("falls back to checkpoint context when referenced failed evidence does not match the selected run", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
     seedStore(store);
@@ -1800,26 +2174,31 @@ describe("SQLite workflow store", () => {
       successorSemanticKey: "manual:repair:lane-implementation:old",
       now: "2026-06-14T00:00:20.000Z",
     });
-    const canvasSession = store.materializeCanvasSession("session-1");
-    const repairNode = canvasSession?.nodes.find((node) => node.id === "lane-implementation-old-repair");
-    const repairBrief = repairNode?.context.brief ?? "";
-    store.close();
+    const repairNode = store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-implementation-old-repair");
 
-    expect(repair.event.payload).not.toHaveProperty("sourceEvidenceIds");
-    expect(repair.event.payload).not.toHaveProperty("failedEvidenceId");
-    expect(repair.event.payload).not.toHaveProperty("failedEvidenceDetail");
-    expect(repair.event.payload).not.toHaveProperty("failedSegmentId");
     expect(repair.event.payload).toMatchObject({
       failedEvidenceFallbackReason: expect.stringContaining("No failed evidence matched"),
     });
-    expect(repairBrief).toContain("No failed evidence matched");
-    expect(repairBrief).not.toContain("new-failed-evidence");
-    expect(repairBrief).not.toContain("new failure detail");
+    expect(repair.event.payload).not.toHaveProperty("sourceEvidenceIds");
+    expect(repair.event.payload).not.toHaveProperty("failedEvidenceId");
+    expect(repairNode?.context.brief).toContain("No failed evidence matched");
+    expect(repairNode?.context.brief).not.toContain("new-failed-evidence");
+    store.close();
   });
 
   it("rejects conflicting idempotent repair retries before adding successor edges", async () => {
     const store = await makeSeededStore();
     declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    appendFailedEvidence(
+      store,
+      "lane-implementation",
+      "segment-session-1-lane-implementation",
+      "evidence-segment-session-1-lane-implementation",
+      "exit 1",
+      "2026-06-14T00:00:10.000Z",
+      "run-session-1-lane-implementation",
+    );
     recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
     store.requestNodeRepair({
       sessionId: "session-1",
@@ -2715,6 +3094,79 @@ describe("SQLite workflow store", () => {
     });
   });
 
+  it("rejects non-terminal or mismatched run result identity at the store boundary", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    const valid = runResultInput(store, "lane-implementation", "failed", "2026-06-14T00:00:05.000Z");
+
+    const invalidInputs = [
+      { label: "cross session", input: { ...valid, sessionId: "session-other" } },
+      { label: "cross lane", input: { ...valid, laneId: "lane-validation" } },
+      { label: "cross segment", input: { ...valid, segmentId: "segment-session-1-lane-validation" } },
+      { label: "wrong request run", input: { ...valid, runId: "run-other" } },
+      { label: "wrong evidence run", input: { ...valid, evidence: { ...valid.evidence, runId: "run-other" } } },
+      { label: "wrong agent", input: { ...valid, agentKind: "hermes" as const } },
+      { label: "non-terminal evidence", input: { ...valid, evidence: { ...valid.evidence, status: "running" } as RunEvidence } },
+    ];
+
+    for (const { label, input } of invalidInputs) {
+      expect(() => store.recordRunResult(input), label).toThrow(/run result.*identity|terminal RunEvidence/i);
+    }
+    expect(store.listRunningSegments()).toHaveLength(1);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot: dirname(dirname(store.databasePath)) });
+    expect(reopened.listRunningSegments()).toEqual([
+      expect.objectContaining({
+        sessionId: valid.sessionId,
+        laneId: valid.laneId,
+        segmentId: valid.segmentId,
+        runId: valid.runId,
+        status: "running",
+      }),
+    ]);
+    expect(reopened.listEvents(valid.sessionId).filter((event) => event.kind === "workflow.segment.finished")).toEqual([]);
+    reopened.close();
+  });
+
+  it("replays executable terminal results only when full evidence and output are identical", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    const input = runResultInput(store, "lane-implementation", "succeeded", "2026-06-14T00:00:05.000Z");
+
+    const assertReplayContract = () => {
+      const eventsBefore = store.listEvents(input.sessionId);
+      const projectionBefore = store.materializeFlowProjection(input.sessionId);
+      expect(store.recordRunResult({ ...input, now: "2026-06-14T00:00:06.000Z" })).toEqual(projectionBefore);
+      expect(store.listEvents(input.sessionId)).toEqual(eventsBefore);
+
+      const conflicts = [
+        { label: "status", input: { ...input, evidence: { ...input.evidence, status: "failed" as const } } },
+        { label: "exit", input: { ...input, evidence: { ...input.evidence, exitCode: 17 } } },
+        { label: "checks", input: { ...input, evidence: { ...input.evidence, checks: [{ ...input.evidence.checks[0]!, detail: "different" }] } } },
+        { label: "changeset", input: { ...input, evidence: { ...input.evidence, changesetId: "changeset-conflict" } } },
+        { label: "output", input: { ...input, outputSummary: "Conflicting terminal output." } },
+      ];
+      for (const conflict of conflicts) {
+        expect(() => store.recordRunResult({ ...conflict.input, now: "2026-06-14T00:00:07.000Z" }), conflict.label).toThrow(
+          /executable terminal (evidence|output) conflict/i,
+        );
+        expect(store.listEvents(input.sessionId), conflict.label).toEqual(eventsBefore);
+      }
+    };
+
+    store.recordRunResult(input);
+    assertReplayContract();
+    store.close();
+    store = createWorkflowStore({ projectRoot });
+    assertReplayContract();
+    store.close();
+  });
+
   it("materializes succeeded planner evidence on the root card after workflow lanes complete", async () => {
     const store = await makeStore();
     store.createWorkflowSession({
@@ -2788,6 +3240,86 @@ describe("SQLite workflow store", () => {
     });
     expect(planner?.context.dependencies).toEqual([]);
     expect(canvas?.edges.some((edge) => edge.target === canvas.plannerNodeId)).toBe(false);
+  });
+
+  it("replays identical planner terminal evidence idempotently and rejects conflicts across reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const runId = "run-session-1-node-1-terminal";
+    const { segment } = store.claimPlannerRunStart({
+      sessionId: "session-1",
+      laneId: "node-1",
+      runId,
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    const evidence = {
+      runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit 0" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:02.000Z",
+    } satisfies RunEvidence;
+    const input = {
+      sessionId: "session-1",
+      laneId: "node-1",
+      segmentId: segment.segmentId,
+      runId,
+      agentKind: "hermes" as const,
+      outputSummary: "Planner terminal output.",
+      evidence,
+      now: "2026-06-14T00:00:02.000Z",
+    };
+    const conflictingInput = {
+      ...input,
+      evidence: {
+        ...evidence,
+        status: "failed" as const,
+        exitCode: 1,
+        errorReason: "Conflicting terminal result.",
+        checks: [{ kind: "run-exit" as const, name: "Hermes CLI exit", status: "failed" as const, detail: "exit 1" }],
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    };
+
+    store.recordRunResult(input);
+    const eventsAfterFirst = store.listEvents("session-1");
+    const segmentAfterFirst = store.listSegments("session-1", "node-1").find((item) => item.runId === runId);
+    store.recordRunResult({ ...input, outputSummary: "Duplicate output is ignored.", now: "2026-06-14T00:00:03.000Z" });
+    expect(store.listEvents("session-1")).toEqual(eventsAfterFirst);
+    expect(store.listSegments("session-1", "node-1").find((item) => item.runId === runId)).toEqual(segmentAfterFirst);
+    expect(() => store.recordRunResult(conflictingInput)).toThrow(/planner terminal evidence conflict/i);
+    expect(store.listEvents("session-1")).toEqual(eventsAfterFirst);
+    expect(store.listSegments("session-1", "node-1").find((item) => item.runId === runId)).toEqual(segmentAfterFirst);
+    expect(eventsAfterFirst.filter((event) =>
+      event.idempotencyKey === `planner-segment:${segment.segmentId}:lane-terminal`
+    )).toEqual([
+      expect.objectContaining({
+        idempotencyKey: `planner-segment:${segment.segmentId}:lane-terminal`,
+        payload: expect.objectContaining({ status: "completed" }),
+      }),
+    ]);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const reopenedEvents = reopened.listEvents("session-1");
+    const reopenedSegment = reopened.listSegments("session-1", "node-1").find((item) => item.runId === runId);
+    reopened.recordRunResult({ ...input, now: "2026-06-14T00:00:05.000Z" });
+    expect(reopened.listEvents("session-1")).toEqual(reopenedEvents);
+    expect(reopened.listSegments("session-1", "node-1").find((item) => item.runId === runId)).toEqual(reopenedSegment);
+    expect(() => reopened.recordRunResult({ ...conflictingInput, now: "2026-06-14T00:00:06.000Z" })).toThrow(
+      /planner terminal evidence conflict/i,
+    );
+    expect(reopened.listEvents("session-1")).toEqual(reopenedEvents);
+    expect(reopened.listSegments("session-1", "node-1").find((item) => item.runId === runId)).toEqual(reopenedSegment);
+    reopened.close();
   });
 
   it.each(["lane-implementation", "lane-validation", "lane-review"] as const)(
@@ -2867,6 +3399,8 @@ describe("SQLite workflow store", () => {
 
   it("redacts run output and evidence before persisting event-stream projection data", async () => {
     const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
     const evidence = {
       runId: "run-session-1-lane-implementation",
       status: "failed",
@@ -2986,7 +3520,10 @@ async function makeSeededStore() {
   return store;
 }
 
-function seedStore(store: ReturnType<typeof createWorkflowStore>): void {
+function seedStore(
+  store: ReturnType<typeof createWorkflowStore>,
+  target?: { executionTarget: "new_worktree"; selectedBranch: string; baseRef: string },
+): void {
   store.createWorkflowSession({
     id: "session-1",
     projectId: "project-1",
@@ -2996,6 +3533,7 @@ function seedStore(store: ReturnType<typeof createWorkflowStore>): void {
     plannerProfile: "default",
     transport: "hermes_replay_recovery",
     recoveryReason: "Hermes live chat handle was not available during test setup.",
+    ...(target ? { target } : {}),
     now: "2026-06-14T00:00:00.000Z",
   });
   store.applyWorkflowCardToolCall(
@@ -3251,6 +3789,20 @@ function appendFailedEvidence(
         checks: ["run-exit:failed"],
         artifacts: [],
         detail,
+        ...(runId ? {
+          runEvidence: {
+            runId,
+            status: "failed",
+            exitCode: 1,
+            changesetId: null,
+            checks: [{ kind: "run-exit", name: "Agent run exit", status: "failed" }],
+            artifacts: [],
+            review: null,
+            errorReason: detail,
+            cancelReason: null,
+            completedAt: now,
+          },
+        } : {}),
       },
     },
     now,

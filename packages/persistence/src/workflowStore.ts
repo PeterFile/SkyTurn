@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 import { hasConcreteRunEvidence, normalizeSessionTarget } from "@skyturn/project-core";
 import type {
@@ -68,6 +68,11 @@ export type WorkflowLaneStatus =
   | "failed"
   | "archived";
 
+export type WorkflowAuditEventKind =
+  | "workflow.run.recovery_failed"
+  | "workflow.run.start_reconciliation_failed"
+  | "workflow.node.checkpoint_failed";
+
 export type WorkflowEventKind =
   | "user_input"
   | "hermes_session_started"
@@ -92,6 +97,7 @@ export type WorkflowEventKind =
   | "review_completed"
   | "continuation_requested"
   | "lane_status_changed"
+  | WorkflowAuditEventKind
   | FlowEventKind;
 
 export interface WorkflowCardCreateInput {
@@ -134,6 +140,15 @@ export type WorkflowCardToolCall =
 export interface WorkflowStoreOptions {
   projectRoot: string;
   databasePath?: string;
+}
+
+function canonicalPath(value: string): string {
+  const absolute = resolve(value);
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    return absolute;
+  }
 }
 
 export interface CreateWorkflowSessionInput {
@@ -228,6 +243,17 @@ export interface WorkflowSegmentRecord {
   errorReason: string | null;
 }
 
+export interface RunningWorkflowSegment {
+  sessionId: string;
+  laneId: string;
+  segmentId: string;
+  runId: string;
+  agentKind: AgentKind;
+  status: "running";
+}
+
+export type RunCheckpointEnrichmentCandidate = Omit<RunningWorkflowSegment, "status">;
+
 export interface WorkflowCardToolContext {
   sourceRunId: string;
   now: string;
@@ -309,6 +335,43 @@ export interface RecordRunResultInput {
   agentKind: AgentKind;
   outputSummary?: string;
   evidence: RunEvidence;
+  now: string;
+}
+
+export interface ClaimPlannerRunStartInput {
+  sessionId: string;
+  laneId: string;
+  runId: string;
+  agentKind: AgentKind;
+  worktreePath: string;
+  now: string;
+}
+
+export interface ClaimPlannerRunStartResult {
+  segment: RunningWorkflowSegment;
+  created: boolean;
+}
+
+export interface ResolveCurrentBranchTargetInput {
+  sessionId: string;
+  branchName: string;
+  now: string;
+}
+
+export interface RecordRunCheckpointInput {
+  sessionId: string;
+  nodeId: string;
+  laneId: string;
+  runId: string;
+  segmentId: string;
+  phase: WorkflowNodeCheckpoint["phase"];
+  executionTarget: WorkflowNodeCheckpoint["executionTarget"];
+  worktreeId?: string;
+  worktreePath: string;
+  branchName: string;
+  headCommit: string;
+  worktreeState: NonNullable<WorkflowNodeCheckpoint["worktreeState"]>;
+  evidenceRefs: WorkflowNodeCheckpoint["evidenceRefs"];
   now: string;
 }
 
@@ -564,6 +627,7 @@ interface SegmentRow {
 interface WorkflowStoreStatements {
   migrations: Database.Statement;
   getSession: Database.Statement;
+  listWorkflowSessionIds: Database.Statement;
   listHermesSessions: Database.Statement;
   listEvents: Database.Statement;
   getEventByIdempotencyKey: Database.Statement;
@@ -578,11 +642,14 @@ interface WorkflowStoreStatements {
   insertEdge: Database.Statement;
   listEdges: Database.Statement;
   getSegment: Database.Statement;
+  getSegmentByRunId: Database.Statement;
   listSegments: Database.Statement;
+  listRunningPlannerSegments: Database.Statement;
   insertSegment: Database.Statement;
   updateSegmentEvidence: Database.Statement;
   finishSegment: Database.Statement;
   insertSession: Database.Statement;
+  updateCurrentBranchTarget: Database.Statement;
   insertHermesSession: Database.Statement;
 }
 
@@ -590,11 +657,13 @@ export class WorkflowStore {
   readonly databasePath: string;
 
   private readonly db: Database.Database;
+  private readonly projectRoot: string;
   private readonly statements: WorkflowStoreStatements;
 
   constructor(options: WorkflowStoreOptions) {
-    this.databasePath = options.databasePath ?? join(options.projectRoot, ".devflow", "skyturn-workflow.sqlite");
-    mkdirSync(join(options.projectRoot, ".devflow"), { recursive: true });
+    this.projectRoot = canonicalPath(options.projectRoot);
+    this.databasePath = options.databasePath ?? join(this.projectRoot, ".devflow", "skyturn-workflow.sqlite");
+    mkdirSync(join(this.projectRoot, ".devflow"), { recursive: true });
     this.db = new Database(this.databasePath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
@@ -697,6 +766,27 @@ export class WorkflowStore {
   getWorkflowSession(sessionId: string): WorkflowSessionRecord | null {
     const row = this.statements.getSession.get(sessionId) as SessionRow | undefined;
     return row ? mapSession(row) : null;
+  }
+
+  resolveCurrentBranchTarget(input: ResolveCurrentBranchTargetInput): WorkflowSessionRecord {
+    const session = this.requireKnownSession(input.sessionId);
+    const branchName = requireIdentifier(input.branchName, "branchName");
+    if (session.target.executionTarget !== "current_branch") {
+      throw new Error("Only current branch workflow targets can resolve HEAD.");
+    }
+    if (session.target.selectedBranch !== "HEAD") {
+      if (session.target.selectedBranch !== branchName) {
+        throw new Error("Current branch workflow target is already resolved to another branch.");
+      }
+      return session;
+    }
+
+    this.statements.updateCurrentBranchTarget.run({
+      id: input.sessionId,
+      selected_branch: branchName,
+      updated_at: input.now,
+    });
+    return this.requireKnownSession(input.sessionId);
   }
 
   listHermesSessions(sessionId: string): HermesSessionRecord[] {
@@ -905,15 +995,62 @@ export class WorkflowStore {
   }
 
   recordRunResult(input: RecordRunResultInput): FlowProjection {
+    const projection = this.materializeFlowProjection(input.sessionId);
+    const lane = projection.lanes.find((item) => item.id === input.laneId) ?? this.getLane(input.sessionId, input.laneId);
+    if (!lane || lane.agentKind !== input.agentKind) {
+      throw new Error("Run result lane and agent identity mismatch.");
+    }
+    if (input.evidence.runId !== input.runId) {
+      throw new Error("Run result RunEvidence identity mismatch.");
+    }
+    if (!isTerminalRunEvidence(input.evidence)) {
+      throw new Error("Run result requires terminal RunEvidence.");
+    }
+    const segment = projection.segments.find((item) => item.id === input.segmentId);
+    let authoritativeInput = input;
+    if (lane.laneKind === "planner") {
+      const stored = this.statements.getSegmentByRunId.get(input.runId) as SegmentRow | undefined;
+      if (stored) {
+        if (
+          stored.session_id !== input.sessionId ||
+          stored.lane_id !== input.laneId ||
+          stored.agent_kind !== input.agentKind ||
+          (input.segmentId !== stored.id && input.segmentId !== segmentIdForLane(input.sessionId, input.laneId))
+        ) {
+          throw new Error("Run result planner segment identity mismatch.");
+        }
+        authoritativeInput = { ...input, segmentId: stored.id };
+      } else if (
+        input.segmentId !== segmentIdForLane(input.sessionId, input.laneId) ||
+        input.runId !== runIdForLane(input.sessionId, input.laneId) ||
+        (segment && (segment.laneId !== input.laneId || segment.runId !== input.runId))
+      ) {
+        throw new Error("Run result planner segment identity mismatch.");
+      }
+    } else if (!segment || segment.laneId !== input.laneId || segment.runId !== input.runId) {
+      throw new Error("Run result segment identity mismatch.");
+    }
     const safeEvidence = sanitizeRunEvidence(input.evidence);
     const outputSummary = sanitizeWorkflowStoredText(input.outputSummary ?? resultSummaryFromEvidence(safeEvidence));
-    const lane = this.getLane(input.sessionId, input.laneId);
-    if (lane?.laneKind === "planner") return this.recordPlannerRunResult(input, safeEvidence, outputSummary);
+    if (lane?.laneKind === "planner") return this.recordPlannerRunResult(authoritativeInput, safeEvidence, outputSummary);
+
+    if (!segment) throw new Error("Run result segment identity mismatch.");
+    if (segment.status !== "running") {
+      this.assertExecutableTerminalReplay(input, safeEvidence, outputSummary);
+      return projection;
+    }
 
     const status = flowStatusFromRunEvidence(input.evidence);
     const evidenceStatus = status === "succeeded" ? "passed" : input.evidence.status === "cancelled" ? "skipped" : "failed";
     const evidenceId = `evidence-${input.segmentId}`;
     const tx = this.db.transaction(() => {
+      const hasTerminalEvent = ["output-summary", "evidence", "finished"].some((suffix) =>
+        this.getEventByIdempotencyKey(input.sessionId, `segment:${input.segmentId}:${suffix}`)
+      );
+      if (hasTerminalEvent) {
+        this.assertExecutableTerminalReplay(input, safeEvidence, outputSummary);
+        return;
+      }
       this.insertFlowEventInTransaction({
         id: `${input.sessionId}:flow-output:${input.segmentId}`,
         sessionId: input.sessionId,
@@ -968,8 +1105,124 @@ export class WorkflowStore {
         idempotencyKey: `segment:${input.segmentId}:finished`,
       }, input.now);
     });
-    tx();
+    tx.immediate();
     return this.materializeFlowProjection(input.sessionId);
+  }
+
+  recordRunCheckpoint(input: RecordRunCheckpointInput): WorkflowNodeCheckpoint {
+    const session = this.requireKnownSession(input.sessionId);
+    if (session.target.executionTarget !== input.executionTarget) {
+      throw new Error("Run checkpoint execution target identity mismatch.");
+    }
+    const canvasSession = this.materializeCanvasSession(input.sessionId);
+    const canvasNode = canvasSession?.nodes.find((node) => node.id === input.nodeId);
+    const canonicalWorktreePath = canonicalPath(input.worktreePath);
+    if (input.executionTarget === "current_branch") {
+      if (input.worktreeId) throw new Error("Current branch checkpoint must not include a worktree id.");
+      if (canonicalWorktreePath !== this.projectRoot) {
+        throw new Error("Current branch checkpoint path must match the project root.");
+      }
+      if (input.branchName !== session.target.selectedBranch) {
+        throw new Error("Current branch checkpoint branch must match the session selected branch.");
+      }
+    } else {
+      if (!input.worktreeId) throw new Error("New worktree checkpoint requires a worktree id.");
+      const managedWorktree = canvasNode?.worktree;
+      const managedPath = managedWorktree?.realPath ?? managedWorktree?.path;
+      if (
+        managedWorktree?.worktreeId !== input.worktreeId ||
+        !managedPath ||
+        canonicalPath(managedPath) !== canonicalWorktreePath ||
+        managedWorktree.branchName !== input.branchName
+      ) {
+        throw new Error("Run checkpoint must match the managed worktree identity.");
+      }
+    }
+    const projection = this.materializeFlowProjection(input.sessionId);
+    const lane = projection.lanes.find((item) => item.id === input.laneId);
+    const projectedNode = projection.projectionNodes.find((node) => node.id === input.nodeId && node.laneId === input.laneId);
+    if (!lane || !projectedNode?.executable) {
+      throw new Error("Run checkpoint requires matching executable lane and node identity.");
+    }
+    const segment = projection.segments.find((item) => item.id === input.segmentId);
+    if (!segment || segment.laneId !== input.laneId || segment.runId !== input.runId) {
+      throw new Error("Run checkpoint segment identity mismatch.");
+    }
+    if (input.phase === "before" && segment.status !== "running") {
+      throw new Error("Before run checkpoint requires a running scheduled segment.");
+    }
+    if (input.phase === "after" && segment.status === "running") {
+      throw new Error("After run checkpoint requires terminal RunEvidence.");
+    }
+    if (input.phase === "after") {
+      const before = projection.checkpoints.find((item) =>
+        item.phase === "before" &&
+        item.sessionId === input.sessionId &&
+        item.laneId === input.laneId &&
+        item.segmentId === input.segmentId &&
+        item.runId === input.runId
+      );
+      if (!before) throw new Error("After run checkpoint requires the matching before checkpoint.");
+      if (
+        before.executionTarget !== input.executionTarget ||
+        before.worktreeId !== input.worktreeId ||
+        !before.worktreePath ||
+        canonicalPath(before.worktreePath) !== canonicalWorktreePath ||
+        before.branchName !== input.branchName
+      ) {
+        throw new Error("After run checkpoint must match before checkpoint worktree identity.");
+      }
+    }
+    if (!/^[0-9a-f]{40}$/i.test(input.headCommit)) throw new Error("Run checkpoint requires a full commit SHA.");
+    if (!input.worktreePath || !input.branchName) throw new Error("Run checkpoint requires worktree and branch identity.");
+    if (!input.evidenceRefs.some((ref) => ref.kind === "run" && ref.id === input.runId)) {
+      throw new Error("Run checkpoint requires matching run evidence.");
+    }
+    if (input.worktreeState === "dirty" && !input.evidenceRefs.some((ref) => ref.kind === "changeset")) {
+      throw new Error("Dirty run checkpoint requires changeset evidence.");
+    }
+    const id = `checkpoint:${input.runId}:${input.phase}`;
+    const checkpoint: WorkflowNodeCheckpoint = {
+      id,
+      sessionId: input.sessionId,
+      nodeId: input.nodeId,
+      laneId: input.laneId,
+      runId: input.runId,
+      segmentId: input.segmentId,
+      phase: input.phase,
+      executionTarget: input.executionTarget,
+      ...(input.worktreeId ? { worktreeId: input.worktreeId } : {}),
+      worktreePath: canonicalWorktreePath,
+      branchName: input.branchName,
+      headCommit: input.headCommit.toLowerCase(),
+      worktreeState: input.worktreeState,
+      createdAt: input.now,
+      source: "backend",
+      evidenceRefs: input.evidenceRefs,
+    };
+    const idempotencyKey = `checkpoint:${input.runId}:${input.phase}`;
+    const existing = this.getEventByIdempotencyKey(input.sessionId, idempotencyKey);
+    if (existing) {
+      const existingCheckpoint = isRecord(existing.payload.checkpoint) ? existing.payload.checkpoint : null;
+      const comparableCheckpoint = existingCheckpoint && typeof existingCheckpoint.createdAt === "string"
+        ? { ...checkpoint, createdAt: existingCheckpoint.createdAt }
+        : checkpoint;
+      if (stableJson(existingCheckpoint) !== stableJson(comparableCheckpoint)) {
+        throw new Error("Run checkpoint identity mismatch for existing run phase.");
+      }
+      return existingCheckpoint as unknown as WorkflowNodeCheckpoint;
+    }
+    this.appendWorkflowEvent({
+      sessionId: input.sessionId,
+      kind: "workflow.node.checkpoint_recorded",
+      source: "backend",
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      idempotencyKey,
+      payload: { checkpoint },
+      now: input.now,
+    });
+    return checkpoint;
   }
 
   private recordPlannerRunResult(
@@ -982,6 +1235,11 @@ export class WorkflowStore {
       ? "completed"
       : "failed";
     const tx = this.db.transaction(() => {
+      const existing = this.statements.getSegment.get(input.sessionId, input.segmentId) as SegmentRow | undefined;
+      if (existing && existing.status !== "running") {
+        assertPlannerTerminalEvidenceReplay(existing, safeEvidence);
+        return;
+      }
       this.ensureSegmentInTransaction({
         sessionId: input.sessionId,
         laneId: input.laneId,
@@ -1046,13 +1304,71 @@ export class WorkflowStore {
         kind: "lane_status_changed",
         source: "workflow_store",
         laneId: input.laneId,
+        segmentId: input.segmentId,
         causationId: evidenceEvent.id,
+        idempotencyKey: `planner-segment:${input.segmentId}:lane-terminal`,
         payload: { status: laneStatus, reason: "planner run evidence" },
         now: input.now,
       });
     });
     tx();
     return this.materializeFlowProjection(input.sessionId);
+  }
+
+  private assertExecutableTerminalReplay(
+    input: RecordRunResultInput,
+    evidence: RunEvidence,
+    outputSummary: string,
+  ): void {
+    const output = this.getEventByIdempotencyKey(input.sessionId, `segment:${input.segmentId}:output-summary`);
+    const expectedOutput = {
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      text: outputSummary,
+    };
+    if (
+      output?.kind !== "workflow.segment.output_delta" ||
+      output.source !== input.agentKind ||
+      stableJson(output.payload) !== stableJson(expectedOutput)
+    ) {
+      throw new Error("Executable terminal output conflict for existing run.");
+    }
+
+    const status = flowStatusFromRunEvidence(evidence);
+    const evidenceStatus = status === "succeeded" ? "passed" : evidence.status === "cancelled" ? "skipped" : "failed";
+    const evidenceEvent = this.getEventByIdempotencyKey(input.sessionId, `segment:${input.segmentId}:evidence`);
+    const expectedEvidence = {
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      evidence: {
+        id: `evidence-${input.segmentId}`,
+        kind: "run-exit",
+        status: evidenceStatus,
+        changesetId: evidence.changesetId,
+        checks: evidence.checks.map((check) => `${check.kind}:${check.name}:${check.status}`),
+        artifacts: evidence.artifacts,
+        detail: evidence.errorReason ?? evidence.review?.detail ?? null,
+        runEvidence: evidence,
+      },
+    };
+    const finished = this.getEventByIdempotencyKey(input.sessionId, `segment:${input.segmentId}:finished`);
+    const expectedFinished = {
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      status,
+      exitCode: evidence.exitCode,
+      errorReason: evidence.errorReason ?? evidence.cancelReason ?? null,
+    };
+    if (
+      evidenceEvent?.kind !== "workflow.evidence.recorded" ||
+      evidenceEvent.source !== input.agentKind ||
+      stableJson(evidenceEvent.payload) !== stableJson(expectedEvidence) ||
+      finished?.kind !== "workflow.segment.finished" ||
+      finished.source !== input.agentKind ||
+      stableJson(finished.payload) !== stableJson(expectedFinished)
+    ) {
+      throw new Error("Executable terminal evidence conflict for existing run.");
+    }
   }
 
   materializeFlowProjection(sessionId: string): FlowProjection {
@@ -1181,8 +1497,123 @@ export class WorkflowStore {
     return row ? mapLane(row) : null;
   }
 
+  claimPlannerRunStart(input: ClaimPlannerRunStartInput): ClaimPlannerRunStartResult {
+    const session = this.requireKnownSession(input.sessionId);
+    const lane = this.getLane(input.sessionId, input.laneId);
+    if (
+      !lane ||
+      lane.id !== session.plannerLaneId ||
+      lane.laneKind !== "planner" ||
+      lane.agentKind !== "hermes" ||
+      input.agentKind !== "hermes" ||
+      lane.archived
+    ) {
+      throw new Error("Planner run start identity mismatch.");
+    }
+    const segmentId = plannerSegmentIdForRun(input.runId);
+    const tx = this.db.transaction(() => {
+      const existing = this.statements.getSegmentByRunId.get(input.runId) as SegmentRow | undefined;
+      if (existing) {
+        if (
+          existing.id !== segmentId ||
+          existing.session_id !== input.sessionId ||
+          existing.lane_id !== input.laneId ||
+          existing.agent_kind !== input.agentKind
+        ) {
+          throw new Error("Planner run start identity mismatch for existing run.");
+        }
+        if (existing.status !== "running") throw new Error(`Planner run ${input.runId} is already terminal.`);
+        return false;
+      }
+      this.ensureSegmentInTransaction({
+        ...input,
+        segmentId,
+        transport: "agent-bridge",
+      });
+      this.setLaneStatus(input.sessionId, input.laneId, "running", input.now);
+      this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "lane_status_changed",
+        source: "workflow_store",
+        laneId: input.laneId,
+        segmentId,
+        idempotencyKey: `planner-run:${input.runId}:lane-running`,
+        payload: { status: "running", reason: "planner turn started", runId: input.runId },
+        now: input.now,
+      });
+      return true;
+    });
+    const created = tx.immediate();
+    const segment: RunningWorkflowSegment = {
+      sessionId: input.sessionId,
+      laneId: input.laneId,
+      segmentId,
+      runId: input.runId,
+      agentKind: input.agentKind,
+      status: "running",
+    };
+    return { segment, created };
+  }
+
   listSegments(sessionId: string, laneId: string): WorkflowSegmentRecord[] {
     return (this.statements.listSegments.all(sessionId, laneId) as SegmentRow[]).map(mapSegment);
+  }
+
+  listRunningSegments(): RunningWorkflowSegment[] {
+    const plannerSegments = (this.statements.listRunningPlannerSegments.all() as SegmentRow[]).map((segment) => ({
+      sessionId: segment.session_id,
+      laneId: segment.lane_id,
+      segmentId: segment.id,
+      runId: segment.run_id,
+      agentKind: segment.agent_kind,
+      status: "running" as const,
+    }));
+    const sessions = this.statements.listWorkflowSessionIds.all() as Array<{ id: string }>;
+    const flowSegments = sessions.flatMap(({ id: sessionId }) => {
+      const projection = this.materializeFlowProjection(sessionId);
+      return projection.segments
+        .filter((segment) => segment.status === "running")
+        .flatMap((segment) => {
+          const lane = projection.lanes.find((item) => item.id === segment.laneId);
+          return lane ? [{
+            sessionId,
+            laneId: segment.laneId,
+            segmentId: segment.id,
+            runId: segment.runId,
+            agentKind: lane.agentKind,
+            status: "running" as const,
+          }] : [];
+        });
+    });
+    return [...plannerSegments, ...flowSegments];
+  }
+
+  listPendingRunCheckpointEnrichments(): RunCheckpointEnrichmentCandidate[] {
+    const sessions = this.statements.listWorkflowSessionIds.all() as Array<{ id: string }>;
+    return sessions.flatMap(({ id: sessionId }) => {
+      const projection = this.materializeFlowProjection(sessionId);
+      return projection.segments.flatMap((segment) => {
+        if (segment.status === "running") return [];
+        const lane = projection.lanes.find((item) => item.id === segment.laneId);
+        if (!lane || lane.executable === false) return [];
+        const checkpoints = projection.checkpoints.filter((checkpoint) =>
+          checkpoint.sessionId === sessionId &&
+          checkpoint.laneId === segment.laneId &&
+          checkpoint.segmentId === segment.id &&
+          checkpoint.runId === segment.runId
+        );
+        if (!checkpoints.some((checkpoint) => checkpoint.phase === "before") || checkpoints.some((checkpoint) => checkpoint.phase === "after")) {
+          return [];
+        }
+        return [{
+          sessionId,
+          laneId: segment.laneId,
+          segmentId: segment.id,
+          runId: segment.runId,
+          agentKind: lane.agentKind,
+        }];
+      });
+    });
   }
 
   applyWorkflowCardToolCall(
@@ -1439,10 +1870,6 @@ export class WorkflowStore {
     const tx = this.db.transaction(() => {
       const currentProjection = this.materializeFlowProjection(input.sessionId);
       const currentPrepared = prepareCheckpointSuccessorRequest(kind, input, currentProjection);
-      const existingForFailedEvidence = kind === "repair" && currentPrepared.failedEvidence
-        ? this.checkpointRepairFailedEvidenceResult(input.sessionId, currentPrepared.failedEvidence.id)
-        : null;
-      if (existingForFailedEvidence) return { kind: "existing" as const, existing: existingForFailedEvidence };
       const existing = this.checkpointSuccessorIdempotentResult(
         kind,
         input,
@@ -1451,6 +1878,10 @@ export class WorkflowStore {
         currentPrepared.successorSemanticKey,
       );
       if (existing) return { kind: "existing" as const, existing };
+      const existingForFailedEvidence = kind === "repair" && currentPrepared.failedEvidence
+        ? this.checkpointRepairFailedEvidenceResult(input.sessionId, currentPrepared.failedEvidence.id)
+        : null;
+      if (existingForFailedEvidence) return { kind: "existing" as const, existing: existingForFailedEvidence };
       this.assertCheckpointSuccessorIdentityAvailable(kind, currentPrepared);
       const lanePayload = successorLanePayload(
         kind,
@@ -2114,7 +2545,7 @@ export class WorkflowStore {
   private setLaneStatus(sessionId: string, laneId: string, status: WorkflowLaneStatus, now: string): void {
     const lane = this.getLane(sessionId, laneId);
     if (!lane) throw new Error(`Unknown workflow lane ${laneId}.`);
-    if (lane.status === "completed" && status === "running") {
+    if (lane.status === "completed" && status === "running" && lane.laneKind !== "planner") {
       throw new Error("Completed workflow lane cannot return to running without continuation.");
     }
     this.statements.updateLaneStatus.run({
@@ -2539,6 +2970,9 @@ function prepareCheckpointSuccessorRequest(
     throw new Error(`${kind} requires an explicit ${requiredPhase} checkpoint.`);
   }
   if (checkpoint.phase !== requiredPhase) throw new Error(`${kind} requires a ${requiredPhase} checkpoint.`);
+  if (kind === "variant" && checkpoint.worktreeState === "dirty") {
+    throw new Error("variant requires a restorable clean before checkpoint.");
+  }
   const lane = projection.lanes.find((item) => item.id === targetLaneId);
   if (!lane) throw new Error(`${kind} requires a known target lane.`);
   const failedEvidence = kind === "repair" ? failedEvidenceForCheckpoint(projection, targetLaneId, checkpoint) : undefined;
@@ -2735,42 +3169,21 @@ function failedEvidenceForCheckpoint(
   laneId: string,
   checkpoint: WorkflowNodeCheckpoint,
 ): FlowEvidence | undefined {
-  const candidates = [...projection.evidence]
-    .reverse()
-    .filter((evidence) => evidence.laneId === laneId && evidence.status === "failed");
-  if (checkpoint.segmentId) {
-    const segmentMatch = candidates.find((evidence) =>
-      evidence.segmentId === checkpoint.segmentId &&
-      failedEvidenceRunMatchesCheckpoint(projection, laneId, checkpoint, evidence)
-    );
-    if (segmentMatch) return segmentMatch;
-    return undefined;
-  }
-  if (checkpoint.runId) {
-    const runMatch = candidates.find((evidence) => failedEvidenceRunMatchesCheckpoint(projection, laneId, checkpoint, evidence));
-    if (runMatch) return runMatch;
-    return undefined;
-  }
-  const checkpointEvidenceIds = new Set(
-    checkpoint.evidenceRefs
-      .filter((ref) => ref.kind === "evidence")
-      .map((ref) => ref.id),
+  if (!checkpoint.runId || !checkpoint.segmentId) return undefined;
+  const segment = projection.segments.find((item) =>
+    item.id === checkpoint.segmentId &&
+    item.laneId === laneId &&
+    item.runId === checkpoint.runId &&
+    item.status === "failed"
   );
-  if (checkpointEvidenceIds.size > 0) {
-    return candidates.find((evidence) => checkpointEvidenceIds.has(evidence.id));
-  }
-  return undefined;
-}
-
-function failedEvidenceRunMatchesCheckpoint(
-  projection: FlowProjection,
-  laneId: string,
-  checkpoint: WorkflowNodeCheckpoint,
-  evidence: FlowEvidence,
-): boolean {
-  if (!checkpoint.runId) return true;
-  const segment = projection.segments.find((item) => item.id === evidence.segmentId && item.laneId === laneId);
-  return segment?.runId === checkpoint.runId;
+  if (!segment) return undefined;
+  return [...projection.evidence].reverse().find((evidence) =>
+    evidence.laneId === laneId &&
+    evidence.segmentId === checkpoint.segmentId &&
+    evidence.status === "failed" &&
+    evidence.runEvidence?.runId === checkpoint.runId &&
+    evidence.runEvidence?.status === "failed"
+  );
 }
 
 function runIdForFailedEvidence(
@@ -2856,10 +3269,32 @@ function segmentIdForLane(sessionId: string, laneId: string): string {
   return `segment-${sessionId}-${laneId}`;
 }
 
+function plannerSegmentIdForRun(runId: string): string {
+  return `planner-segment-${runId}`;
+}
+
 function flowStatusFromRunEvidence(evidence: RunEvidence): "succeeded" | "failed" | "cancelled" | "timed-out" {
   if (evidence.status === "cancelled") return "cancelled";
   if (evidence.status === "timed-out") return "timed-out";
   return evidence.exitCode === 0 || evidence.status === "succeeded" ? "succeeded" : "failed";
+}
+
+function isTerminalRunEvidence(evidence: RunEvidence): boolean {
+  return new Set(["succeeded", "failed", "cancelled", "timed-out"]).has(evidence.status) &&
+    typeof evidence.completedAt === "string" && evidence.completedAt.length > 0;
+}
+
+function assertPlannerTerminalEvidenceReplay(segment: SegmentRow, evidence: RunEvidence): void {
+  const status = flowStatusFromRunEvidence(evidence);
+  const errorReason = evidence.errorReason ?? evidence.cancelReason ?? null;
+  if (
+    segment.status !== status ||
+    segment.evidence_json !== stableJson(evidence) ||
+    segment.exit_code !== (evidence.exitCode ?? null) ||
+    segment.error_reason !== errorReason
+  ) {
+    throw new Error("Planner terminal evidence conflict for existing run.");
+  }
 }
 
 function resultSummaryFromEvidence(evidence: RunEvidence): string {
@@ -3096,6 +3531,7 @@ function prepareStatements(db: Database.Database): WorkflowStoreStatements {
   return {
     migrations: db.prepare("SELECT version FROM schema_migrations ORDER BY version"),
     getSession: db.prepare("SELECT * FROM workflow_sessions WHERE id = ?"),
+    listWorkflowSessionIds: db.prepare("SELECT id FROM workflow_sessions ORDER BY created_at, id"),
     listHermesSessions: db.prepare("SELECT * FROM hermes_sessions WHERE workflow_session_id = ? ORDER BY started_at, id"),
     listEvents: db.prepare("SELECT * FROM workflow_events WHERE session_id = ? ORDER BY seq"),
     getEventByIdempotencyKey: db.prepare("SELECT * FROM workflow_events WHERE session_id = ? AND idempotency_key = ?"),
@@ -3134,7 +3570,16 @@ function prepareStatements(db: Database.Database): WorkflowStoreStatements {
     ),
     listEdges: db.prepare("SELECT * FROM workflow_edges WHERE session_id = ? ORDER BY created_at, id"),
     getSegment: db.prepare("SELECT * FROM workflow_segments WHERE session_id = ? AND id = ?"),
+    getSegmentByRunId: db.prepare("SELECT * FROM workflow_segments WHERE run_id = ?"),
     listSegments: db.prepare("SELECT * FROM workflow_segments WHERE session_id = ? AND lane_id = ? ORDER BY started_at, id"),
+    listRunningPlannerSegments: db.prepare(
+      [
+        "SELECT workflow_segments.* FROM workflow_segments",
+        "JOIN workflow_lanes ON workflow_lanes.id = workflow_segments.lane_id",
+        "WHERE workflow_segments.status = 'running' AND workflow_lanes.lane_kind = 'planner'",
+        "ORDER BY workflow_segments.started_at, workflow_segments.id",
+      ].join(" "),
+    ),
     insertSegment: db.prepare(
       [
         "INSERT INTO workflow_segments(id, session_id, lane_id, parent_segment_id, run_id, agent_kind, transport, status, worktree_path, started_at, ended_at, exit_code, evidence_json, error_reason)",
@@ -3152,6 +3597,9 @@ function prepareStatements(db: Database.Database): WorkflowStoreStatements {
         "INSERT INTO workflow_sessions(id, project_id, hermes_session_id, planner_lane_id, title, goal, mode, execution_target, selected_branch, base_ref, created_at, updated_at)",
         "VALUES (@id, @project_id, @hermes_session_id, @planner_lane_id, @title, @goal, @mode, @execution_target, @selected_branch, @base_ref, @created_at, @updated_at)",
       ].join(" "),
+    ),
+    updateCurrentBranchTarget: db.prepare(
+      "UPDATE workflow_sessions SET selected_branch = @selected_branch, updated_at = @updated_at WHERE id = @id",
     ),
     insertHermesSession: db.prepare(
       [
@@ -3452,7 +3900,13 @@ function workflowIntentId(intent: unknown): string {
 }
 
 function isFlowEventKind(kind: WorkflowEventKind): kind is FlowEventKind {
-  return kind.startsWith("workflow.");
+  return kind.startsWith("workflow.") && !isWorkflowAuditEventKind(kind);
+}
+
+function isWorkflowAuditEventKind(kind: WorkflowEventKind): kind is WorkflowAuditEventKind {
+  return kind === "workflow.run.recovery_failed" ||
+    kind === "workflow.run.start_reconciliation_failed" ||
+    kind === "workflow.node.checkpoint_failed";
 }
 
 function mapLane(row: LaneRow): WorkflowLaneRecord {
