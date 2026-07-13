@@ -94,6 +94,55 @@ describe("deriveSessionTarget", () => {
   });
 });
 
+describe("canvas node position persistence", () => {
+  it("keeps pointer-move positions local and commits workspace state only on drag stop", async () => {
+    const appSource = await readSource("./App.tsx");
+    const moveHandler = appSource.slice(
+      appSource.indexOf("const handleNodesChange"),
+      appSource.indexOf("const handleNodeDragStop"),
+    );
+    const stopHandler = appSource.slice(
+      appSource.indexOf("const handleNodeDragStop"),
+      appSource.indexOf("return (", appSource.indexOf("const handleNodeDragStop")),
+    );
+
+    expect(moveHandler).toContain("onFlowNodesChange(changes)");
+    expect(moveHandler).not.toContain("onNodePositionCommit");
+    expect(moveHandler).not.toContain("setWorkspace");
+    expect(stopHandler).toContain("await onNodePositionCommit(finalCanvasNodePositionUpdate(node))");
+    expect(stopHandler.match(/onNodePositionCommit\(/g)).toHaveLength(1);
+  });
+
+  it("reports a bounded save error and restores the persisted position when IPC fails", async () => {
+    const appSource = await readSource("./App.tsx");
+    const stopHandler = appSource.slice(
+      appSource.indexOf("const handleNodeDragStop"),
+      appSource.indexOf("return (", appSource.indexOf("const handleNodeDragStop")),
+    );
+    const canvasView = appSource.slice(
+      appSource.indexOf("function CanvasView("),
+      appSource.indexOf("function CanvasViewportController"),
+    );
+
+    expect(stopHandler).toContain("catch");
+    expect(stopHandler).toContain("persistedNode.position");
+    expect(canvasView).toContain('role="alert"');
+    expect(canvasView).toContain("positionSaveError");
+  });
+
+  it("retries an ambiguous IPC failure once with the same idempotency key", async () => {
+    const appSource = await readSource("./App.tsx");
+    const commitHandler = appSource.slice(
+      appSource.indexOf("const commitActiveNodePosition"),
+      appSource.indexOf("async function importProject"),
+    );
+
+    expect(commitHandler).toContain("const updateId = crypto.randomUUID()");
+    expect(commitHandler).toContain("const persistPosition = () => workflow.updateNodePosition");
+    expect(commitHandler.match(/await persistPosition\(\)/g)).toHaveLength(2);
+  });
+});
+
 describe("changes logic", () => {
   const node = mockNode("codex");
 

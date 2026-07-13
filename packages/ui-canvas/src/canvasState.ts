@@ -1,5 +1,3 @@
-import type { NodeChange } from "@xyflow/react";
-
 import type { CanvasNode } from "@skyturn/project-core";
 
 export interface CanvasNodePositionUpdate {
@@ -7,21 +5,16 @@ export interface CanvasNodePositionUpdate {
   position: CanvasNode["position"];
 }
 
-export function positionUpdatesFromNodeChanges(changes: NodeChange[]): CanvasNodePositionUpdate[] {
-  const updates: CanvasNodePositionUpdate[] = [];
-
-  for (const change of changes) {
-    if (change.type !== "position" || !change.position) continue;
-    updates.push({
-      id: change.id,
-      position: {
-        x: change.position.x,
-        y: change.position.y,
-      },
-    });
-  }
-
-  return updates;
+export function finalCanvasNodePositionUpdate(
+  node: Pick<CanvasNode, "id" | "position">,
+): CanvasNodePositionUpdate {
+  return {
+    id: node.id,
+    position: {
+      x: node.position.x,
+      y: node.position.y,
+    },
+  };
 }
 
 export function applyCanvasNodePositionUpdates(
