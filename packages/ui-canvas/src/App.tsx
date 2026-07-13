@@ -64,7 +64,7 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 
-import type { EditorKind } from "@skyturn/git-worktree";
+import type { EditorKind, VariantComparisonEvidence } from "@skyturn/git-worktree";
 import {
   browserEditorAdapter,
   emptyWorkspace,
@@ -4535,15 +4535,11 @@ interface WorktreeCleanConfirmationInput {
 const WORKTREE_PRIMARY_CHECK_KINDS = new Set(["test", "build", "typecheck"]);
 const MAX_COMPARE_FILES = 3;
 
-export function summarizeWorktreeComparisonEvidence(comparison: unknown): WorktreeComparisonEvidenceSummary {
-  const source = asRecord(comparison);
-  const rawVariants = Array.isArray(source?.variants) ? source.variants : [];
-  const variants = rawVariants.filter(isRecord).map(summarizeWorktreeComparisonVariant);
-
+export function summarizeWorktreeComparisonEvidence(comparison: VariantComparisonEvidence): WorktreeComparisonEvidenceSummary {
   return {
-    comparisonId: textValue(source?.comparisonId, "Comparison"),
-    collectedAt: optionalText(source?.collectedAt),
-    variants,
+    comparisonId: comparison.comparisonId,
+    collectedAt: comparison.collectedAt,
+    variants: comparison.variants.map(summarizeWorktreeComparisonVariant),
   };
 }
 
@@ -4581,25 +4577,25 @@ export function buildWorktreeDeleteBranchConfirmation(branchName?: string): stri
   ].join("\n");
 }
 
-function summarizeWorktreeComparisonVariant(variant: Record<string, unknown>): WorktreeComparisonVariantSummary {
-  const changeset = asRecord(variant.changeset);
-  const files = stringArray(changeset?.files);
+function summarizeWorktreeComparisonVariant(
+  variant: VariantComparisonEvidence["variants"][number],
+): WorktreeComparisonVariantSummary {
+  const { changeset } = variant;
+  const files = changeset.files;
   const filePreview = files.slice(0, MAX_COMPARE_FILES);
-  const metrics = Array.isArray(variant.metrics)
-    ? variant.metrics.filter(isRecord).map(summarizeWorktreeMetric)
-    : [];
+  const metrics = variant.metrics.map(summarizeWorktreeMetric);
   const changedFileMetric = metrics.find((metric) => metric.kind === "changed-file-count");
   const diffMetric = metrics.find((metric) => metric.kind === "diff-summary");
   const conflictMetric = metrics.find((metric) => metric.kind === "conflict-check");
-  const changeStatus = textValue(changeset?.status, "unknown");
+  const changeStatus = changeset.status;
 
   return {
-    variantId: textValue(variant.variantId, "Unknown variant"),
-    worktreeId: textValue(variant.worktreeId, "Unknown worktree"),
+    variantId: variant.variantId,
+    worktreeId: variant.worktreeId,
     changeStatus,
     changedFileCount: metricValueText(changedFileMetric) ?? changedFileCountText(changeStatus, files),
     diffSummary: diffMetric?.detail
-      ?? diffSummaryText(changeStatus, files, asRecord(changeset?.diffStat), optionalText(changeset?.errorReason)),
+      ?? diffSummaryText(changeStatus, files, changeset.diffStat, changeset.errorReason),
     conflictStatus: conflictMetric?.status === "unknown" || !conflictMetric ? "not recorded" : conflictMetric.status,
     conflictDetail: conflictMetric?.status === "unknown" ? undefined : conflictMetric?.detail,
     checks: metrics
@@ -4610,13 +4606,15 @@ function summarizeWorktreeComparisonVariant(variant: Record<string, unknown>): W
   };
 }
 
-function summarizeWorktreeMetric(metric: Record<string, unknown>) {
+function summarizeWorktreeMetric(
+  metric: VariantComparisonEvidence["variants"][number]["metrics"][number],
+) {
   return {
-    kind: textValue(metric.kind, "unknown"),
-    label: textValue(metric.label, "Metric"),
-    status: textValue(metric.status, "unknown"),
-    value: typeof metric.value === "number" || typeof metric.value === "string" ? metric.value : undefined,
-    detail: optionalText(metric.detail),
+    kind: metric.kind,
+    label: metric.label,
+    status: metric.status,
+    value: metric.value,
+    detail: metric.detail,
   };
 }
 
@@ -4630,15 +4628,15 @@ function changedFileCountText(status: string, files: string[]): string {
 function diffSummaryText(
   status: string,
   files: string[],
-  diffStat: Record<string, unknown> | null,
+  diffStat: VariantComparisonEvidence["variants"][number]["changeset"]["diffStat"],
   errorReason?: string,
 ): string {
   if (status === "failed") return errorReason ?? "Diff collection failed.";
   if (status === "empty") return "No git diff recorded.";
   if (status !== "available") return "Not recorded";
 
-  const added = numberValue(diffStat?.added) ?? 0;
-  const deleted = numberValue(diffStat?.deleted) ?? 0;
+  const added = diffStat.added;
+  const deleted = diffStat.deleted;
   const fileLabel = files.length === 1 ? "file" : "files";
   return `+${added} / -${deleted} across ${files.length} ${fileLabel}`;
 }
@@ -4800,7 +4798,7 @@ function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasN
 
 function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
   const [comparing, setComparing] = useState(false);
-  const [compareResult, setCompareResult] = useState<unknown>(null);
+  const [compareResult, setCompareResult] = useState<VariantComparisonEvidence | null>(null);
   const [compareError, setCompareError] = useState<string | null>(null);
 
   const [adopting, setAdopting] = useState(false);
@@ -4852,8 +4850,9 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
     setCompareError(null);
     try {
       const result = await devflow.workflow.compareWorktrees(projectRoot, {
-        left: node.worktree,
-        right: otherNode.worktree,
+        sessionId: session.id,
+        leftWorktreeId: node.worktree.worktreeId!,
+        rightWorktreeId: otherNode.worktree.worktreeId!,
       });
       setCompareResult(result.comparison);
     } catch (e: any) {

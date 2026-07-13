@@ -15,6 +15,8 @@ import type {
 
 import {
   buildAdjudicationMetrics,
+  parseVariantComparisonEvidence,
+  parseWorktreeComparisonRequest,
   type ChangesetEvidenceInput,
   type ChangesetEvidenceService,
   type ChangesetReconciliationInput,
@@ -51,6 +53,8 @@ import {
   type VariantComparisonInput,
   type VariantAdoptionService,
 } from "./index.js";
+
+export { parseVariantComparisonEvidence, parseWorktreeComparisonRequest };
 
 export type ManagedWorktreeWorkflowEventKind =
   | "workflow.worktree.create_requested"

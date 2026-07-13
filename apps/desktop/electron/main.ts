@@ -9,7 +9,7 @@ import {
   DEVFLOW_FILES,
   defaultDevflowFileContent,
 } from "@skyturn/project-memory";
-import type { AgentDescriptor } from "@skyturn/project-core" with { "resolution-mode": "import" };
+import type { AgentDescriptor, WorkflowWorktreeIdentity } from "@skyturn/project-core" with { "resolution-mode": "import" };
 import {
   isTrustedPlannerRootStartInput,
   normalizeWorkflowIpcError,
@@ -19,6 +19,7 @@ import {
   workflowStartInputError,
   type WorkflowIpcErrorCode,
 } from "./workflowIpcContracts";
+import { compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
 import { createTerminalRuntime } from "./terminalRuntime";
 import {
   normalizeTerminalIpcError,
@@ -315,19 +316,7 @@ interface ManagedWorktreeWorkflowEventLike {
   sessionId?: string;
 }
 
-interface WorkflowWorktreeIdentityLike {
-  worktreeId: string;
-  variantId: string;
-  path: string;
-  realPath: string;
-  gitdir: string;
-  repoRoot: string;
-  branchName: string;
-  baseCommit: string;
-  headCommit: string;
-  parentLaneId: string;
-  parentSegmentId?: string;
-}
+type WorkflowWorktreeIdentityLike = WorkflowWorktreeIdentity;
 
 interface WorkflowVariantAdoptionLike {
   adoptionId: string;
@@ -1178,18 +1167,13 @@ ipcMain.handle("workflow:worktree:create", workflowHandler(async (projectRoot: s
 }));
 
 ipcMain.handle("workflow:worktree:compare", workflowHandler(async (projectRoot: string, input: unknown) => {
-  assertKnownProjectRoot(projectRoot);
-  const left = requireRecord(readField(input, "left"), "left worktree");
-  const right = requireRecord(readField(input, "right"), "right worktree");
-  const comparison = {
-    comparisonId: `comparison-${requireText(left.worktreeId, "left worktree id")}-${requireText(right.worktreeId, "right worktree id")}`,
-    variants: [
-      await collectChangesetEvidenceForWorktree(projectRoot, left),
-      await collectChangesetEvidenceForWorktree(projectRoot, right),
-    ],
-    collectedAt: new Date().toISOString(),
-  };
-  return { protocolVersion: RUN_PROTOCOL_VERSION, comparison };
+  return compareWorkflowWorktrees({
+    assertKnownProjectRoot,
+    getWorkflowStore,
+    loadGitWorktreeModule: () => import("@skyturn/git-worktree/node"),
+    canonicalPath: (value) => fs.realpath(value),
+    protocolVersion: RUN_PROTOCOL_VERSION,
+  }, projectRoot, input);
 }));
 
 ipcMain.handle("workflow:worktree:adopt", workflowHandler(async (projectRoot: string, input: unknown) => {
@@ -4096,50 +4080,6 @@ async function gitExitCode(repoRoot: string, args: string[]): Promise<number> {
   } catch (error) {
     const failure = error as { code?: number | string };
     return typeof failure.code === "number" ? failure.code : 1;
-  }
-}
-
-async function collectChangesetEvidenceForWorktree(
-  projectRoot: string,
-  worktree: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  const variantId = requireText(worktree.variantId, "worktree variant id");
-  const worktreeId = requireText(worktree.worktreeId, "worktree id");
-  const worktreePath = requireText(worktree.realPath ?? worktree.path, "worktree path");
-  assertManagedWorktreePath(projectRoot, worktreePath);
-  const changesetId = `changeset-${worktreeId}`;
-  try {
-    const changeset = await collectGitChangeset(projectRoot, worktreePath, changesetId);
-    return {
-      variantId,
-      worktreeId,
-      changeset: {
-        evidenceId: `changeset-evidence-${worktreeId}`,
-        changesetId,
-        source: "git",
-        status: changeset.files.length > 0 ? "available" : "empty",
-        files: changeset.files,
-        diffStat: changeset.diffStat,
-        patchPreviewTruncated: changeset.patchPreview.length >= 12000,
-        worktreeId,
-      },
-    };
-  } catch (error) {
-    return {
-      variantId,
-      worktreeId,
-      changeset: {
-        evidenceId: `changeset-evidence-${worktreeId}`,
-        changesetId,
-        source: "git",
-        status: "failed",
-        files: [],
-        diffStat: { added: 0, changed: 0, deleted: 0 },
-        patchPreviewTruncated: false,
-        worktreeId,
-        errorReason: sanitizeSnippet(error instanceof Error ? error.message : String(error)),
-      },
-    };
   }
 }
 

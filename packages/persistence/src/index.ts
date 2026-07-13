@@ -9,6 +9,8 @@ import type {
   EditorKind,
   GitBranchFacts,
   ManagedWorktreeCleanupResult,
+  VariantComparisonEvidence,
+  WorktreeComparisonRequest,
 } from "@skyturn/git-worktree";
 import {
   makeHermesPlannerSessionId,
@@ -246,7 +248,7 @@ export interface WorkflowApi {
   }>;
   answerUserDecision: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   createWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown; worktree: WorkflowWorktreeIdentity }>;
-  compareWorktrees: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; comparison: unknown }>;
+  compareWorktrees: (projectRoot: string, input: WorktreeComparisonRequest) => Promise<{ protocolVersion: number; comparison: VariantComparisonEvidence }>;
   adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "adopted" | "failed"; event: unknown | null; adoption: WorkflowVariantAdoption & { status: "adopted" | "failed" } }>;
   cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "cleaned"; event: unknown | null; result: ManagedWorktreeCleanupResult }>;
   createDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
