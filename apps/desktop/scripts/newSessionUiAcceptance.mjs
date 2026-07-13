@@ -35,12 +35,14 @@ export async function runNewSessionUiAcceptance() {
   const demo = await loadDemoHelpers();
   const { demoReadinessPreflight, readinessFailureResult } = demo;
   const bridgeModule = await import("@skyturn/agent-bridge");
-  const bridge = new bridgeModule.AgentBridge({
-    adapters: [bridgeModule.createHermesCliAdapter(), bridgeModule.createCodexCliAdapter()],
-  });
-
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-new-session-ui-react-"));
   const userData = await mkdtemp(join(tmpdir(), "skyturn-new-session-ui-user-data-"));
+  const durableRunClaimStore = bridgeModule.createDurableRunClaimStore({ root: join(userData, "run-claims") });
+  const bridge = new bridgeModule.AgentBridge({
+    adapters: [bridgeModule.createHermesCliAdapter(), bridgeModule.createCodexCliAdapter()],
+    durableRunClaimStore,
+    privateRunEventStore: bridgeModule.createPrivateRunEventStore({ durableRunClaimStore }),
+  });
   let cleanupProject = process.env.SKYTURN_NEW_SESSION_UI_CLEANUP === "1";
   let cleanupUserData = process.env.SKYTURN_NEW_SESSION_UI_KEEP_USER_DATA !== "1";
 

@@ -1,7 +1,8 @@
-import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -9,7 +10,7 @@ import {
   type WorkflowCardCreateInput,
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
-import type { RunEvidence, WorkflowWorktreeIdentity } from "@skyturn/project-core";
+import type { RunEvent, RunEvidence, WorkflowWorktreeIdentity } from "@skyturn/project-core";
 import {
   compileInsertClarificationBefore,
   scheduleReadyLanes,
@@ -19,6 +20,7 @@ import {
 } from "@skyturn/workflow-kernel";
 
 const roots: string[] = [];
+const hermesHandlePhysicalCleanup = "hermes_handle_physical_cleanup_v1";
 
 afterEach(async () => {
   await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
@@ -26,6 +28,192 @@ afterEach(async () => {
 });
 
 describe("SQLite workflow store", () => {
+  it("never persists or returns a raw Hermes resume handle", async () => {
+    const projectRoot = await makeTempRoot();
+    const rawHandle = "Bearer resume-secret path=/Users/alice/private password=hunter2";
+    const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: "session-resume",
+      projectId: "project-1",
+      title: "Resume Hermes",
+      goal: "Continue planning",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_session_resume",
+      opaqueHandle: rawHandle,
+      now: "2026-06-14T00:00:00.000Z",
+    });
+
+    expect(JSON.stringify(store.listHermesSessions("session-resume"))).not.toContain(rawHandle);
+    expect(store.listHermesSessions("session-resume")[0]?.opaqueHandle).toBe("[redacted]");
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), { readonly: true });
+    expect(db.prepare("SELECT opaque_handle FROM hermes_sessions WHERE workflow_session_id = ?").get("session-resume")).toEqual({
+      opaque_handle: "[redacted]",
+    });
+    db.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const serialized = JSON.stringify({
+      sessions: reopened.listHermesSessions("session-resume"),
+      events: reopened.listEvents("session-resume"),
+    });
+    expect(serialized).not.toMatch(/resume-secret|alice|hunter2/);
+    expect(reopened.listHermesSessions("session-resume")[0]?.opaqueHandle).toBe("[redacted]");
+    reopened.close();
+  });
+
+  it("physically redacts schema-current legacy Hermes handles across reopen and repeated migration", async () => {
+    const projectRoot = await makeTempRoot();
+    const rawHandle = "legacy-schema-current-resume-capability-123456";
+    const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: "session-legacy-current",
+      projectId: "project-1",
+      title: "Legacy resume",
+      goal: "Continue planning",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_session_resume",
+      opaqueHandle: "current-write-redacted",
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    store.close();
+    seedLegacyHermesHandle(projectRoot, "session-legacy-current", rawHandle);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const reopened = createWorkflowStore({ projectRoot });
+      expect(reopened.listHermesSessions("session-legacy-current")[0]?.opaqueHandle).toBe("[redacted]");
+      expect(reopened.listAppliedMigrations()).toContain(5);
+      reopened.close();
+      await expectRawHandleAbsent(projectRoot, rawHandle);
+    }
+  });
+
+  it("physically redacts legacy Hermes handles while completing older migration markers", async () => {
+    const projectRoot = await makeTempRoot();
+    const rawHandle = "legacy-old-schema-resume-capability-654321";
+    const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: "session-legacy-old",
+      projectId: "project-1",
+      title: "Old legacy resume",
+      goal: "Continue planning",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_session_resume",
+      opaqueHandle: "current-write-redacted",
+      now: "2026-06-14T00:00:00.000Z",
+    });
+    store.close();
+    seedLegacyHermesHandle(projectRoot, "session-legacy-old", rawHandle, true);
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(reopened.listHermesSessions("session-legacy-old")[0]?.opaqueHandle).toBe("[redacted]");
+    reopened.close();
+    await expectRawHandleAbsent(projectRoot, rawHandle);
+  });
+
+  it.each([
+    ["old database without v5", "absent", "absent"],
+    ["v5 database without physical completion", "present", "absent"],
+    ["schema-current database containing a raw handle", "present", "complete"],
+  ] as const)("physically cleans %s and records completion exactly once", async (_name, v5, physicalState) => {
+    const projectRoot = await makeTempRoot();
+    const rawHandle = `legacy-${v5}-${physicalState}-resume-capability-123456`;
+    seedHermesHandleCleanupCase(projectRoot, rawHandle, { v5, physicalState });
+    const firstTrace: string[] = [];
+
+    const first = createWorkflowStore({
+      projectRoot,
+      faultInjection: maintenanceFaultInjection({ trace: firstTrace }),
+    });
+    expect(first.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(first.listHermesSessions("session-maintenance")[0]?.opaqueHandle).toBe("[redacted]");
+    first.close();
+
+    expect(firstTrace).toEqual(hermesHandlePhysicalCleanupSqlTrace);
+    expect(readHermesHandlePhysicalCleanupState(projectRoot)).toBe("complete");
+    await expectRawHandleAbsent(projectRoot, rawHandle);
+
+    const secondTrace: string[] = [];
+    const second = createWorkflowStore({
+      projectRoot,
+      faultInjection: maintenanceFaultInjection({ trace: secondTrace }),
+    });
+    second.close();
+    expect(secondTrace).toEqual([]);
+    expect(readHermesHandlePhysicalCleanupState(projectRoot)).toBe("complete");
+  });
+
+  it("does not repeat physical cleanup for an already-complete database", async () => {
+    const projectRoot = await makeTempRoot();
+    const first = createWorkflowStore({ projectRoot });
+    first.close();
+    expect(readHermesHandlePhysicalCleanupState(projectRoot)).toBe("complete");
+
+    const trace: string[] = [];
+    const reopened = createWorkflowStore({
+      projectRoot,
+      faultInjection: maintenanceFaultInjection({ trace }),
+    });
+    reopened.close();
+
+    expect(trace).toEqual([]);
+  });
+
+  it.each([
+    ["initial checkpoint busy", "initial-checkpoint"],
+    ["VACUUM SQLITE_FULL", "vacuum"],
+    ["completion marker write", "marker-write"],
+    ["final checkpoint busy", "final-checkpoint"],
+  ] as const)("retries Hermes handle physical cleanup after %s failure", async (_name, fault) => {
+    const projectRoot = await makeTempRoot();
+    const rawHandle = `legacy-${fault}-resume-capability-987654`;
+    seedHermesHandleCleanupCase(projectRoot, rawHandle, { v5: "absent", physicalState: "absent" });
+    const failedTrace: string[] = [];
+
+    expect(() => createWorkflowStore({
+      projectRoot,
+      faultInjection: maintenanceFaultInjection({ trace: failedTrace, fault }),
+    })).toThrow(fault === "vacuum"
+      ? /SQLITE_FULL/
+      : fault === "marker-write"
+        ? /marker write/
+        : /checkpoint failed/);
+    expect(failedTrace).toContain(fault === "initial-checkpoint"
+      ? "PRAGMA wal_checkpoint(TRUNCATE)"
+      : fault === "vacuum"
+        ? "VACUUM"
+        : fault === "final-checkpoint"
+          ? "PRAGMA wal_checkpoint(TRUNCATE)"
+          : "INSERT INTO workflow_maintenance(name, state, completed_at) VALUES (?, 'complete', datetime('now'))");
+    expect(readHermesHandlePhysicalCleanupState(projectRoot)).not.toBe("complete");
+
+    const retryTrace: string[] = [];
+    const reopened = createWorkflowStore({
+      projectRoot,
+      faultInjection: maintenanceFaultInjection({ trace: retryTrace }),
+    });
+    expect(reopened.listAppliedMigrations()).toContain(5);
+    expect(reopened.listHermesSessions("session-maintenance")[0]?.opaqueHandle).toBe("[redacted]");
+    reopened.close();
+
+    expect(retryTrace).toEqual(hermesHandlePhysicalCleanupSqlTrace);
+    expect(readHermesHandlePhysicalCleanupState(projectRoot)).toBe("complete");
+    await expectRawHandleAbsent(projectRoot, rawHandle);
+
+    const finalTrace: string[] = [];
+    const final = createWorkflowStore({
+      projectRoot,
+      faultInjection: maintenanceFaultInjection({ trace: finalTrace }),
+    });
+    final.close();
+    expect(finalTrace).toEqual([]);
+  });
+
   it("rejects a ready insert-before target and preserves the graph across restart", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
@@ -448,8 +636,8 @@ describe("SQLite workflow store", () => {
     expect(first.databasePath).toBe(join(await realpath(projectRoot), ".devflow", "skyturn-workflow.sqlite"));
     expect(pragmas.journalMode).toBe("wal");
     expect(pragmas.foreignKeys).toBe(1);
-    expect(firstMigrations).toEqual([1, 2]);
-    expect(second.listAppliedMigrations()).toEqual([1, 2]);
+    expect(firstMigrations).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(second.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7]);
     second.close();
   });
 
@@ -3415,14 +3603,23 @@ describe("SQLite workflow store", () => {
       idempotencyKey: "raw-output",
       payload: {
         laneId: "lane-implementation",
-        text: [
-          "stderr BEGIN",
-          "OPENAI_API_KEY=sk-do-not-leak",
-          "read .env with DATABASE_URL=postgres://secret",
-          "diff --git a/src/a.ts b/src/a.ts",
-          "+".repeat(7000),
-          "stderr END",
-        ].join("\n"),
+        delta: {
+          protocolVersion: 1,
+          runId: "run-ledger-output",
+          seq: 1,
+          timestamp: "2026-06-14T00:00:03.000Z",
+          kind: "output",
+          payload: {
+            text: [
+              "stderr BEGIN",
+              "OPENAI_API_KEY=sk-do-not-leak",
+              "read .env with DATABASE_URL=postgres://secret",
+              "diff --git a/src/a.ts b/src/a.ts",
+              "+".repeat(7000),
+              "stderr END",
+            ].join("\n"),
+          },
+        },
       },
       now: "2026-06-14T00:00:03.000Z",
     });
@@ -3449,6 +3646,213 @@ describe("SQLite workflow store", () => {
     expect(serialized.length).toBeLessThan(4_000);
   });
 
+  it.each([
+    ["text-only downgrade", "codex", "invalid-output:text-only", { text: "legacy without provenance" }],
+    [
+      "text-only forged compatibility",
+      "codex",
+      "invalid-output:forged-compatibility",
+      { text: "forged legacy", compatibilitySource: "legacy-disk" },
+    ],
+    [
+      "text-only trusted-looking metadata",
+      "persistence-migration",
+      "legacy-disk:output:1",
+      { text: "forged trusted source" },
+    ],
+    [
+      "typed forged compatibility",
+      "codex",
+      "invalid-output:typed-forged-compatibility",
+      {
+        compatibilitySource: "legacy-disk",
+        delta: runOutputEvent("run-typed-forged-compatibility", 1, "typed"),
+      },
+    ],
+    ["malformed delta", "codex", "invalid-output:malformed", { text: "forged", delta: { malformed: true } }],
+    [
+      "mismatched typed text",
+      "codex",
+      "invalid-output:mismatched-text",
+      {
+        text: "forged",
+        delta: runOutputEvent("run-output-mismatch", 1, "typed"),
+      },
+    ],
+    [
+      "patch-only forged text",
+      "codex",
+      "invalid-output:patch-only",
+      {
+        text: "forged",
+        delta: {
+          protocolVersion: 1,
+          runId: "run-patch-forged-text",
+          seq: 1,
+          timestamp: "2026-06-14T00:00:03.000Z",
+          kind: "changes",
+          payload: { patch: { path: "src/a.ts", hunks: [] } },
+        },
+      },
+    ],
+    [
+      "disallowed status event",
+      "codex",
+      "invalid-output:status",
+      {
+        delta: {
+          protocolVersion: 1,
+          runId: "run-status-output",
+          seq: 1,
+          timestamp: "2026-06-14T00:00:03.000Z",
+          kind: "status",
+          payload: { status: "succeeded", exitCode: 0 },
+        },
+      },
+    ],
+  ] as const)("rejects invalid current workflow output delta without a SQLite write: %s", async (
+    _label,
+    source,
+    idempotencyKey,
+    payload,
+  ) => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    const before = store.listEvents("session-1");
+
+    expect(() => store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.output_delta",
+      source,
+      laneId: "lane-implementation",
+      segmentId: "segment-invalid-output",
+      idempotencyKey,
+      payload: { laneId: "lane-implementation", segmentId: "segment-invalid-output", ...payload },
+      now: "2026-06-14T00:00:03.000Z",
+    })).toThrow(/RunEvent output delta|required|mismatch|compatibility/i);
+    expect(store.listEvents("session-1")).toEqual(before);
+    expect(store.materializeFlowProjection("session-1").events.some((event) =>
+      event.idempotencyKey === idempotencyKey
+    )).toBe(false);
+    store.close();
+  });
+
+  it("physically upgrades historical text-only output to a strict typed delta exactly once", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:02.500Z",
+    });
+    const segmentId = "segment-session-1-lane-implementation";
+    const runId = "run-session-1-lane-implementation";
+    const inserted = store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.output_delta",
+      source: "codex",
+      laneId: "lane-implementation",
+      segmentId,
+      idempotencyKey: "legacy-output",
+      payload: {
+        laneId: "lane-implementation",
+        segmentId,
+        delta: runOutputEvent(runId, 1, "typed before migration"),
+      },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.close();
+
+    const databasePath = join(projectRoot, ".devflow", "skyturn-workflow.sqlite");
+    const legacy = new Database(databasePath);
+    legacy.prepare([
+      "UPDATE workflow_events SET payload_json = ?, legacy_evidence_compatibility = 0",
+      "WHERE id = ?",
+    ].join(" ")).run(JSON.stringify({
+      laneId: "lane-implementation",
+      segmentId,
+      text: "  historical output\n",
+      compatibilitySource: "legacy-disk",
+    }), inserted.id);
+    legacy.prepare("DELETE FROM schema_migrations WHERE version = 6").run();
+    legacy.pragma("wal_checkpoint(TRUNCATE)");
+    legacy.close();
+
+    store = createWorkflowStore({ projectRoot });
+    const events = store.listEvents("session-1");
+    const projection = store.materializeFlowProjection("session-1");
+    const canvas = store.materializeCanvasSession("session-1");
+    const migratedEvent = events.find((event) => event.id === inserted.id);
+    const lane = projection.lanes.find((candidate) => candidate.id === "lane-implementation");
+    const node = canvas?.nodes.find((candidate) => candidate.id === "lane-implementation");
+    expect(migratedEvent).toMatchObject({
+      id: inserted.id,
+      seq: inserted.seq,
+      idempotencyKey: "legacy-output",
+      payload: {
+        laneId: "lane-implementation",
+        segmentId,
+        text: "  historical output\n",
+        delta: {
+          protocolVersion: 1,
+          runId,
+          seq: inserted.seq,
+          timestamp: inserted.createdAt,
+          kind: "output",
+          payload: { text: "  historical output\n" },
+        },
+      },
+    });
+    expect(migratedEvent?.payload).not.toHaveProperty("compatibilitySource");
+    expect(lane?.output).toEqual(["  historical output\n"]);
+    expect(lane?.outputDeltas).toEqual([migratedEvent?.payload.delta]);
+    expect(node?.output).toEqual(["  historical output\n"]);
+    expect(node?.outputDeltas).toEqual([migratedEvent?.payload.delta]);
+    store.close();
+
+    const migrated = new Database(databasePath);
+    const raw = migrated.prepare(
+      "SELECT id, seq, idempotency_key, payload_json, legacy_evidence_compatibility FROM workflow_events WHERE id = ?",
+    ).get(inserted.id) as {
+      id: string;
+      seq: number;
+      idempotency_key: string;
+      payload_json: string;
+      legacy_evidence_compatibility: number;
+    };
+    expect(raw.id).toBe(inserted.id);
+    expect(raw.seq).toBe(inserted.seq);
+    expect(raw.idempotency_key).toBe("legacy-output");
+    expect(raw.legacy_evidence_compatibility).toBe(0);
+    expect(JSON.parse(raw.payload_json)).toEqual(migratedEvent?.payload);
+    expect(raw.payload_json).not.toContain("compatibilitySource");
+    expect(migrated.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 6").get()).toEqual({ count: 1 });
+    migrated.exec(`
+      CREATE TRIGGER reject_repeated_output_migration_update
+      BEFORE UPDATE ON workflow_events
+      BEGIN
+        SELECT RAISE(ABORT, 'unexpected repeated output migration update');
+      END;
+      CREATE TRIGGER reject_repeated_output_migration_marker
+      BEFORE INSERT ON schema_migrations
+      WHEN NEW.version = 6
+      BEGIN
+        SELECT RAISE(ABORT, 'unexpected repeated output migration marker');
+      END;
+    `);
+    migrated.pragma("wal_checkpoint(TRUNCATE)");
+    migrated.close();
+
+    const beforeReopenBytes = await readFile(databasePath);
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listEvents("session-1")).toEqual(events);
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(projection);
+    expect(reopened.materializeCanvasSession("session-1")).toEqual(canvas);
+    reopened.close();
+    expect(await readFile(databasePath)).toEqual(beforeReopenBytes);
+  });
+
   it("schedules runnable lanes and records RunEvidence through the Flow Kernel event stream", async () => {
     const store = await makeSeededStore();
     declareCodeChangeWorkflow(store);
@@ -3473,7 +3877,7 @@ describe("SQLite workflow store", () => {
       exitCode: 0,
       changesetId: "changeset-implementation-1",
       checks: [{ kind: "test", name: "pnpm test", status: "passed", detail: "2 passed" }],
-      artifacts: [".devflow/tasks/session-1/lane-implementation/result.md"],
+      artifacts: [".devflow/acceptance/session-1/lane-implementation/result.md"],
       review: null,
       errorReason: null,
       cancelReason: null,
@@ -3506,7 +3910,7 @@ describe("SQLite workflow store", () => {
       status: "completed",
       runId: evidence.runId,
       changesetId: "changeset-implementation-1",
-      output: expect.arrayContaining(["Implemented status filtering with tests."]),
+      output: [],
     });
   });
 
@@ -3552,12 +3956,45 @@ describe("SQLite workflow store", () => {
     seedStore(store);
     declareCodeChangeWorkflow(store);
     advanceCodeChangeWorkflowToLane(store, "lane-implementation");
-    const input = runResultInput(store, "lane-implementation", "succeeded", "2026-06-14T00:00:05.000Z");
+    const baseInput = runResultInput(store, "lane-implementation", "succeeded", "2026-06-14T00:00:05.000Z");
+    const typedDeltas = [
+      runOutputEvent(baseInput.runId, 1, "  exact executable output\n"),
+      runProgressEvent(baseInput.runId, 2, "\texact executable progress  \n", "codex"),
+      runChangesEvent(baseInput.runId, 3, "codex"),
+    ];
+    const input = {
+      ...baseInput,
+      outputSummary: "Executable compact summary is metadata only.",
+      runEvents: typedDeltas,
+    };
 
     const assertReplayContract = () => {
       const eventsBefore = store.listEvents(input.sessionId);
       const projectionBefore = store.materializeFlowProjection(input.sessionId);
+      const canvasBefore = store.materializeCanvasSession(input.sessionId);
+      const outputEvents = eventsBefore.filter((event) =>
+        event.kind === "workflow.segment.output_delta" && event.payload.segmentId === input.segmentId
+      );
+      expect(outputEvents.map((event) => event.payload.delta)).toEqual(typedDeltas);
+      expect(projectionBefore.lanes.find((lane) => lane.id === input.laneId)?.output).toEqual([
+        "  exact executable output\n",
+        "\texact executable progress  \n",
+      ]);
+      expect(canvasBefore?.nodes.find((node) => node.id === input.laneId)?.outputDeltas).toEqual(typedDeltas);
+      const lane = projectionBefore.lanes.find((candidate) => candidate.id === input.laneId);
+      const node = canvasBefore?.nodes.find((candidate) => candidate.id === input.laneId);
+      expect(JSON.stringify({
+        outputEvents,
+        laneOutput: lane?.output,
+        laneOutputDeltas: lane?.outputDeltas,
+        nodeOutput: node?.output,
+        nodeOutputDeltas: node?.outputDeltas,
+      })).not.toContain("Executable compact summary is metadata only.");
       expect(store.recordRunResult({ ...input, now: "2026-06-14T00:00:06.000Z" })).toEqual(projectionBefore);
+      expect(store.listEvents(input.sessionId)).toEqual(eventsBefore);
+      expect(store.recordRunResult({ ...input, outputSummary: "Different metadata summary.", now: "2026-06-14T00:00:06.500Z" })).toEqual(
+        projectionBefore,
+      );
       expect(store.listEvents(input.sessionId)).toEqual(eventsBefore);
 
       const conflicts = [
@@ -3565,7 +4002,7 @@ describe("SQLite workflow store", () => {
         { label: "exit", input: { ...input, evidence: { ...input.evidence, exitCode: 17 } } },
         { label: "checks", input: { ...input, evidence: { ...input.evidence, checks: [{ ...input.evidence.checks[0]!, detail: "different" }] } } },
         { label: "changeset", input: { ...input, evidence: { ...input.evidence, changesetId: "changeset-conflict" } } },
-        { label: "output", input: { ...input, outputSummary: "Conflicting terminal output." } },
+        { label: "output", input: { ...input, runEvents: [runOutputEvent(input.runId, 1, "conflicting typed output\n")] } },
       ];
       for (const conflict of conflicts) {
         expect(() => store.recordRunResult({ ...conflict.input, now: "2026-06-14T00:00:07.000Z" }), conflict.label).toThrow(
@@ -3580,6 +4017,200 @@ describe("SQLite workflow store", () => {
     store.close();
     store = createWorkflowStore({ projectRoot });
     assertReplayContract();
+    store.close();
+  });
+
+  it.each([
+    ["generated", "Generated compact terminal summary.", "Generated compact terminal summary."],
+    ["default", undefined, "Run succeeded; pnpm test: passed."],
+    [
+      "explicit",
+      `${"Explicit compact summary ".repeat(30)}OPENAI_API_KEY=sk-summary-secret-123456789`,
+      undefined,
+    ],
+  ] as const)(
+    "keeps %s executable terminal summary as bounded metadata with empty authoritative output",
+    async (_label, requestedSummary, expectedSummary) => {
+      const projectRoot = await makeTempRoot();
+      let store = createWorkflowStore({ projectRoot });
+      seedStore(store);
+      declareCodeChangeWorkflow(store);
+      advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+      const base = runResultInput(store, "lane-implementation", "succeeded", "2026-06-14T00:00:05.000Z");
+      const { outputSummary: _defaultSummary, ...withoutSummary } = base;
+      const input = {
+        ...withoutSummary,
+        ...(requestedSummary === undefined ? {} : { outputSummary: requestedSummary }),
+        runEvents: terminalOnlyRunEvents(base.runId),
+      };
+
+      store.recordRunResult(input);
+      const firstEvents = store.listEvents("session-1");
+      const firstProjection = store.materializeFlowProjection("session-1");
+      expect(store.recordRunResult({
+        ...input,
+        outputSummary: "Replay summary must not replace stored metadata.",
+        now: "2026-06-14T00:00:06.000Z",
+      })).toEqual(firstProjection);
+      expect(store.listEvents("session-1")).toEqual(firstEvents);
+      store.close();
+
+      store = createWorkflowStore({ projectRoot });
+      const outputEvents = store.listEvents("session-1").filter((event) =>
+        event.kind === "workflow.segment.output_delta" && event.payload.segmentId === base.segmentId
+      );
+      const projection = store.materializeFlowProjection("session-1");
+      const canvasSession = store.materializeCanvasSession("session-1");
+      const desktopPayload = { projectRoot, sessionId: "session-1", projection, canvasSession };
+      const lane = projection.lanes.find((candidate) => candidate.id === base.laneId);
+      const node = canvasSession?.nodes.find((candidate) => candidate.id === base.laneId);
+      const evidenceEvent = store.listEvents("session-1").find((event) =>
+        event.kind === "workflow.evidence.recorded" && event.payload.segmentId === base.segmentId
+      );
+
+      expect(outputEvents).toEqual([]);
+      expect(lane?.output).toEqual([]);
+      expect(lane?.outputDeltas).toBeUndefined();
+      expect(node?.output).toEqual([]);
+      expect(node?.outputDeltas).toBeUndefined();
+      expect(desktopPayload.canvasSession?.nodes.find((candidate) => candidate.id === base.laneId)?.output).toEqual([]);
+      expect(evidenceEvent?.payload.summary).toEqual(expectedSummary ?? expect.stringContaining("... [truncated]"));
+      expect(String(evidenceEvent?.payload.summary ?? "").length).toBeLessThanOrEqual(320);
+      expect(JSON.stringify({ events: store.listEvents("session-1"), projection, canvasSession })).not.toContain("sk-summary-secret");
+
+      const reopenedEvents = store.listEvents("session-1");
+      expect(store.recordRunResult({ ...input, now: "2026-06-14T00:00:07.000Z" })).toEqual(projection);
+      expect(store.listEvents("session-1")).toEqual(reopenedEvents);
+      store.close();
+    },
+  );
+
+  it.each([
+    ["generated", "Generated planner terminal summary.", "Generated planner terminal summary."],
+    ["default", undefined, "Run succeeded; Hermes CLI exit: passed."],
+    [
+      "explicit",
+      `${"Explicit planner summary ".repeat(30)}HERMES_API_KEY=sk-planner-summary-secret-123456789`,
+      undefined,
+    ],
+  ] as const)(
+    "keeps %s planner terminal summary as bounded metadata with empty authoritative output",
+    async (_label, requestedSummary, expectedSummary) => {
+      const projectRoot = await makeTempRoot();
+      let store = createWorkflowStore({ projectRoot });
+      seedStore(store);
+      const runId = `run-session-1-node-1-summary-${_label}`;
+      const { segment } = store.claimPlannerRunStart({
+        sessionId: "session-1",
+        laneId: "node-1",
+        runId,
+        agentKind: "hermes",
+        worktreePath: projectRoot,
+        now: "2026-06-14T00:00:01.000Z",
+      });
+      const completedAt = "2026-06-14T00:00:02.000Z";
+      const evidence = plannerRunEvidence(runId, completedAt);
+      const input = {
+        sessionId: "session-1",
+        laneId: "node-1",
+        segmentId: segment.segmentId,
+        runId,
+        agentKind: "hermes" as const,
+        ...(requestedSummary === undefined ? {} : { outputSummary: requestedSummary }),
+        runEvents: terminalOnlyRunEvents(runId, "hermes"),
+        evidence,
+        now: completedAt,
+      };
+
+      store.recordRunResult(input);
+      const firstEvents = store.listEvents("session-1");
+      const firstProjection = store.materializeFlowProjection("session-1");
+      expect(store.recordRunResult({
+        ...input,
+        outputSummary: "Replay planner summary must not replace stored metadata.",
+        now: "2026-06-14T00:00:03.000Z",
+      })).toEqual(firstProjection);
+      expect(store.listEvents("session-1")).toEqual(firstEvents);
+      store.close();
+
+      store = createWorkflowStore({ projectRoot });
+      const outputEvents = store.listEvents("session-1").filter((event) =>
+        event.kind === "segment_output_delta" && event.segmentId === segment.segmentId
+      );
+      const projection = store.materializeFlowProjection("session-1");
+      const canvasSession = store.materializeCanvasSession("session-1");
+      const desktopPayload = { projectRoot, sessionId: "session-1", projection, canvasSession };
+      const planner = canvasSession?.nodes.find((candidate) => candidate.id === "node-1");
+      const evidenceEvent = store.listEvents("session-1").find((event) =>
+        event.kind === "segment_evidence" && event.segmentId === segment.segmentId
+      );
+
+      expect(outputEvents).toEqual([]);
+      expect(planner?.output).toEqual([]);
+      expect(planner?.outputDeltas).toBeUndefined();
+      expect(desktopPayload.canvasSession?.nodes.find((candidate) => candidate.id === "node-1")?.output).toEqual([]);
+      expect(evidenceEvent?.payload.summary).toEqual(expectedSummary ?? expect.stringContaining("... [truncated]"));
+      expect(String(evidenceEvent?.payload.summary ?? "").length).toBeLessThanOrEqual(320);
+      expect(JSON.stringify({ events: store.listEvents("session-1"), projection, canvasSession })).not.toContain(
+        "sk-planner-summary-secret",
+      );
+
+      const reopenedEvents = store.listEvents("session-1");
+      expect(store.recordRunResult({ ...input, now: "2026-06-14T00:00:04.000Z" })).toEqual(projection);
+      expect(store.listEvents("session-1")).toEqual(reopenedEvents);
+      store.close();
+    },
+  );
+
+  it("persists planner typed deltas exactly once and never duplicates its compact summary into output", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const runId = "run-session-1-node-1-typed-output";
+    const { segment } = store.claimPlannerRunStart({
+      sessionId: "session-1",
+      laneId: "node-1",
+      runId,
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    const typedDeltas = [
+      runOutputEvent(runId, 1, "  planner output\n"),
+      runProgressEvent(runId, 2, "\tplanner progress  \n"),
+      runChangesEvent(runId, 3),
+    ];
+    const completedAt = "2026-06-14T00:00:02.000Z";
+    const evidence = plannerRunEvidence(runId, completedAt);
+    const input = {
+      sessionId: "session-1",
+      laneId: "node-1",
+      segmentId: segment.segmentId,
+      runId,
+      agentKind: "hermes" as const,
+      outputSummary: "This compact summary is metadata only.",
+      runEvents: [...typedDeltas, ...terminalOnlyRunEvents(runId, "hermes", 4)],
+      evidence,
+      now: completedAt,
+    };
+
+    store.recordRunResult(input);
+    store.recordRunResult({ ...input, now: "2026-06-14T00:00:03.000Z" });
+    store.close();
+    store = createWorkflowStore({ projectRoot });
+
+    const outputEvents = store.listEvents("session-1").filter((event) =>
+      event.kind === "segment_output_delta" && event.segmentId === segment.segmentId
+    );
+    const planner = store.materializeCanvasSession("session-1")?.nodes.find((candidate) => candidate.id === "node-1");
+    expect(outputEvents.map((event) => event.payload.delta)).toEqual(typedDeltas);
+    expect(outputEvents.map((event) => event.payload.text).filter((text) => text !== undefined)).toEqual([
+      "  planner output\n",
+      "\tplanner progress  \n",
+    ]);
+    expect(planner?.output).toEqual(["  planner output\n", "\tplanner progress  \n"]);
+    expect(planner?.outputDeltas).toEqual(typedDeltas);
+    expect(JSON.stringify({ outputEvents, planner })).not.toContain("compact summary is metadata only");
     store.close();
   });
 
@@ -3769,6 +4400,1359 @@ describe("SQLite workflow store", () => {
     },
   );
 
+  it("keeps failed expected-artifact evidence terminal when the process exits zero", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    const evidence = {
+      runId: "run-session-1-lane-implementation",
+      status: "failed",
+      exitCode: 0,
+      changesetId: null,
+      checks: [
+        { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+      ],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:04.000Z",
+    } satisfies RunEvidence;
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      runId: evidence.runId,
+      agentKind: "codex",
+      evidence,
+      now: evidence.completedAt,
+    });
+
+    const events = store.listEvents("session-1");
+    const projection = store.materializeFlowProjection("session-1");
+    const canvas = store.materializeCanvasSession("session-1");
+    expect(events.filter((event) => event.kind === "workflow.segment.output_delta")).toEqual([]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "workflow.segment.finished",
+        payload: expect.objectContaining({ status: "failed", exitCode: 0 }),
+      }),
+    );
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(projection.evidence).toContainEqual(
+      expect.objectContaining({
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        status: "failed",
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "workflow.evidence.recorded",
+        payload: expect.objectContaining({
+          evidence: expect.objectContaining({
+            status: "failed",
+            runEvidence: expect.objectContaining({ status: "failed", exitCode: 0 }),
+          }),
+        }),
+      }),
+    );
+    expect(canvas?.nodes.find((node) => node.id === "lane-implementation")).toMatchObject({
+      status: "failed",
+      output: [],
+    });
+
+    const scheduled = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 3,
+      now: "2026-06-14T00:00:05.000Z",
+    });
+    expect(scheduled.readyLanes).toEqual([]);
+  });
+
+  it("normalizes stale succeeded RunEvidence with a failed expected-artifact gate", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    const evidence = {
+      runId: "run-session-1-lane-implementation",
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [
+        { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+      ],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:04.000Z",
+    } satisfies RunEvidence;
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      runId: evidence.runId,
+      agentKind: "codex",
+      evidence,
+      now: evidence.completedAt,
+    });
+
+    const events = store.listEvents("session-1");
+    const projection = store.materializeFlowProjection("session-1");
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        kind: "workflow.evidence.recorded",
+        payload: expect.objectContaining({
+          evidence: expect.objectContaining({
+            status: "failed",
+            runEvidence: expect.objectContaining({ status: "failed", exitCode: 0 }),
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("fails current empty null-exit success across recordRunResult and reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareCodeChangeWorkflow(store);
+    store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    const evidence = {
+      runId: "run-session-1-lane-implementation",
+      status: "succeeded",
+      exitCode: null,
+      changesetId: null,
+      checks: [],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:04.000Z",
+    } satisfies RunEvidence;
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      runId: evidence.runId,
+      agentKind: "codex",
+      evidence,
+      now: evidence.completedAt,
+    });
+
+    expect(store.materializeFlowProjection("session-1").evidence.at(-1)?.status).toBe("failed");
+    expect(store.materializeFlowProjection("session-1").segments.at(-1)?.status).toBe("failed");
+    expect(store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-implementation")?.status).toBe("failed");
+    expect(store.scheduleReadyLanes("session-1", { allowedParallelism: 2, now: "2026-06-14T00:00:05.000Z" }).readyLanes).toEqual([]);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1").evidence.at(-1)?.status).toBe("failed");
+    expect(reopened.materializeFlowProjection("session-1").segments.at(-1)?.status).toBe("failed");
+    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-implementation")?.status).toBe("failed");
+    expect(reopened.scheduleReadyLanes("session-1", { allowedParallelism: 2, now: "2026-06-14T00:00:06.000Z" }).readyLanes).toEqual([]);
+    reopened.close();
+  });
+
+  it("requires artifact-passed evidence for a persisted browser screenshot lane", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:browser",
+      payload: {
+        lane: {
+          id: "lane-browser",
+          semanticKey: "lane-browser",
+          kind: "browser_validation",
+          title: "Capture browser screenshot",
+          agentKind: "codex",
+          status: "pending",
+          requiredEvidence: ["browser", "screenshot"],
+        },
+      },
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:browser-review",
+      payload: {
+        lane: { id: "lane-browser-review", semanticKey: "lane-browser-review", kind: "review", title: "Review screenshot", agentKind: "hermes", status: "pending" },
+      },
+      now: "2026-06-14T00:00:01.100Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.edge.declared",
+      source: "test",
+      idempotencyKey: "edge:browser-review",
+      payload: { edge: { id: "edge-browser-review", sourceLaneId: "lane-browser", targetLaneId: "lane-browser-review" } },
+      now: "2026-06-14T00:00:01.200Z",
+    });
+    store.scheduleReadyLanes("session-1", { allowedParallelism: 1, now: "2026-06-14T00:00:02.000Z" });
+    const evidence = {
+      runId: "run-session-1-lane-browser",
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:03.000Z",
+    } satisfies RunEvidence;
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-browser",
+      segmentId: "segment-session-1-lane-browser",
+      runId: evidence.runId,
+      agentKind: "codex",
+      evidence,
+      now: evidence.completedAt,
+    });
+
+    expect(store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-browser")?.status).toBe("failed");
+    expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-browser")?.status).toBe("failed");
+    expect(store.scheduleReadyLanes("session-1", { allowedParallelism: 2, now: "2026-06-14T00:00:04.000Z" }).readyLanes).toEqual([]);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-browser")?.status).toBe("failed");
+    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-browser")?.status).toBe("failed");
+    expect(reopened.scheduleReadyLanes("session-1", { allowedParallelism: 2, now: "2026-06-14T00:00:05.000Z" }).readyLanes).toEqual([]);
+    reopened.close();
+  });
+
+  it("keeps external browser artifact contracts canonical through terminal reconciliation and reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    store.applyWorkflowIntent({
+      intentId: "intent-browser-contracts",
+      sessionId: "session-1",
+      operations: [{
+        type: "ProposeLanes",
+        lanes: [
+          {
+            id: "lane-browser-omitted",
+            kind: "browser_validation",
+            title: "Capture browser screenshot",
+            agentKind: "codex",
+          },
+          {
+            id: "lane-browser-empty",
+            kind: "browser_validation",
+            title: "Capture browser screenshot",
+            agentKind: "codex",
+            requiredEvidence: [],
+          },
+          {
+            id: "lane-browser-prose-neighbor",
+            kind: "implementation",
+            title: "Avoid browser work in this implementation",
+            agentKind: "codex",
+          },
+          {
+            id: "lane-browser-review",
+            kind: "review",
+            title: "Review screenshot evidence",
+            agentKind: "hermes",
+            dependsOn: ["lane-browser-omitted"],
+          },
+        ],
+      }],
+    }, "2026-06-14T00:00:01.000Z");
+
+    const declaredLanes = store.listEvents("session-1")
+      .filter((item) => item.kind === "workflow.lane.declared")
+      .map((item) => item.payload.lane as { id: string; requiredEvidence?: string[] });
+    expect(declaredLanes.find((lane) => lane.id === "lane-browser-omitted")?.requiredEvidence).toEqual([
+      "browser",
+      "screenshot",
+    ]);
+    expect(declaredLanes.find((lane) => lane.id === "lane-browser-empty")?.requiredEvidence).toEqual([
+      "browser",
+      "screenshot",
+    ]);
+    expect(declaredLanes.find((lane) => lane.id === "lane-browser-prose-neighbor")?.requiredEvidence).toEqual([]);
+
+    const scheduled = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 3,
+      now: "2026-06-14T00:00:02.000Z",
+    });
+    expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual([
+      "lane-browser-omitted",
+      "lane-browser-empty",
+      "lane-browser-prose-neighbor",
+    ]);
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-browser-omitted",
+      segmentId: "segment-session-1-lane-browser-omitted",
+      runId: "run-session-1-lane-browser-omitted",
+      agentKind: "codex",
+      outputSummary: "Browser screenshot captured successfully.",
+      evidence: terminalRunEvidence(
+        "run-session-1-lane-browser-omitted",
+        "succeeded",
+        0,
+        [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+        [],
+      ),
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-browser-empty",
+      segmentId: "segment-session-1-lane-browser-empty",
+      runId: "run-session-1-lane-browser-empty",
+      agentKind: "codex",
+      evidence: terminalRunEvidence(
+        "run-session-1-lane-browser-empty",
+        "succeeded",
+        0,
+        [
+          { kind: "run-exit", name: "Codex CLI exit", status: "passed" },
+          { kind: "artifact", name: "Expected artifacts", status: "passed" },
+        ],
+        [".devflow/acceptance/react-app.png"],
+      ),
+      now: "2026-06-14T00:00:03.100Z",
+    });
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-browser-prose-neighbor",
+      segmentId: "segment-session-1-lane-browser-prose-neighbor",
+      runId: "run-session-1-lane-browser-prose-neighbor",
+      agentKind: "codex",
+      evidence: terminalRunEvidence(
+        "run-session-1-lane-browser-prose-neighbor",
+        "succeeded",
+        0,
+        [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+        [],
+      ),
+      now: "2026-06-14T00:00:03.200Z",
+    });
+
+    const assertCanonical = (current: ReturnType<typeof createWorkflowStore>) => {
+      const projection = current.materializeFlowProjection("session-1");
+      const canvas = current.materializeCanvasSession("session-1");
+      expect(projection.lanes.find((lane) => lane.id === "lane-browser-omitted")).toMatchObject({
+        status: "failed",
+        requiredEvidence: ["browser", "screenshot"],
+      });
+      expect(projection.lanes.find((lane) => lane.id === "lane-browser-empty")).toMatchObject({
+        status: "completed",
+        requiredEvidence: ["browser", "screenshot"],
+      });
+      expect(projection.lanes.find((lane) => lane.id === "lane-browser-prose-neighbor")).toMatchObject({
+        status: "completed",
+        requiredEvidence: [],
+      });
+      expect(canvas?.nodes.find((node) => node.id === "lane-browser-omitted")?.requiredEvidence).toEqual([
+        "browser",
+        "screenshot",
+      ]);
+      expect(current.scheduleReadyLanes("session-1", {
+        allowedParallelism: 4,
+        now: "2026-06-14T00:00:04.000Z",
+      }).readyLanes.map((lane) => lane.id)).not.toContain("lane-browser-review");
+    };
+
+    assertCanonical(store);
+    store.close();
+    const reopened = createWorkflowStore({ projectRoot });
+    assertCanonical(reopened);
+    reopened.close();
+  });
+
+  it("migrates historical browser lane events before projection, canvas materialization, and reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "legacy-test",
+      idempotencyKey: "lane:historical-browser",
+      payload: {
+        lane: {
+          id: "lane-historical-browser",
+          semanticKey: "lane-historical-browser",
+          kind: "browser_validation",
+          title: "Capture browser screenshot",
+          agentKind: "codex",
+          status: "pending",
+        },
+      },
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    store.close();
+
+    const legacy = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    const row = legacy.prepare("SELECT payload_json FROM workflow_events WHERE idempotency_key = ?").get(
+      "lane:historical-browser",
+    ) as { payload_json: string };
+    const payload = JSON.parse(row.payload_json) as { lane: Record<string, unknown> };
+    delete payload.lane.requiredEvidence;
+    legacy.prepare("UPDATE workflow_events SET payload_json = ? WHERE idempotency_key = ?").run(
+      JSON.stringify(payload),
+      "lane:historical-browser",
+    );
+    legacy.prepare("DELETE FROM schema_migrations WHERE version = 7").run();
+    legacy.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const event = reopened.listEvents("session-1").find((item) => item.idempotencyKey === "lane:historical-browser");
+    expect((event?.payload.lane as { requiredEvidence?: string[] }).requiredEvidence).toEqual([
+      "browser",
+      "screenshot",
+    ]);
+    expect(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-historical-browser")?.requiredEvidence).toEqual([
+      "browser",
+      "screenshot",
+    ]);
+    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-historical-browser")?.requiredEvidence).toEqual([
+      "browser",
+      "screenshot",
+    ]);
+    reopened.close();
+  });
+
+  it("normalizes a pre-evidence browser lane row before canvas materialization and terminal reconciliation", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    store.close();
+
+    const legacy = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    legacy.prepare([
+      "INSERT INTO workflow_lanes(",
+      "id, session_id, node_id, semantic_key, lane_kind, agent_kind, title, brief, status, phase, archived, created_at, updated_at",
+      ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ].join(" ")).run(
+      "lane-legacy-browser",
+      "session-1",
+      "lane-legacy-browser",
+      "legacy:browser",
+      "validation",
+      "codex",
+      "Capture browser screenshot",
+      "Capture browser screenshot evidence",
+      "pending",
+      "Validation",
+      0,
+      "2026-06-14T00:00:01.000Z",
+      "2026-06-14T00:00:01.000Z",
+    );
+    legacy.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.getLane("session-1", "lane-legacy-browser")?.requiredEvidence).toEqual([
+      "browser",
+      "screenshot",
+    ]);
+    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-legacy-browser")?.requiredEvidence).toEqual([
+      "browser",
+      "screenshot",
+    ]);
+    const segment = reopened.recordSegmentEvidence({
+      sessionId: "session-1",
+      laneId: "lane-legacy-browser",
+      segmentId: "segment-legacy-browser",
+      runId: "run-legacy-browser",
+      agentKind: "codex",
+      transport: "codex_cli",
+      worktreePath: projectRoot,
+      evidence: {
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+      },
+      now: "2026-06-14T00:00:02.000Z",
+    });
+    expect(segment.status).toBe("failed");
+    reopened.close();
+  });
+
+  it("requires strict nested artifact evidence across append and reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    for (const suffix of ["invalid", "valid"]) {
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind: "workflow.lane.declared",
+        source: "test",
+        idempotencyKey: `lane:browser-${suffix}`,
+        payload: {
+          lane: {
+            id: `lane-browser-${suffix}`,
+            semanticKey: `lane-browser-${suffix}`,
+            kind: "browser_validation",
+            title: "Capture browser screenshot",
+            agentKind: "codex",
+            status: "pending",
+            requiredEvidence: ["browser", "screenshot"],
+          },
+        },
+        now: "2026-06-14T00:00:01.000Z",
+      });
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind: "workflow.lane.declared",
+        source: "test",
+        idempotencyKey: `lane:review-${suffix}`,
+        payload: {
+          lane: {
+            id: `lane-review-${suffix}`,
+            semanticKey: `lane-review-${suffix}`,
+            kind: "review",
+            title: "Review screenshot",
+            agentKind: "hermes",
+            status: "pending",
+          },
+        },
+        now: "2026-06-14T00:00:01.100Z",
+      });
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind: "workflow.edge.declared",
+        source: "test",
+        idempotencyKey: `edge:browser-review-${suffix}`,
+        payload: {
+          edge: {
+            id: `edge-browser-review-${suffix}`,
+            sourceLaneId: `lane-browser-${suffix}`,
+            targetLaneId: `lane-review-${suffix}`,
+          },
+        },
+        now: "2026-06-14T00:00:01.200Z",
+      });
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind: "workflow.segment.started",
+        source: "test",
+        laneId: `lane-browser-${suffix}`,
+        segmentId: `segment-browser-${suffix}`,
+        idempotencyKey: `segment:browser-${suffix}:started`,
+        payload: {
+          laneId: `lane-browser-${suffix}`,
+          segment: {
+            id: `segment-browser-${suffix}`,
+            laneId: `lane-browser-${suffix}`,
+            runId: `run-browser-${suffix}`,
+            status: "running",
+          },
+        },
+        now: "2026-06-14T00:00:02.000Z",
+      });
+    }
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: "lane-browser-invalid",
+      segmentId: "segment-browser-invalid",
+      idempotencyKey: "evidence:browser-invalid",
+      payload: {
+        laneId: "lane-browser-invalid",
+        segmentId: "segment-browser-invalid",
+        evidence: {
+          id: "evidence-browser-invalid",
+          kind: "run-exit",
+          status: "passed",
+          checks: ["run-exit:passed"],
+          artifacts: [],
+        },
+      },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.finished",
+      source: "test",
+      laneId: "lane-browser-invalid",
+      segmentId: "segment-browser-invalid",
+      idempotencyKey: "segment:browser-invalid:finished",
+      payload: { laneId: "lane-browser-invalid", segmentId: "segment-browser-invalid", status: "succeeded", exitCode: 0 },
+      now: "2026-06-14T00:00:03.100Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: "lane-browser-valid",
+      segmentId: "segment-browser-valid",
+      idempotencyKey: "evidence:browser-valid",
+      payload: {
+        laneId: "lane-browser-valid",
+        segmentId: "segment-browser-valid",
+        evidence: {
+          id: "evidence-browser-valid",
+          kind: "run-exit",
+          status: "passed",
+          checks: [],
+          artifacts: [],
+          runEvidence: terminalRunEvidence("run-browser-valid", "succeeded", 0, [
+            { kind: "run-exit", name: "Codex CLI exit", status: "passed" },
+            { kind: "artifact", name: "Expected artifacts", status: "passed" },
+          ], [".devflow/acceptance/browser.png"]),
+        },
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.finished",
+      source: "test",
+      laneId: "lane-browser-valid",
+      segmentId: "segment-browser-valid",
+      idempotencyKey: "segment:browser-valid:finished",
+      payload: { laneId: "lane-browser-valid", segmentId: "segment-browser-valid", status: "succeeded", exitCode: 0 },
+      now: "2026-06-14T00:00:04.100Z",
+    });
+
+    assertStrictArtifactAppendProjection(store);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    assertStrictArtifactAppendProjection(reopened);
+    reopened.close();
+  });
+
+  it("physically migrates historical outer-only artifact payloads before list, projection, canvas, and reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    const hostPath = "/Users/alice/.ssh/id_rsa";
+    const rawCheck = `token=outer-secret path=${hostPath}`;
+    const rawDetail = `Bearer outer-secret ${hostPath}`;
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:artifact-outer-only",
+      payload: {
+        lane: {
+          id: "lane-artifact-outer-only",
+          semanticKey: "lane-artifact-outer-only",
+          kind: "validation",
+          title: "Validate release package",
+          agentKind: "codex",
+          status: "pending",
+          requiredEvidence: ["artifact"],
+        },
+      },
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.declared",
+      source: "test",
+      idempotencyKey: "lane:artifact-outer-only-review",
+      payload: {
+        lane: {
+          id: "lane-artifact-outer-only-review",
+          semanticKey: "lane-artifact-outer-only-review",
+          kind: "review",
+          title: "Review validation",
+          agentKind: "hermes",
+          status: "pending",
+        },
+      },
+      now: "2026-06-14T00:00:01.100Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.edge.declared",
+      source: "test",
+      idempotencyKey: "edge:artifact-outer-only-review",
+      payload: {
+        edge: {
+          id: "edge-artifact-outer-only-review",
+          sourceLaneId: "lane-artifact-outer-only",
+          targetLaneId: "lane-artifact-outer-only-review",
+        },
+      },
+      now: "2026-06-14T00:00:01.200Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.started",
+      source: "test",
+      laneId: "lane-artifact-outer-only",
+      segmentId: "segment-artifact-outer-only",
+      idempotencyKey: "segment:artifact-outer-only:started",
+      payload: {
+        laneId: "lane-artifact-outer-only",
+        segment: {
+          id: "segment-artifact-outer-only",
+          laneId: "lane-artifact-outer-only",
+          runId: "run-artifact-outer-only",
+          status: "running",
+        },
+      },
+      now: "2026-06-14T00:00:02.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: "lane-artifact-outer-only",
+      segmentId: "segment-artifact-outer-only",
+      idempotencyKey: "evidence:artifact-outer-only",
+      payload: {
+        laneId: "lane-artifact-outer-only",
+        segmentId: "segment-artifact-outer-only",
+        evidence: {
+          id: "evidence-artifact-outer-only",
+          kind: "run-exit",
+          status: "passed",
+          checks: [rawCheck],
+          artifacts: [hostPath],
+          detail: rawDetail,
+        },
+      },
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.finished",
+      source: "test",
+      laneId: "lane-artifact-outer-only",
+      segmentId: "segment-artifact-outer-only",
+      idempotencyKey: "segment:artifact-outer-only:finished",
+      payload: {
+        laneId: "lane-artifact-outer-only",
+        segmentId: "segment-artifact-outer-only",
+        status: "succeeded",
+        exitCode: 0,
+      },
+      now: "2026-06-14T00:00:03.100Z",
+    });
+
+    store.close();
+
+    const databasePath = join(projectRoot, ".devflow", "skyturn-workflow.sqlite");
+    const legacy = new Database(databasePath);
+    const eventIdentity = legacy.prepare([
+      "SELECT id, session_id, seq, kind, source, lane_id, segment_id, causation_id, correlation_id,",
+      "idempotency_key, created_at, legacy_evidence_compatibility",
+      "FROM workflow_events WHERE session_id = ? AND idempotency_key = ?",
+    ].join(" ")).get("session-1", "evidence:artifact-outer-only") as Record<string, unknown>;
+    const legacyPayload = JSON.stringify({
+      laneId: "lane-artifact-outer-only",
+      segmentId: "segment-artifact-outer-only",
+      evidence: {
+        id: "evidence-artifact-outer-only",
+        kind: "run-exit",
+        status: "passed",
+        checks: [rawCheck, "API_KEY=historical-api-key password=historical-password"],
+        artifacts: [hostPath],
+        detail: rawDetail,
+        token: "historical-token",
+        path: hostPath,
+      },
+    });
+    legacy.prepare(
+      "UPDATE workflow_events SET payload_json = ? WHERE session_id = ? AND idempotency_key = ?",
+    ).run(legacyPayload, "session-1", "evidence:artifact-outer-only");
+    legacy.prepare("DELETE FROM schema_migrations WHERE version = 4").run();
+    expect(legacy.prepare(
+      "SELECT payload_json FROM workflow_events WHERE session_id = ? AND idempotency_key = ?",
+    ).get("session-1", "evidence:artifact-outer-only")).toEqual({ payload_json: legacyPayload });
+    legacy.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const rawValues = [
+      hostPath,
+      rawCheck,
+      rawDetail,
+      "outer-secret",
+      "historical-api-key",
+      "historical-password",
+      "historical-token",
+    ];
+    assertOuterOnlyArtifactPayloadRemoved(reopened, rawValues);
+    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    reopened.close();
+
+    const migrated = new Database(databasePath);
+    const migratedRow = migrated.prepare([
+      "SELECT id, session_id, seq, kind, source, lane_id, segment_id, causation_id, correlation_id,",
+      "idempotency_key, payload_json, created_at, legacy_evidence_compatibility",
+      "FROM workflow_events WHERE session_id = ? AND idempotency_key = ?",
+    ].join(" ")).get("session-1", "evidence:artifact-outer-only") as Record<string, unknown> & {
+      id: string;
+      payload_json: string;
+    };
+    expect(Object.fromEntries(Object.entries(migratedRow).filter(([key]) => key !== "payload_json"))).toEqual(eventIdentity);
+    expect(JSON.parse(migratedRow.payload_json)).toEqual({
+      evidence: {
+        artifacts: [],
+        checks: [],
+        id: "evidence-artifact-outer-only",
+        kind: "run-exit",
+        status: "failed",
+      },
+      laneId: "lane-artifact-outer-only",
+      segmentId: "segment-artifact-outer-only",
+    });
+    for (const raw of rawValues) expect(migratedRow.payload_json).not.toContain(raw);
+    const firstMigratedPayload = migratedRow.payload_json;
+    migrated.exec(`
+      CREATE TRIGGER reject_second_outer_evidence_migration
+      BEFORE UPDATE OF payload_json ON workflow_events
+      WHEN OLD.id = '${migratedRow.id}'
+      BEGIN
+        SELECT RAISE(ABORT, 'unexpected second migration write');
+      END;
+    `);
+    migrated.close();
+
+    const secondReopen = createWorkflowStore({ projectRoot });
+    assertOuterOnlyArtifactPayloadRemoved(secondReopen, rawValues);
+    secondReopen.close();
+    const afterSecond = new Database(databasePath, { readonly: true });
+    expect(afterSecond.prepare(
+      "SELECT payload_json FROM workflow_events WHERE session_id = ? AND idempotency_key = ?",
+    ).get("session-1", "evidence:artifact-outer-only")).toEqual({ payload_json: firstMigratedPayload });
+    afterSecond.close();
+  });
+
+  it("persists only canonical nested evidence fields across reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareCodeChangeWorkflow(store);
+    store.scheduleReadyLanes("session-1", { allowedParallelism: 1, now: "2026-06-14T00:00:03.000Z" });
+    const rawValues = [
+      "/Users/alice/private/outer.png",
+      "Bearer outer-secret path=/Users/alice/private/repo",
+      "nested-secret",
+      "C:\\Users\\alice\\private",
+    ];
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      idempotencyKey: "evidence:nested-canonical",
+      payload: {
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        evidence: {
+          id: "evidence-nested-canonical",
+          kind: "run-exit",
+          status: "passed",
+          checks: [rawValues[1]],
+          artifacts: [".devflow/acceptance/present.png", rawValues[0]],
+          detail: rawValues[1],
+          runEvidence: {
+            runId: "run-session-1-lane-implementation",
+            status: "succeeded",
+            exitCode: 0,
+            changesetId: null,
+            checks: [{ kind: "artifact", name: "Expected artifacts", status: "failed", detail: `token=${rawValues[2]} path=${rawValues[3]}` }],
+            artifacts: [".devflow/acceptance/present.png"],
+            review: null,
+            errorReason: null,
+            cancelReason: null,
+            completedAt: "2026-06-14T00:00:04.000Z",
+          },
+        },
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.segment.finished",
+      source: "test",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      idempotencyKey: "segment:nested-canonical:stale-finished",
+      payload: { laneId: "lane-implementation", segmentId: "segment-session-1-lane-implementation", status: "succeeded", exitCode: 0 },
+      now: "2026-06-14T00:00:05.000Z",
+    });
+
+    assertCanonicalNestedPersistence(store, rawValues);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    assertCanonicalNestedPersistence(reopened, rawValues);
+    reopened.close();
+  });
+
+  it.each([
+    ["timed-out", "timed-out", "run-timeout", "failed", "evidence-first"],
+    ["failed", "failed", "run-exit", "failed", "evidence-first"],
+    ["cancelled", "cancelled", "run-exit", "skipped", "evidence-first"],
+    ["timed-out", "timed-out", "run-timeout", "failed", "success-first"],
+    ["failed", "failed", "run-exit", "failed", "success-first"],
+    ["cancelled", "cancelled", "run-exit", "skipped", "success-first"],
+  ] as const)(
+    "keeps persisted nested %s as segment %s (%s/%s) when stale success is %s",
+    async (runStatus, segmentStatus, checkKind, evidenceStatus, order) => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareCodeChangeWorkflow(store);
+    store.scheduleReadyLanes("session-1", { allowedParallelism: 1, now: "2026-06-14T00:00:03.000Z" });
+    const terminalInput = {
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      idempotencyKey: `evidence:${runStatus}`,
+      payload: {
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        evidence: {
+          id: `evidence-${runStatus}`,
+          kind: "run-exit",
+          status: "passed",
+          checks: ["outer:passed"],
+          artifacts: [],
+          runEvidence: {
+            runId: "run-session-1-lane-implementation",
+            status: runStatus,
+            exitCode: null,
+            changesetId: null,
+            checks: [{ kind: checkKind, name: "Terminal evidence", status: runStatus === "cancelled" ? "skipped" : "failed" }],
+            artifacts: [],
+            review: null,
+            errorReason: runStatus === "failed" ? "Run failed." : null,
+            cancelReason: runStatus === "cancelled" ? "Run cancelled." : null,
+            completedAt: "2026-06-14T00:00:04.000Z",
+          },
+        },
+      },
+      now: "2026-06-14T00:00:04.000Z",
+    } as const;
+    const staleSuccessInput = {
+      sessionId: "session-1",
+      kind: "workflow.segment.finished",
+      source: "test",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      idempotencyKey: `segment:${runStatus}:stale-finished`,
+      payload: { laneId: "lane-implementation", segmentId: "segment-session-1-lane-implementation", status: "succeeded", exitCode: 0 },
+      now: "2026-06-14T00:00:05.000Z",
+    } as const;
+    if (order === "evidence-first") {
+      store.appendWorkflowEvent(terminalInput);
+      store.appendWorkflowEvent(staleSuccessInput);
+    } else {
+      store.appendWorkflowEvent(staleSuccessInput);
+      store.appendWorkflowEvent(terminalInput);
+    }
+    expect(() => store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      idempotencyKey: `evidence:${runStatus}:conflicting-success`,
+      payload: {
+        laneId: "lane-implementation",
+        segmentId: "segment-session-1-lane-implementation",
+        evidence: {
+          id: `evidence-${runStatus}-conflicting-success`,
+          kind: "run-exit",
+          status: "passed",
+          checks: [],
+          artifacts: [],
+          runEvidence: terminalRunEvidence(
+            "run-session-1-lane-implementation",
+            "succeeded",
+            0,
+            [{ kind: "run-exit", name: "Late success", status: "passed" }],
+            [],
+          ),
+        },
+      },
+      now: "2026-06-14T00:00:05.100Z",
+    })).toThrow(/terminal evidence conflict/i);
+
+    expect(store.materializeFlowProjection("session-1").segments.at(-1)?.status).toBe(segmentStatus);
+    expect(store.materializeFlowProjection("session-1").evidence[0]?.status).toBe(evidenceStatus);
+    expect(store.materializeFlowProjection("session-1").evidence[0]?.runEvidence).toMatchObject({
+      status: runStatus,
+      exitCode: null,
+      cancelReason: runStatus === "cancelled" ? "Run cancelled." : null,
+      completedAt: "2026-06-14T00:00:04.000Z",
+    });
+    expect(store.materializeFlowProjection("session-1").evidence.at(-1)?.status).toBe(evidenceStatus);
+    expect(store.materializeFlowProjection("session-1").evidence.at(-1)?.runEvidence?.status).toBe(runStatus);
+    expect(store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-implementation")?.status).toBe("failed");
+    expect(store.scheduleReadyLanes("session-1", { allowedParallelism: 2, now: "2026-06-14T00:00:06.000Z" }).readyLanes).toEqual([]);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1").segments.at(-1)?.status).toBe(segmentStatus);
+    expect(reopened.materializeFlowProjection("session-1").evidence[0]?.runEvidence?.status).toBe(runStatus);
+    expect(reopened.materializeFlowProjection("session-1").evidence[0]?.runEvidence).toMatchObject({
+      exitCode: null,
+      cancelReason: runStatus === "cancelled" ? "Run cancelled." : null,
+      completedAt: "2026-06-14T00:00:04.000Z",
+    });
+    expect(reopened.materializeFlowProjection("session-1").evidence.at(-1)?.status).toBe(evidenceStatus);
+    expect(reopened.materializeFlowProjection("session-1").evidence.at(-1)?.runEvidence?.status).toBe(runStatus);
+    expect(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-implementation")?.status).toBe("failed");
+    expect(reopened.scheduleReadyLanes("session-1", { allowedParallelism: 2, now: "2026-06-14T00:00:07.000Z" }).readyLanes).toEqual([]);
+    reopened.close();
+    },
+  );
+
+  it("replays exact cancelled executable evidence without writes and rejects later success", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    const input = runResultInput(store, "lane-implementation", "cancelled", "2026-06-14T00:00:05.000Z");
+
+    const assertReplay = () => {
+      const events = store.listEvents(input.sessionId);
+      const projection = store.materializeFlowProjection(input.sessionId);
+      expect(store.recordRunResult({ ...input, now: "2026-06-14T00:00:06.000Z" })).toEqual(projection);
+      expect(store.listEvents(input.sessionId)).toEqual(events);
+      expect(() => store.recordRunResult({
+        ...input,
+        evidence: terminalRunEvidence(
+          input.runId,
+          "succeeded",
+          0,
+          [{ kind: "run-exit", name: "Late success", status: "passed" }],
+          [],
+        ),
+        now: "2026-06-14T00:00:07.000Z",
+      })).toThrow(/terminal evidence conflict/i);
+      expect(store.listEvents(input.sessionId)).toEqual(events);
+      expect(store.materializeFlowProjection(input.sessionId).segments.at(-1)?.status).toBe("cancelled");
+      expect(store.materializeCanvasSession(input.sessionId)?.nodes.find((node) => node.id === input.laneId)?.status).toBe("failed");
+    };
+
+    store.recordRunResult(input);
+    assertReplay();
+    store.close();
+    store = createWorkflowStore({ projectRoot });
+    assertReplay();
+    store.close();
+  });
+
+  it("fails legacy recordSegmentEvidence on artifact failure and clears partial artifacts across reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareLegacyCodeLane(store);
+    store.recordSegmentEvidence({
+      sessionId: "session-1",
+      laneId: "node-code",
+      segmentId: "segment-code-artifact-failed",
+      runId: "run-code-artifact-failed",
+      agentKind: "codex",
+      transport: "codex_cli",
+      worktreePath: "/tmp/worktree",
+      evidence: {
+        exitCode: 0,
+        changesetId: null,
+        checks: [
+          { kind: "run-exit", name: "Codex CLI exit", status: "passed" },
+          { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+        ],
+        artifacts: [".devflow/acceptance/present.png"],
+        review: null,
+        errorReason: null,
+      },
+      now: "2026-06-14T00:00:02.000Z",
+    });
+
+    assertLegacyArtifactFailure(store);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    assertLegacyArtifactFailure(reopened);
+    reopened.close();
+  });
+
+  it("returns the original segment on an identical zero-write evidence replay across reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareLegacyCodeLane(store);
+    const input = artifactFailureSegmentInput();
+    const original = store.recordSegmentEvidence(input);
+    const afterFirstWrite = workflowStoreSnapshot(store);
+
+    const replay = store.recordSegmentEvidence(input);
+    expect(workflowStoreSnapshot(store)).toEqual(afterFirstWrite);
+    expect(replay).toEqual(original);
+    expect(replay).toMatchObject({
+      id: input.segmentId,
+      runId: input.runId,
+      laneId: input.laneId,
+      status: "failed",
+      exitCode: 0,
+      endedAt: input.now,
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const reopenedReplay = reopened.recordSegmentEvidence(input);
+    expect(workflowStoreSnapshot(reopened)).toEqual(afterFirstWrite);
+    expect(reopenedReplay).toEqual(original);
+    reopened.close();
+  });
+
+  it("rejects every recordSegmentEvidence identity or terminal conflict with zero writes across reopen", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareLegacyCodeLane(store);
+    const input = artifactFailureSegmentInput();
+    store.recordSegmentEvidence(input);
+    const terminalSnapshot = workflowStoreSnapshot(store);
+
+    assertSegmentEvidenceConflictsAreAtomic(store, input, terminalSnapshot);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    assertSegmentEvidenceConflictsAreAtomic(reopened, input, terminalSnapshot);
+    reopened.close();
+  });
+
+  it.each([
+    ["malformed check", { checks: [{ kind: "unknown-kind", name: "Unsafe", status: "passed" }] }],
+    ["unsafe artifact", { artifacts: ["/Users/alice/private/result.png"] }],
+  ])("rejects %s in recordSegmentEvidence with zero writes across reopen", async (_label, invalidEvidence) => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareLegacyCodeLane(store);
+    const before = {
+      events: store.listEvents("session-1"),
+      lanes: store.listLanes("session-1"),
+      segments: store.listSegments("session-1", "node-code"),
+    };
+
+    expect(() => store.recordSegmentEvidence({
+      sessionId: "session-1",
+      laneId: "node-code",
+      segmentId: "segment-code-malformed",
+      runId: "run-code-malformed",
+      agentKind: "codex",
+      transport: "codex_cli",
+      worktreePath: "/tmp/worktree",
+      evidence: {
+        exitCode: 0,
+        changesetId: "changeset-code-malformed",
+        checks: [{ kind: "test", name: "pnpm test", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        ...invalidEvidence,
+      } as never,
+      now: "2026-06-14T00:00:02.000Z",
+    })).toThrow(/invalid RunEvidence/i);
+    expect({
+      events: store.listEvents("session-1"),
+      lanes: store.listLanes("session-1"),
+      segments: store.listSegments("session-1", "node-code"),
+    }).toEqual(before);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect({
+      events: reopened.listEvents("session-1"),
+      lanes: reopened.listLanes("session-1"),
+      segments: reopened.listSegments("session-1", "node-code"),
+    }).toEqual(before);
+    reopened.close();
+  });
+
+  it("hydrates concrete artifact-free segment evidence only from an old SQLite schema row", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareLegacyCodeLane(store);
+    store.recordSegmentEvidence({
+      sessionId: "session-1",
+      laneId: "node-code",
+      segmentId: "segment-code-legacy-disk",
+      runId: "run-code-legacy-disk",
+      agentKind: "codex",
+      transport: "codex_cli",
+      worktreePath: "/tmp/worktree",
+      evidence: {
+        exitCode: 0,
+        changesetId: "changeset-code-legacy-disk",
+        checks: [{ kind: "test", name: "pnpm test", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+      },
+      now: "2026-06-14T00:00:02.000Z",
+    });
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    simulateLegacyEvidenceSchema(db);
+    db.prepare("UPDATE workflow_segments SET evidence_json = ?, exit_code = NULL, status = 'succeeded' WHERE id = ?").run(
+      JSON.stringify({
+        exitCode: null,
+        changesetId: "changeset-code-legacy-disk",
+        checks: [{ kind: "test", name: "pnpm test", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+      }),
+      "segment-code-legacy-disk",
+    );
+    db.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const segment = reopened.listSegments("session-1", "node-code").find((item) => item.id === "segment-code-legacy-disk");
+    expect(segment).toMatchObject({
+      status: "succeeded",
+      evidence: {
+        runId: "run-code-legacy-disk",
+        status: "succeeded",
+        exitCode: null,
+        changesetId: "changeset-code-legacy-disk",
+        checks: [{ kind: "test", name: "pnpm test", status: "passed" }],
+        artifacts: [],
+      },
+    });
+    expect(reopened.applyWorkflowCardToolCall(
+      "session-1",
+      createCard("tool-review-legacy-disk", {
+        id: "node-review-legacy-disk",
+        taskKey: "review-legacy-disk",
+        title: "Review legacy code",
+        agent: "hermes",
+        brief: "Review the implementation.",
+        dependencies: ["node-code"],
+      }),
+      workflowContext("run-planner"),
+    )).toMatchObject({ status: "applied" });
+    reopened.close();
+  });
+
+  it("rejects a current-schema segment row forged into legacy null-exit shape", async () => {
+    const store = await makeSeededStore();
+    const projectRoot = dirname(dirname(store.databasePath));
+    declareLegacyCodeLane(store);
+    store.recordSegmentEvidence({
+      ...artifactFailureSegmentInput(),
+      segmentId: "segment-code-current-forgery",
+      runId: "run-code-current-forgery",
+      evidence: {
+        exitCode: 0,
+        changesetId: "changeset-code-current-forgery",
+        checks: [{ kind: "test", name: "pnpm test", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+      },
+    });
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    db.prepare("UPDATE workflow_segments SET evidence_json = ?, exit_code = NULL, status = 'succeeded' WHERE id = ?").run(
+      JSON.stringify({
+        exitCode: null,
+        changesetId: "changeset-code-current-forgery",
+        checks: [{ kind: "test", name: "pnpm test", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+      }),
+      "segment-code-current-forgery",
+    );
+    db.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listSegments("session-1", "node-code").find((item) => item.id === "segment-code-current-forgery")).toMatchObject({
+      status: "failed",
+      evidence: null,
+    });
+    reopened.close();
+  });
+
+  it("grants null-exit FlowEvent compatibility only to rows migrated from an old SQLite schema", async () => {
+    const currentRoot = await makeNullExitFlowEventFixture(false);
+    const current = createWorkflowStore({ projectRoot: currentRoot });
+    expect(current.materializeFlowProjection("session-1").evidence.at(-1)?.status).toBe("failed");
+    expect(current.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    current.close();
+
+    const legacyRoot = await makeNullExitFlowEventFixture(true);
+    const legacy = createWorkflowStore({ projectRoot: legacyRoot });
+    expect(legacy.materializeFlowProjection("session-1").evidence.at(-1)?.status).toBe("passed");
+    expect(legacy.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("completed");
+    expect(legacy.scheduleReadyLanes("session-1", { allowedParallelism: 2, now: "2026-06-14T00:00:06.000Z" }).readyLanes.map((lane) => lane.id)).toContain("lane-validation");
+    legacy.close();
+  });
+
+  it("rejects malformed RunEvidence without writes and preserves the running lane after restart", async () => {
+    const store = await makeSeededStore();
+    declareCodeChangeWorkflow(store);
+    store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    const before = store.listEvents("session-1");
+    const evidence = {
+      runId: "run-session-1-lane-implementation",
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "unknown-kind", name: "Unsafe", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:04.000Z",
+    } as unknown as RunEvidence;
+
+    expect(() => store.recordRunResult({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      runId: evidence.runId,
+      agentKind: "codex",
+      evidence,
+      now: evidence.completedAt!,
+    })).toThrow(/invalid RunEvidence/i);
+    expect(store.listEvents("session-1")).toEqual(before);
+    expect(store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("running");
+
+    const projectRoot = dirname(dirname(store.databasePath));
+    store.close();
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listEvents("session-1")).toEqual(before);
+    expect(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("running");
+    reopened.close();
+  });
+
   it("does not auto-trigger repair for cancelled runs or failed repair lanes", async () => {
     const cancelledStore = await makeSeededStore();
     declareCodeChangeWorkflow(cancelledStore);
@@ -3830,7 +5814,7 @@ describe("SQLite workflow store", () => {
           detail: "DATABASE_URL=postgres://db-secret",
         },
       ],
-      artifacts: [".devflow/tasks/session-1/.env.secret"],
+      artifacts: [".devflow/acceptance/result.png"],
       review: {
         kind: "review",
         name: "review",
@@ -3861,7 +5845,7 @@ describe("SQLite workflow store", () => {
     const serializedEvents = JSON.stringify(store.listEvents("session-1"));
     const serializedCanvas = JSON.stringify(store.materializeCanvasSession("session-1"));
 
-    expect(serializedEvents).toContain("[REDACTED]");
+    expect(serializedEvents).toContain("[redacted]");
     expect(serializedEvents).toContain("Patch content omitted");
     expect(serializedEvents).toContain("runEvidence");
     for (const serialized of [serializedEvents, serializedCanvas]) {
@@ -3875,6 +5859,13 @@ describe("SQLite workflow store", () => {
       expect(serialized).not.toContain("diff --git");
       expect(serialized).not.toContain("stderr BEGIN");
     }
+
+    const projectRoot = dirname(dirname(store.databasePath));
+    store.close();
+    const reopened = createWorkflowStore({ projectRoot });
+    const reopenedData = JSON.stringify(reopened.listEvents("session-1"));
+    expect(reopenedData).not.toMatch(/sk-(?:output|diff|error|check)|db-secret|live-token|\.env/);
+    reopened.close();
   });
 
   it("persists rejected WorkflowIntent events when gate validation fails", async () => {
@@ -3926,6 +5917,129 @@ async function makeTempRoot(): Promise<string> {
   return root;
 }
 
+const hermesHandlePhysicalCleanupSqlTrace = [
+  "UPDATE hermes_sessions SET opaque_handle = '[redacted]' WHERE opaque_handle IS NOT NULL AND opaque_handle != '[redacted]'",
+  "PRAGMA wal_checkpoint(TRUNCATE)",
+  "VACUUM",
+  "PRAGMA wal_checkpoint(TRUNCATE)",
+  "PRAGMA journal_mode = DELETE",
+  "INSERT INTO workflow_maintenance(name, state, completed_at) VALUES (?, 'complete', datetime('now'))",
+  "PRAGMA journal_mode = WAL",
+];
+
+function maintenanceFaultInjection(input: {
+  trace: string[];
+  fault?: "initial-checkpoint" | "vacuum" | "marker-write" | "final-checkpoint";
+}) {
+  return {
+    traceHermesHandleMaintenanceSql(sql: string) {
+      input.trace.push(sql);
+    },
+    beforeHermesHandleMaintenanceStep(
+      step: "initial-checkpoint" | "vacuum" | "marker-write" | "final-checkpoint",
+    ) {
+      if (step !== input.fault) return;
+      if (step === "vacuum") {
+        const error = new Error("injected SQLITE_FULL during VACUUM");
+        Object.assign(error, { code: "SQLITE_FULL" });
+        throw error;
+      }
+      if (step === "marker-write") throw new Error("injected completion marker write failure");
+    },
+    overrideHermesHandleCheckpointResult(phase: "initial" | "final") {
+      if (
+        (phase === "initial" && input.fault === "initial-checkpoint") ||
+        (phase === "final" && input.fault === "final-checkpoint")
+      ) {
+        return [{ busy: 1, log: 1, checkpointed: 0 }];
+      }
+      return undefined;
+    },
+  };
+}
+
+function seedHermesHandleCleanupCase(
+  projectRoot: string,
+  rawHandle: string,
+  state: { v5: "absent" | "present"; physicalState: "absent" | "complete" },
+): void {
+  const store = createWorkflowStore({ projectRoot });
+  store.createWorkflowSession({
+    id: "session-maintenance",
+    projectId: "project-maintenance",
+    title: "Maintenance",
+    goal: "Clean legacy handle",
+    mode: "fast",
+    plannerProfile: "default",
+    transport: "hermes_session_resume",
+    opaqueHandle: "current-write-redacted",
+    now: "2026-07-15T00:00:00.000Z",
+  });
+  store.close();
+
+  const databasePath = join(projectRoot, ".devflow", "skyturn-workflow.sqlite");
+  const db = new Database(databasePath);
+  db.pragma("journal_mode = WAL");
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS workflow_maintenance (
+      name TEXT PRIMARY KEY,
+      state TEXT NOT NULL,
+      completed_at TEXT NOT NULL
+    )
+  `);
+  db.prepare("UPDATE hermes_sessions SET opaque_handle = ? WHERE workflow_session_id = ?")
+    .run(rawHandle, "session-maintenance");
+  if (state.v5 === "absent") db.prepare("DELETE FROM schema_migrations WHERE version = 5").run();
+  db.prepare("DELETE FROM workflow_maintenance WHERE name = ?").run(hermesHandlePhysicalCleanup);
+  if (state.physicalState === "complete") {
+    db.prepare([
+      "INSERT INTO workflow_maintenance(name, state, completed_at)",
+      "VALUES (?, 'complete', datetime('now'))",
+    ].join(" ")).run(hermesHandlePhysicalCleanup);
+  }
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  db.close();
+}
+
+function readHermesHandlePhysicalCleanupState(projectRoot: string): string | null {
+  const databasePath = join(projectRoot, ".devflow", "skyturn-workflow.sqlite");
+  const db = new Database(databasePath, { readonly: true });
+  try {
+    const row = db.prepare("SELECT state FROM workflow_maintenance WHERE name = ?")
+      .get(hermesHandlePhysicalCleanup) as { state: string } | undefined;
+    return row?.state ?? null;
+  } catch {
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+function seedLegacyHermesHandle(
+  projectRoot: string,
+  sessionId: string,
+  rawHandle: string,
+  olderMigrationMarkers = false,
+): void {
+  const databasePath = join(projectRoot, ".devflow", "skyturn-workflow.sqlite");
+  const db = new Database(databasePath);
+  db.pragma("journal_mode = WAL");
+  db.prepare("UPDATE hermes_sessions SET opaque_handle = ? WHERE workflow_session_id = ?").run(rawHandle, sessionId);
+  db.prepare(olderMigrationMarkers
+    ? "DELETE FROM schema_migrations WHERE version > 1"
+    : "DELETE FROM schema_migrations WHERE version = 5").run();
+  db.pragma("wal_checkpoint(TRUNCATE)");
+  db.close();
+}
+
+async function expectRawHandleAbsent(projectRoot: string, rawHandle: string): Promise<void> {
+  const databasePath = join(projectRoot, ".devflow", "skyturn-workflow.sqlite");
+  for (const path of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+    const bytes = await readFile(path).catch(() => Buffer.alloc(0));
+    expect(bytes.includes(Buffer.from(rawHandle, "utf8")), path).toBe(false);
+  }
+}
+
 async function makeStore() {
   return createWorkflowStore({ projectRoot: await makeTempRoot() });
 }
@@ -3934,6 +6048,230 @@ async function makeSeededStore() {
   const store = await makeStore();
   seedStore(store);
   return store;
+}
+
+type TestWorkflowStore = ReturnType<typeof createWorkflowStore>;
+type TestSegmentEvidenceInput = Parameters<TestWorkflowStore["recordSegmentEvidence"]>[0];
+
+function terminalRunEvidence(
+  runId: string,
+  status: RunEvidence["status"],
+  exitCode: number | null,
+  checks: RunEvidence["checks"],
+  artifacts: string[],
+): RunEvidence {
+  return {
+    runId,
+    status,
+    exitCode,
+    changesetId: null,
+    checks,
+    artifacts,
+    review: null,
+    errorReason: status === "failed" ? "Run failed." : null,
+    cancelReason: status === "cancelled" ? "Run cancelled." : null,
+    completedAt: "2026-06-14T00:00:04.000Z",
+  };
+}
+
+function artifactFailureSegmentInput(): TestSegmentEvidenceInput {
+  return {
+    sessionId: "session-1",
+    laneId: "node-code",
+    segmentId: "segment-code-terminal",
+    runId: "run-code-terminal",
+    agentKind: "codex",
+    transport: "codex_cli",
+    worktreePath: "/tmp/worktree",
+    evidence: {
+      exitCode: 0,
+      changesetId: "changeset-code-terminal",
+      checks: [
+        { kind: "run-exit", name: "Codex CLI exit", status: "passed" },
+        { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+      ],
+      artifacts: [".devflow/acceptance/present.png"],
+      review: null,
+      errorReason: null,
+    },
+    now: "2026-06-14T00:00:02.000Z",
+  };
+}
+
+function workflowStoreSnapshot(store: TestWorkflowStore) {
+  return {
+    events: store.listEvents("session-1"),
+    lanes: store.listLanes("session-1"),
+    codeSegments: store.listSegments("session-1", "node-code"),
+    planningSegments: store.listSegments("session-1", "node-plan"),
+  };
+}
+
+function assertSegmentEvidenceConflictsAreAtomic(
+  store: TestWorkflowStore,
+  input: TestSegmentEvidenceInput,
+  snapshot: ReturnType<typeof workflowStoreSnapshot>,
+): void {
+  const conflicts: TestSegmentEvidenceInput[] = [
+    { ...input, runId: "run-code-conflict", now: "2026-06-14T00:00:03.000Z" },
+    { ...input, agentKind: "hermes", now: "2026-06-14T00:00:03.100Z" },
+    { ...input, laneId: "node-plan", now: "2026-06-14T00:00:03.200Z" },
+    {
+      ...input,
+      evidence: { ...input.evidence, changesetId: "changeset-evidence-conflict" },
+      now: "2026-06-14T00:00:03.300Z",
+    },
+    {
+      ...input,
+      evidence: {
+        exitCode: 0,
+        changesetId: "changeset-code-terminal",
+        checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+      },
+      now: "2026-06-14T00:00:03.400Z",
+    },
+    {
+      ...input,
+      evidence: {
+        exitCode: 1,
+        changesetId: "changeset-code-terminal",
+        checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "failed" }],
+        artifacts: [],
+        review: null,
+        errorReason: "exit 1",
+      },
+      now: "2026-06-14T00:00:03.500Z",
+    },
+  ];
+
+  for (const conflict of conflicts) {
+    expect(() => store.recordSegmentEvidence(conflict)).toThrow(/identity|terminal/i);
+    expect(workflowStoreSnapshot(store)).toEqual(snapshot);
+  }
+}
+
+function assertStrictArtifactAppendProjection(store: TestWorkflowStore): void {
+  const projection = store.materializeFlowProjection("session-1");
+  expect(projection.evidence.find((item) => item.id === "evidence-browser-invalid")?.status).toBe("failed");
+  expect(projection.evidence.find((item) => item.id === "evidence-browser-valid")?.status).toBe("passed");
+  expect(projection.segments.find((item) => item.id === "segment-browser-invalid")?.status).toBe("failed");
+  expect(projection.segments.find((item) => item.id === "segment-browser-valid")?.status).toBe("succeeded");
+  expect(projection.lanes.find((item) => item.id === "lane-browser-invalid")?.status).toBe("failed");
+  expect(projection.lanes.find((item) => item.id === "lane-browser-valid")?.status).toBe("completed");
+  expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-browser-invalid")?.status).toBe("failed");
+  const ready = scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id);
+  expect(ready).not.toContain("lane-review-invalid");
+  expect(ready).toContain("lane-review-valid");
+}
+
+function assertOuterOnlyArtifactPayloadRemoved(store: TestWorkflowStore, rawValues: string[]): void {
+  const projection = store.materializeFlowProjection("session-1");
+  const evidence = projection.evidence.find((item) => item.id === "evidence-artifact-outer-only");
+  const canvasSession = store.materializeCanvasSession("session-1");
+  expect(evidence).toMatchObject({ status: "failed", checks: [], artifacts: [] });
+  expect(evidence?.detail).toBeUndefined();
+  expect(evidence?.runEvidence).toBeUndefined();
+  expect(projection.segments.find((item) => item.id === "segment-artifact-outer-only")?.status).toBe("failed");
+  expect(projection.lanes.find((item) => item.id === "lane-artifact-outer-only")?.status).toBe("failed");
+  expect(canvasSession?.nodes.find((node) => node.id === "lane-artifact-outer-only")).toMatchObject({
+    status: "failed",
+    requiredEvidence: ["artifact"],
+  });
+  expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((lane) => lane.id)).not.toContain(
+    "lane-artifact-outer-only-review",
+  );
+  const serialized = JSON.stringify({ events: store.listEvents("session-1"), projection, canvasSession });
+  for (const raw of rawValues) expect(serialized).not.toContain(raw);
+}
+
+function simulateLegacyEvidenceSchema(db: Database.Database): void {
+  for (const table of ["workflow_events", "workflow_segments"]) {
+    const columns = new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
+    if (columns.has("legacy_evidence_compatibility")) {
+      db.exec(`ALTER TABLE ${table} DROP COLUMN legacy_evidence_compatibility`);
+    }
+  }
+  db.prepare("DELETE FROM schema_migrations WHERE version = 3").run();
+}
+
+async function makeNullExitFlowEventFixture(legacySchema: boolean): Promise<string> {
+  const store = await makeSeededStore();
+  const projectRoot = dirname(dirname(store.databasePath));
+  declareCodeChangeWorkflow(store);
+  store.scheduleReadyLanes("session-1", { allowedParallelism: 1, now: "2026-06-14T00:00:03.000Z" });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.evidence.recorded",
+    source: "codex",
+    laneId: "lane-implementation",
+    segmentId: "segment-session-1-lane-implementation",
+    idempotencyKey: "evidence:null-exit-schema-fixture",
+    payload: {
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      evidence: {
+        id: "evidence-null-exit-schema-fixture",
+        kind: "run-exit",
+        status: "passed",
+        checks: [],
+        artifacts: [],
+        runEvidence: terminalRunEvidence(
+          "run-session-1-lane-implementation",
+          "succeeded",
+          0,
+          [{ kind: "test", name: "Historical verification", status: "passed" }],
+          [],
+        ),
+      },
+    },
+    now: "2026-06-14T00:00:04.000Z",
+  });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.segment.finished",
+    source: "codex",
+    laneId: "lane-implementation",
+    segmentId: "segment-session-1-lane-implementation",
+    idempotencyKey: "segment:null-exit-schema-fixture:finished",
+    payload: {
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      status: "succeeded",
+      exitCode: 0,
+    },
+    now: "2026-06-14T00:00:04.100Z",
+  });
+  store.close();
+
+  const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+  if (legacySchema) simulateLegacyEvidenceSchema(db);
+  db.prepare("UPDATE workflow_events SET payload_json = ? WHERE session_id = ? AND idempotency_key = ?").run(
+    JSON.stringify({
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      evidence: {
+        id: "evidence-null-exit-schema-fixture",
+        kind: "run-exit",
+        status: "passed",
+        checks: ["test:Historical verification:passed"],
+        artifacts: [],
+        runEvidence: terminalRunEvidence(
+          "run-session-1-lane-implementation",
+          "succeeded",
+          null,
+          [{ kind: "test", name: "Historical verification", status: "passed" }],
+          [],
+        ),
+      },
+    }),
+    "session-1",
+    "evidence:null-exit-schema-fixture",
+  );
+  db.close();
+  return projectRoot;
 }
 
 function seedStore(
@@ -3985,6 +6323,64 @@ function declareCodeChangeWorkflow(store: ReturnType<typeof createWorkflowStore>
       { type: "ProposeLanes" },
     ],
   }, "2026-06-14T00:00:02.000Z");
+}
+
+function declareLegacyCodeLane(store: ReturnType<typeof createWorkflowStore>): void {
+  declareCompletedPlanningLane(store);
+  expect(store.applyWorkflowCardToolCall(
+    "session-1",
+    createCard("tool-code-legacy-evidence", {
+      id: "node-code",
+      taskKey: "code-legacy-evidence",
+      title: "Implement core",
+      agent: "codex",
+      brief: "Write the implementation.",
+    }),
+    workflowContext("run-planner"),
+  )).toMatchObject({ status: "applied", nodeId: "node-code" });
+}
+
+function assertCanonicalNestedPersistence(
+  store: ReturnType<typeof createWorkflowStore>,
+  rawValues: string[],
+): void {
+  const projection = store.materializeFlowProjection("session-1");
+  const serialized = JSON.stringify({ events: store.listEvents("session-1"), projection });
+  const evidence = projection.evidence.at(-1);
+  expect(evidence).toMatchObject({ status: "failed", artifacts: [] });
+  expect(evidence?.runEvidence).toMatchObject({ status: "failed", artifacts: [] });
+  expect(projection.segments.at(-1)?.status).toBe("failed");
+  expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+  expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-implementation")?.status).toBe("failed");
+  expect(store.scheduleReadyLanes("session-1", { allowedParallelism: 2, now: "2026-06-14T00:00:06.000Z" }).readyLanes).toEqual([]);
+  for (const raw of rawValues) expect(serialized).not.toContain(raw);
+}
+
+function assertLegacyArtifactFailure(store: ReturnType<typeof createWorkflowStore>): void {
+  const segment = store.listSegments("session-1", "node-code").find((item) => item.id === "segment-code-artifact-failed");
+  expect(segment).toMatchObject({
+    status: "failed",
+    evidence: {
+      runId: "run-code-artifact-failed",
+      status: "failed",
+      exitCode: 0,
+      artifacts: [],
+    },
+  });
+  expect(store.getLane("session-1", "node-code")?.status).toBe("failed");
+  expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "node-code")?.status).toBe("failed");
+  expect(store.applyWorkflowCardToolCall(
+    "session-1",
+    createCard("tool-review-blocked-artifact", {
+      id: "node-review-blocked-artifact",
+      taskKey: "review-blocked-artifact",
+      title: "Review failed artifact",
+      agent: "hermes",
+      brief: "Review the implementation.",
+      dependencies: ["node-code"],
+    }),
+    workflowContext("run-planner"),
+  )).toMatchObject({ status: "skipped", message: expect.stringMatching(/evidence/i) });
 }
 
 function appendCompiledFlowEvent(store: ReturnType<typeof createWorkflowStore>, event: FlowEvent): void {
@@ -4072,6 +6468,88 @@ function advanceCodeChangeWorkflowToLane(
     allowedParallelism: 1,
     now: "2026-06-14T00:00:07.000Z",
   });
+}
+
+function runOutputEvent(runId: string, seq: number, text: string): RunEvent {
+  return {
+    protocolVersion: 1,
+    runId,
+    seq,
+    kind: "output",
+    payload: { source: "codex", stream: "stdout", format: "text", text },
+    timestamp: `2026-06-14T00:00:${String(seq).padStart(2, "0")}.000Z`,
+  };
+}
+
+function runProgressEvent(
+  runId: string,
+  seq: number,
+  text: string,
+  source: "codex" | "hermes" = "hermes",
+): RunEvent {
+  return {
+    protocolVersion: 1,
+    runId,
+    seq,
+    kind: "progress",
+    payload: { source, stream: "stderr", format: "text", text },
+    timestamp: `2026-06-14T00:00:${String(seq).padStart(2, "0")}.000Z`,
+  };
+}
+
+function runChangesEvent(runId: string, seq: number, source: "codex" | "hermes" = "hermes"): RunEvent {
+  return {
+    protocolVersion: 1,
+    runId,
+    seq,
+    kind: "changes",
+    payload: { source, files: ["src/planner.ts"] },
+    timestamp: `2026-06-14T00:00:${String(seq).padStart(2, "0")}.000Z`,
+  };
+}
+
+function terminalOnlyRunEvents(
+  runId: string,
+  source: "codex" | "hermes" = "codex",
+  startSeq = 1,
+): RunEvent[] {
+  return [
+    {
+      protocolVersion: 1,
+      runId,
+      seq: startSeq,
+      kind: "evidence",
+      payload: {
+        source,
+        exitCode: 0,
+        checks: [{ kind: "run-exit", name: `${source === "hermes" ? "Hermes CLI" : "Agent"} exit`, status: "passed" }],
+      },
+      timestamp: `2026-06-14T00:00:${String(startSeq).padStart(2, "0")}.000Z`,
+    },
+    {
+      protocolVersion: 1,
+      runId,
+      seq: startSeq + 1,
+      kind: "status",
+      payload: { source, status: "succeeded", exitCode: 0 },
+      timestamp: `2026-06-14T00:00:${String(startSeq + 1).padStart(2, "0")}.000Z`,
+    },
+  ];
+}
+
+function plannerRunEvidence(runId: string, completedAt: string): RunEvidence {
+  return {
+    runId,
+    status: "succeeded",
+    exitCode: 0,
+    changesetId: null,
+    checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit 0" }],
+    artifacts: [],
+    review: null,
+    errorReason: null,
+    cancelReason: null,
+    completedAt,
+  };
 }
 
 function runResultInput(

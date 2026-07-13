@@ -30,6 +30,8 @@ interface RunStartStore {
 }
 
 interface RunStartDependencies<Input, Run, Store extends RunStartStore> {
+  preAuthorizeStart?(input: Input): void | Promise<void>;
+  authorizeStartInput?(input: Input): Input | Promise<Input>;
   resolveIdentity(input: Input): TrustedRunStartIdentity | Promise<TrustedRunStartIdentity>;
   acquireStore(identity: TrustedRunStartIdentity): Promise<Store>;
   reopenStore(identity: TrustedRunStartIdentity): Promise<Store>;
@@ -54,9 +56,14 @@ export function createRunStartHandler<Input, Run, Store extends RunStartStore>(
 ): (input: Input) => Promise<Run> {
   const startFlights = new Map<string, { fingerprint: string; promise: Promise<Run> }>();
   return async (input) => {
+    let authorizedInput: Input;
     let identity: TrustedRunStartIdentity;
     try {
-      identity = await dependencies.resolveIdentity(input);
+      await dependencies.preAuthorizeStart?.(input);
+      authorizedInput = dependencies.authorizeStartInput
+        ? await dependencies.authorizeStartInput(input)
+        : input;
+      identity = await dependencies.resolveIdentity(authorizedInput);
     } catch (error) {
       return Promise.reject(error);
     }
@@ -67,7 +74,7 @@ export function createRunStartHandler<Input, Run, Store extends RunStartStore>(
       }
       return active.promise;
     }
-    const promise = runStartOnce(dependencies, input, identity);
+    const promise = runStartOnce(dependencies, authorizedInput, identity);
     startFlights.set(identity.runId, { fingerprint: identity.startFingerprint, promise });
     void promise.then(
       () => clearStartFlight(startFlights, identity.runId, promise),
@@ -108,11 +115,13 @@ async function runStartOnce<Input, Run, Store extends RunStartStore>(
       throw error;
     }
   } catch (error) {
-    if (!store || !segment || !compensationOwned) throw error;
+    if (!store || !segment || !compensationOwned) {
+      throw isOwnedRunStartFailure(error) ? await publicOwnedRunStartError(error) : error;
+    }
     try {
       await dependencies.reconcileTerminal(store, segment, identity);
     } catch (reconciliationError) {
-      await persistCompensation(dependencies, identity, store, segment, error);
+      await persistCompensation(dependencies, identity, store, segment, runStartCompensationError(error));
       try {
         dependencies.recordReconciliationFailure?.(store, segment, reconciliationError);
       } catch {
@@ -128,7 +137,7 @@ async function runStartOnce<Input, Run, Store extends RunStartStore>(
         // Terminal state is already durable; checkpoint enrichment is best-effort.
       }
     }
-    throw error;
+    throw await publicOwnedRunStartError(error);
   }
 }
 
@@ -183,6 +192,27 @@ async function findOrClaimStartSegment<Input, Run, Store extends RunStartStore>(
 function isOwnedRunStartFailure(error: unknown): boolean {
   return typeof error === "object" && error !== null &&
     "durableRunClaimOwned" in error && error.durableRunClaimOwned === true;
+}
+
+function runStartCompensationError(error: unknown): unknown {
+  if (typeof error !== "object" || error === null) return error;
+  const internal = (error as Record<PropertyKey, unknown>)[
+    Symbol.for("skyturn.agent-bridge.owned-run-start-internal-error")
+  ];
+  return typeof internal === "object" && internal !== null && "cause" in internal
+    ? (internal as { cause: unknown }).cause
+    : error;
+}
+
+async function publicOwnedRunStartError(error: unknown): Promise<Error & { durableRunClaimOwned: true }> {
+  const { sanitizePublicEvidenceText } = await import("@skyturn/project-core");
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const publicError = new Error(sanitizePublicEvidenceText(rawMessage) || "Agent run start failed.") as Error & {
+    durableRunClaimOwned: true;
+  };
+  publicError.name = error instanceof Error ? error.name : "OwnedAgentRunStartError";
+  publicError.durableRunClaimOwned = true;
+  return publicError;
 }
 
 async function persistCompensation<Input, Run, Store extends RunStartStore>(

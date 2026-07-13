@@ -1,10 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, appendFile, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, open, readFile, realpath, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { constants as fsConstants, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, normalize } from "node:path";
+import { delimiter, join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
+import { StringDecoder } from "node:string_decoder";
+import { fileURLToPath } from "node:url";
 
 import type {
   AgentRunHandle,
@@ -16,6 +18,18 @@ import { agentAdapterContracts } from "@skyturn/agent-runtime";
 import {
   DEFAULT_AGENT_TRANSPORT_FEATURE_FLAGS,
   RUN_EVENT_PROTOCOL_VERSION,
+  canonicalExpectedArtifactDeclarationKeys,
+  deriveRunEvidenceFromRunEvents,
+  isSuccessfulRunEvidence,
+  isTerminalAgentRunStatus,
+  parseExpectedArtifactDeclaration,
+  parseExpectedArtifactDeclarations,
+  parseRunEvent,
+  parseRunEvidence,
+  parseRunEvidenceArtifacts,
+  sanitizePublicEvidenceText,
+  sanitizePublicPayloadText,
+  reduceAgentRunStatus,
   type AgentDescriptor,
   type AgentKind,
   type AgentRun,
@@ -37,8 +51,46 @@ import {
   type TerminalSessionStatus,
 } from "@skyturn/project-core";
 import type { FlowEvent } from "@skyturn/workflow-kernel";
+import {
+  DurableRunClaimPublicationError,
+  createDurableRunClaimStore,
+  defaultDurableRunClaimRoot,
+  type DurableRunClaimStore,
+  type DurableRunStartClaim,
+  type DurableRunStartClaimRead,
+} from "./durableRunClaim.js";
+import {
+  createPrivateRunEventStore,
+  type PrivateRunEventStore,
+} from "./privateRunEventStore.js";
+import {
+  assertWindowsExpectedArtifactVerifierCapability,
+  openWindowsExpectedArtifactVerifierSession,
+  type WindowsExpectedArtifactVerifierSession,
+} from "./internal/windowsExpectedArtifactVerifier.js";
+import {
+  artifactVerificationHooksFrom,
+  type ArtifactVerificationHooks,
+} from "./internal/artifactVerificationHooks.js";
+import {
+  StreamingSensitiveOutputRedactor,
+  type RedactedTerminalChunk,
+} from "./internal/streamingSensitiveOutputRedactor.js";
 
 export { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/project-core";
+export {
+  createDurableRunClaimStore,
+  defaultDurableRunClaimRoot,
+  type DurableRunClaimStore,
+  type DurableRunClaimStoreOptions,
+} from "./durableRunClaim.js";
+export {
+  createPrivateRunEventStore,
+  type PrivateRunEventFileSystem,
+  type PrivateRunEventRead,
+  type PrivateRunEventStore,
+  type PrivateRunEventStoreOptions,
+} from "./privateRunEventStore.js";
 
 const commandCandidates: Record<AgentKind, string[]> = {
   hermes: ["hermes"],
@@ -59,8 +111,7 @@ const codexAuthFileName = "auth.json";
 const defaultTerminalCols = 80;
 const defaultTerminalRows = 24;
 const defaultTerminalScrollbackBytes = 256_000;
-const expectedAcceptanceArtifactPrefix = ".devflow/acceptance/";
-const unsafeArtifactPathPattern = /(?:^|[./_-])(auth|credential|credentials|key|password|passwd|secret|token)(?:$|[./_-])/i;
+const artifactHelperTimeoutMs = 2_000;
 
 type CliFailureCategory =
   | "cli-missing"
@@ -96,20 +147,45 @@ export interface AgentBridgeOptions {
   codexConfigRoot?: string | null;
   codexAuthFilePath?: string | null;
   appendEvent?: (projectRoot: string, event: RunEvent) => Promise<void>;
+  onTerminalPersistenceFailure?: (failure: TerminalPersistenceFailure) => Promise<void>;
+  durableRunClaimStore?: DurableRunClaimStore;
+  privateRunEventStore?: PrivateRunEventStore;
+}
+
+export interface TerminalPersistenceFailure {
+  projectRoot: string;
+  runId: string;
+  nodeId: string;
+  sessionId: string;
+  agentKind: AgentKind;
+  reason: "terminal-persistence-failed";
+  evidence: RunEvidence;
 }
 
 export type CodexCliSandbox = AgentRunSandbox;
+
+const ownedRunStartInternalError = Symbol.for("skyturn.agent-bridge.owned-run-start-internal-error");
+const retryTerminalPersistence = Symbol("skyturn.agent-bridge.retry-terminal-persistence");
+type TerminalRunEventDraft = RunEventDraft & { [retryTerminalPersistence]?: true };
 
 export class OwnedAgentRunStartError extends Error {
   readonly durableRunClaimOwned = true;
   readonly cause: unknown;
   readonly terminalPersistenceError?: unknown;
 
-  constructor(cause: unknown, terminalPersistenceError?: unknown) {
-    super(errorMessage(cause));
+  constructor(cause: unknown, terminalPersistenceError?: unknown, publicCauseMessage?: string) {
+    const message = publicCauseMessage ?? (sanitizePublicEvidenceText(errorMessage(cause)) || "Agent run start failed.");
+    super(message);
     this.name = "OwnedAgentRunStartError";
-    this.cause = cause;
-    this.terminalPersistenceError = terminalPersistenceError;
+    this.cause = new Error(message);
+    if (terminalPersistenceError !== undefined) {
+      const persistenceMessage = sanitizePublicEvidenceText(errorMessage(terminalPersistenceError)) || "Terminal persistence failed.";
+      this.terminalPersistenceError = new Error(persistenceMessage);
+    }
+    Object.defineProperty(this, ownedRunStartInternalError, {
+      value: { cause, terminalPersistenceError },
+      enumerable: false,
+    });
   }
 }
 
@@ -174,10 +250,11 @@ function fingerprintOptionalString(value: unknown, field: string): string | null
 
 function fingerprintExpectedArtifacts(value: unknown): string[] {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item.length > 0)) {
+  const canonicalKeys = canonicalExpectedArtifactDeclarationKeys(value);
+  if (!canonicalKeys) {
     throw new Error("Run start fingerprint expectedArtifacts is invalid.");
   }
-  return value.map((item) => normalize(item));
+  return canonicalKeys;
 }
 
 function fingerprintAgentKind(value: unknown): AgentKind {
@@ -230,6 +307,19 @@ export interface HermesCliAdapterOptions {
   extraArgs?: string[];
   pathValue?: string;
   source?: string;
+}
+
+function strictExpectedArtifactDeclarations(value: unknown): string[] {
+  const artifacts = parseExpectedArtifactDeclarations(value === undefined ? [] : value);
+  if (!artifacts) throw new Error("Run start expectedArtifacts declaration is invalid.");
+  return artifacts;
+}
+
+export async function assertExpectedArtifactVerifierCapability(expectedArtifacts?: unknown): Promise<void> {
+  const artifacts = strictExpectedArtifactDeclarations(expectedArtifacts);
+  if (artifacts.length === 0) return;
+  if (process.platform !== "win32") return;
+  await assertWindowsExpectedArtifactVerifierCapability();
 }
 
 export type HermesPlannerPtyContinuity = "resume-handle" | "process-level";
@@ -320,6 +410,8 @@ export interface StartPtyTerminalSessionInput {
   cols?: number;
   rows?: number;
   env?: NodeJS.ProcessEnv;
+  /** @internal Values that may enter the child process but must never cross the public output boundary. */
+  sensitiveValues?: string[];
 }
 
 export interface PtyTerminalSessionManagerOptions {
@@ -404,8 +496,12 @@ export class AgentBridge {
   private readonly handles = new Map<string, AgentRunHandle>();
   private readonly startFlights = new Map<string, { fingerprint: string; promise: Promise<AgentRun> }>();
   private readonly runStartFingerprints = new Map<string, string>();
+  private readonly terminalPersistenceEvidence = new Map<string, RunEvidence>();
   private readonly listeners = new Set<(event: RunEvent) => void>();
-  private readonly appendEvent: (projectRoot: string, event: RunEvent) => Promise<void>;
+  private readonly beforePrivateEventAppend?: (projectRoot: string, event: RunEvent) => Promise<void>;
+  private readonly onTerminalPersistenceFailure?: (failure: TerminalPersistenceFailure) => Promise<void>;
+  private readonly durableRunClaimStore: DurableRunClaimStore;
+  private readonly privateRunEventStore: PrivateRunEventStore;
 
   constructor(options: AgentBridgeOptions = {}) {
     this.adapters = new Map((options.adapters ?? [createMockAgentAdapter()]).map((adapter) => [adapter.kind, adapter]));
@@ -414,7 +510,14 @@ export class AgentBridge {
       codexConfigRoot: options.codexConfigRoot,
       codexAuthFilePath: options.codexAuthFilePath,
     });
-    this.appendEvent = options.appendEvent ?? appendRunEvent;
+    this.beforePrivateEventAppend = options.appendEvent;
+    this.onTerminalPersistenceFailure = options.onTerminalPersistenceFailure;
+    this.durableRunClaimStore = options.durableRunClaimStore ?? createDurableRunClaimStore({
+      root: defaultDurableRunClaimRoot(),
+    });
+    this.privateRunEventStore = options.privateRunEventStore ?? createPrivateRunEventStore({
+      durableRunClaimStore: this.durableRunClaimStore,
+    });
   }
 
   async discoverAgents(): Promise<AgentDescriptor[]> {
@@ -434,44 +537,60 @@ export class AgentBridge {
   }
 
   startRun(input: StartAgentRunInput): Promise<AgentRun> {
-    if (!input.runId) return this.startRunOnce(input);
-    let fingerprint: string;
+    let expectedArtifacts: string[];
     try {
-      fingerprint = createAgentRunStartFingerprint(input);
+      expectedArtifacts = strictExpectedArtifactDeclarations(input.expectedArtifacts);
     } catch (error) {
       return Promise.reject(error);
     }
-    const inFlight = this.startFlights.get(input.runId);
+    const safeInput = input.expectedArtifacts === undefined ? input : { ...input, expectedArtifacts };
+    if (!safeInput.runId) return this.startRunOnce(safeInput);
+    let fingerprint: string;
+    try {
+      fingerprint = createAgentRunStartFingerprint(safeInput);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const inFlight = this.startFlights.get(safeInput.runId);
     if (inFlight) {
       if (inFlight.fingerprint !== fingerprint) {
-        return Promise.reject(new Error(`Run ${input.runId} is already claimed with different identity.`));
+        return Promise.reject(new Error(`Run ${safeInput.runId} is already claimed with different identity.`));
       }
       return inFlight.promise;
     }
-    const existing = this.runs.get(input.runId);
+    const existing = this.runs.get(safeInput.runId);
     if (existing) {
-      const existingFingerprint = this.runStartFingerprints.get(input.runId);
+      const existingFingerprint = this.runStartFingerprints.get(safeInput.runId);
       if (existingFingerprint && existingFingerprint !== fingerprint) {
-        return Promise.reject(new Error(`Run ${input.runId} is already claimed with different identity.`));
+        return Promise.reject(new Error(`Run ${safeInput.runId} is already claimed with different identity.`));
       }
       if (isFinalRunStatus(existing.status)) {
-        return Promise.reject(new Error(`Run ${input.runId} is already terminal (${existing.status}).`));
+        return Promise.reject(new Error(`Run ${safeInput.runId} is already terminal (${existing.status}).`));
       }
       return Promise.resolve(existing);
     }
 
-    const flight = this.startRunOnce(input, fingerprint);
-    this.startFlights.set(input.runId, { fingerprint, promise: flight });
+    const flight = this.startRunOnce(safeInput, fingerprint);
+    this.startFlights.set(safeInput.runId, { fingerprint, promise: flight });
     void flight.then(
-      () => this.clearStartFlight(input.runId!, flight),
-      () => this.clearStartFlight(input.runId!, flight),
+      () => this.clearStartFlight(safeInput.runId!, flight),
+      () => this.clearStartFlight(safeInput.runId!, flight),
     );
     return flight;
   }
 
   private async startRunOnce(input: StartAgentRunInput, explicitFingerprint?: string): Promise<AgentRun> {
+    await assertExpectedArtifactVerifierCapability(input.expectedArtifacts);
+    await this.privateRunEventStore.prepare(input.projectRoot, input.worktreePath);
+    await this.durableRunClaimStore.prepare(input.projectRoot, input.worktreePath);
     const now = new Date().toISOString();
-    const runId = input.runId ?? (await nextAttemptRunId(input.projectRoot, input.sessionId, input.nodeId, this.runs));
+    const runId = input.runId ?? (await nextAttemptRunId(
+      this.durableRunClaimStore,
+      input.projectRoot,
+      input.sessionId,
+      input.nodeId,
+      this.runs,
+    ));
     const run: AgentRun = {
       id: runId,
       nodeId: input.nodeId,
@@ -484,26 +603,68 @@ export class AgentBridge {
       status: "running",
       startedAt: now,
     };
-    const persistedEvents = await loadRunEventsStrict(run.projectRoot, run.id);
+    let persistedEvents: RunEvent[];
+    try {
+      persistedEvents = await this.loadRunEventsStrict(run.projectRoot, run.id);
+    } catch {
+      const recoveredTerminal = await claimedRunRecoveryEvidence(this.durableRunClaimStore, run.projectRoot, run.id);
+      if (recoveredTerminal) {
+        await assertDurableRunStartFingerprint(this.durableRunClaimStore, run, explicitFingerprint);
+        if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
+        this.terminalPersistenceEvidence.set(runTerminalKey(run.projectRoot, run.id), recoveredTerminal);
+        this.runs.set(run.id, {
+          ...run,
+          status: recoveredTerminal.status,
+          endedAt: recoveredTerminal.completedAt ?? undefined,
+        });
+        throw new Error(`Run ${run.id} is already terminal (${recoveredTerminal.status}).`);
+      }
+      throw new Error("Run durable state is invalid.");
+    }
+    const durableClaim = await loadDurableRunStartClaim(this.durableRunClaimStore, run.projectRoot, run.id);
+    if (durableClaim.kind === "invalid") throw new InvalidDurableRunStartClaimError();
+    if (durableClaim.kind === "valid") {
+      assertDurableRunStartClaimIdentity(run, explicitFingerprint, durableClaim.claim);
+    }
     const persisted = deriveEvidenceFromEvents(run, persistedEvents);
-    if (persistedEvents.length > 0) {
-      await assertDurableRunStartFingerprint(run.projectRoot, run.id, explicitFingerprint);
+    if (isFinalRunStatus(persisted.status)) {
       if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
       this.runs.set(run.id, {
         ...run,
         status: persisted.status,
         ...(persisted.completedAt ? { endedAt: persisted.completedAt } : {}),
       });
-      if (isFinalRunStatus(persisted.status)) {
-        throw new Error(`Run ${run.id} is already terminal (${persisted.status}).`);
-      }
+      throw new Error(`Run ${run.id} is already terminal (${persisted.status}).`);
+    }
+    const recoveredTerminal = claimedRunRecoveryEvidenceFromRead(durableClaim);
+    if (recoveredTerminal) {
+      if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
+      this.terminalPersistenceEvidence.set(runTerminalKey(run.projectRoot, run.id), recoveredTerminal);
+      this.runs.set(run.id, {
+        ...run,
+        status: recoveredTerminal.status,
+        ...(recoveredTerminal.completedAt ? { endedAt: recoveredTerminal.completedAt } : {}),
+      });
+      throw new Error(`Run ${run.id} is already terminal (${recoveredTerminal.status}).`);
+    }
+    if (persistedEvents.length > 0) {
+      if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
+      this.runs.set(run.id, {
+        ...run,
+        status: persisted.status,
+        ...(persisted.completedAt ? { endedAt: persisted.completedAt } : {}),
+      });
       throw new Error(`Run ${run.id} is already active or durably claimed.`);
     }
     const claimed = input.runId
-      ? await claimExplicitRunStart(run, explicitFingerprint ?? createAgentRunStartFingerprint(input))
+      ? await claimExplicitRunStart(
+          this.durableRunClaimStore,
+          run,
+          explicitFingerprint ?? createAgentRunStartFingerprint(input),
+        )
       : true;
     if (!claimed) {
-      await assertDurableRunStartFingerprint(run.projectRoot, run.id, explicitFingerprint);
+      await assertDurableRunStartFingerprint(this.durableRunClaimStore, run, explicitFingerprint);
       throw new Error(`Run ${run.id} is already active or durably claimed.`);
     }
     if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
@@ -519,10 +680,13 @@ export class AgentBridge {
       if (!adapter) throw new Error(`No local adapter registered for ${input.agentKind}`);
       handle = await adapter.startRun({ ...input, runId: run.id }, sink);
     } catch (error) {
-      const message = errorMessage(error);
+      const message = sanitizePublicProcessTextWithSensitiveValues(
+        errorMessage(error),
+        input.hermesSessionHandle ? [input.hermesSessionHandle] : [],
+      ) || "Agent run start failed.";
       let terminalPersistenceError: unknown;
       try {
-        const persisted = deriveEvidenceFromEvents(run, await loadRunEvents(run.projectRoot, run.id));
+        const persisted = deriveEvidenceFromEvents(run, await this.loadRunEvents(run.projectRoot, run.id));
         if (isFinalRunStatus(persisted.status)) {
           this.runs.set(run.id, {
             ...run,
@@ -535,7 +699,7 @@ export class AgentBridge {
       } catch (persistenceError) {
         terminalPersistenceError = persistenceError;
       }
-      throw new OwnedAgentRunStartError(error, terminalPersistenceError);
+      throw new OwnedAgentRunStartError(error, terminalPersistenceError, message);
     }
     this.handles.set(run.id, handle);
     return this.runs.get(run.id) ?? run;
@@ -562,7 +726,11 @@ export class AgentBridge {
     } catch (error) {
       cancelError = error;
     }
-    let events = await loadRunEvents(run.projectRoot, runId);
+    const terminalRun = this.runs.get(runId);
+    if (terminalRun && isFinalRunStatus(terminalRun.status)) {
+      return this.getEvidence(run.projectRoot, runId);
+    }
+    let events = await this.loadRunEvents(run.projectRoot, runId);
     if (!events.some(isFinalStatusEvent)) {
       try {
         await this.recordEvent(runId, {
@@ -572,34 +740,68 @@ export class AgentBridge {
       } catch (statusError) {
         throw cancelError ?? statusError;
       }
-      events = await loadRunEvents(run.projectRoot, runId);
+      events = await this.loadRunEvents(run.projectRoot, runId);
     }
     return deriveEvidenceFromEvents(this.runs.get(runId) ?? run, events);
   }
 
   async loadEvents(projectRoot: string, runId: string): Promise<RunEvent[]> {
-    return loadRunEvents(projectRoot, runId);
+    return this.loadRunEvents(projectRoot, runId);
   }
 
   async getEvidence(projectRoot: string, runId: string): Promise<RunEvidence> {
-    const run = this.runs.get(runId) ?? makePersistedRun(projectRoot, runId);
-    const events = await loadRunEventsStrict(projectRoot, runId);
-    return deriveEvidenceFromEvents(run, events);
+    const durableClaim = await loadDurableRunStartClaim(this.durableRunClaimStore, projectRoot, runId);
+    if (durableClaim.kind === "invalid") throw new InvalidDurableRunStartClaimError();
+    const volatileTerminal = this.terminalPersistenceEvidence.get(runTerminalKey(projectRoot, runId));
+    if (volatileTerminal) return volatileTerminal;
+    const liveRun = this.runs.get(runId);
+    const run = liveRun ?? makePersistedRun(projectRoot, runId);
+    let events: RunEvent[];
+    try {
+      events = await this.loadRunEventsStrict(projectRoot, runId);
+    } catch {
+      if (liveRun) throw new Error("Run durable state is invalid.");
+      const recoveredTerminal = claimedRunRecoveryEvidenceFromRead(durableClaim);
+      if (recoveredTerminal) return recoveredTerminal;
+      throw new Error("Run durable state is invalid.");
+    }
+    const persisted = deriveEvidenceFromEvents(
+      events.length > 0 ? { ...run, status: "running", endedAt: undefined } : run,
+      events,
+    );
+    if (liveRun || isFinalRunStatus(persisted.status)) return persisted;
+    const recoveredTerminal = claimedRunRecoveryEvidenceFromRead(durableClaim);
+    if (recoveredTerminal) return recoveredTerminal;
+    return persisted;
   }
 
   private async recordEvent(runId: string, draft: RunEventDraft): Promise<RunEvent> {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`Unknown run ${runId}`);
-    const event: RunEvent = {
+    const event = parseRunEvent({
       protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
       runId,
-      seq: (await loadRunEvents(run.projectRoot, runId)).length + 1,
+      seq: (await this.loadRunEventsStrict(run.projectRoot, runId)).length + 1,
       timestamp: draft.timestamp ?? new Date().toISOString(),
       kind: draft.kind,
       payload: draft.payload,
-    };
-    await this.appendEvent(run.projectRoot, event);
-    if (event.kind === "output") await writeTaskOutputFromEvents(run.projectRoot, run.nodeId, runId);
+    });
+    if (!event) throw new Error("Invalid RunEvent.");
+    const retryTerminal =
+      isFinalStatusEvent(event) ||
+      (draft as TerminalRunEventDraft)[retryTerminalPersistence] === true;
+    try {
+      await this.persistEvent(run.projectRoot, event, retryTerminal);
+    } catch (error) {
+      if (isFinalStatusEvent(event)) {
+        return this.recordTerminalPersistenceFailure(run, event, error);
+      }
+      throw error;
+    }
+    if (event.kind === "output") {
+      const events = await this.loadRunEvents(run.projectRoot, runId);
+      await writeTaskOutputFromEvents(run.projectRoot, run.nodeId, events).catch(() => undefined);
+    }
     this.updateRunFromEvent(run, event);
     for (const listener of this.listeners) {
       try {
@@ -611,34 +813,104 @@ export class AgentBridge {
     return event;
   }
 
+  private async persistEvent(projectRoot: string, event: RunEvent, retry: boolean): Promise<void> {
+    try {
+      const appended = await this.appendPrivateEvent(projectRoot, event);
+      if (appended === "appended") await appendWorkspaceRunEventMirror(projectRoot, event).catch(() => undefined);
+      return;
+    } catch (firstError) {
+      if (!retry) throw firstError;
+      try {
+        await this.appendPrivateEvent(projectRoot, event);
+        await appendWorkspaceRunEventMirror(projectRoot, event).catch(() => undefined);
+      } catch (secondError) {
+        throw secondError ?? firstError;
+      }
+    }
+  }
+
+  private async appendPrivateEvent(projectRoot: string, event: RunEvent): Promise<"appended" | "exists"> {
+    await this.beforePrivateEventAppend?.(projectRoot, event);
+    return this.privateRunEventStore.append(projectRoot, event);
+  }
+
+  private async recordTerminalPersistenceFailure(
+    run: AgentRun,
+    attemptedEvent: RunEvent,
+    _persistenceError: unknown,
+  ): Promise<RunEvent> {
+    const failureEvent = parseRunEvent({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: run.id,
+      seq: attemptedEvent.seq,
+      timestamp: attemptedEvent.timestamp,
+      kind: "status",
+      payload: {
+        status: "failed",
+        exitCode: null,
+        reason: "terminal-persistence-failed",
+        errorReason: "terminal-persistence-failed",
+        checks: [{
+          kind: "run-exit",
+          name: "Terminal persistence",
+          status: "failed",
+          detail: "terminal-persistence-failed",
+        }],
+      },
+    });
+    if (!failureEvent) throw new Error("Invalid terminal persistence failure event.");
+    const failureEvidence = deriveEvidenceFromEvents(run, [failureEvent]);
+
+    this.terminalPersistenceEvidence.set(runTerminalKey(run.projectRoot, run.id), failureEvidence);
+    this.updateRunFromEvent(run, failureEvent);
+    if (this.onTerminalPersistenceFailure) {
+      try {
+        await this.onTerminalPersistenceFailure({
+          projectRoot: run.projectRoot,
+          runId: run.id,
+          nodeId: run.nodeId,
+          sessionId: run.sessionId,
+          agentKind: run.agentKind,
+          reason: "terminal-persistence-failed",
+          evidence: failureEvidence,
+        });
+      } catch {
+        throw new Error("terminal-persistence-failed");
+      }
+    }
+    return failureEvent;
+  }
+
   private updateRunFromEvent(run: AgentRun, event: RunEvent): void {
     if (event.kind !== "status") return;
     const status = event.payload.status;
     if (!isRunStatus(status)) return;
-    if (isFinalRunStatus(run.status) && !isFinalRunStatus(status)) return;
+    const nextStatus = reduceAgentRunStatus(run.status, status);
+    if (nextStatus === run.status) return;
     this.runs.set(run.id, {
       ...run,
-      status,
-      endedAt: isFinalRunStatus(status) ? event.timestamp : run.endedAt,
+      status: nextStatus,
+      endedAt: isTerminalAgentRunStatus(nextStatus) ? event.timestamp : run.endedAt,
     });
   }
 
   private async failRunStart(run: AgentRun, message: string): Promise<void> {
     const timestamp = new Date().toISOString();
+    const publicMessage = sanitizePublicEvidenceText(message) || "Agent start failed.";
     this.runs.set(run.id, { ...run, status: "failed", endedAt: timestamp });
     const payload = {
       status: "failed",
-      reason: message,
-      errorReason: message,
+      reason: publicMessage,
+      errorReason: publicMessage,
       category: "start-failed",
       exitCode: null,
-      checks: [{ kind: "run-exit", name: "Agent start", status: "failed", detail: message }],
+      checks: [{ kind: "run-exit", name: "Agent start", status: "failed", detail: publicMessage }],
     };
     try {
       await this.recordEvent(run.id, { kind: "status", payload, timestamp });
       return;
     } catch {
-      const events = await loadRunEvents(run.projectRoot, run.id);
+      const events = await this.loadRunEvents(run.projectRoot, run.id);
       if (events.some(isFinalStatusEvent)) return;
       const event: RunEvent = {
         protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
@@ -648,15 +920,23 @@ export class AgentBridge {
         kind: "status",
         payload,
       };
-      await appendRunEvent(run.projectRoot, event);
-      for (const listener of this.listeners) {
-        try {
-          listener(event);
-        } catch {
-          // Listener failures must not affect durable run state.
-        }
-      }
+      await this.persistEvent(run.projectRoot, event, true);
     }
+  }
+
+  private async loadRunEvents(projectRoot: string, runId: string): Promise<RunEvent[]> {
+    try {
+      return await this.loadRunEventsStrict(projectRoot, runId);
+    } catch {
+      return [];
+    }
+  }
+
+  private async loadRunEventsStrict(projectRoot: string, runId: string): Promise<RunEvent[]> {
+    const stored = await this.privateRunEventStore.read(projectRoot, runId);
+    if (stored.kind === "missing") return [];
+    if (stored.kind === "invalid") throw new Error("Run durable state is invalid.");
+    return stored.events;
   }
 }
 
@@ -718,29 +998,32 @@ export function createMockAgentAdapter(options: { holdOpen?: boolean } = {}): Lo
   };
 }
 
-export async function loadRunEvents(projectRoot: string, runId: string): Promise<RunEvent[]> {
+export async function loadRunEvents(
+  projectRoot: string,
+  runId: string,
+  store: PrivateRunEventStore = defaultPrivateRunEventStore(),
+): Promise<RunEvent[]> {
   try {
-    const value = await readFile(runEventsPath(projectRoot, runId), "utf8");
-    return value
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as RunEvent);
+    return await loadRunEventsStrict(projectRoot, runId, store);
   } catch {
     return [];
   }
 }
 
-async function loadRunEventsStrict(projectRoot: string, runId: string): Promise<RunEvent[]> {
-  if (!await hasRunEvents(projectRoot, runId)) return [];
-  const value = await readFile(runEventsPath(projectRoot, runId), "utf8");
-  return value
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => {
-      const event = JSON.parse(line) as RunEvent;
-      if (!event || event.runId !== runId) throw new Error(`Run evidence identity mismatch for ${runId}.`);
-      return event;
-    });
+async function loadRunEventsStrict(
+  projectRoot: string,
+  runId: string,
+  store: PrivateRunEventStore = defaultPrivateRunEventStore(),
+): Promise<RunEvent[]> {
+  const stored = await store.read(projectRoot, runId);
+  if (stored.kind === "missing") return [];
+  if (stored.kind === "invalid") throw new Error("Run durable state is invalid.");
+  return stored.events;
+}
+
+function defaultPrivateRunEventStore(): PrivateRunEventStore {
+  const durableRunClaimStore = createDurableRunClaimStore({ root: defaultDurableRunClaimRoot() });
+  return createPrivateRunEventStore({ durableRunClaimStore });
 }
 
 type TerminalSessionEventInput =
@@ -769,6 +1052,7 @@ interface ManagedPtyTerminalSession {
   exitDisposable: PtyDisposable | null;
   scrollback: TerminalScrollbackChunk[];
   scrollbackBytes: number;
+  outputRedactor: StreamingSensitiveOutputRedactor;
   eventQueue: Promise<void>;
   timeoutTimer: NodeJS.Timeout | null;
   stallTimer: NodeJS.Timeout | null;
@@ -830,6 +1114,7 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
       exitDisposable: null,
       scrollback: [],
       scrollbackBytes: 0,
+      outputRedactor: new StreamingSensitiveOutputRedactor(input.sensitiveValues),
       eventQueue: Promise.resolve(),
       timeoutTimer: null,
       stallTimer: null,
@@ -870,9 +1155,10 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
   async cancelSession(sessionId: string, reason = "Terminal cancelled"): Promise<TerminalSessionExitEvidence | null> {
     const state = this.requireSession(sessionId);
     if (state.finalized) return state.exitEvidence;
+    const publicReason = sanitizePublicProcessText(reason) || "Terminal cancelled";
     const evidence = this.finalizeSession(state, {
       status: "cancelled",
-      message: reason,
+      message: publicReason,
       evidence: {
         exitCode: null,
         signal: null,
@@ -881,7 +1167,7 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
             kind: "run-exit",
             name: `${state.session.commandLabel} terminal exit`,
             status: "skipped",
-            detail: reason,
+            detail: publicReason,
           },
         ],
       },
@@ -893,9 +1179,10 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
   async terminateSession(sessionId: string, reason = "Terminal terminated"): Promise<TerminalSessionExitEvidence | null> {
     const state = this.requireSession(sessionId);
     if (state.finalized) return state.exitEvidence;
+    const publicReason = sanitizePublicProcessText(reason) || "Terminal terminated";
     const evidence = this.finalizeSession(state, {
       status: "failed",
-      message: reason,
+      message: publicReason,
       evidence: {
         exitCode: null,
         signal: null,
@@ -904,7 +1191,7 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
             kind: "run-exit",
             name: `${state.session.commandLabel} terminal exit`,
             status: "failed",
-            detail: reason,
+            detail: publicReason,
           },
         ],
       },
@@ -955,10 +1242,22 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
   private captureOutput(state: ManagedPtyTerminalSession, stream: TerminalOutputStream, chunk: string): void {
     if (state.finalized) return;
     this.markActivity(state);
-    const text = redactSecretLikeText(chunk);
+    this.publishOutputChunks(state, state.outputRedactor.push(stream, chunk));
+  }
+
+  private publishOutputChunks(state: ManagedPtyTerminalSession, chunks: RedactedTerminalChunk[]): void {
+    for (const chunk of chunks) this.publishOutput(state, chunk.stream, chunk.text);
+  }
+
+  private publishOutput(state: ManagedPtyTerminalSession, stream: TerminalOutputStream, text: string): void {
+    if (!text) return;
     const timestamp = this.isoNow();
     this.appendScrollback(state, { timestamp, stream, text });
     void this.enqueueTerminalEvent(state, { kind: "output", stream, text, timestamp });
+  }
+
+  private flushOutput(state: ManagedPtyTerminalSession): void {
+    this.publishOutputChunks(state, state.outputRedactor.flush());
   }
 
   private async handleProcessExit(state: ManagedPtyTerminalSession, event: PtyExitEvent): Promise<void> {
@@ -1020,6 +1319,7 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
     },
   ): Promise<TerminalSessionExitEvidence> {
     if (state.finalized) return state.exitEvidence ?? input.evidence;
+    this.flushOutput(state);
     state.finalized = true;
     this.clearLifecycleTimers(state);
     this.disposeOutputListeners(state);
@@ -1177,6 +1477,18 @@ export async function buildHermesPlannerPtyLaunch(
   input: StartHermesPlannerPtySessionInput,
   options: HermesPlannerPtyLaunchOptions = {},
 ): Promise<HermesPlannerPtyLaunch> {
+  const launch = await buildHermesPlannerPtySpawnLaunch(input, options);
+  const resumeIndex = launch.args.indexOf("--resume");
+  return {
+    ...launch,
+    args: launch.args.map((argument, index) => resumeIndex >= 0 && index === resumeIndex + 1 ? "[redacted]" : argument),
+  };
+}
+
+async function buildHermesPlannerPtySpawnLaunch(
+  input: StartHermesPlannerPtySessionInput,
+  options: HermesPlannerPtyLaunchOptions = {},
+): Promise<HermesPlannerPtyLaunch> {
   const cwd = await realpath(input.worktreePath || input.projectRoot);
   const source = options.source ?? "skyturn";
   const command = options.executablePath ?? "hermes";
@@ -1188,7 +1500,7 @@ export async function buildHermesPlannerPtyLaunch(
         degraded: false,
         plannerSessionId: input.plannerSessionId ?? null,
         plannerInputId: input.plannerInputId ?? null,
-        opaqueHandle: input.hermesSessionHandle ?? null,
+        opaqueHandle: "[redacted]",
       }
     : {
         transport: "hermes_live_chat",
@@ -1236,7 +1548,7 @@ class HermesPlannerPtyTransportImpl implements HermesPlannerPtyTransport {
     const existing = this.openSession(input.canvasSessionId);
     if (existing) return existing;
 
-    const launch = await buildHermesPlannerPtyLaunch(input, {
+    const launch = await buildHermesPlannerPtySpawnLaunch(input, {
       executablePath: this.options.executablePath,
       extraArgs: this.options.extraArgs,
       source: this.options.source,
@@ -1253,6 +1565,7 @@ class HermesPlannerPtyTransportImpl implements HermesPlannerPtyTransport {
       cols: input.cols,
       rows: input.rows,
       env: input.env,
+      sensitiveValues: input.hermesSessionHandle ? [input.hermesSessionHandle] : [],
     });
     this.sessionsByCanvasSessionId.set(input.canvasSessionId, {
       terminalSessionId: terminalSession.id,
@@ -1349,6 +1662,7 @@ class HermesPlannerPtyTransportImpl implements HermesPlannerPtyTransport {
 
 class AgentRunWatchdog {
   private finalized = false;
+  private terminalClaimed = false;
   private killTimer: NodeJS.Timeout | null = null;
   private timeoutTimer: NodeJS.Timeout | null = null;
   private stallTimer: NodeJS.Timeout | null = null;
@@ -1360,6 +1674,7 @@ class AgentRunWatchdog {
     private readonly emit: (draft: RunEventDraft) => Promise<RunEvent>,
     private readonly drain: () => Promise<void>,
     private readonly stopChildOutput: () => void,
+    private readonly closeRunResources: () => Promise<void> = async () => undefined,
   ) {}
 
   start(): void {
@@ -1380,10 +1695,16 @@ class AgentRunWatchdog {
   }
 
   async cancel(reason: string): Promise<void> {
-    if (!this.tryFinalize()) return;
+    const publicReason = sanitizePublicEvidenceText(reason) || "Run cancelled";
+    this.tryFinalize();
+    if (!this.tryClaimTerminal()) {
+      await this.closeRunResources();
+      return;
+    }
     this.scheduleKill();
     await this.drain();
-    await this.emit({
+    await this.closeRunResources();
+    await emitRunEventBestEffort(this.emit, {
       kind: "evidence",
       payload: {
         exitCode: null,
@@ -1392,17 +1713,27 @@ class AgentRunWatchdog {
             kind: "run-exit",
             name: `${this.policy.commandLabel} exit`,
             status: "skipped",
-            detail: reason,
+            detail: publicReason,
           },
         ],
       },
     });
-    await this.emit({ kind: "status", payload: { status: "cancelled", reason } });
+    await emitRunEventBestEffort(this.emit, {
+      kind: "status",
+      payload: { status: "cancelled", reason: publicReason },
+    });
   }
 
   async finalizeChildClose(): Promise<boolean> {
     await this.drain();
     return this.tryFinalize();
+  }
+
+  async abortStart(): Promise<void> {
+    this.tryFinalize();
+    this.scheduleKill();
+    await this.drain();
+    await this.closeRunResources();
   }
 
   tryFinalize(): boolean {
@@ -1413,11 +1744,18 @@ class AgentRunWatchdog {
     return true;
   }
 
+  tryClaimTerminal(): boolean {
+    if (this.terminalClaimed) return false;
+    this.terminalClaimed = true;
+    return true;
+  }
+
   private async expire(): Promise<void> {
-    if (!this.tryFinalize()) return;
+    if (!this.tryFinalize() || !this.tryClaimTerminal()) return;
     this.scheduleKill();
     await this.drain();
-    await this.emit({
+    await this.closeRunResources();
+    await emitRunEventBestEffort(this.emit, {
       kind: "evidence",
       payload: {
         exitCode: null,
@@ -1431,7 +1769,7 @@ class AgentRunWatchdog {
         ],
       },
     });
-    await this.emit({
+    await emitRunEventBestEffort(this.emit, {
       kind: "status",
       payload: {
         status: "timed-out",
@@ -1445,21 +1783,26 @@ class AgentRunWatchdog {
     if (this.policy.stallTelemetryMs <= 0 || this.finalized) return;
     this.stallTimer = setTimeout(() => {
       void (async () => {
-        if (this.finalized) return;
-        const idleMs = Date.now() - this.lastActivityAt;
-        if (idleMs >= this.policy.stallTelemetryMs) {
-          await this.emit({
-            kind: "progress",
-            payload: {
-              source: this.policy.source,
-              phase: "stalled",
-              status: "running",
-              idleMs,
-              detail: `${this.policy.commandLabel} still running after ${idleMs}ms without output.`,
-            },
-          });
+        try {
+          if (this.finalized) return;
+          const idleMs = Date.now() - this.lastActivityAt;
+          if (idleMs >= this.policy.stallTelemetryMs) {
+            await this.emit({
+              kind: "progress",
+              payload: {
+                source: this.policy.source,
+                phase: "stalled",
+                status: "running",
+                idleMs,
+                detail: `${this.policy.commandLabel} still running after ${idleMs}ms without output.`,
+              },
+            });
+          }
+        } catch {
+          // Non-terminal telemetry must not decide run lifecycle.
+        } finally {
+          this.scheduleStallTelemetry();
         }
-        this.scheduleStallTelemetry();
       })();
     }, this.policy.stallTelemetryMs);
   }
@@ -1483,6 +1826,7 @@ class AgentRunWatchdog {
 
 export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): LocalAgentAdapterContract {
   const defaultSandbox = options.sandbox ?? "read-only";
+  const artifactVerificationHooks = artifactVerificationHooksFrom(options);
   return {
     kind: "codex",
     label: "Codex CLI",
@@ -1508,7 +1852,36 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
     async startRun(input, sink) {
       const workdir = await resolveRunWorkdir(input, sink, "codex", "Codex CLI");
       if (!workdir) return noopRunHandle();
+      let worktreeHandle: FileHandle | null = null;
+      try {
+        if (artifactVerificationPlatform(artifactVerificationHooks) !== "win32") {
+          worktreeHandle = await open(
+            workdir,
+            fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+          );
+          const worktreeStat = await worktreeHandle.stat();
+          if (!worktreeStat.isDirectory()) throw new Error("Run worktree is not a directory.");
+          await artifactVerificationHooks?.afterWorktreeOpen?.(worktreeHandle.fd);
+        }
+      } catch {
+        await worktreeHandle?.close().catch(() => undefined);
+        return failRunPreflight(sink, "codex", "Codex CLI", "invalid-cwd", "Codex CLI worktree could not be anchored.");
+      }
+      const retainedWorktree = worktreeHandle;
+      const artifactVerificationAbort = new AbortController();
+      let windowsVerifier: WindowsExpectedArtifactVerifierSession | null = null;
+      let closeRunResourcesPromise: Promise<void> | null = null;
+      const closeRunResources = (): Promise<void> => {
+        if (closeRunResourcesPromise) return closeRunResourcesPromise;
+        closeRunResourcesPromise = Promise.resolve().then(async () => {
+          artifactVerificationAbort.abort();
+          await windowsVerifier?.abort().catch(() => undefined);
+          await retainedWorktree?.close().catch(() => undefined);
+        });
+        return closeRunResourcesPromise;
+      };
       if (!(await hasGitMetadata(workdir))) {
+        await closeRunResources();
         return failRunPreflight(sink, "codex", "Codex CLI", "invalid-cwd", "Codex CLI requires a git repository.");
       }
       const executablePath = await resolveCliExecutable(
@@ -1517,7 +1890,20 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         options.pathValue ?? process.env.PATH ?? "",
       );
       if (!executablePath) {
+        await closeRunResources();
         return failRunPreflight(sink, "codex", "Codex CLI", "cli-missing", "Codex CLI executable was not found.");
+      }
+      try {
+        if (artifactVerificationPlatform(artifactVerificationHooks) === "win32") {
+          windowsVerifier = await openWindowsArtifactVerifierForRun(
+            workdir,
+            input,
+            artifactVerificationHooks,
+          );
+        }
+      } catch (error) {
+        await closeRunResources();
+        throw error;
       }
 
       const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : defaultSandbox;
@@ -1527,13 +1913,19 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         workdir,
         extraArgs: options.extraArgs,
       });
-      const child = spawn(executablePath, args, {
-        cwd: workdir,
-        env: { ...process.env, ...options.env },
-        detached: process.platform !== "win32",
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      let child: ChildProcess;
+      try {
+        child = spawn(executablePath, args, {
+          cwd: workdir,
+          env: { ...process.env, ...options.env },
+          detached: process.platform !== "win32",
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (error) {
+        await closeRunResources();
+        throw error;
+      }
       let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
       const outputReaders: Interface[] = [];
@@ -1552,13 +1944,10 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         emit,
         drain,
         () => closeReadlineInterfaces(outputReaders),
+        async () => {
+          await closeRunResources();
+        },
       );
-
-      await emit({
-        kind: "progress",
-        payload: { source: "codex", phase: "started", command: "codex exec" },
-      });
-      watchdog.start();
 
       if (child.stdout) {
         const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -1582,7 +1971,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           if (watchdog.isFinalized()) return;
           if (!line.trim()) return;
           watchdog.markActivity();
-          const safeLine = redactSecretLikeText(line);
+          const safeLine = sanitizePublicProcessText(line);
           stderrLines.push(safeLine);
           void emit({
             kind: "progress",
@@ -1593,13 +1982,14 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
 
       child.once("error", (error) => {
         spawnFailed = true;
-        if (!watchdog.tryFinalize()) return;
+        if (!watchdog.tryFinalize() || !watchdog.tryClaimTerminal()) return;
         const category = errorCategoryFromSpawnError(error);
-        void emit({
+        const publicMessage = sanitizePublicEvidenceText(error.message) || "Codex CLI spawn failed";
+        void emitRunEventBestEffort(emit, {
           kind: "error",
-          payload: { source: "codex", message: error.message, code: error.name, category },
+          payload: { source: "codex", message: publicMessage, code: error.name, category },
         });
-        void emit({
+        void emitRunEventBestEffort(emit, {
           kind: "evidence",
           payload: {
             exitCode: null,
@@ -1608,12 +1998,14 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
                 kind: "run-exit",
                 name: "Codex CLI spawn",
                 status: "failed",
-                detail: `${category}: ${error.message}`,
+                detail: `${category}: ${publicMessage}`,
               },
             ],
           },
         });
-        void emit({ kind: "status", payload: { status: "failed", reason: category } });
+        void closeRunResources().then(async () => {
+          await emitRunEventBestEffort(emit, { kind: "status", payload: { status: "failed", reason: category } });
+        });
       });
 
       child.once("close", (code, signal) => {
@@ -1624,17 +2016,35 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           const checkStatus = exitCode === 0 ? "passed" : "failed";
           const failureCategory = exitCode === 0 ? null : stdoutFailureCategory ?? processFailureCategory(stderrLines);
           if (failureCategory && !stdoutFailureCategory) {
-            await emit({
+            await emitRunEventBestEffort(emit, {
               kind: "error",
               payload: {
                 source: "codex",
                 category: failureCategory,
-                message: formatProcessFailureMessage("Codex CLI", exitCode, signal, stderrLines),
+                message: sanitizePublicProcessText(
+                  formatProcessFailureMessage("Codex CLI", exitCode, signal, stderrLines),
+                ),
               },
             });
           }
-          const artifacts = await collectVerifiedExpectedArtifacts(input, workdir, exitCode);
-          await emit({
+          let artifactVerification: ExpectedArtifactVerification;
+          try {
+            artifactVerification = await verifyExpectedArtifacts(
+              input,
+              workdir,
+              retainedWorktree?.fd ?? null,
+              exitCode,
+              artifactVerificationHooks,
+              windowsVerifier,
+              artifactVerificationAbort.signal,
+            );
+          } catch {
+            artifactVerification = expectedArtifactVerificationFailure();
+          }
+          await closeRunResources();
+          if (!watchdog.tryClaimTerminal()) return;
+          const succeeded = exitCode === 0 && artifactVerification.passed;
+          await emitRunEventBestEffort(emit, {
             kind: "evidence",
             payload: {
               exitCode,
@@ -1645,21 +2055,35 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
                   status: checkStatus,
                   detail: formatExitDetail(code, signal),
                 },
+                ...(artifactVerification.check ? [artifactVerification.check] : []),
               ],
-              ...(artifacts.length > 0 ? { artifacts } : {}),
+              ...(artifactVerification.artifacts.length > 0 ? { artifacts: artifactVerification.artifacts } : {}),
             },
           });
-          await emit({
+          await emitRunEventBestEffort(emit, {
             kind: "status",
             payload: {
-              status: exitCode === 0 ? "succeeded" : "failed",
+              status: succeeded ? "succeeded" : "failed",
               exitCode,
               signal,
               ...(failureCategory ? { reason: failureCategory } : {}),
+              ...(!artifactVerification.passed ? { reason: "expected-artifact-failure" } : {}),
             },
           });
         })();
       });
+
+      const started = emit({
+        kind: "progress",
+        payload: { source: "codex", phase: "started", command: "codex exec" },
+      });
+      watchdog.start();
+      try {
+        await started;
+      } catch (error) {
+        await watchdog.abortStart();
+        throw error;
+      }
 
       return {
         async cancel(reason) {
@@ -1671,6 +2095,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
 }
 
 export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): LocalAgentAdapterContract {
+  const artifactVerificationHooks = artifactVerificationHooksFrom(options);
   return {
     kind: "hermes",
     label: "Hermes CLI",
@@ -1694,13 +2119,54 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
     async startRun(input, sink) {
       const workdir = await resolveRunWorkdir(input, sink, "hermes", "Hermes CLI");
       if (!workdir) return noopRunHandle();
+      let worktreeHandle: FileHandle | null = null;
+      try {
+        if (artifactVerificationPlatform(artifactVerificationHooks) !== "win32") {
+          worktreeHandle = await open(
+            workdir,
+            fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+          );
+          const worktreeStat = await worktreeHandle.stat();
+          if (!worktreeStat.isDirectory()) throw new Error("Run worktree is not a directory.");
+          await artifactVerificationHooks?.afterWorktreeOpen?.(worktreeHandle.fd);
+        }
+      } catch {
+        await worktreeHandle?.close().catch(() => undefined);
+        return failRunPreflight(sink, "hermes", "Hermes CLI", "invalid-cwd", "Hermes CLI worktree could not be anchored.");
+      }
+      const retainedWorktree = worktreeHandle;
+      const artifactVerificationAbort = new AbortController();
+      let windowsVerifier: WindowsExpectedArtifactVerifierSession | null = null;
+      let closeRunResourcesPromise: Promise<void> | null = null;
+      const closeRunResources = (): Promise<void> => {
+        if (closeRunResourcesPromise) return closeRunResourcesPromise;
+        closeRunResourcesPromise = Promise.resolve().then(async () => {
+          artifactVerificationAbort.abort();
+          await windowsVerifier?.abort().catch(() => undefined);
+          await retainedWorktree?.close().catch(() => undefined);
+        });
+        return closeRunResourcesPromise;
+      };
       const executablePath = await resolveCliExecutable(
         options.executablePath,
         commandCandidates.hermes,
         options.pathValue ?? process.env.PATH ?? "",
       );
       if (!executablePath) {
+        await closeRunResources();
         return failRunPreflight(sink, "hermes", "Hermes CLI", "cli-missing", "Hermes CLI executable was not found.");
+      }
+      try {
+        if (artifactVerificationPlatform(artifactVerificationHooks) === "win32") {
+          windowsVerifier = await openWindowsArtifactVerifierForRun(
+            workdir,
+            input,
+            artifactVerificationHooks,
+          );
+        }
+      } catch (error) {
+        await closeRunResources();
+        throw error;
       }
       const args = makeHermesChatArgs({
         prompt: input.prompt,
@@ -1709,18 +2175,39 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         source: options.source ?? "skyturn",
       });
       const transport = input.hermesSessionHandle ? "hermes_session_resume" : "hermes_replay_recovery";
-      const child = spawn(executablePath, args, {
-        cwd: workdir,
-        env: { ...process.env, ...options.env },
-        detached: process.platform !== "win32",
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
+      let child: ChildProcess;
+      try {
+        child = spawn(executablePath, args, {
+          cwd: workdir,
+          env: { ...process.env, ...options.env },
+          detached: process.platform !== "win32",
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      } catch (error) {
+        await closeRunResources();
+        throw error;
+      }
       let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
-      const outputReaders: Interface[] = [];
       const stderrLines: string[] = [];
-      const watchdog = new AgentRunWatchdog(
+      let outputStopped = false;
+      let output: StreamingAdapterOutput | null = null;
+      let watchdog: AgentRunWatchdog;
+      const onStdoutData = (chunk: Buffer | string) => {
+        if (!watchdog.isFinalized()) output?.push("stdout", chunk);
+      };
+      const onStderrData = (chunk: Buffer | string) => {
+        if (!watchdog.isFinalized()) output?.push("stderr", chunk);
+      };
+      const stopOutput = () => {
+        if (outputStopped) return;
+        outputStopped = true;
+        child.stdout?.off("data", onStdoutData);
+        child.stderr?.off("data", onStderrData);
+        output?.flush();
+      };
+      watchdog = new AgentRunWatchdog(
         child,
         {
           source: "hermes",
@@ -1732,69 +2219,35 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         },
         emit,
         drain,
-        () => closeReadlineInterfaces(outputReaders),
-      );
-
-      await emit({
-        kind: "progress",
-        payload: {
-          source: "hermes",
-          phase: "started",
-          command: "hermes chat -q",
-          transport,
-          plannerSessionId: input.plannerSessionId ?? null,
-          plannerInputId: input.plannerInputId ?? null,
-          opaqueHandle: input.hermesSessionHandle ?? null,
-          ...(transport === "hermes_replay_recovery"
-            ? {
-                recoveryReason:
-                  "This is not the same Hermes native session; continuity comes from SkyTurn workflow events and checkpoints.",
-              }
-            : {}),
+        stopOutput,
+        async () => {
+          await closeRunResources();
         },
+      );
+      output = createStreamingAdapterOutput({
+        emit,
+        sensitiveValues: input.hermesSessionHandle ? [input.hermesSessionHandle] : [],
+        onActivity: () => watchdog.markActivity(),
+        onStderr: (text) => stderrLines.push(text),
       });
-      watchdog.start();
 
-      if (child.stdout) {
-        const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity });
-        outputReaders.push(stdout);
-        stdout.on("line", (line) => {
-          if (watchdog.isFinalized()) return;
-          if (!line.trim()) return;
-          watchdog.markActivity();
-          const safeLine = redactSecretLikeText(line);
-          void emit({
-            kind: "output",
-            payload: { source: "hermes", text: safeLine },
-          });
-        });
-      }
-
-      if (child.stderr) {
-        const stderr = createInterface({ input: child.stderr, crlfDelay: Infinity });
-        outputReaders.push(stderr);
-        stderr.on("line", (line) => {
-          if (watchdog.isFinalized()) return;
-          if (!line.trim()) return;
-          watchdog.markActivity();
-          const safeLine = redactSecretLikeText(line);
-          stderrLines.push(safeLine);
-          void emit({
-            kind: "progress",
-            payload: { source: "hermes", stream: "stderr", format: "text", text: safeLine },
-          });
-        });
-      }
+      child.stdout?.on("data", onStdoutData);
+      child.stderr?.on("data", onStderrData);
 
       child.once("error", (error) => {
         spawnFailed = true;
-        if (!watchdog.tryFinalize()) return;
+        if (!watchdog.tryFinalize() || !watchdog.tryClaimTerminal()) return;
+        artifactVerificationAbort.abort();
         const category = errorCategoryFromSpawnError(error);
-        void emit({
+        const publicMessage = sanitizePublicProcessTextWithSensitiveValues(
+          error.message,
+          input.hermesSessionHandle ? [input.hermesSessionHandle] : [],
+        ) || "Hermes CLI spawn failed";
+        void emitRunEventBestEffort(emit, {
           kind: "error",
-          payload: { source: "hermes", message: error.message, code: error.name, category },
+          payload: { source: "hermes", message: publicMessage, code: error.name, category },
         });
-        void emit({
+        void emitRunEventBestEffort(emit, {
           kind: "evidence",
           payload: {
             exitCode: null,
@@ -1803,12 +2256,14 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
                 kind: "run-exit",
                 name: "Hermes CLI spawn",
                 status: "failed",
-                detail: `${category}: ${error.message}`,
+                detail: `${category}: ${publicMessage}`,
               },
             ],
           },
         });
-        void emit({ kind: "status", payload: { status: "failed", reason: category } });
+        void closeRunResources().then(async () => {
+          await emitRunEventBestEffort(emit, { kind: "status", payload: { status: "failed", reason: category } });
+        });
       });
 
       child.once("close", (code, signal) => {
@@ -1819,16 +2274,35 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           const checkStatus = exitCode === 0 ? "passed" : "failed";
           const failureCategory = exitCode === 0 ? null : processFailureCategory(stderrLines);
           if (failureCategory) {
-            await emit({
+            await emitRunEventBestEffort(emit, {
               kind: "error",
               payload: {
                 source: "hermes",
                 category: failureCategory,
-                message: formatProcessFailureMessage("Hermes CLI", exitCode, signal, stderrLines),
+                message: sanitizePublicProcessText(
+                  formatProcessFailureMessage("Hermes CLI", exitCode, signal, stderrLines),
+                ),
               },
             });
           }
-          await emit({
+          let artifactVerification: ExpectedArtifactVerification;
+          try {
+            artifactVerification = await verifyExpectedArtifacts(
+              input,
+              workdir,
+              retainedWorktree?.fd ?? null,
+              exitCode,
+              artifactVerificationHooks,
+              windowsVerifier,
+              artifactVerificationAbort.signal,
+            );
+          } catch {
+            artifactVerification = expectedArtifactVerificationFailure();
+          }
+          await closeRunResources();
+          if (!watchdog.tryClaimTerminal()) return;
+          const succeeded = exitCode === 0 && artifactVerification.passed;
+          await emitRunEventBestEffort(emit, {
             kind: "evidence",
             payload: {
               exitCode,
@@ -1839,20 +2313,48 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
                   status: checkStatus,
                   detail: formatExitDetail(code, signal),
                 },
+                ...(artifactVerification.check ? [artifactVerification.check] : []),
               ],
+              ...(artifactVerification.artifacts.length > 0 ? { artifacts: artifactVerification.artifacts } : {}),
             },
           });
-          await emit({
+          await emitRunEventBestEffort(emit, {
             kind: "status",
             payload: {
-              status: exitCode === 0 ? "succeeded" : "failed",
+              status: succeeded ? "succeeded" : "failed",
               exitCode,
               signal,
               ...(failureCategory ? { reason: failureCategory } : {}),
+              ...(!artifactVerification.passed ? { reason: "expected-artifact-failure" } : {}),
             },
           });
         })();
       });
+
+      watchdog.start();
+      try {
+        await emit({
+          kind: "progress",
+          payload: {
+            source: "hermes",
+            phase: "started",
+            command: "hermes chat -q",
+            transport,
+            plannerSessionId: input.plannerSessionId ?? null,
+            plannerInputId: input.plannerInputId ?? null,
+            opaqueHandle: input.hermesSessionHandle ? "[redacted]" : null,
+            ...(transport === "hermes_replay_recovery"
+              ? {
+                  recoveryReason:
+                    "This is not the same Hermes native session; continuity comes from SkyTurn workflow events and checkpoints.",
+                }
+              : {}),
+          },
+        });
+      } catch (error) {
+        await watchdog.abortStart();
+        throw error;
+      }
 
       return {
         async cancel(reason) {
@@ -1890,42 +2392,222 @@ function closeReadlineInterfaces(readers: Interface[]): void {
   }
 }
 
-async function collectVerifiedExpectedArtifacts(
+interface ExpectedArtifactVerification {
+  artifacts: string[];
+  check: EvidenceCheck | null;
+  passed: boolean;
+}
+
+function expectedArtifactVerificationFailure(): ExpectedArtifactVerification {
+  return {
+    artifacts: [],
+    check: {
+      kind: "artifact",
+      name: "Expected artifacts",
+      status: "failed",
+      detail: "verified=0 missing=0 empty=0 unsafe=1",
+    },
+    passed: false,
+  };
+}
+
+type ExpectedArtifactState = "present" | "missing" | "empty" | "unsafe";
+
+interface ExpectedArtifactInspection {
+  state: ExpectedArtifactState;
+  identity?: string;
+}
+
+function artifactVerificationPlatform(
+  hooks: ArtifactVerificationHooks | undefined,
+): NodeJS.Platform {
+  return hooks?.platform ?? process.platform;
+}
+
+async function openWindowsArtifactVerifierForRun(
+  workdir: string,
+  input: StartAgentRunInput,
+  hooks: ArtifactVerificationHooks | undefined,
+) {
+  const artifacts = strictExpectedArtifactDeclarations(input.expectedArtifacts);
+  if (artifacts.length === 0) return null;
+  await hooks?.beforeHelperStart?.();
+  return openWindowsExpectedArtifactVerifierSession(workdir, artifacts, {
+    ...hooks?.windowsVerifierDependencies,
+    platform: "win32",
+    ...(hooks?.helperPath ? { helperPath: hooks.helperPath } : {}),
+    ...(hooks?.helperTimeoutMs ? { timeoutMs: hooks.helperTimeoutMs } : {}),
+    afterRootOpen: hooks?.afterParentOpen,
+    afterArtifactsOpen: hooks?.afterArtifactOpen ?? hooks?.afterOpen,
+  });
+}
+
+async function verifyExpectedArtifacts(
   input: StartAgentRunInput,
   workdir: string,
+  worktreeFd: number | null,
   exitCode: number | null,
-): Promise<string[]> {
-  if (exitCode !== 0 || !Array.isArray(input.expectedArtifacts)) return [];
+  hooks: ArtifactVerificationHooks = {},
+  windowsVerifier: WindowsExpectedArtifactVerifierSession | null = null,
+  signal?: AbortSignal,
+): Promise<ExpectedArtifactVerification> {
+  const declarations = parseExpectedArtifactDeclarations(
+    input.expectedArtifacts === undefined ? [] : input.expectedArtifacts,
+  );
+  if (!declarations) return expectedArtifactVerificationFailure();
+  if (declarations.length === 0) {
+    return { artifacts: [], check: null, passed: true };
+  }
+  if (exitCode !== 0) return { artifacts: [], check: null, passed: true };
   const artifacts: string[] = [];
-  const seen = new Set<string>();
-  for (const candidate of input.expectedArtifacts) {
-    const artifact = normalizeExpectedArtifactPath(candidate);
-    if (!artifact || seen.has(artifact)) continue;
-    if (!(await isNonEmptyFile(join(workdir, artifact)))) continue;
-    seen.add(artifact);
-    artifacts.push(artifact);
+  const counts: Record<ExpectedArtifactState, number> = { present: 0, missing: 0, empty: 0, unsafe: 0 };
+  const normalizedArtifacts: string[] = [];
+  for (const candidate of declarations) {
+    const artifact = parseExpectedArtifactDeclaration(candidate);
+    if (!artifact) {
+      counts.unsafe += 1;
+      continue;
+    }
+    if (!parseRunEvidenceArtifacts([...normalizedArtifacts, artifact])) {
+      counts.unsafe += 1;
+      continue;
+    }
+    normalizedArtifacts.push(artifact);
   }
-  return artifacts;
+  if (counts.unsafe > 0) {
+    return {
+      artifacts: [],
+      check: {
+        kind: "artifact",
+        name: "Expected artifacts",
+        status: "failed",
+        detail: `verified=0 missing=0 empty=0 unsafe=${counts.unsafe}`,
+      },
+      passed: false,
+    };
+  }
+  if (artifactVerificationPlatform(hooks) === "win32") {
+    if (signal?.aborted) return { artifacts: [], check: null, passed: false };
+    if (!windowsVerifier) return expectedArtifactVerificationFailure();
+    const result = await windowsVerifier.verify();
+    return {
+      artifacts: result.passed ? result.artifacts : [],
+      check: {
+        kind: "artifact",
+        name: "Expected artifacts",
+        status: result.passed ? "passed" : "failed",
+        detail: `verified=${result.counts.verified} missing=${result.counts.missing} empty=${result.counts.empty} unsafe=${result.counts.unsafe}`,
+      },
+      passed: result.passed,
+    };
+  }
+  if (worktreeFd === null) return expectedArtifactVerificationFailure();
+  const seenIdentities = new Set<string>();
+  let duplicateIdentity = false;
+  for (const artifact of normalizedArtifacts) {
+    if (signal?.aborted) return { artifacts: [], check: null, passed: false };
+    await hooks.beforeHelperStart?.();
+    if (signal?.aborted) return { artifacts: [], check: null, passed: false };
+    const inspection = await inspectExpectedArtifact(worktreeFd, artifact, hooks, signal);
+    if (signal?.aborted) return { artifacts: [], check: null, passed: false };
+    if (inspection.identity && seenIdentities.has(inspection.identity)) {
+      counts.unsafe += 1;
+      duplicateIdentity = true;
+      continue;
+    }
+    if (inspection.identity) seenIdentities.add(inspection.identity);
+    counts[inspection.state] += 1;
+    if (inspection.state === "present") artifacts.push(artifact);
+  }
+  const passed = counts.missing === 0 && counts.empty === 0 && counts.unsafe === 0;
+  return {
+    artifacts: passed && !duplicateIdentity ? artifacts : [],
+    check: {
+      kind: "artifact",
+      name: "Expected artifacts",
+      status: passed ? "passed" : "failed",
+      detail: `verified=${counts.present} missing=${counts.missing} empty=${counts.empty} unsafe=${counts.unsafe}`,
+    },
+    passed,
+  };
 }
 
-function normalizeExpectedArtifactPath(candidate: unknown): string | null {
-  if (typeof candidate !== "string") return null;
-  const trimmed = candidate.trim();
-  if (!trimmed || trimmed.includes("\0") || isAbsolute(trimmed)) return null;
-  const artifact = normalize(trimmed).replaceAll("\\", "/");
-  if (artifact === ".." || artifact.startsWith("../")) return null;
-  if (!artifact.startsWith(expectedAcceptanceArtifactPrefix)) return null;
-  if (unsafeArtifactPathPattern.test(artifact)) return null;
-  return artifact;
-}
-
-async function isNonEmptyFile(path: string): Promise<boolean> {
-  try {
-    const artifact = await stat(path);
-    return artifact.isFile() && artifact.size > 0;
-  } catch {
-    return false;
-  }
+async function inspectExpectedArtifact(
+  worktreeFd: number,
+  artifact: string,
+  hooks: ArtifactVerificationHooks,
+  signal?: AbortSignal,
+): Promise<ExpectedArtifactInspection> {
+  if (signal?.aborted) return { state: "unsafe" };
+  const helperPath = hooks.helperPath ?? fileURLToPath(new URL("./native/artifact-gate", import.meta.url));
+  return new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(helperPath, [artifact], {
+        stdio: ["pipe", "pipe", "ignore", worktreeFd],
+      });
+    } catch {
+      resolve({ state: "unsafe" });
+      return;
+    }
+    const helperInput = child.stdin!;
+    const helperOutput = child.stdout!;
+    let output = "";
+    let parentHookStarted = false;
+    let artifactHookStarted = false;
+    let inputClosed = false;
+    let result: ExpectedArtifactInspection = { state: "unsafe" };
+    const closeInput = (continueHelper = false) => {
+      if (inputClosed) return;
+      inputClosed = true;
+      helperInput.end(continueHelper ? "\n" : undefined);
+    };
+    const abortHelper = () => {
+      if (!inputClosed) {
+        inputClosed = true;
+        helperInput.destroy();
+      }
+      child.kill("SIGKILL");
+    };
+    signal?.addEventListener("abort", abortHelper, { once: true });
+    if (signal?.aborted) abortHelper();
+    const timeout = setTimeout(abortHelper, hooks.helperTimeoutMs ?? artifactHelperTimeoutMs);
+    helperInput.on("error", () => undefined);
+    child.once("error", abortHelper);
+    helperOutput.setEncoding("utf8");
+    helperOutput.on("data", (chunk: string) => {
+      output += chunk;
+      if (output.includes("RESULT ")) closeInput();
+      if (!parentHookStarted && output.includes("READY\n")) {
+        parentHookStarted = true;
+        void Promise.resolve(hooks.afterParentOpen?.())
+          .then(() => {
+            if (!inputClosed) helperInput.write("\n");
+          })
+          .catch(abortHelper);
+      }
+      if (!artifactHookStarted && output.includes("OPENED\n")) {
+        artifactHookStarted = true;
+        const helperPid = child.pid ?? -1;
+        void Promise.resolve(hooks.afterArtifactOpen?.(helperPid) ?? hooks.afterOpen?.(helperPid))
+          .then(() => closeInput(true))
+          .catch(abortHelper);
+      }
+    });
+    child.once("close", (code) => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abortHelper);
+      closeInput();
+      if (code === 0) {
+        const match = /(?:^|\n)RESULT (present|missing|empty|unsafe)(?: ([0-9]+:[0-9]+))?\n?$/.exec(output);
+        if (match) {
+          const state = match[1] as ExpectedArtifactState;
+          result = { state, ...(match[2] ? { identity: match[2] } : {}) };
+        }
+      }
+      resolve(result);
+    });
+  });
 }
 
 export async function readTaskOutput(projectRoot: string, nodeId: string): Promise<string> {
@@ -1937,57 +2619,14 @@ export async function readTaskOutput(projectRoot: string, nodeId: string): Promi
 }
 
 export function deriveEvidenceFromEvents(run: AgentRun, events: RunEvent[]): RunEvidence {
-  let status: AgentRunStatus = run.status;
-  let exitCode: number | null = null;
-  let errorReason: string | null = null;
-  let cancelReason: string | null = null;
-  let completedAt: string | null = run.endedAt ?? null;
-  const checks: RunEvidence["checks"] = [];
-  const artifacts: string[] = [];
-  let changesetId: string | null = null;
-  let review: RunEvidence["review"] = null;
-
-  for (const event of events) {
-    if (event.kind === "status" && isRunStatus(event.payload.status)) {
-      const nextStatus = event.payload.status;
-      if (!isFinalRunStatus(status) || isFinalRunStatus(nextStatus)) {
-        status = nextStatus;
-        exitCode = typeof event.payload.exitCode === "number" ? event.payload.exitCode : exitCode;
-        cancelReason =
-          status === "cancelled" && typeof event.payload.reason === "string" ? event.payload.reason : cancelReason;
-        completedAt = isFinalRunStatus(status) ? event.timestamp : completedAt;
-      }
-      if (status === "failed" && typeof event.payload.errorReason === "string") {
-        errorReason = event.payload.errorReason;
-      }
-      if (Array.isArray(event.payload.checks)) checks.push(...(event.payload.checks as RunEvidence["checks"]));
-    }
-    if (event.kind === "error") {
-      status = "failed";
-      errorReason = typeof event.payload.message === "string" ? event.payload.message : "Adapter error";
-      completedAt = event.timestamp;
-    }
-    if (event.kind === "evidence") {
-      exitCode = typeof event.payload.exitCode === "number" ? event.payload.exitCode : exitCode;
-      changesetId = typeof event.payload.changesetId === "string" ? event.payload.changesetId : changesetId;
-      if (Array.isArray(event.payload.checks)) checks.push(...(event.payload.checks as RunEvidence["checks"]));
-      if (Array.isArray(event.payload.artifacts)) artifacts.push(...(event.payload.artifacts as string[]));
-      if (isEvidenceCheck(event.payload.review)) review = event.payload.review;
-    }
-  }
-
-  return {
+  const evidence = deriveRunEvidenceFromRunEvents({
     runId: run.id,
-    status,
-    exitCode,
-    changesetId,
-    checks,
-    artifacts,
-    review,
-    errorReason,
-    cancelReason,
-    completedAt,
-  };
+    events,
+    initialStatus: run.status,
+    initialCompletedAt: run.endedAt ?? null,
+  });
+  if (!evidence) throw new Error("Invalid RunEvidence event stream.");
+  return evidence;
 }
 
 export interface FlowEventsFromAgentRunInput {
@@ -2001,7 +2640,13 @@ export interface FlowEventsFromAgentRunInput {
 }
 
 export function flowEventsFromAgentRun(input: FlowEventsFromAgentRunInput): FlowEvent[] {
-  const outputEvents = input.events.filter((event) => event.kind === "output" && typeof event.payload.text === "string");
+  const sanitizedEvidence = parseRunEvidence(input.evidence);
+  if (!sanitizedEvidence) throw new Error("Invalid RunEvidence.");
+  const outputEvents = input.events.map((candidate) => {
+    const event = parseRunEvent(candidate);
+    if (!event || event.runId !== input.run.id) throw new Error("Invalid RunEvent output stream.");
+    return event;
+  }).filter((event) => event.kind === "output" || event.kind === "progress" || event.kind === "changes");
   const started = makeFlowEvent(input, 1, "workflow.segment.started", {
     segment: {
       id: input.segmentId,
@@ -2015,7 +2660,8 @@ export function flowEventsFromAgentRun(input: FlowEventsFromAgentRunInput): Flow
     makeFlowEvent(input, index + 2, "workflow.segment.output_delta", {
       laneId: input.laneId,
       segmentId: input.segmentId,
-      text: event.payload.text,
+      ...(typeof event.payload.text === "string" ? { text: event.payload.text } : {}),
+      delta: event,
     }),
   );
   const evidenceSeq = output.length + 2;
@@ -2025,18 +2671,23 @@ export function flowEventsFromAgentRun(input: FlowEventsFromAgentRunInput): Flow
     evidence: {
       id: `evidence-${input.segmentId}`,
       kind: "run-exit",
-      status: input.evidence.status === "succeeded" && input.evidence.exitCode === 0 ? "passed" : "failed",
-      checks: input.evidence.checks.map((check) => check.name),
-      artifacts: input.evidence.artifacts,
-      detail: input.evidence.errorReason ?? input.evidence.cancelReason ?? undefined,
+      status: sanitizedEvidence.status === "cancelled"
+        ? "skipped"
+        : isSuccessfulRunEvidence(sanitizedEvidence, { source: "current", expectedArtifactContract: false })
+          ? "passed"
+          : "failed",
+      checks: sanitizedEvidence.checks.map((check) => check.name),
+      artifacts: sanitizedEvidence.artifacts,
+      detail: sanitizedEvidence.errorReason ?? sanitizedEvidence.cancelReason ?? undefined,
+      runEvidence: sanitizedEvidence,
     },
   });
   const finished = makeFlowEvent(input, evidenceSeq + 1, "workflow.segment.finished", {
     laneId: input.laneId,
     segmentId: input.segmentId,
-    status: flowSegmentStatusFromRunEvidence(input.evidence),
-    exitCode: input.evidence.exitCode,
-    errorReason: input.evidence.errorReason,
+    status: flowSegmentStatusFromRunEvidence(sanitizedEvidence),
+    exitCode: sanitizedEvidence.exitCode,
+    errorReason: sanitizedEvidence.errorReason,
   });
   return [started, ...output, evidence, finished];
 }
@@ -2062,7 +2713,7 @@ function makeFlowEvent(
 function flowSegmentStatusFromRunEvidence(evidence: RunEvidence): "succeeded" | "failed" | "cancelled" | "timed-out" {
   if (evidence.status === "cancelled") return "cancelled";
   if (evidence.status === "timed-out") return "timed-out";
-  if (evidence.status === "succeeded" && evidence.exitCode === 0) return "succeeded";
+  if (isSuccessfulRunEvidence(evidence, { source: "current", expectedArtifactContract: false })) return "succeeded";
   return "failed";
 }
 
@@ -2323,13 +2974,13 @@ async function resolveRunWorkdir(
 ): Promise<string | null> {
   try {
     return await realpath(input.worktreePath || input.projectRoot);
-  } catch (error) {
+  } catch {
     await failRunPreflight(
       sink,
       source,
       commandLabel,
       "invalid-cwd",
-      `Invalid worktreePath or projectRoot: ${errorMessage(error)}`,
+      "Run worktree could not be resolved.",
     );
     return null;
   }
@@ -2342,9 +2993,10 @@ async function failRunPreflight(
   category: CliFailureCategory,
   message: string,
 ): Promise<AgentRunHandle> {
+  const publicMessage = sanitizePublicEvidenceText(message) || "Run preflight failed.";
   await sink.emit({
     kind: "error",
-    payload: { source, category, message },
+    payload: { source, category, message: publicMessage },
   });
   await sink.emit({
     kind: "evidence",
@@ -2355,7 +3007,7 @@ async function failRunPreflight(
           kind: "run-exit",
           name: `${commandLabel} preflight`,
           status: "failed",
-          detail: `${category}: ${message}`,
+          detail: `${category}: ${publicMessage}`,
         },
       ],
     },
@@ -2404,6 +3056,71 @@ function redactSecretLikeText(value: string): string {
     );
 }
 
+function sanitizePublicProcessText(value: string): string {
+  return sanitizePublicEvidenceText(redactSecretLikeText(value));
+}
+
+function sanitizePublicProcessTextWithSensitiveValues(value: string, sensitiveValues: string[]): string {
+  const redactor = new StreamingSensitiveOutputRedactor(sensitiveValues);
+  return sanitizePublicProcessText([
+    ...redactor.push("stdout", value),
+    ...redactor.flush(),
+  ].map((chunk) => chunk.text).join(""));
+}
+
+interface StreamingAdapterOutput {
+  push(stream: TerminalOutputStream, chunk: Buffer | string): void;
+  flush(): void;
+}
+
+function createStreamingAdapterOutput(input: {
+  emit: (draft: RunEventDraft) => Promise<RunEvent>;
+  sensitiveValues?: string[];
+  onActivity: () => void;
+  onStderr: (text: string) => void;
+}): StreamingAdapterOutput {
+  const redactor = new StreamingSensitiveOutputRedactor(input.sensitiveValues);
+  const decoders: Record<TerminalOutputStream, StringDecoder> = {
+    stdout: new StringDecoder("utf8"),
+    stderr: new StringDecoder("utf8"),
+  };
+  let flushed = false;
+  const publish = (chunks: RedactedTerminalChunk[]) => {
+    for (const chunk of chunks) {
+      if (!chunk.text) continue;
+      if (chunk.stream === "stderr") {
+        input.onStderr(chunk.text);
+        void input.emit({
+          kind: "progress",
+          payload: { source: "hermes", stream: "stderr", format: "text", text: chunk.text },
+        });
+      } else {
+        void input.emit({
+          kind: "output",
+          payload: { source: "hermes", stream: "stdout", format: "text", text: chunk.text },
+        });
+      }
+    }
+  };
+  return {
+    push(stream, chunk) {
+      if (flushed) return;
+      input.onActivity();
+      const value = typeof chunk === "string" ? chunk : decoders[stream].write(chunk);
+      publish(redactor.push(stream, value));
+    },
+    flush() {
+      if (flushed) return;
+      flushed = true;
+      for (const stream of ["stdout", "stderr"] as const) {
+        const tail = decoders[stream].end();
+        if (tail) publish(redactor.push(stream, tail));
+      }
+      publish(redactor.flush());
+    },
+  };
+}
+
 function redactRunEventDraft(draft: RunEventDraft): RunEventDraft {
   return {
     ...draft,
@@ -2448,25 +3165,91 @@ function cliFailureCategory(value: unknown): CliFailureCategory | null {
   return null;
 }
 
-async function appendRunEvent(projectRoot: string, event: RunEvent): Promise<void> {
+async function appendWorkspaceRunEventMirror(projectRoot: string, event: RunEvent): Promise<void> {
   const target = runEventsPath(projectRoot, event.runId);
   await mkdir(join(projectRoot, ".devflow", "runs", event.runId), { recursive: true });
-  await appendFile(target, `${JSON.stringify(event)}\n`, "utf8");
+  let handle: FileHandle | null = null;
+  try {
+    handle = await open(
+      target,
+      fsConstants.O_WRONLY |
+        fsConstants.O_APPEND |
+        fsConstants.O_CREAT |
+        (fsConstants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    const value = await handle.stat();
+    if (!value.isFile()) throw new Error("Workspace run event mirror is invalid.");
+    await handle.writeFile(`${JSON.stringify(event)}\n`, "utf8");
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
 }
 
-async function writeTaskOutputFromEvents(projectRoot: string, nodeId: string, runId: string): Promise<void> {
-  const events = await loadRunEvents(projectRoot, runId);
+const terminalPersistenceFailureReason = "terminal-persistence-failed" as const;
+const runStartClaimInvalidReason = "run-start-claim-invalid" as const;
+
+export class InvalidDurableRunStartClaimError extends Error {
+  constructor() {
+    super(runStartClaimInvalidReason);
+    this.name = "InvalidDurableRunStartClaimError";
+  }
+}
+
+function terminalPersistenceFailureEvidence(claim: DurableRunStartClaim, completedAt: string): RunEvidence {
+  const evidence = parseRunEvidence({
+    runId: claim.runId,
+    status: "failed",
+    exitCode: null,
+    changesetId: null,
+    checks: [{
+      kind: "run-exit",
+      name: "Terminal persistence",
+      status: "failed",
+      detail: terminalPersistenceFailureReason,
+    }],
+    artifacts: [],
+    review: null,
+    errorReason: terminalPersistenceFailureReason,
+    cancelReason: null,
+    completedAt,
+  });
+  if (!evidence) throw new Error(terminalPersistenceFailureReason);
+  return evidence;
+}
+
+async function claimedRunRecoveryEvidence(
+  store: DurableRunClaimStore,
+  projectRoot: string,
+  runId: string,
+): Promise<RunEvidence | null> {
+  const claim = await loadDurableRunStartClaim(store, projectRoot, runId);
+  if (claim.kind === "invalid") throw new InvalidDurableRunStartClaimError();
+  return claimedRunRecoveryEvidenceFromRead(claim);
+}
+
+function claimedRunRecoveryEvidenceFromRead(claim: DurableRunStartClaimRead): RunEvidence | null {
+  return claim.kind === "valid"
+    ? terminalPersistenceFailureEvidence(claim.claim, claim.claim.startedAt)
+    : null;
+}
+
+async function writeTaskOutputFromEvents(projectRoot: string, nodeId: string, events: RunEvent[]): Promise<void> {
   const output = events
     .filter((event) => event.kind === "output")
     .map((event) => (typeof event.payload.text === "string" ? event.payload.text : ""))
     .filter(Boolean)
-    .join("\n");
+    .join("");
   await mkdir(join(projectRoot, ".devflow", "tasks", nodeId), { recursive: true });
-  await writeFile(taskOutputPath(projectRoot, nodeId), `${output}\n`, "utf8");
+  await writeFile(taskOutputPath(projectRoot, nodeId), output, "utf8");
 }
 
 function runEventsPath(projectRoot: string, runId: string): string {
   return join(projectRoot, ".devflow", "runs", runId, "events.ndjson");
+}
+
+function runTerminalKey(projectRoot: string, runId: string): string {
+  return `${projectRoot}\0${runId}`;
 }
 
 function taskOutputPath(projectRoot: string, nodeId: string): string {
@@ -2478,6 +3261,7 @@ function makeRunId(sessionId: string, nodeId: string): string {
 }
 
 async function nextAttemptRunId(
+  store: DurableRunClaimStore,
   projectRoot: string,
   sessionId: string,
   nodeId: string,
@@ -2486,84 +3270,73 @@ async function nextAttemptRunId(
   const base = makeRunId(sessionId, nodeId);
   for (let attempt = 1; ; attempt += 1) {
     const candidate = attempt === 1 ? base : `${base}-attempt-${attempt}`;
-    if (!runs.has(candidate) && !(await hasRunState(projectRoot, candidate))) return candidate;
+    if (!runs.has(candidate) && !(await hasRunState(store, projectRoot, candidate))) return candidate;
   }
 }
 
-async function hasRunEvents(projectRoot: string, runId: string): Promise<boolean> {
-  try {
-    await access(runEventsPath(projectRoot, runId), fsConstants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
+async function hasRunState(store: DurableRunClaimStore, projectRoot: string, runId: string): Promise<boolean> {
+  const privateEvents = await createPrivateRunEventStore({ durableRunClaimStore: store }).read(projectRoot, runId);
+  return privateEvents.kind !== "missing" || await hasRunStartClaim(store, projectRoot, runId);
 }
 
-async function hasRunState(projectRoot: string, runId: string): Promise<boolean> {
-  return await hasRunEvents(projectRoot, runId) || await hasRunStartClaim(projectRoot, runId);
-}
-
-async function claimExplicitRunStart(run: AgentRun, startFingerprint: string): Promise<boolean> {
-  const directory = join(run.projectRoot, ".devflow", "runs", run.id);
-  await mkdir(directory, { recursive: true });
+async function claimExplicitRunStart(
+  store: DurableRunClaimStore,
+  run: AgentRun,
+  startFingerprint: string,
+): Promise<boolean> {
   try {
-    await writeFile(
-      runStartClaimPath(run.projectRoot, run.id),
-      `${JSON.stringify({
-        runId: run.id,
-        nodeId: run.nodeId,
-        sessionId: run.sessionId,
-        agentKind: run.agentKind,
-        startFingerprint,
-        startedAt: run.startedAt,
-      })}\n`,
-      { encoding: "utf8", flag: "wx", mode: 0o600 },
-    );
-    return true;
+    return await store.publish(run.projectRoot, {
+      runId: run.id,
+      nodeId: run.nodeId,
+      sessionId: run.sessionId,
+      agentKind: run.agentKind,
+      startFingerprint,
+      startedAt: run.startedAt,
+    }) === "published";
   } catch (error) {
-    if (isFileExistsError(error)) return false;
+    if (error instanceof DurableRunClaimPublicationError && error.owned) {
+      throw new OwnedAgentRunStartError(error);
+    }
     throw error;
   }
 }
 
 async function assertDurableRunStartFingerprint(
-  projectRoot: string,
-  runId: string,
+  store: DurableRunClaimStore,
+  run: AgentRun,
   fingerprint: string | undefined,
 ): Promise<void> {
   if (!fingerprint) return;
-  const durableFingerprint = await loadDurableRunStartFingerprint(projectRoot, runId);
-  if (durableFingerprint && durableFingerprint !== fingerprint) {
-    throw new Error(`Run ${runId} is already claimed with different identity.`);
-  }
+  const claim = await loadDurableRunStartClaim(store, run.projectRoot, run.id);
+  if (claim.kind === "invalid") throw new InvalidDurableRunStartClaimError();
+  if (claim.kind !== "valid") throw new Error(`Run ${run.id} is already claimed with different identity.`);
+  assertDurableRunStartClaimIdentity(run, fingerprint, claim.claim);
 }
 
-async function loadDurableRunStartFingerprint(projectRoot: string, runId: string): Promise<string | null> {
-  try {
-    const value = JSON.parse(await readFile(runStartClaimPath(projectRoot, runId), "utf8")) as unknown;
-    if (!value || typeof value !== "object" || !("startFingerprint" in value)) return null;
-    const fingerprint = (value as { startFingerprint?: unknown }).startFingerprint;
-    return typeof fingerprint === "string" && /^[a-f0-9]{64}$/.test(fingerprint) ? fingerprint : null;
-  } catch {
-    return null;
-  }
+function assertDurableRunStartClaimIdentity(
+  run: AgentRun,
+  fingerprint: string | undefined,
+  claim: DurableRunStartClaim,
+): void {
+  if (
+    claim.runId !== run.id ||
+    claim.nodeId !== run.nodeId ||
+    claim.sessionId !== run.sessionId ||
+    claim.agentKind !== run.agentKind ||
+    (fingerprint !== undefined && claim.startFingerprint !== fingerprint)
+  ) throw new Error(`Run ${run.id} is already claimed with different identity.`);
 }
 
-async function hasRunStartClaim(projectRoot: string, runId: string): Promise<boolean> {
-  try {
-    await access(runStartClaimPath(projectRoot, runId), fsConstants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
+async function loadDurableRunStartClaim(
+  store: DurableRunClaimStore,
+  projectRoot: string,
+  runId: string,
+): Promise<DurableRunStartClaimRead> {
+  return store.read(projectRoot, runId);
 }
 
-function runStartClaimPath(projectRoot: string, runId: string): string {
-  return join(projectRoot, ".devflow", "runs", runId, "start-claim.json");
-}
-
-function isFileExistsError(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+async function hasRunStartClaim(store: DurableRunClaimStore, projectRoot: string, runId: string): Promise<boolean> {
+  return (await loadDurableRunStartClaim(store, projectRoot, runId)).kind !== "missing";
 }
 
 function makePersistedRun(projectRoot: string, runId: string): AgentRun {
@@ -2602,12 +3375,6 @@ function isFinalRunStatus(status: AgentRunStatus): boolean {
 
 function isFinalTerminalSessionStatus(status: TerminalSessionStatus): boolean {
   return status === "exited" || status === "failed" || status === "cancelled" || status === "timed-out";
-}
-
-function isEvidenceCheck(value: unknown): value is NonNullable<RunEvidence["review"]> {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as { name?: unknown; kind?: unknown; status?: unknown };
-  return typeof candidate.name === "string" && typeof candidate.kind === "string" && typeof candidate.status === "string";
 }
 
 function isCodexCliSandbox(value: unknown): value is CodexCliSandbox {
@@ -2677,7 +3444,13 @@ function codexStdoutLineToDrafts(line: string): RunEventDraft[] {
     return [
       {
         kind: "progress",
-        payload: { source: "codex", stream: "stdout", format: "text", text: line, category: "output-parse-error" },
+        payload: {
+          source: "codex",
+          stream: "stdout",
+          format: "text",
+          text: sanitizePublicProcessText(line),
+          category: "output-parse-error",
+        },
       },
     ];
   }
@@ -2712,7 +3485,7 @@ function codexStdoutLineToDrafts(line: string): RunEventDraft[] {
     return [{ kind: "progress", payload: { source: "codex", eventType, itemType: getNestedString(event, "item", "type") } }];
   }
   if (eventType === "error" || eventType === "turn.failed") {
-    const message = getCodexErrorMessage(event);
+    const message = sanitizePublicProcessText(getCodexErrorMessage(event));
     return [
       {
         kind: "error",
@@ -2874,6 +3647,17 @@ function createQueuedRunEventEmitter(sink: RunEventSink): {
       await queue;
     },
   };
+}
+
+async function emitRunEventBestEffort(
+  emit: (draft: RunEventDraft) => Promise<RunEvent>,
+  draft: RunEventDraft,
+): Promise<void> {
+  try {
+    await emit({ ...draft, [retryTerminalPersistence]: true } as TerminalRunEventDraft);
+  } catch {
+    // A failed terminal draft must not escape a detached lifecycle handler.
+  }
 }
 
 async function hasGitMetadata(workdir: string): Promise<boolean> {

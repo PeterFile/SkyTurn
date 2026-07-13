@@ -2,7 +2,14 @@ import Database from "better-sqlite3";
 import { mkdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import { hasConcreteRunEvidence, normalizeSessionTarget } from "@skyturn/project-core";
+import {
+  expectedArtifactContractForRequiredEvidence,
+  isSuccessfulRunEvidence,
+  normalizeSessionTarget,
+  parseRunEvent,
+  parseRunEvidence,
+  sanitizePublicEvidenceText,
+} from "@skyturn/project-core";
 import type {
   AgentKind,
   CanvasNode,
@@ -13,6 +20,7 @@ import type {
   NodeRuntimeState,
   NodeStatus,
   RunEvidence,
+  RunEvent,
   SessionTarget,
   UserDecisionProjection,
   WorktreeMetadata,
@@ -27,6 +35,7 @@ import type {
 } from "@skyturn/project-core";
 import type { WorkflowNodePositionUpdateRequest } from "./index.js";
 import {
+  canonicalRequiredEvidenceForLane,
   compileInsertClarificationBefore,
   compileWorkflowIntent,
   createDefaultFlowPolicy,
@@ -145,6 +154,13 @@ export interface WorkflowStoreOptions {
   faultInjection?: {
     beforeInsertBeforeAppend?: () => void;
     afterInsertBeforeProjection?: (projection: FlowProjection) => void;
+    traceHermesHandleMaintenanceSql?: (sql: string) => void;
+    beforeHermesHandleMaintenanceStep?: (
+      step: "initial-checkpoint" | "vacuum" | "marker-write" | "final-checkpoint",
+    ) => void;
+    overrideHermesHandleCheckpointResult?: (
+      phase: "initial" | "final",
+    ) => WalCheckpointRow[] | undefined;
   };
 }
 
@@ -224,6 +240,7 @@ export interface WorkflowLaneRecord {
   agentKind: AgentKind;
   title: string;
   brief: string;
+  requiredEvidence: string[];
   status: WorkflowLaneStatus;
   phase: string;
   archived: boolean;
@@ -245,7 +262,7 @@ export interface WorkflowSegmentRecord {
   startedAt: string;
   endedAt: string | null;
   exitCode: number | null;
-  evidence: Record<string, unknown> | null;
+  evidence: RunEvidence | null;
   errorReason: string | null;
 }
 
@@ -351,6 +368,7 @@ export interface RecordRunResultInput {
   runId: string;
   agentKind: AgentKind;
   outputSummary?: string;
+  runEvents?: unknown[];
   evidence: RunEvidence;
   now: string;
 }
@@ -555,6 +573,22 @@ interface PragmaRow {
   foreign_keys?: number;
 }
 
+interface WalCheckpointRow {
+  busy?: number;
+  log?: number;
+  checkpointed?: number;
+}
+
+const hermesHandlePhysicalCleanup = "hermes_handle_physical_cleanup_v1";
+const redactHermesHandlesSql =
+  "UPDATE hermes_sessions SET opaque_handle = '[redacted]' WHERE opaque_handle IS NOT NULL AND opaque_handle != '[redacted]'";
+const checkpointHermesHandlesSql = "PRAGMA wal_checkpoint(TRUNCATE)";
+const vacuumHermesHandlesSql = "VACUUM";
+const deleteJournalModeSql = "PRAGMA journal_mode = DELETE";
+const insertHermesHandlePhysicalCleanupSql =
+  "INSERT INTO workflow_maintenance(name, state, completed_at) VALUES (?, 'complete', datetime('now'))";
+const walJournalModeSql = "PRAGMA journal_mode = WAL";
+
 interface SessionRow {
   id: string;
   project_id: string;
@@ -598,6 +632,7 @@ interface EventRow {
   idempotency_key: string | null;
   payload_json: string;
   created_at: string;
+  legacy_evidence_compatibility: 0 | 1;
 }
 
 interface LaneRow {
@@ -639,6 +674,7 @@ interface SegmentRow {
   exit_code: number | null;
   evidence_json: string | null;
   error_reason: string | null;
+  legacy_evidence_compatibility: 0 | 1;
 }
 
 interface WorkflowStoreStatements {
@@ -659,6 +695,7 @@ interface WorkflowStoreStatements {
   insertEdge: Database.Statement;
   listEdges: Database.Statement;
   getSegment: Database.Statement;
+  getSegmentById: Database.Statement;
   getSegmentByRunId: Database.Statement;
   listSegments: Database.Statement;
   listRunningPlannerSegments: Database.Statement;
@@ -684,10 +721,19 @@ export class WorkflowStore {
     this.databasePath = options.databasePath ?? join(this.projectRoot, ".devflow", "skyturn-workflow.sqlite");
     mkdirSync(join(this.projectRoot, ".devflow"), { recursive: true });
     this.db = new Database(this.databasePath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    applyMigrations(this.db);
-    this.statements = prepareStatements(this.db);
+    try {
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("secure_delete = ON");
+      this.db.pragma("foreign_keys = ON");
+      const requiresHermesHandlePhysicalCleanup = applyMigrations(this.db, this.faultInjection);
+      if (requiresHermesHandlePhysicalCleanup) {
+        completeHermesHandlePhysicalCleanup(this.db, this.faultInjection);
+      }
+      this.statements = prepareStatements(this.db);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -738,7 +784,7 @@ export class WorkflowStore {
         transport: input.transport,
         planner_profile: input.plannerProfile,
         process_id: input.processId ?? null,
-        opaque_handle: input.opaqueHandle ?? null,
+        opaque_handle: input.opaqueHandle ? "[redacted]" : null,
         status: input.transport === "hermes_replay_recovery" ? "recovered" : "running",
         started_at: input.now,
         last_seen_at: input.now,
@@ -813,10 +859,25 @@ export class WorkflowStore {
   }
 
   appendWorkflowEvent(input: AppendWorkflowEventInput): WorkflowEventRecord {
+    const laneId = laneIdFromPayload(input.payload);
+    const projection = this.materializeFlowProjection(input.sessionId);
+    const lane = laneId ? projection.lanes.find((item) => item.id === laneId) : undefined;
+    const safeInput = isFlowEventKind(input.kind)
+      ? {
+          ...input,
+          payload: canonicalFlowEventPayload(
+            { kind: input.kind as FlowEventKind, payload: input.payload },
+            laneRequiresExpectedArtifact(lane),
+          ),
+        }
+      : input;
+    assertNoConflictingTerminalRunEvidence(projection, safeInput);
     const tx = this.db.transaction(() => {
-      const existing = input.idempotencyKey ? this.getEventByIdempotencyKey(input.sessionId, input.idempotencyKey) : null;
+      const existing = safeInput.idempotencyKey
+        ? this.getEventByIdempotencyKey(safeInput.sessionId, safeInput.idempotencyKey)
+        : null;
       if (existing) return existing;
-      const event = this.insertEventInTransaction(input);
+      const event = this.insertEventInTransaction(safeInput);
       this.projectEventInTransaction(event);
       return event;
     });
@@ -1118,41 +1179,36 @@ export class WorkflowStore {
     } else if (!segment || segment.laneId !== input.laneId || segment.runId !== input.runId) {
       throw new Error("Run result segment identity mismatch.");
     }
-    const safeEvidence = sanitizeRunEvidence(input.evidence);
-    const outputSummary = sanitizeWorkflowStoredText(input.outputSummary ?? resultSummaryFromEvidence(safeEvidence));
-    if (lane?.laneKind === "planner") return this.recordPlannerRunResult(authoritativeInput, safeEvidence, outputSummary);
+    const safeEvidence = parseRunEvidence(input.evidence);
+    if (!safeEvidence) throw new Error("Invalid RunEvidence.");
+    const expectedArtifactContract = laneRequiresExpectedArtifact(lane);
+    const outputSummary = sanitizeWorkflowStoredText(
+      input.outputSummary ?? resultSummaryFromEvidence(safeEvidence, expectedArtifactContract),
+    );
+    const outputDeltas = workflowRunOutputDeltas(input.runEvents, input.runId);
+    if (lane?.laneKind === "planner") {
+      return this.recordPlannerRunResult(authoritativeInput, safeEvidence, outputSummary, outputDeltas);
+    }
 
     if (!segment) throw new Error("Run result segment identity mismatch.");
     if (segment.status !== "running") {
-      this.assertExecutableTerminalReplay(input, safeEvidence, outputSummary);
+      this.assertExecutableTerminalReplay(input, safeEvidence, outputDeltas, expectedArtifactContract);
       return projection;
     }
 
-    const status = flowStatusFromRunEvidence(input.evidence);
-    const evidenceStatus = status === "succeeded" ? "passed" : input.evidence.status === "cancelled" ? "skipped" : "failed";
+    const status = flowStatusFromRunEvidence(safeEvidence, expectedArtifactContract);
+    const evidenceStatus = status === "succeeded" ? "passed" : safeEvidence.status === "cancelled" ? "skipped" : "failed";
     const evidenceId = `evidence-${input.segmentId}`;
+    const outputEvents = workflowRunOutputFlowEvents(input, outputDeltas);
     const tx = this.db.transaction(() => {
-      const hasTerminalEvent = ["output-summary", "evidence", "finished"].some((suffix) =>
+      const hasTerminalEvent = ["evidence", "finished"].some((suffix) =>
         this.getEventByIdempotencyKey(input.sessionId, `segment:${input.segmentId}:${suffix}`)
       );
       if (hasTerminalEvent) {
-        this.assertExecutableTerminalReplay(input, safeEvidence, outputSummary);
+        this.assertExecutableTerminalReplay(input, safeEvidence, outputDeltas, expectedArtifactContract);
         return;
       }
-      this.insertFlowEventInTransaction({
-        id: `${input.sessionId}:flow-output:${input.segmentId}`,
-        sessionId: input.sessionId,
-        seq: 0,
-        kind: "workflow.segment.output_delta",
-        source: input.agentKind,
-        payload: {
-          laneId: input.laneId,
-          segmentId: input.segmentId,
-          text: outputSummary,
-        },
-        createdAt: input.now,
-        idempotencyKey: `segment:${input.segmentId}:output-summary`,
-      }, input.now);
+      for (const event of outputEvents) this.insertFlowEventInTransaction(event, input.now);
       this.insertFlowEventInTransaction({
         id: `${input.sessionId}:flow-evidence:${input.segmentId}`,
         sessionId: input.sessionId,
@@ -1162,6 +1218,7 @@ export class WorkflowStore {
         payload: {
           laneId: input.laneId,
           segmentId: input.segmentId,
+          summary: outputSummary,
           evidence: {
             id: evidenceId,
             kind: "run-exit",
@@ -1169,7 +1226,7 @@ export class WorkflowStore {
             changesetId: safeEvidence.changesetId,
             checks: safeEvidence.checks.map((check) => `${check.kind}:${check.name}:${check.status}`),
             artifacts: safeEvidence.artifacts,
-            detail: safeEvidence.errorReason ?? safeEvidence.review?.detail ?? null,
+            detail: safeEvidence.errorReason ?? safeEvidence.cancelReason ?? safeEvidence.review?.detail ?? null,
             runEvidence: safeEvidence,
           },
         },
@@ -1317,11 +1374,10 @@ export class WorkflowStore {
     input: RecordRunResultInput,
     safeEvidence: RunEvidence,
     outputSummary: string,
+    outputDeltas: RunEvent[],
   ): FlowProjection {
-    const status = flowStatusFromRunEvidence(safeEvidence);
-    const laneStatus: WorkflowLaneStatus = status === "succeeded" && hasConcreteRunEvidence(safeEvidence)
-      ? "completed"
-      : "failed";
+    const status = flowStatusFromRunEvidence(safeEvidence, false);
+    const laneStatus: WorkflowLaneStatus = status === "succeeded" ? "completed" : "failed";
     const tx = this.db.transaction(() => {
       const existing = this.statements.getSegment.get(input.sessionId, input.segmentId) as SegmentRow | undefined;
       if (existing && existing.status !== "running") {
@@ -1338,16 +1394,20 @@ export class WorkflowStore {
         worktreePath: ".",
         now: input.now,
       });
-      this.insertEventInTransaction({
+      const plannerOutputEvents = outputDeltas.map((delta) => ({
         sessionId: input.sessionId,
-        kind: "segment_output_delta",
+        kind: "segment_output_delta" as const,
         source: input.agentKind,
         laneId: input.laneId,
         segmentId: input.segmentId,
-        idempotencyKey: `planner-segment:${input.segmentId}:output-summary`,
-        payload: { text: outputSummary },
+        idempotencyKey: `planner-segment:${input.segmentId}:output-delta:${delta.seq}`,
+        payload: {
+          ...(typeof delta.payload.text === "string" ? { text: delta.payload.text } : {}),
+          delta,
+        },
         now: input.now,
-      });
+      }));
+      for (const event of plannerOutputEvents) this.insertEventInTransaction(event);
       const evidenceEvent = this.insertEventInTransaction({
         sessionId: input.sessionId,
         kind: "segment_evidence",
@@ -1355,7 +1415,7 @@ export class WorkflowStore {
         laneId: input.laneId,
         segmentId: input.segmentId,
         idempotencyKey: `planner-segment:${input.segmentId}:evidence`,
-        payload: { evidence: safeEvidence },
+        payload: { evidence: safeEvidence, summary: outputSummary },
         now: input.now,
       });
       this.statements.updateSegmentEvidence.run({
@@ -1406,28 +1466,37 @@ export class WorkflowStore {
   private assertExecutableTerminalReplay(
     input: RecordRunResultInput,
     evidence: RunEvidence,
-    outputSummary: string,
+    outputDeltas: RunEvent[],
+    expectedArtifactContract: boolean,
   ): void {
-    const output = this.getEventByIdempotencyKey(input.sessionId, `segment:${input.segmentId}:output-summary`);
-    const expectedOutput = {
-      laneId: input.laneId,
-      segmentId: input.segmentId,
-      text: outputSummary,
-    };
-    if (
-      output?.kind !== "workflow.segment.output_delta" ||
-      output.source !== input.agentKind ||
-      stableJson(output.payload) !== stableJson(expectedOutput)
-    ) {
+    const expectedOutputs = workflowRunOutputFlowEvents(input, outputDeltas).map((event) => ({
+      kind: event.kind,
+      source: event.source,
+      idempotencyKey: event.idempotencyKey,
+      payload: event.payload,
+    }));
+    const storedOutputs = this.listEvents(input.sessionId)
+      .filter((event) =>
+        event.kind === "workflow.segment.output_delta" &&
+        event.payload.segmentId === input.segmentId
+      )
+      .map((event) => ({
+        kind: event.kind,
+        source: event.source,
+        idempotencyKey: event.idempotencyKey,
+        payload: event.payload,
+      }));
+    if (stableJson(storedOutputs) !== stableJson(expectedOutputs)) {
       throw new Error("Executable terminal output conflict for existing run.");
     }
 
-    const status = flowStatusFromRunEvidence(evidence);
+    const status = flowStatusFromRunEvidence(evidence, expectedArtifactContract);
     const evidenceStatus = status === "succeeded" ? "passed" : evidence.status === "cancelled" ? "skipped" : "failed";
     const evidenceEvent = this.getEventByIdempotencyKey(input.sessionId, `segment:${input.segmentId}:evidence`);
     const expectedEvidence = {
       laneId: input.laneId,
       segmentId: input.segmentId,
+      ...(typeof evidenceEvent?.payload.summary === "string" ? { summary: evidenceEvent.payload.summary } : {}),
       evidence: {
         id: `evidence-${input.segmentId}`,
         kind: "run-exit",
@@ -1435,7 +1504,7 @@ export class WorkflowStore {
         changesetId: evidence.changesetId,
         checks: evidence.checks.map((check) => `${check.kind}:${check.name}:${check.status}`),
         artifacts: evidence.artifacts,
-        detail: evidence.errorReason ?? evidence.review?.detail ?? null,
+        detail: evidence.errorReason ?? evidence.cancelReason ?? evidence.review?.detail ?? null,
         runEvidence: evidence,
       },
     };
@@ -1460,9 +1529,9 @@ export class WorkflowStore {
   }
 
   materializeFlowProjection(sessionId: string): FlowProjection {
-    const flowEvents = this.listEvents(sessionId)
+    const flowEvents = (this.statements.listEvents.all(sessionId) as EventRow[])
       .filter((event) => isFlowEventKind(event.kind))
-      .map(mapWorkflowRecordToFlowEvent);
+      .map(mapEventRowToFlowEvent);
     return reduceWorkflowEvents([seedFlowUserInputEvent(sessionId), ...flowEvents]);
   }
 
@@ -1644,7 +1713,8 @@ export class WorkflowStore {
   }
 
   listSegments(sessionId: string, laneId: string): WorkflowSegmentRecord[] {
-    return (this.statements.listSegments.all(sessionId, laneId) as SegmentRow[]).map(mapSegment);
+    const lane = this.getLane(sessionId, laneId);
+    return (this.statements.listSegments.all(sessionId, laneId) as SegmentRow[]).map((row) => mapSegment(row, lane));
   }
 
   listRunningSegments(): RunningWorkflowSegment[] {
@@ -1748,8 +1818,36 @@ export class WorkflowStore {
     return tx();
   }
 
-  recordSegmentEvidence(input: SegmentEvidenceInput): void {
+  recordSegmentEvidence(input: SegmentEvidenceInput): WorkflowSegmentRecord {
+    const safeEvidence = parseSegmentEvidenceInput(input);
+    const lane = this.getLane(input.sessionId, input.laneId);
+    const status = flowStatusFromRunEvidence(safeEvidence, laneRequiresExpectedArtifact(lane));
     const tx = this.db.transaction(() => {
+      const existing = this.statements.getSegmentById.get(input.segmentId) as SegmentRow | undefined;
+      if (existing) {
+        if (
+          existing.session_id !== input.sessionId ||
+          existing.lane_id !== input.laneId ||
+          existing.run_id !== input.runId ||
+          existing.agent_kind !== input.agentKind ||
+          existing.transport !== input.transport ||
+          existing.worktree_path !== input.worktreePath
+        ) {
+          throw new Error("Segment evidence identity conflict for existing segment.");
+        }
+        if (existing.status !== "running" || existing.evidence_json !== null) {
+          const errorReason = safeEvidence.errorReason ?? safeEvidence.cancelReason ?? null;
+          if (
+            existing.status !== status ||
+            existing.evidence_json !== stableJson(safeEvidence) ||
+            existing.exit_code !== safeEvidence.exitCode ||
+            existing.error_reason !== errorReason
+          ) {
+            throw new Error("Segment terminal evidence conflict for existing segment.");
+          }
+          return mapSegment(existing, lane);
+        }
+      }
       this.ensureSegmentInTransaction(input);
       const evidenceEvent = this.insertEventInTransaction({
         sessionId: input.sessionId,
@@ -1758,14 +1856,14 @@ export class WorkflowStore {
         laneId: input.laneId,
         segmentId: input.segmentId,
         idempotencyKey: `segment:${input.segmentId}:evidence`,
-        payload: { evidence: input.evidence },
+        payload: { evidence: safeEvidence },
         now: input.now,
       });
       this.statements.updateSegmentEvidence.run({
         id: input.segmentId,
-        evidence_json: stableJson(input.evidence),
-        exit_code: input.evidence.exitCode ?? null,
-        error_reason: input.evidence.errorReason ?? null,
+        evidence_json: stableJson(safeEvidence),
+        exit_code: safeEvidence.exitCode,
+        error_reason: safeEvidence.errorReason,
       });
       this.insertEventInTransaction({
         sessionId: input.sessionId,
@@ -1775,30 +1873,32 @@ export class WorkflowStore {
         segmentId: input.segmentId,
         causationId: evidenceEvent.id,
         idempotencyKey: `segment:${input.segmentId}:finished`,
-        payload: { status: input.evidence.exitCode === 0 ? "succeeded" : "failed", exitCode: input.evidence.exitCode ?? null },
+        payload: { status, exitCode: safeEvidence.exitCode },
         now: input.now,
       });
       this.statements.finishSegment.run({
         id: input.segmentId,
-        status: input.evidence.exitCode === 0 ? "succeeded" : "failed",
+        status,
         ended_at: input.now,
-        exit_code: input.evidence.exitCode ?? null,
-        error_reason: input.evidence.errorReason ?? null,
+        exit_code: safeEvidence.exitCode,
+        error_reason: safeEvidence.errorReason,
       });
-      if (hasConcreteEvidence(input.evidence)) {
-        this.setLaneStatus(input.sessionId, input.laneId, "completed", input.now);
-        this.insertEventInTransaction({
-          sessionId: input.sessionId,
-          kind: "lane_status_changed",
-          source: "workflow_store",
-          laneId: input.laneId,
-          causationId: evidenceEvent.id,
-          payload: { status: "completed", reason: "segment evidence" },
-          now: input.now,
-        });
-      }
+      const laneStatus: WorkflowLaneStatus = status === "succeeded" ? "completed" : "failed";
+      this.setLaneStatus(input.sessionId, input.laneId, laneStatus, input.now);
+      this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "lane_status_changed",
+        source: "workflow_store",
+        laneId: input.laneId,
+        causationId: evidenceEvent.id,
+        payload: { status: laneStatus, reason: "segment evidence" },
+        now: input.now,
+      });
+      const recorded = this.statements.getSegmentById.get(input.segmentId) as SegmentRow | undefined;
+      if (!recorded) throw new Error("Segment evidence transaction did not persist its segment.");
+      return mapSegment(recorded, lane);
     });
-    tx();
+    return tx.immediate();
   }
 
   finishSegment(input: FinishSegmentInput): void {
@@ -2387,14 +2487,20 @@ export class WorkflowStore {
     const latestSegment = segments.at(-1) ?? null;
     const evidence = latestSegment?.evidence ?? null;
     const changesetId = isRecord(evidence) && typeof evidence.changesetId === "string" ? evidence.changesetId : `changeset-${session.id}-${lane.nodeId}`;
-    const output = this.listEvents(session.id)
-      .filter((event) => event.laneId === lane.id && event.kind === "segment_output_delta" && typeof event.payload.text === "string")
+    const outputEvents = this.listEvents(session.id)
+      .filter((event) => event.laneId === lane.id && event.kind === "segment_output_delta");
+    const output = outputEvents
+      .filter((event) => typeof event.payload.text === "string")
       .map((event) => String(event.payload.text));
+    const outputDeltas = outputEvents
+      .map((event) => parseRunEvent(event.payload.delta))
+      .filter((event): event is RunEvent => Boolean(event));
     return {
       id: lane.nodeId,
       title: lane.title,
       agent: lane.agentKind,
       progress: progressForLaneStatus(lane.status),
+      requiredEvidence: lane.requiredEvidence,
       runtime: runtimeForLaneStatus(lane.status),
       display: {
         agentLabel: agentLabel(lane.agentKind),
@@ -2414,7 +2520,8 @@ export class WorkflowStore {
       position: { x: 120 + (index % 3) * 340, y: 120 + Math.floor(index / 3) * 220 },
       runId: latestSegment?.runId ?? `run-${session.id}-${lane.nodeId}`,
       changesetId,
-      output: output.length > 0 ? output : [`Workflow lane ${lane.status}.`],
+      output,
+      ...(outputDeltas.length > 0 ? { outputDeltas } : {}),
       worktree: worktreeForSessionTarget(session, lane.nodeId, latestSegment?.worktreePath, createdWorktree),
       context: {
         brief: lane.brief,
@@ -2518,12 +2625,15 @@ export class WorkflowStore {
   }
 
   private insertFlowEventInTransaction(event: FlowEvent, now: string): WorkflowEventRecord {
+    const laneId = laneIdFromPayload(event.payload);
+    const lane = laneId ? this.materializeFlowProjection(event.sessionId).lanes.find((item) => item.id === laneId) : undefined;
+    const payload = canonicalFlowEventPayload(event, laneRequiresExpectedArtifact(lane));
     return this.insertEventInTransaction({
       sessionId: event.sessionId,
       kind: event.kind,
       source: event.source,
       idempotencyKey: event.idempotencyKey,
-      payload: event.payload,
+      payload,
       now,
     });
   }
@@ -2646,6 +2756,24 @@ export class WorkflowStore {
   }
 }
 
+function assertNoConflictingTerminalRunEvidence(
+  projection: FlowProjection,
+  input: Pick<AppendWorkflowEventInput, "kind" | "payload">,
+): void {
+  if (input.kind !== "workflow.evidence.recorded" || !isRecord(input.payload.evidence)) return;
+  const segmentId = optionalText(input.payload.segmentId);
+  const incoming = parseRunEvidence(input.payload.evidence.runEvidence);
+  if (!segmentId || !incoming || !isTerminalRunEvidence(incoming)) return;
+  const first = projection.evidence.find((candidate) =>
+    candidate.segmentId === segmentId &&
+    candidate.runEvidence &&
+    isTerminalRunEvidence(candidate.runEvidence)
+  )?.runEvidence;
+  if (first && stableJson(first) !== stableJson(incoming)) {
+    throw new Error("Workflow terminal evidence conflict for existing run.");
+  }
+}
+
 class LedgerSanitizer {
   private readonly recentEventLimit: number;
   private readonly factLimit: number;
@@ -2762,7 +2890,7 @@ function flowPlannerNode(session: WorkflowSessionRecord): CanvasNode {
     position: { x: 120, y: 120 },
     runId: runIdForLane(session.id, session.plannerLaneId),
     changesetId: `changeset-${session.id}-${session.plannerLaneId}`,
-    output: ["Workflow planner is active."],
+    output: [],
     worktree: worktreeForSessionTarget(session, session.plannerLaneId),
     context: {
       brief: session.goal,
@@ -2800,6 +2928,7 @@ function flowLaneToCanvasNode(
     executable: lane.executable,
     laneKind: lane.laneKind,
     semanticSubtype: lane.semanticSubtype,
+    requiredEvidence: lane.requiredEvidence,
     runtimePolicy: lane.runtimePolicy,
     runtime: runtimeForNodeStatus(status, lane.kind),
     display: {
@@ -2817,7 +2946,8 @@ function flowLaneToCanvasNode(
     position: { x: 460 + ((index - 1) % 3) * 340, y: 140 + Math.floor((index - 1) / 3) * 220 },
     runId: latestSegment?.runId ?? runIdForLane(session.id, lane.id),
     changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
-    output: lane.output.length > 0 ? lane.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
+    output: lane.output,
+    ...(lane.outputDeltas && lane.outputDeltas.length > 0 ? { outputDeltas: lane.outputDeltas } : {}),
     worktree: worktreeForSessionTarget(session, lane.id, undefined, createdWorktree),
     context: {
       brief: lane.brief ?? lane.title,
@@ -3361,10 +3491,15 @@ function plannerSegmentIdForRun(runId: string): string {
   return `planner-segment-${runId}`;
 }
 
-function flowStatusFromRunEvidence(evidence: RunEvidence): "succeeded" | "failed" | "cancelled" | "timed-out" {
+function flowStatusFromRunEvidence(
+  evidence: RunEvidence,
+  expectedArtifactContract: boolean,
+): "succeeded" | "failed" | "cancelled" | "timed-out" {
   if (evidence.status === "cancelled") return "cancelled";
   if (evidence.status === "timed-out") return "timed-out";
-  return evidence.exitCode === 0 || evidence.status === "succeeded" ? "succeeded" : "failed";
+  return isSuccessfulRunEvidence(evidence, { source: "current", expectedArtifactContract })
+    ? "succeeded"
+    : "failed";
 }
 
 function isTerminalRunEvidence(evidence: RunEvidence): boolean {
@@ -3373,7 +3508,7 @@ function isTerminalRunEvidence(evidence: RunEvidence): boolean {
 }
 
 function assertPlannerTerminalEvidenceReplay(segment: SegmentRow, evidence: RunEvidence): void {
-  const status = flowStatusFromRunEvidence(evidence);
+  const status = flowStatusFromRunEvidence(evidence, false);
   const errorReason = evidence.errorReason ?? evidence.cancelReason ?? null;
   if (
     segment.status !== status ||
@@ -3385,44 +3520,202 @@ function assertPlannerTerminalEvidenceReplay(segment: SegmentRow, evidence: RunE
   }
 }
 
-function resultSummaryFromEvidence(evidence: RunEvidence): string {
-  const status = evidence.exitCode === 0 ? "succeeded" : evidence.status;
+function resultSummaryFromEvidence(evidence: RunEvidence, expectedArtifactContract = false): string {
+  const status = flowStatusFromRunEvidence(evidence, expectedArtifactContract);
   const checkNames = evidence.checks.map((check) => `${check.name}: ${check.status}`).join(", ");
   return checkNames ? `Run ${status}; ${checkNames}.` : `Run ${status}.`;
 }
 
-function sanitizeRunEvidence(evidence: RunEvidence): RunEvidence {
+function parseSegmentEvidenceInput(input: SegmentEvidenceInput): RunEvidence {
+  const parsed = parseRunEvidence({
+    runId: input.runId,
+    status: input.evidence.exitCode === 0 ? "succeeded" : "failed",
+    exitCode: input.evidence.exitCode ?? null,
+    changesetId: input.evidence.changesetId ?? null,
+    checks: input.evidence.checks ?? [],
+    artifacts: input.evidence.artifacts ?? [],
+    review: input.evidence.review ?? null,
+    errorReason: input.evidence.errorReason ?? null,
+    cancelReason: null,
+    completedAt: input.now,
+  });
+  if (!parsed || parsed.runId !== input.runId) throw new Error("Invalid RunEvidence.");
+  return parsed;
+}
+
+interface StoredSegmentEvidence {
+  evidence: RunEvidence;
+  source: "current" | "legacy-disk";
+  expectedArtifactContract: boolean;
+}
+
+function parseStoredSegmentEvidence(
+  row: SegmentRow,
+  expectedArtifactContract: boolean,
+): StoredSegmentEvidence | null {
+  if (!row.evidence_json) return null;
+  let raw: Record<string, unknown>;
+  try {
+    raw = parseJson(row.evidence_json);
+  } catch {
+    return null;
+  }
+  const current = parseRunEvidence(raw);
+  if (current) {
+    if (current.runId !== row.run_id) return null;
+    return { evidence: current, source: "current", expectedArtifactContract };
+  }
+  if (row.legacy_evidence_compatibility !== 1 || "runId" in raw || "status" in raw) return null;
+  const legacyStatus = row.status === "timed-out" || row.status === "cancelled" || row.status === "failed"
+    ? row.status
+    : "succeeded";
+  const legacy = parseRunEvidence({
+    runId: row.run_id,
+    status: legacyStatus,
+    exitCode: "exitCode" in raw ? raw.exitCode : row.exit_code,
+    changesetId: "changesetId" in raw ? raw.changesetId : null,
+    checks: "checks" in raw ? raw.checks : [],
+    artifacts: "artifacts" in raw ? raw.artifacts : [],
+    review: "review" in raw ? raw.review : null,
+    errorReason: "errorReason" in raw ? raw.errorReason : row.error_reason,
+    cancelReason: null,
+    completedAt: row.ended_at ?? row.started_at,
+  });
+  if (!legacy) return null;
+  return { evidence: legacy, source: "legacy-disk", expectedArtifactContract };
+}
+
+function storedSegmentStatus(row: SegmentRow, stored: StoredSegmentEvidence | null): string {
+  if (!row.evidence_json) return row.status;
+  if (!stored) return row.status === "running" ? "running" : "failed";
+  if (stored.evidence.status === "cancelled") return "cancelled";
+  if (stored.evidence.status === "timed-out") return "timed-out";
+  if (stored.evidence.status === "failed") return "failed";
+  const successful = stored.source === "legacy-disk" && !stored.expectedArtifactContract && stored.evidence.artifacts.length === 0
+    ? isSuccessfulRunEvidence(stored.evidence, { source: "legacy-disk", expectedArtifactContract: false })
+    : isSuccessfulRunEvidence(stored.evidence, {
+        source: "current",
+        expectedArtifactContract: stored.expectedArtifactContract,
+      });
+  return successful ? "succeeded" : "failed";
+}
+
+function canonicalFlowEventPayload(
+  event: Pick<FlowEvent, "kind" | "payload">,
+  expectedArtifactContract: boolean,
+): Record<string, unknown> {
+  if (event.kind === "workflow.lane.declared" && isRecord(event.payload.lane)) {
+    return {
+      ...event.payload,
+      lane: {
+        ...event.payload.lane,
+        requiredEvidence: canonicalRequiredEvidenceForLane(event.payload.lane),
+      },
+    };
+  }
+  if (event.kind === "workflow.segment.output_delta") {
+    if (Object.prototype.hasOwnProperty.call(event.payload, "compatibilitySource")) {
+      throw new Error("RunEvent output delta compatibility markers are not accepted.");
+    }
+    if (event.payload.delta === undefined) throw new Error("RunEvent output delta is required.");
+    const delta = parseRunEvent(event.payload.delta);
+    if (!delta || !isWorkflowOutputDelta(delta)) throw new Error("Invalid RunEvent output delta.");
+    if (
+      event.payload.text !== undefined &&
+      event.payload.text !== delta.payload.text
+    ) {
+      throw new Error("RunEvent output delta text mismatch.");
+    }
+    const text = typeof delta.payload.text === "string" ? delta.payload.text : undefined;
+    return {
+      ...event.payload,
+      ...(text !== undefined ? { text } : {}),
+      ...(delta ? { delta } : {}),
+    };
+  }
+  if (event.kind !== "workflow.evidence.recorded" || !isRecord(event.payload.evidence)) return event.payload;
+  const { compatibilitySource: _compatibilitySource, ...outer } = event.payload.evidence;
+  if (!("runEvidence" in outer)) {
+    if (!expectedArtifactContract) return { ...event.payload, evidence: outer };
+    return {
+      ...event.payload,
+      evidence: {
+        id: sanitizePublicEvidenceText(outer.id) || "evidence",
+        kind: sanitizePublicEvidenceText(outer.kind) || "run-exit",
+        status: "failed",
+        checks: [],
+        artifacts: [],
+      },
+    };
+  }
+  const runEvidence = parseRunEvidence(outer.runEvidence);
+  if (!runEvidence) throw new Error("Invalid RunEvidence.");
+  const status = flowStatusFromRunEvidence(runEvidence, expectedArtifactContract);
+  const evidenceStatus = status === "succeeded" ? "passed" : status === "cancelled" ? "skipped" : "failed";
+  const detail = runEvidence.errorReason ?? runEvidence.cancelReason ?? runEvidence.review?.detail ?? null;
+  const summary = typeof event.payload.summary === "string"
+    ? sanitizeWorkflowStoredText(event.payload.summary)
+    : undefined;
   return {
-    runId: evidence.runId,
-    status: evidence.status,
-    exitCode: evidence.exitCode,
-    changesetId: sanitizeOptionalWorkflowText(evidence.changesetId),
-    checks: evidence.checks.map(sanitizeEvidenceCheck),
-    artifacts: evidence.artifacts.map(sanitizeWorkflowStoredText),
-    review: evidence.review ? sanitizeEvidenceCheck(evidence.review) : null,
-    errorReason: sanitizeOptionalWorkflowText(evidence.errorReason),
-    cancelReason: sanitizeOptionalWorkflowText(evidence.cancelReason),
-    completedAt: evidence.completedAt,
+    ...event.payload,
+    ...(summary !== undefined ? { summary } : {}),
+    evidence: {
+      id: sanitizePublicEvidenceText(outer.id) || "evidence",
+      kind: sanitizePublicEvidenceText(outer.kind) || "run-exit",
+      status: evidenceStatus,
+      changesetId: runEvidence.changesetId,
+      checks: runEvidence.checks.map((check) => `${check.kind}:${check.name}:${check.status}`),
+      artifacts: runEvidence.artifacts,
+      detail,
+      runEvidence,
+    },
   };
 }
 
-function sanitizeEvidenceCheck(check: RunEvidence["checks"][number]): RunEvidence["checks"][number] {
-  const detail = sanitizeOptionalWorkflowText(check.detail);
-  return {
-    kind: check.kind,
-    name: sanitizeWorkflowStoredText(check.name),
-    status: check.status,
-    ...(detail ? { detail } : {}),
-  };
+function isWorkflowOutputDelta(event: RunEvent): boolean {
+  return event.kind === "output" || event.kind === "progress" || event.kind === "changes";
 }
 
-function sanitizeOptionalWorkflowText(value: string | null | undefined): string | null {
-  if (!value) return null;
-  return sanitizeWorkflowStoredText(value) || null;
+function laneRequiresExpectedArtifact(
+  lane: { requiredEvidence?: string[] } | null | undefined,
+): boolean {
+  return expectedArtifactContractForRequiredEvidence(lane?.requiredEvidence).required;
 }
 
 function sanitizeWorkflowStoredText(value: string): string {
   return sanitizeLedgerText(value, 320);
+}
+
+function workflowRunOutputDeltas(value: unknown[] | undefined, runId: string): RunEvent[] {
+  if (value === undefined) return [];
+  const deltas: RunEvent[] = [];
+  for (const candidate of value) {
+    const event = parseRunEvent(candidate);
+    if (!event || event.runId !== runId) throw new Error("Invalid RunEvent output stream.");
+    if (event.kind === "output" || event.kind === "progress" || event.kind === "changes") deltas.push(event);
+  }
+  return deltas;
+}
+
+function workflowRunOutputFlowEvents(
+  input: Pick<RecordRunResultInput, "sessionId" | "laneId" | "segmentId" | "agentKind" | "now">,
+  deltas: RunEvent[],
+): FlowEvent[] {
+  return deltas.map((delta) => ({
+    id: `${input.sessionId}:flow-output:${input.segmentId}:${delta.seq}`,
+    sessionId: input.sessionId,
+    seq: 0,
+    kind: "workflow.segment.output_delta",
+    source: input.agentKind,
+    payload: {
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      ...(typeof delta.payload.text === "string" ? { text: delta.payload.text } : {}),
+      delta,
+    },
+    createdAt: input.now,
+    idempotencyKey: `segment:${input.segmentId}:output-delta:${delta.seq}`,
+  }));
 }
 
 function compactStrings(values: string[]): string[] {
@@ -3480,11 +3773,20 @@ function sanitizeLedgerText(value: string, maxLength: number): string {
   return `${sanitized.slice(0, maxLength - 22).trimEnd()}... [truncated]`;
 }
 
-function applyMigrations(db: Database.Database): void {
+function applyMigrations(
+  db: Database.Database,
+  faultInjection: WorkflowStoreOptions["faultInjection"],
+): boolean {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version INTEGER PRIMARY KEY,
       applied_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS workflow_maintenance (
+      name TEXT PRIMARY KEY,
+      state TEXT NOT NULL,
+      completed_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS workflow_sessions (
@@ -3533,6 +3835,7 @@ function applyMigrations(db: Database.Database): void {
       idempotency_key TEXT,
       payload_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
+      legacy_evidence_compatibility INTEGER NOT NULL DEFAULT 0,
       UNIQUE(session_id, seq)
     );
 
@@ -3584,7 +3887,8 @@ function applyMigrations(db: Database.Database): void {
       ended_at TEXT,
       exit_code INTEGER,
       evidence_json TEXT,
-      error_reason TEXT
+      error_reason TEXT,
+      legacy_evidence_compatibility INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS workflow_checkpoints (
@@ -3600,6 +3904,13 @@ function applyMigrations(db: Database.Database): void {
   db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))").run();
   applySessionTargetMigration(db);
   db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, datetime('now'))").run();
+  applyLegacyEvidenceProvenanceMigration(db);
+  db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, datetime('now'))").run();
+  applyExpectedArtifactOuterEvidenceMigration(db);
+  const requiresHermesHandlePhysicalCleanup = applyHermesHandleRedactionMigration(db, faultInjection);
+  applyHistoricalOutputDeltaMigration(db);
+  applyHistoricalLaneRequiredEvidenceMigration(db);
+  return requiresHermesHandlePhysicalCleanup;
 }
 
 function applySessionTargetMigration(db: Database.Database): void {
@@ -3613,6 +3924,280 @@ function applySessionTargetMigration(db: Database.Database): void {
   if (!columns.has("base_ref")) {
     db.exec("ALTER TABLE workflow_sessions ADD COLUMN base_ref TEXT");
   }
+}
+
+function applyLegacyEvidenceProvenanceMigration(db: Database.Database): void {
+  const eventColumns = new Set(
+    (db.prepare("PRAGMA table_info(workflow_events)").all() as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (!eventColumns.has("legacy_evidence_compatibility")) {
+    db.exec("ALTER TABLE workflow_events ADD COLUMN legacy_evidence_compatibility INTEGER NOT NULL DEFAULT 0");
+    db.prepare(
+      "UPDATE workflow_events SET legacy_evidence_compatibility = 1 WHERE kind = 'workflow.evidence.recorded'",
+    ).run();
+  }
+
+  const segmentColumns = new Set(
+    (db.prepare("PRAGMA table_info(workflow_segments)").all() as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (!segmentColumns.has("legacy_evidence_compatibility")) {
+    db.exec("ALTER TABLE workflow_segments ADD COLUMN legacy_evidence_compatibility INTEGER NOT NULL DEFAULT 0");
+    db.prepare(
+      "UPDATE workflow_segments SET legacy_evidence_compatibility = 1 WHERE evidence_json IS NOT NULL",
+    ).run();
+  }
+}
+
+interface HistoricalWorkflowEventRow {
+  id: string;
+  session_id: string;
+  seq: number;
+  kind: string;
+  lane_id: string | null;
+  payload_json: string;
+}
+
+function applyExpectedArtifactOuterEvidenceMigration(db: Database.Database): void {
+  const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 4").get();
+  if (applied) return;
+
+  const migrate = db.transaction(() => {
+    const rows = db.prepare([
+      "SELECT id, session_id, seq, kind, lane_id, payload_json",
+      "FROM workflow_events ORDER BY session_id, seq, id",
+    ].join(" ")).all() as HistoricalWorkflowEventRow[];
+    const expectedArtifactLanes = new Set<string>();
+    for (const row of rows) {
+      if (row.kind !== "workflow.lane.declared") continue;
+      const payload = parseJson(row.payload_json);
+      if (!isRecord(payload.lane) || typeof payload.lane.id !== "string") continue;
+      if (laneRequiresExpectedArtifact({
+        requiredEvidence: canonicalRequiredEvidenceForLane(payload.lane),
+      })) {
+        expectedArtifactLanes.add(`${row.session_id}\0${payload.lane.id}`);
+      }
+    }
+
+    const update = db.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ? AND payload_json = ?");
+    for (const row of rows) {
+      if (row.kind !== "workflow.evidence.recorded") continue;
+      const payload = parseJson(row.payload_json);
+      const laneId = row.lane_id ?? laneIdFromPayload(payload);
+      if (!laneId || !expectedArtifactLanes.has(`${row.session_id}\0${laneId}`)) continue;
+      if (!isRecord(payload.evidence) || Object.prototype.hasOwnProperty.call(payload.evidence, "runEvidence")) {
+        continue;
+      }
+      const canonicalPayload = stableJson(canonicalFlowEventPayload({
+        kind: "workflow.evidence.recorded",
+        payload,
+      }, true));
+      if (canonicalPayload !== row.payload_json) update.run(canonicalPayload, row.id, row.payload_json);
+    }
+    db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (4, datetime('now'))").run();
+  });
+  migrate();
+}
+
+function applyHermesHandleRedactionMigration(
+  db: Database.Database,
+  faultInjection: WorkflowStoreOptions["faultInjection"],
+): boolean {
+  const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 5").get();
+  const physicalCleanupComplete = db.prepare([
+    "SELECT 1 FROM workflow_maintenance",
+    "WHERE name = ? AND state = 'complete'",
+  ].join(" ")).get(hermesHandlePhysicalCleanup);
+  const rawHandle = db.prepare([
+    "SELECT 1 FROM hermes_sessions",
+    "WHERE opaque_handle IS NOT NULL AND opaque_handle != '[redacted]'",
+    "LIMIT 1",
+  ].join(" ")).get();
+  if (applied && physicalCleanupComplete && !rawHandle) return false;
+  const migrate = db.transaction(() => {
+    if (physicalCleanupComplete) {
+      db.prepare("DELETE FROM workflow_maintenance WHERE name = ?").run(hermesHandlePhysicalCleanup);
+    }
+    faultInjection?.traceHermesHandleMaintenanceSql?.(redactHermesHandlesSql);
+    db.prepare(redactHermesHandlesSql).run();
+    if (!applied) {
+      db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (5, datetime('now'))").run();
+    }
+  });
+  migrate();
+  return true;
+}
+
+interface HistoricalOutputDeltaRow {
+  id: string;
+  session_id: string;
+  seq: number;
+  kind: string;
+  lane_id: string | null;
+  segment_id: string | null;
+  payload_json: string;
+  created_at: string;
+}
+
+interface HistoricalOutputSegment {
+  id: string;
+  laneId: string;
+  runId: string;
+  startedAt: string;
+}
+
+function applyHistoricalOutputDeltaMigration(db: Database.Database): void {
+  const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 6").get();
+  if (applied) return;
+  const migrate = db.transaction(() => {
+    const rows = db.prepare([
+      "SELECT id, session_id, seq, kind, lane_id, segment_id, payload_json, created_at",
+      "FROM workflow_events",
+      "WHERE kind IN ('workflow.segment.started', 'workflow.segment.output_delta')",
+      "ORDER BY session_id, seq, id",
+    ].join(" ")).all() as HistoricalOutputDeltaRow[];
+    const update = db.prepare([
+      "UPDATE workflow_events",
+      "SET payload_json = ?, legacy_evidence_compatibility = 0",
+      "WHERE id = ? AND payload_json = ?",
+    ].join(" "));
+    const segments = new Map<string, HistoricalOutputSegment>();
+    for (const row of rows) {
+      let payload: Record<string, unknown>;
+      try {
+        payload = parseJson(row.payload_json);
+      } catch {
+        continue;
+      }
+      if (row.kind === "workflow.segment.started") {
+        if (!isRecord(payload.segment)) continue;
+        const id = typeof payload.segment.id === "string" ? payload.segment.id : null;
+        const laneId = typeof payload.segment.laneId === "string" ? payload.segment.laneId : null;
+        const runId = typeof payload.segment.runId === "string" ? payload.segment.runId : null;
+        if (!id || !laneId || !runId) continue;
+        if (row.segment_id && row.segment_id !== id) continue;
+        if (row.lane_id && row.lane_id !== laneId) continue;
+        if (typeof payload.laneId === "string" && payload.laneId !== laneId) continue;
+        segments.set(`${row.session_id}\0${id}`, { id, laneId, runId, startedAt: row.created_at });
+        continue;
+      }
+      if (payload.delta !== undefined || typeof payload.text !== "string") continue;
+      const payloadSegmentId = typeof payload.segmentId === "string" ? payload.segmentId : null;
+      if (row.segment_id && payloadSegmentId && row.segment_id !== payloadSegmentId) continue;
+      const segmentId = row.segment_id ?? payloadSegmentId;
+      if (!segmentId) continue;
+      const segment = segments.get(`${row.session_id}\0${segmentId}`);
+      if (!segment) continue;
+      if (row.lane_id && row.lane_id !== segment.laneId) continue;
+      if (typeof payload.laneId === "string" && payload.laneId !== segment.laneId) continue;
+      const delta = parseRunEvent({
+        protocolVersion: 1,
+        runId: segment.runId,
+        seq: row.seq,
+        timestamp: row.created_at || segment.startedAt,
+        kind: "output",
+        payload: { text: payload.text },
+      });
+      if (!delta || delta.kind !== "output") continue;
+      update.run(stableJson({
+        laneId: segment.laneId,
+        segmentId: segment.id,
+        text: delta.payload.text,
+        delta,
+      }), row.id, row.payload_json);
+    }
+    db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (6, datetime('now'))").run();
+  });
+  migrate();
+}
+
+function applyHistoricalLaneRequiredEvidenceMigration(db: Database.Database): void {
+  const applied = db.prepare("SELECT 1 FROM schema_migrations WHERE version = 7").get();
+  if (applied) return;
+  const migrate = db.transaction(() => {
+    const rows = db.prepare([
+      "SELECT id, payload_json FROM workflow_events",
+      "WHERE kind = 'workflow.lane.declared' ORDER BY session_id, seq, id",
+    ].join(" ")).all() as Array<{ id: string; payload_json: string }>;
+    const update = db.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ? AND payload_json = ?");
+    for (const row of rows) {
+      let payload: Record<string, unknown>;
+      try {
+        payload = parseJson(row.payload_json);
+      } catch {
+        continue;
+      }
+      if (!isRecord(payload.lane)) continue;
+      const canonicalPayload = stableJson({
+        ...payload,
+        lane: {
+          ...payload.lane,
+          requiredEvidence: canonicalRequiredEvidenceForLane(payload.lane),
+        },
+      });
+      if (canonicalPayload !== row.payload_json) update.run(canonicalPayload, row.id, row.payload_json);
+    }
+    db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (7, datetime('now'))").run();
+  });
+  migrate();
+}
+
+function checkpointRedactedHermesHandles(
+  db: Database.Database,
+  phase: "initial" | "final",
+  faultInjection: WorkflowStoreOptions["faultInjection"],
+): void {
+  faultInjection?.traceHermesHandleMaintenanceSql?.(checkpointHermesHandlesSql);
+  faultInjection?.beforeHermesHandleMaintenanceStep?.(
+    phase === "initial" ? "initial-checkpoint" : "final-checkpoint",
+  );
+  const rows = faultInjection?.overrideHermesHandleCheckpointResult?.(phase) ??
+    db.pragma("wal_checkpoint(TRUNCATE)") as WalCheckpointRow[];
+  const result = rows[0];
+  if (!result || Number(result.busy ?? 1) !== 0 || Number(result.log ?? 1) !== 0) {
+    throw new Error("Hermes session capability redaction checkpoint failed.");
+  }
+}
+
+function completeHermesHandlePhysicalCleanup(
+  db: Database.Database,
+  faultInjection: WorkflowStoreOptions["faultInjection"],
+): void {
+  checkpointRedactedHermesHandles(db, "initial", faultInjection);
+
+  faultInjection?.traceHermesHandleMaintenanceSql?.(vacuumHermesHandlesSql);
+  faultInjection?.beforeHermesHandleMaintenanceStep?.("vacuum");
+  db.exec(vacuumHermesHandlesSql);
+
+  checkpointRedactedHermesHandles(db, "final", faultInjection);
+
+  faultInjection?.traceHermesHandleMaintenanceSql?.(deleteJournalModeSql);
+  setJournalMode(db, "DELETE");
+  let markerWritten = false;
+  try {
+    faultInjection?.traceHermesHandleMaintenanceSql?.(insertHermesHandlePhysicalCleanupSql);
+    faultInjection?.beforeHermesHandleMaintenanceStep?.("marker-write");
+    db.transaction(() => {
+      db.prepare(insertHermesHandlePhysicalCleanupSql).run(hermesHandlePhysicalCleanup);
+    })();
+    markerWritten = true;
+
+    faultInjection?.traceHermesHandleMaintenanceSql?.(walJournalModeSql);
+    setJournalMode(db, "WAL");
+  } catch (error) {
+    if (markerWritten) {
+      try {
+        db.prepare("DELETE FROM workflow_maintenance WHERE name = ?").run(hermesHandlePhysicalCleanup);
+      } catch {
+        // The completed cleanup remains safe, but the constructor still fails closed.
+      }
+    }
+    throw error;
+  }
+}
+
+function setJournalMode(db: Database.Database, mode: "DELETE" | "WAL"): void {
+  const actual = String(db.pragma(`journal_mode = ${mode}`, { simple: true })).toUpperCase();
+  if (actual !== mode) throw new Error(`Hermes session capability redaction could not enter ${mode} journal mode.`);
 }
 
 function prepareStatements(db: Database.Database): WorkflowStoreStatements {
@@ -3658,6 +4243,7 @@ function prepareStatements(db: Database.Database): WorkflowStoreStatements {
     ),
     listEdges: db.prepare("SELECT * FROM workflow_edges WHERE session_id = ? ORDER BY created_at, id"),
     getSegment: db.prepare("SELECT * FROM workflow_segments WHERE session_id = ? AND id = ?"),
+    getSegmentById: db.prepare("SELECT * FROM workflow_segments WHERE id = ?"),
     getSegmentByRunId: db.prepare("SELECT * FROM workflow_segments WHERE run_id = ?"),
     listSegments: db.prepare("SELECT * FROM workflow_segments WHERE session_id = ? AND lane_id = ? ORDER BY started_at, id"),
     listRunningPlannerSegments: db.prepare(
@@ -3782,21 +4368,7 @@ function latestCompletedLane(lanes: WorkflowLaneRecord[], laneKind: WorkflowLane
 }
 
 function laneHasTrustedEvidence(laneId: string, segments: WorkflowSegmentRecord[]): boolean {
-  return segments.some((segment) => segment.laneId === laneId && segment.status === "succeeded" && hasConcreteEvidence(segment.evidence ?? {}));
-}
-
-function hasConcreteEvidence(evidence: Record<string, unknown>): boolean {
-  if (evidence.exitCode === 0 && (typeof evidence.changesetId === "string" || hasPassedCheck(evidence.checks))) return true;
-  if (Array.isArray(evidence.artifacts) && evidence.artifacts.length > 0) return true;
-  return hasPassedCheck(evidence.checks) || isPassedReview(evidence.review);
-}
-
-function hasPassedCheck(value: unknown): boolean {
-  return Array.isArray(value) && value.some((item) => isRecord(item) && item.status === "passed");
-}
-
-function isPassedReview(value: unknown): boolean {
-  return isRecord(value) && value.status === "passed";
+  return segments.some((segment) => segment.laneId === laneId && segment.status === "succeeded" && segment.evidence !== null);
 }
 
 function validateHermesTransport(input: CreateWorkflowSessionInput): void {
@@ -3907,7 +4479,7 @@ function mapHermesSession(row: HermesSessionRow): HermesSessionRecord {
     transport: row.transport,
     plannerProfile: row.planner_profile,
     processId: row.process_id,
-    opaqueHandle: row.opaque_handle,
+    opaqueHandle: row.opaque_handle ? "[redacted]" : null,
     status: row.status,
     startedAt: row.started_at,
     lastSeenAt: row.last_seen_at,
@@ -3918,6 +4490,7 @@ function mapHermesSession(row: HermesSessionRow): HermesSessionRecord {
 }
 
 function mapEvent(row: EventRow): WorkflowEventRecord {
+  const payload = parseJson(row.payload_json);
   return {
     id: row.id,
     sessionId: row.session_id,
@@ -3929,21 +4502,60 @@ function mapEvent(row: EventRow): WorkflowEventRecord {
     causationId: row.causation_id,
     correlationId: row.correlation_id,
     idempotencyKey: row.idempotency_key,
-    payload: parseJson(row.payload_json),
+    payload: stripEvidenceCompatibilitySource(payload),
     createdAt: row.created_at,
   };
 }
 
-function mapWorkflowRecordToFlowEvent(event: WorkflowEventRecord): FlowEvent {
+function stripEvidenceCompatibilitySource(payload: Record<string, unknown>): Record<string, unknown> {
+  if (!isRecord(payload.evidence)) return payload;
+  const { compatibilitySource: _compatibilitySource, ...evidence } = payload.evidence;
+  return { ...payload, evidence };
+}
+
+function mapEventRowToFlowEvent(row: EventRow): FlowEvent {
+  const event = mapEvent(row);
   return {
     id: event.id,
     sessionId: event.sessionId,
     seq: event.seq,
     kind: event.kind as FlowEventKind,
     source: event.source,
-    payload: event.payload,
+    payload: persistedFlowEventPayload(row, event.payload),
     createdAt: event.createdAt,
     idempotencyKey: event.idempotencyKey,
+  };
+}
+
+function persistedFlowEventPayload(row: EventRow, payload: Record<string, unknown>): Record<string, unknown> {
+  if (row.kind !== "workflow.evidence.recorded" || !isRecord(payload.evidence)) return payload;
+  const { compatibilitySource: _compatibilitySource, ...evidence } = payload.evidence;
+  const stripped = { ...payload, evidence };
+  if (row.legacy_evidence_compatibility !== 1 || !("runEvidence" in evidence)) return stripped;
+  const legacy = parseRunEvidence(evidence.runEvidence);
+  if (
+    !legacy ||
+    legacy.status !== "succeeded" ||
+    legacy.exitCode !== null ||
+    legacy.artifacts.length !== 0 ||
+    !isSuccessfulRunEvidence(legacy, { source: "legacy-disk", expectedArtifactContract: false })
+  ) {
+    return stripped;
+  }
+  const current = parseRunEvidence({ ...legacy, exitCode: 0 });
+  if (!current) return stripped;
+  return {
+    ...payload,
+    evidence: {
+      id: sanitizePublicEvidenceText(evidence.id) || "evidence",
+      kind: sanitizePublicEvidenceText(evidence.kind) || "run-exit",
+      status: "passed",
+      changesetId: current.changesetId,
+      checks: current.checks.map((check) => `${check.kind}:${check.name}:${check.status}`),
+      artifacts: current.artifacts,
+      detail: current.errorReason ?? current.cancelReason ?? current.review?.detail ?? null,
+      runEvidence: current,
+    },
   };
 }
 
@@ -4007,6 +4619,12 @@ function mapLane(row: LaneRow): WorkflowLaneRecord {
     agentKind: row.agent_kind,
     title: row.title,
     brief: row.brief,
+    requiredEvidence: canonicalRequiredEvidenceForLane({
+      laneKind: row.lane_kind,
+      agentKind: row.agent_kind,
+      title: row.title,
+      brief: row.brief,
+    }),
     status: row.status,
     phase: row.phase,
     archived: row.archived === 1,
@@ -4015,7 +4633,9 @@ function mapLane(row: LaneRow): WorkflowLaneRecord {
   };
 }
 
-function mapSegment(row: SegmentRow): WorkflowSegmentRecord {
+function mapSegment(row: SegmentRow, lane: WorkflowLaneRecord | null): WorkflowSegmentRecord {
+  const storedEvidence = parseStoredSegmentEvidence(row, laneRequiresExpectedArtifact(lane));
+  const status = storedSegmentStatus(row, storedEvidence);
   return {
     id: row.id,
     sessionId: row.session_id,
@@ -4025,12 +4645,12 @@ function mapSegment(row: SegmentRow): WorkflowSegmentRecord {
     runId: row.run_id,
     agentKind: row.agent_kind,
     transport: row.transport,
-    status: row.status,
+    status,
     worktreePath: row.worktree_path,
     startedAt: row.started_at,
     endedAt: row.ended_at,
     exitCode: row.exit_code,
-    evidence: row.evidence_json ? parseJson(row.evidence_json) : null,
+    evidence: storedEvidence?.evidence ?? null,
     errorReason: row.error_reason,
   };
 }

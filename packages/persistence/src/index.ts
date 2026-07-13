@@ -15,6 +15,8 @@ import type {
 import {
   makeHermesPlannerSessionId,
   normalizeSessionTarget,
+  parseRunEvent,
+  parseRunEvidence,
   type AgentDescriptor,
   type AgentKind,
   type AgentTerminalSession,
@@ -454,10 +456,32 @@ export function normalizeWorkspaceState(value: Partial<WorkspaceState> | null): 
     changesets: value?.changesets ?? {},
     agents: value?.agents ?? [],
     runs: value?.runs ?? {},
-    runEvents: value?.runEvents ?? {},
-    runEvidence: value?.runEvidence ?? {},
+    runEvents: normalizeRunEvents(value?.runEvents),
+    runEvidence: normalizeRunEvidence(value?.runEvidence),
     collapsedProjectIds: Array.isArray(value?.collapsedProjectIds) ? value.collapsedProjectIds : [],
   };
+}
+
+function normalizeRunEvents(value: unknown): Record<string, RunEvent[]> {
+  if (!isRecord(value)) return {};
+  const result: Record<string, RunEvent[]> = {};
+  for (const [runId, candidates] of Object.entries(value)) {
+    if (!Array.isArray(candidates)) continue;
+    const events = candidates.map(parseRunEvent);
+    if (events.some((event) => !event || event.runId !== runId)) continue;
+    result[runId] = events as RunEvent[];
+  }
+  return result;
+}
+
+function normalizeRunEvidence(value: unknown): Record<string, RunEvidence> {
+  if (!isRecord(value)) return {};
+  const result: Record<string, RunEvidence> = {};
+  for (const [runId, candidate] of Object.entries(value)) {
+    const evidence = parseRunEvidence(candidate);
+    if (evidence?.runId === runId) result[runId] = evidence;
+  }
+  return result;
 }
 
 function normalizeSession(session: CanvasSessionTab): CanvasSessionTab {
@@ -493,4 +517,8 @@ function inferPlannerNodeId(nodes: CanvasNode[], activeNodeId: string | null): s
     nodes[0]?.id ??
     "node-1"
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }

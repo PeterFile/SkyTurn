@@ -8,7 +8,17 @@ import {
   RUN_EVENT_PROTOCOL_VERSION,
   TERMINAL_SESSION_STATUSES,
   canUsePtyInteractiveTransport,
+  canonicalExpectedArtifactDeclarationKeys,
+  expectedArtifactContractForRequiredEvidence,
   normalizeSessionTarget,
+  parseExpectedArtifactDeclarations,
+  parseExpectedArtifactDeclaration,
+  parseRunEvent,
+  parseRunEvidence,
+  parseRunEvidenceChecks,
+  parseRunEvidenceArtifacts,
+  sanitizeRunEvidence,
+  sanitizePublicEvidenceText,
   WORKFLOW_LANE_KINDS,
   deriveNodeStatusFromEvidence,
   hasConcreteRunEvidence,
@@ -42,6 +52,303 @@ import {
   type WorkflowVariantAdoption,
   type WorkflowWorktreeIdentity,
 } from "./index";
+
+describe("public RunEvidence boundaries", () => {
+  it("preserves lossless RunEvent payload whitespace while compacting metadata", () => {
+    const output = "  first line\r\n\tsecond line  \n\n";
+    const patch = "@@ -1 +1 @@\r\n-  old\r\n+\tnew  \r\n";
+    const codeBody = "  const value = 1;\r\n\tcwd=/Users/alice/private/repo  \nAPI_KEY=nested-secret-value\r\n\n";
+    const diffLines = ["  first\r\n", "\tsecond  \n", "", "final\n"];
+    const parsed = parseRunEvent({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: "run-lossless-output",
+      seq: 1,
+      timestamp: "2026-07-15T00:00:00.000Z",
+      kind: "output",
+      payload: {
+        text: output,
+        patchPreview: patch,
+        changes: [{ path: "src/index.ts", unifiedDiff: patch }],
+        patch: {
+          path: "  src/index.ts\n",
+          hunks: [{ header: "  @@ -1 +1 @@  ", content: patch }],
+        },
+        code: [{ language: "  typescript\n", body: codeBody }],
+        diff: { path: "  src/index.ts\n", lines: diffLines },
+        phase: "  generating\n  output  ",
+      },
+    });
+
+    expect(parsed?.payload.text).toBe(output);
+    expect(parsed?.payload.patchPreview).toBe(patch);
+    expect(parsed?.payload.changes).toEqual([{ path: "src/index.ts", unifiedDiff: patch }]);
+    expect(parsed?.payload.patch).toEqual({
+      path: "src/index.ts",
+      hunks: [{ header: "@@ -1 +1 @@", content: patch }],
+    });
+    expect(parsed?.payload.code).toEqual([{
+      language: "typescript",
+      body: codeBody
+        .replace("/Users/alice/private/repo", "[redacted-path]")
+        .replace("nested-secret-value", "[redacted]"),
+    }]);
+    expect(parsed?.payload.diff).toEqual({ path: "src/index.ts", lines: diffLines });
+    expect(parsed?.payload.phase).toBe("generating output");
+  });
+
+  it.each([
+    ".devflow/acceptance/a\nb.png",
+    ".devflow/acceptance/a\rb.png",
+    ".devflow/acceptance/a\u007fb.png",
+    "/tmp/result.png",
+    "C:\\Users\\alice\\result.png",
+    ".devflow/acceptance/../result.png",
+    ...[
+      "id_rsa", "id_ed25519", "id_ecdsa", "authorized_keys", "known_hosts", "shadow",
+      "token", "credential", "key", "password", "secret",
+      ".npmrc", "COOKIES_SQLITE", "service_account.JSON", "service-account.backup.json", "report.PRIVATE_PEM",
+      "service-account.json.backup", "service_account.json.bak", "service-account.JSON.old",
+      "SERVICE__ACCOUNT--JSON.BACKUP.old", "service_account_json.bak.backup.old",
+      "service-account.json.backup.txt", "service-account.json.orig.1",
+      "service_account_json.backup.backup.orig.1", "SERVICE._-ACCOUNT--JSON__COPY.tar.gz",
+      "service..account..json..saved..2", "service-account.snapshot.json.backup.txt",
+      "service account.json.backup.txt", "service．account.json.orig.1",
+      "service—account.JSON.backup", "service。account.json.saved.2",
+      "serviceaccount.json.orig.1", "SERVICEACCOUNTJSON.backup.txt",
+      "service-account.json.report.json",
+      "authorized keys.backup.txt", "AUTHORIZED\u3000KEYS.BAK.old",
+      "known\u2014hosts", "Known\uff3fHosts.backup",
+      "AUTHORIZED\u3000KEYS\uff0eJSON\uff0ebackup\uff0eorig\uff0e2",
+      "authorizedkeysjsonbackupbackupbakoldcopyarchive3pem",
+      "KNOWN\u2014HOSTSbackupbackupbakoldcopyarchive3txt",
+      "SERVICE\uff0eACCOUNTcredentialsbackupbackuporig2json",
+      "credentials json.backup", "CREDENTIALS\uff0eJSON.orig.1",
+      "access token.report", "Access\u00a0Token.Results.JSON",
+      "certificate\uff0epem", "certificate\u2024PEM.backup.txt",
+      ".npmrc.backup", ".NPMRC-BAK", ".env.local.backup", ".ENV_LOCAL_BAK",
+      "id_rsa_backup.txt", "ID-RSA.old", "id_ed25519.old", "id-ED25519_backup.TXT",
+      "client.private-key.backup", "signing_private_pem.old",
+      "accesstoken.report", "credentialbackup.json", "passwordbackup.txt",
+      "secretarchive.txt", "idrsa.backup", "privatekey.backup",
+      "TLS_PRIVATEKEY.archive.old", "certificatepem.backup",
+    ].map((name) => `.devflow/acceptance/${name}`),
+  ])("rejects unsafe expected artifact declaration %j", (candidate) => {
+    expect(parseExpectedArtifactDeclaration(candidate)).toBeNull();
+  });
+
+  it.each([
+    "ACCESS　TOKEN․REPORT.JSON.BACKUP",
+    "api-token__archive.tar.gz",
+    "auth．key—backup.old.2",
+    "credentialsbackupjsonorig1",
+    "passwords．backup．txt．old",
+    "secretsarchivebackupzip",
+    "ID−ED25519․backup․old",
+    "certificate．DER．backup．tar．gz",
+    "private—key․P12․archive",
+    "TLS_PRIVATEKEYPEM.backup",
+    "sslcertificatepfxarchive",
+  ])("rejects separatorless sensitive-family suffix chain %j", (name) => {
+    expect(parseExpectedArtifactDeclaration(`.devflow/acceptance/${name}`)).toBeNull();
+  });
+
+  it.each([
+    "accessibility-report.json",
+    "credentialed-learning.json",
+    "passwordless-guide.txt",
+    "secretary-notes.txt",
+    "tokenizer-results.json",
+    "keyboard-layout-report.json",
+    "certificate-course-summary.txt",
+    "identity-rsa-analysis.txt",
+    "service-accounting-report.txt",
+    "service-accountability-report.txt",
+    "authorized-keyspace-report.txt",
+    "known-hostscope-report.txt",
+  ])("accepts unrelated artifact family name %j", (name) => {
+    const candidate = `.devflow/acceptance/${name}`;
+    expect(parseExpectedArtifactDeclaration(candidate)).toBe(candidate);
+  });
+
+  it.each([
+    ".devflow/acceptance/service-account-acceptance-report.json",
+    ".devflow/acceptance/service_account_validation_report.JSON",
+    ".devflow/acceptance/service-account-audit-summary.json",
+    ".devflow/acceptance/service_account_migration_report.JSON",
+  ])("accepts legitimate service-account report artifact %j", (candidate) => {
+    expect(parseExpectedArtifactDeclaration(candidate)).toBe(candidate);
+  });
+
+  it("preserves neighboring non-sensitive families in strict RunEvidence", () => {
+    const artifacts = [
+      ".devflow/acceptance/service-accounting-report.txt",
+      ".devflow/acceptance/service-accountability-report.txt",
+      ".devflow/acceptance/authorized-keyspace-report.txt",
+      ".devflow/acceptance/known-hostscope-report.txt",
+    ];
+    const evidence = {
+      runId: "run-neighbor-artifacts",
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "artifact", name: "Expected artifacts", status: "passed" }],
+      artifacts,
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-07-15T00:00:00.000Z",
+    } satisfies RunEvidence;
+
+    expect(parseExpectedArtifactDeclarations(artifacts)).toEqual(artifacts);
+    expect(parseRunEvidence(evidence)).toEqual(evidence);
+  });
+
+  it("accepts only complete canonical non-sensitive artifact lists", () => {
+    expect(parseRunEvidenceArtifacts([
+      ".devflow/acceptance/browser/result.png",
+      ".devflow/acceptance/mobile/result.png",
+    ])).toEqual([
+      ".devflow/acceptance/browser/result.png",
+      ".devflow/acceptance/mobile/result.png",
+    ]);
+    expect(parseRunEvidenceArtifacts([
+      ".devflow/acceptance/browser/result.png",
+      ".devflow\\acceptance\\windows.png",
+      "/Users/alice/.ssh/id_rsa",
+      "C:\\Users\\alice\\secret.txt",
+      ".devflow/acceptance/../secret.txt",
+      ".devflow/acceptance//empty.png",
+      ".devflow/acceptance/./dot.png",
+      ".devflow/acceptance/link->/etc/passwd",
+      ".DEVFLOW/ACCEPTANCE/TOKEN.PEM",
+      7,
+    ])).toBeNull();
+    expect(parseRunEvidenceArtifacts([
+      ".devflow/acceptance/service-account.json.backup",
+      ".devflow/acceptance/authorized keys.backup.txt",
+      ".devflow/acceptance/known\u2014hosts",
+      ".devflow/acceptance/credentials json.backup",
+      ".devflow/acceptance/access token.report",
+      ".devflow/acceptance/certificate\uff0epem",
+    ])).toBeNull();
+  });
+
+  it.each([
+    ".devflow/acceptance/service-account.json.backup.txt",
+    ".devflow/acceptance/service-account.json.orig.1",
+    ".devflow/acceptance/SERVICE._-ACCOUNT--JSON__COPY.tar.gz",
+    ".devflow/acceptance/service account.json.backup.txt",
+    ".devflow/acceptance/service．account.json.orig.1",
+    ".devflow/acceptance/service—account.JSON.backup",
+    ".devflow/acceptance/serviceaccount.json.orig.1",
+    ".devflow/acceptance/service-account.json.report.json",
+  ])("rejects the complete service-account credential family from strict RunEvidence %j", (artifact) => {
+    const evidence = {
+      runId: "run-sensitive-service-account",
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "artifact", name: "Expected artifacts", status: "passed" }],
+      artifacts: [artifact],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-07-15T00:00:00.000Z",
+    } satisfies RunEvidence;
+
+    expect(parseRunEvidence(evidence)).toBeNull();
+    const sanitized = sanitizeRunEvidence(evidence);
+    expect(sanitized).toMatchObject({ status: "failed", artifacts: [] });
+    expect(JSON.stringify(sanitized)).not.toContain(artifact);
+  });
+
+  it("canonicalizes expected artifact declaration sets with completion parser semantics", () => {
+    expect(parseExpectedArtifactDeclarations([
+      ".devflow/acceptance/Zeta.png",
+      ".devflow/acceptance/alpha.png",
+    ])).toEqual([
+      ".devflow/acceptance/Zeta.png",
+      ".devflow/acceptance/alpha.png",
+    ]);
+    expect(canonicalExpectedArtifactDeclarationKeys([
+      ".devflow/acceptance/Zeta.png",
+      ".devflow/acceptance/alpha.png",
+    ])).toEqual([
+      ".devflow/acceptance/alpha.png",
+      ".devflow/acceptance/zeta.png",
+    ]);
+    expect(canonicalExpectedArtifactDeclarationKeys([
+      ".devflow/acceptance/result.png",
+      ".devflow/acceptance/RESULT.PNG",
+    ])).toBeNull();
+    expect(canonicalExpectedArtifactDeclarationKeys([
+      ".devflow/acceptance/Ｒeport.png",
+      ".devflow/acceptance/Report.png",
+    ])).toBeNull();
+    expect(canonicalExpectedArtifactDeclarationKeys([
+      ".devflow/acceptance/nested/../result.png",
+    ])).toBeNull();
+    expect(canonicalExpectedArtifactDeclarationKeys([
+      ".devflow/acceptance/service_account.json.bak.old",
+    ])).toBeNull();
+  });
+
+  it("derives only the fixed browser artifact from required evidence", () => {
+    expect(expectedArtifactContractForRequiredEvidence(["browser", "screenshot"])).toEqual({
+      required: true,
+      declarations: [".devflow/acceptance/react-app.png"],
+    });
+    expect(expectedArtifactContractForRequiredEvidence(["artifact"])).toEqual({
+      required: true,
+      declarations: [],
+    });
+    expect(expectedArtifactContractForRequiredEvidence(["test"])).toEqual({
+      required: false,
+      declarations: [],
+    });
+  });
+
+  it("redacts public evidence text and caps its length", () => {
+    const value = sanitizePublicEvidenceText(
+      "spawn /Users/alice/bin/codex C:\\Users\\alice\\tool.exe Authorization: Bearer abc123 API_KEY=secret password=hunter2 credentials.json " + "x".repeat(500),
+    );
+    expect(value).not.toMatch(/alice|abc123|secret|hunter2|credentials\.json/);
+    expect(value).toContain("[redacted]");
+    expect(value.length).toBeLessThanOrEqual(320);
+  });
+
+  it("redacts absolute paths at public process-text boundaries", () => {
+    const rawPaths = [
+      "/Users/alice/private/repo",
+      "/Users/alice/private/quoted repo",
+      "/Users/alice/private/paren-repo",
+      "C:\\Users\\alice\\private\\repo",
+      "C:\\Users\\alice\\private\\quoted repo",
+      "C:\\Users\\alice\\private\\paren-repo",
+    ];
+    const value = sanitizePublicEvidenceText(
+      `failed after ${rawPaths[0]} cwd=${rawPaths[1]} "${rawPaths[4]}" (${rawPaths[2]}) (${rawPaths[5]}) then ${rawPaths[3]}`,
+    );
+
+    for (const rawPath of rawPaths) expect(value).not.toContain(rawPath);
+    expect(value).toContain("[redacted-path]");
+  });
+
+  it.each([
+    ["worktree=/Users/alice/private/repo", "worktree=[redacted-path]"],
+    ["path=/private/secret/result", "path=[redacted-path]"],
+    ["repo=C:\\Users\\alice\\private", "repo=[redacted-path]"],
+    ["root:/private/secret/result", "root:[redacted-path]"],
+    ["path:'/private/secret/quoted result'", "path:'[redacted-path]'"],
+    ["path=(/private/secret/paren result)", "path=([redacted-path])"],
+    ["path=[C:\\Users\\alice\\bracketed result]", "path=[[redacted-path]]"],
+    ["path={/private/secret/braced result}", "path={[redacted-path]}"],
+    ["failed: /private/secret/result.", "failed: [redacted-path]."],
+    ["path=/private/secret/result, repo=C:\\Users\\alice\\private;", "path=[redacted-path], repo=[redacted-path];"],
+  ])("redacts delimiter-prefixed absolute paths in %j", (input, expected) => {
+    expect(sanitizePublicEvidenceText(input)).toBe(expected);
+  });
+});
 
 const stableNodeStatusContract: Record<NodeStatus, true> = {
   pending: true,
@@ -102,7 +409,38 @@ function runEvidence(overrides: Partial<RunEvidence> = {}): RunEvidence {
   };
 }
 
+function collectStrings(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(collectStrings);
+  if (value && typeof value === "object") return Object.values(value).flatMap(collectStrings);
+  return [];
+}
+
 describe("agent run contracts", () => {
+  it("rejects an entire check list when any check is malformed", () => {
+    const secret = "sk-supersecret123456";
+    expect(parseRunEvidenceChecks([
+      { kind: "test", name: "Unit /Users/alice/private/repo", status: "passed", detail: `OPENAI_API_KEY=${secret}` },
+    ])).toEqual([
+      {
+        kind: "test",
+        name: "Unit [redacted-path]",
+        status: "passed",
+        detail: "OPENAI_API_KEY=[redacted]",
+      },
+    ]);
+
+    expect(parseRunEvidenceChecks([
+      { kind: "test", name: "Unit", status: "passed" },
+      { kind: "verification", name: "Unknown", status: "passed", detail: "must be ignored" },
+      { kind: "build", name: "Invalid status", status: "success", detail: "must be ignored" },
+      { kind: "review", name: 42, status: "failed" },
+    ])).toBeNull();
+    expect(parseRunEvidenceChecks([
+      { kind: "test", name: "control\ntext", status: "passed" },
+    ])).toBeNull();
+  });
+
   it("publishes stable transport kinds and PTY terminal lifecycle states", () => {
     const terminalSession: AgentTerminalSession = {
       id: "terminal-session-1",
@@ -455,6 +793,91 @@ describe("agent run contracts", () => {
     expect(status).toBe("failed");
   });
 
+  it("fails closed when succeeded RunEvidence contains a failed expected-artifact gate", () => {
+    const evidence = runEvidence({
+      status: "succeeded",
+      exitCode: 0,
+      checks: [
+        { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+      ],
+      artifacts: [".devflow/acceptance/partial.png"],
+    });
+    const run: AgentRun = {
+      id: evidence.runId,
+      nodeId: "node-1",
+      sessionId: "session-1",
+      projectRoot: "/tmp/project",
+      worktreePath: "/tmp/project",
+      agentKind: "codex",
+      status: "succeeded",
+      startedAt: "2026-06-12T00:00:00.000Z",
+      endedAt: "2026-06-12T00:00:01.000Z",
+    };
+
+    expect(sanitizeRunEvidence(evidence).status).toBe("failed");
+    expect(sanitizeRunEvidence(evidence).artifacts).toEqual([]);
+    expect(deriveNodeStatusFromEvidence(run, evidence)).toBe("failed");
+    expect(summarizeRunEvidence({ runEvidence: evidence }).run.status).toBe("failed");
+  });
+
+  it("strictly parses complete RunEvidence before exposing it", () => {
+    const secret = "run-evidence-secret-123456";
+    const parsed = parseRunEvidence({
+      ...runEvidence({
+        status: "succeeded",
+        exitCode: 0,
+        checks: [
+          { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+        ],
+        artifacts: [".devflow/acceptance/result.png"],
+        errorReason: `failed at /Users/alice/private/repo token=${secret}`,
+      }),
+      review: { kind: "review", name: "Review", status: "passed" },
+    });
+
+    expect(parsed).toMatchObject({
+      status: "failed",
+      artifacts: [],
+      review: { kind: "review", name: "Review", status: "passed" },
+    });
+    expect(JSON.stringify(parsed)).not.toMatch(/alice|run-evidence-secret-123456/);
+    expect(parseRunEvidence({ runId: "run-1", status: "succeeded" })).toBeNull();
+  });
+
+  it.each([
+    ["unknown check kind", { checks: [{ kind: "verification", name: "Unknown", status: "passed" }] }],
+    ["unknown check status", { checks: [{ kind: "test", name: "Unit", status: "success" }] }],
+    ["malformed check type", { checks: [{ kind: "test", name: 7, status: "passed" }] }],
+    ["control text", { checks: [{ kind: "test", name: "Unit\nleak", status: "passed" }] }],
+    ["absolute artifact", { artifacts: ["/Users/alice/private/result.png"] }],
+    ["Windows-separator artifact", { artifacts: [".devflow\\acceptance\\result.png"] }],
+    ["control artifact", { artifacts: [".devflow/acceptance/result\u0000.png"] }],
+    ["sensitive artifact", { artifacts: [".devflow/acceptance/.env"] }],
+    ["case-aliased artifact", { artifacts: [
+      ".devflow/acceptance/result.png",
+      ".DEVFLOW/ACCEPTANCE/RESULT.PNG",
+    ] }],
+    ["malformed exit code", { exitCode: "0" }],
+    ["malformed review", { review: { kind: "policy-review", name: "Unsafe", status: "passed" } }],
+  ])("rejects complete RunEvidence with %s", (_label, overrides) => {
+    expect(parseRunEvidence({ ...runEvidence(), ...overrides })).toBeNull();
+  });
+
+  it("fails public summaries closed for malformed RunEvidence", () => {
+    const summary = summarizeRunEvidence({
+      runEvidence: runEvidence({
+        status: "succeeded",
+        checks: [{ kind: "unknown-kind", name: "Unsafe", status: "passed" } as never],
+        artifacts: ["/Users/alice/private/result.png"],
+      }),
+    });
+
+    expect(summary.run).toEqual({ id: null, status: "unknown", exitCode: null });
+    expect(summary.checkSummary).toBe("None");
+    expect(summary.artifactSummary).toBe("None");
+    expect(JSON.stringify(summary)).not.toContain("/Users/alice/private/result.png");
+  });
+
   it("summarizes empty run evidence without inventing facts", () => {
     const summary = summarizeRunEvidence({});
 
@@ -516,15 +939,44 @@ describe("agent run contracts", () => {
     }).reason).toBe("Timeout: watchdog expired");
   });
 
-  it("summarizes artifact evidence from run evidence or explicit expected artifacts", () => {
+  it("summarizes only artifacts recorded in run evidence", () => {
     expect(summarizeRunEvidence({
-      runEvidence: runEvidence({ artifacts: [".devflow/output.md"] }),
+      runEvidence: runEvidence({ artifacts: [".devflow/acceptance/output.md"] }),
       expectedArtifacts: [".devflow/expected.md"],
-    }).artifactSummary).toBe("1 (.devflow/output.md)");
+    }).artifactSummary).toBe("1 (.devflow/acceptance/output.md)");
 
     expect(summarizeRunEvidence({
       expectedArtifacts: [".devflow/expected.md"],
-    }).artifactSummary).toBe("1 expected (.devflow/expected.md)");
+    }).artifactSummary).toBe("None");
+  });
+
+  it("never exposes failed artifact declarations in public evidence summaries", () => {
+    const declarations = [
+      "/Users/alice/private/host-output.png",
+      "../outside/traversal.png",
+      ".devflow/acceptance/.env",
+      ".devflow/acceptance/id_rsa",
+      ".devflow/acceptance/credentials.json",
+      ".DEVFLOW\\ACCEPTANCE\\TOKEN.PEM",
+      ".devflow/acceptance/duplicate/../result.png",
+      ".devflow/acceptance/result.png",
+    ];
+    const summary = summarizeRunEvidence({
+      runEvidence: runEvidence({
+        status: "failed",
+        exitCode: 1,
+        checks: [{ kind: "artifact", name: "Expected artifacts", status: "failed", detail: "invalid=6, duplicate=2" }],
+        artifacts: [],
+      }),
+      expectedArtifacts: declarations,
+    });
+    const returnedStrings = collectStrings(summary);
+
+    expect(summary.artifactSummary).toBe("None");
+    expect(returnedStrings).toContain("artifact [Expected artifacts]: failed - invalid=6, duplicate=2");
+    for (const declaration of declarations) {
+      expect(returnedStrings.every((value) => !value.includes(declaration))).toBe(true);
+    }
   });
 
   it("summarizes commit, changed-file, repo-state, and review evidence", () => {

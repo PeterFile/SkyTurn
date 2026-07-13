@@ -5,6 +5,11 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./src/index.ts",
+  "files": [
+    "dist",
+    "dist/native/artifact-gate.ps1",
+    "src"
+  ],
   "exports": {
     ".": {
       "types": "./src/index.ts",
@@ -13,10 +18,12 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm run native:build && tsc -p tsconfig.json && pnpm run native:copy",
+    "native:build": "node scripts/buildArtifactGate.mjs",
+    "native:copy": "node scripts/buildArtifactGate.mjs --copy-dist",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "vitest run src"
+    "test": "pnpm run native:build && vitest run src"
   },
   "dependencies": {
     "@skyturn/agent-runtime": "workspace:*",

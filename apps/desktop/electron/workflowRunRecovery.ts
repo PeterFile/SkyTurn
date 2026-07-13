@@ -23,6 +23,7 @@ interface RecoveryStore {
     runId: string;
     agentKind: string;
     outputSummary: string;
+    runEvents?: unknown[];
     evidence: unknown;
     now: string;
   }): unknown;
@@ -30,6 +31,7 @@ interface RecoveryStore {
 }
 
 const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed-out"]);
+const INVALID_RUN_START_CLAIM_REASON = "run-start-claim-invalid";
 
 export function compensateFailedWorkflowRun(
   store: RecoveryStore,
@@ -82,10 +84,15 @@ export async function recoverTerminalWorkflowRuns(
       store.recordRunResult({
         ...segment,
         outputSummary: summarizeOutput(events) ?? "",
+        runEvents: events,
         evidence,
         now: completedAt(evidence) ?? now(),
       });
     } catch (error) {
+      const invalidRunStartClaim = isInvalidRunStartClaimError(error);
+      if (invalidRunStartClaim) {
+        compensateFailedWorkflowRun(store, segment, new Error(INVALID_RUN_START_CLAIM_REASON), now);
+      }
       store.appendWorkflowEvent({
         sessionId: segment.sessionId,
         kind: "workflow.run.recovery_failed",
@@ -96,7 +103,7 @@ export async function recoverTerminalWorkflowRuns(
         payload: {
           runId: segment.runId,
           status: "failed",
-          reason: error instanceof Error ? error.message : String(error),
+          reason: invalidRunStartClaim ? INVALID_RUN_START_CLAIM_REASON : "terminal-recovery-failed",
         },
         now: now(),
       });
@@ -126,6 +133,12 @@ export async function recoverTerminalWorkflowRuns(
       });
     }
   }
+}
+
+function isInvalidRunStartClaimError(error: unknown): boolean {
+  return error instanceof Error &&
+    error.name === "InvalidDurableRunStartClaimError" &&
+    error.message === INVALID_RUN_START_CLAIM_REASON;
 }
 
 function isTerminalEvidence(evidence: unknown, runId: string): evidence is Record<string, unknown> {

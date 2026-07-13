@@ -12,6 +12,7 @@ import type {
   WorkflowWorktreeIdentity,
   WorktreeMetadata,
 } from "@skyturn/project-core";
+import { parseRunEvidence } from "@skyturn/project-core";
 
 export const GIT_WORKTREE_CONTRACT_VERSION = 1;
 
@@ -597,9 +598,12 @@ export interface DeliveryMainSyncEvidence {
 }
 
 export function buildAdjudicationMetrics(recorded: RecordedAdjudicationEvidence): AdjudicationMetric[] {
-  const checks = recorded.runEvidence?.checks ?? [];
-  const artifactPaths = [
-    ...(recorded.runEvidence?.artifacts ?? []),
+  const runEvidenceSupplied = recorded.runEvidence !== undefined && recorded.runEvidence !== null;
+  const runEvidence = runEvidenceSupplied ? parseRunEvidence(recorded.runEvidence) : null;
+  const malformedRunEvidence = runEvidenceSupplied && !runEvidence;
+  const checks = runEvidence?.checks ?? [];
+  const artifactPaths = malformedRunEvidence ? [] : [
+    ...(runEvidence?.artifacts ?? []),
     ...(recorded.changeset?.artifactPaths ?? []),
   ];
 
@@ -607,7 +611,7 @@ export function buildAdjudicationMetrics(recorded: RecordedAdjudicationEvidence)
     metricFromCheck("test", "Tests", findCheck(checks, "test")),
     metricFromCheck("build", "Build", findCheck(checks, "build")),
     metricFromCheck("typecheck", "Typecheck", findCheck(checks, "typecheck")),
-    artifactMetric(artifactPaths),
+    artifactMetric(artifactPaths, checks.filter((check) => check.kind === "artifact"), malformedRunEvidence),
     changedFileCountMetric(recorded.changeset),
     diffSummaryMetric(recorded.changeset),
     performanceMetric(recorded.performanceOutput),
@@ -634,7 +638,30 @@ function metricFromCheck(
   };
 }
 
-function artifactMetric(artifactPaths: string[]): AdjudicationMetric {
+function artifactMetric(
+  artifactPaths: string[],
+  checks: EvidenceCheck[],
+  malformedRunEvidence = false,
+): AdjudicationMetric {
+  if (malformedRunEvidence) {
+    return {
+      kind: "artifact",
+      label: "Artifact",
+      status: "failed",
+      source: "recorded",
+      detail: "Run evidence is invalid.",
+    };
+  }
+  const failedCount = checks.filter((check) => check.status === "failed").length;
+  if (failedCount > 0) {
+    return {
+      kind: "artifact",
+      label: "Artifact",
+      status: "failed",
+      source: "recorded",
+      detail: `${failedCount} artifact check${failedCount === 1 ? "" : "s"} failed.`,
+    };
+  }
   if (artifactPaths.length === 0) return unknownMetric("artifact", "Artifact");
   return {
     kind: "artifact",

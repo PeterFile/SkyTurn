@@ -1,17 +1,42 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { test } from "node:test";
+import { dirname, join } from "node:path";
+import { after, test } from "node:test";
 import vm from "node:vm";
 
-import { AgentBridge, RUN_EVENT_PROTOCOL_VERSION, createMockAgentAdapter } from "@skyturn/agent-bridge";
+import {
+  AgentBridge as ProductionAgentBridge,
+  RUN_EVENT_PROTOCOL_VERSION,
+  createAgentRunStartFingerprint,
+  createCodexCliAdapter,
+  createDurableRunClaimStore,
+  createMockAgentAdapter,
+  createPrivateRunEventStore,
+  loadRunEvents,
+} from "@skyturn/agent-bridge";
 import { createWorkflowStore } from "@skyturn/persistence/workflow-store";
 
 import { compensateFailedWorkflowRun, recoverTerminalWorkflowRuns } from "../dist-electron/electron/workflowRunRecovery.js";
 
 const require = createRequire(import.meta.url);
+const previousStateHome = process.env.SKYTURN_STATE_HOME;
+const testStateHome = await mkdtemp(join(tmpdir(), "skyturn-recovery-state-"));
+const testClaimStore = createDurableRunClaimStore({ root: join(testStateHome, "run-claims") });
+process.env.SKYTURN_STATE_HOME = testStateHome;
+
+class AgentBridge extends ProductionAgentBridge {
+  constructor(options = {}) {
+    super({ durableRunClaimStore: testClaimStore, ...options });
+  }
+}
+
+after(async () => {
+  if (previousStateHome === undefined) delete process.env.SKYTURN_STATE_HOME;
+  else process.env.SKYTURN_STATE_HOME = previousStateHome;
+  await rm(testStateHome, { recursive: true, force: true });
+});
 
 for (const status of ["succeeded", "failed", "cancelled", "timed-out"]) {
   test(`restart recovery persists ${status} agent-bridge disk evidence exactly once`, async () => {
@@ -35,6 +60,611 @@ for (const status of ["succeeded", "failed", "cancelled", "timed-out"]) {
     }
   });
 }
+
+test("restart recovery reconciles permanent child-close terminal persistence failure exactly once", async () => {
+  const root = await makeRoot();
+  const binRoot = await makeRoot();
+  const executablePath = join(binRoot, "codex");
+  const launchCountPath = join(binRoot, "launches.log");
+  const input = runInput(root);
+  const eventsPath = join(root, ".devflow", "runs", input.runId, "events.ndjson");
+  const privateError = "status append failed token=desktop-persistence-secret-123456 at /Users/alice/.ssh/id_rsa";
+  let statusAppendAttempts = 0;
+  const liveEvents = [];
+  try {
+    await mkdir(join(root, ".git"));
+    await writeFile(
+      executablePath,
+      `#!/bin/sh\nprintf 'launch\\n' >> ${JSON.stringify(launchCountPath)}\nexit 0\n`,
+      { mode: 0o755 },
+    );
+    seedRunningStore(root).close();
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({ executablePath })],
+      appendEvent: async (projectRoot, event) => {
+        if (event.kind === "status") {
+          if (statusAppendAttempts === 0) {
+            await rm(eventsPath, { force: true });
+            await mkdir(eventsPath);
+          }
+          statusAppendAttempts += 1;
+          throw new Error(privateError);
+        }
+        const directory = join(projectRoot, ".devflow", "runs", event.runId);
+        await mkdir(directory, { recursive: true });
+        await appendFile(join(directory, "events.ndjson"), `${JSON.stringify(event)}\n`, "utf8");
+      },
+    });
+    bridge.onRunEvent((event) => liveEvents.push(event));
+    await bridge.startRun(input);
+    await waitUntil(() => statusAppendAttempts === 2);
+    await waitUntil(() => bridge.listRuns().some((run) => run.id === input.runId && run.status === "failed"));
+    await waitUntil(async () => (await bridge.getEvidence(root, input.runId)).status === "failed");
+
+    let reopened = createWorkflowStore({ projectRoot: root });
+    const restartedBridge = new AgentBridge({ adapters: [] });
+    await recoverTerminalWorkflowRuns(root, reopened, restartedBridge, () => "terminal persistence failed");
+    await recoverTerminalWorkflowRuns(root, reopened, restartedBridge, () => "duplicate recovery");
+    assert.equal(reopened.listRunningSegments().length, 0);
+    assert.equal(segmentStatus(reopened), "failed");
+    assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    assert.equal(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-implementation")?.status, "failed");
+    assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 0);
+    reopened.close();
+
+    reopened = createWorkflowStore({ projectRoot: root });
+    await recoverTerminalWorkflowRuns(root, reopened, new AgentBridge({ adapters: [] }), () => "reopened recovery");
+    assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    reopened.close();
+
+    const runEvents = await loadRunEvents(root, input.runId);
+    const terminalStatuses = runEvents.filter((event) => event.kind === "status");
+    assert.equal(terminalStatuses.length, 0);
+    assert.equal(liveEvents.filter((event) => event.kind === "status" && event.payload.status === "failed").length, 0);
+    await assert.rejects(readFile(join(root, ".devflow", "runs", input.runId, "terminal-recovery.json")));
+    const publicState = JSON.stringify({ liveEvents, runEvents, evidence: await bridge.getEvidence(root, input.runId) });
+    assert.match(publicState, /terminal-persistence-failed/);
+    assert.doesNotMatch(publicState, /desktop-persistence-secret-123456|alice|id_rsa/);
+
+    const launchGuardBridge = new AgentBridge({ adapters: [createCodexCliAdapter({ executablePath })] });
+    await assert.rejects(launchGuardBridge.startRun(input), /already terminal/i);
+    assert.equal((await launchGuardBridge.getEvidence(root, input.runId)).status, "failed");
+    assert.equal(await readFile(launchCountPath, "utf8"), "launch\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(binRoot, { recursive: true, force: true });
+  }
+});
+
+test("readable unsynced terminal compensates SQLite and never releases Canvas downstream work", async () => {
+  const root = await makeRoot();
+  const input = runInput(root);
+  const privateStore = readableUnsyncedTerminalStore();
+  const liveEvents = [];
+  let compensationCount = 0;
+  let store;
+  try {
+    store = seedRunningStore(root);
+    declareDownstreamLane(store);
+    const bridge = new AgentBridge({
+      adapters: [createMockAgentAdapter()],
+      privateRunEventStore: privateStore.store,
+      onTerminalPersistenceFailure: async (failure) => {
+        compensationCount += 1;
+        const segment = store.listRunningSegments().find((candidate) => candidate.runId === failure.runId);
+        assert.ok(segment);
+        compensateFailedWorkflowRun(store, segment, new Error(failure.reason), () => "2026-07-14T00:00:02.000Z");
+      },
+    });
+    bridge.onRunEvent((event) => liveEvents.push(event));
+
+    await bridge.startRun(input);
+    await waitUntil(() => compensationCount === 1);
+
+    assert.equal(privateStore.statusAttempts, 2);
+    assert.equal(compensationCount, 1);
+    assert.equal(liveEvents.filter((event) => event.kind === "status").length, 0);
+    assert.equal((await bridge.getEvidence(root, input.runId)).status, "failed");
+    const mirror = await workspaceRunEvents(root, input.runId);
+    assert.equal(mirror.filter((event) => event.kind === "status").length, 0);
+    const projection = store.materializeFlowProjection("session-1");
+    const canvas = store.materializeCanvasSession("session-1");
+    assert.equal(projection.events.filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    assert.equal(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status, "failed");
+    assert.equal(projection.lanes.find((lane) => lane.id === "lane-downstream")?.status, "pending");
+    assert.equal(canvas?.nodes.find((node) => node.id === "lane-implementation")?.status, "failed");
+    assert.deepEqual(store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      now: "2026-07-14T00:00:03.000Z",
+    }).readyLanes, []);
+    store.close();
+    store = undefined;
+
+    const reopened = createWorkflowStore({ projectRoot: root });
+    assert.equal(segmentStatus(reopened), "failed");
+    assert.equal(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-downstream")?.status, "pending");
+    reopened.close();
+  } finally {
+    store?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+for (const failedSyncTarget of ["file", "directory"]) {
+  test(`crashed ${failedSyncTarget} sync failure needs durable read before SQLite and Canvas recovery`, async () => {
+    const root = await makeRoot();
+    const privateRoot = await makeRoot();
+    const input = runInput(root);
+    const durableRunClaimStore = createDurableRunClaimStore({ root: privateRoot });
+    const terminal = {
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: input.runId,
+      seq: 1,
+      timestamp: "2026-07-15T00:00:01.000Z",
+      kind: "status",
+      payload: { status: "succeeded", exitCode: 0 },
+    };
+    let store;
+    try {
+      store = seedRunningStore(root);
+      declareDownstreamLane(store);
+      const eventPath = await durableRunClaimStore.runStatePath(root, input.runId, "events");
+      const writeFault = syncFaultPrivateEventStore(
+        durableRunClaimStore,
+        ({ target, path }) =>
+          target === failedSyncTarget && (failedSyncTarget === "file" || path === dirname(eventPath)) ? "EIO" : null,
+      );
+      await writeFault.store.prepare(root, root);
+      await durableRunClaimStore.publish(root, {
+        runId: input.runId,
+        nodeId: input.nodeId,
+        sessionId: input.sessionId,
+        agentKind: input.agentKind,
+        startFingerprint: createAgentRunStartFingerprint(input),
+        startedAt: terminal.timestamp,
+      });
+      await assert.rejects(writeFault.store.append(root, terminal), { code: "EIO" });
+
+      const readFault = syncFaultPrivateEventStore(
+        durableRunClaimStore,
+        ({ target, path }) =>
+          target === failedSyncTarget && (failedSyncTarget === "file" || path === dirname(eventPath)) ? "EIO" : null,
+      );
+      const restartedBridge = new AgentBridge({
+        adapters: [],
+        durableRunClaimStore,
+        privateRunEventStore: readFault.store,
+      });
+      assert.deepEqual(await restartedBridge.loadEvents(root, input.runId), []);
+      assert.deepEqual(await restartedBridge.getEvidence(root, input.runId), {
+        runId: input.runId,
+        status: "failed",
+        exitCode: null,
+        changesetId: null,
+        checks: [{
+          kind: "run-exit",
+          name: "Terminal persistence",
+          status: "failed",
+          detail: "terminal-persistence-failed",
+        }],
+        artifacts: [],
+        review: null,
+        errorReason: "terminal-persistence-failed",
+        cancelReason: null,
+        completedAt: terminal.timestamp,
+      });
+
+      await recoverTerminalWorkflowRuns(root, store, restartedBridge, () => "must not expose succeeded output");
+      await recoverTerminalWorkflowRuns(root, store, restartedBridge, () => "duplicate recovery");
+      const projection = store.materializeFlowProjection("session-1");
+      const canvas = store.materializeCanvasSession("session-1");
+      const compensationCount = projection.events.filter((event) => event.kind === "workflow.segment.finished").length;
+      assert.equal(compensationCount, 1);
+      assert.equal(store.listRunningSegments().length, 0);
+      assert.equal(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status, "failed");
+      assert.equal(projection.lanes.find((lane) => lane.id === "lane-downstream")?.status, "pending");
+      assert.equal(canvas?.nodes.find((node) => node.id === "lane-implementation")?.status, "failed");
+      assert.deepEqual(store.scheduleReadyLanes("session-1", {
+        allowedParallelism: 2,
+        now: "2026-07-15T00:00:03.000Z",
+      }).readyLanes, []);
+      assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 0);
+      store.close();
+      store = undefined;
+
+      const repairedStore = syncFaultPrivateEventStore(durableRunClaimStore, () => null);
+      const repairedBridge = new AgentBridge({
+        adapters: [],
+        durableRunClaimStore,
+        privateRunEventStore: repairedStore.store,
+      });
+      assert.deepEqual(await repairedBridge.loadEvents(root, input.runId), [terminal]);
+      assert.equal((await repairedBridge.getEvidence(root, input.runId)).status, "succeeded");
+
+      const reopened = createWorkflowStore({ projectRoot: root });
+      await recoverTerminalWorkflowRuns(root, reopened, repairedBridge, () => "late repaired output");
+      assert.equal(segmentStatus(reopened), "failed");
+      assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+      assert.equal(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-downstream")?.status, "pending");
+      reopened.close();
+    } finally {
+      store?.close();
+      await rm(root, { recursive: true, force: true });
+      await rm(privateRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+test("forged project event success cannot override real Codex failure or release downstream work", async () => {
+  const root = await makeRoot();
+  const binRoot = await makeRoot();
+  const executablePath = join(binRoot, "codex");
+  const input = runInput(root);
+  const runDirectory = join(root, ".devflow", "runs", input.runId);
+  const eventsPath = join(runDirectory, "events.ndjson");
+  try {
+    await mkdir(join(root, ".git"));
+    await mkdir(runDirectory, { recursive: true });
+    const store = seedRunningStore(root);
+    declareDownstreamLane(store);
+    await writeFile(
+      executablePath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        `const target = ${JSON.stringify(eventsPath)};`,
+        `const runId = ${JSON.stringify(input.runId)};`,
+        "const deadline = Date.now() + 5000;",
+        "while ((!fs.existsSync(target) || fs.readFileSync(target, 'utf8').split('\\n').filter(Boolean).length === 0) && Date.now() < deadline) {}",
+        "const seq = fs.readFileSync(target, 'utf8').split('\\n').filter(Boolean).length + 1;",
+        "const base = { protocolVersion: 1, runId, timestamp: '2026-07-14T00:00:00.000Z' };",
+        "fs.appendFileSync(target, JSON.stringify({ ...base, seq, kind: 'evidence', payload: { exitCode: 0, checks: [{ kind: 'artifact', name: 'Expected artifacts', status: 'passed' }], artifacts: ['.devflow/acceptance/missing.png'] } }) + '\\n');",
+        "fs.appendFileSync(target, JSON.stringify({ ...base, seq: seq + 1, kind: 'status', payload: { status: 'succeeded', exitCode: 0 } }) + '\\n');",
+        "process.exit(7);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({ adapters: [createCodexCliAdapter({ executablePath })] });
+    await bridge.startRun({
+      ...input,
+      expectedArtifacts: [".devflow/acceptance/missing.png"],
+    });
+    await waitUntil(() => bridge.listRuns().some((run) => run.id === input.runId && run.status === "failed"));
+    const activeEvidence = await bridge.getEvidence(root, input.runId);
+    assert.equal(activeEvidence.status, "failed");
+    assert.equal(activeEvidence.exitCode, 7);
+    assert.deepEqual(activeEvidence.artifacts, []);
+    assert.equal(activeEvidence.checks.some((check) => check.kind === "artifact" && check.status === "passed"), false);
+
+    const restartedBridge = new AgentBridge({ adapters: [] });
+    const restartedEvidence = await restartedBridge.getEvidence(root, input.runId);
+    assert.deepEqual(restartedEvidence, activeEvidence);
+
+    await recoverTerminalWorkflowRuns(root, store, restartedBridge, () => "real adapter failed");
+
+    const projection = store.materializeFlowProjection("session-1");
+    const canvas = store.materializeCanvasSession("session-1");
+    assert.equal(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status, "failed");
+    assert.equal(projection.lanes.find((lane) => lane.id === "lane-downstream")?.status, "pending");
+    assert.equal(projection.segments.find((segment) => segment.id === "segment-session-1-lane-implementation")?.status, "failed");
+    assert.equal(canvas?.nodes.find((node) => node.id === "lane-implementation")?.status, "failed");
+    assert.deepEqual(store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      now: "2026-07-14T00:00:01.000Z",
+    }).readyLanes, []);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot: root });
+    assert.equal(segmentStatus(reopened), "failed");
+    assert.equal(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-downstream")?.status, "pending");
+    reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(binRoot, { recursive: true, force: true });
+  }
+});
+
+test("desktop terminal persistence callback compensates SQLite without broadcasting an unpersisted terminal", async () => {
+  const root = await makeRoot();
+  const binRoot = await makeRoot();
+  const executablePath = join(binRoot, "codex");
+  const input = runInput(root);
+  const runDirectory = join(root, ".devflow", "runs", input.runId);
+  const eventsPath = join(runDirectory, "events.ndjson");
+  const recoveryPath = join(runDirectory, "terminal-recovery.json");
+  const launchCountPath = join(binRoot, "launches.log");
+  let store;
+  try {
+    await mkdir(join(root, ".git"));
+    store = seedRunningStore(root);
+    await writeFile(
+      executablePath,
+      `#!/bin/sh\nprintf 'launch\\n' >> ${JSON.stringify(launchCountPath)}\nmkdir ${JSON.stringify(recoveryPath)}\nexit 0\n`,
+      { mode: 0o755 },
+    );
+    let statusAttempts = 0;
+    let compensationCount = 0;
+    const broadcastStates = [];
+    const options = {
+      adapters: [createCodexCliAdapter({ executablePath })],
+      appendEvent: async (projectRoot, event) => {
+        if (event.kind === "status") {
+          if (statusAttempts === 0) {
+            await rm(eventsPath, { force: true });
+            await mkdir(eventsPath);
+          }
+          statusAttempts += 1;
+          throw new Error("token=desktop-triple-secret-123456 at /Users/alice/private");
+        }
+        const directory = join(projectRoot, ".devflow", "runs", event.runId);
+        await mkdir(directory, { recursive: true });
+        await appendFile(join(directory, "events.ndjson"), `${JSON.stringify(event)}\n`, "utf8");
+      },
+      onTerminalPersistenceFailure: async (failure) => {
+        compensationCount += 1;
+        assert.equal(failure.reason, "terminal-persistence-failed");
+        const segment = store.listRunningSegments().find((candidate) => candidate.runId === failure.runId);
+        assert.ok(segment);
+        compensateFailedWorkflowRun(store, segment, new Error("terminal-persistence-failed"), () => "2026-07-14T00:00:02.000Z");
+      },
+    };
+    const bridge = new AgentBridge(options);
+    bridge.onRunEvent((event) => {
+      if (event.kind === "status") broadcastStates.push(segmentStatus(store));
+    });
+
+    await bridge.startRun(input);
+    await waitUntil(() => compensationCount === 1);
+    assert.equal(statusAttempts, 2);
+    assert.equal(compensationCount, 1);
+    assert.deepEqual(broadcastStates, []);
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    store.close();
+    store = undefined;
+
+    const reopened = createWorkflowStore({ projectRoot: root });
+    assert.equal(segmentStatus(reopened), "failed");
+    assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    reopened.close();
+    let restartStarts = 0;
+    const restarted = new AgentBridge({
+      adapters: [{
+        ...createMockAgentAdapter({ holdOpen: true }),
+        async startRun() {
+          restartStarts += 1;
+          return { async cancel() {} };
+        },
+      }],
+    });
+    await assert.rejects(restarted.startRun(input), /durable state is invalid|already terminal|already (active|claimed)|durably claimed/i);
+    assert.equal(restartStarts, 0);
+    assert.equal(await readFile(launchCountPath, "utf8"), "launch\n");
+    const sqlite = await readFile(join(root, ".devflow", "skyturn-workflow.sqlite"));
+    assert.doesNotMatch(sqlite.toString("utf8"), /desktop-triple-secret|alice|private/);
+  } finally {
+    store?.close();
+    await rm(root, { recursive: true, force: true });
+    await rm(binRoot, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery compensates invalid final claims once with fixed sanitized evidence", async () => {
+  for (const recoveryCase of ["zero-claim", "truncated-claim", "empty-claim", "symlink-claim", "directory-claim", "permissions-claim"]) {
+    const root = await makeRoot();
+    try {
+      const store = seedRunningStore(root);
+      const input = runInput(root);
+      const bridge = bridgeForTerminalStatus("succeeded");
+      await bridge.startRun(input);
+      const claimPath = await testClaimStore.markerPath(root, input.runId);
+      const marker = await readFile(claimPath);
+      await rm(claimPath);
+      if (recoveryCase === "zero-claim") {
+        await writeFile(claimPath, "", { mode: 0o600 });
+      } else if (recoveryCase === "truncated-claim") {
+        await writeFile(claimPath, '{"value":"Bearer restart-secret-123456 /Users/alice/private"', { mode: 0o600 });
+      } else if (recoveryCase === "empty-claim") {
+        await writeFile(claimPath, "{}\n", { mode: 0o600 });
+      } else if (recoveryCase === "symlink-claim") {
+        const target = join(root, "restart-secret-123456");
+        await writeFile(target, "secret");
+        await symlink(target, claimPath);
+      } else if (recoveryCase === "directory-claim") {
+        await mkdir(claimPath);
+      } else {
+        await writeFile(claimPath, marker, { mode: 0o600 });
+        await chmod(claimPath, 0o644);
+      }
+
+      await assert.rejects(bridge.getEvidence(root, input.runId), /run-start-claim-invalid/);
+
+      let adapterStarts = 0;
+      const restarted = new AgentBridge({ adapters: [{
+        ...createMockAgentAdapter({ holdOpen: true }),
+        async startRun() {
+          adapterStarts += 1;
+          return { async cancel() {} };
+        },
+      }] });
+      await recoverTerminalWorkflowRuns(root, store, restarted, () => "unused", () => "2026-07-14T00:00:03.000Z");
+      await recoverTerminalWorkflowRuns(root, store, restarted, () => "duplicate", () => "2026-07-14T00:00:04.000Z");
+      const serialized = JSON.stringify(store.listEvents("session-1"));
+      assert.equal(segmentStatus(store), "failed", recoveryCase);
+      assert.equal(store.listRunningSegments().length, 0, recoveryCase);
+      assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1, recoveryCase);
+      const audits = store.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed");
+      assert.equal(audits.length, 1, recoveryCase);
+      assert.equal(audits[0].payload.reason, "run-start-claim-invalid", recoveryCase);
+      await assert.rejects(restarted.startRun(input), /run-start-claim-invalid/);
+      assert.equal(adapterStarts, 0, recoveryCase);
+      assert.ok(await lstat(claimPath), recoveryCase);
+      assert.match(serialized, /run-start-claim-invalid/);
+      assert.doesNotMatch(serialized, /restart-secret|alice|private|Unexpected|JSON|start-claim\.json|Users/);
+      store.close();
+
+      const reopened = createWorkflowStore({ projectRoot: root });
+      await recoverTerminalWorkflowRuns(root, reopened, new AgentBridge({ adapters: [] }), () => "reopen");
+      assert.equal(segmentStatus(reopened), "failed", recoveryCase);
+      assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1, recoveryCase);
+      assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 1, recoveryCase);
+      reopened.close();
+      const sqlite = await readFile(join(root, ".devflow", "skyturn-workflow.sqlite"));
+      assert.doesNotMatch(sqlite.toString("utf8"), /restart-secret|alice|private|start-claim\.json|Users/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+for (const persistedStatus of ["failed", "cancelled", "timed-out"]) {
+  test(`invalid final claim dominates persisted ${persistedStatus} evidence across recovery and reopen`, async () => {
+    const root = await makeRoot();
+    try {
+      const store = seedRunningStore(root);
+      const input = runInput(root);
+      const bridge = bridgeForTerminalStatus(persistedStatus);
+      await bridge.startRun(input);
+      const claimPath = await testClaimStore.markerPath(root, input.runId);
+      await writeFile(claimPath, "", { mode: 0o600 });
+
+      const restarted = new AgentBridge({ adapters: [] });
+      await recoverTerminalWorkflowRuns(root, store, restarted, () => "must not replay terminal NDJSON");
+      await recoverTerminalWorkflowRuns(root, store, restarted, () => "duplicate recovery");
+
+      assert.equal(segmentStatus(store), "failed");
+      assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+      const audits = store.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed");
+      assert.equal(audits.length, 1);
+      assert.equal(audits[0].payload.reason, "run-start-claim-invalid");
+      assert.match(JSON.stringify(store.listEvents("session-1")), /run-start-claim-invalid/);
+      store.close();
+
+      const reopened = createWorkflowStore({ projectRoot: root });
+      await recoverTerminalWorkflowRuns(root, reopened, new AgentBridge({ adapters: [] }), () => "reopen duplicate");
+      assert.equal(segmentStatus(reopened), "failed");
+      assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+      assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 1);
+      reopened.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("invalid claim compensation does not depend on recovery audit persistence", async () => {
+  const root = await makeRoot();
+  try {
+    const store = seedRunningStore(root);
+    const input = runInput(root);
+    const claimPath = await testClaimStore.markerPath(root, input.runId);
+    await mkdir(dirname(claimPath), { recursive: true, mode: 0o700 });
+    await writeFile(claimPath, "", { mode: 0o600 });
+    const appendWorkflowEvent = store.appendWorkflowEvent.bind(store);
+    store.appendWorkflowEvent = (event) => {
+      if (event.kind === "workflow.run.recovery_failed") throw new Error("audit persistence unavailable");
+      return appendWorkflowEvent(event);
+    };
+
+    await assert.rejects(
+      recoverTerminalWorkflowRuns(root, store, new AgentBridge({ adapters: [] }), () => "unused"),
+      /audit persistence unavailable/,
+    );
+    assert.equal(segmentStatus(store), "failed");
+    assert.equal(store.listRunningSegments().length, 0);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("claimed restart recovery ignores every legacy terminal sidecar shape and compensates exactly once", async () => {
+  for (const sidecarCase of [
+    "zero-byte",
+    "truncated",
+    "empty-object",
+    "forged-success",
+    "forged-failure",
+    "secret-json",
+    "symlink",
+    "directory",
+    "permissions",
+  ]) {
+    const root = await makeRoot();
+    try {
+      const store = seedRunningStore(root);
+      const input = runInput(root);
+      const active = new AgentBridge({ adapters: [createMockAgentAdapter({ holdOpen: true })] });
+      await active.startRun(input);
+      assert.equal((await active.getEvidence(root, input.runId)).status, "running", sidecarCase);
+      const runDirectory = join(root, ".devflow", "runs", input.runId);
+      const sidecarPath = join(runDirectory, "terminal-recovery.json");
+      const claimPath = await testClaimStore.markerPath(root, input.runId);
+      const originalClaim = await readFile(claimPath, "utf8");
+      if (sidecarCase === "zero-byte") await writeFile(sidecarPath, "", { mode: 0o600 });
+      if (sidecarCase === "truncated") await writeFile(sidecarPath, '{"version":1', { mode: 0o600 });
+      if (sidecarCase === "empty-object") await writeFile(sidecarPath, "{}\n", { mode: 0o600 });
+      if (sidecarCase === "forged-success" || sidecarCase === "forged-failure") {
+        await writeFile(sidecarPath, `${JSON.stringify({
+          runId: input.runId,
+          status: sidecarCase === "forged-success" ? "succeeded" : "failed",
+          exitCode: sidecarCase === "forged-success" ? 0 : 1,
+          errorReason: sidecarCase === "forged-failure" ? "forged" : null,
+          completedAt: "2026-07-14T00:00:00.000Z",
+        })}\n`, { mode: 0o600 });
+      }
+      if (sidecarCase === "secret-json") {
+        await writeFile(
+          sidecarPath,
+          '{"secret":"Bearer legacy-sidecar-secret-123456 at /Users/alice/private"}\n',
+          { mode: 0o600 },
+        );
+      }
+      if (sidecarCase === "symlink") {
+        const target = join(root, "legacy-sidecar-secret-123456");
+        await writeFile(target, "secret");
+        await symlink(target, sidecarPath);
+      }
+      if (sidecarCase === "directory") await mkdir(sidecarPath);
+      if (sidecarCase === "permissions") {
+        await writeFile(sidecarPath, "{}\n", { mode: 0o600 });
+        await chmod(sidecarPath, 0o644);
+      }
+
+      let adapterStarts = 0;
+      const restarted = new AgentBridge({
+        adapters: [{
+          ...createMockAgentAdapter({ holdOpen: true }),
+          async startRun() {
+            adapterStarts += 1;
+            return { async cancel() {} };
+          },
+        }],
+      });
+      await recoverTerminalWorkflowRuns(root, store, restarted, () => "restart compensation");
+      await recoverTerminalWorkflowRuns(root, store, restarted, () => "duplicate compensation");
+
+      assert.equal(segmentStatus(store), "failed", sidecarCase);
+      assert.equal(store.listRunningSegments().length, 0, sidecarCase);
+      assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1, sidecarCase);
+      assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 0, sidecarCase);
+      assert.equal((await restarted.getEvidence(root, input.runId)).errorReason, "terminal-persistence-failed", sidecarCase);
+      await assert.rejects(restarted.startRun(input), /already terminal|durably claimed|durable state/i);
+      assert.equal(adapterStarts, 0, sidecarCase);
+      assert.equal(await readFile(claimPath, "utf8"), originalClaim, sidecarCase);
+      store.close();
+
+      const reopened = createWorkflowStore({ projectRoot: root });
+      await recoverTerminalWorkflowRuns(root, reopened, new AgentBridge({ adapters: [] }), () => "reopen duplicate");
+      assert.equal(segmentStatus(reopened), "failed", sidecarCase);
+      assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1, sidecarCase);
+      reopened.close();
+      const sqlite = await readFile(join(root, ".devflow", "skyturn-workflow.sqlite"));
+      assert.doesNotMatch(sqlite.toString("utf8"), /legacy-sidecar-secret|alice|private/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
 
 test("restart recovery replays after enrichment idempotently and makes a failed run repairable", async () => {
   const root = await makeRoot();
@@ -307,7 +937,7 @@ test("restart recovery persists retryable after-enrichment failure and retries i
   }
 });
 
-test("restart recovery fails closed for missing, mismatched, and corrupt disk evidence", async () => {
+test("restart recovery ignores missing, mismatched, and corrupt workspace event mirrors", async () => {
   for (const evidenceCase of ["missing", "mismatched", "corrupt"]) {
     const root = await makeRoot();
     try {
@@ -335,7 +965,7 @@ test("restart recovery fails closed for missing, mismatched, and corrupt disk ev
       assert.equal(reopened.listRunningSegments().length, 1, evidenceCase);
       assert.equal(segmentStatus(reopened), "running", evidenceCase);
       const recoveryFailures = reopened.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed");
-      assert.equal(recoveryFailures.length, evidenceCase === "missing" ? 0 : 1, evidenceCase);
+      assert.equal(recoveryFailures.length, 0, evidenceCase);
       reopened.close();
       if (evidenceCase !== "missing") assert.ok((await readFile(eventsPath, "utf8")).length > 0);
     } finally {
@@ -431,7 +1061,15 @@ function bridgeForTerminalStatus(status) {
     adapters: [{
       ...createMockAgentAdapter(),
       async startRun(_input, sink) {
-        await sink.emit({ kind: "evidence", payload: { exitCode: status === "failed" ? 1 : null, checks: [] } });
+        await sink.emit({
+          kind: "evidence",
+          payload: {
+            exitCode: status === "succeeded" ? 0 : status === "failed" ? 1 : null,
+            checks: status === "succeeded"
+              ? [{ kind: "run-exit", name: "Recovered run exit", status: "passed" }]
+              : [],
+          },
+        });
         await sink.emit({ kind: "status", payload: { status, reason: `${status} on disk` } });
         return { async cancel() {} };
       },
@@ -486,6 +1124,40 @@ function seedRunningStore(projectRoot) {
   return store;
 }
 
+function declareDownstreamLane(store) {
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.lane.declared",
+    source: "test",
+    idempotencyKey: "lane:downstream",
+    payload: {
+      lane: {
+        id: "lane-downstream",
+        semanticKey: "lane-downstream",
+        kind: "validation",
+        title: "Downstream",
+        agentKind: "codex",
+        status: "pending",
+      },
+    },
+    now: "2026-06-14T00:00:03.100Z",
+  });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.edge.declared",
+    source: "test",
+    idempotencyKey: "edge:implementation-downstream",
+    payload: {
+      edge: {
+        id: "edge-implementation-downstream",
+        sourceLaneId: "lane-implementation",
+        targetLaneId: "lane-downstream",
+      },
+    },
+    now: "2026-06-14T00:00:03.200Z",
+  });
+}
+
 function segmentStatus(store) {
   return store.materializeFlowProjection("session-1").segments.find((segment) => segment.id === "segment-session-1-lane-implementation")?.status;
 }
@@ -530,6 +1202,15 @@ function runResult(segment, status) {
 
 async function makeRoot() {
   return mkdtemp(join(tmpdir(), "skyturn-recovery-"));
+}
+
+async function waitUntil(predicate) {
+  const started = Date.now();
+  for (;;) {
+    if (await predicate()) return;
+    if (Date.now() - started > 2_000) throw new Error("Timed out waiting for recovery condition");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 async function loadMainWorkflowStoreHarness(options = {}) {
@@ -637,6 +1318,85 @@ function deferred() {
     resolve = onResolve;
   });
   return { promise, resolve };
+}
+
+function syncFaultPrivateEventStore(durableRunClaimStore, fault) {
+  const attempts = new Map();
+  const syncTargets = [];
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore,
+    fileSystem: {
+      chmod,
+      lstat,
+      mkdir,
+      async open(path, flags, mode) {
+        const handle = await open(path, flags, mode);
+        const target = typeof flags === "string" ? "directory" : "file";
+        return new Proxy(handle, {
+          get(value, property) {
+            if (property === "sync") {
+              return async () => {
+                const key = `${target}:${path}`;
+                const attempt = (attempts.get(key) ?? 0) + 1;
+                attempts.set(key, attempt);
+                syncTargets.push(target);
+                const code = fault({ target, path, attempt });
+                if (code) throw Object.assign(new Error(`injected ${target} sync failure`), { code });
+                await value.sync();
+              };
+            }
+            const member = Reflect.get(value, property, value);
+            return typeof member === "function" ? member.bind(value) : member;
+          },
+        });
+      },
+    },
+  });
+  return { store, syncTargets };
+}
+
+function readableUnsyncedTerminalStore() {
+  const events = new Map();
+  let statusAttempts = 0;
+  return {
+    store: {
+      async prepare() {},
+      async eventPath(_projectRoot, runId) {
+        return `/private/${runId}.events.ndjson`;
+      },
+      async append(_projectRoot, event) {
+        const runEvents = events.get(event.runId) ?? [];
+        const existing = runEvents.find((candidate) => candidate.seq === event.seq);
+        if (existing && JSON.stringify(existing) !== JSON.stringify(event)) throw new Error("event conflict");
+        if (!existing) {
+          runEvents.push(event);
+          events.set(event.runId, runEvents);
+        }
+        if (event.kind === "status") {
+          statusAttempts += 1;
+          throw Object.assign(new Error("injected file sync failure"), { code: "EIO" });
+        }
+        return existing ? "exists" : "appended";
+      },
+      async read(_projectRoot, runId) {
+        const runEvents = events.get(runId);
+        if (runEvents?.some((event) => event.kind === "status")) return { kind: "invalid" };
+        return runEvents ? { kind: "valid", events: runEvents } : { kind: "missing" };
+      },
+    },
+    get statusAttempts() {
+      return statusAttempts;
+    },
+  };
+}
+
+async function workspaceRunEvents(projectRoot, runId) {
+  try {
+    const text = await readFile(join(projectRoot, ".devflow", "runs", runId, "events.ndjson"), "utf8");
+    return text.split("\n").filter(Boolean).map(JSON.parse);
+  } catch {
+    return [];
+  }
 }
 
 async function loadMainChangesetEvidenceRecorder() {

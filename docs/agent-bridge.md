@@ -10,7 +10,8 @@ It does not orchestrate the task graph. Hermes/orchestrator still owns DAG sched
 - Return explicit `supportLevel` so SkyTurn does not claim unverified CLI support.
 - Start, send to, cancel, and list local Agent runs.
 - Emit versioned `RunEvent` objects with monotonic `seq`.
-- Persist events to `.devflow/runs/<runId>/events.ndjson`.
+- Persist authoritative events under the backend-private app state root.
+- Best-effort mirror sanitized events to `.devflow/runs/<runId>/events.ndjson` for userspace observability.
 - Persist readable output to `.devflow/tasks/<nodeId>/output.md`.
 - Build `RunEvidence` from exit state, changesets, checks, artifacts, review, errors, or cancellation.
 
@@ -37,7 +38,7 @@ IPC uses the same shape intended for future NDJSON bridge transport:
 }
 ```
 
-Renderer streams update UI only. The event log is the source of truth after reload.
+Renderer streams and project-local event mirrors update observability only. The backend-private event log is the source of truth after reload, evidence derivation, recovery, and duplicate-start reconciliation. Its path is `<userData>/run-claims/<projectSha256>/<runSha256>.events.ndjson`; neither hashed path nor stored event records include the raw project path, prompt, or continuity handle. Project mirrors have no programmatic replay path and cannot acquire legacy provenance through public events or write APIs.
 
 ## Run Evidence
 

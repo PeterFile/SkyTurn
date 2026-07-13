@@ -49,10 +49,30 @@ export type AgentRunStatus =
   | "failed"
   | "cancelled"
   | "timed-out";
+
+export function isTerminalAgentRunStatus(status: AgentRunStatus): boolean {
+  return status === "succeeded" || status === "failed" || status === "cancelled" || status === "timed-out";
+}
+
+export function reduceAgentRunStatus(
+  current: AgentRunStatus,
+  transition: AgentRunStatus | "error",
+): AgentRunStatus {
+  if (isTerminalAgentRunStatus(current)) return current;
+  return transition === "error" ? "failed" : transition;
+}
 export type AgentRunSandbox = "read-only" | "workspace-write" | "danger-full-access";
 export type RunEventKind = "output" | "status" | "error" | "approval" | "progress" | "evidence" | "changes";
 export type EvidenceCheckStatus = "passed" | "failed" | "skipped";
-export type EvidenceCheckKind = "run-exit" | "run-timeout" | "git" | "test" | "typecheck" | "build" | "review";
+export type EvidenceCheckKind =
+  | "run-exit"
+  | "run-timeout"
+  | "artifact"
+  | "git"
+  | "test"
+  | "typecheck"
+  | "build"
+  | "review";
 export type HermesPlannerTransport = "hermes_live_chat" | "hermes_session_resume" | "hermes_replay_recovery";
 export type SessionExecutionTarget = "current_branch" | "new_worktree";
 export type WorkflowLaneKind =
@@ -146,12 +166,22 @@ export const WORKFLOW_LANE_KINDS: WorkflowLaneKind[] = [
 export const EVIDENCE_CHECK_KINDS: EvidenceCheckKind[] = [
   "run-exit",
   "run-timeout",
+  "artifact",
   "git",
   "test",
   "typecheck",
   "build",
   "review",
 ];
+const EVIDENCE_CHECK_STATUSES: EvidenceCheckStatus[] = ["passed", "failed", "skipped"];
+const assignedAbsolutePathInTextPattern =
+  /\bcwd=(?:(["'])(?:\/|[A-Za-z]:[\\/]).*?\1|(?:\/|[A-Za-z]:[\\/]).*?(?=\s+(?:["'(]|[A-Za-z_][\w-]*=)|$))/gi;
+const quotedAbsolutePathInTextPattern = /(["'])(?:\/|[A-Za-z]:[\\/]).*?\1/g;
+const bracketedAbsolutePathInTextPattern = /([([{])(?:\/|[A-Za-z]:[\\/]).*?([)\]}])/g;
+const absolutePathInTextPattern = /(^|[\s=:([{])((?:\/(?:[^\s/]+\/)*|[A-Za-z]:[\\/](?:[^\s\\/]+[\\/])*)[^\s"'()\[\]{}<>]*)/g;
+const trailingPathPunctuationPattern = /[.,;!?]+$/;
+const secretAssignmentPattern =
+  /(["']?)(api[_-]?key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|OPENAI_API_KEY|HERMES_API_KEY|ANTHROPIC_API_KEY)\1(\s*[:=]\s*)(["']?)[^\s,'"}]{8,}\4/gi;
 export const AGENT_SUPPORT_LEVELS: AgentSupportLevel[] = [
   "mock-only",
   "detected-only",
@@ -422,6 +452,7 @@ export interface StartAgentRunInput {
   agentKind: AgentKind;
   transport?: AgentTransportKind;
   sandbox?: AgentRunSandbox;
+  /** An omitted or empty declaration imposes no artifact requirements. */
   expectedArtifacts?: string[];
   prompt: string;
 }
@@ -442,6 +473,292 @@ export interface EvidenceCheck {
   detail?: string;
 }
 
+export function parseRunEvidenceChecks(value: unknown): EvidenceCheck[] | null {
+  if (!Array.isArray(value)) return null;
+  const checks: EvidenceCheck[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return null;
+    const candidate = item;
+    if (!EVIDENCE_CHECK_KINDS.includes(candidate.kind as EvidenceCheckKind)) return null;
+    if (!EVIDENCE_CHECK_STATUSES.includes(candidate.status as EvidenceCheckStatus)) return null;
+    if (typeof candidate.name !== "string" || !candidate.name.trim() || hasAsciiControl(candidate.name)) return null;
+    if (candidate.detail !== undefined && (typeof candidate.detail !== "string" || hasAsciiControl(candidate.detail))) return null;
+    checks.push({
+      kind: candidate.kind as EvidenceCheckKind,
+      name: sanitizeEvidenceCheckText(candidate.name),
+      status: candidate.status as EvidenceCheckStatus,
+      ...(typeof candidate.detail === "string" ? { detail: sanitizeEvidenceCheckText(candidate.detail) } : {}),
+    });
+  }
+  return checks;
+}
+
+const publicEvidenceTextLimit = 320;
+const acceptanceArtifactPrefix = ".devflow/acceptance/";
+export const BROWSER_SCREENSHOT_EXPECTED_ARTIFACT = ".devflow/acceptance/react-app.png";
+const artifactNameSeparatorPattern = /[\p{Separator}\p{Punctuation}\u2212]+/gu;
+const sensitiveArtifactTokens = new Set([
+  "auth",
+  "credential",
+  "credentials",
+  "key",
+  "keys",
+  "passwd",
+  "password",
+  "passwords",
+  "secret",
+  "secrets",
+  "shadow",
+  "token",
+  "tokens",
+]);
+const sensitiveArtifactExtensions = new Set(["der", "jks", "key", "keystore", "p12", "pem", "pfx"]);
+const privateKeyIds = new Set(["dsa", "ecdsa", "ed25519", "rsa"]);
+const narrowServiceAccountReportPattern = /^service\.account\.(?:acceptance|audit|migration|validation)\.(?:report|results?|summary)\.json$/;
+const boundedCompactSensitiveFamilyRoots = [
+  "accesstoken",
+  "accesstokens",
+  "accesskey",
+  "accesskeys",
+  "apitoken",
+  "apitokens",
+  "apikey",
+  "apikeys",
+  "authtoken",
+  "authtokens",
+  "authkey",
+  "authkeys",
+  "credential",
+  "credentials",
+  "passwd",
+  "password",
+  "passwords",
+  "secret",
+  "secrets",
+  "token",
+  "tokens",
+  "key",
+  "keys",
+].sort((left, right) => right.length - left.length);
+const compactSensitiveSuffixes = [
+  "configuration",
+  "credentials",
+  "validation",
+  "acceptance",
+  "migration",
+  "certificate",
+  "keystore",
+  "original",
+  "snapshot",
+  "archive",
+  "backups",
+  "results",
+  "summary",
+  "backup",
+  "private",
+  "report",
+  "export",
+  "config",
+  "saved",
+  "result",
+  "store",
+  "copy",
+  "data",
+  "file",
+  "orig",
+  "audit",
+  "dump",
+  "sqlite",
+  "json",
+  "yaml",
+  "text",
+  "jks",
+  "p12",
+  "pfx",
+  "pem",
+  "der",
+  "key",
+  "bak",
+  "old",
+  "txt",
+  "yml",
+  "xml",
+  "csv",
+  "tar",
+  "zip",
+  "gz",
+  "db",
+].sort((left, right) => right.length - left.length);
+const compactPrivateContainerRoots = [
+  "certificate",
+  "clientcertificate",
+  "servercertificate",
+  "sslcertificate",
+  "tlscertificate",
+  "privatekey",
+  "clientprivatekey",
+  "serverprivatekey",
+  "signingprivatekey",
+  "sslprivatekey",
+  "sshprivatekey",
+  "tlsprivatekey",
+  "clientprivate",
+  "serverprivate",
+  "signingprivate",
+  "sslprivate",
+  "sshprivate",
+  "tlsprivate",
+];
+const compactSensitiveArtifactFamilies = [
+  "authorizedkeys",
+  "knownhosts",
+  "serviceaccount",
+  ...boundedCompactSensitiveFamilyRoots,
+  ...[...privateKeyIds].map((keyId) => `id${keyId}`),
+  ...compactPrivateContainerRoots.filter((root) => root.endsWith("key")),
+  ...compactPrivateContainerRoots.flatMap((root) =>
+    ["pem", "der", "p12", "pfx"].map((extension) => `${root}${extension}`)
+  ),
+].sort((left, right) => right.length - left.length);
+
+export function parseExpectedArtifactDeclaration(value: unknown): string | null {
+  if (typeof value !== "string" || !value || /[\x00-\x1f\x7f]/.test(value)) return null;
+  if (value.includes("\\") || value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value)) return null;
+  const normalized = value;
+  const components = normalized.split("/");
+  if (!normalized.startsWith(acceptanceArtifactPrefix) || components.some((part) => !part || part === "." || part === "..")) return null;
+  if (/[<>|:]/.test(normalized) || /(?:^|\/)(?:symlink|link)(?:$|[-_.])/i.test(normalized)) return null;
+  if (components.some(isSensitiveArtifactComponent)) return null;
+  return normalized;
+}
+
+function isSensitiveArtifactComponent(value: string): boolean {
+  const key = sensitiveArtifactFoldKey(value);
+  if (narrowServiceAccountReportPattern.test(key)) return false;
+  const tokens = key.split(".").filter(Boolean);
+  const compact = tokens.join("");
+  if (key === ".env" || key.startsWith(".env.") || key === ".npmrc" || key.startsWith(".npmrc.")) return true;
+  if (isSensitiveCompactArtifactFamily(compact)) return true;
+  if (tokens[0] === "cookies" && tokens[1] === "sqlite") return true;
+  if (tokens[0] === "id" && privateKeyIds.has(tokens[1] ?? "")) return true;
+  return tokens.some((token) => sensitiveArtifactTokens.has(token) || sensitiveArtifactExtensions.has(token));
+}
+
+function isSensitiveCompactArtifactFamily(compact: string): boolean {
+  return compactSensitiveArtifactFamilies.some((root) => hasBoundedCompactSuffixChain(compact, root));
+}
+
+function hasBoundedCompactSuffixChain(value: string, root: string): boolean {
+  if (!value.startsWith(root)) return false;
+  let suffix = value.slice(root.length);
+  while (suffix) {
+    const digits = /^\d+/.exec(suffix)?.[0];
+    if (digits) {
+      suffix = suffix.slice(digits.length);
+      continue;
+    }
+    const atom = compactSensitiveSuffixes.find((candidate) => suffix.startsWith(candidate));
+    if (!atom) return false;
+    suffix = suffix.slice(atom.length);
+  }
+  return true;
+}
+
+function sensitiveArtifactFoldKey(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replaceAll(artifactNameSeparatorPattern, ".")
+    .replace(/\.{2,}/g, ".");
+}
+
+export function parseExpectedArtifactDeclarations(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const artifacts: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    const normalized = parseExpectedArtifactDeclaration(item);
+    if (!normalized) return null;
+    const key = expectedArtifactDeclarationKey(normalized);
+    if (seen.has(key)) return null;
+    seen.add(key);
+    artifacts.push(normalized);
+  }
+  return artifacts;
+}
+
+export function canonicalExpectedArtifactDeclarationKeys(value: unknown): string[] | null {
+  const declarations = parseExpectedArtifactDeclarations(value);
+  return declarations ? declarations.map(expectedArtifactDeclarationKey).sort() : null;
+}
+
+function expectedArtifactDeclarationKey(declaration: string): string {
+  return declaration.normalize("NFKC").toLowerCase();
+}
+
+export function parseRunEvidenceArtifacts(value: unknown): string[] | null {
+  return parseExpectedArtifactDeclarations(value);
+}
+
+export function expectedArtifactContractForRequiredEvidence(
+  value: unknown,
+): { required: boolean; declarations: string[] } {
+  const requiredEvidence = Array.isArray(value)
+    ? value.filter((kind): kind is string => typeof kind === "string")
+    : [];
+  const browserScreenshotRequired = requiredEvidence.some((kind) => /^(?:browser|screenshot)$/i.test(kind));
+  const required = browserScreenshotRequired || requiredEvidence.some((kind) => /^artifact$/i.test(kind));
+  return {
+    required,
+    declarations: browserScreenshotRequired ? [BROWSER_SCREENSHOT_EXPECTED_ARTIFACT] : [],
+  };
+}
+
+function hasAsciiControl(value: string): boolean {
+  return /[\x00-\x1f\x7f]/.test(value);
+}
+
+export function sanitizePublicEvidenceText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  let sanitized = value
+    .trim()
+    .replace(/\b(?:Authorization:\s*)?Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, "[redacted]")
+    .replace(secretAssignmentPattern, "$1$2$1$3$4[redacted]$4")
+    .replace(/\b(password|passwd|credential|secret|token|api[_-]?key)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .replace(assignedAbsolutePathInTextPattern, (match) => redactAbsolutePath(match, "cwd="))
+    .replace(quotedAbsolutePathInTextPattern, (match, quote: string) => `${quote}[redacted-path]${quote}`)
+    .replace(bracketedAbsolutePathInTextPattern, (_match, opening: string, closing: string) => `${opening}[redacted-path]${closing}`)
+    .replace(absolutePathInTextPattern, (_match, prefix: string, path: string) => `${prefix}[redacted-path]${path.match(trailingPathPunctuationPattern)?.[0] ?? ""}`)
+    .replace(/\.env(?:\.[A-Za-z0-9_-]+)?|\b(?:id[_-]?(?:rsa|dsa|ecdsa|ed25519)|authorized[_-]?keys|known[_-]?hosts|shadow|credentials?(?:\.\w+)?|secrets?(?:\.\w+)?|tokens?(?:\.\w+)?)\b/gi, "[redacted]")
+    .replace(/\s+/g, " ");
+  if (sanitized.length > publicEvidenceTextLimit) sanitized = `${sanitized.slice(0, publicEvidenceTextLimit - 15).trimEnd()}... [truncated]`;
+  return sanitized;
+}
+
+export function sanitizePublicPayloadText(value: unknown): string {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/\b(?:Authorization:\s*)?Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, "[redacted]")
+    .replace(secretAssignmentPattern, "$1$2$1$3$4[redacted]$4")
+    .replace(/\b(password|passwd|credential|secret|token|api[_-]?key)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .replace(assignedAbsolutePathInTextPattern, (match) => redactAbsolutePath(match, "cwd="))
+    .replace(quotedAbsolutePathInTextPattern, (match, quote: string) => `${quote}[redacted-path]${quote}`)
+    .replace(bracketedAbsolutePathInTextPattern, (_match, opening: string, closing: string) => `${opening}[redacted-path]${closing}`)
+    .replace(absolutePathInTextPattern, (_match, prefix: string, path: string) => `${prefix}[redacted-path]${path.match(trailingPathPunctuationPattern)?.[0] ?? ""}`)
+    .replace(/\.env(?:\.[A-Za-z0-9_-]+)?|\b(?:id[_-]?(?:rsa|dsa|ecdsa|ed25519)|authorized[_-]?keys|known[_-]?hosts|shadow|credentials?(?:\.\w+)?|secrets?(?:\.\w+)?|tokens?(?:\.\w+)?)\b/gi, "[redacted]");
+}
+
+function redactAbsolutePath(match: string, prefix: string): string {
+  const punctuation = match.match(trailingPathPunctuationPattern)?.[0] ?? "";
+  return `${prefix}[redacted-path]${punctuation}`;
+}
+
+function sanitizeEvidenceCheckText(value: string): string {
+  return sanitizePublicEvidenceText(value);
+}
+
 export interface RunEvidence {
   runId: string;
   status: AgentRunStatus;
@@ -453,6 +770,320 @@ export interface RunEvidence {
   errorReason: string | null;
   cancelReason: string | null;
   completedAt: string | null;
+}
+
+export function sanitizeTrustedRunEvidence(evidence: RunEvidence): RunEvidence {
+  const checks = uniqueEvidenceChecks(evidence.checks.map(sanitizeTrustedEvidenceCheck));
+  const review = evidence.review ? sanitizeTrustedEvidenceCheck(evidence.review) : null;
+  const artifacts: string[] = [];
+  const artifactKeys = new Set<string>();
+  let artifactsValid = true;
+  for (const candidate of evidence.artifacts) {
+    const artifact = parseExpectedArtifactDeclaration(candidate);
+    if (!artifact) {
+      artifactsValid = false;
+      continue;
+    }
+    const key = artifact.toLowerCase();
+    if (artifactKeys.has(key)) continue;
+    artifactKeys.add(key);
+    artifacts.push(artifact);
+  }
+  const failedArtifactGate = checks.some((check) => check.kind === "artifact" && check.status === "failed");
+  const mustFail = failedArtifactGate || !artifactsValid;
+  const status = mustFail && evidence.status !== "failed" && evidence.status !== "cancelled" && evidence.status !== "timed-out"
+    ? "failed"
+    : evidence.status;
+  return {
+    runId: evidence.runId,
+    status,
+    exitCode: evidence.exitCode,
+    changesetId: sanitizePublicEvidenceText(evidence.changesetId) || null,
+    checks,
+    artifacts: mustFail ? [] : artifacts,
+    review,
+    errorReason: sanitizePublicEvidenceText(evidence.errorReason) || null,
+    cancelReason: sanitizePublicEvidenceText(evidence.cancelReason) || null,
+    completedAt: evidence.completedAt,
+  };
+}
+
+export function sanitizeRunEvidence(evidence: RunEvidence): RunEvidence {
+  return sanitizeTrustedRunEvidence(evidence);
+}
+
+function sanitizeTrustedEvidenceCheck(check: EvidenceCheck): EvidenceCheck {
+  return {
+    kind: check.kind,
+    name: sanitizeEvidenceCheckText(check.name),
+    status: check.status,
+    ...(check.detail !== undefined ? { detail: sanitizeEvidenceCheckText(check.detail) } : {}),
+  };
+}
+
+function uniqueEvidenceChecks(checks: EvidenceCheck[]): EvidenceCheck[] {
+  const seen = new Set<string>();
+  return checks.filter((check) => {
+    const key = `${check.kind}\0${check.name}\0${check.status}\0${check.detail ?? ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export function parseRunEvidence(value: unknown): RunEvidence | null {
+  if (!isRecord(value)) return null;
+  if (typeof value.runId !== "string" || !value.runId.trim() || hasAsciiControl(value.runId)) return null;
+  if (!isAgentRunStatus(value.status)) return null;
+  if (value.exitCode !== null && (typeof value.exitCode !== "number" || !Number.isInteger(value.exitCode) || value.exitCode < 0)) return null;
+  if (value.changesetId !== null && typeof value.changesetId !== "string") return null;
+  if (!Array.isArray(value.checks) || !Array.isArray(value.artifacts)) return null;
+  if (value.review !== null && !isRecord(value.review)) return null;
+  if (value.errorReason !== null && typeof value.errorReason !== "string") return null;
+  if (value.cancelReason !== null && typeof value.cancelReason !== "string") return null;
+  if (value.completedAt !== null && (typeof value.completedAt !== "string" || Number.isNaN(Date.parse(value.completedAt)))) return null;
+  const checks = parseRunEvidenceChecks(value.checks);
+  const artifacts = parseRunEvidenceArtifacts(value.artifacts);
+  const review = value.review === null ? null : parseRunEvidenceChecks([value.review]);
+  if (!checks || !artifacts || (value.review !== null && (!review || review.length !== 1))) return null;
+  return sanitizeTrustedRunEvidence({
+    runId: value.runId,
+    status: value.status,
+    exitCode: value.exitCode,
+    changesetId: value.changesetId,
+    checks,
+    artifacts,
+    review: review?.[0] ?? null,
+    errorReason: sanitizePublicEvidenceText(value.errorReason) || null,
+    cancelReason: sanitizePublicEvidenceText(value.cancelReason) || null,
+    completedAt: value.completedAt,
+  });
+}
+
+export function parseRunEvent(value: unknown): RunEvent | null {
+  if (!isRecord(value)) return null;
+  if (value.protocolVersion !== RUN_EVENT_PROTOCOL_VERSION) return null;
+  if (typeof value.runId !== "string" || !value.runId.trim() || hasAsciiControl(value.runId)) return null;
+  if (typeof value.seq !== "number" || !Number.isInteger(value.seq) || value.seq < 1) return null;
+  if (typeof value.timestamp !== "string" || Number.isNaN(Date.parse(value.timestamp))) return null;
+  if (!isRunEventKind(value.kind) || !isRecord(value.payload)) return null;
+
+  const payload = sanitizeRunEventRecord(value.payload);
+  if (value.kind === "output" && typeof value.payload.text !== "string") return null;
+  if (value.kind === "error" && typeof value.payload.message !== "string") return null;
+  if (value.kind === "status" && !isAgentRunStatus(value.payload.status)) return null;
+  if (!validOptionalExitCode(value.payload.exitCode)) return null;
+  if (!validOptionalText(value.payload.reason) || !validOptionalText(value.payload.errorReason)) return null;
+
+  if ("checks" in value.payload) {
+    const checks = parseRunEvidenceChecks(value.payload.checks);
+    if (!checks) return null;
+    payload.checks = checks;
+  }
+  if ("artifacts" in value.payload) {
+    const artifacts = parseRunEvidenceArtifacts(value.payload.artifacts);
+    if (!artifacts) return null;
+    payload.artifacts = artifacts;
+  }
+  if ("review" in value.payload) {
+    if (value.payload.review === null) {
+      payload.review = null;
+    } else {
+      const review = parseRunEvidenceChecks([value.payload.review]);
+      if (!review || review.length !== 1) return null;
+      payload.review = review[0];
+    }
+  }
+  return {
+    protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+    runId: value.runId,
+    seq: value.seq,
+    timestamp: value.timestamp,
+    kind: value.kind,
+    payload,
+  };
+}
+
+const losslessRunEventPayloadKeys = new Set([
+  "code",
+  "diff",
+  "output",
+  "patch",
+  "patchPreview",
+  "text",
+  "unified_diff",
+  "unifiedDiff",
+]);
+
+const compactRunEventMetadataKeys = new Set([
+  "category",
+  "command",
+  "eventType",
+  "file",
+  "filePath",
+  "format",
+  "header",
+  "kind",
+  "label",
+  "language",
+  "name",
+  "newPath",
+  "oldPath",
+  "operation",
+  "path",
+  "phase",
+  "source",
+  "status",
+  "stream",
+  "type",
+]);
+
+function sanitizeRunEventRecord(
+  value: Record<string, unknown>,
+  inheritedLossless = false,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(value).map(([key, nested]) => [
+      key,
+      key === "opaqueHandle" && typeof nested === "string"
+        ? "[redacted]"
+        : sanitizeRunEventValue(nested, runEventFieldIsLossless(key, inheritedLossless)),
+    ]),
+  );
+}
+
+function runEventFieldIsLossless(key: string, inheritedLossless: boolean): boolean {
+  if (compactRunEventMetadataKeys.has(key)) return false;
+  return inheritedLossless || losslessRunEventPayloadKeys.has(key);
+}
+
+function sanitizeRunEventValue(value: unknown, lossless = false): unknown {
+  if (typeof value === "string") return lossless ? sanitizePublicPayloadText(value) : sanitizePublicEvidenceText(value);
+  if (Array.isArray(value)) return value.map((nested) => sanitizeRunEventValue(nested, lossless));
+  if (isRecord(value)) return sanitizeRunEventRecord(value, lossless);
+  return value;
+}
+
+function validOptionalExitCode(value: unknown): boolean {
+  return value === undefined || value === null ||
+    (typeof value === "number" && Number.isInteger(value) && value >= 0);
+}
+
+function validOptionalText(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+export interface DeriveRunEvidenceFromEventsInput {
+  runId: string;
+  events: readonly RunEvent[];
+  initialStatus?: AgentRunStatus;
+  initialCompletedAt?: string | null;
+  initialEvidence?: unknown;
+}
+
+export function deriveRunEvidenceFromRunEvents(input: DeriveRunEvidenceFromEventsInput): RunEvidence | null {
+  const initialEvidence = input.initialEvidence === undefined ? null : parseRunEvidence(input.initialEvidence);
+  if (input.initialEvidence !== undefined && (!initialEvidence || initialEvidence.runId !== input.runId)) return null;
+  if (input.initialStatus !== undefined && !isAgentRunStatus(input.initialStatus)) return null;
+  let status: AgentRunStatus = initialEvidence?.status ?? input.initialStatus ?? "running";
+  let exitCode = initialEvidence?.exitCode ?? null;
+  let changesetId = initialEvidence?.changesetId ?? null;
+  const checks = [...(initialEvidence?.checks ?? [])];
+  const artifacts = [...(initialEvidence?.artifacts ?? [])];
+  let review = initialEvidence?.review ?? null;
+  let errorReason = initialEvidence?.errorReason ?? null;
+  let cancelReason = initialEvidence?.cancelReason ?? null;
+  let completedAt = initialEvidence?.completedAt ?? input.initialCompletedAt ?? null;
+  const terminalFromRunRecord = !initialEvidence && isTerminalAgentRunStatus(status);
+  let terminalSeen = initialEvidence ? isTerminalAgentRunStatus(status) : false;
+  let terminalFromError = false;
+
+  for (const candidate of input.events) {
+    const event = parseRunEvent(candidate);
+    if (!event || event.runId !== input.runId) return null;
+    const payload = event.payload;
+    const eventChecks = "checks" in payload ? parseRunEvidenceChecks(payload.checks) : [];
+    if (!eventChecks) return null;
+
+    if (event.kind === "status") {
+      if (!isAgentRunStatus(payload.status)) return null;
+      if (!terminalSeen) {
+        status = reduceAgentRunStatus(status, payload.status);
+        if (typeof payload.exitCode === "number") exitCode = payload.exitCode;
+        if (status === "cancelled") cancelReason = sanitizePublicEvidenceText(payload.reason) || cancelReason;
+        if (status === "failed") errorReason = sanitizePublicEvidenceText(payload.errorReason) || errorReason;
+        terminalSeen = terminalFromRunRecord
+          ? isTerminalAgentRunStatus(payload.status)
+          : isTerminalAgentRunStatus(status);
+        if (terminalSeen && !completedAt) completedAt = event.timestamp;
+        if (terminalSeen) terminalFromError = false;
+      }
+      checks.push(...eventChecks);
+    }
+
+    if (event.kind === "error" && !terminalSeen) {
+      if (terminalFromRunRecord) {
+        if (status === "failed") errorReason = sanitizePublicEvidenceText(payload.message) || errorReason;
+      } else {
+        status = "failed";
+        errorReason = sanitizePublicEvidenceText(payload.message) || "Adapter error";
+        completedAt = event.timestamp;
+        terminalSeen = true;
+        terminalFromError = true;
+      }
+    }
+
+    if (event.kind === "evidence") {
+      if (!terminalSeen || (terminalFromError && !initialEvidence && exitCode === null)) {
+        if (typeof payload.exitCode === "number") exitCode = payload.exitCode;
+      }
+      changesetId = sanitizePublicEvidenceText(payload.changesetId) || changesetId;
+      checks.push(...eventChecks);
+      if ("artifacts" in payload) {
+        const eventArtifacts = parseRunEvidenceArtifacts(payload.artifacts);
+        if (!eventArtifacts) return null;
+        artifacts.push(...eventArtifacts);
+      }
+      if ("review" in payload) {
+        if (payload.review === null) {
+          review = null;
+        } else {
+          const parsedReview = parseRunEvidenceChecks([payload.review]);
+          if (!parsedReview || parsedReview.length !== 1) return null;
+          review = parsedReview[0] ?? null;
+        }
+      }
+    }
+  }
+
+  return sanitizeTrustedRunEvidence({
+    runId: input.runId,
+    status,
+    exitCode,
+    changesetId,
+    checks,
+    artifacts,
+    review,
+    errorReason,
+    cancelReason,
+    completedAt,
+  });
+}
+
+function isRunEventKind(value: unknown): value is RunEventKind {
+  return value === "output" || value === "status" || value === "error" || value === "approval" ||
+    value === "progress" || value === "evidence" || value === "changes";
+}
+
+function isAgentRunStatus(value: unknown): value is AgentRunStatus {
+  return value === "queued" ||
+    value === "running" ||
+    value === "waiting-input" ||
+    value === "requires-approval" ||
+    value === "succeeded" ||
+    value === "failed" ||
+    value === "cancelled" ||
+    value === "timed-out";
 }
 
 export interface ImportedProject {
@@ -920,6 +1551,7 @@ export interface CanvasNode {
   executable?: boolean;
   laneKind?: WorkflowLaneKind;
   semanticSubtype?: WorkflowLaneSemanticSubtype;
+  requiredEvidence?: string[];
   runtimePolicy?: WorkflowRuntimePolicy;
   userDecision?: UserDecisionProjection;
   runtime?: NodeRuntimeState;
@@ -934,6 +1566,7 @@ export interface CanvasNode {
   runId: string;
   changesetId: string;
   output: string[];
+  outputDeltas?: RunEvent[];
   worktree: WorktreeMetadata;
   context: CanvasNodeContext;
 }
@@ -1035,22 +1668,47 @@ export interface RunEvidenceSummary {
 
 export function hasConcreteRunEvidence(evidence: RunEvidence | null | undefined): boolean {
   if (!evidence) return false;
-  if (evidence.exitCode === 0) return true;
-  if (evidence.changesetId) return true;
-  if (evidence.artifacts.length > 0) return true;
-  if (evidence.review?.status === "passed") return true;
-  return evidence.checks.some((check) => check.status === "passed");
+  const safeEvidence = parseRunEvidence(evidence);
+  if (!safeEvidence) return false;
+  if (safeEvidence.exitCode === 0) return true;
+  if (safeEvidence.changesetId) return true;
+  if (safeEvidence.artifacts.length > 0) return true;
+  if (safeEvidence.review?.status === "passed") return true;
+  return safeEvidence.checks.some((check) => check.status === "passed");
+}
+
+export type RunEvidenceCompletionContext =
+  | { source: "current"; expectedArtifactContract: boolean }
+  | { source: "legacy-disk"; expectedArtifactContract: false };
+
+export function isSuccessfulRunEvidence(
+  evidence: RunEvidence | null | undefined,
+  context: RunEvidenceCompletionContext,
+): boolean {
+  if (!evidence) return false;
+  const safeEvidence = parseRunEvidence(evidence);
+  if (!safeEvidence || safeEvidence.status !== "succeeded") return false;
+  const artifactChecks = safeEvidence.checks.filter((check) => check.kind === "artifact");
+  if (context.expectedArtifactContract) {
+    return safeEvidence.exitCode === 0 &&
+      artifactChecks.some((check) => check.status === "passed") &&
+      safeEvidence.artifacts.length > 0;
+  }
+  if (safeEvidence.exitCode === 0) return true;
+  if (context.source !== "legacy-disk" || safeEvidence.exitCode !== null || artifactChecks.length > 0) return false;
+  return Boolean(
+    safeEvidence.changesetId ||
+    safeEvidence.review?.status === "passed" ||
+    safeEvidence.checks.some((check) => check.status === "passed"),
+  );
 }
 
 export function summarizeRunEvidence(input: RunEvidenceSummaryInput = {}): RunEvidenceSummary {
-  const runEvidence = input.runEvidence ?? null;
+  const sourceEvidence = input.runEvidence ?? null;
+  const runEvidence = sourceEvidence ? parseRunEvidence(sourceEvidence) : null;
   const checks = runEvidence?.checks ?? [];
   const reviewSummary = runEvidence?.review ? formatEvidenceCheck(runEvidence.review) : null;
-  const artifactPaths = runEvidence?.artifacts.length ? runEvidence.artifacts : input.expectedArtifacts ?? [];
-  const artifactSummary = formatArtifacts(
-    artifactPaths,
-    runEvidence?.artifacts.length ? "recorded" : input.expectedArtifacts?.length ? "expected" : "none",
-  );
+  const artifactSummary = formatArtifacts(runEvidence?.artifacts ?? []);
   const reason = runEvidence ? runEvidenceReason(runEvidence) : null;
   const latestFailedCheck = latestFailedCheckSummary(checks);
   const changes = summarizeChangeEvidence(input.reconciliation ?? null, input.changeset ?? null);
@@ -1182,10 +1840,9 @@ function formatEvidenceCheck(check: EvidenceCheck): string {
   return `${check.kind} [${check.name}]: ${check.status}${detail ? ` - ${detail}` : ""}`;
 }
 
-function formatArtifacts(paths: string[], source: "recorded" | "expected" | "none"): string {
-  if (!paths.length || source === "none") return "None";
-  const label = source === "expected" ? " expected" : "";
-  return `${paths.length}${label} (${paths.join(", ")})`;
+function formatArtifacts(paths: string[]): string {
+  if (!paths.length) return "None";
+  return `${paths.length} (${paths.join(", ")})`;
 }
 
 function commitEvidenceSummary(commitEvidence: EvidenceCommitSummary | null): string | null {
@@ -1244,7 +1901,10 @@ export function deriveNodeStatusFromEvidence(
     return "running";
   }
   if (run.status === "succeeded") {
-    return hasConcreteRunEvidence(evidence) ? "completed" : "failed";
+    const safeEvidence = evidence ? parseRunEvidence(evidence) : null;
+    return isSuccessfulRunEvidence(safeEvidence, { source: "current", expectedArtifactContract: false })
+      ? "completed"
+      : "failed";
   }
   return "failed";
 }

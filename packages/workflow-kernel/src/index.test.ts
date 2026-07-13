@@ -31,6 +31,509 @@ const stableFlowLaneStatusContract: Record<FlowLaneStatus, true> = {
 };
 
 describe("Flow Kernel intent compiler", () => {
+  it("rejects current empty null-exit success through stale outer and segment success", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.lane.declared", { lane: lane("lane-validation", "validation") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-implementation-validation", sourceLaneId: "lane-implementation", targetLaneId: "lane-validation" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-empty", laneId: "lane-implementation", runId: "run-empty", status: "running" },
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-implementation",
+        segmentId: "segment-empty",
+        evidence: {
+          id: "evidence-empty",
+          kind: "run-exit",
+          status: "passed",
+          checks: ["outer:passed"],
+          artifacts: [],
+          runEvidence: terminalEvidence("run-empty", "succeeded", null, [], []),
+        },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-implementation",
+        segmentId: "segment-empty",
+        status: "succeeded",
+        exitCode: null,
+      }),
+    ]);
+
+    expect(projection.evidence[0]?.status).toBe("failed");
+    expect(projection.segments.find((segment) => segment.id === "segment-empty")?.status).toBe("failed");
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(nodeStatusProjectionForFlowLane(projection.lanes.find((lane) => lane.id === "lane-implementation")!).status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((lane) => lane.id)).not.toContain("lane-validation");
+  });
+
+  it("requires artifact-passed evidence for an artifact-declared lane", () => {
+    const browserLane = {
+      ...lane("lane-browser", "browser_validation"),
+      title: "Capture browser screenshot",
+      requiredEvidence: ["browser", "screenshot"],
+    };
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: browserLane }),
+      event("workflow.lane.declared", { lane: lane("lane-review", "review") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-browser-review", sourceLaneId: "lane-browser", targetLaneId: "lane-review" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-browser", laneId: "lane-browser", runId: "run-browser", status: "running" },
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-browser",
+        segmentId: "segment-browser",
+        evidence: {
+          id: "evidence-browser",
+          kind: "run-exit",
+          status: "passed",
+          compatibilitySource: "legacy-disk",
+          checks: ["run-exit:passed"],
+          artifacts: [],
+          runEvidence: terminalEvidence("run-browser", "succeeded", 0, [
+            { kind: "run-exit", name: "Codex CLI exit", status: "passed" },
+          ], []),
+        },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-browser",
+        segmentId: "segment-browser",
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    expect(projection.evidence[0]?.status).toBe("failed");
+    expect(projection.segments.find((segment) => segment.id === "segment-browser")?.status).toBe("failed");
+    expect(projection.lanes.find((lane) => lane.id === "lane-browser")?.status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((lane) => lane.id)).not.toContain("lane-review");
+  });
+
+  it("requires strict nested RunEvidence before an artifact lane can complete", () => {
+    const browserLane = {
+      ...lane("lane-browser", "browser_validation"),
+      title: "Capture browser screenshot",
+      requiredEvidence: ["browser", "screenshot"],
+    };
+    const prefix = [
+      event("workflow.lane.declared", { lane: browserLane }),
+      event("workflow.lane.declared", { lane: lane("lane-review", "review") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-browser-review", sourceLaneId: "lane-browser", targetLaneId: "lane-review" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-browser", laneId: "lane-browser", runId: "run-browser", status: "running" },
+      }),
+    ];
+    const outerOnly = reduceWorkflowEvents([
+      ...prefix,
+      event("workflow.evidence.recorded", {
+        laneId: "lane-browser",
+        segmentId: "segment-browser",
+        evidence: {
+          id: "evidence-browser-outer-only",
+          kind: "run-exit",
+          status: "passed",
+          checks: ["run-exit:passed"],
+          artifacts: [],
+        },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-browser",
+        segmentId: "segment-browser",
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    expect(outerOnly.evidence.at(-1)?.status).toBe("failed");
+    expect(outerOnly.segments.find((segment) => segment.id === "segment-browser")?.status).toBe("failed");
+    expect(outerOnly.lanes.find((lane) => lane.id === "lane-browser")?.status).toBe("failed");
+    expect(nodeStatusProjectionForFlowLane(outerOnly.lanes.find((lane) => lane.id === "lane-browser")!).status).toBe("failed");
+    expect(scheduleReadyLanes(outerOnly, { allowedParallelism: 2 }).map((lane) => lane.id)).not.toContain("lane-review");
+
+    const strictNested = reduceWorkflowEvents([
+      ...prefix,
+      event("workflow.evidence.recorded", {
+        laneId: "lane-browser",
+        segmentId: "segment-browser",
+        evidence: {
+          id: "evidence-browser-strict",
+          kind: "run-exit",
+          status: "passed",
+          checks: [],
+          artifacts: [],
+          runEvidence: terminalEvidence("run-browser", "succeeded", 0, [
+            { kind: "run-exit", name: "Codex CLI exit", status: "passed" },
+            { kind: "artifact", name: "Expected artifacts", status: "passed" },
+          ], [".devflow/acceptance/browser.png"]),
+        },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-browser",
+        segmentId: "segment-browser",
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    expect(strictNested.evidence.at(-1)?.status).toBe("passed");
+    expect(strictNested.segments.find((segment) => segment.id === "segment-browser")?.status).toBe("succeeded");
+    expect(strictNested.lanes.find((lane) => lane.id === "lane-browser")?.status).toBe("completed");
+    expect(scheduleReadyLanes(strictNested, { allowedParallelism: 2 }).map((lane) => lane.id)).toContain("lane-review");
+  });
+
+  it("removes outer-only artifact payloads before publishing a failed projection", () => {
+    const hostPath = "/Users/alice/.ssh/id_rsa";
+    const rawCheck = `token=outer-secret path=${hostPath}`;
+    const rawDetail = `Bearer outer-secret ${hostPath}`;
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-artifact", "validation"),
+          title: "Validate release package",
+          requiredEvidence: ["artifact"],
+        },
+      }),
+      event("workflow.lane.declared", { lane: lane("lane-review", "review") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-artifact-review", sourceLaneId: "lane-artifact", targetLaneId: "lane-review" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-artifact", laneId: "lane-artifact", runId: "run-artifact", status: "running" },
+      }),
+      {
+        ...event("workflow.evidence.recorded", {
+          laneId: "lane-artifact",
+          segmentId: "segment-artifact",
+          evidence: {
+            id: "evidence-artifact-outer-only",
+            kind: "run-exit",
+            status: "passed",
+            checks: [rawCheck],
+            artifacts: [hostPath],
+            detail: rawDetail,
+          },
+        }),
+        id: "event-artifact-outer-only",
+        idempotencyKey: "event-artifact-outer-only",
+      },
+      event("workflow.segment.finished", {
+        laneId: "lane-artifact",
+        segmentId: "segment-artifact",
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    const evidence = projection.evidence.at(-1);
+    expect(evidence).toMatchObject({ status: "failed", checks: [], artifacts: [] });
+    expect(evidence?.detail).toBeUndefined();
+    expect(evidence?.runEvidence).toBeUndefined();
+    expect(projection.segments.find((segment) => segment.id === "segment-artifact")?.status).toBe("failed");
+    expect(projection.lanes.find((item) => item.id === "lane-artifact")?.status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((item) => item.id)).not.toContain("lane-review");
+    const serialized = JSON.stringify(projection);
+    for (const raw of [hostPath, rawCheck, rawDetail, "outer-secret"]) {
+      expect(serialized).not.toContain(raw);
+    }
+  });
+
+  it("rejects a current event that forges legacy disk compatibility", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.lane.declared", { lane: lane("lane-validation", "validation") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-implementation-validation", sourceLaneId: "lane-implementation", targetLaneId: "lane-validation" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-legacy-disk", laneId: "lane-implementation", runId: "run-legacy-disk", status: "running" },
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-implementation",
+        segmentId: "segment-legacy-disk",
+        evidence: {
+          id: "evidence-legacy-disk",
+          kind: "run-exit",
+          status: "passed",
+          compatibilitySource: "legacy-disk",
+          checks: ["test:pnpm test:passed"],
+          artifacts: [],
+          runEvidence: terminalEvidence("run-legacy-disk", "succeeded", null, [
+            { kind: "run-exit", name: "Historical verification", status: "passed" },
+          ], []),
+        },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-implementation",
+        segmentId: "segment-legacy-disk",
+        status: "succeeded",
+        exitCode: null,
+      }),
+    ]);
+
+    expect(projection.evidence[0]?.status).toBe("failed");
+    expect(projection.segments.find((segment) => segment.id === "segment-legacy-disk")?.status).toBe("failed");
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((lane) => lane.id)).not.toContain("lane-validation");
+  });
+
+  it("canonicalizes every outer evidence field from failed nested evidence", () => {
+    const rawOuterArtifact = "/Users/alice/private/outer.png";
+    const rawOuterDetail = "Bearer outer-secret path=/Users/alice/private/repo";
+    const rawNestedDetail = "token=nested-secret path=C:\\Users\\alice\\private";
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.lane.declared", { lane: lane("lane-validation", "validation") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-implementation-validation", sourceLaneId: "lane-implementation", targetLaneId: "lane-validation" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-unsafe-outer", laneId: "lane-implementation", runId: "run-unsafe-outer", status: "running" },
+      }),
+      {
+        ...event("workflow.evidence.recorded", {
+          laneId: "lane-implementation",
+          segmentId: "segment-unsafe-outer",
+          evidence: {
+            id: "evidence-unsafe-outer",
+            kind: "run-exit",
+            status: "passed",
+            checks: [rawOuterDetail],
+            artifacts: [".devflow/acceptance/present.png", rawOuterArtifact],
+            detail: rawOuterDetail,
+            runEvidence: terminalEvidence("run-unsafe-outer", "succeeded", 0, [
+              { kind: "artifact", name: "Expected artifacts", status: "failed", detail: rawNestedDetail },
+            ], [".devflow/acceptance/present.png"]),
+          },
+        }),
+        id: "workflow.evidence.recorded:unsafe-outer",
+        idempotencyKey: "workflow.evidence.recorded:unsafe-outer",
+      },
+      event("workflow.segment.finished", {
+        laneId: "lane-implementation",
+        segmentId: "segment-unsafe-outer",
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    const serialized = JSON.stringify(projection);
+    expect(projection.evidence[0]).toMatchObject({ status: "failed", artifacts: [] });
+    expect(projection.evidence[0]?.runEvidence).toMatchObject({ status: "failed", artifacts: [] });
+    expect(projection.segments.find((segment) => segment.id === "segment-unsafe-outer")?.status).toBe("failed");
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((lane) => lane.id)).not.toContain("lane-validation");
+    for (const raw of [rawOuterArtifact, rawOuterDetail, "nested-secret", "C:\\Users\\alice\\private"]) {
+      expect(serialized).not.toContain(raw);
+    }
+  });
+
+  it.each([
+    ["timed-out", "timed-out", "run-timeout", "failed", "evidence-first"],
+    ["failed", "failed", "run-exit", "failed", "evidence-first"],
+    ["cancelled", "cancelled", "run-exit", "skipped", "evidence-first"],
+    ["timed-out", "timed-out", "run-timeout", "failed", "success-first"],
+    ["failed", "failed", "run-exit", "failed", "success-first"],
+    ["cancelled", "cancelled", "run-exit", "skipped", "success-first"],
+  ] as const)(
+    "keeps nested %s as segment %s (%s/%s) when stale success is %s",
+    (runStatus, segmentStatus, checkKind, evidenceStatus, order) => {
+    const terminal = event("workflow.evidence.recorded", {
+      laneId: "lane-implementation",
+      segmentId: `segment-${runStatus}`,
+      evidence: {
+        id: `evidence-${runStatus}`,
+        kind: "run-exit",
+        status: "passed",
+        checks: ["outer:passed"],
+        artifacts: [],
+        runEvidence: terminalEvidence(`run-${runStatus}`, runStatus, null, [
+          { kind: checkKind, name: "Terminal evidence", status: runStatus === "cancelled" ? "skipped" : "failed" },
+        ], []),
+      },
+    });
+    const staleSuccess = event("workflow.segment.finished", {
+      laneId: "lane-implementation",
+      segmentId: `segment-${runStatus}`,
+      status: "succeeded",
+      exitCode: 0,
+    });
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.lane.declared", { lane: lane("lane-validation", "validation") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-implementation-validation", sourceLaneId: "lane-implementation", targetLaneId: "lane-validation" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: `segment-${runStatus}`, laneId: "lane-implementation", runId: `run-${runStatus}`, status: "running" },
+      }),
+      ...(order === "evidence-first" ? [terminal, staleSuccess] : [staleSuccess, terminal]),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-implementation",
+        segmentId: `segment-${runStatus}`,
+        evidence: {
+          id: `evidence-${runStatus}-conflicting-success`,
+          kind: "run-exit",
+          status: "passed",
+          checks: [],
+          artifacts: [],
+          runEvidence: terminalEvidence(`run-${runStatus}`, "succeeded", 0, [
+            { kind: "run-exit", name: "Late success", status: "passed" },
+          ], []),
+        },
+      }),
+    ]);
+
+    expect(projection.evidence[0]?.runEvidence?.status).toBe(runStatus);
+    expect(projection.evidence[0]?.status).toBe(evidenceStatus);
+    expect(projection.evidence[0]?.runEvidence).toMatchObject({
+      exitCode: null,
+      completedAt: "2026-06-14T00:00:01.000Z",
+      cancelReason: runStatus === "cancelled" ? "Run cancelled." : null,
+    });
+    expect(projection.evidence.at(-1)?.status).toBe(evidenceStatus);
+    expect(projection.evidence.at(-1)?.runEvidence?.status).toBe(runStatus);
+    expect(projection.events.some((item) => item.id.includes("conflicting-success"))).toBe(false);
+    expect(projection.segments.find((segment) => segment.id === `segment-${runStatus}`)?.status).toBe(segmentStatus);
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((lane) => lane.id)).not.toContain("lane-validation");
+    },
+  );
+
+  it("deduplicates an exact cancelled terminal replay without changing terminal identity", () => {
+    const cancelled = event("workflow.evidence.recorded", {
+      laneId: "lane-implementation",
+      segmentId: "segment-cancelled-replay",
+      evidence: {
+        id: "evidence-cancelled-replay",
+        kind: "run-exit",
+        status: "skipped",
+        checks: ["run-exit:Terminal evidence:skipped"],
+        artifacts: [],
+        runEvidence: terminalEvidence("run-cancelled-replay", "cancelled", 143, [
+          { kind: "run-exit", name: "Terminal evidence", status: "skipped" },
+        ], []),
+      },
+    });
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.segment.started", {
+        segment: {
+          id: "segment-cancelled-replay",
+          laneId: "lane-implementation",
+          runId: "run-cancelled-replay",
+          status: "running",
+        },
+      }),
+      cancelled,
+      cancelled,
+    ]);
+
+    expect(projection.events.filter((item) => item.id === cancelled.id)).toHaveLength(1);
+    expect(projection.evidence).toHaveLength(1);
+    expect(projection.evidence[0]?.runEvidence).toMatchObject({
+      status: "cancelled",
+      exitCode: 143,
+      cancelReason: "Run cancelled.",
+      completedAt: "2026-06-14T00:00:01.000Z",
+    });
+    expect(projection.segments[0]?.status).toBe("cancelled");
+    expect(projection.lanes[0]?.status).toBe("failed");
+  });
+
+  it("fails the outer evidence, segment, lane, and downstream schedule for nested artifact failure", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.lane.declared", { lane: lane("lane-validation", "validation") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-implementation-validation", sourceLaneId: "lane-implementation", targetLaneId: "lane-validation" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-1", laneId: "lane-implementation", runId: "run-1", status: "running" },
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-implementation",
+        segmentId: "segment-1",
+        evidence: {
+          id: "evidence-1",
+          kind: "run-exit",
+          status: "passed",
+          checks: [],
+          artifacts: [],
+          runEvidence: {
+            runId: "run-1",
+            status: "succeeded",
+            exitCode: 0,
+            changesetId: null,
+            checks: [
+              { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+            ],
+            artifacts: [".devflow/acceptance/result.png"],
+            review: null,
+            errorReason: null,
+            cancelReason: null,
+            completedAt: "2026-06-14T00:00:01.000Z",
+          },
+        },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-implementation",
+        segmentId: "segment-1",
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+
+    expect(projection.evidence[0]?.runEvidence).toMatchObject({
+      status: "failed",
+      artifacts: [],
+    });
+    expect(projection.evidence[0]?.status).toBe("failed");
+    expect(projection.segments.find((segment) => segment.id === "segment-1")?.status).toBe("failed");
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((lane) => lane.id)).not.toContain("lane-validation");
+  });
+
+  it("rejects malformed nested RunEvidence instead of completing its lane", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-1", laneId: "lane-implementation", runId: "run-1", status: "running" },
+      }),
+      event("workflow.evidence.recorded", {
+        laneId: "lane-implementation",
+        segmentId: "segment-1",
+        evidence: {
+          id: "evidence-1",
+          kind: "run-exit",
+          status: "passed",
+          checks: [],
+          artifacts: [],
+          runEvidence: {
+            runId: "run-1",
+            status: "succeeded",
+            exitCode: 0,
+            changesetId: null,
+            checks: [{ kind: "unknown-kind", name: "Unsafe", status: "passed" }],
+            artifacts: [],
+            review: null,
+            errorReason: null,
+            cancelReason: null,
+            completedAt: "2026-06-14T00:00:01.000Z",
+          },
+        },
+      }),
+    ]);
+
+    expect(projection.evidence[0]?.runEvidence).toBeUndefined();
+    expect(projection.evidence[0]?.status).toBe("failed");
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+  });
+
   it("replays an explicit lane reassignment without changing lane execution facts", () => {
     const declared = event("workflow.lane.declared", {
       lane: {
@@ -652,6 +1155,7 @@ describe("Flow Kernel intent compiler", () => {
         laneId: "lane-understand-app",
         segmentId: "segment-understand-1",
         text: "Done; continue.",
+        delta: runDelta("run-understand-1", "output", { text: "Done; continue." }),
       }),
       event("workflow.segment.finished", {
         laneId: "lane-understand-app",
@@ -676,6 +1180,78 @@ describe("Flow Kernel intent compiler", () => {
     expect(scheduleReadyLanes(withEvidence, { allowedParallelism: 2 }).map((lane) => lane.id)).toEqual([
       "lane-change-badge",
     ]);
+  });
+
+  it.each([
+    ["omitted", {}],
+    ["empty", { requiredEvidence: [] }],
+  ])("derives canonical browser evidence when an external lane declaration is %s", (_caseName, evidenceInput) => {
+    const parsed = parseWorkflowIntent(JSON.stringify({
+      intentId: `intent-browser-${_caseName}`,
+      sessionId: "session-1",
+      operations: [{
+        type: "ProposeLanes",
+        lanes: [{
+          id: `lane-browser-${_caseName}`,
+          kind: "browser_validation",
+          title: "Capture browser screenshot",
+          agentKind: "codex",
+          ...evidenceInput,
+        }],
+      }],
+    }));
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.reason);
+
+    const compiled = compileWorkflowIntent(
+      parsed.intent,
+      emptyProjection("session-1"),
+      createDefaultFlowPolicy(),
+      now,
+    );
+    const laneEvent = compiled.events.find((item) => item.kind === "workflow.lane.declared");
+    const projection = reduceWorkflowEvents(compiled.events);
+
+    expect((laneEvent?.payload.lane as { requiredEvidence?: string[] }).requiredEvidence).toEqual([
+      "browser",
+      "screenshot",
+    ]);
+    expect(projection.lanes[0]?.requiredEvidence).toEqual(["browser", "screenshot"]);
+  });
+
+  it("unions derived browser evidence without allowing prose neighbors to create artifact contracts", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-browser", "browser_screenshot_validation"),
+          title: "Capture browser screenshot",
+          requiredEvidence: ["test", "browser", "TEST"],
+        },
+      }),
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-negative-title", "implementation"),
+          title: "Avoid browser work in this implementation",
+          requiredEvidence: undefined,
+        },
+      }),
+      event("workflow.lane.declared", {
+        lane: {
+          ...lane("lane-negative-brief", "validation"),
+          title: "Review platform scope",
+          brief: "Discuss whether screenshot work should be avoided.",
+          requiredEvidence: undefined,
+        },
+      }),
+    ]);
+
+    expect(projection.lanes.find((item) => item.id === "lane-browser")?.requiredEvidence).toEqual([
+      "test",
+      "browser",
+      "screenshot",
+    ]);
+    expect(projection.lanes.find((item) => item.id === "lane-negative-title")?.requiredEvidence).toEqual([]);
+    expect(projection.lanes.find((item) => item.id === "lane-negative-brief")?.requiredEvidence).toEqual([]);
   });
 
   it("strips untrusted runtime controls from Hermes lane suggestions while preserving agy agent kind", () => {
@@ -883,7 +1459,12 @@ describe("Flow Kernel gate engine and scheduler", () => {
     const projection = reduceWorkflowEvents([
       event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
       event("workflow.segment.started", { segment: { id: "segment-1", laneId: "lane-implementation", runId: "run-1", status: "running" } }),
-      event("workflow.segment.output_delta", { laneId: "lane-implementation", segmentId: "segment-1", text: "done, completed, ship it" }),
+      event("workflow.segment.output_delta", {
+        laneId: "lane-implementation",
+        segmentId: "segment-1",
+        text: "done, completed, ship it",
+        delta: runDelta("run-1", "output", { text: "done, completed, ship it" }),
+      }),
       event("workflow.segment.finished", { laneId: "lane-implementation", segmentId: "segment-1", status: "succeeded", exitCode: 0 }),
     ]);
 
@@ -899,6 +1480,144 @@ describe("Flow Kernel gate engine and scheduler", () => {
     ]);
 
     expect(withEvidence.lanes.find((item) => item.id === "lane-implementation")?.status).toBe("completed");
+  });
+
+  it("preserves an empty typed output delta without collapsing it", () => {
+    const delta = {
+      protocolVersion: 1 as const,
+      runId: "run-empty-output",
+      seq: 1,
+      timestamp: "2026-06-10T00:00:01.000Z",
+      kind: "output" as const,
+      payload: { text: "" },
+    };
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.segment.output_delta", {
+        laneId: "lane-implementation",
+        segmentId: "segment-empty-output",
+        text: "",
+        delta,
+      }),
+    ]);
+    const projectedLane = projection.lanes.find((item) => item.id === "lane-implementation");
+
+    expect(projectedLane?.output).toEqual([""]);
+    expect(projectedLane?.outputDeltas).toEqual([delta]);
+  });
+
+  it.each([
+    [
+      "malformed delta with forged text",
+      { text: "forged", delta: { malformed: true } },
+    ],
+    [
+      "typed text with mismatched outer text",
+      {
+        text: "forged",
+        delta: runDelta("run-mismatched-text", "output", { text: "typed" }),
+      },
+    ],
+    [
+      "patch-only delta with forged outer text",
+      {
+        text: "forged",
+        delta: runDelta("run-patch-forged-text", "changes", {
+          patch: { path: "src/a.ts", hunks: [{ header: "@@ -1 +1 @@", content: "-a\n+b\n" }] },
+        }),
+      },
+    ],
+    [
+      "disallowed typed status event",
+      {
+        delta: runDelta("run-status-delta", "status", { status: "succeeded", exitCode: 0 }),
+      },
+    ],
+  ] as const)("drops invalid workflow output delta before projection: %s", (_label, payload) => {
+    const invalid = event("workflow.segment.output_delta", {
+      laneId: "lane-implementation",
+      segmentId: "segment-invalid-output",
+      ...payload,
+    });
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      invalid,
+    ]);
+    const projectedLane = projection.lanes.find((item) => item.id === "lane-implementation");
+
+    expect(projection.events.some((item) => item.id === invalid.id)).toBe(false);
+    expect(projectedLane?.output).toEqual([]);
+    expect(projectedLane?.outputDeltas).toBeUndefined();
+    expect(projectedLane?.status).toBe("pending");
+  });
+
+  it("preserves a valid exact typed text delta", () => {
+    const delta = runDelta("run-exact-text", "output", { text: "  exact output\n" });
+    const output = event("workflow.segment.output_delta", {
+      laneId: "lane-implementation",
+      segmentId: "segment-exact-text",
+      text: "  exact output\n",
+      delta,
+    });
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      output,
+    ]);
+
+    expect(projection.events.some((item) => item.id === output.id)).toBe(true);
+    expect(projection.lanes[0]?.output).toEqual(["  exact output\n"]);
+    expect(projection.lanes[0]?.outputDeltas).toEqual([delta]);
+  });
+
+  it("preserves typed patch, diff, and code without synthesizing outer text", () => {
+    const delta = runDelta("run-structured-change", "changes", {
+      patch: { path: "src/a.ts", hunks: [{ header: "@@ -1 +1 @@", content: "-a\n+b\n" }] },
+      diff: { path: "src/a.ts", lines: [{ type: "add", content: "+b" }] },
+      code: [{ language: "typescript", body: "const value = 1;\n" }],
+    });
+    const output = event("workflow.segment.output_delta", {
+      laneId: "lane-implementation",
+      segmentId: "segment-structured-change",
+      delta,
+    });
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      output,
+    ]);
+
+    expect(projection.events.some((item) => item.id === output.id)).toBe(true);
+    expect(projection.lanes[0]?.output).toEqual([]);
+    expect(projection.lanes[0]?.outputDeltas).toEqual([delta]);
+    expect(projection.events.find((item) => item.id === output.id)?.payload).not.toHaveProperty("text");
+  });
+
+  it.each([
+    ["without provenance", {}, {}],
+    ["with forged payload provenance", { compatibilitySource: "legacy-disk" }, {}],
+    [
+      "with trusted-looking event metadata",
+      {},
+      { source: "persistence-migration", idempotencyKey: "legacy-disk:output:1" },
+    ],
+  ] as const)("drops text-only workflow output unconditionally: %s", (_label, payload, metadata) => {
+    const output = {
+      ...event("workflow.segment.output_delta", {
+        laneId: "lane-implementation",
+        segmentId: "segment-legacy-text",
+        text: "legacy output",
+        ...payload,
+      }),
+      ...metadata,
+    };
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      output,
+    ]);
+
+    expect(projection.events.some((item) => item.id === output.id)).toBe(false);
+    expect(projection.lanes[0]?.output).toEqual([]);
+    expect(projection.lanes[0]?.outputDeltas).toBeUndefined();
+    expect(projection.lanes[0]?.status).toBe("pending");
   });
 
   it("completes only commit lanes from workflow.commit.created events", () => {
@@ -1917,6 +2636,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
         laneId: "lane-b",
         segmentId: "segment-b-1",
         text: "implementation output\n",
+        delta: runDelta("run-b-1", "output", { text: "implementation output\n" }),
       }),
       event("workflow.evidence.recorded", {
         laneId: "lane-b",
@@ -5080,6 +5800,21 @@ function event(kind: FlowEvent["kind"], payload: Record<string, unknown>): FlowE
   };
 }
 
+function runDelta(
+  runId: string,
+  kind: "output" | "progress" | "changes" | "status",
+  payload: Record<string, unknown>,
+) {
+  return {
+    protocolVersion: 1 as const,
+    runId,
+    seq: 1,
+    timestamp: "2026-06-14T00:00:01.000Z",
+    kind,
+    payload,
+  };
+}
+
 function lane(
   id: string,
   kind: string,
@@ -5096,6 +5831,27 @@ function lane(
     fileScopes,
     packageScopes,
     requiredEvidence: [],
+  };
+}
+
+function terminalEvidence(
+  runId: string,
+  status: "succeeded" | "failed" | "cancelled" | "timed-out",
+  exitCode: number | null,
+  checks: Array<{ kind: "run-exit" | "run-timeout" | "artifact"; name: string; status: "passed" | "failed" | "skipped"; detail?: string }>,
+  artifacts: string[],
+) {
+  return {
+    runId,
+    status,
+    exitCode,
+    changesetId: null,
+    checks,
+    artifacts,
+    review: null,
+    errorReason: status === "failed" ? "Run failed." : null,
+    cancelReason: status === "cancelled" ? "Run cancelled." : null,
+    completedAt: "2026-06-14T00:00:01.000Z",
   };
 }
 

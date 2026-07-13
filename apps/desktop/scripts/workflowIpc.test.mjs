@@ -102,7 +102,18 @@ test("Electron main owns natural workflow IPC channels", async () => {
     main.indexOf("async function getWorkflowStore"),
   );
   assert.match(agentBridgeFactory, /reconcileTerminalRunEvent/);
+  assert.match(agentBridgeFactory, /createDurableRunClaimStore/);
+  assert.match(agentBridgeFactory, /path\.join\(app\.getPath\("userData"\), "run-claims"\)/);
+  assert.match(agentBridgeFactory, /durableRunClaimStore/);
+  assert.match(agentBridgeFactory, /await durableRunClaimStore\.initialize\(\)/);
+  assert.match(agentBridgeFactory, /window\.webContents\.send\("run:event", event\)/);
   assert.match(main, /event\.kind !== "status"/);
+  const outputSummary = main.slice(
+    main.indexOf("function summarizeRunOutput"),
+    main.indexOf("function liveChangesFromRunEvents"),
+  );
+  assert.match(outputSummary, /\.join\(""\)/);
+  assert.doesNotMatch(outputSummary, /\.trim\(\)|\.join\("\\n"\)/);
 
   const workflowEventsHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:events"'),
