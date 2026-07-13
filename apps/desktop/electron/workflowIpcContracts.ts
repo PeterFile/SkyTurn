@@ -7,6 +7,7 @@ export const WORKFLOW_IPC_CHANNELS = {
   applyIntent: "workflow:applyIntent",
   scheduleReady: "workflow:scheduleReady",
   recordRunResult: "workflow:recordRunResult",
+  updateNodePosition: "workflow:nodePosition:update",
   projection: "workflow:projection",
   events: "workflow:events",
   checkpoints: "workflow:checkpoints",
@@ -28,6 +29,31 @@ export const WORKFLOW_IPC_CHANNELS = {
   changeset: "workflow:changeset",
   changesetReconcileFinal: "workflow:changeset:reconcileFinal",
 } as const;
+
+export interface WorkflowNodePositionUpdateInput {
+  sessionId: string;
+  updateId: string;
+  nodeId: string;
+  position: { x: number; y: number };
+}
+
+const MAX_CANVAS_COORDINATE = 1_000_000;
+
+export function normalizeWorkflowNodePositionUpdate(input: unknown): WorkflowNodePositionUpdateInput {
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Node position input must be an object.");
+  const sessionId = boundedIdentifier(input.sessionId, "sessionId");
+  const updateId = boundedIdentifier(input.updateId, "updateId");
+  const nodeId = boundedIdentifier(input.nodeId, "nodeId");
+  if (!isRecord(input.position) || !Number.isFinite(input.position.x) || !Number.isFinite(input.position.y)) {
+    throw workflowIpcError("INVALID_INPUT", "Node position coordinates must be finite numbers.");
+  }
+  const x = Number(input.position.x);
+  const y = Number(input.position.y);
+  if (Math.abs(x) > MAX_CANVAS_COORDINATE || Math.abs(y) > MAX_CANVAS_COORDINATE) {
+    throw workflowIpcError("INVALID_INPUT", `Node position coordinates must be within ${MAX_CANVAS_COORDINATE}.`);
+  }
+  return { sessionId, updateId, nodeId, position: { x, y } };
+}
 
 export type WorkflowIpcErrorCode =
   | "INVALID_INPUT"
@@ -110,4 +136,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function boundedIdentifier(value: unknown, field: string): string {
+  if (!isNonEmptyString(value) || value.trim().length > 200) {
+    throw workflowIpcError("INVALID_INPUT", `${field} must be a non-empty string of at most 200 characters.`);
+  }
+  return value.trim();
 }

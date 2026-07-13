@@ -137,6 +137,25 @@ describe("SkyTurn UI style tokens", () => {
     });
   });
 
+  it("puts keyboard textarea focus on the outer New Session composer only", async () => {
+    const styles = await readSource("./styles.css");
+    const composerFocusBlock = lastCssRuleForSelector(
+      styles,
+      ".new-session-intake:has(.session-panel-input:focus-visible)",
+    );
+    const inputFocusBlock = lastCssRuleForSelector(
+      styles,
+      ".new-session-intake .session-panel-input:focus-visible",
+    );
+
+    expect(composerFocusBlock).toContain("box-shadow: 0 0 0 1px var(--sk-accent) !important");
+    expect(styles).not.toContain(".new-session-intake:focus-within {");
+    expect(styles).not.toContain(".new-session-intake .intake-sheet:focus-within {");
+    expect(inputFocusBlock).toContain("border-color: transparent !important");
+    expect(inputFocusBlock).toContain("box-shadow: none !important");
+    expect(inputFocusBlock).toContain("outline: none !important");
+  });
+
   it("keeps New Session listboxes above the intake form instead of clipping them", async () => {
     const styles = await readSource("./styles.css");
     const targetSelectorBlock = lastCssBlock(styles, ".target-selector-inner");

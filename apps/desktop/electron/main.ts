@@ -13,6 +13,7 @@ import type { AgentDescriptor } from "@skyturn/project-core" with { "resolution-
 import {
   isTrustedPlannerRootStartInput,
   normalizeWorkflowIpcError,
+  normalizeWorkflowNodePositionUpdate,
   rejectMissingWorkflowProjectionNode,
   workflowIpcError,
   workflowStartInputError,
@@ -484,6 +485,7 @@ interface WorkflowStoreHost {
   applyWorkflowIntent(intent: unknown, now: string): unknown;
   scheduleReadyLanes(sessionId: string, input: unknown): unknown;
   recordRunResult(input: unknown): unknown;
+  recordCanvasNodePosition(input: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
@@ -830,6 +832,23 @@ ipcMain.handle("workflow:recordRunResult", async (_event, projectRoot: string, i
     canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 });
+
+ipcMain.handle("workflow:nodePosition:update", workflowHandler(async (projectRoot: string, input: unknown) => {
+  assertKnownProjectRoot(projectRoot);
+  const normalized = normalizeWorkflowNodePositionUpdate(input);
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, normalized.sessionId);
+  const event = store.recordCanvasNodePosition({
+    ...normalized,
+    now: new Date().toISOString(),
+  });
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    event,
+    projection: store.materializeFlowProjection(normalized.sessionId),
+    canvasSession: materializeRendererCanvasSession(store, normalized.sessionId),
+  };
+}));
 
 ipcMain.handle("workflow:projection", workflowHandler(async (projectRoot: string, sessionId: string) => {
   assertKnownProjectRoot(projectRoot);
