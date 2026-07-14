@@ -19,6 +19,9 @@ import {
   changeReviewSummary,
   changeEvidenceFactsForDisplay,
   deriveSessionTarget,
+  createInsertBeforeIntentRequestTracker,
+  INSERT_BEFORE_UNAVAILABLE_ERROR,
+  submitInsertBeforeIntent,
   hasAvailableChangeEvidence,
   hasFinalGitEvidence,
   affectedDownstreamSummaryForDisplay,
@@ -77,6 +80,115 @@ function mockRunEvidence(overrides: Partial<RunEvidence> = {}): RunEvidence {
 }
 
 describe("deriveSessionTarget", () => {
+  it("reuses one insert-before requestId after a committed IPC response is lost", async () => {
+    const tracker = createInsertBeforeIntentRequestTracker(() => "request-1");
+    const requestIds: string[] = [];
+    const durableNodes = [{ id: "lane-target", title: "Target" }];
+    let calls = 0;
+    const insertBefore = async (_root: string, request: { requestId: string }) => {
+      requestIds.push(request.requestId);
+      if (!durableNodes.some((node) => node.id === `clarification-${request.requestId}`)) {
+        durableNodes.unshift({ id: `clarification-${request.requestId}`, title: "Clarification" });
+      }
+      calls += 1;
+      if (calls === 1) throw new Error("response lost after commit");
+      return {
+        canvasSession: { id: "session-1", kind: "canvas", nodes: durableNodes, edges: [] },
+      } as never;
+    };
+    const submit = () => submitInsertBeforeIntent({
+      projectRoot: "/repo",
+      sessionId: "session-1",
+      targetLaneId: "lane-target",
+      requestId: tracker.requestIdFor("session-1", "lane-target"),
+      insertBefore: insertBefore as never,
+      replaceCanvasSession: () => tracker.clear("session-1", "lane-target"),
+    });
+
+    await expect(submit()).rejects.toThrow("response lost after commit");
+    await expect(submit()).resolves.toBe(true);
+
+    expect(requestIds).toEqual(["request-1", "request-1"]);
+    expect(durableNodes.filter((node) => node.title === "Clarification")).toHaveLength(1);
+  });
+
+  it("keeps separate pending insert-before requestIds when switching targets", () => {
+    let sequence = 0;
+    const tracker = createInsertBeforeIntentRequestTracker(() => `request-${++sequence}`);
+
+    expect(tracker.requestIdFor("session-1", "lane-a")).toBe("request-1");
+    expect(tracker.requestIdFor("session-1", "lane-a")).toBe("request-1");
+    expect(tracker.requestIdFor("session-1", "lane-b")).toBe("request-2");
+    expect(tracker.requestIdFor("session-1", "lane-a")).toBe("request-1");
+  });
+
+  it("reconstructs an insert-before tracker from the durable pending request identity", () => {
+    const restarted = createInsertBeforeIntentRequestTracker(() => "request-after-restart");
+    const requestIdFor = restarted.requestIdFor as (
+      sessionId: string,
+      targetLaneId: string,
+      durableRequestId?: string,
+    ) => string;
+
+    expect(requestIdFor("session-1", "lane-a", "request-before-restart")).toBe("request-before-restart");
+    expect(requestIdFor("session-1", "lane-a")).toBe("request-before-restart");
+  });
+
+  it("submits only insert intent and adopts the authoritative session", async () => {
+    const authoritative = { id: "session-1", kind: "canvas", nodes: [], edges: [] } as never;
+    const requests: unknown[] = [];
+    const replacements: unknown[] = [];
+    const handled = await submitInsertBeforeIntent({
+      projectRoot: "/repo",
+      sessionId: "session-1",
+      targetLaneId: "lane-target",
+      requestId: "request-1",
+      insertBefore: async (_root, request) => {
+        requests.push(request);
+        return { canvasSession: authoritative } as never;
+      },
+      replaceCanvasSession: (session) => replacements.push(session),
+    });
+    expect(handled).toBe(true);
+    expect(requests).toEqual([{ sessionId: "session-1", targetLaneId: "lane-target", requestId: "request-1" }]);
+    expect(replacements).toEqual([authoritative]);
+  });
+
+  it("does not apply browser fallback when desktop insert rejects", async () => {
+    let replaced = false;
+    await expect(submitInsertBeforeIntent({
+      projectRoot: "/repo", sessionId: "session-1", targetLaneId: "lane-target", requestId: "request-1",
+      insertBefore: async () => { throw new Error("response failed"); },
+      replaceCanvasSession: () => { replaced = true; },
+    })).rejects.toThrow("response failed");
+    expect(replaced).toBe(false);
+  });
+
+  it("keeps insert-before intent-only when the desktop backend is unavailable", async () => {
+    const appSource = await readSource("./App.tsx");
+    const insertBefore = appSource.slice(
+      appSource.indexOf("async function insertBefore"),
+      appSource.indexOf("async function openEditor"),
+    );
+    const submitIntent = appSource.slice(
+      appSource.indexOf("export async function submitInsertBeforeIntent"),
+      appSource.indexOf("function upsertProject"),
+    );
+
+    expect(insertBefore).toContain("window.devflow?.workflow?.insertBefore");
+    expect(insertBefore).toContain("getPendingInsertBeforeRequest");
+    expect(insertBefore).toContain("replaceCanvasSession");
+    expect(insertBefore).toContain("setNodeActionError(INSERT_BEFORE_UNAVAILABLE_ERROR)");
+    expect(insertBefore).not.toContain("updateCanvasSession");
+    expect(insertBefore).not.toContain("insertBeforeBrowserFallback");
+    expect(insertBefore).not.toContain("...target,");
+    expect(insertBefore).not.toContain("runtimePolicy");
+    expect(appSource).not.toContain("function insertBeforeBrowserFallback");
+    expect(INSERT_BEFORE_UNAVAILABLE_ERROR).toBe("Insert before is unavailable because the desktop workflow backend is not connected.");
+    expect(submitIntent).toContain("result.canvasSession");
+    expect(submitIntent).toContain("replaceCanvasSession(result.canvasSession)");
+  });
+
   it("uses current_branch executionTarget and selectedBranch", () => {
     const target = deriveSessionTarget("current_branch", "main");
     expect(target).toEqual({

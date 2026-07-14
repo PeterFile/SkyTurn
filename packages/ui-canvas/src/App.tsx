@@ -128,6 +128,7 @@ import {
   canvasViewportSignature,
   shouldAutoFitCanvas,
 } from "./canvasLayout.js";
+
 import DecryptedText from "./DecryptedText.js";
 import {
   chooseActiveSessionIdForProject,
@@ -173,6 +174,8 @@ import {
   buildSelectedNodeActionState,
   type SelectedNodeActionState,
 } from "./nodeActionState.js";
+
+export const INSERT_BEFORE_UNAVAILABLE_ERROR = "Insert before is unavailable because the desktop workflow backend is not connected.";
 
 gsap.registerPlugin(useGSAP);
 
@@ -234,6 +237,7 @@ export default function App() {
   const [nodeActionStatus, setNodeActionStatus] = useState<string | null>(null);
   const startedBridgeRuns = useRef(new Set<string>());
   const completedBridgeRunPersistenceClaims = useRef(new Set<string>());
+  const insertBeforeIntentRequests = useRef(createInsertBeforeIntentRequestTracker(() => globalThis.crypto.randomUUID()));
   const workspaceRef = useRef(workspace);
   const selectedNodeActionScopeRef = useRef<{ sessionId: string; nodeId: string } | null>(null);
   const selectedNodeActionGenerationRef = useRef(0);
@@ -628,6 +632,13 @@ export default function App() {
     }));
   }
 
+  function replaceCanvasSession(session: CanvasSession) {
+    setWorkspace((current) => ({
+      ...current,
+      sessions: current.sessions.map((item) => (item.id === session.id ? session : item)),
+    }));
+  }
+
   function updateNode(nodeId: string, updater: (node: CanvasNode) => CanvasNode) {
     if (!activeSession || activeSession.kind !== "canvas") return;
     updateCanvasSession(activeSession.id, (session) => ({
@@ -903,51 +914,43 @@ export default function App() {
     });
   }
 
-  function insertBefore(nodeId: string) {
-    if (!activeSession || activeSession.kind !== "canvas") return;
+  async function insertBefore(nodeId: string) {
+    if (!activeProject || !activeSession || activeSession.kind !== "canvas") return;
     const target = activeSession.nodes.find((node: CanvasNode) => node.id === nodeId);
     if (!target) return;
 
-    const id = `node-${activeSession.nodes.length + 1}`;
-    const node: CanvasNode = {
-      ...target,
-      id,
-      title: "Clarify dependency",
-      agent: "hermes",
-      status: "pending",
-      progress: "Inserted before target",
-      runId: `run-${activeSession.id}-${id}`,
-      changesetId: `changeset-${activeSession.id}-${id}`,
-      position: { x: Math.max(40, target.position.x - 260), y: target.position.y + 140 },
-      output: ["Dependency inserted before target node."],
-      context: {
-        ...target.context,
-        brief: "Clarify constraints before the selected task runs.",
-        dependencies: target.context.dependencies,
-      },
-      worktree: {
-        ...target.worktree,
-        branchName: `skyturn/${activeSession.id}/${id}`,
-      },
-    };
+    const desktopInsertBefore = window.devflow?.workflow?.insertBefore;
+    const getPendingInsertBeforeRequest = window.devflow?.workflow?.getPendingInsertBeforeRequest;
+    if (desktopInsertBefore && getPendingInsertBeforeRequest) {
+      try {
+        const pending = await getPendingInsertBeforeRequest(activeProject.rootPath, {
+          sessionId: activeSession.id,
+          targetLaneId: nodeId,
+        });
+        const requestId = insertBeforeIntentRequests.current.requestIdFor(
+          activeSession.id,
+          nodeId,
+          pending.requestId ?? undefined,
+        );
+        await submitInsertBeforeIntent({
+          projectRoot: activeProject.rootPath,
+          sessionId: activeSession.id,
+          targetLaneId: nodeId,
+          requestId,
+          insertBefore: desktopInsertBefore,
+          replaceCanvasSession: (session) => {
+            replaceCanvasSession(session);
+            insertBeforeIntentRequests.current.clear(activeSession.id, nodeId);
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setNodeActionError(`Insert before failed: ${message}`);
+      }
+      return;
+    }
 
-    updateCanvasSession(activeSession.id, (session) => ({
-      ...session,
-      nodes: session.nodes
-        .map((item) =>
-          item.id === target.id
-            ? {
-                ...item,
-                context: {
-                  ...item.context,
-                  dependencies: [...new Set([...item.context.dependencies, id])],
-                },
-              }
-            : item,
-        )
-        .concat(node),
-      edges: [...session.edges, { id: `edge-${id}-${target.id}`, source: id, target: target.id }],
-    }));
+    setNodeActionError(INSERT_BEFORE_UNAVAILABLE_ERROR);
   }
 
   async function openEditor(editor: EditorKind, node: CanvasNode) {
@@ -5836,6 +5839,47 @@ function makeProject(project: { name: string; rootPath: string; devflowPath: str
     rootPath: project.rootPath,
     devflowPath: project.devflowPath,
     openedAt: new Date().toISOString(),
+  };
+}
+
+export async function submitInsertBeforeIntent(input: {
+  projectRoot: string;
+  sessionId: string;
+  targetLaneId: string;
+  requestId: string;
+  insertBefore: (projectRoot: string, request: { sessionId: string; targetLaneId: string; requestId: string }) => Promise<{ canvasSession: CanvasSession | null }>;
+  replaceCanvasSession: (session: CanvasSession) => void;
+}): Promise<true> {
+  const result = await input.insertBefore(input.projectRoot, {
+    sessionId: input.sessionId,
+    targetLaneId: input.targetLaneId,
+    requestId: input.requestId,
+  });
+  if (result.canvasSession) input.replaceCanvasSession(result.canvasSession);
+  return true;
+}
+
+export function createInsertBeforeIntentRequestTracker(createRequestId: () => string): {
+  requestIdFor: (sessionId: string, targetLaneId: string, durableRequestId?: string) => string;
+  clear: (sessionId: string, targetLaneId: string) => void;
+} {
+  const pending = new Map<string, string>();
+  return {
+    requestIdFor(sessionId, targetLaneId, durableRequestId) {
+      const key = `${sessionId}:${targetLaneId}`;
+      if (durableRequestId) {
+        pending.set(key, durableRequestId);
+        return durableRequestId;
+      }
+      const existing = pending.get(key);
+      if (existing) return existing;
+      const requestId = createRequestId();
+      pending.set(key, requestId);
+      return requestId;
+    },
+    clear(sessionId, targetLaneId) {
+      pending.delete(`${sessionId}:${targetLaneId}`);
+    },
   };
 }
 

@@ -49,6 +49,31 @@ export interface OpenProjectResult {
   };
 }
 
+export interface WorkflowInsertBeforeRequest {
+  sessionId: string;
+  targetLaneId: string;
+  requestId: string;
+}
+
+export interface WorkflowPendingInsertBeforeRequest {
+  sessionId: string;
+  targetLaneId: string;
+}
+
+export interface WorkflowPendingInsertBeforeResult {
+  protocolVersion: number;
+  requestId: string | null;
+}
+
+export interface WorkflowInsertBeforeResult {
+  protocolVersion: number;
+  status: "inserted";
+  laneId: string;
+  event: unknown;
+  projection: unknown;
+  canvasSession: CanvasSession | null;
+}
+
 export interface WorkflowRunResultRecordRequest {
   sessionId: string;
   laneId: string;
@@ -242,6 +267,11 @@ export interface WorkflowApi {
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   reassignLane: (projectRoot: string, input: WorkflowLaneReassignRequest) => Promise<WorkflowLaneReassignResult>;
   getCheckpoints: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; checkpoints: WorkflowNodeCheckpoint[] }>;
+  getPendingInsertBeforeRequest: (
+    projectRoot: string,
+    input: WorkflowPendingInsertBeforeRequest,
+  ) => Promise<WorkflowPendingInsertBeforeResult>;
+  insertBefore: (projectRoot: string, input: WorkflowInsertBeforeRequest) => Promise<WorkflowInsertBeforeResult>;
   getRollbackEligibility: (projectRoot: string, input: unknown) => Promise<{
     protocolVersion: number;
     eligibility: WorkflowRollbackEligibility;

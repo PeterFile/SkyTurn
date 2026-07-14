@@ -83,6 +83,7 @@ const knownFlowEventKinds = new Set<string>([
   "workflow.intent.accepted",
   "workflow.intent.rejected",
   "workflow.lane.declared",
+  "workflow.lane.inserted_before",
   "workflow.edge.declared",
   "workflow.segment.started",
   "workflow.segment.output_delta",
@@ -560,6 +561,8 @@ function flowEventPayloadIsSafe(
   concreteRemoteSideEffects: readonly ConcreteRemoteSideEffectEvent[],
 ): boolean {
   switch (event.kind) {
+    case "workflow.lane.inserted_before":
+      return event.source === "workflow-kernel";
     case "workflow.lane.declared":
       return isValidLaneDeclaredPayload(event.payload);
     case "workflow.edge.declared":

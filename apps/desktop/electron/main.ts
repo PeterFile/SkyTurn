@@ -183,6 +183,12 @@ interface WorkflowCheckpointInput {
   phase?: unknown;
 }
 
+interface WorkflowInsertBeforeInput {
+  sessionId?: unknown;
+  targetLaneId?: unknown;
+  requestId?: unknown;
+}
+
 interface WorkflowRollbackInput {
   sessionId?: unknown;
   nodeId?: unknown;
@@ -551,6 +557,8 @@ interface WorkflowStoreHost {
     agentKind: string;
   }>;
   listNodeCheckpoints(input: unknown): unknown[];
+  findPendingInsertBeforeRequest(sessionId: string, targetLaneId: string): string | null;
+  insertClarificationBefore(input: unknown): unknown;
   getNodeRollbackEligibility(input: unknown): WorkflowRollbackEligibilityLike;
   applyNodeRollback(input: unknown): WorkflowRollbackResultLike;
   requestNodeRepair(input: unknown): WorkflowCheckpointSuccessorResultLike;
@@ -1034,6 +1042,51 @@ ipcMain.handle("workflow:checkpoints", workflowHandler(async (projectRoot: strin
       ...(optionalText(readField(input, "runId")) ? { runId: optionalText(readField(input, "runId")) } : {}),
       ...(readField(input, "phase") === "before" || readField(input, "phase") === "after" ? { phase: readField(input, "phase") } : {}),
     }),
+  };
+}));
+
+ipcMain.handle("workflow:insertBefore:pending", workflowHandler(async (projectRoot: string, input: WorkflowInsertBeforeInput) => {
+  assertKnownProjectRoot(projectRoot);
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Pending insert-before input must be an object.");
+  const sessionId = assertWorkflowSessionId(input.sessionId);
+  const targetLaneId = assertRequiredText(input.targetLaneId, "Insert-before targetLaneId is required.");
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, sessionId);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    requestId: store.findPendingInsertBeforeRequest(sessionId, targetLaneId),
+  };
+}));
+
+ipcMain.handle("workflow:insertBefore", workflowHandler(async (projectRoot: string, input: WorkflowInsertBeforeInput) => {
+  assertKnownProjectRoot(projectRoot);
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Insert-before input must be an object.");
+  const sessionId = assertWorkflowSessionId(input.sessionId);
+  const targetLaneId = assertRequiredText(input.targetLaneId, "Insert-before targetLaneId is required.");
+  const requestId = assertRequiredText(input.requestId, "Insert-before requestId is required.");
+  const store = await getWorkflowStore(projectRoot);
+  assertKnownWorkflowCanvasSession(store, sessionId);
+  const result = store.insertClarificationBefore({
+    sessionId,
+    targetLaneId,
+    requestId,
+    now: new Date().toISOString(),
+  }) as { event: unknown; lane: { id: string }; projection: unknown; canvasSession: unknown };
+  try {
+    broadcastWorkflowProjection(projectRoot, sessionId, store);
+  } catch (error) {
+    console.warn("Workflow insert-before broadcast failed after durable commit.", error);
+  }
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    status: "inserted" as const,
+    laneId: result.lane.id,
+    event: result.event,
+    projection: result.projection,
+    canvasSession: augmentCanvasSessionWithHermesTerminal(
+      result.canvasSession,
+      terminalRuntime.hermesPlannerTerminalSessionId(sessionId),
+    ),
   };
 }));
 

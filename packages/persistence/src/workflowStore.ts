@@ -27,6 +27,7 @@ import type {
 } from "@skyturn/project-core";
 import type { WorkflowNodePositionUpdateRequest } from "./index.js";
 import {
+  compileInsertClarificationBefore,
   compileWorkflowIntent,
   createDefaultFlowPolicy,
   evaluateRollbackEligibility,
@@ -41,6 +42,7 @@ import {
   type FlowEventKind,
   type FlowLane,
   type FlowProjection,
+  type InsertClarificationBeforeRequest,
 } from "@skyturn/workflow-kernel";
 
 export type WorkflowLaneKind =
@@ -140,6 +142,10 @@ export type WorkflowCardToolCall =
 export interface WorkflowStoreOptions {
   projectRoot: string;
   databasePath?: string;
+  faultInjection?: {
+    beforeInsertBeforeAppend?: () => void;
+    afterInsertBeforeProjection?: (projection: FlowProjection) => void;
+  };
 }
 
 function canonicalPath(value: string): string {
@@ -325,6 +331,17 @@ export interface WorkflowLaneReassignmentResult {
   event: WorkflowEventRecord;
   projection: FlowProjection;
   canvasSession: CanvasSession;
+}
+
+export interface InsertClarificationBeforeInput extends InsertClarificationBeforeRequest {
+  now: string;
+}
+
+export interface InsertClarificationBeforeStoreResult {
+  event: WorkflowEventRecord;
+  lane: FlowLane;
+  projection: FlowProjection;
+  canvasSession: CanvasSession | null;
 }
 
 export interface RecordRunResultInput {
@@ -659,9 +676,11 @@ export class WorkflowStore {
   private readonly db: Database.Database;
   private readonly projectRoot: string;
   private readonly statements: WorkflowStoreStatements;
+  private readonly faultInjection: WorkflowStoreOptions["faultInjection"];
 
   constructor(options: WorkflowStoreOptions) {
     this.projectRoot = canonicalPath(options.projectRoot);
+    this.faultInjection = options.faultInjection;
     this.databasePath = options.databasePath ?? join(this.projectRoot, ".devflow", "skyturn-workflow.sqlite");
     mkdirSync(join(this.projectRoot, ".devflow"), { recursive: true });
     this.db = new Database(this.databasePath);
@@ -877,6 +896,75 @@ export class WorkflowStore {
     });
     tx();
     return compiled;
+  }
+
+  findPendingInsertBeforeRequest(sessionId: string, targetLaneId: string): string | null {
+    this.requireKnownSession(sessionId);
+    const projection = this.materializeFlowProjection(sessionId);
+    for (const event of [...this.listEvents(sessionId)].reverse()) {
+      if (event.kind !== "workflow.lane.inserted_before" || event.payload.targetLaneId !== targetLaneId) continue;
+      const requestId = optionalText(event.payload.requestId);
+      const laneId = isRecord(event.payload.lane) ? optionalText(event.payload.lane.id) : null;
+      const lane = laneId ? projection.lanes.find((item) => item.id === laneId) : undefined;
+      if (
+        requestId &&
+        lane &&
+        (lane.status === "pending" || lane.status === "ready" || lane.status === "running" || lane.status === "waiting_input")
+      ) {
+        return requestId;
+      }
+    }
+    return null;
+  }
+
+  insertClarificationBefore(input: InsertClarificationBeforeInput): InsertClarificationBeforeStoreResult {
+    this.requireKnownSession(input.sessionId);
+    const idempotencyKey = `insert-before:${input.requestId}`;
+    const existing = this.getEventByIdempotencyKey(input.sessionId, idempotencyKey);
+    if (existing) {
+      if (
+        existing.kind !== "workflow.lane.inserted_before" ||
+        existing.sessionId !== input.sessionId ||
+        existing.idempotencyKey !== idempotencyKey ||
+        existing.payload.requestId !== input.requestId ||
+        existing.payload.targetLaneId !== input.targetLaneId
+      ) {
+        throw new Error("Insert-before requestId conflicts with an existing mutation.");
+      }
+      const projection = this.materializeFlowProjection(input.sessionId);
+      const laneId = isRecord(existing.payload.lane) ? optionalText(existing.payload.lane.id) : null;
+      const lane = laneId ? projection.lanes.find((item) => item.id === laneId) : undefined;
+      if (!lane) throw new Error("Insert-before retry is missing its durable lane.");
+      return { event: existing, lane, projection, canvasSession: this.materializeCanvasSession(input.sessionId) };
+    }
+
+    const pendingRequestId = this.findPendingInsertBeforeRequest(input.sessionId, input.targetLaneId);
+    if (pendingRequestId && pendingRequestId !== input.requestId) {
+      return this.insertClarificationBefore({ ...input, requestId: pendingRequestId });
+    }
+
+    const compiled = compileInsertClarificationBefore(this.materializeFlowProjection(input.sessionId), input, input.now);
+    const committed = this.db.transaction(() => {
+      this.faultInjection?.beforeInsertBeforeAppend?.();
+      const event = this.insertFlowEventInTransaction(compiled.event, input.now);
+      const projection = this.materializeFlowProjection(input.sessionId);
+      const lane = projection.lanes.find((item) => item.id === compiled.lane.id);
+      if (!lane || !projection.edges.some((edge) => edge.sourceLaneId === lane.id && edge.targetLaneId === input.targetLaneId)) {
+        throw new Error("Insert-before projection failed invariant validation.");
+      }
+      this.faultInjection?.afterInsertBeforeProjection?.(projection);
+      const canvasSession = this.materializeCanvasSession(input.sessionId);
+      if (!canvasSession || !canvasSession.nodes.some((node) => node.id === lane.id)) {
+        throw new Error("Insert-before CanvasSession failed invariant validation.");
+      }
+      return { event, projection, lane, canvasSession };
+    })();
+    return {
+      event: committed.event,
+      lane: committed.lane,
+      projection: committed.projection,
+      canvasSession: committed.canvasSession,
+    };
   }
 
   scheduleReadyLanes(

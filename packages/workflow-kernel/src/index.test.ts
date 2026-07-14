@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  compileInsertClarificationBefore,
   compileWorkflowIntent,
   createDefaultFlowPolicy,
   evaluateGate,
@@ -63,6 +64,386 @@ describe("Flow Kernel intent compiler", () => {
     expect(reassigned.segments).toEqual(before.segments);
     expect(reassigned.evidence).toEqual(before.evidence);
     expect(reassigned.worktrees).toEqual(before.worktrees);
+  });
+
+  it("atomically inserts a trusted clarification lane before a pending target", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-upstream", "discovery") }),
+      event("workflow.lane.declared", { lane: lane("lane-target", "implementation") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-upstream-target", sourceLaneId: "lane-upstream", targetLaneId: "lane-target" },
+      }),
+    ]);
+
+    const result = compileInsertClarificationBefore(projection, {
+      sessionId: "session-1",
+      targetLaneId: "lane-target",
+      requestId: "insert-request-1",
+    }, now);
+    const inserted = reduceWorkflowEvents([...projection.events, result.event]);
+
+    expect(result.lane).toMatchObject({
+      id: "lane-clarification-1fb3iw2",
+      semanticKey: "clarification:1fb3iw2",
+      kind: "clarification",
+      laneKind: "design",
+      semanticSubtype: "clarification",
+      nodeKind: "agent_task",
+      agentKind: "hermes",
+      status: "pending",
+      executable: true,
+      runtimePolicy: { sandbox: "read-only", executable: true },
+    });
+    expect(inserted.edges.map((edge) => [edge.sourceLaneId, edge.targetLaneId])).toEqual([
+      ["lane-upstream", result.lane.id],
+      [result.lane.id, "lane-target"],
+    ]);
+  });
+
+  it.each([
+    ["planner", { ...lane("lane-planner", "planner"), status: "pending" }],
+    ["user decision", { ...lane("lane-decision", "decision"), nodeKind: "user_decision", executable: false }],
+    ["ready", { ...lane("lane-ready", "implementation"), status: "ready" }],
+    ["running", { ...lane("lane-running", "implementation"), status: "running" }],
+    ["completed", { ...lane("lane-completed", "implementation"), status: "completed" }],
+    ["rolled back", { ...lane("lane-rolled-back", "implementation"), rollbackStatus: "rolled_back" }],
+  ])("rejects unsafe insert-before target: %s", (_label, target) => {
+    const projection = reduceWorkflowEvents([event("workflow.lane.declared", { lane: target })]);
+
+    expect(() => compileInsertClarificationBefore(projection, {
+      sessionId: "session-1",
+      targetLaneId: target.id,
+      requestId: "insert-request-1",
+    }, now)).toThrow(/eligible pending lane/i);
+  });
+
+  it("rejects a missing target and dangling prerequisite before rewriting edges", () => {
+    const missingTarget = reduceWorkflowEvents([]);
+    expect(() => compileInsertClarificationBefore(missingTarget, {
+      sessionId: "session-1", targetLaneId: "lane-missing", requestId: "missing-target",
+    }, now)).toThrow(/eligible pending lane/i);
+
+    const dangling = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-target", "implementation") }),
+      event("workflow.edge.declared", { edge: { id: "edge-missing-target", sourceLaneId: "lane-missing", targetLaneId: "lane-target" } }),
+    ]);
+    expect(() => compileInsertClarificationBefore(dangling, {
+      sessionId: "session-1", targetLaneId: "lane-target", requestId: "dangling-prerequisite",
+    }, now)).toThrow(/missing source lane/i);
+  });
+
+  it.each([
+    ["planner pollution", { id: "edge-target-planner", sourceLaneId: "lane-target", targetLaneId: "lane-planner" }, /planner|intake/i],
+    ["malformed retained endpoint", { id: "edge-missing-source", sourceLaneId: "lane-missing", targetLaneId: "lane-planner" }, /missing source lane/i],
+  ])("rejects insert-before when the existing graph has %s", (_label, badEdge, expected) => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-planner", "planner") }),
+      event("workflow.lane.declared", { lane: lane("lane-target", "implementation") }),
+      event("workflow.edge.declared", { edge: badEdge }),
+    ]);
+
+    expect(() => compileInsertClarificationBefore(projection, {
+      sessionId: "session-1", targetLaneId: "lane-target", requestId: "dirty-existing-graph",
+    }, now)).toThrow(expected);
+  });
+
+  it("rejects generated edge IDs that collide with retained edges", () => {
+    const clean = insertBeforeReplayFixture();
+    const request = { sessionId: "session-1", targetLaneId: "lane-target", requestId: "retained-id-collision" };
+    const compiled = compileInsertClarificationBefore(clean, request, now);
+    const generatedId = (compiled.event.payload.edges as Array<{ id: string }>)[0].id;
+    const projection = reduceWorkflowEvents([
+      ...clean.events,
+      event("workflow.edge.declared", {
+        edge: { id: generatedId, sourceLaneId: "lane-upstream-a", targetLaneId: "lane-upstream-b" },
+      }),
+    ]);
+
+    expect(() => compileInsertClarificationBefore(projection, request, now)).toThrow(/edge ID.*conflict/i);
+  });
+
+  it("rejects DeclareEdge with missing endpoints and cycles", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-a", "implementation") }),
+      event("workflow.lane.declared", { lane: lane("lane-b", "validation") }),
+      event("workflow.edge.declared", { edge: { id: "edge-a-b", sourceLaneId: "lane-a", targetLaneId: "lane-b" } }),
+    ]);
+
+    expect(evaluateGate(projection, { type: "DeclareEdge", sourceLaneId: "lane-missing", targetLaneId: "lane-b" })).toMatchObject({ allowed: false, reason: expect.stringMatching(/missing source lane/i) });
+    expect(evaluateGate(projection, { type: "DeclareEdge", sourceLaneId: "lane-a", targetLaneId: "lane-missing" })).toMatchObject({ allowed: false, reason: expect.stringMatching(/missing target lane/i) });
+    expect(evaluateGate(projection, { type: "DeclareEdge", sourceLaneId: "lane-b", targetLaneId: "lane-a" })).toMatchObject({ allowed: false, reason: expect.stringMatching(/cycle/i) });
+  });
+
+  it("blocks the target until clarification completes and keeps the planner dependency-free", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-planner", "planner") }),
+      event("workflow.lane.declared", { lane: lane("lane-target", "implementation") }),
+    ]);
+    const result = compileInsertClarificationBefore(projection, {
+      sessionId: "session-1", targetLaneId: "lane-target", requestId: "schedule-order",
+    }, now);
+    const inserted = reduceWorkflowEvents([...projection.events, result.event]);
+    expect(scheduleReadyLanes(inserted, { allowedParallelism: 10 }).map((item) => item.id)).toContain(result.lane.id);
+    expect(scheduleReadyLanes(inserted, { allowedParallelism: 10 }).map((item) => item.id)).not.toContain("lane-target");
+    const completed = reduceWorkflowEvents([...inserted.events,
+      event("workflow.evidence.recorded", { laneId: result.lane.id, segmentId: "segment-clarification", evidence: { id: "evidence-clarification", status: "passed" } }),
+    ]);
+    expect(scheduleReadyLanes(completed, { allowedParallelism: 10 }).map((item) => item.id)).toContain("lane-target");
+    expect(completed.edges.some((edge) => edge.targetLaneId === "lane-planner")).toBe(false);
+  });
+
+  it("keeps failed-evidence Repair schedulable after its inserted clarification completes", () => {
+    const projection = failedCheckpointRepairProjection();
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual(["lane-repair-b"]);
+
+    const compiled = compileInsertClarificationBefore(projection, {
+      sessionId: "session-1",
+      targetLaneId: "lane-repair-b",
+      requestId: "clarify-failed-repair",
+    }, now);
+    const inserted = reduceWorkflowEvents([...projection.events, compiled.event]);
+
+    expect(scheduleReadyLanes(inserted, { allowedParallelism: 2 }).map((item) => item.id)).toEqual([compiled.lane.id]);
+    expect(inserted.edges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceLaneId: "lane-b", targetLaneId: "lane-repair-b" }),
+      expect.objectContaining({ sourceLaneId: compiled.lane.id, targetLaneId: "lane-repair-b" }),
+    ]));
+
+    const completed = completeLane(inserted, compiled.lane.id);
+    expect(scheduleReadyLanes(completed, { allowedParallelism: 2 }).map((item) => item.id)).toEqual(["lane-repair-b"]);
+  });
+
+  it("keeps a ReplanFromEvidence Repair schedulable across insert-before replay", () => {
+    const { projection, repairLaneId, regressionLaneId } = failedEvidenceReplanProjection();
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 2 }).map((item) => item.id)).toEqual([repairLaneId]);
+
+    const compiled = compileInsertClarificationBefore(projection, {
+      sessionId: "session-1",
+      targetLaneId: repairLaneId,
+      requestId: "clarify-replan-repair",
+    }, now);
+    const inserted = reduceWorkflowEvents([...projection.events, compiled.event]);
+    const replayed = reduceWorkflowEvents(inserted.events);
+
+    expect(replayed.edges.filter((edge) =>
+      edge.targetLaneId === repairLaneId ||
+      edge.sourceLaneId === repairLaneId
+    )).toEqual([
+      {
+        id: `edge-implementation-${repairLaneId.replace(/^lane-/, "")}`,
+        sourceLaneId: "lane-implementation",
+        targetLaneId: repairLaneId,
+      },
+      {
+        id: `edge-${repairLaneId.replace(/^lane-/, "")}-${regressionLaneId.replace(/^lane-/, "")}`,
+        sourceLaneId: repairLaneId,
+        targetLaneId: regressionLaneId,
+      },
+      {
+        id: `edge-${compiled.lane.id}-${repairLaneId}`,
+        sourceLaneId: compiled.lane.id,
+        targetLaneId: repairLaneId,
+      },
+    ]);
+    expect(replayed.edges).toEqual(inserted.edges);
+    expect(scheduleReadyLanes(replayed, { allowedParallelism: 2 }).map((item) => item.id)).toEqual([compiled.lane.id]);
+
+    const completed = completeLane(replayed, compiled.lane.id);
+    const completedReplay = reduceWorkflowEvents(completed.events);
+    expect(completedReplay.edges).toEqual(replayed.edges);
+    expect(scheduleReadyLanes(completedReplay, { allowedParallelism: 2 }).map((item) => item.id)).toEqual([repairLaneId]);
+  });
+
+  it.each(["repair", "variant"] as const)(
+    "keeps rolled-back %s successor schedulable after its inserted clarification completes",
+    (kind) => {
+      const projection = rolledBackCheckpointSuccessorProjection(kind);
+      const targetLaneId = `lane-${kind}-b`;
+      expect(scheduleReadyLanes(projection, { allowedParallelism: 1 }).map((item) => item.id)).toEqual([targetLaneId]);
+
+      const compiled = compileInsertClarificationBefore(projection, {
+        sessionId: "session-1",
+        targetLaneId,
+        requestId: `clarify-rolled-back-${kind}`,
+      }, now);
+      const inserted = reduceWorkflowEvents([...projection.events, compiled.event]);
+
+      expect(scheduleReadyLanes(inserted, { allowedParallelism: 2 }).map((item) => item.id)).toEqual([compiled.lane.id]);
+      expect(inserted.edges).toEqual(expect.arrayContaining([
+        expect.objectContaining({ sourceLaneId: "lane-b", targetLaneId }),
+        expect.objectContaining({ sourceLaneId: compiled.lane.id, targetLaneId }),
+      ]));
+
+      const completed = completeLane(inserted, compiled.lane.id);
+      expect(scheduleReadyLanes(completed, { allowedParallelism: 2 }).map((item) => item.id)).toEqual([targetLaneId]);
+    },
+  );
+
+  it("fails closed when replaying an insert-before payload that violates graph hygiene", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-planner", "planner") }),
+      event("workflow.lane.declared", { lane: lane("lane-target", "implementation") }),
+    ]);
+    const malformed = event("workflow.lane.inserted_before", {
+      requestId: "bad-replay",
+      targetLaneId: "lane-target",
+      lane: { ...lane("lane-clarification", "clarification"), agentKind: "hermes" },
+      replacedIncomingEdgeIds: [],
+      edges: [{ id: "edge-clarification-planner", sourceLaneId: "lane-clarification", targetLaneId: "lane-planner" }],
+    });
+    expect(() => reduceWorkflowEvents([...projection.events, malformed])).toThrow(/insert-before replay/i);
+  });
+
+  it("rejects insert-before replay when the target is ready and leaves the graph unchanged", () => {
+    const pending = insertBeforeReplayFixture();
+    const compiled = compileInsertClarificationBefore(pending, {
+      sessionId: "session-1", targetLaneId: "lane-target", requestId: "ready-replay",
+    }, now);
+    const ready = reduceWorkflowEvents(pending.events.map((item) =>
+      item.kind === "workflow.lane.declared" && (item.payload.lane as { id?: string }).id === "lane-target"
+        ? { ...item, payload: { lane: { ...(item.payload.lane as object), status: "ready" } } }
+        : item));
+    const before = structuredClone(ready);
+
+    expect(() => reduceWorkflowEvents([...ready.events, compiled.event])).toThrow(/insert-before replay target/i);
+    expect(ready).toEqual(before);
+  });
+
+  it.each([
+    ["preexisting planner pollution", { id: "edge-target-planner", sourceLaneId: "lane-target", targetLaneId: "lane-planner" }, /planner|intake/i],
+    ["preexisting malformed endpoint", { id: "edge-missing-source", sourceLaneId: "lane-missing", targetLaneId: "lane-planner" }, /missing source lane/i],
+  ])("fails closed during insert-before replay with %s", (_label, badEdge, expected) => {
+    const clean = insertBeforeReplayFixture();
+    const compiled = compileInsertClarificationBefore(clean, {
+      sessionId: "session-1", targetLaneId: "lane-target", requestId: "dirty-replay",
+    }, now);
+    const polluted = reduceWorkflowEvents([
+      ...clean.events,
+      event("workflow.edge.declared", { edge: badEdge }),
+    ]);
+
+    expect(() => reduceWorkflowEvents([...polluted.events, compiled.event])).toThrow(expected);
+  });
+
+  it("fails closed when an insert-before replay edge ID collides with a retained edge", () => {
+    const clean = insertBeforeReplayFixture();
+    const compiled = compileInsertClarificationBefore(clean, {
+      sessionId: "session-1", targetLaneId: "lane-target", requestId: "replay-retained-id-collision",
+    }, now);
+    const generatedId = (compiled.event.payload.edges as Array<{ id: string }>)[0].id;
+    const polluted = reduceWorkflowEvents([
+      ...clean.events,
+      event("workflow.edge.declared", {
+        edge: { id: generatedId, sourceLaneId: "lane-upstream-a", targetLaneId: "lane-upstream-b" },
+      }),
+    ]);
+
+    expect(() => reduceWorkflowEvents([...polluted.events, compiled.event])).toThrow(/edge ID.*conflict/i);
+  });
+
+  it.each([
+    ["missing requestId", (payload: Record<string, unknown>) => { delete payload.requestId; }],
+    ["invalid requestId", (payload: Record<string, unknown>) => { payload.requestId = " invalid "; }],
+    ["missing lane", (payload: Record<string, unknown>) => { delete payload.lane; }],
+    ["invalid lane", (payload: Record<string, unknown>) => { payload.lane = null; }],
+    ["missing target", (payload: Record<string, unknown>) => { delete payload.targetLaneId; }],
+    ["invalid target", (payload: Record<string, unknown>) => { payload.targetLaneId = 42; }],
+    ["missing edges", (payload: Record<string, unknown>) => { delete payload.edges; }],
+    ["invalid edges", (payload: Record<string, unknown>) => { payload.edges = {}; }],
+    ["missing replaced IDs", (payload: Record<string, unknown>) => { delete payload.replacedIncomingEdgeIds; }],
+    ["invalid replaced IDs", (payload: Record<string, unknown>) => { payload.replacedIncomingEdgeIds = [42]; }],
+    ["missing replaced ID", (payload: Record<string, unknown>) => { payload.replacedIncomingEdgeIds = ["edge-upstream-a-target"]; }],
+    ["extra replaced ID", (payload: Record<string, unknown>) => { payload.replacedIncomingEdgeIds = ["edge-upstream-a-target", "edge-upstream-b-target", "edge-fake-target"]; }],
+    ["duplicate replaced ID", (payload: Record<string, unknown>) => { payload.replacedIncomingEdgeIds = ["edge-upstream-a-target", "edge-upstream-b-target", "edge-upstream-b-target"]; }],
+    ["missing prerequisite edge", (payload: Record<string, unknown>) => { payload.edges = (payload.edges as unknown[]).slice(1); }],
+    ["extra prerequisite edge", (payload: Record<string, unknown>) => { (payload.edges as unknown[]).unshift({ id: "edge-planner-inserted", sourceLaneId: "lane-planner", targetLaneId: insertedReplayLaneId(payload) }); }],
+    ["duplicate prerequisite edge", (payload: Record<string, unknown>) => { (payload.edges as unknown[]).splice(1, 0, { ...(payload.edges as Record<string, unknown>[])[0], id: "edge-duplicate-prerequisite" }); }],
+    ["duplicate edge ID", (payload: Record<string, unknown>) => { (payload.edges as Record<string, unknown>[])[1].id = (payload.edges as Record<string, unknown>[])[0].id; }],
+    ["missing target edge", (payload: Record<string, unknown>) => { (payload.edges as unknown[]).pop(); }],
+    ["extra target edge", (payload: Record<string, unknown>) => { (payload.edges as unknown[]).push({ id: "edge-extra-target", sourceLaneId: insertedReplayLaneId(payload), targetLaneId: "lane-upstream-a" }); }],
+    ["duplicate target edge", (payload: Record<string, unknown>) => { (payload.edges as unknown[]).push({ ...(payload.edges as Record<string, unknown>[]).at(-1), id: "edge-duplicate-target" }); }],
+    ["invalid edge", (payload: Record<string, unknown>) => { (payload.edges as unknown[])[0] = null; }],
+  ])("rejects malformed insert-before replay: %s", (_label, mutate) => {
+    const projection = insertBeforeReplayFixture();
+    const compiled = compileInsertClarificationBefore(projection, {
+      sessionId: "session-1",
+      targetLaneId: "lane-target",
+      requestId: "strict-replay",
+    }, now);
+    const payload = structuredClone(compiled.event.payload);
+    mutate(payload);
+
+    expect(() => reduceWorkflowEvents([...projection.events, { ...compiled.event, payload }])).toThrow(/insert-before replay/i);
+  });
+
+  it.each([
+    ["null idempotency key", null, "strict-envelope"],
+    ["wrong idempotency key", "insert-before:wrong-request", "strict-envelope"],
+    ["envelope and payload request mismatch", "insert-before:strict-envelope", "other-request"],
+  ])("rejects malformed insert-before replay envelope: %s", (_label, idempotencyKey, payloadRequestId) => {
+    const projection = insertBeforeReplayFixture();
+    const compiled = compileInsertClarificationBefore(projection, {
+      sessionId: "session-1", targetLaneId: "lane-target", requestId: "strict-envelope",
+    }, now);
+    const malformed = {
+      ...compiled.event,
+      idempotencyKey,
+      payload: { ...compiled.event.payload, requestId: payloadRequestId },
+    };
+
+    expect(() => reduceWorkflowEvents([...projection.events, malformed])).toThrow(/insert-before replay/i);
+  });
+
+  it.each([
+    ["executable false", (lanePayload: Record<string, unknown>) => { lanePayload.executable = false; }],
+    ["wrong kind", (lanePayload: Record<string, unknown>) => { lanePayload.kind = "implementation"; }],
+    ["danger-full-access", (lanePayload: Record<string, unknown>) => { lanePayload.runtimePolicy = { executable: true, sandbox: "danger-full-access" }; }],
+    ["runtime non-executable", (lanePayload: Record<string, unknown>) => { lanePayload.runtimePolicy = { executable: false, sandbox: "read-only" }; }],
+    ["wrong laneKind", (lanePayload: Record<string, unknown>) => { lanePayload.laneKind = "implementation"; }],
+    ["wrong semanticSubtype", (lanePayload: Record<string, unknown>) => { lanePayload.semanticSubtype = "implementation"; }],
+    ["wrong nodeKind", (lanePayload: Record<string, unknown>) => { lanePayload.nodeKind = "user_decision"; }],
+    ["wrong agent", (lanePayload: Record<string, unknown>) => { lanePayload.agentKind = "codex"; }],
+    ["wrong status", (lanePayload: Record<string, unknown>) => { lanePayload.status = "ready"; }],
+    ["rollback status", (lanePayload: Record<string, unknown>) => { lanePayload.rollbackStatus = "rolled_back"; }],
+    ["lane ID mismatch", (lanePayload: Record<string, unknown>) => { lanePayload.id = "lane-clarification-forged"; }],
+    ["semantic key mismatch", (lanePayload: Record<string, unknown>) => { lanePayload.semanticKey = "clarification:forged"; }],
+  ])("fails closed when insert-before replay lane authority drifts: %s", (_label, mutateLane) => {
+    const projection = insertBeforeReplayFixture();
+    const compiled = compileInsertClarificationBefore(projection, {
+      sessionId: "session-1",
+      targetLaneId: "lane-target",
+      requestId: "strict-authority",
+    }, now);
+    const payload = structuredClone(compiled.event.payload);
+    mutateLane(payload.lane as Record<string, unknown>);
+
+    expect(() => reduceWorkflowEvents([...projection.events, { ...compiled.event, payload }])).toThrow(/insert-before replay/i);
+  });
+
+  it.each([
+    ["source", (event: FlowEvent) => { event.source = "hermes"; }],
+    ["title", (event: FlowEvent) => { insertBeforeLanePayload(event).title = "Injected title"; }],
+    ["brief", (event: FlowEvent) => { insertBeforeLanePayload(event).brief = "Injected instructions"; }],
+    ["file scopes", (event: FlowEvent) => { insertBeforeLanePayload(event).fileScopes = ["secret/**"]; }],
+    ["package scopes", (event: FlowEvent) => { insertBeforeLanePayload(event).packageScopes = ["@skyturn/desktop"]; }],
+    ["required evidence", (event: FlowEvent) => { insertBeforeLanePayload(event).requiredEvidence = ["approval"]; }],
+    ["output", (event: FlowEvent) => { insertBeforeLanePayload(event).output = ["Injected prompt context"]; }],
+    ["side effects", (event: FlowEvent) => {
+      (insertBeforeLanePayload(event).runtimePolicy as Record<string, unknown>).sideEffects = ["git"];
+    }],
+  ] as const)("rejects non-canonical insert-before replay %s without mutating topology", (_label, mutate) => {
+    const projection = insertBeforeReplayFixture();
+    const before = structuredClone(projection);
+    const compiled = compileInsertClarificationBefore(projection, {
+      sessionId: "session-1",
+      targetLaneId: "lane-target",
+      requestId: "canonical-replay",
+    }, now);
+    const tampered = structuredClone(compiled.event);
+    mutate(tampered);
+
+    expect(() => reduceWorkflowEvents([...projection.events, tampered])).toThrow(/insert-before replay/i);
+    expect(projection).toEqual(before);
   });
 
   it("accepts WorkflowIntent JSON and rejects Hermes UI mutations or self-completion", () => {
@@ -4522,6 +4903,168 @@ describe("Flow Kernel gate engine and scheduler", () => {
 
 function emptyProjection(sessionId: string): FlowProjection {
   return reduceWorkflowEvents([event("workflow.user_input", { sessionId, text: "seed" })]);
+}
+
+function insertBeforeReplayFixture(): FlowProjection {
+  return reduceWorkflowEvents([
+    event("workflow.lane.declared", { lane: lane("lane-planner", "planner") }),
+    event("workflow.lane.declared", { lane: lane("lane-upstream-a", "implementation") }),
+    event("workflow.lane.declared", { lane: lane("lane-upstream-b", "implementation") }),
+    event("workflow.lane.declared", { lane: lane("lane-target", "validation") }),
+    event("workflow.edge.declared", { edge: { id: "edge-upstream-a-target", sourceLaneId: "lane-upstream-a", targetLaneId: "lane-target" } }),
+    event("workflow.edge.declared", { edge: { id: "edge-upstream-b-target", sourceLaneId: "lane-upstream-b", targetLaneId: "lane-target" } }),
+  ]);
+}
+
+function failedCheckpointRepairProjection(): FlowProjection {
+  const checkpointId = "checkpoint-after-lane-b-run-1";
+  return reduceWorkflowEvents([
+    event("workflow.lane.declared", { lane: lane("lane-b", "implementation") }),
+    event("workflow.lane.declared", {
+      lane: { ...lane("lane-repair-b", "fix"), semanticKey: "manual:repair-lane-b" },
+    }),
+    event("workflow.edge.declared", {
+      edge: { id: "edge-b-repair", sourceLaneId: "lane-b", targetLaneId: "lane-repair-b" },
+    }),
+    event("workflow.node.checkpoint_recorded", {
+      checkpoint: checkpoint(checkpointId, "lane-b", "after", "head-sha"),
+    }),
+    event("workflow.segment.started", {
+      segment: { id: "segment-b-1", laneId: "lane-b", runId: "run-b-1", status: "running" },
+    }),
+    event("workflow.segment.finished", {
+      laneId: "lane-b",
+      segmentId: "segment-b-1",
+      status: "failed",
+      exitCode: 1,
+    }),
+    event("workflow.evidence.recorded", {
+      laneId: "lane-b",
+      segmentId: "segment-b-1",
+      evidence: {
+        id: "evidence-b-failed",
+        kind: "run-exit",
+        status: "failed",
+        checks: ["run-exit:failed"],
+        artifacts: [],
+      },
+    }),
+    event("workflow.node.repair_requested", {
+      intentId: "repair-lane-b-after",
+      laneId: "lane-b",
+      checkpointId,
+      successorLaneId: "lane-repair-b",
+      successorSemanticKey: "manual:repair-lane-b",
+      sourceEvidenceIds: ["evidence-b-failed"],
+    }),
+  ]);
+}
+
+function failedEvidenceReplanProjection(): {
+  projection: FlowProjection;
+  repairLaneId: string;
+  regressionLaneId: string;
+} {
+  const failedLaneId = "lane-implementation";
+  const evidenceId = "evidence-implementation-failed";
+  const base = reduceWorkflowEvents([
+    event("workflow.lane.declared", { lane: lane(failedLaneId, "implementation") }),
+    event("workflow.segment.started", {
+      segment: { id: "segment-implementation-1", laneId: failedLaneId, runId: "run-implementation-1", status: "running" },
+    }),
+    event("workflow.segment.finished", {
+      laneId: failedLaneId,
+      segmentId: "segment-implementation-1",
+      status: "failed",
+      exitCode: 1,
+    }),
+    event("workflow.evidence.recorded", {
+      laneId: failedLaneId,
+      segmentId: "segment-implementation-1",
+      evidence: {
+        id: evidenceId,
+        kind: "test",
+        status: "failed",
+        checks: ["unit"],
+        artifacts: ["artifacts/unit.log"],
+        detail: "unit test failed",
+      },
+    }),
+  ]);
+  const compiled = compileWorkflowIntent({
+    intentId: "intent-replan-failed-evidence",
+    sessionId: "session-1",
+    operations: [{ type: "ReplanFromEvidence", laneId: failedLaneId, evidenceId }],
+  }, base, createDefaultFlowPolicy(), now);
+  if (!compiled.ok) throw new Error(`Failed to compile ReplanFromEvidence fixture: ${compiled.reason}`);
+  const projection = reduceWorkflowEvents([...base.events, ...compiled.events]);
+  const repair = projection.lanes.find((item) => item.semanticKey === `repair:${failedLaneId}:${evidenceId}`);
+  const regression = projection.lanes.find((item) => item.semanticKey === `regression:${failedLaneId}:${evidenceId}`);
+  if (!repair || !regression) throw new Error("ReplanFromEvidence fixture did not create its repair chain.");
+  return { projection, repairLaneId: repair.id, regressionLaneId: regression.id };
+}
+
+function rolledBackCheckpointSuccessorProjection(kind: "repair" | "variant"): FlowProjection {
+  const beforeCheckpointId = "checkpoint-before-lane-b-run-1";
+  const afterCheckpointId = "checkpoint-after-lane-b-run-1";
+  const targetLaneId = `lane-${kind}-b`;
+  const targetSemanticKey = `successor:${kind}-lane-b`;
+  const requestKind = kind === "repair" ? "workflow.node.repair_requested" : "workflow.node.variant_requested";
+  return reduceWorkflowEvents([
+    event("workflow.lane.declared", { lane: { ...lane("lane-b", "implementation"), status: "completed" } }),
+    event("workflow.lane.declared", {
+      lane: {
+        ...lane(targetLaneId, kind === "repair" ? "fix" : "implementation"),
+        semanticKey: targetSemanticKey,
+      },
+    }),
+    event("workflow.edge.declared", {
+      edge: { id: `edge-b-${kind}`, sourceLaneId: "lane-b", targetLaneId },
+    }),
+    event("workflow.node.checkpoint_recorded", {
+      checkpoint: checkpoint(beforeCheckpointId, "lane-b", "before", "base-sha"),
+    }),
+    event("workflow.node.checkpoint_recorded", {
+      checkpoint: checkpoint(afterCheckpointId, "lane-b", "after", "head-sha"),
+    }),
+    event(requestKind, {
+      intentId: `${kind}-lane-b-checkpoint`,
+      laneId: "lane-b",
+      checkpointId: kind === "repair" ? afterCheckpointId : beforeCheckpointId,
+      successorLaneId: targetLaneId,
+      successorSemanticKey: targetSemanticKey,
+    }),
+    event("workflow.node.rollback_applied", {
+      requestId: "rollback-lane-b",
+      laneId: "lane-b",
+      checkpointId: beforeCheckpointId,
+    }),
+  ]);
+}
+
+function completeLane(projection: FlowProjection, laneId: string): FlowProjection {
+  return reduceWorkflowEvents([
+    ...projection.events,
+    event("workflow.evidence.recorded", {
+      laneId,
+      segmentId: `segment-${laneId}`,
+      evidence: {
+        id: `evidence-${laneId}`,
+        kind: "run-exit",
+        status: "passed",
+        checks: ["run-exit:succeeded"],
+        artifacts: [],
+      },
+    }),
+  ]);
+}
+
+function insertBeforeLanePayload(event: FlowEvent): Record<string, unknown> {
+  return event.payload.lane as Record<string, unknown>;
+}
+
+function insertedReplayLaneId(payload: Record<string, unknown>): string {
+  return (payload.lane as { id: string }).id;
 }
 
 function event(kind: FlowEvent["kind"], payload: Record<string, unknown>): FlowEvent {
