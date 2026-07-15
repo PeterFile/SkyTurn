@@ -92,9 +92,13 @@ export async function runNewSessionUiAcceptance() {
       return;
     }
     try {
-      const cdp = await connectToSkyTurnRenderer(app.cdpPort, app.devServerUrl);
+      const cdp = await connectToReadySkyTurnRenderer({
+        cdpPort: app.cdpPort,
+        devServerUrl: app.devServerUrl,
+        projectRoot: project.rootPath,
+        processDiagnostics: app.diagnostics,
+      });
       try {
-        await assertPreseededProjectLoaded(cdp, project.rootPath);
         await fillTextareaAndClickCreate(cdp, requirement);
         const workspace = await waitForWorkflowCompletion({
           baselineCommitSha,
@@ -274,6 +278,9 @@ export async function launchElectronAcceptanceApp({ userData }) {
   return {
     cdpPort,
     devServerUrl,
+    diagnostics() {
+      return [vite.diagnosticOutput(), electron.diagnosticOutput()].filter(Boolean).join("\n");
+    },
     async close() {
       await Promise.allSettled([electron.close(), vite.close()]);
     },
@@ -325,16 +332,62 @@ async function loadDemoHelpers() {
 }
 
 async function connectToSkyTurnRenderer(cdpPort, devServerUrl) {
-  const targets = await waitForJsonTargets(cdpPort);
-  const target = targets.find((item) => typeof item.url === "string" && item.url.startsWith(devServerUrl))
-    ?? targets.find((item) => item.type === "page" && typeof item.webSocketDebuggerUrl === "string");
-  if (!target?.webSocketDebuggerUrl) {
-    throw new Error(`Could not find SkyTurn renderer CDP target at ${devServerUrl}.`);
-  }
+  const target = await waitForSkyTurnRendererTarget(cdpPort, devServerUrl);
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.call("Runtime.enable");
   await cdp.call("Page.enable");
   return cdp;
+}
+
+export function selectSkyTurnRendererTarget(targets, devServerUrl) {
+  if (!Array.isArray(targets)) return null;
+  return targets.find((item) =>
+    item?.type === "page" &&
+    typeof item.url === "string" &&
+    item.url.startsWith(devServerUrl) &&
+    typeof item.webSocketDebuggerUrl === "string"
+  ) ?? null;
+}
+
+export async function connectToReadySkyTurnRenderer({
+  cdpPort,
+  devServerUrl,
+  projectRoot,
+  connect = connectToSkyTurnRenderer,
+  assertLoaded = assertPreseededProjectLoaded,
+  processDiagnostics = () => "",
+  retryDelayMs = 100,
+}) {
+  const attempts = [];
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const cdp = await connect(cdpPort, devServerUrl);
+    try {
+      await assertLoaded(cdp, projectRoot);
+      return cdp;
+    } catch (error) {
+      attempts.push({
+        attempt,
+        error: error instanceof Error ? error.message : String(error),
+        events: typeof cdp.diagnosticEvents === "function" ? cdp.diagnosticEvents() : [],
+      });
+      cdp.close();
+      if (attempt === 2 || !isRendererContextLoss(error)) {
+        const processOutput = boundedText(processDiagnostics(), commandOutputLimitBytes).value;
+        throw new Error([
+          error instanceof Error ? error.message : String(error),
+          `Renderer readiness attempts: ${JSON.stringify(attempts)}`,
+          processOutput ? `Process output: ${processOutput}` : "",
+        ].filter(Boolean).join("; "));
+      }
+      await delay(retryDelayMs);
+    }
+  }
+  throw new Error("Renderer readiness retry exhausted.");
+}
+
+function isRendererContextLoss(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id/i.test(message);
 }
 
 async function assertPreseededProjectLoaded(cdp, projectRoot) {
@@ -945,6 +998,9 @@ function spawnManaged(command, args, { cwd, env, label }) {
     output() {
       return `${stderr}${stdout}`.trim();
     },
+    diagnosticOutput() {
+      return boundedText(`${label}:\n${stderr}${stdout}`.trim(), commandOutputLimitBytes).value;
+    },
     assertAlive() {
       if (!closed) return;
       const reason = closeResult?.signal ? `signal ${closeResult.signal}` : `exit ${closeResult?.code}`;
@@ -1002,7 +1058,7 @@ async function waitForCdp(port, electronProcess) {
   throw new Error(`Timed out waiting for Electron CDP at ${url}.`);
 }
 
-async function waitForJsonTargets(port) {
+async function waitForSkyTurnRendererTarget(port, devServerUrl) {
   const deadline = Date.now() + 30_000;
   const url = `http://${RENDERER_HOST}:${port}/json/list`;
   while (Date.now() < deadline) {
@@ -1010,12 +1066,13 @@ async function waitForJsonTargets(port) {
       const response = await fetch(url);
       if (response.ok) {
         const targets = await response.json();
-        if (Array.isArray(targets) && targets.length > 0) return targets;
+        const target = selectSkyTurnRendererTarget(targets, devServerUrl);
+        if (target) return target;
       }
     } catch {}
     await delay(250);
   }
-  throw new Error(`Timed out waiting for Electron CDP targets at ${url}.`);
+  throw new Error(`Timed out waiting for SkyTurn renderer CDP target at ${devServerUrl} via ${url}.`);
 }
 
 class CdpClient {
@@ -1031,6 +1088,7 @@ class CdpClient {
     this.nextId = 1;
     this.pending = new Map();
     this.buffer = Buffer.alloc(0);
+    this.events = [];
   }
 
   async open() {
@@ -1158,12 +1216,26 @@ class CdpClient {
     }
     if (opcode !== 0x1) return;
     const message = JSON.parse(payload.toString("utf8"));
-    if (!message.id) return;
+    if (!message.id) {
+      this.recordDiagnosticEvent(message);
+      return;
+    }
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
     if (message.error) pending.reject(new Error(message.error.message));
     else pending.resolve(message);
+  }
+
+  recordDiagnosticEvent(message) {
+    const event = cdpDiagnosticEvent(message);
+    if (!event) return;
+    this.events.push(event);
+    if (this.events.length > 32) this.events.shift();
+  }
+
+  diagnosticEvents() {
+    return [...this.events];
   }
 
   rejectAll(error) {
@@ -1175,6 +1247,25 @@ class CdpClient {
     if (!this.socket || this.socket.destroyed) return;
     this.socket.end();
   }
+}
+
+function cdpDiagnosticEvent(message) {
+  if (message.method === "Page.frameNavigated") {
+    return {
+      method: message.method,
+      frameId: message.params?.frame?.id ?? null,
+      url: message.params?.frame?.url ?? null,
+    };
+  }
+  if (message.method === "Page.loadEventFired") return { method: message.method };
+  if (message.method === "Runtime.executionContextDestroyed") {
+    return {
+      method: message.method,
+      executionContextId: message.params?.executionContextId ?? null,
+    };
+  }
+  if (message.method === "Runtime.executionContextsCleared") return { method: message.method };
+  return null;
 }
 
 function connectTcp(host, port) {

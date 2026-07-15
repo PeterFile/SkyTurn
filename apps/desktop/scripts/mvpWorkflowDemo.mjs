@@ -17,7 +17,7 @@ import {
 } from "@skyturn/agent-bridge";
 import { parseHermesWorkflowIntent } from "@skyturn/orchestrator";
 import { createFastCanvasSession } from "@skyturn/planner";
-import { summarizeAgentReadiness } from "@skyturn/project-core";
+import { expectedArtifactContractForRequiredEvidence, summarizeAgentReadiness } from "@skyturn/project-core";
 import { addRequirementPlanningNode } from "@skyturn/ui-canvas/composer";
 import { buildPromptForNodeRun, mergeRunEventsIntoWorkspace, sandboxForNodeRun } from "@skyturn/ui-canvas/workflow-runtime";
 
@@ -538,8 +538,14 @@ function startNodeRun(bridge, projectRoot, session, node) {
     worktreePath: projectRoot,
     agentKind: node.agent,
     ...(sandbox ? { sandbox } : {}),
+    ...demoExpectedArtifactsInputForNode(node),
     prompt: buildPromptForNodeRun(session, node),
   });
+}
+
+export function demoExpectedArtifactsInputForNode(node) {
+  const { declarations } = expectedArtifactContractForRequiredEvidence(node?.requiredEvidence);
+  return declarations.length > 0 ? { expectedArtifacts: declarations } : {};
 }
 
 function waitForFinalStatus(bridge, runId) {

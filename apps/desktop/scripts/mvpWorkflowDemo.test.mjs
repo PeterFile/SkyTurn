@@ -110,6 +110,17 @@ test("MVP demo passes bounded watchdogs into Hermes and Codex adapters", async (
   assert.match(source, /skyturn-demo-claims-/);
 });
 
+test("MVP demo passes canonical expected artifacts into every direct bridge run", async () => {
+  const source = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
+  const { demoExpectedArtifactsInputForNode } = await import("./mvpWorkflowDemo.mjs");
+
+  assert.deepEqual(demoExpectedArtifactsInputForNode({ requiredEvidence: ["browser", "screenshot"] }), {
+    expectedArtifacts: [".devflow/acceptance/react-app.png"],
+  });
+  assert.deepEqual(demoExpectedArtifactsInputForNode({ requiredEvidence: ["test"] }), {});
+  assert.match(source, /\.\.\.demoExpectedArtifactsInputForNode\(node\)/);
+});
+
 test("MVP demo verification script checks renderable Vite output", async () => {
   const source = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
 

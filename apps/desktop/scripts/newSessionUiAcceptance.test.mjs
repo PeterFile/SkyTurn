@@ -257,6 +257,72 @@ test("New Session UI acceptance reports and cleans Electron launch failures", as
   assert.match(source, /Promise\.allSettled\(\[electron\.close\(\), vite\.close\(\)\]\)/);
 });
 
+test("New Session UI acceptance selects only the exact renderer target", async () => {
+  const { selectSkyTurnRendererTarget } = await import("./newSessionUiAcceptance.mjs");
+  const devServerUrl = "http://127.0.0.1:5173/";
+  const unrelated = {
+    type: "page",
+    url: "devtools://devtools/bundled/inspector.html",
+    webSocketDebuggerUrl: "ws://127.0.0.1:5223/devtools/page/unrelated",
+  };
+  const renderer = {
+    type: "page",
+    url: devServerUrl,
+    webSocketDebuggerUrl: "ws://127.0.0.1:5223/devtools/page/renderer",
+  };
+
+  assert.equal(selectSkyTurnRendererTarget([unrelated], devServerUrl), null);
+  assert.equal(selectSkyTurnRendererTarget([unrelated, renderer], devServerUrl), renderer);
+});
+
+test("New Session UI acceptance reacquires the renderer once before the Create click", async () => {
+  const { connectToReadySkyTurnRenderer } = await import("./newSessionUiAcceptance.mjs");
+  const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
+  const closed = [];
+  const first = {
+    close() {
+      closed.push("first");
+    },
+    diagnosticEvents() {
+      return [{ method: "Runtime.executionContextsCleared" }];
+    },
+  };
+  const second = {
+    close() {
+      closed.push("second");
+    },
+    diagnosticEvents() {
+      return [];
+    },
+  };
+  const connections = [first, second];
+  let connectCount = 0;
+  let assertCount = 0;
+
+  const result = await connectToReadySkyTurnRenderer({
+    cdpPort: 5223,
+    devServerUrl: "http://127.0.0.1:5173/",
+    projectRoot: "/tmp/project",
+    connect: async () => connections[connectCount++],
+    assertLoaded: async () => {
+      assertCount += 1;
+      if (assertCount === 1) throw new Error("Inspected target navigated or closed");
+    },
+    processDiagnostics: () => "Electron and Vite remained alive.",
+    retryDelayMs: 0,
+  });
+
+  assert.equal(result, second);
+  assert.equal(connectCount, 2);
+  assert.equal(assertCount, 2);
+  assert.deepEqual(closed, ["first"]);
+  assert.ok(
+    source.indexOf("const cdp = await connectToReadySkyTurnRenderer") <
+      source.indexOf("await fillTextareaAndClickCreate(cdp, requirement)"),
+    "renderer reacquisition must finish before the non-idempotent Create click.",
+  );
+});
+
 test("New Session UI acceptance is exposed as an explicit desktop package script", async () => {
   const packageJson = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
 
