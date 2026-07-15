@@ -391,7 +391,7 @@ export async function connectToReadySkyTurnRenderer({
         events: typeof cdp?.diagnosticEvents === "function" ? cdp.diagnosticEvents() : [],
       });
       cdp?.close();
-      if (attempt === 2 || !isRendererContextLoss(error)) {
+      if (attempt === 2 || !isRendererAcquisitionRetryable(error)) {
         throw new Error(rendererReadinessDiagnostic({
           error,
           attempts,
@@ -405,9 +405,11 @@ export async function connectToReadySkyTurnRenderer({
   throw new Error("Renderer readiness retry exhausted.");
 }
 
-function isRendererContextLoss(error) {
+function isRendererAcquisitionRetryable(error) {
   const message = error instanceof Error ? error.message : String(error);
-  return /Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id/i.test(message);
+  const code = error && typeof error === "object" && typeof error.code === "string" ? error.code : "";
+  return /Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id|CDP WebSocket (?:upgrade failed|accept header mismatch)|CDP socket closed|socket hang up/i.test(message)
+    || /^(?:ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT)$/.test(code);
 }
 
 function rendererReadinessDiagnostic({ error, attempts, processOutput, limitBytes }) {
@@ -447,14 +449,19 @@ function sanitizeRendererDiagnosticEvent(event) {
 }
 
 function sanitizeDiagnosticText(value) {
-  return String(value).replace(/https?:\/\/[^\s"'<>]+/gi, (url) => sanitizeDiagnosticUrl(url) ?? "[invalid-url]");
+  return String(value)
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi, (url) => sanitizeDiagnosticUrl(url) ?? "[redacted-url]")
+    .replace(/(^|[\s("'=])\/[^\s"'<>]*/g, (match, prefix) => {
+      const target = match.slice(prefix.length);
+      return `${prefix}${stripDiagnosticUrlCapability(target)}`;
+    });
 }
 
 function sanitizeDiagnosticUrl(value) {
   if (typeof value !== "string") return null;
   try {
     const url = new URL(value);
-    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    if (!/^(?:https?|wss?|file):$/.test(url.protocol)) return null;
     url.username = "";
     url.password = "";
     url.search = "";
@@ -463,6 +470,11 @@ function sanitizeDiagnosticUrl(value) {
   } catch {
     return null;
   }
+}
+
+function stripDiagnosticUrlCapability(value) {
+  const capabilityIndex = value.search(/[?#]/);
+  return capabilityIndex === -1 ? value : value.slice(0, capabilityIndex);
 }
 
 function boundedDiagnosticText(value, limitBytes) {
@@ -1163,8 +1175,13 @@ async function waitForSkyTurnRendererTarget(port, devServerUrl) {
 class CdpClient {
   static async connect(webSocketUrl) {
     const client = new CdpClient(webSocketUrl);
-    await client.open();
-    return client;
+    try {
+      await client.open();
+      return client;
+    } catch (error) {
+      client.destroy();
+      throw error;
+    }
   }
 
   constructor(webSocketUrl) {
@@ -1198,11 +1215,22 @@ class CdpClient {
 
   readHandshake(key) {
     return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        this.socket.off("data", onData);
+        this.socket.off("error", onError);
+        this.socket.off("close", onClose);
+      };
+      const fail = (error) => {
+        cleanup();
+        reject(error);
+      };
+      const onError = (error) => fail(error);
+      const onClose = () => fail(new Error("CDP socket closed during WebSocket handshake."));
       const onData = (chunk) => {
         this.buffer = Buffer.concat([this.buffer, chunk]);
         const headerEnd = this.buffer.indexOf("\r\n\r\n");
         if (headerEnd === -1) return;
-        this.socket.off("data", onData);
+        cleanup();
         const header = this.buffer.subarray(0, headerEnd).toString("utf8");
         this.buffer = this.buffer.subarray(headerEnd + 4);
         if (!header.startsWith("HTTP/1.1 101")) {
@@ -1220,7 +1248,8 @@ class CdpClient {
         resolve();
       };
       this.socket.on("data", onData);
-      this.socket.once("error", reject);
+      this.socket.once("error", onError);
+      this.socket.once("close", onClose);
     });
   }
 
@@ -1332,6 +1361,11 @@ class CdpClient {
     if (!this.socket || this.socket.destroyed) return;
     this.socket.end();
   }
+
+  destroy() {
+    if (!this.socket || this.socket.destroyed) return;
+    this.socket.destroy();
+  }
 }
 
 function cdpDiagnosticEvent(message) {
@@ -1356,8 +1390,25 @@ function cdpDiagnosticEvent(message) {
 function connectTcp(host, port) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host, port });
-    socket.once("connect", () => resolve(socket));
-    socket.once("error", reject);
+    const cleanup = () => {
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const fail = (error) => {
+      cleanup();
+      socket.destroy();
+      reject(error);
+    };
+    const onConnect = () => {
+      cleanup();
+      resolve(socket);
+    };
+    const onError = (error) => fail(error);
+    const onClose = () => fail(new Error("CDP socket closed before TCP connection completed."));
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+    socket.once("close", onClose);
   });
 }
 

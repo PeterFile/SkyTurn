@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -365,9 +367,119 @@ test("New Session UI acceptance retries context loss during renderer acquisition
   assert.equal(assertCount, 1);
 });
 
+test("New Session UI acceptance retries transient CDP acquisition failures", async () => {
+  const { connectToReadySkyTurnRenderer } = await import("./newSessionUiAcceptance.mjs");
+  const failures = [
+    new Error("CDP socket closed."),
+    Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+  ];
+
+  for (const failure of failures) {
+    const renderer = {
+      close() {},
+      diagnosticEvents() {
+        return [];
+      },
+    };
+    let connectCount = 0;
+    const result = await connectToReadySkyTurnRenderer({
+      cdpPort: 5223,
+      devServerUrl: "http://127.0.0.1:5173/",
+      projectRoot: "/tmp/project",
+      connect: async () => {
+        connectCount += 1;
+        if (connectCount === 1) throw failure;
+        return renderer;
+      },
+      assertLoaded: async () => {},
+      retryDelayMs: 0,
+    });
+
+    assert.equal(result, renderer);
+    assert.equal(connectCount, 2);
+  }
+});
+
+async function assertRealCdpHandshakeFailure({ failUpgrade, expectedError }) {
+  const { connectToReadySkyTurnRenderer } = await import("./newSessionUiAcceptance.mjs");
+  const clientSockets = [];
+  const upgradeSockets = [];
+  let upgradeCount = 0;
+  const originalCreateConnection = net.createConnection;
+  const server = createServer((request, response) => {
+    if (request.url !== "/json/list") {
+      response.writeHead(404).end();
+      return;
+    }
+    const address = server.address();
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify([{
+      type: "page",
+      url: "http://127.0.0.1:5173/",
+      webSocketDebuggerUrl: `ws://127.0.0.1:${address.port}/devtools/page/stale`,
+    }]));
+  });
+  server.on("upgrade", (_request, socket) => {
+    upgradeCount += 1;
+    upgradeSockets.push(socket);
+    failUpgrade(socket);
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  net.createConnection = (...args) => {
+    const socket = originalCreateConnection(...args);
+    clientSockets.push(socket);
+    return socket;
+  };
+
+  try {
+    await assert.rejects(
+      connectToReadySkyTurnRenderer({
+        cdpPort: address.port,
+        devServerUrl: "http://127.0.0.1:5173/",
+        projectRoot: "/tmp/project",
+        retryDelayMs: 0,
+      }),
+      expectedError,
+    );
+    assert.equal(upgradeCount, 2);
+    assert.equal(clientSockets.length, 2);
+    assert.equal(clientSockets.every((socket) => socket.destroyed), true);
+    assert.equal(clientSockets.every((socket) => socket.listenerCount("error") === 0), true);
+    assert.equal(clientSockets.every((socket) => socket.listenerCount("close") === 0), true);
+  } finally {
+    net.createConnection = originalCreateConnection;
+    for (const socket of upgradeSockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+test("New Session UI acceptance retries real failed upgrades and destroys their sockets", async () => {
+  await assertRealCdpHandshakeFailure({
+    expectedError: /CDP WebSocket upgrade failed/,
+    failUpgrade(socket) {
+      socket.write("HTTP/1.1 400 Bad Request\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n");
+      socket.resume();
+    },
+  });
+});
+
+test("New Session UI acceptance retries real reset sockets before Create", async () => {
+  await assertRealCdpHandshakeFailure({
+    expectedError: /ECONNRESET|CDP socket closed/,
+    failUpgrade(socket) {
+      if (typeof socket.resetAndDestroy === "function") socket.resetAndDestroy();
+      else socket.destroy();
+    },
+  });
+});
+
 test("New Session UI acceptance bounds diagnostics and strips URL capabilities", async () => {
   const { connectToReadySkyTurnRenderer } = await import("./newSessionUiAcceptance.mjs");
-  const secret = `secret-${"x".repeat(10_000)}`;
+  const secret = "secret-capability-value";
   const renderer = {
     close() {},
     diagnosticEvents() {
@@ -388,14 +500,23 @@ test("New Session UI acceptance bounds diagnostics and strips URL capabilities",
       assertLoaded: async () => {
         throw new Error("Inspected target navigated or closed");
       },
-      processDiagnostics: () => `Vite loaded http://127.0.0.1:5173/?token=${secret}#capability`,
+      processDiagnostics: () => [
+        `Vite loaded http://127.0.0.1:5173/?token=${secret}#capability`,
+        `GET /?token=${secret}#capability`,
+        `WebSocket ws://127.0.0.1:5223/devtools/page/1?token=${secret}#capability`,
+        `File file:///tmp/renderer.html?token=${secret}#capability`,
+        "x".repeat(10_000),
+      ].join("\n"),
       retryDelayMs: 0,
-      diagnosticLimitBytes: 256,
+      diagnosticLimitBytes: 1_024,
     }),
     (error) => {
-      assert.ok(Buffer.byteLength(error.message) <= 256);
+      assert.ok(Buffer.byteLength(error.message) <= 1_024);
       assert.doesNotMatch(error.message, /secret-|token=|capability/);
       assert.match(error.message, /http:\/\/127\.0\.0\.1:5173\/app/);
+      assert.match(error.message, /GET \/(?:;|\s)/);
+      assert.match(error.message, /ws:\/\/127\.0\.0\.1:5223\/devtools\/page\/1/);
+      assert.match(error.message, /file:\/\/\/tmp\/renderer\.html/);
       return true;
     },
   );
