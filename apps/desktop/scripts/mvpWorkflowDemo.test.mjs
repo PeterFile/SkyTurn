@@ -118,6 +118,10 @@ test("MVP demo passes canonical expected artifacts into every direct bridge run"
     expectedArtifacts: [".devflow/acceptance/react-app.png"],
   });
   assert.deepEqual(demoExpectedArtifactsInputForNode({ requiredEvidence: ["test"] }), {});
+  assert.throws(
+    () => demoExpectedArtifactsInputForNode({ requiredEvidence: ["artifact"] }),
+    /concrete expected artifact declaration/i,
+  );
   assert.match(source, /\.\.\.demoExpectedArtifactsInputForNode\(node\)/);
 });
 

@@ -544,7 +544,10 @@ function startNodeRun(bridge, projectRoot, session, node) {
 }
 
 export function demoExpectedArtifactsInputForNode(node) {
-  const { declarations } = expectedArtifactContractForRequiredEvidence(node?.requiredEvidence);
+  const { required, declarations } = expectedArtifactContractForRequiredEvidence(node?.requiredEvidence);
+  if (required && declarations.length === 0) {
+    throw new Error("Artifact-required demo nodes need a concrete expected artifact declaration.");
+  }
   return declarations.length > 0 ? { expectedArtifacts: declarations } : {};
 }
 

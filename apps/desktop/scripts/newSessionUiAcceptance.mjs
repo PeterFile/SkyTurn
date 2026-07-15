@@ -334,19 +334,37 @@ async function loadDemoHelpers() {
 async function connectToSkyTurnRenderer(cdpPort, devServerUrl) {
   const target = await waitForSkyTurnRendererTarget(cdpPort, devServerUrl);
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
-  await cdp.call("Runtime.enable");
-  await cdp.call("Page.enable");
-  return cdp;
+  try {
+    await cdp.call("Runtime.enable");
+    await cdp.call("Page.enable");
+    return cdp;
+  } catch (error) {
+    cdp.close();
+    throw error;
+  }
 }
 
 export function selectSkyTurnRendererTarget(targets, devServerUrl) {
   if (!Array.isArray(targets)) return null;
+  const expectedUrl = normalizedRendererTargetUrl(devServerUrl);
+  if (!expectedUrl) return null;
   return targets.find((item) =>
     item?.type === "page" &&
     typeof item.url === "string" &&
-    item.url.startsWith(devServerUrl) &&
+    normalizedRendererTargetUrl(item.url) === expectedUrl &&
     typeof item.webSocketDebuggerUrl === "string"
   ) ?? null;
+}
+
+function normalizedRendererTargetUrl(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return url.href;
+  } catch {
+    return null;
+  }
 }
 
 export async function connectToReadySkyTurnRenderer({
@@ -357,27 +375,29 @@ export async function connectToReadySkyTurnRenderer({
   assertLoaded = assertPreseededProjectLoaded,
   processDiagnostics = () => "",
   retryDelayMs = 100,
+  diagnosticLimitBytes = commandOutputLimitBytes,
 }) {
   const attempts = [];
   for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const cdp = await connect(cdpPort, devServerUrl);
+    let cdp = null;
     try {
+      cdp = await connect(cdpPort, devServerUrl);
       await assertLoaded(cdp, projectRoot);
       return cdp;
     } catch (error) {
       attempts.push({
         attempt,
         error: error instanceof Error ? error.message : String(error),
-        events: typeof cdp.diagnosticEvents === "function" ? cdp.diagnosticEvents() : [],
+        events: typeof cdp?.diagnosticEvents === "function" ? cdp.diagnosticEvents() : [],
       });
-      cdp.close();
+      cdp?.close();
       if (attempt === 2 || !isRendererContextLoss(error)) {
-        const processOutput = boundedText(processDiagnostics(), commandOutputLimitBytes).value;
-        throw new Error([
-          error instanceof Error ? error.message : String(error),
-          `Renderer readiness attempts: ${JSON.stringify(attempts)}`,
-          processOutput ? `Process output: ${processOutput}` : "",
-        ].filter(Boolean).join("; "));
+        throw new Error(rendererReadinessDiagnostic({
+          error,
+          attempts,
+          processOutput: processDiagnostics(),
+          limitBytes: diagnosticLimitBytes,
+        }));
       }
       await delay(retryDelayMs);
     }
@@ -388,6 +408,71 @@ export async function connectToReadySkyTurnRenderer({
 function isRendererContextLoss(error) {
   const message = error instanceof Error ? error.message : String(error);
   return /Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id/i.test(message);
+}
+
+function rendererReadinessDiagnostic({ error, attempts, processOutput, limitBytes }) {
+  const sanitizedAttempts = attempts.map((attempt) => ({
+    attempt: attempt.attempt,
+    error: sanitizeDiagnosticText(attempt.error),
+    events: Array.isArray(attempt.events)
+      ? attempt.events.map((event) => sanitizeRendererDiagnosticEvent(event)).filter(Boolean)
+      : [],
+  }));
+  const message = [
+    sanitizeDiagnosticText(error instanceof Error ? error.message : String(error)),
+    `Renderer readiness attempts: ${JSON.stringify(sanitizedAttempts)}`,
+    processOutput ? `Process output: ${sanitizeDiagnosticText(processOutput)}` : "",
+  ].filter(Boolean).join("; ");
+  return boundedDiagnosticText(message, limitBytes);
+}
+
+function sanitizeRendererDiagnosticEvent(event) {
+  if (!event || typeof event !== "object" || typeof event.method !== "string") return null;
+  if (event.method === "Page.frameNavigated") {
+    return {
+      method: event.method,
+      frameId: event.frameId ?? null,
+      url: sanitizeDiagnosticUrl(event.url),
+    };
+  }
+  if (event.method === "Page.loadEventFired") return { method: event.method };
+  if (event.method === "Runtime.executionContextDestroyed") {
+    return {
+      method: event.method,
+      executionContextId: event.executionContextId ?? null,
+    };
+  }
+  if (event.method === "Runtime.executionContextsCleared") return { method: event.method };
+  return null;
+}
+
+function sanitizeDiagnosticText(value) {
+  return String(value).replace(/https?:\/\/[^\s"'<>]+/gi, (url) => sanitizeDiagnosticUrl(url) ?? "[invalid-url]");
+}
+
+function sanitizeDiagnosticUrl(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function boundedDiagnosticText(value, limitBytes) {
+  const limit = Number.isFinite(limitBytes) ? Math.max(0, Math.floor(limitBytes)) : commandOutputLimitBytes;
+  const text = String(value);
+  if (Buffer.byteLength(text) <= limit) return text;
+  const marker = "... [truncated]";
+  const markerBytes = Buffer.byteLength(marker);
+  if (limit <= markerBytes) return boundedText(marker, limit).value;
+  return `${boundedText(text, limit - markerBytes).value}${marker}`;
 }
 
 async function assertPreseededProjectLoaded(cdp, projectRoot) {
@@ -1254,7 +1339,7 @@ function cdpDiagnosticEvent(message) {
     return {
       method: message.method,
       frameId: message.params?.frame?.id ?? null,
-      url: message.params?.frame?.url ?? null,
+      url: sanitizeDiagnosticUrl(message.params?.frame?.url),
     };
   }
   if (message.method === "Page.loadEventFired") return { method: message.method };

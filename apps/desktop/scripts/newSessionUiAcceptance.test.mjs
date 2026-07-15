@@ -259,20 +259,31 @@ test("New Session UI acceptance reports and cleans Electron launch failures", as
 
 test("New Session UI acceptance selects only the exact renderer target", async () => {
   const { selectSkyTurnRendererTarget } = await import("./newSessionUiAcceptance.mjs");
-  const devServerUrl = "http://127.0.0.1:5173/";
+  const devServerUrl = "http://127.0.0.1:5173";
   const unrelated = {
     type: "page",
     url: "devtools://devtools/bundled/inspector.html",
     webSocketDebuggerUrl: "ws://127.0.0.1:5223/devtools/page/unrelated",
   };
+  const adjacentPort = {
+    type: "page",
+    url: "http://127.0.0.1:51730/",
+    webSocketDebuggerUrl: "ws://127.0.0.1:5223/devtools/page/adjacent-port",
+  };
+  const nestedPath = {
+    type: "page",
+    url: "http://127.0.0.1:5173/other",
+    webSocketDebuggerUrl: "ws://127.0.0.1:5223/devtools/page/nested-path",
+  };
   const renderer = {
     type: "page",
-    url: devServerUrl,
+    url: `${devServerUrl}/`,
     webSocketDebuggerUrl: "ws://127.0.0.1:5223/devtools/page/renderer",
   };
 
   assert.equal(selectSkyTurnRendererTarget([unrelated], devServerUrl), null);
-  assert.equal(selectSkyTurnRendererTarget([unrelated, renderer], devServerUrl), renderer);
+  assert.equal(selectSkyTurnRendererTarget([adjacentPort, nestedPath], devServerUrl), null);
+  assert.equal(selectSkyTurnRendererTarget([adjacentPort, nestedPath, renderer], devServerUrl), renderer);
 });
 
 test("New Session UI acceptance reacquires the renderer once before the Create click", async () => {
@@ -320,6 +331,73 @@ test("New Session UI acceptance reacquires the renderer once before the Create c
     source.indexOf("const cdp = await connectToReadySkyTurnRenderer") <
       source.indexOf("await fillTextareaAndClickCreate(cdp, requirement)"),
     "renderer reacquisition must finish before the non-idempotent Create click.",
+  );
+});
+
+test("New Session UI acceptance retries context loss during renderer acquisition", async () => {
+  const { connectToReadySkyTurnRenderer } = await import("./newSessionUiAcceptance.mjs");
+  const renderer = {
+    close() {},
+    diagnosticEvents() {
+      return [];
+    },
+  };
+  let connectCount = 0;
+  let assertCount = 0;
+
+  const result = await connectToReadySkyTurnRenderer({
+    cdpPort: 5223,
+    devServerUrl: "http://127.0.0.1:5173/",
+    projectRoot: "/tmp/project",
+    connect: async () => {
+      connectCount += 1;
+      if (connectCount === 1) throw new Error("Execution context was destroyed");
+      return renderer;
+    },
+    assertLoaded: async () => {
+      assertCount += 1;
+    },
+    retryDelayMs: 0,
+  });
+
+  assert.equal(result, renderer);
+  assert.equal(connectCount, 2);
+  assert.equal(assertCount, 1);
+});
+
+test("New Session UI acceptance bounds diagnostics and strips URL capabilities", async () => {
+  const { connectToReadySkyTurnRenderer } = await import("./newSessionUiAcceptance.mjs");
+  const secret = `secret-${"x".repeat(10_000)}`;
+  const renderer = {
+    close() {},
+    diagnosticEvents() {
+      return [{
+        method: "Page.frameNavigated",
+        frameId: "frame-1",
+        url: `http://127.0.0.1:5173/app?token=${secret}#capability`,
+      }];
+    },
+  };
+
+  await assert.rejects(
+    connectToReadySkyTurnRenderer({
+      cdpPort: 5223,
+      devServerUrl: "http://127.0.0.1:5173/",
+      projectRoot: "/tmp/project",
+      connect: async () => renderer,
+      assertLoaded: async () => {
+        throw new Error("Inspected target navigated or closed");
+      },
+      processDiagnostics: () => `Vite loaded http://127.0.0.1:5173/?token=${secret}#capability`,
+      retryDelayMs: 0,
+      diagnosticLimitBytes: 256,
+    }),
+    (error) => {
+      assert.ok(Buffer.byteLength(error.message) <= 256);
+      assert.doesNotMatch(error.message, /secret-|token=|capability/);
+      assert.match(error.message, /http:\/\/127\.0\.0\.1:5173\/app/);
+      return true;
+    },
   );
 });
 
