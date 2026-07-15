@@ -82,6 +82,6 @@ Electron uses a preload API and keeps renderer Node access disabled:
 - `nodeIntegration: false`
 - IPC methods expose specific operations only.
 
-Folder writes are limited to the user-selected project root and `.devflow` helper files.
+Project writes are limited to the user-selected root and `.devflow` helper files. Electron also writes private claims and authoritative run events under its app-private `userData` state boundary.
 
-Agent run events are durable data under `.devflow/runs/<runId>/events.ndjson`. Renderer streams can update UI, but reloads must recover Output from the persisted event log.
+Authoritative Agent run events live under `<userData>/run-claims/<projectSha256>/<runSha256>.events.ndjson`. Renderer streams and `.devflow/runs/<runId>/events.ndjson` are sanitized, non-authoritative observability mirrors; reload, Output recovery, evidence, artifact gates, and scheduling read only the private log.

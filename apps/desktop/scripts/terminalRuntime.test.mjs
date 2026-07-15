@@ -136,6 +136,84 @@ test("terminal runtime starts Hermes PTY, captures snapshots, broadcasts events,
   }
 });
 
+test("terminal runtime preserves interleaved PTY chunks and whitespace in broadcasts and snapshots", async () => {
+  const { createTerminalRuntime } = await loadTerminalRuntime();
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-terminal-runtime-fidelity-"));
+  const pty = new FakePtyProcess();
+  const broadcasts = [];
+  const runtime = createTerminalRuntime({
+    protocolVersion: 1,
+    featureEnabled: () => true,
+    ptyFactory: { spawn: () => pty },
+    loadAgentBridge: () => import("@skyturn/agent-bridge"),
+    broadcastEvent: (event) => broadcasts.push(event),
+  });
+
+  try {
+    const result = await runtime.startHermesPlannerForWorkflowSession({
+      projectRoot,
+      canvasSessionId: "canvas-session-fidelity",
+      runId: "run-fidelity",
+      hermesSessionHandle: "test-secret",
+    });
+    pty.emitStdout("t");
+    pty.emitStderr("notice\n");
+    pty.emitStdout("est complete\n");
+    pty.emitStdout("  const value = 1;  \n");
+    await waitUntil(() => broadcasts.some((event) => event.kind === "output" && event.text === "  const value = 1;  \n"));
+
+    const expected = [
+      { stream: "stdout", text: "t" },
+      { stream: "stderr", text: "notice\n" },
+      { stream: "stdout", text: "est complete\n" },
+      { stream: "stdout", text: "  const value = 1;  \n" },
+    ];
+    assert.deepEqual(toPlain(
+      broadcasts.filter((event) => event.kind === "output").map(({ stream, text }) => ({ stream, text })),
+    ), expected);
+    const snapshot = await runtime.snapshot({ terminalSessionId: result.terminalSessionId });
+    assert.deepEqual(toPlain(snapshot.lines.map(({ stream, text }) => ({ stream, text }))), expected);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("terminal runtime redacts assignments spanning stdout and stderr in broadcasts and snapshots", async () => {
+  const { createTerminalRuntime } = await loadTerminalRuntime();
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-terminal-runtime-cross-stream-"));
+  const pty = new FakePtyProcess();
+  const broadcasts = [];
+  const runtime = createTerminalRuntime({
+    protocolVersion: 1,
+    featureEnabled: () => true,
+    ptyFactory: { spawn: () => pty },
+    loadAgentBridge: () => import("@skyturn/agent-bridge"),
+    broadcastEvent: (event) => broadcasts.push(event),
+  });
+
+  try {
+    const result = await runtime.startHermesPlannerForWorkflowSession({
+      projectRoot,
+      canvasSessionId: "canvas-session-cross-stream",
+      runId: "run-cross-stream",
+    });
+    pty.emitStdout("token=");
+    pty.emitStderr("abcXYZ\n");
+    pty.emitStdout("  normal output  \n");
+    await waitUntil(() => broadcasts.some((event) => event.kind === "output" && event.text === "  normal output  \n"));
+
+    const snapshot = await runtime.snapshot({ terminalSessionId: result.terminalSessionId });
+    const broadcastOutput = broadcasts.filter((event) => event.kind === "output").map((event) => event.text ?? "").join("");
+    const snapshotOutput = snapshot.lines.map((line) => line.text).join("");
+    assert.doesNotMatch(broadcastOutput, /abcXYZ/);
+    assert.doesNotMatch(snapshotOutput, /abcXYZ/);
+    assert.match(broadcastOutput, /token=\[redacted\]\n  normal output  \n$/);
+    assert.equal(snapshotOutput, broadcastOutput);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("terminal runtime default workflow Hermes PTY launch stays process-level without resume args", async () => {
   const { createTerminalRuntime } = await loadTerminalRuntime();
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-terminal-runtime-"));
@@ -186,12 +264,37 @@ test("terminal runtime sends workflow follow-up input to the existing Hermes pla
   const { createTerminalRuntime } = await loadTerminalRuntime();
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-terminal-runtime-"));
   const pty = new FakePtyProcess();
+  const spawnInputs = [];
+  const broadcasts = [];
   const runtime = createTerminalRuntime({
     protocolVersion: 1,
     featureEnabled: () => true,
-    ptyFactory: { spawn: () => pty },
+    ptyFactory: {
+      spawn(input) {
+        spawnInputs.push(input);
+        return pty;
+      },
+    },
     loadAgentBridge: () => import("@skyturn/agent-bridge"),
+    broadcastEvent: (event) => broadcasts.push(event),
   });
+  const rawHandle = "opaque-desktop-resume-capability-6f4d2a8c";
+  const rawOutputs = [
+    rawHandle,
+    "Bearer desktop-output-secret-123456",
+    "HERMES_API_KEY=sk-desktop-api-secret-123456",
+    "password=desktop-password-secret-123456",
+    "/Users/alice/private/desktop-repo",
+    "C:\\Users\\alice\\private\\desktop-repo",
+  ];
+  const privatePayloads = [
+    rawHandle,
+    "desktop-output-secret-123456",
+    "sk-desktop-api-secret-123456",
+    "desktop-password-secret-123456",
+    "alice/private/desktop-repo",
+    "alice\\private\\desktop-repo",
+  ];
 
   try {
     const start = await runtime.startHermesPlannerForWorkflowSession({
@@ -200,14 +303,45 @@ test("terminal runtime sends workflow follow-up input to the existing Hermes pla
       runId: "run-hermes-planner",
       plannerSessionId: "hermes-planner-canvas-session-1",
       plannerInputId: "input-1",
-      hermesSessionHandle: "opaque-hermes-session-1",
+      hermesSessionHandle: rawHandle,
     });
 
     await runtime.sendWorkflowUserInput("canvas-session-1", "follow up\n");
+    for (const [index, rawOutput] of rawOutputs.entries()) {
+      const split = Math.max(1, Math.floor(rawOutput.length / 2));
+      const emit = index % 2 === 0
+        ? (chunk) => pty.emitStdout(chunk)
+        : (chunk) => pty.emitStderr(chunk);
+      emit(`before-${index} ${rawOutput.slice(0, split)}`);
+      emit(`${rawOutput.slice(split)} after-${index}\n`);
+    }
+    pty.emitStdout("public-after-paths\n");
+    await waitUntil(async () => {
+      const snapshot = await runtime.snapshot({ terminalSessionId: start.terminalSessionId });
+      return snapshot.lines.some((line) => line.text.includes("public-after-paths"));
+    });
 
     assert.equal(start.terminalSessionId, "hermes-planner-canvas-session-1");
     assert.equal(runtime.hermesPlannerTerminalSessionId("canvas-session-1"), start.terminalSessionId);
     assert.deepEqual(pty.writes, ["follow up\n"]);
+    assert.deepEqual(spawnInputs[0].args, ["chat", "--cli", "--source", "skyturn", "--resume", rawHandle]);
+    await runtime.cancel({ terminalSessionId: start.terminalSessionId, reason: "User cancelled desktop terminal" });
+    const publicState = JSON.stringify({
+      start,
+      snapshot: await runtime.snapshot({ terminalSessionId: start.terminalSessionId }),
+      broadcasts,
+    });
+    const broadcastOutput = broadcasts.filter((event) => event.kind === "output").map((event) => event.text ?? "").join("");
+    const snapshotOutput = (await runtime.snapshot({ terminalSessionId: start.terminalSessionId })).lines
+      .map((line) => line.text)
+      .join("");
+    for (const privatePayload of privatePayloads) {
+      assert.ok(!publicState.includes(privatePayload));
+      assert.ok(!broadcastOutput.includes(privatePayload));
+      assert.ok(!snapshotOutput.includes(privatePayload));
+    }
+    assert.ok(broadcastOutput.indexOf("before-0") < broadcastOutput.indexOf("public-after-paths"));
+    assert.ok(snapshotOutput.indexOf("before-0") < snapshotOutput.indexOf("public-after-paths"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -300,6 +434,10 @@ class FakePtyProcess {
 
   emitStdout(chunk) {
     for (const listener of this.dataListeners) listener(chunk);
+  }
+
+  emitStderr(chunk) {
+    for (const listener of this.stderrListeners) listener(chunk);
   }
 }
 

@@ -11,8 +11,9 @@ import {
   AgentBridge,
   RUN_EVENT_PROTOCOL_VERSION,
   createCodexCliAdapter,
+  createDurableRunClaimStore,
   createHermesCliAdapter,
-  loadRunEvents,
+  createPrivateRunEventStore,
 } from "@skyturn/agent-bridge";
 import { parseHermesWorkflowIntent } from "@skyturn/orchestrator";
 import { createFastCanvasSession } from "@skyturn/planner";
@@ -30,17 +31,22 @@ const agentWatchdogTimeoutMs = demoTimeouts.agentWatchdogTimeoutMs;
 const maxWorkflowRuns = Number(process.env.SKYTURN_DEMO_MAX_RUNS ?? 12);
 
 export async function runMvpWorkflowDemo() {
+  const durableRunClaimRoot = await mkdtemp(join(tmpdir(), "skyturn-demo-claims-"));
+  const durableRunClaimStore = createDurableRunClaimStore({ root: durableRunClaimRoot });
   const bridge = new AgentBridge({
     adapters: [
       createHermesCliAdapter({ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs }),
       createCodexCliAdapter({ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs }),
     ],
+    durableRunClaimStore,
+    privateRunEventStore: createPrivateRunEventStore({ durableRunClaimStore }),
   });
 
   const readinessPreflight = await demoReadinessPreflight(bridge);
   if (readinessPreflight.failFast) {
     console.log(JSON.stringify(readinessFailureResult(readinessPreflight.readiness), null, 2));
     process.exitCode = 1;
+    await rm(durableRunClaimRoot, { recursive: true, force: true });
     return;
   }
 
@@ -110,7 +116,7 @@ export async function runMvpWorkflowDemo() {
           commitCountBefore,
           commitCountAfter,
         });
-        const events = await loadRunEvents(root, run.id);
+        const events = await bridge.loadEvents(root, run.id);
         workspace = mergeRunEventsIntoWorkspace(workspace, run.id, events);
       }
     }
@@ -220,6 +226,7 @@ export async function runMvpWorkflowDemo() {
     if (!ok) process.exitCode = 1;
   } finally {
     if (cleanupRoot) await rm(root, { recursive: true, force: true });
+    await rm(durableRunClaimRoot, { recursive: true, force: true });
   }
 }
 

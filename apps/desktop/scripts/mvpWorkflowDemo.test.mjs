@@ -105,6 +105,9 @@ test("MVP demo passes bounded watchdogs into Hermes and Codex adapters", async (
 
   assert.match(source, /createHermesCliAdapter\(\{ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs \}\)/);
   assert.match(source, /createCodexCliAdapter\(\{ defaultWatchdogTimeoutMs: agentWatchdogTimeoutMs \}\)/);
+  assert.match(source, /createDurableRunClaimStore/);
+  assert.match(source, /durableRunClaimStore/);
+  assert.match(source, /skyturn-demo-claims-/);
 });
 
 test("MVP demo verification script checks renderable Vite output", async () => {

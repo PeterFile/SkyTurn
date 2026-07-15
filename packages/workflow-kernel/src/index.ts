@@ -1,6 +1,7 @@
 import type {
   AgentKind,
   AgentRunSandbox,
+  RunEvent,
   RunEvidence,
   ChangesetEvidence,
   NodeStatus,
@@ -35,6 +36,13 @@ import type {
   WorkflowSuccessorLoopState,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
+} from "@skyturn/project-core";
+import {
+  isTerminalAgentRunStatus,
+  isSuccessfulRunEvidence,
+  parseRunEvent,
+  parseRunEvidence,
+  sanitizePublicEvidenceText,
 } from "@skyturn/project-core";
 
 export type {
@@ -163,6 +171,7 @@ export interface FlowLane {
   packageScopes: string[];
   requiredEvidence: string[];
   output: string[];
+  outputDeltas?: RunEvent[];
 }
 
 export type FlowLaneStatus = "pending" | "ready" | "running" | "waiting_input" | "completed" | "failed" | "blocked";
@@ -1387,7 +1396,10 @@ export function nodeStatusProjectionForFlowLaneStatus(
 }
 
 export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
-  const unique = dedupeEvents(events);
+  const unique = dedupeEvents(events.flatMap((event) => {
+    const canonical = canonicalOutputDeltaEvent(event);
+    return canonical ? [canonical] : [];
+  }));
   const projection = emptyFlowProjection(unique[0]?.sessionId ?? "session-1");
   projection.events = unique;
   const pullRequestHeadState: PullRequestHeadState = {
@@ -1447,21 +1459,54 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
     if (event.kind === "workflow.segment.output_delta") {
       const laneId = typeof event.payload.laneId === "string" ? event.payload.laneId : null;
       const text = typeof event.payload.text === "string" ? event.payload.text : null;
-      if (laneId && text) appendLaneOutput(projection, laneId, text);
+      const delta = parseRunEvent(event.payload.delta);
+      if (laneId && (text !== null || delta)) appendLaneOutput(projection, laneId, text, delta);
     }
     if (event.kind === "workflow.segment.finished") {
       const segmentId = typeof event.payload.segmentId === "string" ? event.payload.segmentId : null;
       const laneId = typeof event.payload.laneId === "string" ? event.payload.laneId : null;
-      const status = normalizeSegmentStatus(event.payload.status);
-      if (segmentId) updateSegment(projection, segmentId, status, numberOrNull(event.payload.exitCode));
+      const recordedSegment = segmentId
+        ? projection.segments.find((segment) => segment.id === segmentId)
+        : undefined;
+      const stickyFailure = isBlockingTerminalSegmentStatus(recordedSegment?.status);
+      const status = stickyFailure
+        ? recordedSegment.status
+        : normalizeSegmentStatus(event.payload.status);
+      const exitCode = stickyFailure ? recordedSegment.exitCode : numberOrNull(event.payload.exitCode);
+      if (segmentId) updateSegment(projection, segmentId, status, exitCode);
       if (laneId && status !== "succeeded") setLaneStatus(projection, laneId, "failed");
     }
     if (event.kind === "workflow.evidence.recorded" && isRecord(event.payload.evidence)) {
       const laneId = typeof event.payload.laneId === "string" ? event.payload.laneId : "";
       const segmentId = typeof event.payload.segmentId === "string" ? event.payload.segmentId : "";
-      const evidence = normalizeEvidence(event.payload.evidence, laneId, segmentId);
+      const lane = projection.lanes.find((item) => item.id === laneId);
+      const recordedSegment = projection.segments.find((segment) => segment.id === segmentId);
+      const normalizedEvidence = normalizeEvidence(event.payload.evidence, laneId, segmentId, lane);
+      if (conflictsWithFirstTerminalRunEvidence(projection, normalizedEvidence)) {
+        projection.events = projection.events.filter((recorded) => recorded.id !== event.id);
+        continue;
+      }
+      const evidence = normalizedEvidence.status === "passed" && isBlockingTerminalSegmentStatus(recordedSegment?.status)
+        ? { ...normalizedEvidence, status: "failed" as const }
+        : normalizedEvidence;
+      projection.events = projection.events.map((recorded) =>
+        recorded.id === event.id
+          ? { ...recorded, payload: { ...recorded.payload, laneId, segmentId, evidence } }
+          : recorded
+      );
       projection.evidence.push(evidence);
       if (evidence.status === "passed") setLaneStatus(projection, evidence.laneId, "completed");
+      const evidenceTerminalStatus = terminalSegmentStatusFromEvidence(evidence);
+      if (evidenceTerminalStatus) {
+        const segmentStatus = isBlockingTerminalSegmentStatus(recordedSegment?.status)
+          ? recordedSegment.status
+          : evidenceTerminalStatus;
+        const exitCode = isBlockingTerminalSegmentStatus(recordedSegment?.status)
+          ? recordedSegment.exitCode
+          : evidence.runEvidence?.exitCode ?? null;
+        updateSegment(projection, evidence.segmentId, segmentStatus, exitCode);
+        setLaneStatus(projection, evidence.laneId, "failed");
+      }
     }
     if (event.kind === "workflow.changeset.evidence_recorded" && isRecord(event.payload.evidence)) {
       projection.changesetEvidence.push(event.payload.evidence as unknown as ChangesetEvidence);
@@ -1563,6 +1608,52 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
 
   refreshProjectionNodes(projection);
   return projection;
+}
+
+function canonicalOutputDeltaEvent(event: FlowEvent): FlowEvent | null {
+  if (event.kind !== "workflow.segment.output_delta") return event;
+  if (event.payload.delta === undefined) return null;
+  const delta = parseRunEvent(event.payload.delta);
+  if (!delta || !isOutputDeltaRunEvent(delta)) return null;
+  const deltaText = typeof delta.payload.text === "string" ? delta.payload.text : undefined;
+  if (
+    event.payload.text !== undefined &&
+    (typeof event.payload.text !== "string" || event.payload.text !== deltaText)
+  ) return null;
+  const { text: _text, ...payload } = event.payload;
+  return {
+    ...event,
+    payload: {
+      ...payload,
+      ...(deltaText !== undefined ? { text: deltaText } : {}),
+      delta,
+    },
+  };
+}
+
+function isOutputDeltaRunEvent(event: RunEvent): boolean {
+  return event.kind === "output" || event.kind === "progress" || event.kind === "changes";
+}
+
+function conflictsWithFirstTerminalRunEvidence(
+  projection: FlowProjection,
+  evidence: FlowEvidence,
+): boolean {
+  if (!evidence.runEvidence || !isTerminalAgentRunStatus(evidence.runEvidence.status)) return false;
+  const first = projection.evidence.find((candidate) =>
+    candidate.segmentId === evidence.segmentId &&
+    candidate.runEvidence &&
+    isTerminalAgentRunStatus(candidate.runEvidence.status)
+  )?.runEvidence;
+  return Boolean(first && JSON.stringify(first) !== JSON.stringify(evidence.runEvidence));
+}
+
+function terminalSegmentStatusFromEvidence(
+  evidence: FlowEvidence,
+): "failed" | "cancelled" | "timed-out" | null {
+  if (evidence.runEvidence?.status === "cancelled") return "cancelled";
+  if (evidence.runEvidence?.status === "timed-out") return "timed-out";
+  return evidence.status === "failed" ? "failed" : null;
 }
 
 function parseInsertBeforeReplayPayload(
@@ -2109,6 +2200,17 @@ function normalizeRequirementProfile(value: Record<string, unknown> | Requiremen
   };
 }
 
+export function canonicalRequiredEvidenceForLane(value: unknown): string[] {
+  if (!isRecord(value)) return [];
+  const explicit = deduplicatedRequiredEvidence(value.requiredEvidence);
+  if (!laneDenotesBrowserScreenshotValidation(value)) return explicit;
+  return [
+    ...explicit.filter((kind) => !/^(?:browser|screenshot)$/i.test(kind)),
+    "browser",
+    "screenshot",
+  ];
+}
+
 function normalizeLane(value: Record<string, unknown> | LaneSuggestion | FlowLane): FlowLane {
   const record = value as Record<string, unknown>;
   const id = requireString(record.id, "lane.id");
@@ -2139,9 +2241,60 @@ function normalizeLane(value: Record<string, unknown> | LaneSuggestion | FlowLan
     ...(rollbackStatus ? { rollbackStatus } : {}),
     fileScopes: stringArray(record.fileScopes),
     packageScopes: stringArray(record.packageScopes),
-    requiredEvidence: stringArray(record.requiredEvidence),
+    requiredEvidence: canonicalRequiredEvidenceForLane(record),
     output: stringArray(record.output),
   };
+}
+
+function deduplicatedRequiredEvidence(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const evidence: string[] = [];
+  for (const candidate of value) {
+    if (typeof candidate !== "string" || !candidate.trim()) continue;
+    const kind = candidate.trim();
+    const key = kind.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    evidence.push(/^(?:artifact|browser|screenshot)$/i.test(kind) ? key : kind);
+  }
+  return evidence;
+}
+
+function laneDenotesBrowserScreenshotValidation(record: Record<string, unknown>): boolean {
+  const agentKind = isAgentKind(record.agentKind) ? record.agentKind : "codex";
+  const executable = typeof record.executable === "boolean" ? record.executable : true;
+  if (agentKind !== "codex" || !executable) return false;
+
+  const kind = semanticEvidenceKey(record.kind);
+  const semanticSubtype = semanticEvidenceKey(record.semanticSubtype);
+  if (isBrowserScreenshotValidationSemantic(kind) || isBrowserScreenshotValidationSemantic(semanticSubtype)) {
+    return true;
+  }
+
+  const laneKind = semanticEvidenceKey(record.laneKind) || laneKindForLegacyKind(kind);
+  if (laneKind !== "validation" && laneKind !== "regression") return false;
+  return isBoundedBrowserScreenshotValidationText(record.title) ||
+    isBoundedBrowserScreenshotValidationText(record.brief);
+}
+
+function semanticEvidenceKey(value: unknown): string {
+  return typeof value === "string"
+    ? value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")
+    : "";
+}
+
+function isBrowserScreenshotValidationSemantic(value: string): boolean {
+  return /^(?:browser|screenshot|browser_screenshot)_(?:validation|test|check)$/.test(value);
+}
+
+function isBoundedBrowserScreenshotValidationText(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const text = value.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!text || text.length > 120) return false;
+  return /^(?:capture|take|record|validate|verify) (?:a |the )?(?:browser )?screenshot(?: (?:evidence|proof))?$/.test(text) ||
+    /^(?:validate|verify|test)(?: [a-z0-9][a-z0-9 ._-]{0,60})? in (?:the )?browser$/.test(text) ||
+    /^(?:browser|browser screenshot|screenshot) (?:validation|test|check|evidence|proof)$/.test(text);
 }
 
 function laneKindForLegacyKind(kind: string): WorkflowLaneKind {
@@ -2347,18 +2500,83 @@ function normalizeSegmentStatus(value: unknown): FlowSegment["status"] {
   return "running";
 }
 
-function normalizeEvidence(value: Record<string, unknown>, laneId: string, segmentId: string): FlowEvidence {
+function isBlockingTerminalSegmentStatus(
+  status: FlowSegment["status"] | undefined,
+): status is "failed" | "cancelled" | "timed-out" {
+  return status === "failed" || status === "cancelled" || status === "timed-out";
+}
+
+function normalizeEvidence(
+  value: Record<string, unknown>,
+  laneId: string,
+  segmentId: string,
+  lane?: FlowLane,
+): FlowEvidence {
+  const hasNestedRunEvidence = "runEvidence" in value;
+  const runEvidence = parseRunEvidence(value.runEvidence);
+  const discardOuterEvidence = !hasNestedRunEvidence && laneRequiresExpectedArtifact(lane);
+  const outerStatus = normalizeFlowEvidenceStatus(value.status);
+  const status = normalizeEvidenceStatus(
+    outerStatus,
+    hasNestedRunEvidence,
+    runEvidence,
+    lane,
+  );
+  const nestedDetail = runEvidence
+    ? runEvidence.errorReason ??
+      runEvidence.cancelReason ??
+      [...runEvidence.checks].reverse().find((check) => check.status === "failed")?.detail ??
+      runEvidence.review?.detail
+    : undefined;
+  const checks = discardOuterEvidence
+    ? []
+    : hasNestedRunEvidence
+      ? runEvidence?.checks.map((check) => `${check.kind}:${check.name}:${check.status}`) ?? []
+      : stringArray(value.checks).map(sanitizePublicEvidenceText).filter(Boolean);
+  const artifacts = discardOuterEvidence
+    ? []
+    : hasNestedRunEvidence
+      ? runEvidence?.artifacts ?? []
+      : stringArray(value.artifacts);
+  const detail = discardOuterEvidence
+    ? undefined
+    : hasNestedRunEvidence
+      ? nestedDetail
+      : typeof value.detail === "string"
+        ? sanitizePublicEvidenceText(value.detail)
+        : undefined;
   return {
-    id: typeof value.id === "string" ? value.id : `evidence-${laneId}-${segmentId}`,
+    id: typeof value.id === "string"
+      ? sanitizePublicEvidenceText(value.id) || `evidence-${laneId}-${segmentId}`
+      : `evidence-${laneId}-${segmentId}`,
     laneId,
     segmentId,
-    kind: typeof value.kind === "string" ? value.kind : "run-exit",
-    status: normalizeFlowEvidenceStatus(value.status),
-    checks: stringArray(value.checks),
-    artifacts: stringArray(value.artifacts),
-    ...(typeof value.detail === "string" ? { detail: value.detail } : {}),
-    ...(isRecord(value.runEvidence) ? { runEvidence: value.runEvidence as unknown as RunEvidence } : {}),
+    kind: typeof value.kind === "string" ? sanitizePublicEvidenceText(value.kind) || "run-exit" : "run-exit",
+    status,
+    checks,
+    artifacts,
+    ...(detail ? { detail } : {}),
+    ...(runEvidence ? { runEvidence } : {}),
   };
+}
+
+function normalizeEvidenceStatus(
+  outerStatus: FlowEvidence["status"],
+  hasNestedRunEvidence: boolean,
+  runEvidence: RunEvidence | null,
+  lane?: FlowLane,
+): FlowEvidence["status"] {
+  const expectedArtifactContract = laneRequiresExpectedArtifact(lane);
+  if (!hasNestedRunEvidence) return expectedArtifactContract ? "failed" : outerStatus;
+  if (!runEvidence) return "failed";
+  if (runEvidence.status === "cancelled") return "skipped";
+  const successful = isSuccessfulRunEvidence(runEvidence, { source: "current", expectedArtifactContract });
+  if (!successful) return "failed";
+  return outerStatus;
+}
+
+function laneRequiresExpectedArtifact(lane: FlowLane | undefined): boolean {
+  return Boolean(lane?.requiredEvidence.some((kind) => /^(?:artifact|browser|screenshot)$/.test(kind.toLowerCase())));
 }
 
 function normalizeNodeCheckpoint(
@@ -3434,8 +3652,14 @@ function withLaneRollbackStatus(lane: FlowLane, rollbackStatus: FlowLaneRollback
   };
 }
 
-function appendLaneOutput(projection: FlowProjection, laneId: string, text: string): void {
-  projection.lanes = projection.lanes.map((lane) => (lane.id === laneId ? { ...lane, output: [...lane.output, text] } : lane));
+function appendLaneOutput(projection: FlowProjection, laneId: string, text: string | null, delta: RunEvent | null): void {
+  projection.lanes = projection.lanes.map((lane) => lane.id === laneId
+    ? {
+        ...lane,
+        ...(text !== null ? { output: [...lane.output, text] } : {}),
+        ...(delta ? { outputDeltas: [...(lane.outputDeltas ?? []), delta] } : {}),
+      }
+    : lane);
 }
 
 function dependencyIsSatisfied(

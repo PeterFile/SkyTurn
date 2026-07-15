@@ -11,6 +11,7 @@ import {
 } from "@skyturn/project-memory";
 import type { AgentDescriptor, WorkflowWorktreeIdentity } from "@skyturn/project-core" with { "resolution-mode": "import" };
 import {
+  authorizeRunStartExpectedArtifacts,
   isTrustedPlannerRootStartInput,
   normalizeWorkflowIpcError,
   normalizeWorkflowNodePositionUpdate,
@@ -518,6 +519,16 @@ interface AgentBridgeHost {
   getEvidence(projectRoot: string, runId: string): Promise<unknown>;
 }
 
+interface TerminalPersistenceFailureLike {
+  projectRoot: string;
+  runId: string;
+  nodeId: string;
+  sessionId: string;
+  agentKind: string;
+  reason: "terminal-persistence-failed";
+  evidence: unknown;
+}
+
 interface WorkflowStoreHost {
   createWorkflowSession(input: unknown): unknown;
   appendUserInput(input: unknown): unknown;
@@ -668,6 +679,14 @@ ipcMain.handle("agent:health", async () => {
 });
 
 const runStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
+  preAuthorizeStart: async (input) => {
+    const { assertExpectedArtifactVerifierCapability } = await import("@skyturn/agent-bridge");
+    await assertExpectedArtifactVerifierCapability(input.expectedArtifacts);
+  },
+  authorizeStartInput: async (input) => {
+    assertKnownProjectRoot(input.projectRoot);
+    return authorizeRunStartExpectedArtifacts(input, await getWorkflowStore(input.projectRoot));
+  },
   resolveIdentity: trustedRunStartIdentity,
   acquireStore: (identity) => getWorkflowStore(identity.projectRoot),
   reopenStore: reopenWorkflowStore,
@@ -706,7 +725,7 @@ const runStartHandler = createRunStartHandler<StartAgentRunInput, unknown, Workf
       laneId: segment.laneId,
       segmentId: segment.segmentId,
       idempotencyKey: `run-start:${segment.runId}:reconciliation-failed`,
-      payload: { runId: segment.runId, status: "failed", reason: sanitizeSnippet(error instanceof Error ? error.message : String(error)) },
+      payload: { runId: segment.runId, status: "failed", reason: "terminal-recovery-failed" },
       now: new Date().toISOString(),
     });
   },
@@ -945,6 +964,7 @@ ipcMain.handle("workflow:recordRunResult", async (_event, projectRoot: string, i
     runId,
     agentKind,
     outputSummary: summarizeRunOutput(events),
+    runEvents: events,
     evidence,
     now,
   });
@@ -1957,13 +1977,27 @@ function workspaceStorePath(): string {
 
 async function getAgentBridge(): Promise<AgentBridgeHost> {
   if (!agentBridge) {
-    const { AgentBridge, createCodexCliAdapter, createHermesCliAdapter } = await import("@skyturn/agent-bridge");
+    const {
+      AgentBridge,
+      createCodexCliAdapter,
+      createDurableRunClaimStore,
+      createHermesCliAdapter,
+      createPrivateRunEventStore,
+    } = await import("@skyturn/agent-bridge");
     const codexOptions = {
       ...(process.env.SKYTURN_CODEX_SANDBOX === "workspace-write" ? { sandbox: "workspace-write" as const } : {}),
       ...(process.env.SKYTURN_CODEX_IGNORE_USER_CONFIG === "1" ? { extraArgs: ["--ignore-user-config"] } : {}),
     };
+    const durableRunClaimStore = createDurableRunClaimStore({
+      root: path.join(app.getPath("userData"), "run-claims"),
+    });
+    await durableRunClaimStore.initialize();
+    const privateRunEventStore = createPrivateRunEventStore({ durableRunClaimStore });
     const bridge = new AgentBridge({
       adapters: [createHermesCliAdapter(), createCodexCliAdapter(codexOptions)],
+      durableRunClaimStore,
+      privateRunEventStore,
+      onTerminalPersistenceFailure: compensateTerminalPersistenceFailure,
     }) as AgentBridgeHost;
     bridge.onRunEvent((event) => {
       for (const window of BrowserWindow.getAllWindows()) {
@@ -1974,6 +2008,60 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
     agentBridge = bridge;
   }
   return agentBridge;
+}
+
+async function compensateTerminalPersistenceFailure(failure: TerminalPersistenceFailureLike): Promise<void> {
+  try {
+    if (failure.reason !== "terminal-persistence-failed") throw new Error("terminal-persistence-failed");
+    assertTerminalRunEvidence(failure.evidence, failure.runId);
+    if (
+      readField(failure.evidence, "status") !== "failed" ||
+      readField(failure.evidence, "errorReason") !== "terminal-persistence-failed"
+    ) {
+      throw new Error("terminal-persistence-failed");
+    }
+    const projectRoot = await workflowStoreIdentity(failure.projectRoot);
+    const store = workflowStores.get(projectRoot);
+    const segment = store?.listRunningSegments().find((candidate) =>
+      candidate.runId === failure.runId &&
+      candidate.sessionId === failure.sessionId &&
+      candidate.laneId === failure.nodeId &&
+      candidate.agentKind === failure.agentKind
+    );
+    if (!store || !segment) throw new Error("terminal-persistence-failed");
+    const input = {
+      sessionId: segment.sessionId,
+      laneId: segment.laneId,
+      segmentId: segment.segmentId,
+      runId: segment.runId,
+      agentKind: assertWorkflowAgentKind(segment.agentKind),
+      outputSummary: "terminal-persistence-failed",
+      evidence: failure.evidence,
+      now: optionalText(readField(failure.evidence, "completedAt")) ?? new Date().toISOString(),
+    };
+    try {
+      store.recordRunResult(input);
+    } catch {
+      const reopened = await reopenWorkflowStore({
+        projectRoot,
+        sessionId: segment.sessionId,
+        laneId: segment.laneId,
+        runId: segment.runId,
+        agentKind: segment.agentKind,
+        worktreePath: projectRoot,
+        startFingerprint: "terminal-persistence-failed",
+      });
+      try {
+        reopened.recordRunResult(input);
+      } finally {
+        reopened.close();
+      }
+    }
+    broadcastWorkflowProjection(projectRoot, segment.sessionId, store);
+  } catch {
+    console.error("terminal-persistence-failed");
+    throw new Error("terminal-persistence-failed");
+  }
 }
 
 async function reconcileTerminalRunEvent(bridge: AgentBridgeHost, event: unknown): Promise<void> {
@@ -1990,7 +2078,7 @@ async function reconcileTerminalRunEvent(bridge: AgentBridgeHost, event: unknown
   if (!store || !segment) return;
   try {
     await reconcileTerminalWorkflowRun(store, bridge, projectRoot, segment);
-  } catch (error) {
+  } catch {
     store.appendWorkflowEvent({
       sessionId: segment.sessionId,
       kind: "workflow.run.recovery_failed",
@@ -1998,7 +2086,7 @@ async function reconcileTerminalRunEvent(bridge: AgentBridgeHost, event: unknown
       laneId: segment.laneId,
       segmentId: segment.segmentId,
       idempotencyKey: `run-live-recovery:${segment.runId}:failed`,
-      payload: { runId: segment.runId, status: "failed", reason: sanitizeSnippet(error instanceof Error ? error.message : String(error)) },
+      payload: { runId: segment.runId, status: "failed", reason: "terminal-recovery-failed" },
       now: new Date().toISOString(),
     });
     return;
@@ -2082,6 +2170,7 @@ async function reconcileTerminalWorkflowRun(
     runId: segment.runId,
     agentKind: assertWorkflowAgentKind(segment.agentKind),
     outputSummary: summarizeRunOutput(events),
+    runEvents: events,
     evidence,
     now: optionalText(readField(evidence, "completedAt")) ?? new Date().toISOString(),
   });
@@ -2190,8 +2279,7 @@ function summarizeRunOutput(events: unknown[]): string | undefined {
         : null;
     })
     .filter((text): text is string => Boolean(text))
-    .join("\n")
-    .trim();
+    .join("");
   if (!output) return undefined;
   return output.length > 1_000 ? output.slice(0, 1_000) : output;
 }

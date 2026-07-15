@@ -70,7 +70,7 @@ function mockRunEvidence(overrides: Partial<RunEvidence> = {}): RunEvidence {
     exitCode: 0,
     changesetId: "cs-1",
     checks: [{ kind: "test", name: "unit", status: "passed" }],
-    artifacts: ["patch", "screenshot"],
+    artifacts: [".devflow/acceptance/patch.diff", ".devflow/acceptance/screenshot.png"],
     review: null,
     errorReason: null,
     cancelReason: null,
@@ -417,7 +417,7 @@ describe("UI source validation", () => {
       { label: "Run status", value: "succeeded" },
       { label: "Exit code", value: "0" },
       { label: "Checks", value: "test [unit]: passed" },
-      { label: "Artifacts", value: "2 (patch, screenshot)" },
+      { label: "Artifacts", value: "2 (.devflow/acceptance/patch.diff, .devflow/acceptance/screenshot.png)" },
     ]);
   });
 
@@ -438,7 +438,7 @@ describe("UI source validation", () => {
             detail: "tsc -p tsconfig.json",
           },
         ],
-        artifacts: ["artifacts/node-modal/context-screenshot.png"],
+        artifacts: [".devflow/acceptance/node-modal/context-screenshot.png"],
       })),
     ).toEqual([
       { label: "Run ID", value: "run-1" },
@@ -448,7 +448,7 @@ describe("UI source validation", () => {
         label: "Checks",
         value: "test [corepack pnpm --filter @skyturn/ui-canvas run test]: passed - 118 tests passed, build [ui-canvas build]: passed - tsc -p tsconfig.json",
       },
-      { label: "Artifacts", value: "1 (artifacts/node-modal/context-screenshot.png)" },
+      { label: "Artifacts", value: "1 (.devflow/acceptance/node-modal/context-screenshot.png)" },
     ]);
   });
 

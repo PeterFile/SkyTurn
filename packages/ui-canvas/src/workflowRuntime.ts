@@ -7,9 +7,13 @@ import {
 import type { WorkspaceState } from "@skyturn/persistence";
 import {
   RUN_EVENT_PROTOCOL_VERSION,
+  deriveRunEvidenceFromRunEvents,
   deriveNodeStatusFromEvidence,
   hasConcreteRunEvidence,
+  isSuccessfulRunEvidence,
+  expectedArtifactContractForRequiredEvidence,
   makeHermesPlannerSessionId,
+  parseRunEvidence,
   type AgentRun,
   type AgentRunSandbox,
   type AgentRunStatus,
@@ -65,7 +69,6 @@ export interface WorkflowSchedulingPolicy {
 const SERIAL_WORKFLOW_PARALLELISM = 1;
 const MAX_WORKFLOW_PARALLELISM = 4;
 const CURRENT_BRANCH_WORKTREE_KEY = "current_branch";
-const BROWSER_SCREENSHOT_ARTIFACT = ".devflow/acceptance/react-app.png";
 
 export async function startBridgeRun(
   project: ImportedProject,
@@ -100,8 +103,9 @@ export async function startBridgeRun(
     window.devflow.getRunEvents(project.rootPath, node.runId),
     window.devflow.getRunEvidence(project.rootPath, node.runId),
   ]);
-  const workflowSession = await persistWorkflowRunResult(project, session, node, eventsResult.events, evidenceResult.evidence);
-  return { run: result.run, events: eventsResult.events, evidence: evidenceResult.evidence, workflowSession };
+  const evidence = requireRunEvidence(evidenceResult.evidence);
+  const workflowSession = await persistWorkflowRunResult(project, session, node, eventsResult.events, evidence);
+  return { run: result.run, events: eventsResult.events, evidence, workflowSession };
 }
 
 export async function persistCompletedBridgeRunResult(
@@ -109,20 +113,21 @@ export async function persistCompletedBridgeRunResult(
   session: CanvasSession,
   node: CanvasNode,
 ): Promise<CompletedBridgeRunPersistenceResult | null> {
-  if (!canStartNodeRun(node) || !window.devflow) return null;
+  if (!isExecutableNode(node) || !window.devflow) return null;
   const [eventsResult, evidenceResult] = await Promise.all([
     window.devflow.getRunEvents(project.rootPath, node.runId),
     window.devflow.getRunEvidence(project.rootPath, node.runId),
   ]);
-  if (!hasTerminalRunEvidence(evidenceResult.evidence)) return null;
+  const evidence = requireRunEvidence(evidenceResult.evidence);
+  if (!hasTerminalRunEvidence(evidence)) return null;
   const workflowSession = await persistWorkflowRunResult(
     project,
     session,
     node,
     eventsResult.events,
-    evidenceResult.evidence,
+    evidence,
   );
-  return { events: eventsResult.events, evidence: evidenceResult.evidence, workflowSession };
+  return { events: eventsResult.events, evidence, workflowSession };
 }
 
 export function claimCompletedBridgeRunPersistence(
@@ -134,7 +139,7 @@ export function claimCompletedBridgeRunPersistence(
   for (const session of workspace.sessions) {
     if (session.kind !== "canvas") continue;
     const node = session.nodes.find((candidate) => candidate.runId === event.runId);
-    if (!node || !canStartNodeRun(node)) continue;
+    if (!node || !isExecutableNode(node)) continue;
     if (node.status !== "running" && node.status !== "retrying") continue;
     const project = workspace.projects.find((candidate) => candidate.id === session.projectId);
     if (!project) continue;
@@ -149,9 +154,10 @@ export function applyCompletedBridgeRunPersistenceResult(
   runId: string,
   result: CompletedBridgeRunPersistenceResult,
 ): WorkspaceState {
+  const evidence = firstTerminalRunEvidence(workspace.runEvidence[runId], requireRunEvidence(result.evidence));
   const withEvents = mergeRunEventsIntoWorkspace(workspace, runId, result.events);
   const workflowSession = result.workflowSession
-    ? applyTerminalEvidenceToWorkflowSession(result.workflowSession, runId, result.evidence)
+    ? applyTerminalEvidenceToWorkflowSession(result.workflowSession, runId, evidence)
     : null;
   return {
     ...withEvents,
@@ -159,15 +165,26 @@ export function applyCompletedBridgeRunPersistenceResult(
       ? withEvents.sessions.map((session) =>
           session.id === workflowSession.id ? workflowSession : session,
         )
-      : withEvents.sessions,
-    runEvidence: { ...withEvents.runEvidence, [runId]: result.evidence },
+      : withEvents.sessions.map((session) =>
+          session.kind === "canvas" ? applyTerminalEvidenceToWorkflowSession(session, runId, evidence) : session,
+        ),
+    runEvidence: { ...withEvents.runEvidence, [runId]: evidence },
   };
 }
 
 export function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRunResult): WorkspaceState {
+  const evidence = firstTerminalRunEvidence(
+    workspace.runEvidence[result.run.id],
+    requireRunEvidence(result.evidence),
+  );
   const withEvents = mergeRunEventsIntoWorkspace(workspace, result.run.id, result.events);
+  const canonicalRun: AgentRun = {
+    ...result.run,
+    status: evidence.status,
+    endedAt: evidence.completedAt ?? undefined,
+  };
   const workflowSession = result.workflowSession
-    ? applyTerminalEvidenceToWorkflowSession(result.workflowSession, result.run.id, result.evidence, result.run.nodeId)
+    ? applyTerminalEvidenceToWorkflowSession(result.workflowSession, result.run.id, evidence, result.run.nodeId)
     : null;
   if (workflowSession) {
     return {
@@ -175,14 +192,19 @@ export function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRu
       sessions: withEvents.sessions.map((session) =>
         session.id === workflowSession.id ? workflowSession : session,
       ),
-      runs: { ...withEvents.runs, [result.run.id]: result.run },
-      runEvidence: { ...withEvents.runEvidence, [result.run.id]: result.evidence },
+      runs: { ...withEvents.runs, [result.run.id]: canonicalRun },
+      runEvidence: { ...withEvents.runEvidence, [result.run.id]: evidence },
     };
   }
   return {
     ...withEvents,
-    runs: { ...withEvents.runs, [result.run.id]: result.run },
-    runEvidence: { ...withEvents.runEvidence, [result.run.id]: result.evidence },
+    sessions: withEvents.sessions.map((session) =>
+      session.kind === "canvas"
+        ? applyTerminalEvidenceToWorkflowSession(session, result.run.id, evidence, result.run.nodeId)
+        : session
+    ),
+    runs: { ...withEvents.runs, [result.run.id]: canonicalRun },
+    runEvidence: { ...withEvents.runEvidence, [result.run.id]: evidence },
   };
 }
 
@@ -203,10 +225,11 @@ async function persistWorkflowRunResult(
   evidence: RunEvidence,
 ): Promise<CanvasSession | null> {
   if (!window.devflow) return null;
-  if (!hasTerminalRunEvidence(evidence)) return null;
-  const now = evidence.completedAt ?? latestEventTimestamp(events) ?? new Date().toISOString();
+  const safeEvidence = requireRunEvidence(evidence);
+  if (!hasTerminalRunEvidence(safeEvidence)) return null;
+  const now = safeEvidence.completedAt ?? latestEventTimestamp(events) ?? new Date().toISOString();
   if (isPlannerRootNode(session, node)) {
-    if (evidence.status !== "succeeded") return null;
+    if (safeEvidence.status !== "succeeded") return null;
     if (
       typeof window.devflow.applyWorkflowIntent !== "function" ||
       typeof window.devflow.recordWorkflowRunResult !== "function" ||
@@ -232,7 +255,7 @@ async function persistWorkflowRunResult(
       now,
     });
     const workflowSession = scheduled.canvasSession ?? applied.canvasSession ?? recorded.canvasSession ?? null;
-    return workflowSession ? applyTerminalEvidenceToSessionNode(workflowSession, node.id, evidence) : null;
+    return workflowSession ? applyTerminalEvidenceToSessionNode(workflowSession, node.id, safeEvidence) : null;
   }
 
   if (!node.display?.meta.includes("flow-kernel") || node.executable === false) return null;
@@ -250,14 +273,14 @@ async function persistWorkflowRunResult(
     agentKind: node.agent,
     now,
   });
-  const schedulingSession = applyTerminalEvidenceToSessionNode(recorded.canvasSession ?? session, node.id, evidence);
+  const schedulingSession = applyTerminalEvidenceToSessionNode(recorded.canvasSession ?? session, node.id, safeEvidence);
   const schedulingPolicy = workflowSchedulingPolicyForSession(schedulingSession);
   const scheduled = await window.devflow.scheduleWorkflowReadyLanes(project.rootPath, session.id, {
     allowedParallelism: schedulingPolicy.allowedParallelism,
     now,
   });
   const workflowSession = scheduled.canvasSession ?? recorded.canvasSession ?? null;
-  return workflowSession ? applyTerminalEvidenceToSessionNode(workflowSession, node.id, evidence) : null;
+  return workflowSession ? applyTerminalEvidenceToSessionNode(workflowSession, node.id, safeEvidence) : null;
 }
 
 function applyTerminalEvidenceToWorkflowSession(
@@ -270,14 +293,23 @@ function applyTerminalEvidenceToWorkflowSession(
   return target ? applyTerminalEvidenceToSessionNode(session, target.id, evidence) : session;
 }
 
+function firstTerminalRunEvidence(existing: RunEvidence | undefined, incoming: RunEvidence): RunEvidence {
+  const safeExisting = existing ? parseRunEvidence(existing) : null;
+  return safeExisting && isFinalRunStatus(safeExisting.status) ? safeExisting : incoming;
+}
+
 function applyTerminalEvidenceToSessionNode(
   session: CanvasSession,
   nodeId: string,
   evidence: RunEvidence,
 ): CanvasSession {
-  if (!isFinalRunStatus(evidence.status)) return session;
+  const safeEvidence = requireRunEvidence(evidence);
+  if (!isFinalRunStatus(safeEvidence.status)) return session;
   const status: CanvasNode["status"] =
-    evidence.status === "succeeded" && hasConcreteRunEvidence(evidence) ? "completed" : "failed";
+    isSuccessfulRunEvidence(safeEvidence, {
+      source: "current",
+      expectedArtifactContract: nodeRequiresExpectedArtifact(session.nodes.find((node) => node.id === nodeId)),
+    }) ? "completed" : "failed";
   return {
     ...session,
     nodes: session.nodes.map((node) => (node.id === nodeId ? { ...node, status } : node)),
@@ -325,8 +357,8 @@ export function mergeRunEventsIntoWorkspace(
   runId: string,
   events: RunEvent[],
 ): WorkspaceState {
-  const deduped = dedupeRunEvents(events);
-  const evidence = evidenceFromRunEvents(runId, deduped);
+  const deduped = dedupeRunEvents([...(workspace.runEvents[runId] ?? []), ...events]);
+  const evidence = evidenceFromRunEvents(runId, deduped, workspace.runEvidence[runId]);
   const sessions = workspace.sessions.map((session) => {
     if (session.kind !== "canvas") return session;
     const target = session.nodes.find((node) => node.runId === runId);
@@ -334,7 +366,9 @@ export function mergeRunEventsIntoWorkspace(
 
     const updatedSession = {
       ...session,
-      nodes: session.nodes.map((node) => (node.runId === runId ? applyRunEventsToNode(node, session, deduped) : node)),
+      nodes: session.nodes.map((node) =>
+        node.runId === runId ? applyRunEventsToNode(node, session, deduped, evidence) : node
+      ),
     };
     if (!shouldUseRendererWorkflowProjection()) return updatedSession;
     const projected = isPlannerRootNode(updatedSession, target)
@@ -351,11 +385,19 @@ export function mergeRunEventsIntoWorkspace(
   };
 }
 
-function applyRunEventsToNode(node: CanvasNode, session: CanvasSession, events: RunEvent[]): CanvasNode {
+function applyRunEventsToNode(
+  node: CanvasNode,
+  session: CanvasSession,
+  events: RunEvent[],
+  evidence: RunEvidence | null,
+): CanvasNode {
   const output = outputFromEvents(events);
-  const evidence = evidenceFromRunEvents(node.runId, events);
-  const run = runFromEvents(node, session, events);
-  const status = run ? deriveNodeStatusFromEvidence(run, evidence) : node.status;
+  const run = runFromEvents(node, session, evidence);
+  const derivedStatus = run ? deriveNodeStatusFromEvidence(run, evidence) : node.status;
+  const status = derivedStatus === "completed" && !isSuccessfulRunEvidence(evidence, {
+    source: "current",
+    expectedArtifactContract: nodeRequiresExpectedArtifact(node),
+  }) ? "failed" : derivedStatus;
   const progress = progressFromEvents(status, events, node.progress);
   return {
     ...node,
@@ -639,7 +681,7 @@ function flowProjectionFromSession(session: CanvasSession): FlowProjection {
           status: node.status,
           fileScopes: [],
           packageScopes: [],
-          requiredEvidence: [],
+          requiredEvidence: node.requiredEvidence ?? [],
           output: node.output,
         },
       },
@@ -704,6 +746,7 @@ function flowLaneToCanvasNode(
     executable: lane.executable,
     laneKind: lane.laneKind,
     semanticSubtype: lane.semanticSubtype,
+    requiredEvidence: lane.requiredEvidence,
     runtimePolicy: lane.runtimePolicy,
     runtime: runtimeForStatus(status, progress),
     display: {
@@ -723,7 +766,7 @@ function flowLaneToCanvasNode(
     },
     runId: `run-${session.id}-${lane.id}`,
     changesetId: `changeset-${session.id}-${lane.id}`,
-    output: lane.output.length > 0 ? lane.output : existing?.output.length ? existing.output : [`Flow Kernel lane ${lane.kind} is ${lane.status}.`],
+    output: lane.output.length > 0 ? lane.output : existing?.output ?? [],
     worktree: {
       path: ".",
       branchName: `skyturn/${session.id}/${lane.id}`,
@@ -917,6 +960,11 @@ export function sandboxForNodeRun(node: CanvasNode): AgentRunSandbox | undefined
 }
 
 function canStartNodeRun(node: CanvasNode): boolean {
+  if (!isExecutableNode(node)) return false;
+  return !nodeRequiresExpectedArtifact(node) || expectedArtifactsForNode(node).length > 0;
+}
+
+function isExecutableNode(node: CanvasNode): boolean {
   return node.nodeKind !== "user_decision" && node.executable !== false && node.runtimePolicy?.executable !== false;
 }
 
@@ -951,10 +999,24 @@ function codexLaneInstruction(laneKind: string, title = ""): string {
 }
 
 function expectedArtifactsInputForNode(node: CanvasNode): Pick<StartAgentRunInput, "expectedArtifacts"> | Record<string, never> {
-  if (node.agent !== "codex") return {};
-  const laneText = `${node.display?.meta[0] ?? ""} ${node.id} ${node.title}`.toLowerCase();
-  if (!/browser|screenshot/.test(laneText)) return {};
-  return { expectedArtifacts: [BROWSER_SCREENSHOT_ARTIFACT] };
+  const { expectedArtifacts } = artifactContractForNode(node);
+  return expectedArtifacts.length > 0 ? { expectedArtifacts } : {};
+}
+
+function nodeRequiresExpectedArtifact(node: CanvasNode | undefined): boolean {
+  return node ? artifactContractForNode(node).required : false;
+}
+
+function expectedArtifactsForNode(node: CanvasNode): string[] {
+  return artifactContractForNode(node).expectedArtifacts;
+}
+
+function artifactContractForNode(node: CanvasNode): { required: boolean; expectedArtifacts: string[] } {
+  const contract = expectedArtifactContractForRequiredEvidence(node.requiredEvidence);
+  return {
+    required: contract.required,
+    expectedArtifacts: contract.declarations,
+  };
 }
 
 function dependencyEvidenceForPrompt(session: CanvasSession, node: CanvasNode): string {
@@ -1033,59 +1095,22 @@ function isAbsoluteLocalPath(value: string): boolean {
   return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
 }
 
-function evidenceFromRunEvents(runId: string, events: RunEvent[]): RunEvidence | null {
-  if (events.length === 0) return null;
-  let status: AgentRunStatus = "running";
-  let exitCode: number | null = null;
-  let errorReason: string | null = null;
-  let cancelReason: string | null = null;
-  let completedAt: string | null = null;
-  const checks: RunEvidence["checks"] = [];
-  const artifacts: string[] = [];
-  let changesetId: string | null = null;
-  let review: RunEvidence["review"] = null;
-
-  for (const event of events) {
-    if (event.kind === "status" && isRunStatus(event.payload.status)) {
-      const nextStatus = event.payload.status;
-      if (!isFinalRunStatus(status) || isFinalRunStatus(nextStatus)) {
-        status = nextStatus;
-        exitCode = typeof event.payload.exitCode === "number" ? event.payload.exitCode : exitCode;
-        cancelReason =
-          status === "cancelled" && typeof event.payload.reason === "string" ? event.payload.reason : cancelReason;
-        completedAt = isFinalRunStatus(status) ? event.timestamp : completedAt;
-      }
-    }
-    if (event.kind === "error") {
-      status = "failed";
-      errorReason = typeof event.payload.message === "string" ? event.payload.message : "Adapter error";
-      completedAt = event.timestamp;
-    }
-    if (event.kind === "evidence") {
-      exitCode = typeof event.payload.exitCode === "number" ? event.payload.exitCode : exitCode;
-      changesetId = typeof event.payload.changesetId === "string" ? event.payload.changesetId : changesetId;
-      if (Array.isArray(event.payload.checks)) checks.push(...(event.payload.checks as RunEvidence["checks"]));
-      if (Array.isArray(event.payload.artifacts)) artifacts.push(...(event.payload.artifacts as string[]));
-      if (isEvidenceCheck(event.payload.review)) review = event.payload.review;
-    }
-  }
-
-  return {
+function evidenceFromRunEvents(
+  runId: string,
+  events: RunEvent[],
+  initialEvidence?: RunEvidence,
+): RunEvidence | null {
+  if (events.length === 0 && !initialEvidence) return null;
+  const evidence = deriveRunEvidenceFromRunEvents({
     runId,
-    status,
-    exitCode,
-    changesetId,
-    checks,
-    artifacts,
-    review,
-    errorReason,
-    cancelReason,
-    completedAt,
-  };
+    events,
+    ...(initialEvidence ? { initialEvidence } : {}),
+  });
+  if (!evidence) throw new Error("Invalid RunEvidence event stream.");
+  return evidence;
 }
 
-function runFromEvents(node: CanvasNode, session: CanvasSession, events: RunEvent[]): AgentRun | null {
-  const evidence = evidenceFromRunEvents(node.runId, events);
+function runFromEvents(node: CanvasNode, session: CanvasSession, evidence: RunEvidence | null): AgentRun | null {
   if (!evidence) return null;
   return {
     id: node.runId,
@@ -1098,6 +1123,12 @@ function runFromEvents(node: CanvasNode, session: CanvasSession, events: RunEven
     startedAt: session.createdAt,
     endedAt: evidence.completedAt ?? undefined,
   };
+}
+
+function requireRunEvidence(value: unknown): RunEvidence {
+  const evidence = parseRunEvidence(value);
+  if (!evidence) throw new Error("Invalid RunEvidence.");
+  return evidence;
 }
 
 function progressFromEvents(status: CanvasNode["status"], events: RunEvent[], fallback: string): string {
@@ -1225,12 +1256,6 @@ function hasTerminalRunEvidence(evidence: RunEvidence): boolean {
 
 function isFinalRunStatus(status: AgentRunStatus): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled" || status === "timed-out";
-}
-
-function isEvidenceCheck(value: unknown): value is NonNullable<RunEvidence["review"]> {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as { name?: unknown; kind?: unknown; status?: unknown };
-  return typeof candidate.name === "string" && typeof candidate.kind === "string" && typeof candidate.status === "string";
 }
 
 function runtimeForStatus(status: CanvasNode["status"], action: string): NodeRuntimeState {

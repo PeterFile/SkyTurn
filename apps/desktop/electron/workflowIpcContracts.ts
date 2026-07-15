@@ -112,6 +112,43 @@ export interface TrustedPlannerRootStartStore {
   materializeCanvasSession(sessionId: string): unknown;
 }
 
+export interface ExpectedArtifactRunStartStore extends TrustedPlannerRootStartStore {
+  materializeFlowProjection(sessionId: string): unknown;
+}
+
+export async function authorizeRunStartExpectedArtifacts<T extends Record<string, unknown>>(
+  input: T,
+  store: ExpectedArtifactRunStartStore,
+): Promise<T> {
+  const {
+    canonicalExpectedArtifactDeclarationKeys,
+    expectedArtifactContractForRequiredEvidence,
+  } = await import("@skyturn/project-core");
+  const requiredEvidence = authoritativeRunStartRequiredEvidence(input, store);
+  const contract = expectedArtifactContractForRequiredEvidence(requiredEvidence);
+  const submittedKeys = canonicalExpectedArtifactDeclarationKeys(
+    input.expectedArtifacts === undefined ? [] : input.expectedArtifacts,
+  );
+  if (!submittedKeys) {
+    throw workflowIpcError("INVALID_INPUT", "Expected artifact declarations are invalid.");
+  }
+  if (contract.required && contract.declarations.length === 0) {
+    throw workflowIpcError(
+      "INVALID_INPUT",
+      "Workflow required evidence has no concrete backend-approved expected artifact declaration.",
+    );
+  }
+  const approvedKeys = canonicalExpectedArtifactDeclarationKeys(contract.declarations);
+  if (!approvedKeys || !sameStrings(submittedKeys, approvedKeys)) {
+    throw workflowIpcError("INVALID_INPUT", "Expected artifact declarations do not match backend required evidence.");
+  }
+
+  const { expectedArtifacts: _expectedArtifacts, ...withoutRendererDeclaration } = input;
+  return (contract.declarations.length > 0
+    ? { ...withoutRendererDeclaration, expectedArtifacts: contract.declarations }
+    : withoutRendererDeclaration) as T;
+}
+
 export function isTrustedPlannerRootStartInput(input: unknown, store: TrustedPlannerRootStartStore): boolean {
   if (!isRecord(input)) return false;
   if (
@@ -145,6 +182,36 @@ export function isTrustedPlannerRootStartInput(input: unknown, store: TrustedPla
   if (!isRecord(plannerNode.context) || !Array.isArray(plannerNode.context.dependencies)) return false;
   if (plannerNode.context.dependencies.length > 0) return false;
   return new Set(["running", "retrying", "completed", "failed"]).has(String(plannerNode.status));
+}
+
+function authoritativeRunStartRequiredEvidence(
+  input: Record<string, unknown>,
+  store: ExpectedArtifactRunStartStore,
+): string[] {
+  if (!isNonEmptyString(input.sessionId) || !isNonEmptyString(input.nodeId)) return [];
+  const projection = store.materializeFlowProjection(input.sessionId);
+  const lane = isRecord(projection) && Array.isArray(projection.lanes)
+    ? projection.lanes.find((candidate) => isRecord(candidate) && candidate.id === input.nodeId)
+    : undefined;
+  if (isRecord(lane)) return requiredEvidenceFromBackendRecord(lane);
+
+  const canvasSession = store.materializeCanvasSession(input.sessionId);
+  const node = isRecord(canvasSession) && Array.isArray(canvasSession.nodes)
+    ? canvasSession.nodes.find((candidate) => isRecord(candidate) && candidate.id === input.nodeId)
+    : undefined;
+  return isRecord(node) ? requiredEvidenceFromBackendRecord(node) : [];
+}
+
+function requiredEvidenceFromBackendRecord(value: Record<string, unknown>): string[] {
+  if (value.requiredEvidence === undefined) return [];
+  if (!Array.isArray(value.requiredEvidence) || !value.requiredEvidence.every((kind) => typeof kind === "string")) {
+    throw workflowIpcError("INVALID_INPUT", "Backend required evidence is invalid.");
+  }
+  return value.requiredEvidence;
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

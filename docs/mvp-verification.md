@@ -72,7 +72,8 @@ Status: historical scaffold verification. This file records the original MVP bui
     - Discover local Agents with explicit `supportLevel`.
     - Stream mock run output through versioned run events.
     - Run Codex CLI only through the explicit `experimental-run` adapter.
-    - Persist run events to `.devflow/runs/<runId>/events.ndjson`.
+    - Persist authoritative run events under the backend-private app state root.
+    - Mirror sanitized events to `.devflow/runs/<runId>/events.ndjson` only for userspace observability.
     - Persist readable node output to `.devflow/tasks/<nodeId>/output.md`.
     - Derive node status from `RunEvidence`, not Agent prose.
 

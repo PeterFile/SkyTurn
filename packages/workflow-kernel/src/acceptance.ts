@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
+
+import type { RunEvidence } from "@skyturn/project-core";
 
 import {
   compileWorkflowIntent,
@@ -152,6 +154,33 @@ async function runAcceptanceLane(
   await applyLaneFixtureWork(repoRoot, definition, lane, laneArtifacts, commands);
   artifacts.push(...laneArtifacts);
   const status = commands.every((command) => command.exitCode === 0) ? "passed" : "failed";
+  const safeArtifacts = laneArtifacts.map((artifact) => relative(repoRoot, artifact));
+  const runEvidence: RunEvidence = {
+    runId: `run-${lane.id}`,
+    status: status === "passed" ? "succeeded" : "failed",
+    exitCode: status === "passed" ? 0 : 1,
+    changesetId: null,
+    checks: [
+      ...commands.map((command) => ({
+        kind: "test" as const,
+        name: command.command,
+        status: command.exitCode === 0 ? "passed" as const : "failed" as const,
+      })),
+      { kind: "run-exit", name: "Acceptance runner exit", status },
+      ...(safeArtifacts.length > 0
+        ? [{
+            kind: "artifact" as const,
+            name: "Acceptance artifacts",
+            status: status === "passed" ? "passed" as const : "failed" as const,
+          }]
+        : []),
+    ],
+    artifacts: status === "passed" ? safeArtifacts : [],
+    review: null,
+    errorReason: status === "failed" ? "Acceptance command failed." : null,
+    cancelReason: null,
+    completedAt: "2026-06-14T00:00:00.000Z",
+  };
   return {
     commands,
     evidence: {
@@ -160,8 +189,9 @@ async function runAcceptanceLane(
       segmentId: `segment-${definition.id}-${lane.id}`,
       kind: evidenceKindForLane(lane.kind),
       status,
-      checks: commands.map((command) => command.command),
-      artifacts: laneArtifacts,
+      checks: runEvidence.checks.map((check) => `${check.kind}:${check.name}:${check.status}`),
+      artifacts: runEvidence.artifacts,
+      runEvidence,
     },
   };
 }
@@ -183,8 +213,8 @@ async function applyLaneFixtureWork(
     ].join("\n"));
   }
   if (definition.id === "frontend-ui" && lane.kind === "browser_validation") {
-    const artifact = join(repoRoot, ".devflow", "flow-kernel-artifacts", "search-filter-browser.png");
-    await mkdir(join(repoRoot, ".devflow", "flow-kernel-artifacts"), { recursive: true });
+    const artifact = join(repoRoot, ".devflow", "acceptance", "search-filter-browser.png");
+    await mkdir(join(repoRoot, ".devflow", "acceptance"), { recursive: true });
     await writePng(artifact);
     artifacts.push(artifact);
     commands.push(await runCommand("node", ["-e", "import('node:fs').then(fs=>{const html=fs.readFileSync('index.html','utf8'); if(!html.includes('aria-label=\"Search tasks\"')) process.exit(1)})"], repoRoot));
@@ -255,8 +285,8 @@ async function applyLaneFixtureWork(
     await writeFile(join(repoRoot, "persistence", "settings-store.mjs"), "export function createSettingsStore() { return {}; }\n");
   }
   if (definition.id === "complex-fullstack" && lane.kind === "integration_join") {
-    const artifact = join(repoRoot, ".devflow", "flow-kernel-artifacts", "integration-join.json");
-    await mkdir(join(repoRoot, ".devflow", "flow-kernel-artifacts"), { recursive: true });
+    const artifact = join(repoRoot, ".devflow", "acceptance", "integration-join.json");
+    await mkdir(join(repoRoot, ".devflow", "acceptance"), { recursive: true });
     await writeFile(artifact, JSON.stringify({ upstream: ["frontend", "backend", "persistence"], joined: true }, null, 2));
     artifacts.push(artifact);
   }
@@ -304,7 +334,19 @@ function appendLaneExecutionEvents(
   const output = makeEvent(working, {
     kind: "workflow.segment.output_delta",
     source: "acceptance-runner",
-    payload: { laneId: lane.id, segmentId: segment.id, text: `${lane.kind} executed` },
+    payload: {
+      laneId: lane.id,
+      segmentId: segment.id,
+      text: `${lane.kind} executed`,
+      delta: {
+        protocolVersion: 1,
+        runId: segment.runId,
+        seq: 1,
+        timestamp: now,
+        kind: "output",
+        payload: { text: `${lane.kind} executed` },
+      },
+    },
     now,
     idempotencyKey: `segment:${segment.id}:output`,
   });

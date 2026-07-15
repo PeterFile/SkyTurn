@@ -6,6 +6,7 @@ import type { AgentRun, CanvasNode, CanvasSession, ImportedProject, RunEvent, Ru
 import * as WorkflowRuntime from "./workflowRuntime.js";
 import {
   applyBridgeRunResult,
+  applyCompletedBridgeRunPersistenceResult,
   buildPromptForNodeRun,
   claimCompletedBridgeRunPersistence,
   mergeRunEventsIntoWorkspace,
@@ -135,9 +136,56 @@ describe("workflow runtime event merging", () => {
       "lane-design",
     ]);
     expect(session.nodes.find((node) => node.id === "lane-browser-validation")?.display?.meta).toContain("browser_validation");
+    expect(session.nodes.find((node) => node.id === "lane-implementation")?.output).toEqual([]);
     expect(session.nodes.find((node) => node.id === "lane-discovery")?.position.x).toBeGreaterThan(
       (session.nodes.find((node) => node.id === "node-1")?.position.x ?? 0) + 300,
     );
+  });
+
+  it.each([
+    ["omitted", {}],
+    ["empty", { requiredEvidence: [] }],
+  ])("submits the fixed screenshot declaration for an external browser lane with %s evidence", async (_caseName, evidenceInput) => {
+    const workspace = makeWorkspace();
+    const project = workspace.projects[0] as ImportedProject;
+    const hermesRunId = "run-session-1-node-1";
+    const projected = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+      event(hermesRunId, 1, "output", {
+        text: JSON.stringify({
+          intentId: `intent-browser-${_caseName}`,
+          sessionId: "session-1",
+          operations: [{
+            type: "ProposeLanes",
+            lanes: [{
+              id: `lane-browser-${_caseName}`,
+              kind: "browser_validation",
+              title: "Capture browser screenshot",
+              agentKind: "codex",
+              ...evidenceInput,
+            }],
+          }],
+        }),
+      }),
+    ]);
+    const projectedSession = projected.sessions[0] as CanvasSession;
+    const projectedNode = projectedSession.nodes.find((node) => node.id === `lane-browser-${_caseName}`)!;
+    const node = { ...projectedNode, status: "running" as const };
+    const session = {
+      ...projectedSession,
+      nodes: projectedSession.nodes.map((candidate) => candidate.id === node.id ? node : candidate),
+    };
+    const startAgentRun = vi.fn(async () => null);
+    vi.stubGlobal("window", { devflow: { startAgentRun } });
+
+    try {
+      expect(node.requiredEvidence).toEqual(["browser", "screenshot"]);
+      expect(await startBridgeRun(project, session, node)).toBeNull();
+      expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
+        expectedArtifacts: [".devflow/acceptance/react-app.png"],
+      }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("does not locally project WorkflowIntent output from a non-planner Hermes lane", () => {
@@ -1071,6 +1119,7 @@ describe("workflow runtime event merging", () => {
         status: "running",
         runId: "run-session-1-lane-browser",
         meta: ["browser_screenshot_validation", "lane-browser", "flow-kernel"],
+        requiredEvidence: ["browser", "screenshot"],
       }),
       makeNode({
         id: "lane-commit",
@@ -1506,6 +1555,137 @@ describe("workflow runtime event merging", () => {
     }
   });
 
+  it("keeps backend artifact failure authoritative for a non-browser validation lane across reopen", async () => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const artifactNode = Object.assign(makeNode({
+      id: "lane-artifact",
+      agent: "codex",
+      status: "running",
+      runId: "run-session-1-lane-artifact",
+      title: "Validate release package",
+      meta: ["validation", "lane-artifact", "flow-kernel"],
+    }), { requiredEvidence: ["artifact"] });
+    const downstreamNode = makeNode({
+      id: "lane-review",
+      agent: "hermes",
+      status: "pending",
+      runId: "run-session-1-lane-review",
+      title: "Review validation",
+      meta: ["review", "lane-review", "flow-kernel"],
+      dependencies: [artifactNode.id],
+    });
+    const session: CanvasSession = {
+      ...makeSession([artifactNode, downstreamNode]),
+      edges: [{ id: "edge-artifact-review", source: artifactNode.id, target: downstreamNode.id }],
+    };
+    const backendFailedSession: CanvasSession = {
+      ...session,
+      activeNodeId: null,
+      nodes: session.nodes.map((node) =>
+        node.id === artifactNode.id || node.id === downstreamNode.id
+          ? { ...node, status: "failed" as const }
+          : node,
+      ),
+    };
+    const evidence = {
+      runId: artifactNode.runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-10T00:00:01.000Z",
+    } satisfies RunEvidence;
+    const recordWorkflowRunResult = vi.fn(async () => ({
+      protocolVersion: 1,
+      projection: {},
+      canvasSession: backendFailedSession,
+    }));
+    const scheduleWorkflowReadyLanes = vi.fn(async () => ({
+      protocolVersion: 1,
+      result: { readyLanes: [] },
+      projection: {},
+      canvasSession: backendFailedSession,
+    }));
+    vi.stubGlobal("window", {
+      devflow: {
+        getRunEvents: vi.fn(async () => ({ protocolVersion: 1, events: [] })),
+        getRunEvidence: vi.fn(async () => ({ protocolVersion: 1, evidence })),
+        recordWorkflowRunResult,
+        scheduleWorkflowReadyLanes,
+      },
+    });
+
+    try {
+      const result = await persistCompletedBridgeRunResult(project, session, artifactNode);
+      const reopened = await persistCompletedBridgeRunResult(
+        project,
+        result?.workflowSession ?? backendFailedSession,
+        (result?.workflowSession ?? backendFailedSession).nodes.find((node) => node.id === artifactNode.id)!,
+      );
+
+      for (const materialized of [result?.workflowSession, reopened?.workflowSession]) {
+        expect(materialized?.nodes.find((node) => node.id === artifactNode.id)?.status).toBe("failed");
+        expect(materialized?.nodes.find((node) => node.id === downstreamNode.id)?.status).toBe("failed");
+        expect(materialized?.nodes.find((node) => node.id === artifactNode.id)).toMatchObject({
+          requiredEvidence: ["artifact"],
+        });
+      }
+      expect(scheduleWorkflowReadyLanes).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["codex", "hermes"] as const)("does not launch a generic %s artifact contract without a concrete declaration", async (agent) => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const node = Object.assign(makeNode({
+      id: "lane-artifact",
+      agent,
+      status: "running",
+      runId: "run-session-1-lane-artifact",
+      title: "Validate release package",
+      meta: ["validation", "lane-artifact", "flow-kernel"],
+    }), { requiredEvidence: ["artifact"] });
+    const session = makeSession([node]);
+    const startAgentRun = vi.fn(async () => null);
+    vi.stubGlobal("window", { devflow: { startAgentRun } });
+
+    try {
+      expect(await startBridgeRun(project, session, node)).toBeNull();
+      expect(startAgentRun).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["codex", "hermes"] as const)("derives the known %s screenshot declaration from required evidence without text heuristics", async (agent) => {
+    const project = makeWorkspace().projects[0] as ImportedProject;
+    const node = Object.assign(makeNode({
+      id: "lane-visual-check",
+      agent,
+      status: "running",
+      runId: "run-session-1-lane-visual-check",
+      title: "Validate release package",
+      meta: ["validation", "lane-visual-check", "flow-kernel"],
+    }), { requiredEvidence: ["screenshot"] });
+    const session = makeSession([node]);
+    const startAgentRun = vi.fn(async () => null);
+    vi.stubGlobal("window", { devflow: { startAgentRun } });
+
+    try {
+      expect(await startBridgeRun(project, session, node)).toBeNull();
+      expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
+        expectedArtifacts: [".devflow/acceptance/react-app.png"],
+      }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("records non-planner Hermes Flow Kernel run results without applying WorkflowIntent", async () => {
     const project = makeWorkspace().projects[0] as ImportedProject;
     const session = makeSession([
@@ -1887,7 +2067,7 @@ describe("workflow runtime event merging", () => {
       }),
       event(codexRunId, 2, "evidence", {
         exitCode: 0,
-        artifacts: [".devflow/tasks/node-code/output.md"],
+        artifacts: [".devflow/acceptance/node-code/output.md"],
         checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed", detail: "exit 0" }],
       }),
       event(codexRunId, 3, "status", {
@@ -1901,7 +2081,540 @@ describe("workflow runtime event merging", () => {
     expect(codeNode?.status).toBe("completed");
     expect(codeNode?.progress).toBe("Evidence ready");
     expect(codeNode?.output).toContain("Implemented the smallest evidence reflection path.");
-    expect(next.runEvidence[codexRunId]?.artifacts).toEqual([".devflow/tasks/node-code/output.md"]);
+    expect(next.runEvidence[codexRunId]?.artifacts).toEqual([".devflow/acceptance/node-code/output.md"]);
+  });
+
+  it.each(["succeeded", "cancelled", "timed-out", "failed"] as const)(
+    "keeps first terminal %s across every late terminal status and error",
+    (firstStatus) => {
+      for (const lateStatus of ["succeeded", "failed", "cancelled", "timed-out"] as const) {
+        const runId = `run-session-1-node-code-${firstStatus}-${lateStatus}`;
+        const workspace = makeWorkspace([
+          makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+        ]);
+        const firstExitCode = firstStatus === "failed" ? 7 : firstStatus === "succeeded" ? 0 : undefined;
+        const next = mergeRunEventsIntoWorkspace(workspace, runId, [
+          event(runId, 1, "status", { status: firstStatus, exitCode: firstExitCode, reason: firstStatus }),
+          event(runId, 2, "status", { status: lateStatus, exitCode: 0, reason: "late terminal" }),
+          event(runId, 3, "error", { message: "late adapter error" }),
+        ]);
+
+        expect(next.runEvidence[runId]).toMatchObject({
+          status: firstStatus,
+          exitCode: firstExitCode ?? null,
+          errorReason: null,
+        });
+      }
+    },
+  );
+
+  it("keeps artifact failure terminal across every late terminal status and error", () => {
+    for (const lateStatus of ["succeeded", "failed", "cancelled", "timed-out"] as const) {
+      const runId = `run-session-1-node-code-artifact-${lateStatus}`;
+      const workspace = makeWorkspace([
+        makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+      ]);
+      const next = mergeRunEventsIntoWorkspace(workspace, runId, [
+        event(runId, 1, "evidence", {
+          exitCode: 0,
+          checks: [
+            { kind: "run-exit", name: "Codex CLI exit", status: "passed", detail: "exit 0" },
+            { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+          ],
+        }),
+        event(runId, 2, "status", { status: "failed", exitCode: 0, reason: "expected-artifact-failure" }),
+        event(runId, 3, "status", { status: lateStatus, exitCode: 0, reason: "late terminal" }),
+        event(runId, 4, "error", { message: "late adapter error" }),
+      ]);
+
+      expect(next.runEvidence[runId]).toMatchObject({ status: "failed", exitCode: 0, errorReason: null });
+      expect(next.runEvidence[runId]?.checks).toContainEqual(
+        expect.objectContaining({ kind: "artifact", status: "failed" }),
+      );
+    }
+  });
+
+  it("keeps a failed expected-artifact gate terminal across a stale succeeded status", () => {
+    const runId = "run-session-1-node-code-artifact-stale-success";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+    const next = mergeRunEventsIntoWorkspace(workspace, runId, [
+      event(runId, 1, "evidence", {
+        exitCode: 0,
+        checks: [
+          { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+        ],
+      }),
+      event(runId, 2, "status", { status: "succeeded", exitCode: 0 }),
+    ]);
+
+    expect(next.runEvidence[runId]).toMatchObject({ status: "failed", exitCode: 0 });
+    expect(next.sessions[0]?.nodes.find((node) => node.id === "node-code")?.status).toBe("failed");
+  });
+
+  it("sanitizes stale succeeded RunEvidence before applying a completed bridge result", () => {
+    const runId = "run-session-1-node-code-stale-result";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+    const evidence = {
+      runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [
+        { kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" },
+      ],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-10T00:00:02.000Z",
+    } satisfies RunEvidence;
+    const next = applyBridgeRunResult(workspace, {
+      run: {
+        id: runId,
+        nodeId: "node-code",
+        sessionId: "session-1",
+        projectRoot: "/tmp/project",
+        worktreePath: "/tmp/project",
+        agentKind: "codex",
+        status: "succeeded",
+        startedAt: "2026-06-10T00:00:00.000Z",
+        endedAt: evidence.completedAt,
+      },
+      events: [
+        event(runId, 1, "evidence", { exitCode: 0, checks: evidence.checks }),
+        event(runId, 2, "status", { status: "succeeded", exitCode: 0 }),
+      ],
+      evidence,
+    });
+
+    expect(next.runEvidence[runId]?.status).toBe("failed");
+    expect(next.sessions[0]?.nodes.find((node) => node.id === "node-code")?.status).toBe("failed");
+  });
+
+  it("applies full cancelled bridge evidence over stale succeeded events without a workflow session", () => {
+    const runId = "run-session-1-node-code-cancelled-result";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+    const evidence = {
+      ...runEvidenceFor(runId, "cancelled"),
+      exitCode: 143,
+      cancelReason: "first cancellation",
+      completedAt: "2026-06-10T00:00:02.000Z",
+    } satisfies RunEvidence;
+
+    const next = applyBridgeRunResult(workspace, {
+      run: {
+        id: runId,
+        nodeId: "node-code",
+        sessionId: "session-1",
+        projectRoot: "/tmp/project",
+        worktreePath: "/tmp/project",
+        agentKind: "codex",
+        status: "succeeded",
+        startedAt: "2026-06-10T00:00:00.000Z",
+        endedAt: "2026-06-10T00:00:03.000Z",
+      },
+      events: [event(runId, 1, "status", { status: "succeeded", exitCode: 0 })],
+      evidence,
+    });
+
+    expect(next.runEvidence[runId]).toMatchObject({
+      status: "cancelled",
+      exitCode: 143,
+      cancelReason: "first cancellation",
+      completedAt: "2026-06-10T00:00:02.000Z",
+    });
+    expect(next.runs[runId]).toMatchObject({ status: "cancelled", endedAt: "2026-06-10T00:00:02.000Z" });
+    expect(next.sessions[0]?.nodes.find((node) => node.id === "node-code")?.status).toBe("failed");
+  });
+
+  it("clears a stale run end time when cancelled evidence has no completion time", () => {
+    const runId = "run-session-1-node-code-cancelled-no-time";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+    const evidence = {
+      ...runEvidenceFor(runId, "cancelled"),
+      exitCode: 143,
+      cancelReason: "first cancellation",
+      completedAt: null,
+    } satisfies RunEvidence;
+
+    const next = applyBridgeRunResult(workspace, {
+      run: {
+        id: runId,
+        nodeId: "node-code",
+        sessionId: "session-1",
+        projectRoot: "/tmp/project",
+        worktreePath: "/tmp/project",
+        agentKind: "codex",
+        status: "succeeded",
+        startedAt: "2026-06-10T00:00:00.000Z",
+        endedAt: "2026-06-10T00:00:03.000Z",
+      },
+      events: [event(runId, 1, "status", { status: "succeeded", exitCode: 0 })],
+      evidence,
+    });
+
+    expect(next.runs[runId]).toMatchObject({ status: "cancelled" });
+    expect(next.runs[runId]?.endedAt).toBeUndefined();
+  });
+
+  it("applies persisted full cancelled evidence over stale succeeded events without a workflow session", () => {
+    const runId = "run-session-1-node-code-cancelled-persistence";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+    const evidence = {
+      ...runEvidenceFor(runId, "cancelled"),
+      exitCode: 143,
+      cancelReason: "first cancellation",
+      completedAt: "2026-06-10T00:00:02.000Z",
+    } satisfies RunEvidence;
+
+    const next = applyCompletedBridgeRunPersistenceResult(workspace, runId, {
+      events: [event(runId, 1, "status", { status: "succeeded", exitCode: 0 })],
+      evidence,
+      workflowSession: null,
+    });
+
+    expect(next.runEvidence[runId]).toMatchObject({
+      status: "cancelled",
+      exitCode: 143,
+      cancelReason: "first cancellation",
+      completedAt: "2026-06-10T00:00:02.000Z",
+    });
+    expect(next.sessions[0]?.nodes.find((node) => node.id === "node-code")?.status).toBe("failed");
+  });
+
+  it("retains the first cancelled result against later conflicting bridge and persistence success", () => {
+    const runId = "run-session-1-node-code-first-cancelled";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+    const cancelled = {
+      ...runEvidenceFor(runId, "cancelled"),
+      exitCode: 143,
+      cancelReason: "first cancellation",
+      completedAt: "2026-06-10T00:00:02.000Z",
+    } satisfies RunEvidence;
+    const first = applyBridgeRunResult(workspace, {
+      run: {
+        id: runId,
+        nodeId: "node-code",
+        sessionId: "session-1",
+        projectRoot: "/tmp/project",
+        worktreePath: "/tmp/project",
+        agentKind: "codex",
+        status: "cancelled",
+        startedAt: "2026-06-10T00:00:00.000Z",
+        endedAt: cancelled.completedAt,
+      },
+      events: [event(runId, 1, "status", { status: "cancelled", exitCode: 143 })],
+      evidence: cancelled,
+    });
+    const succeeded = runEvidenceFor(runId, "succeeded");
+    const lateBridge = applyBridgeRunResult(first, {
+      run: {
+        ...(first.runs[runId] as AgentRun),
+        status: "succeeded",
+        endedAt: succeeded.completedAt ?? undefined,
+      },
+      events: [event(runId, 2, "status", { status: "succeeded", exitCode: 0 })],
+      evidence: succeeded,
+    });
+    const latePersistence = applyCompletedBridgeRunPersistenceResult(first, runId, {
+      events: [event(runId, 2, "status", { status: "succeeded", exitCode: 0 })],
+      evidence: succeeded,
+      workflowSession: null,
+    });
+
+    for (const state of [lateBridge, latePersistence]) {
+      expect(state.runEvidence[runId]).toMatchObject({
+        status: "cancelled",
+        exitCode: 143,
+        cancelReason: "first cancellation",
+        completedAt: "2026-06-10T00:00:02.000Z",
+      });
+      expect(state.sessions[0]?.nodes.find((node) => node.id === "node-code")?.status).toBe("failed");
+    }
+    expect(lateBridge.runs[runId]).toMatchObject({
+      status: "cancelled",
+      endedAt: "2026-06-10T00:00:02.000Z",
+    });
+  });
+
+  it("does not complete a browser screenshot node without artifact-passed evidence", () => {
+    const runId = "run-session-1-lane-browser-missing-artifact-check";
+    const workspace = makeWorkspace([
+      makeNode({
+        id: "lane-browser",
+        agent: "codex",
+        status: "running",
+        runId,
+        title: "Capture browser screenshot evidence",
+        meta: ["browser_screenshot_validation", "lane-browser", "flow-kernel"],
+        requiredEvidence: ["browser", "screenshot"],
+      }),
+    ]);
+    const evidence = {
+      runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-10T00:00:02.000Z",
+    } satisfies RunEvidence;
+
+    const next = applyBridgeRunResult(workspace, {
+      run: {
+        id: runId,
+        nodeId: "lane-browser",
+        sessionId: "session-1",
+        projectRoot: "/tmp/project",
+        worktreePath: "/tmp/project",
+        agentKind: "codex",
+        status: "succeeded",
+        startedAt: "2026-06-10T00:00:00.000Z",
+        endedAt: evidence.completedAt,
+      },
+      events: [
+        event(runId, 1, "evidence", { exitCode: 0, checks: evidence.checks }),
+        event(runId, 2, "status", { status: "succeeded", exitCode: 0 }),
+      ],
+      evidence,
+    });
+
+    expect(next.sessions[0]?.nodes.find((node) => node.id === "lane-browser")?.status).toBe("failed");
+  });
+
+  it("rejects malformed full RunEvidence instead of applying a completed bridge result", () => {
+    const runId = "run-session-1-node-code-malformed-result";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+    const result = {
+      run: {
+        id: runId,
+        nodeId: "node-code",
+        sessionId: "session-1",
+        projectRoot: "/tmp/project",
+        worktreePath: "/tmp/project",
+        agentKind: "codex" as const,
+        status: "succeeded" as const,
+        startedAt: "2026-06-10T00:00:00.000Z",
+        endedAt: "2026-06-10T00:00:02.000Z",
+      },
+      events: [],
+      evidence: {
+        runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "unknown-kind", name: "Unsafe", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-10T00:00:02.000Z",
+      } as unknown as RunEvidence,
+    };
+
+    expect(() => applyBridgeRunResult(workspace, result)).toThrow(/invalid RunEvidence/i);
+    expect(workspace.sessions[0]?.nodes.find((node) => node.id === "node-code")?.status).toBe("running");
+  });
+
+  it.each([
+    {
+      name: "failed",
+      evidence: {
+        status: "failed" as const,
+        exitCode: 7,
+        errorReason: "first failure",
+        cancelReason: null,
+      },
+    },
+    {
+      name: "cancelled",
+      evidence: {
+        status: "cancelled" as const,
+        exitCode: null,
+        errorReason: null,
+        cancelReason: "first cancellation",
+      },
+    },
+  ])("hydrates persisted terminal $name fields before applying a late event slice", ({ name, evidence }) => {
+    const runId = `run-session-1-node-code-persisted-${name}`;
+    const completedAt = "2026-06-10T00:00:01.000Z";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "failed", runId }),
+    ]);
+    workspace.runEvidence[runId] = {
+      runId,
+      ...evidence,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "First terminal", status: evidence.status === "cancelled" ? "skipped" : "failed" }],
+      artifacts: [],
+      review: null,
+      completedAt,
+    };
+    const lateSlice = [
+      event(runId, 2, "status", { status: "succeeded", exitCode: 0, errorReason: "late success reason" }),
+      event(runId, 3, "status", { status: "failed", exitCode: 9, errorReason: "late failure reason", reason: "late cancel" }),
+    ];
+
+    const next = mergeRunEventsIntoWorkspace(workspace, runId, lateSlice);
+    const reopened = mergeRunEventsIntoWorkspace(JSON.parse(JSON.stringify(next)) as WorkspaceState, runId, lateSlice);
+
+    for (const state of [next, reopened]) {
+      expect(state.runEvidence[runId]).toMatchObject({ ...evidence, completedAt });
+      expect(state.sessions[0]?.nodes.find((node) => node.id === "node-code")?.status).toBe("failed");
+    }
+  });
+
+  it("keeps the first terminal error reason across late failed and succeeded statuses", () => {
+    const runId = "run-session-1-node-code-first-error";
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+
+    const next = mergeRunEventsIntoWorkspace(workspace, runId, [
+      event(runId, 1, "status", { status: "failed", exitCode: 7, errorReason: "first" }),
+      event(runId, 2, "status", { status: "failed", exitCode: 9, errorReason: "late failed" }),
+      event(runId, 3, "status", { status: "succeeded", exitCode: 0, errorReason: "late succeeded" }),
+    ]);
+
+    expect(next.runEvidence[runId]).toMatchObject({
+      status: "failed",
+      exitCode: 7,
+      errorReason: "first",
+      completedAt: "2026-06-10T00:00:01.000Z",
+    });
+  });
+
+  it.each([
+    {
+      name: "cancelled",
+      initialEvents: (runId: string) => [
+        event(runId, 1, "status", { status: "cancelled", reason: "user cancelled" }),
+      ],
+      expected: {
+        status: "cancelled",
+        exitCode: null,
+        completedAt: "2026-06-10T00:00:01.000Z",
+        errorReason: null,
+        cancelReason: "user cancelled",
+      },
+    },
+    {
+      name: "timed-out",
+      initialEvents: (runId: string) => [event(runId, 1, "status", { status: "timed-out" })],
+      expected: {
+        status: "timed-out",
+        exitCode: null,
+        completedAt: "2026-06-10T00:00:01.000Z",
+        errorReason: null,
+        cancelReason: null,
+      },
+    },
+    {
+      name: "nonzero-failed",
+      initialEvents: (runId: string) => [event(runId, 1, "status", { status: "failed", exitCode: 7 })],
+      expected: {
+        status: "failed",
+        exitCode: 7,
+        completedAt: "2026-06-10T00:00:01.000Z",
+        errorReason: null,
+        cancelReason: null,
+      },
+    },
+    {
+      name: "artifact-failed",
+      initialEvents: (runId: string) => [
+        event(runId, 1, "evidence", {
+          exitCode: 0,
+          checks: [{ kind: "artifact", name: "Expected artifacts", status: "failed", detail: "missing=1" }],
+          artifacts: [".devflow/acceptance/node-code/missing.md"],
+        }),
+        event(runId, 2, "status", { status: "failed", exitCode: 0, reason: "expected-artifact-failure" }),
+      ],
+      expected: {
+        status: "failed",
+        exitCode: 0,
+        completedAt: "2026-06-10T00:00:02.000Z",
+        errorReason: null,
+        cancelReason: null,
+      },
+    },
+  ])("keeps first-terminal fields for $name while merging safe late evidence", ({ name, initialEvents, expected }) => {
+    const runId = `run-session-1-node-code-${name}-late-evidence`;
+    const workspace = makeWorkspace([
+      makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+    ]);
+    const lateCheck = { kind: "test", name: "Late verification", status: "passed", detail: "safe" } as const;
+    const lateReview = { kind: "review", name: "Late review", status: "passed", detail: "safe" } as const;
+
+    const next = mergeRunEventsIntoWorkspace(workspace, runId, [
+      ...initialEvents(runId),
+      event(runId, 3, "evidence", {
+        exitCode: 0,
+        changesetId: "changeset-late",
+        checks: [lateCheck],
+        artifacts: [".devflow/acceptance/node-code/late.md"],
+        review: lateReview,
+      }),
+    ]);
+
+    expect(next.runEvidence[runId]).toMatchObject(expected);
+    expect(next.runEvidence[runId]?.checks).toContainEqual(lateCheck);
+    if (name === "artifact-failed") {
+      expect(next.runEvidence[runId]?.artifacts).toEqual([]);
+    } else {
+      expect(next.runEvidence[runId]?.artifacts).toContain(".devflow/acceptance/node-code/late.md");
+    }
+    expect(next.runEvidence[runId]?.changesetId).toBe("changeset-late");
+    expect(next.runEvidence[runId]?.review).toEqual(lateReview);
+  });
+
+  it("rejects a renderer event slice when any evidence field is malformed", () => {
+    const runId = "run-session-1-node-code-strict-checks";
+    const workspace = makeWorkspace([makeNode({ id: "node-code", agent: "codex", status: "running", runId })]);
+
+    expect(() => mergeRunEventsIntoWorkspace(workspace, runId, [
+      event(runId, 1, "status", { status: "cancelled", reason: "user cancelled" }),
+      event(runId, 2, "evidence", {
+        checks: [
+          { kind: "test", name: "Late verification", status: "passed" },
+          { kind: "verification", name: "Unknown", status: "passed" },
+        ],
+      }),
+    ])).toThrow(/invalid RunEvidence event stream/i);
+    expect(workspace.runEvidence[runId]).toBeUndefined();
+  });
+
+  it("rejects malformed terminal status checks from persisted events", () => {
+    const workspace = makeWorkspace();
+    const runId = "run-session-1-node-1";
+
+    expect(() => mergeRunEventsIntoWorkspace(workspace, runId, [
+      event(runId, 1, "status", {
+        status: "failed",
+        exitCode: 1,
+        checks: [
+          { kind: "run-exit", name: "Exit", status: "failed" },
+          { kind: "unknown-kind", name: "Unsafe", status: "passed" },
+        ],
+      }),
+    ])).toThrow(/invalid RunEvidence event stream/i);
   });
 
   it("updates node short phrases from safe run progress fields", () => {
@@ -1931,7 +2644,7 @@ describe("workflow runtime event merging", () => {
     expect(codeNode?.progress).not.toContain("WorkflowIntent");
   });
 
-  it("preserves persisted custom review evidence kinds while merging run events", () => {
+  it("rejects persisted review evidence with an unknown kind while merging run events", () => {
     const workspace = makeWorkspace([
       makeNode({
         id: "node-review",
@@ -1942,7 +2655,7 @@ describe("workflow runtime event merging", () => {
     ]);
     const runId = "run-session-1-node-review";
 
-    const next = mergeRunEventsIntoWorkspace(workspace, runId, [
+    expect(() => mergeRunEventsIntoWorkspace(workspace, runId, [
       event(runId, 1, "evidence", {
         review: {
           kind: "policy-review",
@@ -1954,14 +2667,7 @@ describe("workflow runtime event merging", () => {
       event(runId, 2, "status", {
         status: "failed",
       }),
-    ]);
-
-    expect(next.runEvidence[runId]?.review).toEqual({
-      kind: "policy-review",
-      name: "Architecture review",
-      status: "failed",
-      detail: "Preserved from older persisted events.",
-    });
+    ])).toThrow(/invalid RunEvidence event stream/i);
   });
 });
 
@@ -2163,6 +2869,7 @@ function makeNode(input: {
   brief?: string;
   title?: string;
   meta?: string[];
+  requiredEvidence?: string[];
   dependencies?: string[];
   output?: string[];
 }): CanvasNode {
@@ -2176,6 +2883,7 @@ function makeNode(input: {
     runId: input.runId,
     changesetId: `changeset-${input.id}`,
     output: input.output ?? [],
+    ...(input.requiredEvidence ? { requiredEvidence: input.requiredEvidence } : {}),
     display: input.meta ? { agentLabel: input.agent, meta: input.meta } : undefined,
     worktree: {
       path: ".",
