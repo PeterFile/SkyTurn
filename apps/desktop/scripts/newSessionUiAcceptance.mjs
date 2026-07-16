@@ -92,9 +92,13 @@ export async function runNewSessionUiAcceptance() {
       return;
     }
     try {
-      const cdp = await connectToSkyTurnRenderer(app.cdpPort, app.devServerUrl);
+      const cdp = await connectToReadySkyTurnRenderer({
+        cdpPort: app.cdpPort,
+        devServerUrl: app.devServerUrl,
+        projectRoot: project.rootPath,
+        processDiagnostics: app.diagnostics,
+      });
       try {
-        await assertPreseededProjectLoaded(cdp, project.rootPath);
         await fillTextareaAndClickCreate(cdp, requirement);
         const workspace = await waitForWorkflowCompletion({
           baselineCommitSha,
@@ -274,6 +278,9 @@ export async function launchElectronAcceptanceApp({ userData }) {
   return {
     cdpPort,
     devServerUrl,
+    diagnostics() {
+      return [vite.diagnosticOutput(), electron.diagnosticOutput()].filter(Boolean).join("\n");
+    },
     async close() {
       await Promise.allSettled([electron.close(), vite.close()]);
     },
@@ -325,16 +332,159 @@ async function loadDemoHelpers() {
 }
 
 async function connectToSkyTurnRenderer(cdpPort, devServerUrl) {
-  const targets = await waitForJsonTargets(cdpPort);
-  const target = targets.find((item) => typeof item.url === "string" && item.url.startsWith(devServerUrl))
-    ?? targets.find((item) => item.type === "page" && typeof item.webSocketDebuggerUrl === "string");
-  if (!target?.webSocketDebuggerUrl) {
-    throw new Error(`Could not find SkyTurn renderer CDP target at ${devServerUrl}.`);
-  }
+  const target = await waitForSkyTurnRendererTarget(cdpPort, devServerUrl);
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
-  await cdp.call("Runtime.enable");
-  await cdp.call("Page.enable");
-  return cdp;
+  try {
+    await cdp.call("Runtime.enable");
+    await cdp.call("Page.enable");
+    return cdp;
+  } catch (error) {
+    cdp.close();
+    throw error;
+  }
+}
+
+export function selectSkyTurnRendererTarget(targets, devServerUrl) {
+  if (!Array.isArray(targets)) return null;
+  const expectedUrl = normalizedRendererTargetUrl(devServerUrl);
+  if (!expectedUrl) return null;
+  return targets.find((item) =>
+    item?.type === "page" &&
+    typeof item.url === "string" &&
+    normalizedRendererTargetUrl(item.url) === expectedUrl &&
+    typeof item.webSocketDebuggerUrl === "string"
+  ) ?? null;
+}
+
+function normalizedRendererTargetUrl(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+export async function connectToReadySkyTurnRenderer({
+  cdpPort,
+  devServerUrl,
+  projectRoot,
+  connect = connectToSkyTurnRenderer,
+  assertLoaded = assertPreseededProjectLoaded,
+  processDiagnostics = () => "",
+  retryDelayMs = 100,
+  diagnosticLimitBytes = commandOutputLimitBytes,
+}) {
+  const attempts = [];
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    let cdp = null;
+    try {
+      cdp = await connect(cdpPort, devServerUrl);
+      await assertLoaded(cdp, projectRoot);
+      return cdp;
+    } catch (error) {
+      attempts.push({
+        attempt,
+        error: error instanceof Error ? error.message : String(error),
+        events: typeof cdp?.diagnosticEvents === "function" ? cdp.diagnosticEvents() : [],
+      });
+      cdp?.close();
+      if (attempt === 2 || !isRendererAcquisitionRetryable(error)) {
+        throw new Error(rendererReadinessDiagnostic({
+          error,
+          attempts,
+          processOutput: processDiagnostics(),
+          limitBytes: diagnosticLimitBytes,
+        }));
+      }
+      await delay(retryDelayMs);
+    }
+  }
+  throw new Error("Renderer readiness retry exhausted.");
+}
+
+function isRendererAcquisitionRetryable(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = error && typeof error === "object" && typeof error.code === "string" ? error.code : "";
+  return /Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id|CDP WebSocket (?:upgrade failed|accept header mismatch)|CDP socket closed|socket hang up/i.test(message)
+    || /^(?:ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT)$/.test(code);
+}
+
+function rendererReadinessDiagnostic({ error, attempts, processOutput, limitBytes }) {
+  const sanitizedAttempts = attempts.map((attempt) => ({
+    attempt: attempt.attempt,
+    error: sanitizeDiagnosticText(attempt.error),
+    events: Array.isArray(attempt.events)
+      ? attempt.events.map((event) => sanitizeRendererDiagnosticEvent(event)).filter(Boolean)
+      : [],
+  }));
+  const message = [
+    sanitizeDiagnosticText(error instanceof Error ? error.message : String(error)),
+    `Renderer readiness attempts: ${JSON.stringify(sanitizedAttempts)}`,
+    processOutput ? `Process output: ${sanitizeDiagnosticText(processOutput)}` : "",
+  ].filter(Boolean).join("; ");
+  return boundedDiagnosticText(message, limitBytes);
+}
+
+function sanitizeRendererDiagnosticEvent(event) {
+  if (!event || typeof event !== "object" || typeof event.method !== "string") return null;
+  if (event.method === "Page.frameNavigated") {
+    return {
+      method: event.method,
+      frameId: event.frameId ?? null,
+      url: sanitizeDiagnosticUrl(event.url),
+    };
+  }
+  if (event.method === "Page.loadEventFired") return { method: event.method };
+  if (event.method === "Runtime.executionContextDestroyed") {
+    return {
+      method: event.method,
+      executionContextId: event.executionContextId ?? null,
+    };
+  }
+  if (event.method === "Runtime.executionContextsCleared") return { method: event.method };
+  return null;
+}
+
+function sanitizeDiagnosticText(value) {
+  return String(value)
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi, (url) => sanitizeDiagnosticUrl(url) ?? "[redacted-url]")
+    .replace(/(^|[\s("'=])\/[^\s"'<>]*/g, (match, prefix) => {
+      const target = match.slice(prefix.length);
+      return `${prefix}${stripDiagnosticUrlCapability(target)}`;
+    });
+}
+
+function sanitizeDiagnosticUrl(value) {
+  if (typeof value !== "string") return null;
+  try {
+    const url = new URL(value);
+    if (!/^(?:https?|wss?|file):$/.test(url.protocol)) return null;
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function stripDiagnosticUrlCapability(value) {
+  const capabilityIndex = value.search(/[?#]/);
+  return capabilityIndex === -1 ? value : value.slice(0, capabilityIndex);
+}
+
+function boundedDiagnosticText(value, limitBytes) {
+  const limit = Number.isFinite(limitBytes) ? Math.max(0, Math.floor(limitBytes)) : commandOutputLimitBytes;
+  const text = String(value);
+  if (Buffer.byteLength(text) <= limit) return text;
+  const marker = "... [truncated]";
+  const markerBytes = Buffer.byteLength(marker);
+  if (limit <= markerBytes) return boundedText(marker, limit).value;
+  return `${boundedText(text, limit - markerBytes).value}${marker}`;
 }
 
 async function assertPreseededProjectLoaded(cdp, projectRoot) {
@@ -945,6 +1095,9 @@ function spawnManaged(command, args, { cwd, env, label }) {
     output() {
       return `${stderr}${stdout}`.trim();
     },
+    diagnosticOutput() {
+      return boundedText(`${label}:\n${stderr}${stdout}`.trim(), commandOutputLimitBytes).value;
+    },
     assertAlive() {
       if (!closed) return;
       const reason = closeResult?.signal ? `signal ${closeResult.signal}` : `exit ${closeResult?.code}`;
@@ -1002,7 +1155,7 @@ async function waitForCdp(port, electronProcess) {
   throw new Error(`Timed out waiting for Electron CDP at ${url}.`);
 }
 
-async function waitForJsonTargets(port) {
+async function waitForSkyTurnRendererTarget(port, devServerUrl) {
   const deadline = Date.now() + 30_000;
   const url = `http://${RENDERER_HOST}:${port}/json/list`;
   while (Date.now() < deadline) {
@@ -1010,19 +1163,25 @@ async function waitForJsonTargets(port) {
       const response = await fetch(url);
       if (response.ok) {
         const targets = await response.json();
-        if (Array.isArray(targets) && targets.length > 0) return targets;
+        const target = selectSkyTurnRendererTarget(targets, devServerUrl);
+        if (target) return target;
       }
     } catch {}
     await delay(250);
   }
-  throw new Error(`Timed out waiting for Electron CDP targets at ${url}.`);
+  throw new Error(`Timed out waiting for SkyTurn renderer CDP target at ${devServerUrl} via ${url}.`);
 }
 
 class CdpClient {
   static async connect(webSocketUrl) {
     const client = new CdpClient(webSocketUrl);
-    await client.open();
-    return client;
+    try {
+      await client.open();
+      return client;
+    } catch (error) {
+      client.destroy();
+      throw error;
+    }
   }
 
   constructor(webSocketUrl) {
@@ -1031,6 +1190,7 @@ class CdpClient {
     this.nextId = 1;
     this.pending = new Map();
     this.buffer = Buffer.alloc(0);
+    this.events = [];
   }
 
   async open() {
@@ -1055,11 +1215,22 @@ class CdpClient {
 
   readHandshake(key) {
     return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        this.socket.off("data", onData);
+        this.socket.off("error", onError);
+        this.socket.off("close", onClose);
+      };
+      const fail = (error) => {
+        cleanup();
+        reject(error);
+      };
+      const onError = (error) => fail(error);
+      const onClose = () => fail(new Error("CDP socket closed during WebSocket handshake."));
       const onData = (chunk) => {
         this.buffer = Buffer.concat([this.buffer, chunk]);
         const headerEnd = this.buffer.indexOf("\r\n\r\n");
         if (headerEnd === -1) return;
-        this.socket.off("data", onData);
+        cleanup();
         const header = this.buffer.subarray(0, headerEnd).toString("utf8");
         this.buffer = this.buffer.subarray(headerEnd + 4);
         if (!header.startsWith("HTTP/1.1 101")) {
@@ -1077,7 +1248,8 @@ class CdpClient {
         resolve();
       };
       this.socket.on("data", onData);
-      this.socket.once("error", reject);
+      this.socket.once("error", onError);
+      this.socket.once("close", onClose);
     });
   }
 
@@ -1158,12 +1330,26 @@ class CdpClient {
     }
     if (opcode !== 0x1) return;
     const message = JSON.parse(payload.toString("utf8"));
-    if (!message.id) return;
+    if (!message.id) {
+      this.recordDiagnosticEvent(message);
+      return;
+    }
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
     if (message.error) pending.reject(new Error(message.error.message));
     else pending.resolve(message);
+  }
+
+  recordDiagnosticEvent(message) {
+    const event = cdpDiagnosticEvent(message);
+    if (!event) return;
+    this.events.push(event);
+    if (this.events.length > 32) this.events.shift();
+  }
+
+  diagnosticEvents() {
+    return [...this.events];
   }
 
   rejectAll(error) {
@@ -1175,13 +1361,54 @@ class CdpClient {
     if (!this.socket || this.socket.destroyed) return;
     this.socket.end();
   }
+
+  destroy() {
+    if (!this.socket || this.socket.destroyed) return;
+    this.socket.destroy();
+  }
+}
+
+function cdpDiagnosticEvent(message) {
+  if (message.method === "Page.frameNavigated") {
+    return {
+      method: message.method,
+      frameId: message.params?.frame?.id ?? null,
+      url: sanitizeDiagnosticUrl(message.params?.frame?.url),
+    };
+  }
+  if (message.method === "Page.loadEventFired") return { method: message.method };
+  if (message.method === "Runtime.executionContextDestroyed") {
+    return {
+      method: message.method,
+      executionContextId: message.params?.executionContextId ?? null,
+    };
+  }
+  if (message.method === "Runtime.executionContextsCleared") return { method: message.method };
+  return null;
 }
 
 function connectTcp(host, port) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ host, port });
-    socket.once("connect", () => resolve(socket));
-    socket.once("error", reject);
+    const cleanup = () => {
+      socket.off("connect", onConnect);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const fail = (error) => {
+      cleanup();
+      socket.destroy();
+      reject(error);
+    };
+    const onConnect = () => {
+      cleanup();
+      resolve(socket);
+    };
+    const onError = (error) => fail(error);
+    const onClose = () => fail(new Error("CDP socket closed before TCP connection completed."));
+    socket.once("connect", onConnect);
+    socket.once("error", onError);
+    socket.once("close", onClose);
   });
 }
 
