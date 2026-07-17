@@ -6726,6 +6726,11 @@ select:focus-visible,
   --sk-edge-retrying: #d97706;
   --sk-edge-failed: #dc2626;
   --sk-edge-active: #a78bfa;
+  --sk-syntax-keyword: #569cd6;
+  --sk-syntax-string: #ce9178;
+  --sk-syntax-number: #b5cea8;
+  --sk-syntax-comment: #6a9955;
+  --sk-syntax-function: #dcdcaa;
 }
 
 .empty-stage,
@@ -7203,7 +7208,7 @@ select:focus-visible,
   box-shadow: none !important;
 }
 
-/* PR2 Plan mode — flat single-column document surface (final cascade). */
+/* Plan mode — flat single-column document surface (final cascade). */
 .plan-view {
   display: grid !important;
   grid-template-rows: auto minmax(0, 1fr) auto !important;
@@ -7211,9 +7216,9 @@ select:focus-visible,
   gap: 0 !important;
   overflow: hidden !important;
   padding: 12px 16px 0 !important;
-  background: #f3f4f6 !important;
+  background: var(--sk-bg) !important;
   background-image: none !important;
-  color: #111827 !important;
+  color: var(--sk-text) !important;
   backdrop-filter: none !important;
 }
 
@@ -7227,8 +7232,8 @@ select:focus-visible,
   gap: 8px;
   min-height: 44px;
   padding: 4px 0 10px;
-  border-bottom: 1px solid #d1d5db;
-  background: #f3f4f6;
+  border-bottom: 1px solid var(--sk-border-muted);
+  background: var(--sk-bg);
   background-image: none;
   box-shadow: none;
 }
@@ -7260,7 +7265,7 @@ select:focus-visible,
 .plan-composer-send {
   min-height: 44px;
   min-width: 44px;
-  border-radius: 6px;
+  border-radius: var(--sk-radius-sm);
   box-shadow: none !important;
   background-image: none !important;
   backdrop-filter: none !important;
@@ -7273,12 +7278,20 @@ select:focus-visible,
   align-items: center;
   justify-content: center;
   gap: 6px;
-  border: 1px solid #d1d5db;
-  background: #ffffff;
-  color: #111827;
+  border: 1px solid var(--sk-border);
+  background: var(--sk-surface);
+  color: var(--sk-text);
   padding: 8px 12px;
   font-size: 13px;
   font-weight: 650;
+}
+
+.plan-stage-progress-button:hover:not(:disabled),
+.plan-toolbar-actions > button:hover:not(:disabled),
+.plan-view-toggle button:hover:not(:disabled),
+.plan-stage-actions button:hover:not(:disabled),
+.plan-error-banner button:hover:not(:disabled) {
+  background: var(--sk-white);
 }
 
 .plan-stage-progress-button:disabled,
@@ -7292,13 +7305,13 @@ select:focus-visible,
 }
 
 .plan-stage-progress-button.active {
-  border-color: #2563eb;
-  background: #eff6ff;
-  color: #1d4ed8;
+  border-color: var(--sk-accent);
+  background: color-mix(in srgb, var(--sk-accent) 15%, var(--sk-surface));
+  color: var(--sk-accent);
 }
 
 .plan-stage-progress-button.accepted {
-  color: #047857;
+  color: var(--sk-status-completed-text);
 }
 
 .plan-stage-progress-marker {
@@ -7307,23 +7320,24 @@ select:focus-visible,
   justify-content: center;
   width: 18px;
   height: 18px;
-  border-radius: 999px;
-  background: #e5e7eb;
+  border-radius: var(--sk-radius-pill);
+  background: var(--sk-border-muted);
+  color: var(--sk-text);
   font-size: 11px;
   font-weight: 700;
 }
 
 .plan-stage-progress-button.accepted .plan-stage-progress-marker {
-  background: #d1fae5;
-  color: #047857;
+  background: color-mix(in srgb, var(--sk-status-completed-text) 15%, transparent);
+  color: var(--sk-status-completed-text);
 }
 
 .plan-view-toggle {
   display: inline-flex;
   align-items: center;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  background: #ffffff;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-surface);
   overflow: hidden;
 }
 
@@ -7332,22 +7346,22 @@ select:focus-visible,
   align-items: center;
   gap: 6px;
   border: 0;
-  border-radius: 0;
+  border-radius: var(--sk-radius-none);
   background: transparent;
-  color: #111827;
+  color: var(--sk-text);
   padding: 8px 12px;
 }
 
 .plan-view-toggle button[aria-pressed="true"] {
-  background: #eff6ff;
-  color: #1d4ed8;
+  background: color-mix(in srgb, var(--sk-accent) 15%, transparent);
+  color: var(--sk-accent);
 }
 
 .plan-next-button,
 .plan-finish-button {
-  border-color: #2563eb !important;
-  background: #eff6ff !important;
-  color: #1d4ed8 !important;
+  border-color: var(--sk-accent) !important;
+  background: color-mix(in srgb, var(--sk-accent) 15%, var(--sk-surface)) !important;
+  color: var(--sk-accent) !important;
 }
 
 .plan-document {
@@ -7355,9 +7369,9 @@ select:focus-visible,
   min-height: max(320px, 100%);
   margin-inline: auto;
   overflow: auto;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
-  background: #ffffff !important;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-md);
+  background: var(--sk-surface) !important;
   background-image: none !important;
   padding: 20px 24px 32px;
   box-shadow: none !important;
@@ -7375,10 +7389,10 @@ select:focus-visible,
   align-items: center;
   gap: 10px;
   margin: 0 0 16px;
-  border: 1px solid #fca5a5;
-  border-radius: 6px;
-  background: #fef2f2;
-  color: #991b1b;
+  border: 1px solid color-mix(in srgb, var(--sk-status-failed-text) 50%, transparent);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-status-failed-bg);
+  color: var(--sk-status-failed-text);
   padding: 10px 12px;
   box-shadow: none;
 }
@@ -7388,15 +7402,15 @@ select:focus-visible,
   align-items: center;
   gap: 6px;
   margin-left: auto;
-  border: 1px solid #fca5a5;
-  background: #ffffff;
-  color: #991b1b;
+  border: 1px solid color-mix(in srgb, var(--sk-status-failed-text) 50%, transparent);
+  background: var(--sk-surface);
+  color: var(--sk-status-failed-text);
   padding: 8px 12px;
 }
 
 .plan-md-preview {
   max-width: 100%;
-  color: #111827;
+  color: var(--sk-text);
   font-family: var(--sk-font-ui);
   font-size: 14px;
   line-height: 1.65;
@@ -7406,7 +7420,7 @@ select:focus-visible,
 .plan-md-preview h2,
 .plan-md-preview h3 {
   margin: 1.25em 0 0.5em;
-  color: #0f172a;
+  color: var(--sk-text-strong);
   font-weight: 700;
   text-decoration: none;
 }
@@ -7433,14 +7447,14 @@ select:focus-visible,
 
 .plan-md-preview blockquote {
   margin: 0 0 0.85em;
-  border-left: 2px solid #d1d5db;
+  border-left: 2px solid var(--sk-border-muted);
   padding-left: 12px;
-  color: #374151;
+  color: var(--sk-text-subtle);
 }
 
 .plan-md-preview hr {
   border: 0;
-  border-top: 1px solid #d1d5db;
+  border-top: 1px solid var(--sk-border-muted);
 }
 
 .plan-md-preview table {
@@ -7451,18 +7465,18 @@ select:focus-visible,
 
 .plan-md-preview th,
 .plan-md-preview td {
-  border: 1px solid #d1d5db;
+  border: 1px solid var(--sk-border-muted);
   padding: 8px 10px;
   text-align: left;
 }
 
 .plan-md-preview th {
   border-bottom-width: 2px;
-  background: #f9fafb;
+  background: var(--sk-surface-warm-muted);
 }
 
 .plan-md-preview a {
-  color: #2563eb;
+  color: var(--sk-accent);
   text-decoration: none;
 }
 
@@ -7473,17 +7487,17 @@ select:focus-visible,
 .plan-md-preview code {
   font-family: var(--sk-font-mono);
   font-size: 0.92em;
-  border-radius: 4px;
-  background: #f3f4f6;
-  color: #111827;
+  border-radius: var(--sk-radius-xs);
+  background: var(--sk-surface-warm-muted);
+  color: var(--sk-text);
   padding: 0.1em 0.35em;
 }
 
 .plan-md-preview pre {
   margin: 0 0 0.85em;
-  border: 1px solid #2d2d2d;
-  border-radius: 6px;
-  background: #1e1e1e;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-code-bg-warm);
   padding: 12px 14px;
   overflow: auto;
   box-shadow: none;
@@ -7492,7 +7506,7 @@ select:focus-visible,
 .plan-md-preview pre code {
   display: block;
   background: transparent;
-  color: #d4d4d4;
+  color: var(--sk-code-text-warm);
   padding: 0;
   font-size: 13px;
   line-height: 1.55;
@@ -7501,36 +7515,36 @@ select:focus-visible,
 .plan-md-preview pre code .hljs-keyword,
 .plan-md-preview pre code .hljs-selector-tag,
 .plan-md-preview pre code .hljs-literal {
-  color: #569cd6;
+  color: var(--sk-syntax-keyword);
 }
 
 .plan-md-preview pre code .hljs-string,
 .plan-md-preview pre code .hljs-attr {
-  color: #ce9178;
+  color: var(--sk-syntax-string);
 }
 
 .plan-md-preview pre code .hljs-number,
 .plan-md-preview pre code .hljs-built_in {
-  color: #b5cea8;
+  color: var(--sk-syntax-number);
 }
 
 .plan-md-preview pre code .hljs-comment {
-  color: #6a9955;
+  color: var(--sk-syntax-comment);
 }
 
 .plan-md-preview pre code .hljs-function,
 .plan-md-preview pre code .hljs-title {
-  color: #dcdcaa;
+  color: var(--sk-syntax-function);
 }
 
 .plan-md-source {
   display: block;
   width: 100%;
   min-height: 280px;
-  border: 1px solid #d1d5db !important;
-  border-radius: 6px;
-  background: #ffffff !important;
-  color: #111827 !important;
+  border: 1px solid var(--sk-border) !important;
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-surface) !important;
+  color: var(--sk-text) !important;
   padding: 12px 14px;
   resize: none;
   font-family: var(--sk-font-mono);
@@ -7547,7 +7561,7 @@ select:focus-visible,
 
 .plan-composer-status {
   margin: 0 0 8px;
-  color: #4b5563;
+  color: var(--sk-text-subtle);
   font-size: 12px;
   font-weight: 650;
 }
@@ -7557,15 +7571,15 @@ select:focus-visible,
   display: flex;
   align-items: flex-end;
   min-height: 44px;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
-  background: #ffffff;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-md);
+  background: var(--sk-surface);
   box-shadow: none !important;
   backdrop-filter: none !important;
 }
 
 .plan-composer-field:focus-within {
-  border-color: #2563eb;
+  border-color: var(--sk-accent);
   box-shadow: none !important;
 }
 
@@ -7574,9 +7588,9 @@ select:focus-visible,
   min-height: 44px;
   max-height: 160px;
   border: 0 !important;
-  border-radius: 8px;
+  border-radius: var(--sk-radius-md);
   background: transparent !important;
-  color: #111827 !important;
+  color: var(--sk-text) !important;
   padding: 10px 52px 10px 12px;
   resize: none;
   outline: none !important;
@@ -7601,8 +7615,8 @@ select:focus-visible,
   width: 44px;
   height: 44px;
   border: 0;
-  background: #2563eb !important;
-  color: #ffffff !important;
+  background: var(--sk-accent) !important;
+  color: var(--sk-text-inverse-warm) !important;
   padding: 0;
 }
 
@@ -7613,7 +7627,7 @@ select:focus-visible,
 .plan-view button:focus-visible,
 .plan-view textarea:focus-visible,
 .plan-view [role="button"]:focus-visible {
-  outline: 1px solid #2563eb !important;
+  outline: 2px solid var(--sk-accent) !important;
   outline-offset: 1px;
   box-shadow: none !important;
 }

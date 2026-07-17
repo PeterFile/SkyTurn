@@ -31,7 +31,7 @@ function exactCssBlockCount(styles: string, selector: string): number {
 describe("SkyTurn UI style tokens", () => {
   it("keeps one authoritative flat Plan cascade", async () => {
     const styles = await readSource("./styles.css");
-    expect(styles.match(/PR2 Plan mode — flat single-column document surface/g) ?? []).toHaveLength(1);
+    expect(styles.match(/Plan mode — flat single-column document surface/g) ?? []).toHaveLength(1);
     const planSelectors = [
       ".plan-view",
       ".plan-view-toggle",
@@ -48,14 +48,26 @@ describe("SkyTurn UI style tokens", () => {
       expect(exactCssBlockCount(styles, selector), selector).toBe(1);
     }
 
-    const planCascade = styles.slice(styles.indexOf("/* PR2 Plan mode — flat single-column document surface (final cascade). */"));
+    const planCascade = styles.slice(styles.indexOf("/* Plan mode — flat single-column document surface (final cascade). */"));
     expect(planCascade).toContain("grid-template-columns: minmax(0, 1fr) !important");
     expect(planCascade).toContain("width: min(100%, 48rem)");
     expect(planCascade).toContain("min-height: max(320px, 100%)");
-    expect(planCascade).toContain("background: #f3f4f6 !important");
-    expect(planCascade).toContain("background: #ffffff !important");
+    expect(planCascade).toContain("background: var(--sk-bg) !important");
+    expect(planCascade).toContain("background: var(--sk-surface) !important");
     expect(planCascade).toContain("box-shadow: none !important");
-    expect(planCascade).toContain("outline: 1px solid #2563eb !important");
+    expect(planCascade).toContain("outline: 2px solid var(--sk-accent) !important");
+    expect(planCascade).toContain("color: var(--sk-text-inverse-warm) !important");
+    expect(planCascade).toContain("border-radius: var(--sk-radius-none)");
+    expect(planCascade).toContain("border-radius: var(--sk-radius-xs)");
+    expect(planCascade).toContain("border-radius: var(--sk-radius-sm)");
+    expect(planCascade).toContain("border-radius: var(--sk-radius-md)");
+    expect(planCascade).toContain("border-radius: var(--sk-radius-pill)");
+    expect(planCascade).not.toMatch(/#[0-9a-f]{3,8}\b|rgba?\(/i);
+    expect(planCascade).not.toMatch(/border-radius:\s*\d/);
+    const shadowValues = Array.from(planCascade.matchAll(/box-shadow:\s*([^;]+);/g), (match) => match[1].trim());
+    const backdropValues = Array.from(planCascade.matchAll(/backdrop-filter:\s*([^;]+);/g), (match) => match[1].trim());
+    expect(shadowValues.every((value) => value === "none" || value === "none !important")).toBe(true);
+    expect(backdropValues.every((value) => value === "none" || value === "none !important")).toBe(true);
     expect(planCascade).not.toContain("linear-gradient");
     expect(planCascade).not.toContain("grid-template-columns: 1fr 1fr");
   });
@@ -63,7 +75,7 @@ describe("SkyTurn UI style tokens", () => {
   it("keeps the Plan toolbar to one row on wide desktops and two explicit rows on compact desktops", async () => {
     const styles = await readSource("./styles.css");
     const baseCascade = styles.slice(
-      styles.indexOf("/* PR2 Plan mode — flat single-column document surface (final cascade). */"),
+      styles.indexOf("/* Plan mode — flat single-column document surface (final cascade). */"),
       styles.indexOf("@media (max-width: 1099px)"),
     );
     const toolbar = lastCssBlock(baseCascade, ".plan-toolbar");
