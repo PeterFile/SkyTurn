@@ -32,6 +32,7 @@ import {
   runEvidenceFactsForDisplay,
   summarizeWorktreeComparisonEvidence,
   PlanDocumentEditor,
+  derivePlanRevisionTracking,
   isPlanRevisionAvailable,
   derivePlanUiPhase,
   isPlanSourceEditable,
@@ -964,6 +965,8 @@ describe("UI source validation", () => {
   );
 
   it("Plan control matrix keeps failed documents editable and running documents locked", () => {
+    expect(isPlanSourceEditable("idle_empty", false, false)).toBe(true);
+    expect(isPlanSourceEditable("idle_empty", false, true)).toBe(false);
     expect(isPlanSourceEditable("error", true, false)).toBe(true);
     expect(isPlanSourceEditable("error", false, false)).toBe(false);
     expect(isPlanSourceEditable("generating", true, false)).toBe(false);
@@ -974,6 +977,9 @@ describe("UI source validation", () => {
     expect(derivePlanUiPhase({ status: "revising", draft: "x" }, "x", "source", true)).toBe("revising");
     expect(derivePlanUiPhase({ status: "failed", draft: "" }, "# Keep", "source", false)).toBe("error");
     expect(derivePlanUiPhase({ status: "ready", draft: "" }, "# Ready", "source", true)).toBe("editing");
+    const clearedPhase = derivePlanUiPhase({ status: "pending", draft: "" }, "", "source", true);
+    expect(clearedPhase).toBe("idle_empty");
+    expect(isPlanSourceEditable(clearedPhase, false, false)).toBe(true);
 
     const finishReady = editablePlanSession();
     expect(isPlanFinishEnabled(finishReady, "ready", false)).toBe(true);
@@ -1106,20 +1112,49 @@ describe("UI source validation", () => {
   });
 
   it("resets the revision composer height only after a successful revision", async () => {
+    const activeRevision = derivePlanRevisionTracking(null, {
+      status: "revising",
+      operation: "revise",
+      runId: "revision-run",
+      lastRunId: null,
+    });
+    expect(activeRevision).toEqual({ pendingRunId: "revision-run", terminalStatus: null });
+    expect(derivePlanRevisionTracking(activeRevision.pendingRunId, {
+      status: "ready",
+      operation: "revise",
+      runId: null,
+      lastRunId: "revision-run",
+    })).toEqual({ pendingRunId: null, terminalStatus: "ready" });
+    expect(derivePlanRevisionTracking(activeRevision.pendingRunId, {
+      status: "failed",
+      operation: "revise",
+      runId: null,
+      lastRunId: "revision-run",
+    })).toEqual({ pendingRunId: null, terminalStatus: "failed" });
+    expect(derivePlanRevisionTracking(activeRevision.pendingRunId, {
+      status: "ready",
+      operation: "revise",
+      runId: null,
+      lastRunId: "another-run",
+    })).toEqual({ pendingRunId: "revision-run", terminalStatus: null });
+
     const appSource = await readSource("./App.tsx");
     const planView = appSource.slice(appSource.indexOf("function PlanView("), appSource.indexOf("function CanvasView("));
     const revisionResultEffect = planView.slice(
       planView.indexOf("useEffect(() => {"),
-      planView.indexOf("}, [stageState.runId, stageState.status, submittedRevisionRunId]);"),
+      planView.indexOf("}, [stageState.lastRunId, stageState.operation, stageState.runId, stageState.status, submittedRevisionRunId]);"),
     );
     const successfulRevision = revisionResultEffect.slice(
-      revisionResultEffect.indexOf('if (stageState.status === "ready")'),
-      revisionResultEffect.indexOf('if (stageState.status === "ready" || stageState.status === "failed")'),
+      revisionResultEffect.indexOf('if (tracking.terminalStatus === "ready")'),
+      revisionResultEffect.indexOf("setSubmittedRevisionRunId(tracking.pendingRunId)"),
     );
 
+    expect(revisionResultEffect).toContain("derivePlanRevisionTracking(submittedRevisionRunId, stageState)");
     expect(successfulRevision).toContain('composerRef.current?.style.removeProperty("height")');
     expect(successfulRevision).toContain('setAgentInstruction("")');
-    expect(revisionResultEffect).not.toContain('if (stageState.status === "failed") {\n      setAgentInstruction("")');
+    expect(successfulRevision).toContain('setPreservedFailedInstruction("")');
+    expect(revisionResultEffect).not.toContain('if (tracking.terminalStatus === "failed") {\n      setAgentInstruction("")');
+    expect(planView).not.toContain("catch {\n      setSubmittedRevisionRunId(null);");
   });
 
   it("PlanView document editor stays editable after clearing while running and blank completion stay closed", () => {
@@ -1138,6 +1173,7 @@ describe("UI source validation", () => {
     const readyEditor = renderEditor();
     expect(readyEditor.props.readOnly).toBe(false);
     expect(readyEditor.props.className).toBe("plan-md-source");
+    expect(readyEditor.props["aria-label"]).toBe("Plan source editor");
     expect(readyEditor.props.spellCheck).toBe(false);
     expect(readyEditor.props["aria-readonly"]).toBeUndefined();
     readyEditor.props.onBlur();

@@ -2118,7 +2118,7 @@ export function isPlanSourceEditable(
   if (locked) return false;
   if (phase === "generating" || phase === "streaming" || phase === "revising") return false;
   if (phase === "error") return hasBuffer;
-  return phase === "ready" || phase === "editing";
+  return phase === "idle_empty" || phase === "ready" || phase === "editing";
 }
 
 export function isPlanNextEnabled(
@@ -2176,6 +2176,7 @@ export function PlanDocumentEditor({
       className="plan-md-source"
       value={value}
       readOnly={readOnly}
+      aria-label="Plan source editor"
       aria-readonly={readOnly ? true : undefined}
       spellCheck={false}
       onChange={(event) => onChange(event.currentTarget.value)}
@@ -2188,6 +2189,27 @@ export function isPlanRevisionAvailable(
   state: Pick<PlanSession["stages"][PlanStage], "status" | "operation">,
 ): boolean {
   return state.status === "ready" || (state.status === "failed" && state.operation === "revise");
+}
+
+export function derivePlanRevisionTracking(
+  pendingRunId: string | null,
+  stage: Pick<
+    PlanSession["stages"][PlanStage],
+    "status" | "operation" | "runId" | "lastRunId"
+  >,
+): { pendingRunId: string | null; terminalStatus: "ready" | "failed" | null } {
+  if (stage.status === "revising" && stage.operation === "revise" && stage.runId) {
+    return { pendingRunId: stage.runId, terminalStatus: null };
+  }
+  if (
+    pendingRunId &&
+    stage.runId === null &&
+    stage.lastRunId === pendingRunId &&
+    (stage.status === "ready" || stage.status === "failed")
+  ) {
+    return { pendingRunId: null, terminalStatus: stage.status };
+  }
+  return { pendingRunId, terminalStatus: null };
 }
 
 export function PlanMarkdownPreview({ markdown }: { markdown: string }) {
@@ -2270,16 +2292,16 @@ function PlanView({
   const failedOperation = stageState.status === "failed" ? stageState.operation : null;
 
   useEffect(() => {
-    if (!submittedRevisionRunId || stageState.runId) return;
-    if (stageState.status === "ready") {
+    const tracking = derivePlanRevisionTracking(submittedRevisionRunId, stageState);
+    if (tracking.terminalStatus === "ready") {
       setAgentInstruction("");
       setPreservedFailedInstruction("");
       composerRef.current?.style.removeProperty("height");
     }
-    if (stageState.status === "ready" || stageState.status === "failed") {
-      setSubmittedRevisionRunId(null);
+    if (tracking.pendingRunId !== submittedRevisionRunId) {
+      setSubmittedRevisionRunId(tracking.pendingRunId);
     }
-  }, [stageState.runId, stageState.status, submittedRevisionRunId]);
+  }, [stageState.lastRunId, stageState.operation, stageState.runId, stageState.status, submittedRevisionRunId]);
 
   useEffect(() => {
     if (stageState.status === "failed" && stageState.operation === "revise" && agentInstruction.trim()) {
@@ -2313,7 +2335,7 @@ function PlanView({
       const result = await onRevise(activeStep.key, instruction);
       setSubmittedRevisionRunId(result.runId);
     } catch {
-      setSubmittedRevisionRunId(null);
+      /* The rendered durable stage state owns revision tracking after a bound start. */
     }
   }
 
@@ -2353,7 +2375,7 @@ function PlanView({
         const result = await onRevise(activeStep.key, instruction);
         setSubmittedRevisionRunId(result.runId);
       } catch {
-        setSubmittedRevisionRunId(null);
+        /* The rendered durable stage state owns revision tracking after a bound start. */
       }
     }
   }
