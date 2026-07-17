@@ -21,7 +21,77 @@ function lastCssRuleForSelector(styles: string, selector: string): string {
   return matches.at(-1)?.[0] ?? "";
 }
 
+function exactCssBlockCount(styles: string, selector: string): number {
+  return Array.from(styles.matchAll(/(?:^|\n)([^{}]+) \{[\s\S]*?\n\}/g)).filter((match) => {
+    const selectorText = match[1].replace(/\/\*[\s\S]*?\*\//g, "").trim();
+    return selectorText === selector;
+  }).length;
+}
+
 describe("SkyTurn UI style tokens", () => {
+  it("keeps one authoritative flat Plan cascade", async () => {
+    const styles = await readSource("./styles.css");
+    expect(styles.match(/PR2 Plan mode — flat single-column document surface/g) ?? []).toHaveLength(1);
+    const planSelectors = [
+      ".plan-view",
+      ".plan-view-toggle",
+      ".plan-document",
+      ".plan-md-preview",
+      ".plan-md-source",
+      ".plan-composer",
+      ".plan-composer-field",
+      ".plan-composer-input",
+      ".plan-composer-send",
+    ];
+
+    for (const selector of planSelectors) {
+      expect(exactCssBlockCount(styles, selector), selector).toBe(1);
+    }
+
+    const planCascade = styles.slice(styles.indexOf("/* PR2 Plan mode — flat single-column document surface (final cascade). */"));
+    expect(planCascade).toContain("grid-template-columns: minmax(0, 1fr) !important");
+    expect(planCascade).toContain("width: min(100%, 48rem)");
+    expect(planCascade).toContain("min-height: max(320px, 100%)");
+    expect(planCascade).toContain("background: #f3f4f6 !important");
+    expect(planCascade).toContain("background: #ffffff !important");
+    expect(planCascade).toContain("box-shadow: none !important");
+    expect(planCascade).toContain("outline: 1px solid #2563eb !important");
+    expect(planCascade).not.toContain("linear-gradient");
+    expect(planCascade).not.toContain("grid-template-columns: 1fr 1fr");
+  });
+
+  it("keeps the Plan toolbar to one row on wide desktops and two explicit rows on compact desktops", async () => {
+    const styles = await readSource("./styles.css");
+    const baseCascade = styles.slice(
+      styles.indexOf("/* PR2 Plan mode — flat single-column document surface (final cascade). */"),
+      styles.indexOf("@media (max-width: 1099px)"),
+    );
+    const toolbar = lastCssBlock(baseCascade, ".plan-toolbar");
+    const progress = lastCssBlock(baseCascade, ".plan-stage-progress");
+
+    expect(toolbar).toContain("flex-wrap: nowrap");
+    expect(progress).toContain("flex-wrap: nowrap");
+    expect(baseCascade).toContain([
+      ".plan-toolbar-actions,",
+      ".plan-stage-actions {",
+      "  display: flex;",
+      "  flex-wrap: nowrap;",
+    ].join("\n"));
+
+    const compactDesktop = styles.slice(
+      styles.indexOf("@media (max-width: 1099px)"),
+      styles.indexOf("@media (max-width: 719px)"),
+    );
+    expect(compactDesktop).toContain(".plan-toolbar {");
+    expect(compactDesktop).toContain("flex-wrap: wrap");
+    expect(compactDesktop).toContain(".plan-stage-progress {");
+    expect(compactDesktop).toContain("flex: 0 0 100%");
+    expect(compactDesktop).toContain(".plan-toolbar-actions {");
+    expect(compactDesktop).toContain("width: 100%");
+    expect(compactDesktop).toContain("justify-content: flex-end");
+    expect(compactDesktop).toContain("padding-inline: 4px");
+  });
+
   it("uses modern dark tokens instead of paper collage material tokens", async () => {
     const styles = await readSource("./styles.css");
 
