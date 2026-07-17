@@ -5,6 +5,7 @@ import {
   createFastCanvasSession,
   createPlanSession,
 } from "./index";
+import * as planner from "./index";
 
 describe("canvas session factory", () => {
   it("creates a fast session with a Hermes-orchestrated canvas graph", () => {
@@ -103,11 +104,68 @@ describe("canvas session factory", () => {
       projectId: "project-1",
       goal: "Design a task workflow",
       createdAt: "2026-06-10T00:00:00.000Z",
-    });
+    }, { randomUUID: () => "11111111-1111-4111-8111-111111111111" });
 
     expect(session.kind).toBe("plan");
-    expect(session.plan.requirements).toContain("## Requirements");
+    expect(session.plan).toEqual({ requirements: "", design: "", tasks: "" });
+    expect(session.activeStage).toBe("requirements");
+    expect(session.plannerConversationId).toBe(
+      "hermes-plan-plan-202606100000-11111111-1111-4111-8111-111111111111",
+    );
+    expect(session.conversationStarted).toBe(false);
+    expect(session.stages).toEqual({
+      requirements: {
+        status: "pending",
+        accepted: false,
+        draft: "",
+        error: null,
+        runId: null,
+        lastRunId: null,
+        operation: null,
+        checkpoints: [],
+      },
+      design: {
+        status: "pending",
+        accepted: false,
+        draft: "",
+        error: null,
+        runId: null,
+        lastRunId: null,
+        operation: null,
+        checkpoints: [],
+      },
+      tasks: {
+        status: "pending",
+        accepted: false,
+        draft: "",
+        error: null,
+        runId: null,
+        lastRunId: null,
+        operation: null,
+        checkpoints: [],
+      },
+    });
     expect(session.nodes).toHaveLength(0);
+  });
+
+  it("creates distinct Plan identities for the same creation timestamp", () => {
+    const createdAt = "2026-06-10T00:00:00.000Z";
+    const ids = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+    ];
+
+    const first = createPlanSession({ projectId: "project-1", goal: "First", createdAt }, {
+      randomUUID: () => ids.shift()!,
+    });
+    const second = createPlanSession({ projectId: "project-1", goal: "Second", createdAt }, {
+      randomUUID: () => ids.shift()!,
+    });
+
+    expect(first.id).not.toBe(second.id);
+    expect(first.id).toBe("plan-202606100000-11111111-1111-4111-8111-111111111111");
+    expect(second.id).toBe("plan-202606100000-22222222-2222-4222-8222-222222222222");
+    expect(first.plannerConversationId).not.toBe(second.plannerConversationId);
   });
 
   it("converts plan tasks into compact canvas nodes with dependencies", () => {
@@ -115,13 +173,15 @@ describe("canvas session factory", () => {
       projectId: "project-1",
       goal: "Plan then execute",
       createdAt: "2026-06-10T00:00:00.000Z",
-    });
+    }, { randomUUID: () => "11111111-1111-4111-8111-111111111111" });
 
     const canvas = convertPlanToCanvas(plan);
 
     expect(canvas.kind).toBe("canvas");
     expect(canvas.mode).toBe("plan");
-    expect(canvas.hermesPlannerSessionId).toBe("hermes-planner-plan-202606100000");
+    expect(canvas.hermesPlannerSessionId).toBe(
+      "hermes-planner-plan-202606100000-11111111-1111-4111-8111-111111111111",
+    );
     expect(canvas.plannerNodeId).toBe("node-1");
     expect(canvas.nodes.map((node) => node.title)).toEqual([
       "Confirm requirements",
@@ -156,5 +216,45 @@ describe("canvas session factory", () => {
     expect(canvas.nodes[1]?.context.relatedRequirements).toContain("Edited requirement");
     expect(canvas.nodes[1]?.context.relatedDesign).toContain("Edited design");
     expect(canvas.nodes[1]?.context.relatedTasks).toContain("Edited task");
+  });
+
+  it("formats the exact approved Plan as deterministic authoritative workflow input", () => {
+    const format = Reflect.get(planner, "formatApprovedPlanWorkflowInput") as undefined | ((session: unknown) => string);
+    expect(format).toBeTypeOf("function");
+    if (!format) return;
+    const session = createPlanSession({
+      projectId: "project-1",
+      goal: "Original goal, unchanged.",
+      createdAt: "2026-07-17T00:00:00.000Z",
+    }, { randomUUID: () => "11111111-1111-4111-8111-111111111111" });
+    const approved = {
+      ...session,
+      plan: {
+        requirements: "# Requirements\n\nExact requirement bytes.",
+        design: "# Design\n\nExact design bytes.",
+        tasks: "# Tasks\n\n- [ ] Exact task bytes.",
+      },
+      stages: {
+        requirements: { ...session.stages.requirements, status: "ready" as const, accepted: true },
+        design: { ...session.stages.design, status: "ready" as const, accepted: true },
+        tasks: { ...session.stages.tasks, status: "ready" as const, accepted: true },
+      },
+    };
+
+    expect(format(approved)).toBe([
+      "# Approved Plan",
+      "",
+      "## Goal",
+      "Original goal, unchanged.",
+      "",
+      "## Requirements",
+      "# Requirements\n\nExact requirement bytes.",
+      "",
+      "## Design",
+      "# Design\n\nExact design bytes.",
+      "",
+      "## Tasks",
+      "# Tasks\n\n- [ ] Exact task bytes.",
+    ].join("\n"));
   });
 });

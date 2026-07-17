@@ -84,6 +84,8 @@ export type WorkflowAuditEventKind =
   | "workflow.run.start_reconciliation_failed"
   | "workflow.node.checkpoint_failed";
 
+export type WorkflowInternalEventKind = "workflow.user_input.delivered";
+
 export type WorkflowEventKind =
   | "user_input"
   | "hermes_session_started"
@@ -109,6 +111,7 @@ export type WorkflowEventKind =
   | "continuation_requested"
   | "lane_status_changed"
   | WorkflowAuditEventKind
+  | WorkflowInternalEventKind
   | FlowEventKind;
 
 export interface WorkflowCardCreateInput {
@@ -308,6 +311,18 @@ export interface AppendUserInput {
   sessionId: string;
   inputId: string;
   text: string;
+  now: string;
+}
+
+export interface ClaimUserInputResult {
+  event: WorkflowEventRecord;
+  created: boolean;
+  ownsDelivery: boolean;
+}
+
+export interface RecordUserInputDeliveredInput {
+  sessionId: string;
+  inputId: string;
   now: string;
 }
 
@@ -885,14 +900,78 @@ export class WorkflowStore {
   }
 
   appendUserInput(input: AppendUserInput): WorkflowEventRecord {
-    return this.appendWorkflowEvent({
+    return this.claimUserInput(input).event;
+  }
+
+  claimUserInput(input: AppendUserInput): ClaimUserInputResult {
+    const safeInput: AppendWorkflowEventInput = {
       sessionId: input.sessionId,
       kind: "workflow.user_input",
       source: "user",
       idempotencyKey: `user-input:${input.inputId}`,
       payload: { inputId: input.inputId, text: input.text },
       now: input.now,
+    };
+    const tx = this.db.transaction(() => {
+      const existing = this.getEventByIdempotencyKey(input.sessionId, safeInput.idempotencyKey!);
+      let event: WorkflowEventRecord;
+      let created: boolean;
+      if (existing) {
+        if (
+          existing.kind !== safeInput.kind ||
+          existing.source !== safeInput.source ||
+          existing.sessionId !== safeInput.sessionId ||
+          existing.idempotencyKey !== safeInput.idempotencyKey ||
+          stableJson(existing.payload) !== stableJson(safeInput.payload)
+        ) {
+          throw new Error(`Workflow user input id was already used with different input: ${input.inputId}.`);
+        }
+        event = existing;
+        created = false;
+      } else {
+        event = this.insertEventInTransaction(safeInput);
+        this.projectEventInTransaction(event);
+        created = true;
+      }
+      const delivered = this.getEventByIdempotencyKey(
+        input.sessionId,
+        userInputDeliveredIdempotencyKey(input.inputId),
+      );
+      if (delivered) assertMatchingUserInputDeliveredEvent(delivered, event, input.inputId);
+      return { event, created, ownsDelivery: !delivered };
     });
+    return tx();
+  }
+
+  recordUserInputDelivered(input: RecordUserInputDeliveredInput): WorkflowEventRecord {
+    const inputIdempotencyKey = `user-input:${input.inputId}`;
+    const deliveredIdempotencyKey = userInputDeliveredIdempotencyKey(input.inputId);
+    const tx = this.db.transaction(() => {
+      const userInput = this.getEventByIdempotencyKey(input.sessionId, inputIdempotencyKey);
+      if (
+        !userInput ||
+        userInput.kind !== "workflow.user_input" ||
+        userInput.source !== "user" ||
+        userInput.payload.inputId !== input.inputId
+      ) {
+        throw new Error(`Workflow user input is not pending delivery: ${input.inputId}.`);
+      }
+      const existing = this.getEventByIdempotencyKey(input.sessionId, deliveredIdempotencyKey);
+      if (existing) {
+        assertMatchingUserInputDeliveredEvent(existing, userInput, input.inputId);
+        return existing;
+      }
+      return this.insertEventInTransaction({
+        sessionId: input.sessionId,
+        kind: "workflow.user_input.delivered",
+        source: "workflow_store",
+        causationId: userInput.id,
+        idempotencyKey: deliveredIdempotencyKey,
+        payload: { inputId: input.inputId },
+        now: input.now,
+      });
+    });
+    return tx();
   }
 
   recordCanvasNodePosition(input: RecordCanvasNodePositionInput): WorkflowEventRecord {
@@ -2786,7 +2865,9 @@ class LedgerSanitizer {
   }
 
   build(events: WorkflowEventRecord[]): WorkflowLedgerSummary {
-    const workflowEvents = events.filter((event) => event.kind.startsWith("workflow."));
+    const workflowEvents = events.filter((event) =>
+      event.kind.startsWith("workflow.") && !isWorkflowInternalEventKind(event.kind)
+    );
     const facts: string[] = [];
     const requestedQuestions = new Map<string, string>();
     const answeredQuestions = new Set<string>();
@@ -4600,13 +4681,40 @@ function workflowIntentId(intent: unknown): string {
 }
 
 function isFlowEventKind(kind: WorkflowEventKind): kind is FlowEventKind {
-  return kind.startsWith("workflow.") && !isWorkflowAuditEventKind(kind);
+  return kind.startsWith("workflow.") &&
+    !isWorkflowAuditEventKind(kind) &&
+    !isWorkflowInternalEventKind(kind);
 }
 
 function isWorkflowAuditEventKind(kind: WorkflowEventKind): kind is WorkflowAuditEventKind {
   return kind === "workflow.run.recovery_failed" ||
     kind === "workflow.run.start_reconciliation_failed" ||
     kind === "workflow.node.checkpoint_failed";
+}
+
+function isWorkflowInternalEventKind(kind: WorkflowEventKind): kind is WorkflowInternalEventKind {
+  return kind === "workflow.user_input.delivered";
+}
+
+function userInputDeliveredIdempotencyKey(inputId: string): string {
+  return `user-input-delivered:${inputId}`;
+}
+
+function assertMatchingUserInputDeliveredEvent(
+  delivered: WorkflowEventRecord,
+  pending: WorkflowEventRecord,
+  inputId: string,
+): void {
+  if (
+    delivered.sessionId !== pending.sessionId ||
+    delivered.idempotencyKey !== userInputDeliveredIdempotencyKey(inputId) ||
+    delivered.kind !== "workflow.user_input.delivered" ||
+    delivered.source !== "workflow_store" ||
+    delivered.causationId !== pending.id ||
+    stableJson(delivered.payload) !== stableJson({ inputId })
+  ) {
+    throw new Error(`Workflow user input delivery id conflicts with existing state: ${inputId}.`);
+  }
 }
 
 function mapLane(row: LaneRow): WorkflowLaneRecord {

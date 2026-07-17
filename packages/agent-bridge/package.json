@@ -26,6 +26,7 @@
     "test": "pnpm run native:build && vitest run src"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "1.2.1",
     "@skyturn/agent-runtime": "workspace:*",
     "@skyturn/project-core": "workspace:*",
     "@skyturn/workflow-kernel": "workspace:*"

@@ -1,11 +1,13 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { WorktreeComparisonRequest } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
 import type {
+  PlanApi,
   WorkflowApi,
   WorkflowLaneReassignRequest,
   WorkflowLaneReassignResult,
   WorkflowNodePositionUpdateRequest,
 } from "@skyturn/persistence" with { "resolution-mode": "import" };
+import type { PlanEvent } from "@skyturn/project-core" with { "resolution-mode": "import" };
 import type {
   TerminalActionResult,
   TerminalCancelInput,
@@ -36,6 +38,17 @@ const terminal = {
     return () => ipcRenderer.removeListener("terminal:event", handler);
   },
 };
+
+const plan = {
+  generate: (input) => ipcRenderer.invoke("plan:generate", input),
+  revise: (input) => ipcRenderer.invoke("plan:revise", input),
+  updateStage: (input) => ipcRenderer.invoke("plan:updateStage", input),
+  acceptStage: (input) => ipcRenderer.invoke("plan:acceptStage", input),
+  undoStage: (input) => ipcRenderer.invoke("plan:undoStage", input),
+  cancel: (input) => ipcRenderer.invoke("plan:cancel", input),
+  bootstrap: (input) => ipcRenderer.invoke("plan:bootstrap", input),
+  getState: (input) => ipcRenderer.invoke("plan:getState", input),
+} satisfies PlanApi;
 
 const reassignWorkflowLane = (
   projectRoot: string,
@@ -136,6 +149,7 @@ contextBridge.exposeInMainWorld("devflow", {
   syncWorkflowMain: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:syncMain", projectRoot, input),
   workflow,
   terminal,
+  plan,
   onRunEvent: (listener: (event: unknown) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value);
     ipcRenderer.on("run:event", handler);
@@ -145,5 +159,10 @@ contextBridge.exposeInMainWorld("devflow", {
     const handler = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value);
     ipcRenderer.on("workflow:event", handler);
     return () => ipcRenderer.removeListener("workflow:event", handler);
+  },
+  onPlanEvent: (listener: (event: PlanEvent) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, value: PlanEvent) => listener(value);
+    ipcRenderer.on("plan:event", handler);
+    return () => ipcRenderer.removeListener("plan:event", handler);
   },
 });

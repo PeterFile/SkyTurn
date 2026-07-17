@@ -1,5 +1,8 @@
 export type WorkflowMode = "fast" | "plan";
 export type SessionKind = "plan" | "canvas";
+export type PlanStage = "requirements" | "design" | "tasks";
+export type PlanStageStatus = "pending" | "generating" | "ready" | "revising" | "failed";
+export type PlanOperation = "generate" | "revise";
 export type AgentKind = "hermes" | "codex" | "agy" | "gemini" | "claude-code" | "openclaw";
 export type NodeStatus = "pending" | "running" | "retrying" | "completed" | "failed";
 export type NodeRollbackStatus = "rolled_back" | "inactive" | "rejected";
@@ -1090,6 +1093,7 @@ export interface ImportedProject {
   id: string;
   name: string;
   rootPath: string;
+  canonicalRootPath?: string;
   devflowPath: string;
   openedAt: string;
 }
@@ -1099,6 +1103,484 @@ export interface PlanMarkdown {
   design: string;
   tasks: string;
 }
+
+export interface PlanAcceptedState {
+  requirements: boolean;
+  design: boolean;
+  tasks: boolean;
+}
+
+export const PLAN_CHECKPOINT_LIMIT = 20;
+export const PLAN_MARKDOWN_MAX_LENGTH = 2_000_000;
+
+export interface PlanCheckpointState {
+  requirements: string[];
+  design: string[];
+  tasks: string[];
+}
+
+export interface PlanStateSnapshot {
+  version: number;
+  plan: PlanMarkdown;
+  accepted: PlanAcceptedState;
+  checkpoints: PlanCheckpointState;
+}
+
+export function emptyPlanStateSnapshot(): PlanStateSnapshot {
+  return {
+    version: 0,
+    plan: { requirements: "", design: "", tasks: "" },
+    accepted: { requirements: false, design: false, tasks: false },
+    checkpoints: emptyPlanCheckpointState(),
+  };
+}
+
+export function parsePlanStateSnapshot(value: unknown): PlanStateSnapshot {
+  if (!hasExactKeys(value, ["version", "plan", "accepted", "checkpoints"])) {
+    throw new Error("Plan state snapshot is invalid.");
+  }
+  const version = value.version;
+  if (!Number.isSafeInteger(version) || (version as number) < 0) {
+    throw new Error("Plan state snapshot is invalid.");
+  }
+  const plan = parsePlanMarkdown(value.plan);
+  const accepted = parsePlanAcceptedState(value.accepted);
+  try {
+    const checkpoints = parsePlanCheckpointState(value.checkpoints);
+    const requirementsReady = accepted.requirements && !!plan.requirements.trim();
+    const designReady = accepted.design && !!plan.design.trim();
+    const materialDesign = accepted.design || checkpoints.design.length > 0;
+    const materialTasks = accepted.tasks || checkpoints.tasks.length > 0;
+    if (
+      planStages.some((stage) => accepted[stage] && !plan[stage].trim()) ||
+      (materialDesign && !requirementsReady) ||
+      (materialTasks && (!requirementsReady || !designReady))
+    ) {
+      throw new Error("invalid");
+    }
+    return {
+      version: version as number,
+      plan,
+      accepted,
+      checkpoints,
+    };
+  } catch {
+    throw new Error("Plan state snapshot is invalid.");
+  }
+}
+
+export interface ParsedPlanBootstrapSession {
+  schemaVersion: 0 | 1;
+  snapshot: PlanStateSnapshot;
+}
+
+const legacyPlanSessionKeys = [
+  "id",
+  "projectId",
+  "title",
+  "goal",
+  "mode",
+  "kind",
+  "target",
+  "createdAt",
+  "updatedAt",
+  "plan",
+  "nodes",
+  "edges",
+  "activeNodeId",
+] as const;
+const currentPlanSessionKeys = [
+  ...legacyPlanSessionKeys,
+  "stateVersion",
+  "activeStage",
+  "plannerConversationId",
+  "conversationStarted",
+  "stages",
+] as const;
+const planStageStateKeys = [
+  "status",
+  "accepted",
+  "draft",
+  "error",
+  "runId",
+  "lastRunId",
+  "operation",
+  "checkpoints",
+] as const;
+
+export function parsePlanBootstrapSession(value: unknown): ParsedPlanBootstrapSession {
+  try {
+    assertPlanBootstrapSessionBase(value);
+    const session = value as Record<string, unknown>;
+    const plan = parsePlanMarkdown(session.plan);
+    if (hasExactKeys(value, legacyPlanSessionKeys)) {
+      return {
+        schemaVersion: 0,
+        snapshot: parsePlanStateSnapshot({
+          version: 0,
+          plan,
+          accepted: { requirements: false, design: false, tasks: false },
+          checkpoints: emptyPlanCheckpointState(),
+        }),
+      };
+    }
+    if (!hasExactKeys(value, currentPlanSessionKeys)) throw new Error("invalid");
+    if (
+      !Number.isSafeInteger(session.stateVersion) ||
+      (session.stateVersion as number) < 0 ||
+      !isPlanBootstrapStage(session.activeStage) ||
+      typeof session.plannerConversationId !== "string" ||
+      session.plannerConversationId !== makeHermesPlanConversationId(session.id as string) ||
+      typeof session.conversationStarted !== "boolean" ||
+      !hasExactKeys(session.stages, planStages)
+    ) {
+      throw new Error("invalid");
+    }
+    const stages = session.stages as Record<PlanStage, unknown>;
+    const parsedStages = Object.fromEntries(planStages.map((stage) => [
+      stage,
+      parsePlanBootstrapStage(stages[stage], plan[stage]),
+    ])) as Record<PlanStage, { accepted: boolean; checkpoints: string[] }>;
+    return {
+      schemaVersion: 1,
+      snapshot: parsePlanStateSnapshot({
+        version: session.stateVersion,
+        plan,
+        accepted: {
+          requirements: parsedStages.requirements.accepted,
+          design: parsedStages.design.accepted,
+          tasks: parsedStages.tasks.accepted,
+        },
+        checkpoints: {
+          requirements: parsedStages.requirements.checkpoints,
+          design: parsedStages.design.checkpoints,
+          tasks: parsedStages.tasks.checkpoints,
+        },
+      }),
+    };
+  } catch {
+    throw new Error("Plan bootstrap session is invalid.");
+  }
+}
+
+export function derivePlanBootstrapSnapshot(session: PlanSession): PlanStateSnapshot {
+  try {
+    return parsePlanBootstrapSession(session).snapshot;
+  } catch {
+    throw new Error("Plan state snapshot is invalid.");
+  }
+}
+
+function assertPlanBootstrapSessionBase(value: unknown): asserts value is Record<string, unknown> {
+  if (!isRecord(value)) throw new Error("invalid");
+  if (
+    typeof value.id !== "string" ||
+    !value.id.trim() ||
+    value.id !== value.id.trim() ||
+    typeof value.projectId !== "string" ||
+    !value.projectId.trim() ||
+    value.projectId !== value.projectId.trim() ||
+    typeof value.title !== "string" ||
+    typeof value.goal !== "string" ||
+    value.mode !== "plan" ||
+    value.kind !== "plan" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.updatedAt !== "string" ||
+    !Array.isArray(value.nodes) ||
+    value.nodes.length !== 0 ||
+    !Array.isArray(value.edges) ||
+    value.edges.length !== 0 ||
+    value.activeNodeId !== null
+  ) {
+    throw new Error("invalid");
+  }
+  assertPlanBootstrapTarget(value.target);
+}
+
+function assertPlanBootstrapTarget(value: unknown): void {
+  if (!isRecord(value)) throw new Error("invalid");
+  const selectedBranch = value.selectedBranch;
+  if (
+    typeof selectedBranch !== "string" ||
+    !selectedBranch.trim() ||
+    selectedBranch !== selectedBranch.trim() ||
+    selectedBranch.length > 4_096
+  ) {
+    throw new Error("invalid");
+  }
+  if (value.executionTarget === "current_branch") {
+    if (!hasExactKeys(value, ["executionTarget", "selectedBranch"])) throw new Error("invalid");
+    return;
+  }
+  if (
+    value.executionTarget !== "new_worktree" ||
+    !hasExactKeys(value, ["executionTarget", "selectedBranch", "baseRef"]) ||
+    typeof value.baseRef !== "string" ||
+    !value.baseRef.trim() ||
+    value.baseRef !== value.baseRef.trim() ||
+    value.baseRef.length > 4_096
+  ) {
+    throw new Error("invalid");
+  }
+}
+
+function parsePlanBootstrapStage(
+  value: unknown,
+  markdown: string,
+): { accepted: boolean; checkpoints: string[] } {
+  if (!hasExactKeys(value, planStageStateKeys)) throw new Error("invalid");
+  const stage = value as Record<string, unknown>;
+  if (
+    !isPlanStageStatus(stage.status) ||
+    typeof stage.accepted !== "boolean" ||
+    typeof stage.draft !== "string" ||
+    stage.draft.length > PLAN_MARKDOWN_MAX_LENGTH ||
+    !isNullableBoundedPlanRuntimeText(stage.error) ||
+    !isNullableBoundedPlanRuntimeText(stage.runId) ||
+    !isNullableBoundedPlanRuntimeText(stage.lastRunId) ||
+    !isNullablePlanOperation(stage.operation)
+  ) {
+    throw new Error("invalid");
+  }
+  const checkpoints = parsePlanCheckpointArray(stage.checkpoints);
+  const hasMarkdown = !!markdown.trim();
+  const idle = stage.status === "pending" || stage.status === "ready" || stage.status === "failed";
+  if (idle && (stage.runId !== null || stage.draft !== "")) throw new Error("invalid");
+  if (stage.status === "pending" && (
+    hasMarkdown || stage.accepted || stage.error !== null || stage.operation !== null
+  )) {
+    throw new Error("invalid");
+  }
+  if (stage.status === "ready" && (
+    !hasMarkdown || stage.error !== null || stage.operation !== null
+  )) {
+    throw new Error("invalid");
+  }
+  if (stage.status === "failed" && (
+    typeof stage.error !== "string" ||
+    !stage.error.trim() ||
+    stage.operation === null ||
+    (stage.accepted && (stage.operation !== "revise" || !hasMarkdown))
+  )) {
+    throw new Error("invalid");
+  }
+  if (stage.status === "generating" && (
+    stage.accepted || stage.error !== null || stage.operation !== "generate" || stage.runId === null
+  )) {
+    throw new Error("invalid");
+  }
+  if (stage.status === "revising" && (
+    !hasMarkdown || stage.accepted || stage.error !== null || stage.operation !== "revise" || stage.runId === null
+  )) {
+    throw new Error("invalid");
+  }
+  return { accepted: stage.accepted as boolean, checkpoints };
+}
+
+function isPlanStageStatus(value: unknown): value is PlanStageStatus {
+  return value === "pending" || value === "generating" || value === "ready" || value === "revising" || value === "failed";
+}
+
+function isPlanBootstrapStage(value: unknown): value is PlanStage {
+  return value === "requirements" || value === "design" || value === "tasks";
+}
+
+function isNullablePlanOperation(value: unknown): value is PlanOperation | null {
+  return value === null || value === "generate" || value === "revise";
+}
+
+function isNullableBoundedPlanRuntimeText(value: unknown): value is string | null {
+  return value === null || (
+    typeof value === "string" &&
+    !!value.trim() &&
+    value === value.trim() &&
+    value.length <= 4_096
+  );
+}
+
+function parsePlanMarkdown(value: unknown): PlanMarkdown {
+  if (!hasExactKeys(value, planStages)) throw new Error("Plan state snapshot is invalid.");
+  const markdown = value as Record<PlanStage, unknown>;
+  if (planStages.some((stage) => (
+    typeof markdown[stage] !== "string" || markdown[stage].length > PLAN_MARKDOWN_MAX_LENGTH
+  ))) {
+    throw new Error("Plan state snapshot is invalid.");
+  }
+  return {
+    requirements: markdown.requirements as string,
+    design: markdown.design as string,
+    tasks: markdown.tasks as string,
+  };
+}
+
+function parsePlanAcceptedState(value: unknown): PlanAcceptedState {
+  if (!hasExactKeys(value, planStages)) throw new Error("Plan state snapshot is invalid.");
+  const accepted = value as Record<PlanStage, unknown>;
+  if (planStages.some((stage) => typeof accepted[stage] !== "boolean")) {
+    throw new Error("Plan state snapshot is invalid.");
+  }
+  return {
+    requirements: accepted.requirements as boolean,
+    design: accepted.design as boolean,
+    tasks: accepted.tasks as boolean,
+  };
+}
+
+const planStages: PlanStage[] = ["requirements", "design", "tasks"];
+
+function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && actual.every((key) => keys.includes(key));
+}
+
+export function emptyPlanCheckpointState(): PlanCheckpointState {
+  return { requirements: [], design: [], tasks: [] };
+}
+
+export function parsePlanCheckpointState(value: unknown): PlanCheckpointState {
+  if (!isRecord(value) || Object.keys(value).some((key) => !isPlanCheckpointStage(key))) {
+    throw new Error("Plan checkpoint state is invalid.");
+  }
+  return {
+    requirements: parsePlanCheckpointArray(value.requirements),
+    design: parsePlanCheckpointArray(value.design),
+    tasks: parsePlanCheckpointArray(value.tasks),
+  };
+}
+
+function parsePlanCheckpointArray(value: unknown): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.length > PLAN_CHECKPOINT_LIMIT ||
+    value.some((checkpoint) => (
+      typeof checkpoint !== "string" ||
+      !checkpoint.trim() ||
+      checkpoint.length > PLAN_MARKDOWN_MAX_LENGTH
+    ))
+  ) {
+    throw new Error("Plan checkpoint state is invalid.");
+  }
+  return [...value];
+}
+
+function isPlanCheckpointStage(value: string): value is PlanStage {
+  return value === "requirements" || value === "design" || value === "tasks";
+}
+
+export interface PlanStageState {
+  status: PlanStageStatus;
+  accepted: boolean;
+  draft: string;
+  error: string | null;
+  runId: string | null;
+  lastRunId: string | null;
+  operation: PlanOperation | null;
+  checkpoints: string[];
+}
+
+export type PlanStageStates = Record<PlanStage, PlanStageState>;
+
+interface PlanRunRequestBase {
+  planSessionId: string;
+  projectRoot: string;
+  stage: PlanStage;
+  goal: string;
+  expectedStateVersion: number;
+}
+
+export interface PlanGenerateRequest extends PlanRunRequestBase {
+  operation: "generate";
+}
+
+export interface PlanReviseRequest extends PlanRunRequestBase {
+  operation: "revise";
+  instruction: string;
+}
+
+export type PlanRunRequest = PlanGenerateRequest | PlanReviseRequest;
+
+export interface PlanCancelRequest {
+  planSessionId: string;
+  projectRoot: string;
+  runId: string;
+}
+
+export interface PlanGetStateRequest {
+  planSessionId: string;
+  projectRoot: string;
+}
+
+export type PlanBootstrapRequest = PlanGetStateRequest;
+
+interface PlanStageMutationRequestBase {
+  planSessionId: string;
+  projectRoot: string;
+  stage: PlanStage;
+  expectedStateVersion: number;
+}
+
+export interface PlanUpdateStageRequest extends PlanStageMutationRequestBase {
+  markdown: string;
+}
+
+export type PlanAcceptStageRequest = PlanStageMutationRequestBase;
+export type PlanUndoStageRequest = PlanStageMutationRequestBase;
+
+export interface PlanStateTransitionResult {
+  protocolVersion: 1;
+  snapshot: PlanStateSnapshot;
+}
+
+export interface PlanRunStartResult {
+  protocolVersion: 1;
+  planSessionId: string;
+  runId: string;
+  stage: PlanStage;
+  operation: PlanOperation;
+  duplicate: boolean;
+}
+
+export interface PlanRuntimeStateResult {
+  protocolVersion: 1;
+  needsBootstrap: boolean;
+  snapshot: PlanStateSnapshot;
+  active: {
+    planSessionId: string;
+    runId: string;
+    stage: PlanStage;
+    operation: PlanOperation;
+    conversationReady: boolean;
+    draft: string;
+    checkpoints: PlanCheckpointState;
+  } | null;
+  terminal: Extract<PlanEvent, { kind: "completed" | "failed" }> | null;
+}
+
+interface PlanEventBase {
+  protocolVersion: 1;
+  planSessionId: string;
+  runId: string;
+  stage: PlanStage;
+  operation: PlanOperation;
+}
+
+export type PlanEvent =
+  | (PlanEventBase & { kind: "started" })
+  | (PlanEventBase & { kind: "conversation_ready" })
+  | (PlanEventBase & { kind: "delta"; text: string })
+  | (PlanEventBase & {
+      kind: "completed";
+      markdown: string;
+      checkpoints: PlanCheckpointState;
+      snapshot: PlanStateSnapshot;
+    })
+  | (PlanEventBase & {
+      kind: "failed";
+      error: string;
+      checkpoints: PlanCheckpointState;
+      snapshot: PlanStateSnapshot;
+    });
 
 export interface SessionTarget {
   executionTarget: SessionExecutionTarget;
@@ -1601,6 +2083,11 @@ export interface PlanSession extends SessionBase {
   kind: "plan";
   mode: "plan";
   plan: PlanMarkdown;
+  stateVersion: number;
+  activeStage: PlanStage;
+  plannerConversationId: string;
+  conversationStarted: boolean;
+  stages: PlanStageStates;
   nodes: [];
   edges: [];
   activeNodeId: null;
@@ -1870,6 +2357,10 @@ export function canUsePtyInteractiveTransport(
 
 export function makeHermesPlannerSessionId(sessionId: string): string {
   return `hermes-planner-${sessionId}`;
+}
+
+export function makeHermesPlanConversationId(sessionId: string): string {
+  return `hermes-plan-${sessionId}`;
 }
 
 export function normalizeSessionTarget(value: unknown, fallbackSelectedBranch = "HEAD"): SessionTarget {

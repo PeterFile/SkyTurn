@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -9,7 +10,14 @@ import {
   DEVFLOW_FILES,
   defaultDevflowFileContent,
 } from "@skyturn/project-memory";
-import type { AgentDescriptor, WorkflowWorktreeIdentity } from "@skyturn/project-core" with { "resolution-mode": "import" };
+import type {
+  AgentDescriptor,
+  PlanBootstrapRequest,
+  PlanCancelRequest,
+  PlanEvent,
+  PlanStateSnapshot,
+  WorkflowWorktreeIdentity,
+} from "@skyturn/project-core" with { "resolution-mode": "import" };
 import {
   authorizeRunStartExpectedArtifacts,
   isTrustedPlannerRootStartInput,
@@ -25,6 +33,18 @@ import { createTerminalRuntime } from "./terminalRuntime";
 import { compensateFailedWorkflowRun, recoverTerminalWorkflowRuns } from "./workflowRunRecovery";
 import { createRunStartHandler, type TrustedRunStartIdentity } from "./runStartHandler";
 import { resolveCurrentBranchRunBaseline } from "./workflowCheckpointRuntime";
+import {
+  parsePlanBootstrapRequest,
+  parsePlanCancelRequest,
+  parsePlanAcceptStageRequest,
+  parsePlanGenerateRequest,
+  parsePlanGetStateRequest,
+  parsePlanReviseRequest,
+  parsePlanUndoStageRequest,
+  parsePlanUpdateStageRequest,
+} from "./planIpcContracts";
+import { createPlanRuntime } from "./planRuntime";
+import { createPlanProjectIdentityRegistry } from "./planProjectIdentity";
 import {
   normalizeTerminalIpcError,
   terminalCancelInputError,
@@ -51,6 +71,7 @@ interface OpenProjectResult {
   project?: {
     name: string;
     rootPath: string;
+    canonicalRootPath: string;
     devflowPath: string;
   };
 }
@@ -494,14 +515,69 @@ interface ManagedRollbackWorktree {
   branchName?: string;
 }
 
+interface WorkspaceSaveRequest {
+  generation: number;
+  state: unknown;
+  resolve: (value: { ok: true }) => void;
+  reject: (error: unknown) => void;
+}
+
+interface AuthorizedWorkspaceSave extends WorkspaceSaveRequest {
+  safeState: unknown;
+}
+
+interface WorkspacePlanBootstrapSource {
+  request: PlanBootstrapRequest;
+  snapshot: PlanStateSnapshot;
+}
+
+interface PersistedWorkspaceProject extends Record<string, unknown> {
+  id: string;
+  name: string;
+  rootPath: string;
+  devflowPath: string;
+  openedAt: string;
+  canonicalRootPath?: string;
+}
+
+interface WorkspaceProjectRootDiscovery {
+  project: PersistedWorkspaceProject;
+  canonicalRootPath: string;
+}
+
+interface ValidatedWorkspacePlan {
+  session: Record<string, unknown>;
+  snapshot: PlanStateSnapshot;
+}
+
+interface ValidatedWorkspaceCollections {
+  projects: PersistedWorkspaceProject[];
+  projectsById: Map<string, PersistedWorkspaceProject>;
+  sessions: Record<string, unknown>[];
+  plans: ValidatedWorkspacePlan[];
+}
+
 const RUN_PROTOCOL_VERSION = 1;
+const planRuntimeShutdownError = "Plan runtime is unavailable while SkyTurn is shutting down.";
+const workflowUserInputDeliveryError = "Workflow user input could not be delivered.";
+const workspaceLoadError = "Workspace could not be loaded.";
+const workspaceSaveError = "Workspace could not be saved.";
+const workspaceSaveUnavailableError = "Workspace saving is unavailable while SkyTurn is shutting down.";
+const workspaceProjectAuthorizationError = "Workspace contains a project that is not open in SkyTurn.";
 const openedProjectRoots = new Set<string>();
+const planProjectIdentities = createPlanProjectIdentityRegistry();
 let agentBridge: AgentBridgeHost | null = null;
+let appShutdownRequested = false;
+let windowCloseRecoveryState: "idle" | "failed" = "idle";
+let windowCloseRecoveryPromise: Promise<void> | null = null;
+let planRuntime: ReturnType<typeof createPlanRuntime> | null = null;
+let workflowStoresClosePromise: Promise<void> | null = null;
 const workflowStores = new Map<string, WorkflowStoreHost>();
 const workflowStoreInitializations = new Map<string, Promise<WorkflowStoreHost>>();
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
 const workflowSessionMutationLocks = new Map<string, Promise<void>>();
 let remoteSideEffectSequence = 0;
+const workspaceSaveWriter = createWorkspaceSaveWriter();
 const terminalRuntime = createTerminalRuntime({
   protocolVersion: RUN_PROTOCOL_VERSION,
   featureEnabled: terminalPtyFeatureEnabled,
@@ -532,6 +608,8 @@ interface TerminalPersistenceFailureLike {
 interface WorkflowStoreHost {
   createWorkflowSession(input: unknown): unknown;
   appendUserInput(input: unknown): unknown;
+  claimUserInput(input: unknown): { event: unknown; created: boolean; ownsDelivery: boolean };
+  recordUserInputDelivered(input: unknown): unknown;
   buildLedgerSummary(sessionId: string): unknown;
   appendWorkflowEvent(input: unknown): unknown;
   applyWorkflowIntent(intent: unknown, now: string): unknown;
@@ -579,6 +657,9 @@ interface WorkflowStoreHost {
 }
 
 async function createMainWindow(): Promise<void> {
+  const closeBarrier = workflowStoresClosePromise;
+  if (closeBarrier) await closeBarrier;
+  if (appShutdownRequested || BrowserWindow.getAllWindows().length > 0) return;
   const mainWindow = new BrowserWindow({
     width: 1320,
     height: 860,
@@ -612,12 +693,14 @@ ipcMain.handle("project:open", async (): Promise<OpenProjectResult> => {
   }
 
   const rootPath = result.filePaths[0];
+  const canonicalRootPath = await planProjectIdentities.remember(rootPath);
   openedProjectRoots.add(rootPath);
   return {
     canceled: false,
     project: {
       name: path.basename(rootPath),
       rootPath,
+      canonicalRootPath,
       devflowPath: path.join(rootPath, ".devflow"),
     },
   };
@@ -806,6 +889,62 @@ ipcMain.handle("terminal:snapshot", terminalHandler(async (input: unknown): Prom
   return terminalRuntime.snapshot(normalized);
 }));
 
+ipcMain.handle("plan:generate", async (_event, input: unknown) => {
+  const request = parsePlanGenerateRequest(input);
+  assertKnownProjectRoot(request.projectRoot);
+  return getPlanRuntime().generate(await canonicalizePlanRequest(request));
+});
+
+ipcMain.handle("plan:revise", async (_event, input: unknown) => {
+  const request = parsePlanReviseRequest(input);
+  assertKnownProjectRoot(request.projectRoot);
+  return getPlanRuntime().revise(await canonicalizePlanRequest(request));
+});
+
+ipcMain.handle("plan:updateStage", async (_event, input: unknown) => {
+  const request = parsePlanUpdateStageRequest(input);
+  assertKnownProjectRoot(request.projectRoot);
+  return getPlanRuntime().updateStage(await canonicalizePlanRequest(request));
+});
+
+ipcMain.handle("plan:acceptStage", async (_event, input: unknown) => {
+  const request = parsePlanAcceptStageRequest(input);
+  assertKnownProjectRoot(request.projectRoot);
+  return getPlanRuntime().acceptStage(await canonicalizePlanRequest(request));
+});
+
+ipcMain.handle("plan:undoStage", async (_event, input: unknown) => {
+  const request = parsePlanUndoStageRequest(input);
+  assertKnownProjectRoot(request.projectRoot);
+  return getPlanRuntime().undoStage(await canonicalizePlanRequest(request));
+});
+
+ipcMain.handle("plan:cancel", async (_event, input: unknown) => {
+  const request = parsePlanCancelRequest(input);
+  assertKnownProjectRoot(request.projectRoot);
+  return getPlanRuntime().cancel(await canonicalizePlanCancelRequest(request));
+});
+
+ipcMain.handle("plan:bootstrap", async (_event, input: unknown) => {
+  const request = parsePlanBootstrapRequest(input);
+  assertKnownProjectRoot(request.projectRoot);
+  const canonicalRequest = {
+    ...request,
+    projectRoot: await planProjectIdentities.canonicalize(request.projectRoot),
+  };
+  const snapshot = await planBootstrapSnapshotFromWorkspace(canonicalRequest);
+  return ensurePlanBootstrap(canonicalRequest, snapshot);
+});
+
+ipcMain.handle("plan:getState", async (_event, input: unknown) => {
+  const request = parsePlanGetStateRequest(input);
+  assertKnownProjectRoot(request.projectRoot);
+  return getPlanRuntime().getState({
+    ...request,
+    projectRoot: await planProjectIdentities.canonicalize(request.projectRoot),
+  });
+});
+
 ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, input: WorkflowSessionCreateInput) => {
   assertKnownProjectRoot(projectRoot);
   const sessionId = assertWorkflowSessionId(input.id ?? input.sessionId);
@@ -847,23 +986,32 @@ ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, inp
 ipcMain.handle("workflow:appendUserInput", async (_event, projectRoot: string, input: WorkflowAppendUserInput) => {
   assertKnownProjectRoot(projectRoot);
   const sessionId = assertWorkflowSessionId(input.sessionId);
-  const store = await getWorkflowStore(projectRoot);
   const text = requireText(input.text, "workflow user input");
-  const event = store.appendUserInput({
-    sessionId,
-    inputId: optionalText(input.inputId) ?? optionalText(input.idempotencyKey) ?? `input-${Date.now()}`,
-    text,
-    now: optionalText(input.now) ?? new Date().toISOString(),
+  const inputId = optionalText(input.inputId) ?? optionalText(input.idempotencyKey) ?? `input-${Date.now()}`;
+  const now = optionalText(input.now) ?? new Date().toISOString();
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  return await withWorkflowSessionMutationLock(workflowProjectRoot, sessionId, async () => {
+    const store = await getWorkflowStore(projectRoot);
+    const claim = store.claimUserInput({ sessionId, inputId, text, now });
+    if (claim.ownsDelivery) {
+      let delivery: Awaited<ReturnType<typeof terminalRuntime.sendWorkflowUserInput>>;
+      try {
+        delivery = await terminalRuntime.sendWorkflowUserInput(sessionId, `${text}\n`);
+      } catch {
+        throw new Error(workflowUserInputDeliveryError);
+      }
+      if (!delivery.ok) throw new Error(workflowUserInputDeliveryError);
+      store.recordUserInputDelivered({ sessionId, inputId, now: new Date().toISOString() });
+    }
+    broadcastWorkflowProjection(projectRoot, sessionId, store);
+    return {
+      protocolVersion: RUN_PROTOCOL_VERSION,
+      event: claim.event,
+      ledger: store.buildLedgerSummary(sessionId),
+      projection: store.materializeFlowProjection(sessionId),
+      canvasSession: materializeRendererCanvasSession(store, sessionId),
+    };
   });
-  await terminalRuntime.sendWorkflowUserInput(sessionId, `${text}\n`);
-  broadcastWorkflowProjection(projectRoot, sessionId, store);
-  return {
-    protocolVersion: RUN_PROTOCOL_VERSION,
-    event,
-    ledger: store.buildLedgerSummary(sessionId),
-    projection: store.materializeFlowProjection(sessionId),
-    canvasSession: materializeRendererCanvasSession(store, sessionId),
-  };
 });
 
 ipcMain.handle("workflow:ledger", async (_event, projectRoot: string, sessionId: string) => {
@@ -1956,23 +2104,268 @@ ipcMain.handle("workspace:load", async () => {
   try {
     const value = await fs.readFile(workspaceStorePath(), "utf8");
     const state = JSON.parse(value) as unknown;
-    rememberProjectRoots(state);
-    return state;
-  } catch {
-    return null;
+    const projectRoots = await discoverWorkspaceProjectRoots(state);
+    const sources = await planBootstrapSourcesFromWorkspace(state, projectRoots);
+    for (const source of sources) {
+      await ensurePlanBootstrap(source.request, source.snapshot);
+    }
+    publishWorkspaceProjectRoots(projectRoots);
+    return sanitizeWorkspaceStateForPersistence(state);
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") return null;
+    throw new Error(workspaceLoadError);
   }
 });
 
 ipcMain.handle("workspace:save", async (_event, state: unknown) => {
-  const safeState = sanitizeWorkspaceStateForKnownProjects(state);
-  const target = workspaceStorePath();
-  await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, JSON.stringify(safeState, null, 2), "utf8");
-  return { ok: true };
+  return workspaceSaveWriter.save(state);
 });
 
 function workspaceStorePath(): string {
   return path.join(app.getPath("userData"), "workspace.json");
+}
+
+function createWorkspaceSaveWriter() {
+  let nextGeneration = 0;
+  let pending: WorkspaceSaveRequest[] = [];
+  let running: Promise<void> | null = null;
+  let retained: AuthorizedWorkspaceSave | null = null;
+  let admissionOpen = true;
+
+  const start = (): void => {
+    if (running) return;
+    running = Promise.resolve().then(async () => {
+      while (pending.length > 0) {
+        const authorized: AuthorizedWorkspaceSave[] = [];
+        do {
+          const batch = pending;
+          pending = [];
+          for (const request of batch) {
+            try {
+              authorized.push({
+                ...request,
+                safeState: await authorizeWorkspaceStateForSave(request.state),
+              });
+            } catch (error) {
+              request.reject(error);
+            }
+          }
+        } while (pending.length > 0);
+        const latest = authorized.at(-1);
+        if (!latest) continue;
+        try {
+          await writeWorkspaceStateAtomically(latest.safeState, latest.generation);
+          retained = null;
+          for (const request of authorized) request.resolve({ ok: true });
+        } catch (error) {
+          retained = latest;
+          for (const request of authorized) request.reject(error);
+        }
+      }
+    }).finally(() => {
+      running = null;
+      if (pending.length > 0) start();
+    });
+  };
+
+  return {
+    save(state: unknown): Promise<{ ok: true }> {
+      if (!admissionOpen) return Promise.reject(new Error(workspaceSaveUnavailableError));
+      const generation = ++nextGeneration;
+      return new Promise((resolve, reject) => {
+        pending.push({ generation, state, resolve, reject });
+        start();
+      });
+    },
+    closeAdmission(): void {
+      admissionOpen = false;
+    },
+    reopenAdmission(): void {
+      admissionOpen = true;
+    },
+    async drain(): Promise<void> {
+      while (running || pending.length > 0) {
+        start();
+        if (running) await running;
+      }
+      const retry = retained;
+      if (!retry) return;
+      let retryError: unknown;
+      let retryRunning: Promise<void>;
+      retryRunning = (async () => {
+        try {
+          await writeWorkspaceStateAtomically(retry.safeState, retry.generation);
+          if (retained === retry) retained = null;
+        } catch (error) {
+          retryError = error;
+        }
+      })().finally(() => {
+        if (running === retryRunning) running = null;
+        if (pending.length > 0) start();
+      });
+      running = retryRunning;
+      await retryRunning;
+      while (running || pending.length > 0) {
+        start();
+        if (running) await running;
+      }
+      if (retained) throw retryError ?? new Error("Workspace save failed.");
+    },
+  };
+}
+
+async function writeWorkspaceStateAtomically(state: unknown, generation: number): Promise<void> {
+  const target = workspaceStorePath();
+  const parent = path.dirname(target);
+  const temporary = path.join(
+    parent,
+    `workspace.json.${process.pid}.${generation}.${randomUUID()}.tmp`,
+  );
+  await fs.mkdir(parent, { recursive: true, mode: 0o700 });
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  let renamed = false;
+  try {
+    handle = await fs.open(temporary, "wx", 0o600);
+    await handle.writeFile(JSON.stringify(state, null, 2), "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.rename(temporary, target);
+    renamed = true;
+    await syncWorkspaceDirectory(parent);
+  } catch (error) {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {}
+    }
+    if (!renamed) {
+      try {
+        await fs.rm(temporary, { force: true });
+      } catch {}
+    }
+    throw error;
+  }
+}
+
+async function syncWorkspaceDirectory(parent: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const parentHandle = await fs.open(parent, "r");
+  try {
+    await parentHandle.sync();
+  } finally {
+    await parentHandle.close();
+  }
+}
+
+async function planBootstrapSnapshotFromWorkspace(
+  request: PlanBootstrapRequest,
+): Promise<PlanStateSnapshot> {
+  let workspace: unknown;
+  try {
+    workspace = JSON.parse(await fs.readFile(workspaceStorePath(), "utf8")) as unknown;
+  } catch (error) {
+    if (isRecord(error) && error.code === "ENOENT") {
+      const { emptyPlanStateSnapshot } = await import("@skyturn/project-core");
+      return emptyPlanStateSnapshot();
+    }
+    throw new Error("Plan bootstrap source is invalid.");
+  }
+  let sources: WorkspacePlanBootstrapSource[];
+  try {
+    sources = await planBootstrapSourcesFromWorkspace(workspace, undefined, request.planSessionId);
+  } catch {
+    throw new Error("Plan bootstrap source is invalid.");
+  }
+  const source = sources.find((candidate) => candidate.request.planSessionId === request.planSessionId);
+  if (!source) {
+    const { emptyPlanStateSnapshot } = await import("@skyturn/project-core");
+    return emptyPlanStateSnapshot();
+  }
+  if (source.request.projectRoot !== request.projectRoot) {
+    throw new Error("Plan bootstrap project does not match.");
+  }
+  return source.snapshot;
+}
+
+async function planBootstrapSourcesFromWorkspace(
+  workspace: unknown,
+  projectRoots?: readonly WorkspaceProjectRootDiscovery[],
+  planSessionId?: string,
+): Promise<WorkspacePlanBootstrapSource[]> {
+  const validated = await validateWorkspaceCollections(workspace, true);
+  const parsedPlans: Array<{
+    planSessionId: string;
+    project: PersistedWorkspaceProject;
+    snapshot: PlanStateSnapshot;
+  }> = [];
+  for (const { session, snapshot } of validated.plans) {
+    const project = validated.projectsById.get(session.projectId as string);
+    if (!project) throw new Error("Plan bootstrap source is invalid.");
+    parsedPlans.push({
+      planSessionId: session.id as string,
+      project,
+      snapshot,
+    });
+  }
+  const canonicalRootsByProjectId = projectRoots === undefined
+    ? null
+    : new Map(projectRoots.map(({ project, canonicalRootPath }) => [project.id, canonicalRootPath]));
+  const sources: WorkspacePlanBootstrapSource[] = [];
+  for (const parsed of parsedPlans) {
+    if (planSessionId !== undefined && parsed.planSessionId !== planSessionId) continue;
+    let projectRoot: string;
+    if (canonicalRootsByProjectId === null) {
+      projectRoot = await planProjectIdentities.canonicalize(parsed.project.rootPath);
+    } else {
+      const discoveredRoot = canonicalRootsByProjectId.get(parsed.project.id);
+      if (!discoveredRoot) continue;
+      projectRoot = discoveredRoot;
+    }
+    sources.push({
+      request: {
+        planSessionId: parsed.planSessionId,
+        projectRoot,
+      },
+      snapshot: parsed.snapshot,
+    });
+  }
+  return sources;
+}
+
+async function ensurePlanBootstrap(
+  request: PlanBootstrapRequest,
+  snapshot: PlanStateSnapshot,
+) {
+  const runtime = getPlanRuntime();
+  const state = await runtime.getState(request);
+  if (!state.needsBootstrap) return state;
+  return runtime.bootstrap(request, snapshot);
+}
+
+function getPlanRuntime(): ReturnType<typeof createPlanRuntime> {
+  if (appShutdownRequested || workflowStoresClosePromise) throw new Error(planRuntimeShutdownError);
+  if (!planRuntime) {
+    planRuntime = createPlanRuntime({
+      stateRoot: path.join(app.getPath("userData"), "plan-acp-sessions"),
+      emit: broadcastPlanEvent,
+    });
+  }
+  return planRuntime;
+}
+
+async function canonicalizePlanRequest<T extends { projectRoot: string }>(request: T): Promise<T> {
+  return {
+    ...request,
+    projectRoot: await planProjectIdentities.canonicalize(request.projectRoot),
+  };
+}
+
+async function canonicalizePlanCancelRequest(request: PlanCancelRequest): Promise<PlanCancelRequest> {
+  return {
+    ...request,
+    projectRoot: await planProjectIdentities.canonicalize(request.projectRoot),
+  };
 }
 
 async function getAgentBridge(): Promise<AgentBridgeHost> {
@@ -2225,6 +2618,15 @@ function broadcastTerminalEvent(event: TerminalRendererEvent): void {
   }
 }
 
+function broadcastPlanEvent(event: PlanEvent): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    try {
+      if (window.isDestroyed() || window.webContents.isDestroyed()) continue;
+      window.webContents.send("plan:event", event);
+    } catch {}
+  }
+}
+
 function augmentCanvasSessionWithHermesTerminal(canvasSession: unknown, terminalSessionId: string | null): unknown {
   if (!terminalSessionId || !isRecord(canvasSession) || canvasSession.kind !== "canvas") return canvasSession;
   return {
@@ -2403,7 +2805,8 @@ function dedupeStructuredRunChanges(changes: StructuredRunChange[]): StructuredR
 
 function isWorkflowEventRecord(event: unknown): event is Record<string, unknown> & { kind: string } {
   return Boolean(event) && typeof event === "object" && typeof (event as { kind?: unknown }).kind === "string" &&
-    (event as { kind: string }).kind.startsWith("workflow.");
+    (event as { kind: string }).kind.startsWith("workflow.") &&
+    (event as { kind: string }).kind !== "workflow.user_input.delivered";
 }
 
 function redactWorkflowEventForRenderer(event: Record<string, unknown> & { kind: string }): Record<string, unknown> {
@@ -3575,25 +3978,41 @@ function isPathInside(candidate: string, parent: string): boolean {
   return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-function rememberProjectRoots(state: unknown): void {
-  if (!state || typeof state !== "object") return;
-  const projects = (state as { projects?: unknown }).projects;
-  if (!Array.isArray(projects)) return;
-  for (const project of projects) {
-    const rootPath = (project as { rootPath?: unknown }).rootPath;
-    if (typeof rootPath === "string" && path.isAbsolute(rootPath)) openedProjectRoots.add(rootPath);
+async function discoverWorkspaceProjectRoots(state: unknown): Promise<WorkspaceProjectRootDiscovery[]> {
+  const validated = await validateWorkspaceCollections(state, true);
+  const discovered: WorkspaceProjectRootDiscovery[] = [];
+  // Canonical identities are a cache; openedProjectRoots remains the authorization boundary.
+  for (const project of validated.projects) {
+    const rootPath = project.rootPath;
+    const persistedCanonicalRoot = project.canonicalRootPath;
+    try {
+      const canonicalRootPath = await planProjectIdentities.remember(rootPath, persistedCanonicalRoot);
+      discovered.push({ project, canonicalRootPath });
+    } catch {}
+  }
+  return discovered;
+}
+
+function publishWorkspaceProjectRoots(projectRoots: readonly WorkspaceProjectRootDiscovery[]): void {
+  for (const { project, canonicalRootPath } of projectRoots) {
+    project.canonicalRootPath = canonicalRootPath;
+    openedProjectRoots.add(project.rootPath);
   }
 }
 
-function sanitizeWorkspaceStateForKnownProjects(state: unknown): unknown {
+function sanitizeWorkspaceStateForPersistence(state: unknown): unknown {
   if (!isRecord(state) || !Array.isArray(state.projects)) return state;
-  const projects = state.projects.filter((project) => {
-    if (!isRecord(project) || typeof project.rootPath !== "string") return false;
-    return openedProjectRoots.has(project.rootPath);
-  });
+  const projects = state.projects.filter(isPersistedWorkspaceProject);
   const projectIds = new Set(projects.map((project) => isRecord(project) ? optionalText(project.id) : null).filter(Boolean));
   const sessions = Array.isArray(state.sessions)
-    ? state.sessions.filter((session) => isRecord(session) && typeof session.projectId === "string" && projectIds.has(session.projectId))
+    ? state.sessions.filter((session) => (
+        isRecord(session) &&
+        typeof session.id === "string" &&
+        !!session.id &&
+        typeof session.projectId === "string" &&
+        projectIds.has(session.projectId) &&
+        (session.kind === "canvas" || session.kind === "plan")
+      ))
     : [];
   const activeProjectId = typeof state.activeProjectId === "string" && projectIds.has(state.activeProjectId)
     ? state.activeProjectId
@@ -3612,6 +4031,171 @@ function sanitizeWorkspaceStateForKnownProjects(state: unknown): unknown {
       ? state.collapsedProjectIds.filter((id): id is string => typeof id === "string" && projectIds.has(id))
       : [],
   };
+}
+
+async function authorizeWorkspaceStateForSave(state: unknown): Promise<unknown> {
+  try {
+    await validateWorkspaceCollections(state, false);
+    validateWorkspaceSaveEnvelope(state);
+  } catch {
+    throw new Error(workspaceSaveError);
+  }
+  const safeState = sanitizeWorkspaceStateForPersistence(state);
+  if (!isRecord(safeState) || !Array.isArray(safeState.projects)) throw new Error(workspaceSaveError);
+  const trustedIdentities = await trustedWorkspaceProjectIdentities();
+  const projects = [];
+  for (const project of safeState.projects) {
+    if (!isPersistedWorkspaceProject(project)) throw new Error(workspaceSaveError);
+    if (openedProjectRoots.has(project.rootPath)) {
+      let canonicalRootPath: string;
+      try {
+        canonicalRootPath = await planProjectIdentities.canonicalize(project.rootPath);
+      } catch {
+        throw new Error(workspaceProjectAuthorizationError);
+      }
+      if (project.canonicalRootPath !== undefined && project.canonicalRootPath !== canonicalRootPath) {
+        throw new Error(workspaceProjectAuthorizationError);
+      }
+      projects.push({ ...project, canonicalRootPath });
+      continue;
+    }
+    if (!trustedIdentities.has(workspaceProjectIdentity(project))) {
+      throw new Error(workspaceProjectAuthorizationError);
+    }
+    projects.push(project);
+  }
+  return { ...safeState, projects };
+}
+
+async function validateWorkspaceCollections(
+  state: unknown,
+  allowLegacyPlan: boolean,
+): Promise<ValidatedWorkspaceCollections> {
+  if (!isRecord(state) || !Array.isArray(state.projects) || !Array.isArray(state.sessions)) {
+    throw new Error("Workspace state is invalid.");
+  }
+  const projects: PersistedWorkspaceProject[] = [];
+  const projectsById = new Map<string, PersistedWorkspaceProject>();
+  for (const project of state.projects) {
+    if (!isPersistedWorkspaceProject(project) || !isCanonicalWorkspaceIdentity(project.id)) {
+      throw new Error("Workspace state is invalid.");
+    }
+    if (projectsById.has(project.id)) throw new Error("Workspace state is invalid.");
+    projects.push(project);
+    projectsById.set(project.id, project);
+  }
+
+  const { parsePlanBootstrapSession } = await import("@skyturn/project-core");
+  const sessions: Record<string, unknown>[] = [];
+  const sessionIds = new Set<string>();
+  const plans: ValidatedWorkspacePlan[] = [];
+  for (const session of state.sessions) {
+    if (!isRecord(session) || !isCanonicalWorkspaceIdentity(session.id) || !isCanonicalWorkspaceIdentity(session.projectId)) {
+      throw new Error("Workspace state is invalid.");
+    }
+    if (sessionIds.has(session.id)) throw new Error("Workspace state is invalid.");
+    sessionIds.add(session.id);
+    if (!projectsById.has(session.projectId)) throw new Error("Workspace state is invalid.");
+
+    const isPlanCandidate = session.kind === "plan" || session.mode === "plan";
+    if (isPlanCandidate) {
+      const parsed = parsePlanBootstrapSession(session);
+      if (!allowLegacyPlan && parsed.schemaVersion !== 1) throw new Error("Workspace state is invalid.");
+      plans.push({ session, snapshot: parsed.snapshot });
+    } else if (session.kind !== "canvas" || !isSupportedWorkspaceMode(session.mode)) {
+      throw new Error("Workspace state is invalid.");
+    }
+    sessions.push(session);
+  }
+  return { projects, projectsById, sessions, plans };
+}
+
+function validateWorkspaceSaveEnvelope(state: unknown): void {
+  if (!isRecord(state)) throw new Error("Workspace state is invalid.");
+  if (
+    !isRecord(state.changesets) ||
+    !Array.isArray(state.agents) ||
+    !isRecord(state.runs) ||
+    !isRecord(state.runEvents) ||
+    !isRecord(state.runEvidence) ||
+    typeof state.sidebarCollapsed !== "boolean" ||
+    !Array.isArray(state.collapsedProjectIds)
+  ) {
+    throw new Error("Workspace state is invalid.");
+  }
+  const projectIds = new Set((state.projects as PersistedWorkspaceProject[]).map((project) => project.id));
+  const sessions = state.sessions as Record<string, unknown>[];
+  if (!isNullableWorkspaceIdentity(state.activeProjectId) || !isNullableWorkspaceIdentity(state.activeSessionId)) {
+    throw new Error("Workspace state is invalid.");
+  }
+  if (state.activeProjectId !== null && !projectIds.has(state.activeProjectId)) {
+    throw new Error("Workspace state is invalid.");
+  }
+  if (state.activeSessionId !== null) {
+    const activeSession = sessions.find((session) => session.id === state.activeSessionId);
+    if (!activeSession || activeSession.projectId !== state.activeProjectId) {
+      throw new Error("Workspace state is invalid.");
+    }
+  }
+  const collapsedProjectIds = new Set<string>();
+  for (const projectId of state.collapsedProjectIds) {
+    if (!isCanonicalWorkspaceIdentity(projectId) || !projectIds.has(projectId) || collapsedProjectIds.has(projectId)) {
+      throw new Error("Workspace state is invalid.");
+    }
+    collapsedProjectIds.add(projectId);
+  }
+}
+
+function isCanonicalWorkspaceIdentity(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value === value.trim();
+}
+
+function isNullableWorkspaceIdentity(value: unknown): value is string | null {
+  return value === null || isCanonicalWorkspaceIdentity(value);
+}
+
+function isSupportedWorkspaceMode(value: unknown): value is "fast" | "plan" {
+  return value === "fast" || value === "plan";
+}
+
+async function trustedWorkspaceProjectIdentities(): Promise<Set<string>> {
+  try {
+    const value = JSON.parse(await fs.readFile(workspaceStorePath(), "utf8")) as unknown;
+    if (!isRecord(value) || !Array.isArray(value.projects)) return new Set();
+    return new Set(value.projects.filter(isPersistedWorkspaceProject).map(workspaceProjectIdentity));
+  } catch {
+    return new Set();
+  }
+}
+
+function workspaceProjectIdentity(project: {
+  id: string;
+  rootPath: string;
+  devflowPath: string;
+  canonicalRootPath?: string;
+}): string {
+  return JSON.stringify([
+    project.id,
+    project.rootPath,
+    project.canonicalRootPath ?? null,
+    project.devflowPath,
+  ]);
+}
+
+function isPersistedWorkspaceProject(value: unknown): value is PersistedWorkspaceProject {
+  if (!isRecord(value)) return false;
+  if (
+    typeof value.id !== "string" || !value.id ||
+    typeof value.name !== "string" ||
+    typeof value.rootPath !== "string" || !path.isAbsolute(value.rootPath) ||
+    typeof value.devflowPath !== "string" || !path.isAbsolute(value.devflowPath) ||
+    typeof value.openedAt !== "string"
+  ) {
+    return false;
+  }
+  return value.canonicalRootPath === undefined || (
+    typeof value.canonicalRootPath === "string" && path.isAbsolute(value.canonicalRootPath)
+  );
 }
 
 async function trustedRunStartIdentity(input: StartAgentRunInput): Promise<TrustedRunStartIdentity> {
@@ -5030,21 +5614,144 @@ function sortJson(value: unknown): unknown {
   return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortJson(value[key])]));
 }
 
-app.whenReady().then(createMainWindow);
+const hasSingleInstanceLock = app.requestSingleInstanceLock();
+if (!hasSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const window = BrowserWindow.getAllWindows()[0];
+    if (window) {
+      focusWindow(window);
+      return;
+    }
+    requestFailedWindowCloseRecovery();
+  });
 
-app.on("window-all-closed", () => {
-  closeWorkflowStores();
-  if (process.platform !== "darwin") app.quit();
-});
+  app.whenReady().then(createMainWindow);
 
-app.on("activate", () => {
-  if (BrowserWindow.getAllWindows().length === 0) {
-    void createMainWindow();
-  }
-});
+  app.on("before-quit", createBeforeQuitHandler(async () => {
+    appShutdownRequested = true;
+    try {
+      await closeWorkflowStores();
+    } catch (error) {
+      appShutdownRequested = false;
+      throw error;
+    }
+  }, () => app.quit()));
 
-function closeWorkflowStores(): void {
-  for (const store of workflowStores.values()) store.close();
-  workflowStores.clear();
-  workflowStoreInitializations.clear();
+  app.on("window-all-closed", () => {
+    appShutdownRequested = true;
+    windowCloseRecoveryState = "idle";
+    void closeWorkflowStores().then(
+      () => {
+        if (process.platform !== "darwin") {
+          app.quit();
+          return;
+        }
+        workspaceSaveWriter.reopenAdmission();
+        appShutdownRequested = false;
+      },
+      () => {
+        windowCloseRecoveryState = "failed";
+        workspaceSaveWriter.closeAdmission();
+      },
+    );
+  });
+
+  app.on("activate", () => {
+    if (windowCloseRecoveryState === "failed") {
+      requestFailedWindowCloseRecovery();
+      return;
+    }
+    if (appShutdownRequested || workflowStoresClosePromise) return;
+    if (BrowserWindow.getAllWindows().length === 0) {
+      void createMainWindow();
+    }
+  });
+}
+
+function focusWindow(window: BrowserWindow): void {
+  if (window.isMinimized()) window.restore();
+  window.focus();
+}
+
+function requestFailedWindowCloseRecovery(): void {
+  if (windowCloseRecoveryState !== "failed" || windowCloseRecoveryPromise) return;
+  const recovery = (async () => {
+    try {
+      await closeWorkflowStores();
+    } catch {
+      workspaceSaveWriter.closeAdmission();
+      return;
+    }
+    workspaceSaveWriter.reopenAdmission();
+    windowCloseRecoveryState = "idle";
+    appShutdownRequested = false;
+    await createMainWindow();
+    const window = BrowserWindow.getAllWindows()[0];
+    if (window) focusWindow(window);
+  })();
+  windowCloseRecoveryPromise = recovery;
+  const reset = (): void => {
+    if (windowCloseRecoveryPromise === recovery) windowCloseRecoveryPromise = null;
+  };
+  void recovery.then(reset, reset);
+}
+
+function createBeforeQuitHandler(
+  cleanup: () => Promise<void>,
+  quit: () => void,
+): (event: { preventDefault(): void }) => void {
+  let cleanupPending = false;
+  let quitAllowed = false;
+  return (event) => {
+    if (quitAllowed) return;
+    event.preventDefault();
+    if (cleanupPending) return;
+    cleanupPending = true;
+    let pending: Promise<void>;
+    try {
+      pending = cleanup();
+    } catch {
+      cleanupPending = false;
+      return;
+    }
+    void pending.then(
+      () => {
+        quitAllowed = true;
+        quit();
+      },
+      () => {
+        cleanupPending = false;
+      },
+    );
+  };
+}
+
+function closeWorkflowStores(): Promise<void> {
+  if (workflowStoresClosePromise) return workflowStoresClosePromise;
+  const closing = (async () => {
+    workspaceSaveWriter.closeAdmission();
+    try {
+      await workspaceSaveWriter.drain();
+      const closingPlanRuntime = planRuntime;
+      await closingPlanRuntime?.close();
+      if (planRuntime === closingPlanRuntime) planRuntime = null;
+      for (const [projectRoot, store] of workflowStores) {
+        store.close();
+        workflowStores.delete(projectRoot);
+        workflowStoreInitializations.delete(projectRoot);
+      }
+      workflowStoreInitializations.clear();
+    } catch (error) {
+      workspaceSaveWriter.reopenAdmission();
+      throw error;
+    }
+  })();
+  workflowStoresClosePromise = closing;
+  const reset = (): void => {
+    if (workflowStoresClosePromise === closing) workflowStoresClosePromise = null;
+  };
+  void closing.then(reset, reset);
+  return closing;
 }

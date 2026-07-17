@@ -79,6 +79,14 @@ import {
 
 export { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/project-core";
 export {
+  createHermesAcpClient,
+  denyHermesAcpPermission,
+  type HermesAcpClient,
+  type HermesAcpClientOptions,
+  type HermesAcpPromptOptions,
+  type HermesAcpPromptResult,
+} from "./hermesAcpClient.js";
+export {
   createDurableRunClaimStore,
   defaultDurableRunClaimRoot,
   type DurableRunClaimStore,

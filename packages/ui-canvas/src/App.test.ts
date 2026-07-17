@@ -1,12 +1,12 @@
 import { readFile } from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   formatTerminalTitle,
   formatTerminalBadge,
   formatTerminalMessage,
   plannerSessionStatusForSnapshot,
 } from "./terminalInspector.js";
-import type { TerminalSnapshotResult } from "@skyturn/persistence";
+import { normalizeWorkspaceState, type TerminalSnapshotResult } from "@skyturn/persistence";
 import type { VariantComparisonEvidence } from "@skyturn/git-worktree";
 import {
   REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
@@ -29,10 +29,16 @@ import {
   lastRunEvidenceForDisplay,
   runEvidenceFactsForDisplay,
   summarizeWorktreeComparisonEvidence,
+  PlanDocumentEditor,
+  isPlanRevisionAvailable,
 } from "./App.js";
-import type { CanvasNode, Changeset, FinalChangesetReconciliation, RunEvidence } from "@skyturn/project-core";
+import * as AppModule from "./App.js";
+import { parsePlanBootstrapSession } from "@skyturn/project-core";
+import type { CanvasNode, Changeset, FinalChangesetReconciliation, PlanSession, RunEvidence } from "@skyturn/project-core";
 import type { DeliveryCommitSummary } from "./deliveryPanel.js";
 import type { SelectedNodeActionState } from "./nodeActionState.js";
+import { acceptPlanStage, canFinishPlan, editPlanStage } from "./planRuntime.js";
+import { convertPlanToCanvas } from "@skyturn/planner";
 
 function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
   return {
@@ -78,6 +84,221 @@ function mockRunEvidence(overrides: Partial<RunEvidence> = {}): RunEvidence {
     ...overrides,
   };
 }
+
+function editablePlanSession(): PlanSession {
+  const readyStage = {
+    status: "ready" as const,
+    accepted: true,
+    draft: "",
+    error: null,
+    runId: null,
+    operation: null,
+    checkpoints: [],
+  };
+  return {
+    id: "plan-edit-test",
+    projectId: "project-1",
+    title: "Editable Plan",
+    goal: "Repair Plan editing",
+    mode: "plan",
+    kind: "plan",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    createdAt: "2026-07-16T00:00:00.000Z",
+    updatedAt: "2026-07-16T00:00:00.000Z",
+    plan: {
+      requirements: "# Requirements",
+      design: "# Design",
+      tasks: "# Tasks",
+    },
+    stateVersion: 0,
+    activeStage: "tasks",
+    plannerConversationId: "hermes-plan-edit-test",
+    conversationStarted: true,
+    stages: {
+      requirements: { ...readyStage },
+      design: { ...readyStage },
+      tasks: { ...readyStage },
+    },
+    nodes: [],
+    edges: [],
+    activeNodeId: null,
+  };
+}
+
+function workspaceWithPlan(session: PlanSession) {
+  return {
+    projects: [{
+      id: "project-1",
+      name: "Project",
+      rootPath: "/repo",
+      devflowPath: "/repo/.devflow",
+      openedAt: "2026-07-16T00:00:00.000Z",
+    }],
+    sessions: [session],
+    changesets: {},
+    agents: [],
+    runs: {},
+    runEvents: {},
+    runEvidence: {},
+    activeProjectId: "project-1",
+    activeSessionId: session.id,
+    sidebarCollapsed: false,
+    collapsedProjectIds: [],
+  };
+}
+
+describe("Plan finish workflow handoff", () => {
+  it("owns Finish synchronously, locks while pending, and calls the backend once", async () => {
+    const createController = Reflect.get(AppModule, "createPlanFinishController") as undefined | (() => {
+      acquire(sessionId: string): boolean;
+      isInFlight(sessionId: string): boolean;
+      release(sessionId: string): void;
+    });
+    expect(createController).toBeTypeOf("function");
+    const controller = createController!();
+    let backendCalls = 0;
+    let releaseBackend: (() => void) | undefined;
+    const backend = new Promise<void>((resolve) => { releaseBackend = resolve; });
+    const finish = async () => {
+      if (!controller.acquire("plan-edit-test")) return;
+      try {
+        backendCalls += 1;
+        await backend;
+      } finally {
+        controller.release("plan-edit-test");
+      }
+    };
+
+    const first = finish();
+    const duplicate = finish();
+    expect(backendCalls).toBe(1);
+    expect(controller.isInFlight("plan-edit-test")).toBe(true);
+    releaseBackend!();
+    await Promise.all([first, duplicate]);
+    expect(controller.isInFlight("plan-edit-test")).toBe(false);
+  });
+
+  it("installs a finished Canvas only when the exact Plan boundary still matches", () => {
+    const capture = Reflect.get(AppModule, "capturePlanFinishBoundary") as undefined | ((session: PlanSession) => unknown);
+    const install = Reflect.get(AppModule, "installFinishedPlanCanvas") as undefined | ((
+      workspace: ReturnType<typeof workspaceWithPlan>,
+      boundary: unknown,
+      canvas: ReturnType<typeof convertPlanToCanvas>,
+    ) => { workspace: ReturnType<typeof workspaceWithPlan>; installed: boolean });
+    expect(capture).toBeTypeOf("function");
+    expect(install).toBeTypeOf("function");
+    const plan = editablePlanSession();
+    const workspace = workspaceWithPlan(plan);
+    const boundary = capture!(plan);
+    const canvas = convertPlanToCanvas(plan);
+
+    const normal = install!(workspace, boundary, canvas);
+    expect(normal.installed).toBe(true);
+    expect(normal.workspace.sessions[0]).toEqual(canvas);
+
+    const changedPlan = editPlanStage(plan, "tasks", "# Forced post-boundary change");
+    const changedWorkspace = workspaceWithPlan(changedPlan);
+    const stale = install!(changedWorkspace, boundary, canvas);
+    expect(stale.installed).toBe(false);
+    expect(stale.workspace).toBe(changedWorkspace);
+    expect(stale.workspace.sessions[0]).toEqual(changedPlan);
+  });
+
+  it("appends the exact approved Plan and returns the authoritative backend canvas", async () => {
+    const finish = Reflect.get(AppModule, "finishPlanSession") as undefined | ((
+      project: { id: string; name: string; rootPath: string; devflowPath: string; openedAt: string },
+      session: PlanSession,
+    ) => Promise<unknown>);
+    expect(finish).toBeTypeOf("function");
+    if (!finish) return;
+    const plan = editablePlanSession();
+    const localCanvas = convertPlanToCanvas(plan);
+    const authoritativeCanvas = {
+      ...localCanvas,
+      plannerNodeId: "backend-planner",
+      activeNodeId: "backend-planner",
+      nodes: [{
+        ...mockNode("hermes"),
+        id: "backend-planner",
+        title: "Authoritative backend planner",
+        runId: "backend-run",
+        changesetId: "backend-changeset",
+      }],
+      edges: [],
+    };
+    const calls: Array<{ kind: string; input: unknown }> = [];
+    vi.stubGlobal("window", {
+      devflow: {
+        createWorkflowSession: async (_projectRoot: string, input: unknown) => {
+          calls.push({ kind: "create", input });
+          return { protocolVersion: 1, session: {}, projection: {}, canvasSession: localCanvas };
+        },
+        appendWorkflowUserInput: async (_projectRoot: string, input: unknown) => {
+          calls.push({ kind: "append", input });
+          return { protocolVersion: 1, event: {}, ledger: {}, projection: {}, canvasSession: authoritativeCanvas };
+        },
+      },
+    });
+    try {
+      const result = await finish({
+        id: "project-1",
+        name: "Project",
+        rootPath: "/repo",
+        devflowPath: "/repo/.devflow",
+        openedAt: "2026-07-17T00:00:00.000Z",
+      }, plan);
+
+      expect(result).toEqual(authoritativeCanvas);
+      expect((result as typeof authoritativeCanvas).nodes.map((node) => node.title)).toEqual([
+        "Authoritative backend planner",
+      ]);
+      expect(calls[1]).toEqual({
+        kind: "append",
+        input: {
+          sessionId: plan.id,
+          inputId: `plan-confirm-${plan.id}`,
+          text: [
+            "# Approved Plan",
+            "",
+            "## Goal",
+            "Repair Plan editing",
+            "",
+            "## Requirements",
+            "# Requirements",
+            "",
+            "## Design",
+            "# Design",
+            "",
+            "## Tasks",
+            "# Tasks",
+          ].join("\n"),
+          now: plan.createdAt,
+        },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("fails closed when workflow append omits the authoritative canvas", async () => {
+    const finish = Reflect.get(AppModule, "finishPlanSession") as undefined | ((project: unknown, session: PlanSession) => Promise<unknown>);
+    expect(finish).toBeTypeOf("function");
+    if (!finish) return;
+    vi.stubGlobal("window", {
+      devflow: {
+        createWorkflowSession: async () => ({ canvasSession: convertPlanToCanvas(editablePlanSession()) }),
+        appendWorkflowUserInput: async () => ({ canvasSession: null }),
+      },
+    });
+    try {
+      await expect(finish({ rootPath: "/repo" }, editablePlanSession())).rejects.toThrow(
+        "Authoritative canvas session was not returned.",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
 
 describe("deriveSessionTarget", () => {
   it("reuses one insert-before requestId after a committed IPC response is lost", async () => {
@@ -624,15 +845,254 @@ describe("UI source validation", () => {
 
     expect(planView).toContain("Review one plan page at a time");
     expect(planView).toContain("Ask agent to revise this page");
-    expect(planView).toContain("disabled={!allApproved}");
-    expect(planView).toContain('setActiveSection("design")');
-    expect(planView).toContain('setActiveSection("tasks")');
-    expect(planView).not.toContain('changeActiveSection("design")');
-    expect(planView).not.toContain('changeActiveSection("tasks")');
+    expect(planView).toContain("Finish");
+    expect(planView).toContain("Retry");
+    expect(planView).toContain("Undo");
+    expect(planView).toContain("activePlanMarkdown");
+    expect(planView).toContain("const revisionAvailable = isPlanRevisionAvailable(stageState);");
+    expect(planView).toContain('const [agentInstruction, setAgentInstruction] = useState("");');
+    expect(planView).toContain("<PlanDocumentEditor");
+    expect((planView.match(/readOnly=\{interactionLocked \|\| !revisionAvailable\}/g) ?? [])).toHaveLength(1);
+    expect((planView.match(/!revisionAvailable/g) ?? [])).toHaveLength(3);
+    expect(planView).toContain('stageState.status !== "ready"');
+    expect(planView).toContain("!session.plan[activeStep.key].trim()");
     expect(planView).toContain("<textarea");
     expect(planView).not.toContain("markdown-grid");
     expect(planView).not.toContain("<article");
     expect((planView.match(/<ReactMarkdown/g) ?? [])).toHaveLength(1);
+    expect(planView).not.toContain("Convert to Canvas");
+    expect(planView).not.toContain("Captured locally");
+    expect(planView).not.toContain("Mock agent revision");
+  });
+
+  it.each([
+    ["ready", null, true],
+    ["failed", "revise", true],
+    ["failed", "generate", false],
+    ["pending", null, false],
+    ["generating", "generate", false],
+    ["revising", "revise", false],
+  ] as const)(
+    "allows revision only for %s with operation %s",
+    (status, operation, expected) => {
+      const state = {
+        ...editablePlanSession().stages.requirements,
+        status,
+        operation,
+      };
+
+      expect(isPlanRevisionAvailable(state)).toBe(expected);
+    },
+  );
+
+  it.each(["requirements", "design"] as const)(
+    "reopens failed-revise %s as revision-enabled while failed-generate stays disabled",
+    (stage) => {
+      const session = editablePlanSession();
+      session.activeStage = stage;
+      session.stages[stage] = {
+        ...session.stages[stage],
+        status: "failed",
+        operation: "revise",
+        error: "Hermes ACP prompt failed.",
+      };
+      const persisted = JSON.parse(JSON.stringify(normalizeWorkspaceState(workspaceWithPlan(session))));
+      const reopenedWorkspace = normalizeWorkspaceState(persisted);
+      const reopened = reopenedWorkspace.sessions.find((item) => item.id === session.id);
+      expect(reopened?.kind).toBe("plan");
+      if (!reopened || reopened.kind !== "plan") return;
+      expect(() => parsePlanBootstrapSession(reopened)).not.toThrow();
+      expect(isPlanRevisionAvailable(reopened.stages[stage])).toBe(true);
+      expect(isPlanRevisionAvailable({
+        ...reopened.stages[stage],
+        operation: "generate",
+      })).toBe(false);
+    },
+  );
+
+  it("uses one revision predicate at every PlanView submission boundary", async () => {
+    const appSource = await readSource("./App.tsx");
+    const planView = appSource.slice(appSource.indexOf("function PlanView("), appSource.indexOf("function CanvasView("));
+    const submitRevision = planView.slice(
+      planView.indexOf("async function submitRevision"),
+      planView.indexOf("function requestAgentRevision"),
+    );
+
+    expect(submitRevision).toContain("!revisionAvailable");
+    expect(submitRevision).toContain("onRevise(activeStep.key, instruction)");
+    expect(submitRevision).not.toContain("onGenerate");
+    expect(planView).toContain("readOnly={interactionLocked || !revisionAvailable}");
+    expect(planView).toMatch(/disabled=\{[\s\S]*?interactionLocked \|\| runActive \|\| !revisionAvailable/);
+  });
+
+  it("PlanView document editor stays editable after clearing while running and blank completion stay closed", () => {
+    let session: PlanSession = editablePlanSession();
+    let blurCalls = 0;
+    const renderEditor = () => PlanDocumentEditor({
+      id: "plan-document",
+      value: session.plan.tasks,
+      status: session.stages.tasks.status,
+      onChange: (value) => {
+        session = editPlanStage(session, "tasks", value);
+      },
+      onBlur: () => { blurCalls += 1; },
+    });
+
+    const readyEditor = renderEditor();
+    expect(readyEditor.props.readOnly).toBe(false);
+    readyEditor.props.onBlur();
+    expect(blurCalls).toBe(1);
+    readyEditor.props.onChange({ currentTarget: { value: "   " } });
+    expect(session.stages.tasks.status).toBe("pending");
+    expect(canFinishPlan(acceptPlanStage(session, "tasks"))).toBe(false);
+
+    const emptyEditor = renderEditor();
+    expect(emptyEditor.props.readOnly).toBe(false);
+    emptyEditor.props.onChange({ currentTarget: { value: "# Replacement tasks" } });
+    expect(session.plan.tasks).toBe("# Replacement tasks");
+    expect(session.stages.tasks.status).toBe("ready");
+
+    const runningEditor = PlanDocumentEditor({
+      id: "running-plan-document",
+      value: session.plan.tasks,
+      status: "revising",
+      onChange: () => undefined,
+    });
+    expect(runningEditor.props.readOnly).toBe(true);
+
+    const recoveryLockedEditor = PlanDocumentEditor({
+      id: "recovery-locked-plan-document",
+      value: session.plan.tasks,
+      status: "ready",
+      locked: true,
+      onChange: () => undefined,
+    });
+    expect(recoveryLockedEditor.props.readOnly).toBe(true);
+  });
+
+  it("dispatches every committed workspace to main immediately without waiting for an older request", () => {
+    const createDispatcher = Reflect.get(AppModule, "createWorkspaceSaveDispatcher") as undefined | ((
+      save: (workspace: unknown) => Promise<void>,
+      currentWorkspace: () => unknown,
+      onError: (message: string | null) => void,
+    ) => { dispatch(workspace: unknown): void; retry(): void });
+    expect(createDispatcher).toBeTypeOf("function");
+    const attempts: unknown[] = [];
+    let resolveFirst: (() => void) | undefined;
+    const firstPending = new Promise<void>((resolve) => { resolveFirst = resolve; });
+    const dispatcher = createDispatcher!(async (workspace) => {
+      attempts.push(workspace);
+      if (attempts.length === 1) await firstPending;
+    }, () => ({ generation: 2 }), () => undefined);
+
+    dispatcher.dispatch({ generation: 1 });
+    dispatcher.dispatch({ generation: 2 });
+
+    expect(attempts).toEqual([{ generation: 1 }, { generation: 2 }]);
+    resolveFirst?.();
+  });
+
+  it("ignores an older save rejection after a newer request succeeds", async () => {
+    const createDispatcher = Reflect.get(AppModule, "createWorkspaceSaveDispatcher") as undefined | ((
+      save: (workspace: unknown) => Promise<void>,
+      currentWorkspace: () => unknown,
+      onError: (message: string | null) => void,
+    ) => { dispatch(workspace: unknown): void; retry(): void });
+    expect(createDispatcher).toBeTypeOf("function");
+    let rejectFirst: ((error: Error) => void) | undefined;
+    let resolveSecond: (() => void) | undefined;
+    const first = new Promise<void>((_resolve, reject) => { rejectFirst = reject; });
+    const second = new Promise<void>((resolve) => { resolveSecond = resolve; });
+    const errors: Array<string | null> = [];
+    const dispatcher = createDispatcher!(
+      (workspace) => (Reflect.get(workspace as object, "generation") === 1 ? first : second),
+      () => ({ generation: 2 }),
+      (message) => { errors.push(message); },
+    );
+
+    dispatcher.dispatch({ generation: 1 });
+    dispatcher.dispatch({ generation: 2 });
+    resolveSecond?.();
+    await Promise.resolve();
+    rejectFirst?.(new Error("stale failure"));
+    await Promise.resolve();
+
+    expect(errors.at(-1)).toBeNull();
+    expect(errors).not.toContain("Workspace save failed.");
+  });
+
+  it("surfaces only the latest rejection and retries the exact current workspace", async () => {
+    const createDispatcher = Reflect.get(AppModule, "createWorkspaceSaveDispatcher") as undefined | ((
+      save: (workspace: unknown) => Promise<void>,
+      currentWorkspace: () => unknown,
+      onError: (message: string | null) => void,
+    ) => { dispatch(workspace: unknown): void; retry(): void });
+    expect(createDispatcher).toBeTypeOf("function");
+    const current = { generation: 3 };
+    const attempts: unknown[] = [];
+    const errors: Array<string | null> = [];
+    const dispatcher = createDispatcher!(async (workspace) => {
+      attempts.push(workspace);
+      if (attempts.length === 1) throw new Error("latest failure");
+    }, () => current, (message) => { errors.push(message); });
+
+    dispatcher.dispatch({ generation: 2 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(errors.at(-1)).toBe("Workspace save failed.");
+
+    dispatcher.retry();
+    await Promise.resolve();
+    expect(attempts).toEqual([{ generation: 2 }, current]);
+    expect(attempts[1]).toBe(current);
+    expect(errors.at(-1)).toBeNull();
+  });
+
+  it("keeps workspace load failures out of the save path and exposes bounded retries", async () => {
+    const appSource = await readSource("./App.tsx");
+
+    expect(appSource).toContain("setWorkspaceLoadError");
+    expect(appSource).toContain("Retry workspace load");
+    expect(appSource).toContain("Retry workspace save");
+    expect(appSource).toMatch(/loadWorkspaceState\(\)[\s\S]*?\.catch\(/);
+    expect(appSource).toContain("useLayoutEffect");
+    expect(appSource).not.toContain("createLatestWorkspaceSaveController");
+    expect(appSource).not.toMatch(/workspaceSaveControllerRef|\.drain\(\)/);
+  });
+
+  it("routes user Undo through the durable Plan mutation queue", async () => {
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("planMutationQueue().undoStage");
+    expect(appSource).not.toContain("undoPlanStage(activeSession");
+  });
+
+  it("wires Plan sessions to typed streamed desktop events and automatic Requirements generation", async () => {
+    const appSource = await readSource("./App.tsx");
+    const autoStartEffect = appSource.slice(
+      appSource.indexOf("const requestKey = `${activePlanScope}:requirements:generate`;"),
+      appSource.indexOf("}, [activeProject?.id, activeSession, planRuntimeRecovery]);"),
+    );
+    expect(appSource).toContain("window.devflow.onPlanEvent");
+    expect(appSource).toContain('requirements.status !== "pending"');
+    expect(autoStartEffect).toContain("isEligible: () => {");
+    expect(autoStartEffect.match(/workspaceRef\.current/g)).toHaveLength(2);
+    expect(autoStartEffect).toContain("current.activeProjectId !== projectId");
+    expect(autoStartEffect).toContain("current.activeSessionId !== planSessionId");
+    expect(autoStartEffect).toContain('currentSession?.kind === "plan"');
+    expect(autoStartEffect).toContain('currentSession.stages.requirements.status === "pending"');
+    expect(autoStartEffect).toContain("currentSession.stages.requirements.runId === null");
+    expect(autoStartEffect).toContain('runPlanGeneration(activeProject, currentSession, "requirements")');
+    expect(autoStartEffect).not.toContain('runPlanGeneration(activeProject, activeSession, "requirements")');
+    expect(appSource).toContain("applyPlanEventToWorkspace");
+    expect(appSource).toContain("createPlanAdapter(window.devflow");
+    expect(appSource).toContain("reconcilePlanRuntimeState");
+    expect(appSource).toContain("canStartPlanRequest(planRuntimeRecovery, activeSession.id)");
+    expect(appSource).toContain("loadPlanRuntimeState(planAdapter(), planSessionId, project.rootPath)");
+    expect(appSource).toContain("bindAndRecoverPlanStart(project, result)");
+    expect(appSource).toContain("Retry runtime state");
+    expect(appSource).toContain("!canFinishPlan(accepted)");
+    expect(appSource).toContain("capturePlanFinishBoundary(accepted)");
+    expect(appSource).toContain("installFinishedPlanCanvas(current, boundary, canvas)");
   });
 
   it("loads agent health through desktop IPC and stores discovered agents", async () => {
