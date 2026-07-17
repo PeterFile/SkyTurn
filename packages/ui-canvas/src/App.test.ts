@@ -1088,6 +1088,40 @@ describe("UI source validation", () => {
     expect(planView).toContain("disabled={!undoEnabled}");
   });
 
+  it("prioritizes runtime recovery for a failed Plan stage without duplicating alerts", async () => {
+    const appSource = await readSource("./App.tsx");
+    const planView = appSource.slice(appSource.indexOf("function PlanView("), appSource.indexOf("function CanvasView("));
+    const runtimeRecovery = planView.slice(
+      planView.indexOf("{runtimeStateError ? ("),
+      planView.indexOf(") : stageState.status === \"failed\" ? ("),
+    );
+
+    expect(planView).toContain('{runtimeStateError ? (');
+    expect(planView).toContain(') : stageState.status === "failed" ? (');
+    expect(planView).not.toContain('runtimeStateError && stageState.status !== "failed"');
+    expect(runtimeRecovery).toContain("{runtimeStateError}");
+    expect(runtimeRecovery).toContain("onClick={() => void onRetryRuntimeState()}");
+    expect(runtimeRecovery).toContain("Retry runtime state");
+    expect(runtimeRecovery).not.toContain("disabled=");
+  });
+
+  it("resets the revision composer height only after a successful revision", async () => {
+    const appSource = await readSource("./App.tsx");
+    const planView = appSource.slice(appSource.indexOf("function PlanView("), appSource.indexOf("function CanvasView("));
+    const revisionResultEffect = planView.slice(
+      planView.indexOf("useEffect(() => {"),
+      planView.indexOf("}, [stageState.runId, stageState.status, submittedRevisionRunId]);"),
+    );
+    const successfulRevision = revisionResultEffect.slice(
+      revisionResultEffect.indexOf('if (stageState.status === "ready")'),
+      revisionResultEffect.indexOf('if (stageState.status === "ready" || stageState.status === "failed")'),
+    );
+
+    expect(successfulRevision).toContain('composerRef.current?.style.removeProperty("height")');
+    expect(successfulRevision).toContain('setAgentInstruction("")');
+    expect(revisionResultEffect).not.toContain('if (stageState.status === "failed") {\n      setAgentInstruction("")');
+  });
+
   it("PlanView document editor stays editable after clearing while running and blank completion stay closed", () => {
     let session: PlanSession = editablePlanSession();
     let blurCalls = 0;

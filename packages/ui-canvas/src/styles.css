@@ -7357,11 +7357,16 @@ select:focus-visible,
   color: var(--sk-accent);
 }
 
-.plan-next-button,
-.plan-finish-button {
-  border-color: var(--sk-accent) !important;
-  background: color-mix(in srgb, var(--sk-accent) 15%, var(--sk-surface)) !important;
-  color: var(--sk-accent) !important;
+.plan-stage-actions .plan-next-button,
+.plan-stage-actions .plan-finish-button {
+  border-color: var(--sk-accent);
+  background: color-mix(in srgb, var(--sk-accent) 15%, var(--sk-surface));
+  color: var(--sk-accent);
+}
+
+.plan-stage-actions .plan-next-button:hover:not(:disabled),
+.plan-stage-actions .plan-finish-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sk-accent) 28%, var(--sk-surface));
 }
 
 .plan-document {

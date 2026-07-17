@@ -2274,6 +2274,7 @@ function PlanView({
     if (stageState.status === "ready") {
       setAgentInstruction("");
       setPreservedFailedInstruction("");
+      composerRef.current?.style.removeProperty("height");
     }
     if (stageState.status === "ready" || stageState.status === "failed") {
       setSubmittedRevisionRunId(null);
@@ -2495,7 +2496,15 @@ function PlanView({
         data-phase={phase}
         data-view={effectiveViewMode}
       >
-        {stageState.status === "failed" && (
+        {runtimeStateError ? (
+          <div className="plan-error-banner" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>{runtimeStateError}</span>
+            <button type="button" onClick={() => void onRetryRuntimeState()}>
+              Retry runtime state
+            </button>
+          </div>
+        ) : stageState.status === "failed" ? (
           <div className="plan-error-banner" role="alert">
             <AlertTriangle size={16} aria-hidden="true" />
             <span>
@@ -2517,17 +2526,7 @@ function PlanView({
               Retry
             </button>
           </div>
-        )}
-
-        {runtimeStateError && stageState.status !== "failed" && (
-          <div className="plan-error-banner" role="alert">
-            <AlertTriangle size={16} aria-hidden="true" />
-            <span>{runtimeStateError}</span>
-            <button type="button" onClick={() => void onRetryRuntimeState()}>
-              Retry runtime state
-            </button>
-          </div>
-        )}
+        ) : null}
 
         {finishError && (
           <div className="plan-error-banner" role="alert">

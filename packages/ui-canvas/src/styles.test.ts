@@ -104,6 +104,22 @@ describe("SkyTurn UI style tokens", () => {
     expect(compactDesktop).toContain("padding-inline: 4px");
   });
 
+  it("keeps Plan primary button hover distinct without important overrides", async () => {
+    const styles = await readSource("./styles.css");
+    const primaryBase = lastCssRuleForSelector(styles, ".plan-stage-actions .plan-next-button");
+    const primaryHover = lastCssRuleForSelector(styles, ".plan-stage-actions .plan-next-button:hover:not(:disabled)");
+
+    expect(primaryBase).toContain("background: color-mix(");
+    expect(primaryBase).toContain("var(--sk-accent)");
+    expect(primaryBase).not.toContain("!important");
+    expect(primaryHover).toContain("background: color-mix(");
+    expect(primaryHover).toContain("var(--sk-accent)");
+    expect(primaryHover).toContain("var(--sk-surface)");
+    expect(primaryHover).not.toMatch(/#[0-9a-f]{3,8}\b|rgba?\(/i);
+    expect(primaryHover).not.toContain("gradient");
+    expect(primaryHover).not.toContain("box-shadow");
+  });
+
   it("uses modern dark tokens instead of paper collage material tokens", async () => {
     const styles = await readSource("./styles.css");
 
