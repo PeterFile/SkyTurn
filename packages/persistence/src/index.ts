@@ -13,6 +13,7 @@ import type {
   WorktreeComparisonRequest,
 } from "@skyturn/git-worktree";
 import {
+  makeHermesPlanConversationId,
   makeHermesPlannerSessionId,
   normalizeSessionTarget,
   parseRunEvent,
@@ -28,6 +29,23 @@ import {
   type Changeset,
   type FinalChangesetReconciliation,
   type ImportedProject,
+  type PlanCancelRequest,
+  type PlanBootstrapRequest,
+  type PlanAcceptStageRequest,
+  type PlanEvent,
+  type PlanGenerateRequest,
+  type PlanGetStateRequest,
+  type PlanMarkdown,
+  type PlanOperation,
+  type PlanReviseRequest,
+  type PlanRunStartResult,
+  type PlanRuntimeStateResult,
+  type PlanStateTransitionResult,
+  type PlanSession,
+  type PlanStage,
+  type PlanStageState,
+  type PlanUndoStageRequest,
+  type PlanUpdateStageRequest,
   type RunEvent,
   type RunEvidence,
   type SessionTarget,
@@ -47,6 +65,7 @@ export interface OpenProjectResult {
   project?: {
     name: string;
     rootPath: string;
+    canonicalRootPath?: string;
     devflowPath: string;
   };
 }
@@ -257,8 +276,20 @@ export interface TerminalApi {
   onEvent: (listener: (event: TerminalRendererEvent) => void) => () => void;
 }
 
+export interface PlanApi {
+  generate: (input: PlanGenerateRequest) => Promise<PlanRunStartResult>;
+  revise: (input: PlanReviseRequest) => Promise<PlanRunStartResult>;
+  updateStage: (input: PlanUpdateStageRequest) => Promise<PlanStateTransitionResult>;
+  acceptStage: (input: PlanAcceptStageRequest) => Promise<PlanStateTransitionResult>;
+  undoStage: (input: PlanUndoStageRequest) => Promise<PlanStateTransitionResult>;
+  cancel: (input: PlanCancelRequest) => Promise<{ protocolVersion: 1; cancelled: boolean }>;
+  bootstrap: (input: PlanBootstrapRequest) => Promise<PlanRuntimeStateResult>;
+  getState: (input: PlanGetStateRequest) => Promise<PlanRuntimeStateResult>;
+}
+
 export interface WorkflowApi {
   createSession: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; session: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  finishPlan: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   appendUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   getLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: WorkflowLedgerSummary }>;
   applyIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
@@ -336,6 +367,7 @@ export interface DevflowApi {
   listAgentRuns: () => Promise<{ protocolVersion: number; runs: AgentRun[] }>;
   getRunEvidence: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;
   createWorkflowSession: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; session: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  finishPlanWorkflow: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   appendWorkflowUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   getWorkflowLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: unknown }>;
   getChangeset: (projectRoot: string, node: CanvasNode) => Promise<{ protocolVersion: number; changeset: Changeset }>;
@@ -346,6 +378,7 @@ export interface DevflowApi {
   getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   workflow: WorkflowApi;
   terminal: TerminalApi;
+  plan: PlanApi;
   getWorkflowEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;
   pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => Promise<WorkflowDeliveryPushResult>;
@@ -355,6 +388,7 @@ export interface DevflowApi {
   syncWorkflowMain: (projectRoot: string, input: unknown) => Promise<WorkflowDeliveryMainSyncResult>;
   onRunEvent: (listener: (event: RunEvent) => void) => () => void;
   onWorkflowEvent: (listener: (event: unknown) => void) => () => void;
+  onPlanEvent: (listener: (event: PlanEvent) => void) => () => void;
 }
 
 declare global {
@@ -485,8 +519,146 @@ function normalizeRunEvidence(value: unknown): Record<string, RunEvidence> {
 }
 
 function normalizeSession(session: CanvasSessionTab): CanvasSessionTab {
-  if (session.kind !== "canvas") return session;
+  if (session.kind !== "canvas") return normalizePlanSession(session);
   return normalizeCanvasSession(session);
+}
+
+const planStages: PlanStage[] = ["requirements", "design", "tasks"];
+const maxPlanCheckpoints = 20;
+const maxPlanMarkdownLength = 2_000_000;
+
+function normalizePlanSession(session: PlanSession): PlanSession {
+  const candidate = session as unknown as Record<string, unknown>;
+  const plan = normalizePlanMarkdown(candidate.plan);
+  const rawStages = isRecord(candidate.stages) ? candidate.stages : {};
+  const stages = {
+    requirements: normalizePlanStageState(rawStages.requirements, plan.requirements),
+    design: normalizePlanStageState(rawStages.design, plan.design),
+    tasks: normalizePlanStageState(rawStages.tasks, plan.tasks),
+  };
+  enforcePlanStageDependencies(stages, plan);
+  const id = typeof candidate.id === "string" ? candidate.id : "plan-session";
+  const createdAt = typeof candidate.createdAt === "string" ? candidate.createdAt : new Date(0).toISOString();
+  return {
+    id,
+    projectId: typeof candidate.projectId === "string" ? candidate.projectId : "",
+    title: typeof candidate.title === "string" ? candidate.title : "Plan",
+    goal: typeof candidate.goal === "string" ? candidate.goal : "",
+    mode: "plan",
+    kind: "plan",
+    target: normalizeSessionTarget(candidate.target ?? candidate),
+    createdAt,
+    updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : createdAt,
+    plan,
+    stateVersion: normalizePlanStateVersion(candidate.stateVersion),
+    activeStage: isPlanStage(candidate.activeStage) ? candidate.activeStage : "requirements",
+    plannerConversationId: makeHermesPlanConversationId(id),
+    conversationStarted: candidate.conversationStarted === true,
+    stages,
+    nodes: [],
+    edges: [],
+    activeNodeId: null,
+  };
+}
+
+function normalizePlanStateVersion(value: unknown): number {
+  return Number.isSafeInteger(value) && (value as number) >= 0 ? value as number : 0;
+}
+
+function normalizePlanMarkdown(value: unknown): PlanMarkdown {
+  const candidate = isRecord(value) ? value : {};
+  return {
+    requirements: normalizePlanMarkdownStage(candidate.requirements),
+    design: normalizePlanMarkdownStage(candidate.design),
+    tasks: normalizePlanMarkdownStage(candidate.tasks),
+  };
+}
+
+function normalizePlanMarkdownStage(value: unknown): string {
+  return typeof value === "string" ? value.slice(0, maxPlanMarkdownLength) : "";
+}
+
+function enforcePlanStageDependencies(
+  stages: Record<PlanStage, PlanStageState>,
+  plan: PlanMarkdown,
+): void {
+  if (!hasAcceptedPlanMaterial(stages.requirements, plan.requirements)) {
+    stages.design = clearDependentPlanMaterial(stages.design);
+    stages.tasks = clearDependentPlanMaterial(stages.tasks);
+    return;
+  }
+  if (!hasAcceptedPlanMaterial(stages.design, plan.design)) {
+    stages.tasks = clearDependentPlanMaterial(stages.tasks);
+  }
+}
+
+function hasAcceptedPlanMaterial(stage: PlanStageState, markdown: string): boolean {
+  return stage.accepted && markdown.trim().length > 0;
+}
+
+function clearDependentPlanMaterial(stage: PlanStageState): PlanStageState {
+  return { ...stage, accepted: false, checkpoints: [] };
+}
+
+function normalizePlanStageState(value: unknown, markdown: string): PlanStageState {
+  const candidate = isRecord(value) ? value : {};
+  const rawStatus = candidate.status;
+  const hasMarkdown = markdown.trim().length > 0;
+  const checkpoints = Array.isArray(candidate.checkpoints)
+    ? candidate.checkpoints
+        .filter((item): item is string => (
+          typeof item === "string" && item.trim().length > 0 && item.length <= maxPlanMarkdownLength
+        ))
+        .slice(-maxPlanCheckpoints)
+    : [];
+  if (rawStatus === "generating" || rawStatus === "revising") {
+    return {
+      status: "failed",
+      accepted: false,
+      draft: "",
+      error: "Plan generation was interrupted. Retry to continue.",
+      runId: null,
+      lastRunId: boundedPlanRuntimeText(candidate.lastRunId),
+      operation: rawStatus === "generating" ? "generate" : "revise",
+      checkpoints,
+    };
+  }
+  const failedOperation: PlanOperation | null = rawStatus === "failed" && isPlanOperation(candidate.operation)
+    ? candidate.operation
+    : null;
+  const status = failedOperation ? "failed" : hasMarkdown ? "ready" : "pending";
+  const operation = status === "failed" ? failedOperation : null;
+  return {
+    status,
+    accepted: hasMarkdown && candidate.accepted === true && (
+      status === "ready" ||
+      (status === "failed" && operation === "revise")
+    ),
+    draft: "",
+    error: status === "failed" ? boundedPlanError(candidate.error) : null,
+    runId: null,
+    lastRunId: boundedPlanRuntimeText(candidate.lastRunId),
+    operation,
+    checkpoints,
+  };
+}
+
+function isPlanOperation(value: unknown): value is PlanOperation {
+  return value === "generate" || value === "revise";
+}
+
+function boundedPlanError(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) return "Plan generation failed. Retry to continue.";
+  return value.trim().slice(0, 500);
+}
+
+function boundedPlanRuntimeText(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  return value.trim().slice(0, 4_096);
+}
+
+function isPlanStage(value: unknown): value is PlanStage {
+  return planStages.includes(value as PlanStage);
 }
 
 function normalizeCanvasSession(session: CanvasSession): CanvasSession {

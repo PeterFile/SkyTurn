@@ -24,6 +24,7 @@ import {
   CheckCircle2,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Columns2,
   Copy,
@@ -43,6 +44,7 @@ import {
   RefreshCw,
   Settings,
   Square,
+  Undo2,
   WrapText,
   Users,
   Upload,
@@ -55,7 +57,9 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
   type FormEvent,
@@ -63,6 +67,8 @@ import {
   type ReactNode,
 } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
+import remarkGfm from "remark-gfm";
 
 import type { EditorKind, VariantComparisonEvidence } from "@skyturn/git-worktree";
 import {
@@ -81,7 +87,11 @@ import {
   plannerSessionStatusForSnapshot,
   type PlannerSessionStatusChrome,
 } from "./terminalInspector.js";
-import { convertPlanToCanvas, createFastCanvasSession, createPlanSession } from "@skyturn/planner";
+import {
+  convertPlanToCanvas,
+  createFastCanvasSession,
+  createPlanSession,
+} from "@skyturn/planner";
 import {
   NODE_MODAL_TABS,
   deriveNodeStatusFromEvidence,
@@ -100,7 +110,10 @@ import {
   type NodeRuntimeState,
   type NodeStatus,
   type PlanMarkdown,
+  type PlanEvent,
+  type PlanRunStartResult,
   type PlanSession,
+  type PlanStage,
   type RunEvent,
   type RunEvidence,
   type SessionTarget,
@@ -128,6 +141,26 @@ import {
   canvasViewportSignature,
   shouldAutoFitCanvas,
 } from "./canvasLayout.js";
+import {
+  activePlanMarkdown,
+  applyPlanRunStartFailure,
+  applyPlanEvent,
+  bindPlanRunStart,
+  canFinishPlan,
+  canStartPlanRequest,
+  createPlanAdapter,
+  createPlanAutoStartController,
+  createPlanMutationQueue,
+  createPlanRuntimeWatchdog,
+  editPlanStage,
+  initialPlanRuntimeRecovery,
+  isPlanInteractionLocked,
+  loadPlanRuntimeState,
+  PLAN_RUNTIME_STATE_ERROR,
+  planRuntimeRecoveryReducer,
+  reconcilePlanRuntimeState,
+  setActivePlanStage,
+} from "./planRuntime.js";
 
 import DecryptedText from "./DecryptedText.js";
 import {
@@ -208,7 +241,7 @@ const edgeTypes: EdgeTypes = {
   agent: MemoAgentEdge,
 };
 
-type PlanSectionKey = keyof PlanMarkdown;
+type PlanSectionKey = PlanStage;
 
 const PLAN_SECTION_STEPS: Array<{ key: PlanSectionKey; label: string }> = [
   { key: "requirements", label: "Requirements" },
@@ -221,6 +254,8 @@ export default function App() {
     return emptyWorkspace();
   });
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
+  const [workspaceLoadAttempt, setWorkspaceLoadAttempt] = useState(0);
+  const [workspaceLoadError, setWorkspaceLoadError] = useState<string | null>(null);
   const [newTaskGoal, setNewTaskGoal] = useState("");
   const [newTaskMode, setNewTaskMode] = useState<WorkflowMode>("fast");
   const [newTaskProjectId, setNewTaskProjectId] = useState<string | null>(null);
@@ -235,18 +270,69 @@ export default function App() {
   const [nodeActionBusy, setNodeActionBusy] = useState<Exclude<ComposerAction, null> | null>(null);
   const [nodeActionError, setNodeActionError] = useState<string | null>(null);
   const [nodeActionStatus, setNodeActionStatus] = useState<string | null>(null);
+  const [planRuntimeRecovery, dispatchPlanRuntimeRecovery] = useReducer(
+    planRuntimeRecoveryReducer,
+    initialPlanRuntimeRecovery,
+  );
+  const [finishingPlanSessionIds, setFinishingPlanSessionIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [planFinishError, setPlanFinishError] = useState<{ sessionId: string; message: string } | null>(null);
+  const [workspaceSaveError, setWorkspaceSaveError] = useState<string | null>(null);
   const startedBridgeRuns = useRef(new Set<string>());
   const completedBridgeRunPersistenceClaims = useRef(new Set<string>());
   const insertBeforeIntentRequests = useRef(createInsertBeforeIntentRequestTracker(() => globalThis.crypto.randomUUID()));
   const workspaceRef = useRef(workspace);
   const selectedNodeActionScopeRef = useRef<{ sessionId: string; nodeId: string } | null>(null);
   const selectedNodeActionGenerationRef = useRef(0);
+  const planRuntimeRecoveryGeneration = useRef(0);
+  const planAdapterRef = useRef<ReturnType<typeof createPlanAdapter> | null>(null);
+  const planMutationQueueRef = useRef<ReturnType<typeof createPlanMutationQueue> | null>(null);
+  const planAutoStartControllerRef = useRef<ReturnType<typeof createPlanAutoStartController> | null>(null);
+  const planFinishControllerRef = useRef<ReturnType<typeof createPlanFinishController> | null>(null);
+  const workspaceSaveDispatcherRef = useRef<ReturnType<typeof createWorkspaceSaveDispatcher<WorkspaceState>> | null>(null);
+  if (!planAdapterRef.current) {
+    planAdapterRef.current = createPlanAdapter(window.devflow, (event) => {
+      setWorkspace((current) => {
+        const next = applyPlanEventToWorkspace(current, event);
+        workspaceRef.current = next;
+        return next;
+      });
+    });
+  }
+  if (!planMutationQueueRef.current) {
+    planMutationQueueRef.current = createPlanMutationQueue(
+      planAdapterRef.current,
+      (planSessionId) => {
+        const session = workspaceRef.current.sessions.find((item) => item.id === planSessionId);
+        return session?.kind === "plan" ? session : null;
+      },
+      (session) => replacePlanSessionFromRef(session.id, () => session),
+    );
+  }
+  if (!planAutoStartControllerRef.current) {
+    planAutoStartControllerRef.current = createPlanAutoStartController({});
+  }
+  if (!planFinishControllerRef.current) {
+    planFinishControllerRef.current = createPlanFinishController();
+  }
+  if (!workspaceSaveDispatcherRef.current) {
+    workspaceSaveDispatcherRef.current = createWorkspaceSaveDispatcher(
+      saveWorkspaceState,
+      () => workspaceRef.current,
+      setWorkspaceSaveError,
+    );
+  }
 
   const activeProject = workspace.projects.find((project) => project.id === workspace.activeProjectId) ?? null;
   const activeSession =
     workspace.sessions.find(
       (session) => session.id === workspace.activeSessionId && session.projectId === activeProject?.id,
     ) ?? null;
+  const activePlanRunId = activeSession?.kind === "plan"
+    ? Object.values(activeSession.stages).find((stage) => stage.runId)?.runId ?? null
+    : null;
+  const activePlanScope = activeProject && activeSession?.kind === "plan"
+    ? `${activeProject.id}:${activeSession.id}`
+    : null;
   const selectedNode =
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
@@ -266,23 +352,26 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
+    setWorkspaceLoadError(null);
     void loadWorkspaceState().then((state) => {
       if (!active) return;
       setWorkspace(state);
       setWorkspaceLoaded(true);
+    }).catch(() => {
+      if (!active) return;
+      setWorkspaceLoaded(false);
+      setWorkspaceLoadError("Workspace could not be loaded.");
     });
     return () => {
       active = false;
     };
-  }, []);
+  }, [workspaceLoadAttempt]);
 
-  useEffect(() => {
-    if (workspaceLoaded) void saveWorkspaceState(workspace);
-  }, [workspace, workspaceLoaded]);
-
-  useEffect(() => {
+  useLayoutEffect(() => {
     workspaceRef.current = workspace;
-  }, [workspace]);
+    if (!workspaceLoaded) return;
+    workspaceSaveDispatcherRef.current?.dispatch(workspace);
+  }, [workspace, workspaceLoaded]);
 
   useEffect(() => {
     if (window.devflow) return;
@@ -347,6 +436,84 @@ export default function App() {
       }));
     });
   }, []);
+
+  useEffect(() => {
+    if (!window.devflow || typeof window.devflow.onPlanEvent !== "function") return;
+    return window.devflow.onPlanEvent((event) => {
+      setWorkspace((current) => {
+        const next = applyPlanEventToWorkspace(current, event);
+        workspaceRef.current = next;
+        return next;
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    planRuntimeRecoveryGeneration.current += 1;
+    dispatchPlanRuntimeRecovery({ type: "reset" });
+    if (!activeProject || activeSession?.kind !== "plan") return;
+    void recoverPlanRuntime(activeProject, activeSession.id);
+    return () => {
+      planRuntimeRecoveryGeneration.current += 1;
+    };
+  }, [activeProject?.rootPath, activeSession?.id, activeSession?.kind]);
+
+  useEffect(() => {
+    planAutoStartControllerRef.current?.setScope(activePlanScope);
+    return () => planAutoStartControllerRef.current?.setScope(null);
+  }, [activePlanScope]);
+
+  useEffect(() => {
+    if (!activeProject || activeSession?.kind !== "plan" || !activePlanRunId) return;
+    const projectId = activeProject.id;
+    const planSessionId = activeSession.id;
+    const runId = activePlanRunId;
+    return createPlanRuntimeWatchdog({
+      recover: () => recoverPlanRuntime(activeProject, planSessionId),
+      isActive: () => {
+        const current = workspaceRef.current;
+        if (current.activeProjectId !== projectId || current.activeSessionId !== planSessionId) return false;
+        const session = current.sessions.find((item) => item.id === planSessionId);
+        return session?.kind === "plan" && Object.values(session.stages).some((stage) => stage.runId === runId);
+      },
+    });
+  }, [activeProject?.id, activeProject?.rootPath, activeSession?.id, activePlanRunId]);
+
+  useEffect(() => {
+    if (!activeProject || activeSession?.kind !== "plan") return;
+    if (!canStartPlanRequest(planRuntimeRecovery, activeSession.id)) return;
+    const requirements = activeSession.stages.requirements;
+    if (requirements.status !== "pending" || requirements.runId) return;
+    const projectId = activeProject.id;
+    const planSessionId = activeSession.id;
+    const requestKey = `${activePlanScope}:requirements:generate`;
+    planAutoStartControllerRef.current?.start({
+      key: requestKey,
+      isEligible: () => {
+        const current = workspaceRef.current;
+        if (current.activeProjectId !== projectId || current.activeSessionId !== planSessionId) return false;
+        const currentSession = current.sessions.find((session) => session.id === planSessionId);
+        return currentSession?.kind === "plan" &&
+          currentSession.projectId === projectId &&
+          currentSession.stages.requirements.status === "pending" &&
+          currentSession.stages.requirements.runId === null;
+      },
+      start: async () => {
+        const current = workspaceRef.current;
+        const currentSession = current.sessions.find((session) => session.id === planSessionId);
+        if (
+          current.activeProjectId !== projectId ||
+          current.activeSessionId !== planSessionId ||
+          currentSession?.kind !== "plan" ||
+          currentSession.projectId !== projectId ||
+          currentSession.stages.requirements.status !== "pending" ||
+          currentSession.stages.requirements.runId !== null
+        ) return;
+        await runPlanGeneration(activeProject, currentSession, "requirements");
+      },
+      onFailure: () => undefined,
+    });
+  }, [activeProject?.id, activeSession, planRuntimeRecovery]);
 
   useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
@@ -589,35 +756,205 @@ export default function App() {
     setNewTaskGoal("");
   }
 
-  async function confirmPlan(session: PlanSession) {
-    const canvas = convertPlanToCanvas(session);
-    const project = workspace.projects.find((item) => item.id === canvas.projectId);
-    if (project) await persistCanvasWorkflowSession(project, canvas, "plan-confirm");
-    setWorkspace((current) => ({
-      ...current,
-      sessions: current.sessions.map((item) => (item.id === session.id ? canvas : item)),
-      changesets: { ...current.changesets, ...changesetsForSession(canvas) },
-      activeSessionId: canvas.id,
-    }));
+  function updatePlanSection(sessionId: string, section: PlanSectionKey, value: string) {
+    if (isPlanInteractionLocked(
+      planRuntimeRecovery,
+      sessionId,
+      planFinishControllerRef.current!.isInFlight(sessionId),
+    )) return;
+    setWorkspace((current) => {
+      const next = {
+        ...current,
+        sessions: current.sessions.map((session) =>
+        session.id === sessionId && session.kind === "plan"
+          ? editPlanStage(session, section, value)
+          : session,
+        ),
+      };
+      workspaceRef.current = next;
+      return next;
+    });
   }
 
-  function updatePlanSection(sessionId: string, section: PlanSectionKey, value: string) {
-    const updatedAt = new Date().toISOString();
-    setWorkspace((current) => ({
-      ...current,
-      sessions: current.sessions.map((session) =>
-        session.id === sessionId && session.kind === "plan"
-          ? {
-              ...session,
-              updatedAt,
-              plan: {
-                ...session.plan,
-                [section]: value,
-              },
-            }
-          : session,
-      ),
-    }));
+  function updatePlanSession(session: PlanSession): void {
+    setWorkspace((current) => {
+      const next = {
+        ...current,
+        sessions: current.sessions.map((item) => (item.id === session.id ? session : item)),
+      };
+      workspaceRef.current = next;
+      return next;
+    });
+  }
+
+  function planAdapter() {
+    return planAdapterRef.current!;
+  }
+
+  function planMutationQueue() {
+    return planMutationQueueRef.current!;
+  }
+
+  function replacePlanSessionFromRef(
+    sessionId: string,
+    update: (session: PlanSession) => PlanSession,
+  ): void {
+    const current = workspaceRef.current;
+    const sessions = current.sessions.map((session) =>
+      session.id === sessionId && session.kind === "plan" ? update(session) : session,
+    );
+    const next = sessions.every((session, index) => session === current.sessions[index])
+      ? current
+      : { ...current, sessions };
+    workspaceRef.current = next;
+    setWorkspace(next);
+  }
+
+  async function recoverPlanRuntime(project: ImportedProject, planSessionId: string): Promise<boolean> {
+    const generation = ++planRuntimeRecoveryGeneration.current;
+    dispatchPlanRuntimeRecovery({ type: "begin", planSessionId });
+    let state;
+    try {
+      state = await loadPlanRuntimeState(planAdapter(), planSessionId, project.rootPath);
+    } catch {
+      if (generation === planRuntimeRecoveryGeneration.current) {
+        dispatchPlanRuntimeRecovery({ type: "failed", planSessionId });
+      }
+      return false;
+    }
+    if (generation !== planRuntimeRecoveryGeneration.current) return false;
+    try {
+      replacePlanSessionFromRef(planSessionId, (session) => reconcilePlanRuntimeState(session, state));
+    } catch {
+      dispatchPlanRuntimeRecovery({ type: "failed", planSessionId });
+      return false;
+    }
+    dispatchPlanRuntimeRecovery({ type: "succeeded", planSessionId });
+    return true;
+  }
+
+  async function bindAndRecoverPlanStart(
+    project: ImportedProject,
+    result: PlanRunStartResult,
+  ): Promise<void> {
+    try {
+      replacePlanSessionFromRef(result.planSessionId, (session) => bindPlanRunStart(session, result));
+    } catch {
+      dispatchPlanRuntimeRecovery({ type: "failed", planSessionId: result.planSessionId });
+      throw new Error(PLAN_RUNTIME_STATE_ERROR);
+    }
+    if (!await recoverPlanRuntime(project, result.planSessionId)) throw new Error(PLAN_RUNTIME_STATE_ERROR);
+  }
+
+  async function runPlanGeneration(
+    project: ImportedProject,
+    session: PlanSession,
+    stage: PlanStage,
+  ): Promise<PlanRunStartResult> {
+    if (isPlanInteractionLocked(
+      planRuntimeRecovery,
+      session.id,
+      planFinishControllerRef.current!.isInFlight(session.id),
+    )) throw new Error(PLAN_RUNTIME_STATE_ERROR);
+    let result: PlanRunStartResult;
+    try {
+      result = await planMutationQueue().generate(project.rootPath, session.id, stage, session.goal);
+    } catch (error) {
+      replacePlanSessionFromRef(session.id, (item) => applyPlanRunStartFailure(item, stage, "generate", error));
+      throw error;
+    }
+    await bindAndRecoverPlanStart(project, result);
+    return result;
+  }
+
+  async function runPlanRevision(
+    project: ImportedProject,
+    session: PlanSession,
+    stage: PlanStage,
+    instruction: string,
+  ): Promise<PlanRunStartResult> {
+    if (isPlanInteractionLocked(
+      planRuntimeRecovery,
+      session.id,
+      planFinishControllerRef.current!.isInFlight(session.id),
+    )) throw new Error(PLAN_RUNTIME_STATE_ERROR);
+    let result: PlanRunStartResult;
+    try {
+      result = await planMutationQueue().revise(
+        project.rootPath,
+        session.id,
+        stage,
+        session.goal,
+        instruction,
+      );
+    } catch (error) {
+      replacePlanSessionFromRef(session.id, (item) => applyPlanRunStartFailure(item, stage, "revise", error));
+      throw error;
+    }
+    await bindAndRecoverPlanStart(project, result);
+    return result;
+  }
+
+  async function continuePlan(session: PlanSession, stage: PlanStage): Promise<void> {
+    if (!activeProject) return;
+    if (isPlanInteractionLocked(planRuntimeRecovery, session.id)) return;
+    if (stage === "tasks") {
+      await finishPlan(session);
+      return;
+    }
+    const result = await planMutationQueue().acceptStage(activeProject.rootPath, session.id, stage);
+    const accepted = workspaceRef.current.sessions.find((item) => item.id === session.id);
+    if (accepted?.kind !== "plan" || !result.snapshot.accepted[stage]) return;
+    const nextStage: PlanStage = stage === "requirements" ? "design" : "tasks";
+    const nextSession = setActivePlanStage(accepted, nextStage);
+    updatePlanSession(nextSession);
+    const nextState = nextSession.stages[nextStage];
+    if (nextState.status === "pending" || nextState.status === "failed") {
+      await runPlanGeneration(activeProject, nextSession, nextStage);
+    }
+  }
+
+  async function undoPlanStageDurably(session: PlanSession, stage: PlanStage): Promise<void> {
+    if (
+      !activeProject ||
+      isPlanInteractionLocked(
+        planRuntimeRecovery,
+        session.id,
+        planFinishControllerRef.current!.isInFlight(session.id),
+      )
+    ) return;
+    await planMutationQueue().undoStage(activeProject.rootPath, session.id, stage);
+  }
+
+  async function finishPlan(session: PlanSession): Promise<void> {
+    const controller = planFinishControllerRef.current!;
+    if (!controller.acquire(session.id)) return;
+    setFinishingPlanSessionIds((current) => new Set(current).add(session.id));
+    setPlanFinishError(null);
+    try {
+      const project = workspaceRef.current.projects.find((item) => item.id === session.projectId);
+      if (!project || !canStartPlanRequest(planRuntimeRecovery, session.id)) return;
+      const acceptedResult = await planMutationQueue().acceptStage(project.rootPath, session.id, "tasks");
+      const accepted = workspaceRef.current.sessions.find((item) => item.id === session.id);
+      if (accepted?.kind !== "plan" || !acceptedResult.snapshot.accepted.tasks || !canFinishPlan(accepted)) return;
+      const boundary = capturePlanFinishBoundary(accepted);
+      const canvas = await finishPlanSession(project, accepted);
+      registerBackendStartedCanvasRuns(startedBridgeRuns.current, canvas);
+      setWorkspace((current) => {
+        const result = installFinishedPlanCanvas(current, boundary, canvas);
+        workspaceRef.current = result.workspace;
+        return result.workspace;
+      });
+    } catch {
+      setPlanFinishError({ sessionId: session.id, message: "Plan finish failed. Retry." });
+    } finally {
+      controller.release(session.id);
+      setFinishingPlanSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(session.id);
+        return next;
+      });
+    }
   }
 
   function updateCanvasSession(
@@ -1025,11 +1362,50 @@ export default function App() {
         />
 
         <main className="stage">
+          {workspaceLoadError && (
+            <div className="notice error" role="alert">
+              {workspaceLoadError}
+              <button type="button" onClick={() => setWorkspaceLoadAttempt((attempt) => attempt + 1)}>
+                Retry workspace load
+              </button>
+            </div>
+          )}
+          {workspaceSaveError && (
+            <div className="notice error" role="alert">
+              {workspaceSaveError}
+              <button
+                type="button"
+                onClick={() => {
+                  workspaceSaveDispatcherRef.current?.retry();
+                }}
+              >
+                Retry workspace save
+              </button>
+            </div>
+          )}
           {activeSession?.kind === "plan" && (
             <PlanView
+              key={planViewScopeKey(activeSession)}
               session={activeSession}
               onPlanChange={(section, value) => updatePlanSection(activeSession.id, section, value)}
-              onConfirm={confirmPlan}
+              onPlanBlur={(stage) => planMutationQueue().persistStage(activeProject.rootPath, activeSession.id, stage)}
+              onStageChange={(stage) => updatePlanSession(setActivePlanStage(activeSession, stage))}
+              onGenerate={(stage) => runPlanGeneration(activeProject, activeSession, stage)}
+              onRevise={(stage, instruction) => runPlanRevision(activeProject, activeSession, stage, instruction)}
+              onCancel={(runId) => planAdapter().cancel({
+                planSessionId: activeSession.id,
+                projectRoot: activeProject.rootPath,
+                runId,
+              })}
+              onUndo={(stage) => undoPlanStageDurably(activeSession, stage)}
+              onContinue={(stage) => continuePlan(activeSession, stage)}
+              runtimeStateError={
+                planRuntimeRecovery.planSessionId === activeSession.id ? planRuntimeRecovery.error : null
+              }
+              runtimeStateReady={canStartPlanRequest(planRuntimeRecovery, activeSession.id)}
+              finishInFlight={finishingPlanSessionIds.has(activeSession.id)}
+              finishError={planFinishError?.sessionId === activeSession.id ? planFinishError.message : null}
+              onRetryRuntimeState={() => recoverPlanRuntime(activeProject, activeSession.id)}
             />
           )}
           {activeSession?.kind === "canvas" && (
@@ -1696,204 +2072,541 @@ function formatRelativeTime(value: string): string {
   return `${Math.floor(days / 30)}mo`;
 }
 
+export type PlanUiPhase =
+  | "idle_empty"
+  | "generating"
+  | "streaming"
+  | "ready"
+  | "editing"
+  | "revising"
+  | "error";
+
+export type PlanViewMode = "preview" | "source";
+
+const PLAN_REMARK_PLUGINS = [remarkGfm];
+const PLAN_REHYPE_PLUGINS = [rehypeHighlight];
+
+export function planViewScopeKey(
+  session: Pick<PlanSession, "id" | "activeStage">,
+): string {
+  return `${session.id}:${session.activeStage}`;
+}
+
+export function derivePlanUiPhase(
+  state: Pick<PlanSession["stages"][PlanStage], "status" | "draft">,
+  markdown: string,
+  viewMode: PlanViewMode,
+  sourceDirty: boolean,
+): PlanUiPhase {
+  if (state.status === "generating") {
+    return state.draft.trim().length > 0 ? "streaming" : "generating";
+  }
+  if (state.status === "revising") return "revising";
+  if (state.status === "failed") return "error";
+  if (state.status === "pending" && !markdown.trim()) return "idle_empty";
+  if (state.status === "ready" || (state.status === "pending" && markdown.trim())) {
+    return viewMode === "source" && sourceDirty ? "editing" : "ready";
+  }
+  return "idle_empty";
+}
+
+export function isPlanSourceEditable(
+  phase: PlanUiPhase,
+  hasBuffer: boolean,
+  locked: boolean,
+): boolean {
+  if (locked) return false;
+  if (phase === "generating" || phase === "streaming" || phase === "revising") return false;
+  if (phase === "error") return hasBuffer;
+  return phase === "idle_empty" || phase === "ready" || phase === "editing";
+}
+
+export function isPlanNextEnabled(
+  phase: PlanUiPhase,
+  markdown: string,
+  operation: PlanSession["stages"][PlanStage]["operation"],
+  locked: boolean,
+): boolean {
+  if (locked || !markdown.trim()) return false;
+  if (phase === "generating" || phase === "streaming" || phase === "revising") return false;
+  if (phase === "error") return operation === "revise";
+  return phase === "ready" || phase === "editing";
+}
+
+export function isPlanFinishEnabled(
+  session: PlanSession,
+  phase: PlanUiPhase,
+  locked: boolean,
+): boolean {
+  if (locked) return false;
+  if (phase === "generating" || phase === "streaming" || phase === "revising") return false;
+  return PLAN_SECTION_STEPS.every(({ key }) => {
+    const stage = session.stages[key];
+    const markdown = session.plan[key].trim();
+    if (!markdown) return false;
+    if (key === "tasks") {
+      // Finish accepts Tasks atomically before conversion; requiring prior acceptance makes it unreachable.
+      return stage.status === "ready" && !stage.runId && (
+        stage.accepted || session.activeStage === "tasks"
+      );
+    }
+    return stage.accepted && stage.status === "ready" && !stage.runId;
+  });
+}
+
+export function PlanDocumentEditor({
+  id,
+  value,
+  status,
+  locked = false,
+  onChange,
+  onBlur,
+}: {
+  id: string;
+  value: string;
+  status: PlanSession["stages"][PlanStage]["status"];
+  locked?: boolean;
+  onChange: (value: string) => void;
+  onBlur?: () => void;
+}) {
+  const readOnly = locked || status === "generating" || status === "revising";
+  return (
+    <textarea
+      id={id}
+      className="plan-md-source"
+      value={value}
+      readOnly={readOnly}
+      aria-label="Plan source editor"
+      aria-readonly={readOnly ? true : undefined}
+      spellCheck={false}
+      onChange={(event) => onChange(event.currentTarget.value)}
+      onBlur={onBlur}
+    />
+  );
+}
+
+export function isPlanRevisionAvailable(
+  state: Pick<PlanSession["stages"][PlanStage], "status" | "operation">,
+): boolean {
+  return state.status === "ready" || (state.status === "failed" && state.operation === "revise");
+}
+
+export function derivePlanRevisionTracking(
+  pendingRunId: string | null,
+  stage: Pick<
+    PlanSession["stages"][PlanStage],
+    "status" | "operation" | "runId" | "lastRunId"
+  >,
+): { pendingRunId: string | null; terminalStatus: "ready" | "failed" | null } {
+  if (stage.status === "revising" && stage.operation === "revise" && stage.runId) {
+    return { pendingRunId: stage.runId, terminalStatus: null };
+  }
+  if (
+    pendingRunId &&
+    stage.runId === null &&
+    stage.lastRunId === pendingRunId &&
+    (stage.status === "ready" || stage.status === "failed")
+  ) {
+    return { pendingRunId: null, terminalStatus: stage.status };
+  }
+  return { pendingRunId, terminalStatus: null };
+}
+
+export function PlanMarkdownPreview({ markdown }: { markdown: string }) {
+  return (
+    <article className="plan-md-preview" role="article">
+      <ReactMarkdown
+        remarkPlugins={PLAN_REMARK_PLUGINS}
+        rehypePlugins={PLAN_REHYPE_PLUGINS}
+      >
+        {markdown}
+      </ReactMarkdown>
+    </article>
+  );
+}
+
 function PlanView({
   session,
   onPlanChange,
-  onConfirm,
+  onPlanBlur,
+  onStageChange,
+  onGenerate,
+  onRevise,
+  onCancel,
+  onUndo,
+  onContinue,
+  runtimeStateError,
+  runtimeStateReady,
+  finishInFlight,
+  finishError,
+  onRetryRuntimeState,
 }: {
   session: PlanSession;
   onPlanChange: (section: PlanSectionKey, value: string) => void;
-  onConfirm: (session: PlanSession) => void;
+  onPlanBlur: (section: PlanSectionKey) => Promise<unknown>;
+  onStageChange: (stage: PlanStage) => void;
+  onGenerate: (stage: PlanStage) => Promise<PlanRunStartResult>;
+  onRevise: (stage: PlanStage, instruction: string) => Promise<PlanRunStartResult>;
+  onCancel: (runId: string) => Promise<unknown>;
+  onUndo: (stage: PlanStage) => Promise<void>;
+  onContinue: (stage: PlanStage) => Promise<void>;
+  runtimeStateError: string | null;
+  runtimeStateReady: boolean;
+  finishInFlight: boolean;
+  finishError: string | null;
+  onRetryRuntimeState: () => Promise<boolean>;
 }) {
-  const [activeSection, setActiveSection] = useState<PlanSectionKey>("requirements");
   const [agentInstruction, setAgentInstruction] = useState("");
-  const [revisionStatus, setRevisionStatus] = useState<string | null>(null);
-  const [approvals, setApprovals] = useState<Record<PlanSectionKey, boolean>>({
-    requirements: false,
-    design: false,
-    tasks: false,
-  });
+  const [preservedFailedInstruction, setPreservedFailedInstruction] = useState("");
+  const [submittedRevisionRunId, setSubmittedRevisionRunId] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<PlanViewMode>("preview");
+  const [sourceDirty, setSourceDirty] = useState(false);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   const editorId = useId();
   const requestId = useId();
-  const activeIndex = Math.max(0, PLAN_SECTION_STEPS.findIndex((step) => step.key === activeSection));
+  const activeIndex = Math.max(0, PLAN_SECTION_STEPS.findIndex((step) => step.key === session.activeStage));
   const activeStep = PLAN_SECTION_STEPS[activeIndex] ?? PLAN_SECTION_STEPS[0];
-  const activeText = session.plan[activeStep.key];
-  const isDesktopShell = typeof window !== "undefined" && Boolean(window.devflow);
+  const stageState = session.stages[activeStep.key];
+  const activeText = activePlanMarkdown(session, activeStep.key);
+  const hasBuffer = activeText.trim().length > 0;
+  const revisionAvailable = isPlanRevisionAvailable(stageState);
+  const runActive = stageState.status === "generating" || stageState.status === "revising";
+  const interactionLocked = !runtimeStateReady || finishInFlight;
+  const phase = derivePlanUiPhase(stageState, activeText, viewMode, sourceDirty);
+  const effectiveViewMode: PlanViewMode =
+    phase === "generating" || phase === "streaming" || phase === "revising" || (phase === "error" && !hasBuffer)
+      ? "preview"
+      : viewMode;
+  const sourceEditable = isPlanSourceEditable(phase, hasBuffer, interactionLocked);
+  const nextEnabled = isPlanNextEnabled(phase, activeText, stageState.operation, interactionLocked);
+  const finishEnabled = isPlanFinishEnabled(session, phase, interactionLocked);
+  const undoEnabled = !interactionLocked && !runActive && stageState.checkpoints.length > 0;
+  const sendEnabled =
+    !interactionLocked &&
+    !runActive &&
+    revisionAvailable &&
+    agentInstruction.trim().length > 0 &&
+    hasBuffer;
+  const stopVisible = runActive && !!stageState.runId;
+  const failedOperation = stageState.status === "failed" ? stageState.operation : null;
+
+  useEffect(() => {
+    const tracking = derivePlanRevisionTracking(submittedRevisionRunId, stageState);
+    if (tracking.terminalStatus === "ready") {
+      setAgentInstruction("");
+      setPreservedFailedInstruction("");
+      composerRef.current?.style.removeProperty("height");
+    }
+    if (tracking.pendingRunId !== submittedRevisionRunId) {
+      setSubmittedRevisionRunId(tracking.pendingRunId);
+    }
+  }, [stageState.lastRunId, stageState.operation, stageState.runId, stageState.status, submittedRevisionRunId]);
+
+  useEffect(() => {
+    if (stageState.status === "failed" && stageState.operation === "revise" && agentInstruction.trim()) {
+      setPreservedFailedInstruction(agentInstruction.trim());
+    }
+  }, [stageState.status, stageState.operation, agentInstruction]);
 
   function canAccessSection(section: PlanSectionKey) {
     if (section === "requirements") return true;
-    if (section === "design") return approvals.requirements;
-    if (section === "tasks") return approvals.requirements && approvals.design;
+    if (section === "design") {
+      return session.stages.requirements.accepted || session.stages.design.status !== "pending";
+    }
+    if (section === "tasks") {
+      return session.stages.design.accepted || session.stages.tasks.status !== "pending";
+    }
     return false;
   }
 
   function changeActiveSection(section: PlanSectionKey) {
-    if (!canAccessSection(section)) return;
-    setActiveSection(section);
-    setRevisionStatus(null);
+    if (!interactionLocked && !runActive && canAccessSection(section)) onStageChange(section);
   }
 
-  function handlePlanChange(section: PlanSectionKey, value: string) {
-    onPlanChange(section, value);
-    setApprovals((prev) => {
-      if (!prev[section]) return prev;
-      const next = { ...prev };
-      next[section] = false;
-      if (section === "requirements") {
-        next.design = false;
-        next.tasks = false;
-      } else if (section === "design") {
-        next.tasks = false;
-      }
-      return next;
-    });
-  }
-
-  function handleApprove() {
-    setApprovals((prev) => ({ ...prev, [activeStep.key]: true }));
-    if (activeStep.key === "requirements") {
-      setActiveSection("design");
-      setRevisionStatus(null);
-    } else if (activeStep.key === "design") {
-      setActiveSection("tasks");
-      setRevisionStatus(null);
+  async function submitRevision(): Promise<void> {
+    const instruction = agentInstruction.trim();
+    if (
+      interactionLocked || runActive || !revisionAvailable ||
+      !instruction || !session.plan[activeStep.key].trim()
+    ) return;
+    setPreservedFailedInstruction(instruction);
+    try {
+      const result = await onRevise(activeStep.key, instruction);
+      setSubmittedRevisionRunId(result.runId);
+    } catch {
+      /* The rendered durable stage state owns revision tracking after a bound start. */
     }
   }
 
-  const allApproved = approvals.requirements && approvals.design && approvals.tasks;
-
   function requestAgentRevision(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const instruction = agentInstruction.trim();
-    if (!instruction) return;
-
-    const revisionNote = [
-      `### ${isDesktopShell ? "Agent revision request" : "Mock agent revision"}`,
-      "",
-      `- Page: ${activeStep.label}`,
-      `- Request: ${instruction}`,
-      isDesktopShell
-        ? "- Status: Captured locally; no desktop plan-revision IPC is connected yet."
-        : "- Mock response: deterministic local revision note appended for review.",
-    ].join("\n");
-    const currentText = activeText.trimEnd();
-    const nextText = currentText ? `${currentText}\n\n${revisionNote}` : revisionNote;
-
-    handlePlanChange(activeStep.key, nextText);
-    setAgentInstruction("");
-    setRevisionStatus(
-      isDesktopShell
-        ? "Plan revision request captured. Edit this page before converting."
-        : "Mock agent revision note appended. Review the page before converting.",
-    );
+    void submitRevision();
   }
+
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void submitRevision();
+    }
+  }
+
+  function resizeComposer(element: HTMLTextAreaElement) {
+    element.style.height = "auto";
+    element.style.height = `${Math.min(160, Math.max(44, element.scrollHeight))}px`;
+  }
+
+  async function retryFailedOperation(): Promise<void> {
+    if (interactionLocked || runActive || stageState.status !== "failed") return;
+    if (stageState.operation === "generate") {
+      try {
+        await onGenerate(activeStep.key);
+      } catch {
+        /* surface stays in failed stage state */
+      }
+      return;
+    }
+    if (stageState.operation === "revise") {
+      const instruction = (agentInstruction.trim() || preservedFailedInstruction).trim();
+      if (!instruction || !hasBuffer) return;
+      setAgentInstruction(instruction);
+      setPreservedFailedInstruction(instruction);
+      try {
+        const result = await onRevise(activeStep.key, instruction);
+        setSubmittedRevisionRunId(result.runId);
+      } catch {
+        /* The rendered durable stage state owns revision tracking after a bound start. */
+      }
+    }
+  }
+
+  const nextStep = PLAN_SECTION_STEPS[activeIndex + 1];
+  const prevStep = PLAN_SECTION_STEPS[activeIndex - 1];
+  const statusLiveText =
+    phase === "revising" ? "Revising…"
+      : phase === "generating" || phase === "streaming" ? "Generating…"
+        : finishInFlight ? "Finishing…"
+          : null;
 
   return (
     <section className="plan-view">
-      <div className="plan-header">
-        <div>
-          <p className="eyebrow">Plan</p>
-          <h2>{session.title}</h2>
-          <p>Review one plan page at a time.</p>
-        </div>
-        <button
-          className="primary-action compact-action"
-          disabled={!allApproved}
-          onClick={() => onConfirm(session)}
-        >
-          <Play size={16} />
-          Convert to Canvas
-        </button>
-      </div>
-
-      <div className="plan-stepbar" aria-label="Plan progress">
-        <span>
-          Step {activeIndex + 1} of {PLAN_SECTION_STEPS.length}
-        </span>
-        <div className="plan-step-buttons">
+      <div className="plan-toolbar">
+        <nav className="plan-stage-progress" aria-label="Plan progress">
           {PLAN_SECTION_STEPS.map((step, index) => {
-            const isApproved = approvals[step.key];
+            const isApproved = session.stages[step.key].accepted;
             const isAccessible = canAccessSection(step.key);
+            const isCurrent = step.key === activeStep.key;
             return (
               <button
                 key={step.key}
-                className={step.key === activeStep.key ? "active" : ""}
+                className={[
+                  "plan-stage-progress-button",
+                  isCurrent ? "active" : "",
+                  isApproved ? "accepted" : "",
+                ].filter(Boolean).join(" ")}
                 type="button"
-                aria-current={step.key === activeStep.key ? "step" : undefined}
-                disabled={!isAccessible}
+                aria-current={isCurrent ? "step" : undefined}
+                aria-label={step.label}
+                disabled={interactionLocked || !isAccessible || runActive}
                 onClick={() => changeActiveSection(step.key)}
               >
-                <span>{isApproved ? <CheckCircle2 size={12} /> : index + 1}</span>
+                <span className="plan-stage-progress-marker" aria-hidden="true">
+                  {isApproved ? <Check size={12} /> : index + 1}
+                </span>
                 {step.label}
               </button>
             );
           })}
-        </div>
-      </div>
+        </nav>
 
-      <div className="plan-workspace">
-        <div className="plan-editor-card">
-          <div className="plan-section-heading">
-            <div>
-              <p className="eyebrow">{activeStep.label}</p>
-              <h3>{activeStep.label}</h3>
-            </div>
-            <div className="plan-step-actions">
+        <div className="plan-toolbar-actions">
+          <button
+            className="plan-undo-revision"
+            type="button"
+            aria-label="Undo last revision"
+            disabled={!undoEnabled}
+            onClick={() => void onUndo(activeStep.key)}
+          >
+            <Undo2 size={16} />
+            Undo
+          </button>
+
+          <div className="plan-view-toggle" role="group" aria-label="Document view">
+            <button
+              type="button"
+              aria-label="Preview mode"
+              aria-pressed={effectiveViewMode === "preview"}
+              disabled={interactionLocked || runActive}
+              onClick={() => setViewMode("preview")}
+            >
+              <Eye size={14} />
+              Preview
+            </button>
+            <button
+              type="button"
+              aria-label="Source mode"
+              aria-pressed={effectiveViewMode === "source"}
+              disabled={
+                interactionLocked ||
+                runActive ||
+                phase === "generating" ||
+                phase === "streaming" ||
+                phase === "revising" ||
+                (phase === "error" && !hasBuffer)
+              }
+              onClick={() => setViewMode("source")}
+            >
+              <FileText size={14} />
+              Source
+            </button>
+          </div>
+
+          {stopVisible && (
+            <button
+              className="plan-stop-button"
+              type="button"
+              aria-label="Stop"
+              disabled={interactionLocked}
+              onClick={() => void onCancel(stageState.runId!)}
+            >
+              <Square size={14} />
+              Stop
+            </button>
+          )}
+
+          <div className="plan-stage-actions">
+            {activeIndex > 0 && (
               <button
                 type="button"
-                disabled={activeIndex === 0}
-                onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex - 1]?.key ?? activeStep.key)}
+                aria-label={prevStep ? `Back to ${prevStep.label}` : "Back"}
+                disabled={interactionLocked || runActive}
+                onClick={() => changeActiveSection(prevStep?.key ?? activeStep.key)}
               >
+                <ChevronLeft size={14} />
                 Back
               </button>
-              {approvals[activeStep.key] ? (
-                <button
-                  type="button"
-                  disabled={activeIndex === PLAN_SECTION_STEPS.length - 1 || !canAccessSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key as PlanSectionKey)}
-                  onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex + 1]?.key ?? activeStep.key)}
-                >
-                  Next
-                </button>
-              ) : (
-                <button className="plan-approve-button" type="button" onClick={handleApprove}>
-                  <CheckCircle2 size={16} />
-                  {activeStep.key === "tasks" ? "Approve tasks" : `Approve ${activeStep.label.toLowerCase()} / Continue`}
-                </button>
-              )}
-            </div>
+            )}
+            {activeStep.key === "tasks" ? (
+              <button
+                className="plan-finish-button"
+                type="button"
+                aria-label="Finish plan and convert to canvas"
+                disabled={!finishEnabled}
+                onClick={() => void onContinue(activeStep.key)}
+              >
+                <Check size={14} />
+                Finish Plan
+              </button>
+            ) : (
+              <button
+                className="plan-next-button"
+                type="button"
+                aria-label={nextStep ? `Approve and continue to ${nextStep.label}` : "Next"}
+                disabled={!nextEnabled}
+                onClick={() => void onContinue(activeStep.key)}
+              >
+                Next
+                <ChevronRight size={14} />
+              </button>
+            )}
           </div>
-          <label className="plan-editor-label" htmlFor={editorId}>
-            Edit this page
-          </label>
-          <textarea
-            id={editorId}
-            className="plan-editor"
-            value={activeText}
-            onChange={(event) => handlePlanChange(activeStep.key, event.currentTarget.value)}
-          />
-        </div>
-
-        <div className="plan-preview-card" aria-label={`${activeStep.label} preview`}>
-          <ReactMarkdown>{activeText}</ReactMarkdown>
         </div>
       </div>
 
-      <form className="plan-agent-panel" onSubmit={requestAgentRevision}>
-        <div>
-          <label htmlFor={requestId}>Ask agent to revise this page</label>
-          <p>Convert only after the plan is acceptable.</p>
-        </div>
-        <textarea
-          id={requestId}
-          value={agentInstruction}
-          onChange={(event) => setAgentInstruction(event.currentTarget.value)}
-          placeholder={`Request changes to ${activeStep.label.toLowerCase()}`}
-        />
-        <div className="plan-agent-actions">
-          {revisionStatus && <span>{revisionStatus}</span>}
-          <button className="primary-action compact-action" type="submit" disabled={!agentInstruction.trim()}>
-            Request revision
+      <div
+        className="plan-document"
+        data-phase={phase}
+        data-view={effectiveViewMode}
+      >
+        {runtimeStateError ? (
+          <div className="plan-error-banner" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>{runtimeStateError}</span>
+            <button type="button" onClick={() => void onRetryRuntimeState()}>
+              Retry runtime state
+            </button>
+          </div>
+        ) : stageState.status === "failed" ? (
+          <div className="plan-error-banner" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>
+              {stageState.error
+                ?? (failedOperation === "revise"
+                  ? "Revision failed. Retry to continue."
+                  : "Generation failed. Retry to continue.")}
+            </span>
+            <button
+              type="button"
+              aria-label={failedOperation === "revise" ? "Retry revision" : "Retry generation"}
+              disabled={
+                interactionLocked ||
+                (failedOperation === "revise" && !(agentInstruction.trim() || preservedFailedInstruction).trim())
+              }
+              onClick={() => void retryFailedOperation()}
+            >
+              <RefreshCw size={14} />
+              Retry
+            </button>
+          </div>
+        ) : null}
+
+        {finishError && (
+          <div className="plan-error-banner" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>{finishError}</span>
+          </div>
+        )}
+
+        {effectiveViewMode === "source" ? (
+          <PlanDocumentEditor
+            id={editorId}
+            value={activeText}
+            status={stageState.status}
+            locked={!sourceEditable}
+            onChange={(value) => {
+              if (!sourceEditable) return;
+              setSourceDirty(true);
+              onPlanChange(activeStep.key, value);
+            }}
+            onBlur={() => {
+              if (!interactionLocked) void onPlanBlur(activeStep.key);
+            }}
+          />
+        ) : (
+          <PlanMarkdownPreview markdown={activeText} />
+        )}
+      </div>
+
+      <form className="plan-composer" onSubmit={requestAgentRevision}>
+        {statusLiveText && (
+          <div className="plan-composer-status" aria-live="polite">
+            {statusLiveText}
+          </div>
+        )}
+        <div className="plan-composer-field">
+          <textarea
+            id={requestId}
+            ref={composerRef}
+            className="plan-composer-input"
+            value={agentInstruction}
+            readOnly={interactionLocked || !revisionAvailable || runActive}
+            aria-label="Revision instruction"
+            placeholder="Revise with instruction"
+            rows={1}
+            onChange={(event) => {
+              setAgentInstruction(event.currentTarget.value);
+              resizeComposer(event.currentTarget);
+            }}
+            onKeyDown={handleComposerKeyDown}
+          />
+          <button
+            className="plan-composer-send"
+            type="submit"
+            aria-label="Send revision"
+            disabled={!sendEnabled}
+            aria-busy={phase === "revising" || undefined}
+          >
+            <ArrowUp size={18} strokeWidth={2.5} />
           </button>
         </div>
       </form>
@@ -5655,10 +6368,20 @@ function ModeSwitch({
 }) {
   return (
     <div className={`mode-segmented-switch ${compact ? "compact" : ""}`} role="group" aria-label="Mode">
-      <button className={`mode-segment-btn ${mode === "fast" ? "active" : ""}`} onClick={() => onChange("fast")} type="button">
-        Fast
+      <button
+        className={`mode-segment-btn ${mode === "fast" ? "active" : ""}`}
+        onClick={() => onChange("fast")}
+        type="button"
+        aria-pressed={mode === "fast"}
+      >
+        Canvas
       </button>
-      <button className={`mode-segment-btn ${mode === "plan" ? "active" : ""}`} onClick={() => onChange("plan")} type="button">
+      <button
+        className={`mode-segment-btn ${mode === "plan" ? "active" : ""}`}
+        onClick={() => onChange("plan")}
+        type="button"
+        aria-pressed={mode === "plan"}
+      >
         Plan
       </button>
     </div>
@@ -5669,12 +6392,185 @@ function StatusLight({ status }: { status: NodeStatus }) {
   return <span className={`status-light ${status}`} aria-label={status} />;
 }
 
+export function createPlanFinishController() {
+  const inFlight = new Set<string>();
+  return {
+    acquire(planSessionId: string): boolean {
+      if (inFlight.has(planSessionId)) return false;
+      inFlight.add(planSessionId);
+      return true;
+    },
+    isInFlight(planSessionId: string): boolean {
+      return inFlight.has(planSessionId);
+    },
+    release(planSessionId: string): void {
+      inFlight.delete(planSessionId);
+    },
+  };
+}
+
+export interface PlanFinishBoundary {
+  planSessionId: string;
+  projectId: string;
+  stateVersion: number;
+  plan: PlanMarkdown;
+  stages: Record<PlanStage, {
+    status: PlanSession["stages"][PlanStage]["status"];
+    accepted: boolean;
+    draft: string;
+    error: string | null;
+    runId: string | null;
+    lastRunId: string | null;
+    operation: PlanSession["stages"][PlanStage]["operation"];
+    checkpoints: string[];
+  }>;
+}
+
+export function capturePlanFinishBoundary(session: PlanSession): PlanFinishBoundary {
+  return {
+    planSessionId: session.id,
+    projectId: session.projectId,
+    stateVersion: session.stateVersion,
+    plan: { ...session.plan },
+    stages: Object.fromEntries(PLAN_SECTION_STEPS.map(({ key }) => {
+      const stage = session.stages[key];
+      return [key, {
+        status: stage.status,
+        accepted: stage.accepted,
+        draft: stage.draft,
+        error: stage.error,
+        runId: stage.runId,
+        lastRunId: stage.lastRunId,
+        operation: stage.operation,
+        checkpoints: [...stage.checkpoints],
+      }];
+    })) as PlanFinishBoundary["stages"],
+  };
+}
+
+export function installFinishedPlanCanvas(
+  workspace: WorkspaceState,
+  boundary: PlanFinishBoundary,
+  canvas: CanvasSession,
+): { workspace: WorkspaceState; installed: boolean } {
+  if (canvas.id !== boundary.planSessionId || canvas.projectId !== boundary.projectId) {
+    return { workspace, installed: false };
+  }
+  const index = workspace.sessions.findIndex((session) => session.id === boundary.planSessionId);
+  const session = workspace.sessions[index];
+  if (!session || session.kind !== "plan" || !planMatchesFinishBoundary(session, boundary)) {
+    return { workspace, installed: false };
+  }
+  const sessions = [...workspace.sessions];
+  sessions[index] = canvas;
+  return {
+    installed: true,
+    workspace: {
+      ...workspace,
+      sessions,
+      changesets: { ...workspace.changesets, ...changesetsForSession(canvas) },
+      activeSessionId: canvas.id,
+    },
+  };
+}
+
+export function registerBackendStartedCanvasRuns(startedRuns: Set<string>, canvas: CanvasSession): void {
+  for (const node of canvas.nodes) {
+    if ((node.status === "running" || node.status === "retrying") && node.runId) {
+      startedRuns.add(node.runId);
+    }
+  }
+}
+
+function planMatchesFinishBoundary(session: PlanSession, boundary: PlanFinishBoundary): boolean {
+  if (
+    session.id !== boundary.planSessionId ||
+    session.projectId !== boundary.projectId ||
+    session.stateVersion !== boundary.stateVersion
+  ) return false;
+  return PLAN_SECTION_STEPS.every(({ key }) => {
+    const stage = session.stages[key];
+    const expected = boundary.stages[key];
+    return session.plan[key] === boundary.plan[key] &&
+      stage.status === expected.status &&
+      stage.accepted === expected.accepted &&
+      stage.draft === expected.draft &&
+      stage.error === expected.error &&
+      stage.runId === expected.runId &&
+      stage.lastRunId === expected.lastRunId &&
+      stage.operation === expected.operation &&
+      stage.checkpoints.length === expected.checkpoints.length &&
+      stage.checkpoints.every((checkpoint, index) => checkpoint === expected.checkpoints[index]);
+  });
+}
+
+export function createWorkspaceSaveDispatcher<T>(
+  save: (workspace: T) => Promise<void>,
+  currentWorkspace: () => T,
+  onError: (message: string | null) => void,
+) {
+  let latestGeneration = 0;
+
+  const dispatch = (workspace: T): void => {
+    const generation = ++latestGeneration;
+    onError(null);
+    let request: Promise<void>;
+    try {
+      request = save(workspace);
+    } catch {
+      if (generation === latestGeneration) onError("Workspace save failed.");
+      return;
+    }
+    void request.then(
+      () => {
+        if (generation === latestGeneration) onError(null);
+      },
+      () => {
+        if (generation === latestGeneration) onError("Workspace save failed.");
+      },
+    );
+  };
+
+  return {
+    dispatch,
+    retry(): void {
+      dispatch(currentWorkspace());
+    },
+  };
+}
+
+export async function finishPlanSession(
+  project: ImportedProject,
+  session: PlanSession,
+): Promise<CanvasSession> {
+  if (!canFinishPlan(session)) throw new Error("Approved Plan is invalid.");
+  const canvas = convertPlanToCanvas(session);
+  if (!window.devflow) return canvas;
+  const result = await window.devflow.finishPlanWorkflow(project.rootPath, {
+    planSessionId: session.id,
+    session: {
+      id: canvas.id,
+      projectId: canvas.projectId,
+      title: canvas.title,
+      goal: canvas.goal,
+      mode: canvas.mode,
+      target: canvas.target,
+    },
+  });
+  if (!isCanvasSession(result.canvasSession) || result.canvasSession.id !== session.id) {
+    throw new Error("Authoritative canvas session was not returned.");
+  }
+  return result.canvasSession;
+}
+
 async function persistCanvasWorkflowSession(
   project: ImportedProject,
   session: CanvasSession,
   inputSource: string,
-): Promise<void> {
-  if (!window.devflow) return;
+  workflowInput = session.goal,
+  requireAuthoritativeCanvas = false,
+): Promise<CanvasSession> {
+  if (!window.devflow) return session;
   await window.devflow.createWorkflowSession(project.rootPath, {
     id: session.id,
     projectId: session.projectId,
@@ -5687,12 +6583,17 @@ async function persistCanvasWorkflowSession(
     recoveryReason: "SkyTurn event ledger initializes planner continuity.",
     now: session.createdAt,
   });
-  await window.devflow.appendWorkflowUserInput(project.rootPath, {
+  const result = await window.devflow.appendWorkflowUserInput(project.rootPath, {
     sessionId: session.id,
     inputId: `${inputSource}-${session.id}`,
-    text: session.goal,
+    text: workflowInput,
     now: session.createdAt,
   });
+  if (!isCanvasSession(result.canvasSession) || result.canvasSession.id !== session.id) {
+    if (requireAuthoritativeCanvas) throw new Error("Authoritative canvas session was not returned.");
+    return session;
+  }
+  return result.canvasSession;
 }
 
 function canvasSessionFromWorkflowEvent(event: unknown): CanvasSession | null {
@@ -5732,6 +6633,17 @@ function isCanvasSession(value: unknown): value is CanvasSession {
     Array.isArray(candidate.nodes) &&
     Array.isArray(candidate.edges)
   );
+}
+
+export function applyPlanEventToWorkspace(workspace: WorkspaceState, event: PlanEvent): WorkspaceState {
+  let changed = false;
+  const sessions = workspace.sessions.map((session) => {
+    if (session.kind !== "plan" || session.id !== event.planSessionId) return session;
+    const next = applyPlanEvent(session, event);
+    if (next !== session) changed = true;
+    return next;
+  });
+  return changed ? { ...workspace, sessions } : workspace;
 }
 
 function createSession(projectId: string, goal: string, mode: WorkflowMode, target: SessionTarget): CanvasSessionTab {
@@ -5832,11 +6744,12 @@ function nextMockOutputLine(node: CanvasNode, lineIndex: number): string {
   return lines[lineIndex] ?? `${node.agent} is waiting for the next checkpoint.`;
 }
 
-function makeProject(project: { name: string; rootPath: string; devflowPath: string }): ImportedProject {
+function makeProject(project: { name: string; rootPath: string; canonicalRootPath?: string; devflowPath: string }): ImportedProject {
   return {
     id: `project-${stableId(project.rootPath)}`,
     name: project.name,
     rootPath: project.rootPath,
+    ...(project.canonicalRootPath ? { canonicalRootPath: project.canonicalRootPath } : {}),
     devflowPath: project.devflowPath,
     openedAt: new Date().toISOString(),
   };

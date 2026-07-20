@@ -110,7 +110,8 @@ test("preload exposes a narrow terminal namespace with safe subscriptions", asyn
   assert.match(terminalBlock, /ipcRenderer\.on\("terminal:event", handler\)/);
   assert.match(terminalBlock, /return \(\) => ipcRenderer\.removeListener\("terminal:event", handler\)/);
   assert.doesNotMatch(terminalBlock, /ipcRenderer\s*:|return\s+ipcRenderer|listener\(_event|ipcRenderer\.on\("terminal:event", listener\)/);
-  assert.match(preload, /terminal,\n\s+onRunEvent/);
+  const exposedApi = preload.slice(preload.indexOf('contextBridge.exposeInMainWorld("devflow"'), preload.indexOf("declare global"));
+  assert.match(exposedApi, /\n\s+terminal,\n/);
 });
 
 test("renderer public types expose terminal API without backend internals", async () => {

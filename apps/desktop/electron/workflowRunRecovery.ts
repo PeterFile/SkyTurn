@@ -15,6 +15,7 @@ interface RecoveryBridge {
 
 interface RecoveryStore {
   listRunningSegments(): RunningSegment[];
+  listPendingPlannerIntentReconciliations(): RunSegmentIdentity[];
   listPendingRunCheckpointEnrichments(): RunSegmentIdentity[];
   recordRunResult(input: {
     sessionId: string;
@@ -75,6 +76,7 @@ export async function recoverTerminalWorkflowRuns(
   summarizeOutput: (events: unknown[]) => string | undefined,
   now: () => string = () => new Date().toISOString(),
   enrichAfterCheckpoint?: (segment: RunSegmentIdentity) => Promise<void>,
+  reconcilePendingPlannerIntent?: (segment: RunSegmentIdentity) => Promise<void>,
 ): Promise<void> {
   for (const segment of store.listRunningSegments()) {
     try {
@@ -107,6 +109,24 @@ export async function recoverTerminalWorkflowRuns(
         },
         now: now(),
       });
+    }
+  }
+  if (reconcilePendingPlannerIntent) {
+    for (const segment of store.listPendingPlannerIntentReconciliations()) {
+      try {
+        await reconcilePendingPlannerIntent(segment);
+      } catch {
+        store.appendWorkflowEvent({
+          sessionId: segment.sessionId,
+          kind: "workflow.run.recovery_failed",
+          source: "electron-main",
+          laneId: segment.laneId,
+          segmentId: segment.segmentId,
+          idempotencyKey: `planner-intent-recovery:${segment.runId}:failed`,
+          payload: { runId: segment.runId, status: "failed", reason: "planner-intent-recovery-failed" },
+          now: now(),
+        });
+      }
     }
   }
   if (!enrichAfterCheckpoint) return;

@@ -1,4 +1,6 @@
 import {
+  PLAN_MARKDOWN_MAX_LENGTH,
+  makeHermesPlanConversationId,
   makeHermesPlannerSessionId,
   normalizeSessionTarget,
   type AgentKind,
@@ -8,6 +10,9 @@ import {
   type CanvasSession,
   type NodeRuntimeState,
   type PlanMarkdown,
+  type PlanOperation,
+  type PlanStage,
+  type PlanStageState,
   type PlanSession,
   type SessionTarget,
   type WorktreeMetadata,
@@ -18,6 +23,10 @@ interface CreateSessionInput {
   goal: string;
   createdAt: string;
   target?: SessionTarget;
+}
+
+export interface CreatePlanSessionOptions {
+  randomUUID?: () => string;
 }
 
 interface TaskSeed {
@@ -70,6 +79,28 @@ const plan: PlanMarkdown = {
     "- [ ] Task 2 (ref: Requirement 2)",
   ].join("\n"),
 };
+
+const emptyPlan: PlanMarkdown = {
+  requirements: "",
+  design: "",
+  tasks: "",
+};
+
+const maxPlanGoalLength = 100_000;
+const maxApprovedPlanWorkflowInputLength = maxPlanGoalLength + PLAN_MARKDOWN_MAX_LENGTH * 3 + 256;
+
+function pendingPlanStage(): PlanStageState {
+  return {
+    status: "pending",
+    accepted: false,
+    draft: "",
+    error: null,
+    runId: null,
+    lastRunId: null,
+    operation: null,
+    checkpoints: [],
+  };
+}
 
 const fastSeeds: TaskSeed[] = [
   {
@@ -134,8 +165,11 @@ export function createFastCanvasSession(input: CreateSessionInput): CanvasSessio
   });
 }
 
-export function createPlanSession(input: CreateSessionInput): PlanSession {
-  const sessionId = makeSessionId("plan", input.createdAt);
+export function createPlanSession(
+  input: CreateSessionInput,
+  options: CreatePlanSessionOptions = {},
+): PlanSession {
+  const sessionId = `${makeSessionId("plan", input.createdAt)}-${(options.randomUUID ?? defaultRandomUUID)()}`;
   const target = normalizeSessionTarget(input.target);
   return {
     id: sessionId,
@@ -147,11 +181,105 @@ export function createPlanSession(input: CreateSessionInput): PlanSession {
     target,
     createdAt: input.createdAt,
     updatedAt: input.createdAt,
-    plan,
+    plan: { ...emptyPlan },
+    stateVersion: 0,
+    activeStage: "requirements",
+    plannerConversationId: makeHermesPlanConversationId(sessionId),
+    conversationStarted: false,
+    stages: {
+      requirements: pendingPlanStage(),
+      design: pendingPlanStage(),
+      tasks: pendingPlanStage(),
+    },
     nodes: [],
     edges: [],
     activeNodeId: null,
   };
+}
+
+function defaultRandomUUID(): string {
+  return globalThis.crypto.randomUUID();
+}
+
+export interface BuildPlanPromptInput {
+  operation: PlanOperation;
+  stage: PlanStage;
+  goal: string;
+  projectContext: string;
+  requirements: string;
+  design: string;
+  currentMarkdown?: string;
+  instruction?: string;
+}
+
+export function buildPlanPrompt(input: BuildPlanPromptInput): string {
+  const stageName = stageLabel(input.stage);
+  const rules = [
+    "You are planning only. Do not modify files or execute commands.",
+    `Return only Markdown for the complete ${stageName} document.`,
+    "Do not wrap the document in a code fence and do not add commentary.",
+  ];
+
+  const context = [
+    ...rules,
+    `Goal:\n${input.goal}`,
+    `Project context:\n${input.projectContext}`,
+  ];
+  if (input.stage !== "requirements") context.push(`Completed Requirements:\n${input.requirements}`);
+  if (input.stage === "tasks") context.push(`Completed Design:\n${input.design}`);
+  if (input.operation === "revise") {
+    context.push(
+      `Revise the ${stageName} stage and return a full replacement Markdown document for that stage only.`,
+      `Current completed Markdown:\n${input.currentMarkdown ?? ""}`,
+      `User revision instruction:\n${input.instruction ?? ""}`,
+    );
+  } else if (input.stage === "requirements") {
+    context.push("Produce Requirements only.");
+  } else if (input.stage === "design") {
+    context.push("Produce Design only.");
+  } else {
+    context.push("Produce Tasks only.");
+  }
+  return context.join("\n\n");
+}
+
+export function formatApprovedPlanWorkflowInput(session: PlanSession): string {
+  if (
+    !session.goal.trim() ||
+    session.goal.length > maxPlanGoalLength ||
+    (["requirements", "design", "tasks"] as const).some((stage) => (
+      session.stages[stage].status !== "ready" ||
+      !session.stages[stage].accepted ||
+      session.stages[stage].runId !== null ||
+      !session.plan[stage].trim() ||
+      session.plan[stage].length > PLAN_MARKDOWN_MAX_LENGTH
+    ))
+  ) {
+    throw new Error("Approved Plan is invalid.");
+  }
+  const formatted = [
+    "# Approved Plan",
+    "",
+    "## Goal",
+    session.goal,
+    "",
+    "## Requirements",
+    session.plan.requirements,
+    "",
+    "## Design",
+    session.plan.design,
+    "",
+    "## Tasks",
+    session.plan.tasks,
+  ].join("\n");
+  if (formatted.length > maxApprovedPlanWorkflowInputLength) {
+    throw new Error("Approved Plan is invalid.");
+  }
+  return formatted;
+}
+
+function stageLabel(stage: PlanStage): string {
+  return stage[0].toUpperCase() + stage.slice(1);
 }
 
 export function convertPlanToCanvas(session: PlanSession): CanvasSession {

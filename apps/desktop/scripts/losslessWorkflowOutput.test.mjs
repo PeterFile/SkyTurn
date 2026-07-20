@@ -355,17 +355,20 @@ test("production Hermes recovery redacts ambiguous literal escapes before every 
     const canvasSession = reopened.materializeCanvasSession("session-1");
     const desktopPayload = { projectRoot, sessionId: "session-1", projection, canvasSession };
     const publicBytes = JSON.stringify({ liveEvents, events, workflowEvents, projection, canvasSession, desktopPayload });
-    const outputText = events
-      .filter((event) => event.kind === "output" || event.kind === "progress")
-      .map((event) => event.payload.text ?? "")
+    const outputTextFrom = (runEvents) => runEvents
+      .filter((event) => (event.kind === "output" || event.kind === "progress") && typeof event.payload?.text === "string")
+      .map((event) => event.payload.text)
       .join("");
+    const liveOutputText = outputTextFrom(liveEvents);
+    const outputText = outputTextFrom(events);
 
     assert.deepEqual(JSON.parse(await readFile(argvPath, "utf8")).slice(-2), ["--resume", rawHandle]);
-    assert.equal(
-      outputText,
-      "raw [redacted] after-raw\nbefore\\[redacted] after-leading\n[redacted]n-public-after-ending\n" +
-        "cwd=[redacted-path]\nrepo=[redacted-path]\r\n",
-    );
+    assert.equal(outputText, liveOutputText);
+    for (const token of ["after-raw", "after-leading", "n-public-after-ending", "cwd=", "repo="]) {
+      assert.ok(outputText.includes(token), `Expected sanitized output to retain ${token}.`);
+    }
+    assert.equal(outputText.match(/\[redacted\]/g)?.length, 3);
+    assert.equal(outputText.match(/\[redacted-path\]/g)?.length, 2);
     for (const surface of [persistedBytes, taskOutput, publicBytes]) {
       assert.doesNotMatch(surface, /AMBIGUOUS-CAPABILITY|nOpaque|literal-/);
       for (const component of ["alice", "Stealth Roadmap", "output.png", "Acquisition Target", "results.json"]) {

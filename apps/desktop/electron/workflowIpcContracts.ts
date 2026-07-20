@@ -2,6 +2,7 @@ export const WORKFLOW_IPC_ERROR_PREFIX = "SKYTURN_WORKFLOW_IPC_ERROR";
 
 export const WORKFLOW_IPC_CHANNELS = {
   createSession: "workflow:createSession",
+  finishPlan: "workflow:finishPlan",
   appendUserInput: "workflow:appendUserInput",
   ledger: "workflow:ledger",
   applyIntent: "workflow:applyIntent",

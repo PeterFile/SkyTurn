@@ -887,11 +887,22 @@ test("Electron project memory IPC does not register arbitrary renderer paths", a
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const initHandler = main.match(/ipcMain\.handle\("project:initDevflow"[\s\S]*?\n\}\);/)?.[0] ?? "";
   const saveHandler = main.match(/ipcMain\.handle\("workspace:save"[\s\S]*?\n\}\);/)?.[0] ?? "";
+  const authorizeWorkspaceStateForSave = main.slice(
+    main.indexOf("async function authorizeWorkspaceStateForSave"),
+    main.indexOf("async function trustedWorkspaceProjectIdentities"),
+  );
+  const workspaceSaveWriter = main.slice(
+    main.indexOf("function createWorkspaceSaveWriter"),
+    main.indexOf("async function writeWorkspaceStateAtomically"),
+  );
 
   assert.match(initHandler, /assertKnownProjectRoot\(rootPath\)/);
   assert.doesNotMatch(initHandler, /openedProjectRoots\.add\(rootPath\)/);
   assert.doesNotMatch(saveHandler, /rememberProjectRoots/);
-  assert.match(saveHandler, /sanitizeWorkspaceStateForKnownProjects\(state\)/);
+  assert.match(saveHandler, /workspaceSaveWriter\.save\(state\)/);
+  assert.match(workspaceSaveWriter, /await authorizeWorkspaceStateForSave\(request\.state\)/);
+  assert.match(authorizeWorkspaceStateForSave, /sanitizeWorkspaceStateForPersistence\(state\)/);
+  assert.doesNotMatch(saveHandler, /openedProjectRoots/);
 });
 
 test("preload exposes narrow natural workflow wrappers", async () => {
