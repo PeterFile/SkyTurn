@@ -110,7 +110,7 @@ describe("SQLite workflow store", () => {
     seedLegacyHermesHandle(projectRoot, "session-legacy-old", rawHandle, true);
 
     const reopened = createWorkflowStore({ projectRoot });
-    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(reopened.listHermesSessions("session-legacy-old")[0]?.opaqueHandle).toBe("[redacted]");
     reopened.close();
     await expectRawHandleAbsent(projectRoot, rawHandle);
@@ -130,7 +130,7 @@ describe("SQLite workflow store", () => {
       projectRoot,
       faultInjection: maintenanceFaultInjection({ trace: firstTrace }),
     });
-    expect(first.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(first.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     expect(first.listHermesSessions("session-maintenance")[0]?.opaqueHandle).toBe("[redacted]");
     first.close();
 
@@ -636,8 +636,8 @@ describe("SQLite workflow store", () => {
     expect(first.databasePath).toBe(join(await realpath(projectRoot), ".devflow", "skyturn-workflow.sqlite"));
     expect(pragmas.journalMode).toBe("wal");
     expect(pragmas.foreignKeys).toBe(1);
-    expect(firstMigrations).toEqual([1, 2, 3, 4, 5, 6, 7]);
-    expect(second.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(firstMigrations).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(second.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     second.close();
   });
 
@@ -3695,6 +3695,161 @@ describe("SQLite workflow store", () => {
     store.close();
   });
 
+  it("keeps Finish launch acceptance durable but out of Flow projection and planner ledger", async () => {
+    const projectRoot = await makeTempRoot();
+    const rawAcpHandle = "acp-private-finish-plan-handle";
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const projectionBefore = store.materializeFlowProjection("session-1");
+    const ledgerBefore = store.buildLedgerSummary("session-1");
+    const input = {
+      sessionId: "session-1",
+      kind: "workflow.plan_finish.launch_accepted" as const,
+      source: "electron-main" as const,
+      idempotencyKey: "plan-finish:plan-confirm-session-1:launch-accepted",
+      payload: {
+        inputId: "plan-confirm-session-1",
+        runId: "hermes-plan-finish-session-1-attempt-1",
+      },
+      now: "2026-06-14T00:00:03.000Z",
+    };
+
+    const accepted = store.appendWorkflowEvent(input);
+    const retry = store.appendWorkflowEvent(input);
+    expect(retry).toEqual(accepted);
+    expect(store.listEvents("session-1").filter((event) => event.kind === input.kind)).toHaveLength(1);
+    expect(store.materializeFlowProjection("session-1")).toEqual(projectionBefore);
+    expect(store.buildLedgerSummary("session-1")).toEqual(ledgerBefore);
+    expect(JSON.stringify(store.listEvents("session-1"))).not.toContain(rawAcpHandle);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listEvents("session-1").filter((event) => event.kind === input.kind)).toHaveLength(1);
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(projectionBefore);
+    expect(reopened.buildLedgerSummary("session-1")).toEqual(ledgerBefore);
+    expect(JSON.stringify(reopened.listEvents("session-1"))).not.toContain(rawAcpHandle);
+    reopened.close();
+  });
+
+  it("bounds terminal planner intent recovery with an internal durable marker", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const session = planFinishWorkflowSessionInput();
+    store.createPlanFinishWorkflowSession(session);
+    const { segment } = store.claimPlannerRunStart({
+      sessionId: session.id,
+      laneId: "node-1",
+      runId: "hermes-plan-finish-session-plan-finish-attempt-1",
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-07-18T00:00:01.000Z",
+    });
+    store.recordRunResult({
+      ...segment,
+      outputSummary: "Planner completed before intent reconciliation.",
+      evidence: {
+        runId: segment.runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-07-18T00:00:02.000Z",
+      },
+      now: "2026-07-18T00:00:02.000Z",
+    });
+    const projectionBefore = store.materializeFlowProjection(session.id);
+    const ledgerBefore = store.buildLedgerSummary(session.id);
+
+    expect(store.listPendingPlannerIntentReconciliations()).toEqual([{
+      sessionId: segment.sessionId,
+      laneId: segment.laneId,
+      segmentId: segment.segmentId,
+      runId: segment.runId,
+      agentKind: segment.agentKind,
+    }]);
+    store.recordPlannerIntentReconciled(segment, "2026-07-18T00:00:03.000Z");
+
+    expect(store.listPendingPlannerIntentReconciliations()).toEqual([]);
+    expect(store.materializeFlowProjection(session.id)).toEqual(projectionBefore);
+    expect(store.buildLedgerSummary(session.id)).toEqual(ledgerBefore);
+    store.close();
+  });
+
+  it("creates the Plan Finish session and backend binding atomically", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({
+      projectRoot,
+      faultInjection: {
+        beforePlanFinishBinding: () => {
+          throw new Error("injected Plan Finish binding failure");
+        },
+      },
+    });
+
+    expect(() => store.createPlanFinishWorkflowSession(planFinishWorkflowSessionInput()))
+      .toThrow("injected Plan Finish binding failure");
+    expect(store.getWorkflowSession("session-plan-finish")).toBeNull();
+    expect(store.listEvents("session-plan-finish")).toEqual([]);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.getWorkflowSession("session-plan-finish")).toBeNull();
+    expect(reopened.listEvents("session-plan-finish")).toEqual([]);
+    reopened.close();
+  });
+
+  it("rejects generic reuse while preserving exact durable Plan Finish retries across reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const input = planFinishWorkflowSessionInput();
+    const store = createWorkflowStore({ projectRoot });
+    const created = store.createPlanFinishWorkflowSession(input);
+    const projection = store.materializeFlowProjection(input.id);
+    const ledger = store.buildLedgerSummary(input.id);
+
+    expect(() => store.createWorkflowSession({ ...input, now: "2026-07-18T00:00:01.000Z" }))
+      .toThrow(/bound by Plan Finish/i);
+    expect(store.createPlanFinishWorkflowSession({ ...input, now: "2026-07-18T00:00:01.000Z" })).toEqual(created);
+    expect(store.listEvents(input.id).filter((event) => event.kind === "workflow.plan_finish.bound"))
+      .toHaveLength(1);
+    expect(projection.events.some((event) => String(event.kind) === "workflow.plan_finish.bound")).toBe(false);
+    expect(ledger.recentEvents.some((event) => event.kind === "workflow.plan_finish.bound")).toBe(false);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.createPlanFinishWorkflowSession({ ...input, now: "2026-07-18T00:00:02.000Z" }))
+      .toEqual(created);
+    expect(() => reopened.createPlanFinishWorkflowSession({
+      ...input,
+      planSessionId: "another-plan",
+      now: "2026-07-18T00:00:03.000Z",
+    })).toThrow(/Plan Finish binding conflicts/i);
+    expect(() => reopened.createPlanFinishWorkflowSession({
+      ...input,
+      title: "Forged matching Plan session",
+      now: "2026-07-18T00:00:04.000Z",
+    })).toThrow(/Plan Finish binding conflicts/i);
+    expect(reopened.listEvents(input.id).filter((event) => event.kind === "workflow.plan_finish.bound"))
+      .toHaveLength(1);
+    reopened.close();
+  });
+
+  it("rejects generic workflow sessions that lack a backend Plan Finish binding", async () => {
+    const store = await makeStore();
+    const input = planFinishWorkflowSessionInput();
+    store.createWorkflowSession(input);
+
+    expect(() => store.assertPlanFinishWorkflowSessionAvailable(input))
+      .toThrow(/not bound by Plan Finish/i);
+    expect(() => store.createPlanFinishWorkflowSession(input))
+      .toThrow(/not bound by Plan Finish/i);
+    expect(store.listEvents(input.id).some((event) => event.kind === "workflow.plan_finish.bound")).toBe(false);
+    store.close();
+  });
+
   it("keeps a pending user input retryable after store reopen", async () => {
     const projectRoot = await makeTempRoot();
     const input = {
@@ -5367,7 +5522,7 @@ describe("SQLite workflow store", () => {
       "historical-token",
     ];
     assertOuterOnlyArtifactPayloadRemoved(reopened, rawValues);
-    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
     reopened.close();
 
     const migrated = new Database(databasePath);
@@ -6082,6 +6237,23 @@ function createCard(
   input: WorkflowCardCreateInput,
 ): WorkflowCardToolCall {
   return { tool: "createWorkflowCard", toolCallId, input };
+}
+
+function planFinishWorkflowSessionInput() {
+  return {
+    planSessionId: "plan-session-1",
+    id: "session-plan-finish",
+    projectId: "project-1",
+    title: "Approved Plan",
+    goal: "Finish the approved Plan",
+    mode: "plan" as const,
+    target: { executionTarget: "current_branch" as const, selectedBranch: "main" },
+    plannerProfile: "default",
+    transport: "hermes_session_resume" as const,
+    hasOpaqueHandle: true,
+    recoveryReason: "Plan ACP continuity is used only for this backend-owned planner launch.",
+    now: "2026-07-18T00:00:00.000Z",
+  };
 }
 
 async function makeTempRoot(): Promise<string> {

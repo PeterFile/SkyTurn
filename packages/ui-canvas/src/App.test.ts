@@ -1,4 +1,6 @@
 import { readFile } from "node:fs/promises";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import {
   formatTerminalTitle,
@@ -30,7 +32,12 @@ import {
   runEvidenceFactsForDisplay,
   summarizeWorktreeComparisonEvidence,
   PlanDocumentEditor,
+  derivePlanRevisionTracking,
   isPlanRevisionAvailable,
+  derivePlanUiPhase,
+  isPlanSourceEditable,
+  isPlanNextEnabled,
+  isPlanFinishEnabled,
 } from "./App.js";
 import * as AppModule from "./App.js";
 import { parsePlanBootstrapSession } from "@skyturn/project-core";
@@ -204,7 +211,27 @@ describe("Plan finish workflow handoff", () => {
     expect(stale.workspace.sessions[0]).toEqual(changedPlan);
   });
 
-  it("appends the exact approved Plan and returns the authoritative backend canvas", async () => {
+  it("registers only backend-started Finish Canvas runs before installation", () => {
+    const register = Reflect.get(AppModule, "registerBackendStartedCanvasRuns") as undefined | ((
+      startedRuns: Set<string>,
+      canvas: ReturnType<typeof convertPlanToCanvas>,
+    ) => void);
+    expect(register).toBeTypeOf("function");
+    if (!register) return;
+    const plan = editablePlanSession();
+    const canvas = convertPlanToCanvas(plan);
+    canvas.nodes = [
+      { ...mockNode("hermes"), id: "planner", runId: "planner-run", status: "running" },
+      { ...mockNode("codex"), id: "scheduled", runId: "scheduled-run", status: "pending" },
+    ];
+    const startedRuns = new Set<string>(["already-started"]);
+
+    register(startedRuns, canvas);
+
+    expect([...startedRuns]).toEqual(["already-started", "planner-run"]);
+  });
+
+  it("hands the exact approved Plan to the dedicated backend finish boundary and returns its authoritative canvas", async () => {
     const finish = Reflect.get(AppModule, "finishPlanSession") as undefined | ((
       project: { id: string; name: string; rootPath: string; devflowPath: string; openedAt: string },
       session: PlanSession,
@@ -229,12 +256,8 @@ describe("Plan finish workflow handoff", () => {
     const calls: Array<{ kind: string; input: unknown }> = [];
     vi.stubGlobal("window", {
       devflow: {
-        createWorkflowSession: async (_projectRoot: string, input: unknown) => {
-          calls.push({ kind: "create", input });
-          return { protocolVersion: 1, session: {}, projection: {}, canvasSession: localCanvas };
-        },
-        appendWorkflowUserInput: async (_projectRoot: string, input: unknown) => {
-          calls.push({ kind: "append", input });
+        finishPlanWorkflow: async (_projectRoot: string, input: unknown) => {
+          calls.push({ kind: "finish", input });
           return { protocolVersion: 1, event: {}, ledger: {}, projection: {}, canvasSession: authoritativeCanvas };
         },
       },
@@ -252,29 +275,20 @@ describe("Plan finish workflow handoff", () => {
       expect((result as typeof authoritativeCanvas).nodes.map((node) => node.title)).toEqual([
         "Authoritative backend planner",
       ]);
-      expect(calls[1]).toEqual({
-        kind: "append",
+      expect(calls).toEqual([{
+        kind: "finish",
         input: {
-          sessionId: plan.id,
-          inputId: `plan-confirm-${plan.id}`,
-          text: [
-            "# Approved Plan",
-            "",
-            "## Goal",
-            "Repair Plan editing",
-            "",
-            "## Requirements",
-            "# Requirements",
-            "",
-            "## Design",
-            "# Design",
-            "",
-            "## Tasks",
-            "# Tasks",
-          ].join("\n"),
-          now: plan.createdAt,
+          planSessionId: plan.id,
+          session: {
+            id: localCanvas.id,
+            projectId: localCanvas.projectId,
+            title: localCanvas.title,
+            goal: localCanvas.goal,
+            mode: localCanvas.mode,
+            target: localCanvas.target,
+          },
         },
-      });
+      }]);
     } finally {
       vi.unstubAllGlobals();
     }
@@ -286,8 +300,7 @@ describe("Plan finish workflow handoff", () => {
     if (!finish) return;
     vi.stubGlobal("window", {
       devflow: {
-        createWorkflowSession: async () => ({ canvasSession: convertPlanToCanvas(editablePlanSession()) }),
-        appendWorkflowUserInput: async () => ({ canvasSession: null }),
+        finishPlanWorkflow: async () => ({ canvasSession: null }),
       },
     });
     try {
@@ -835,34 +848,183 @@ describe("UI source validation", () => {
     const projectDropdown = appSource.slice(appSource.indexOf("function ProjectDropdown("), appSource.indexOf("function ModeSwitch("));
     const modeSwitch = appSource.slice(appSource.indexOf("function ModeSwitch("), appSource.indexOf("function StatusLight("));
     expect(projectDropdown).toContain('aria-label="Project"');
-    expect(modeSwitch).toContain("Fast");
+    expect(modeSwitch).toContain("Canvas");
     expect(modeSwitch).toContain("Plan");
+    expect(modeSwitch).not.toContain("Fast");
+    expect(modeSwitch).toContain('aria-pressed={mode === "fast"}');
+    expect(modeSwitch).toContain('aria-pressed={mode === "plan"}');
   });
 
-  it("PlanView is a single-page editor instead of three simultaneous markdown articles", async () => {
+  it("PlanView is a single-column document workspace with Preview/Source controls", async () => {
     const appSource = await readSource("./App.tsx");
+    const planSurface = appSource.slice(
+      appSource.indexOf("function PlanMarkdownPreview("),
+      appSource.indexOf("function CanvasView("),
+    );
     const planView = appSource.slice(appSource.indexOf("function PlanView("), appSource.indexOf("function CanvasView("));
 
-    expect(planView).toContain("Review one plan page at a time");
-    expect(planView).toContain("Ask agent to revise this page");
-    expect(planView).toContain("Finish");
-    expect(planView).toContain("Retry");
-    expect(planView).toContain("Undo");
+    expect(planView).toContain('className="plan-view"');
+    expect(planView).toContain('className="plan-toolbar"');
+    expect(planView).toContain('className="plan-document"');
+    expect(planView).toContain('className="plan-composer"');
+    expect(planView).toContain('className="plan-stage-progress"');
+    expect(planView).toContain('className="plan-view-toggle"');
+    expect(planView).toContain('className="plan-undo-revision"');
+    expect(planView).toContain('className="plan-error-banner"');
+    expect(planView).toContain('className="plan-composer-send"');
+    expect(planView).toContain('aria-label="Undo last revision"');
+    expect(planView).toContain('aria-label="Send revision"');
+    expect(planView).toContain('aria-label="Stop"');
+    expect(planView).toContain('"Retry generation"');
+    expect(planView).toContain('"Retry revision"');
+    expect(planView).toContain('aria-label="Preview mode"');
+    expect(planView).toContain('aria-label="Source mode"');
+    expect(planView).toContain('aria-pressed={effectiveViewMode === "preview"}');
+    expect(planView).toContain('aria-pressed={effectiveViewMode === "source"}');
+    expect(planView).toContain('aria-current={isCurrent ? "step" : undefined}');
+    expect(planView).not.toContain('role="list"');
+    expect(planView).not.toContain('role="listitem"');
+    expect(planView).toContain('aria-live="polite"');
+    expect(planView).toContain("Finish Plan");
+    expect(planView).toContain("Approve and continue to");
+    expect(planView).toContain("<Undo2");
+    expect(planView).toContain("<ArrowUp");
     expect(planView).toContain("activePlanMarkdown");
     expect(planView).toContain("const revisionAvailable = isPlanRevisionAvailable(stageState);");
     expect(planView).toContain('const [agentInstruction, setAgentInstruction] = useState("");');
+    expect(planView).toContain("preservedFailedInstruction");
+    expect(planView).toContain("retryFailedOperation");
+    expect(planView).toContain("handleComposerKeyDown");
+    expect(planView).toContain('event.key === "Enter" && !event.shiftKey');
     expect(planView).toContain("<PlanDocumentEditor");
-    expect((planView.match(/readOnly=\{interactionLocked \|\| !revisionAvailable\}/g) ?? [])).toHaveLength(1);
-    expect((planView.match(/!revisionAvailable/g) ?? [])).toHaveLength(3);
-    expect(planView).toContain('stageState.status !== "ready"');
-    expect(planView).toContain("!session.plan[activeStep.key].trim()");
-    expect(planView).toContain("<textarea");
+    expect(planView).toContain("<PlanMarkdownPreview");
+    expect(planSurface).toContain('className="plan-md-preview"');
+    expect(planSurface).toContain('role="article"');
+    expect((planSurface.match(/<ReactMarkdown/g) ?? [])).toHaveLength(1);
+    expect(planView).not.toContain("plan-workspace");
+    expect(planView).not.toContain("plan-editor-card");
+    expect(planView).not.toContain("plan-preview-card");
+    expect(planView).not.toContain("plan-header");
+    expect(planView).not.toContain("plan-agent-panel");
     expect(planView).not.toContain("markdown-grid");
-    expect(planView).not.toContain("<article");
-    expect((planView.match(/<ReactMarkdown/g) ?? [])).toHaveLength(1);
+    expect(planView).not.toContain("Review one plan page at a time");
+    expect(planView).not.toContain("Ask agent to revise this page");
+    expect(planView).not.toContain("Convert only after");
+    expect(planView).not.toContain("Edit this page");
+    expect(planView).not.toContain("Request revision");
+    expect(planView).not.toContain("STEP 1 OF 3");
+    expect(planView).not.toContain("Step {activeIndex + 1} of");
     expect(planView).not.toContain("Convert to Canvas");
     expect(planView).not.toContain("Captured locally");
     expect(planView).not.toContain("Mock agent revision");
+    expect(planView).toContain("Retry");
+    expect(planView).toContain("<RefreshCw size={14} />");
+    expect(planView).toContain("async function retryFailedOperation");
+    expect(planView).toContain("onGenerate(activeStep.key)");
+    expect(planView).toContain("onRevise(activeStep.key, instruction)");
+  });
+
+  it("renders GFM tables and highlighted typed code through the Plan preview", () => {
+    const preview = Reflect.get(AppModule, "PlanMarkdownPreview") as
+      | undefined
+      | ((props: { markdown: string }) => ReturnType<typeof createElement>);
+    expect(preview).toBeTypeOf("function");
+    if (!preview) return;
+
+    const html = renderToStaticMarkup(createElement(preview, {
+      markdown: [
+        "| Stage | Ready |",
+        "| --- | --- |",
+        "| Design | yes |",
+        "",
+        "```ts",
+        'const stage: string = "design";',
+        "```",
+        "",
+        '<script data-unsafe="true">alert("no")</script>',
+      ].join("\n"),
+    }));
+
+    expect(html).toContain("<table>");
+    expect(html).toContain('class="hljs language-ts"');
+    expect(html).toContain('class="hljs-keyword"');
+    expect(html).not.toContain("<script");
+  });
+
+  it.each([
+    ["error", "generate", "# Preserved canonical", false, false],
+    ["error", "revise", "# Preserved canonical", false, true],
+    ["error", "revise", "   ", false, false],
+    ["error", null, "# Preserved canonical", false, false],
+    ["ready", null, "# Requirements", false, true],
+    ["editing", null, "# Requirements", false, true],
+    ["generating", "generate", "# Requirements", false, false],
+    ["streaming", "generate", "# Requirements", false, false],
+    ["revising", "revise", "# Requirements", false, false],
+    ["idle_empty", null, "", false, false],
+    ["ready", null, "# Requirements", true, false],
+  ] as const)(
+    "Next for phase=%s operation=%s markdown=%s locked=%s is %s",
+    (phase, operation, markdown, locked, expected) => {
+      expect(isPlanNextEnabled(phase, markdown, operation, locked)).toBe(expected);
+    },
+  );
+
+  it("Plan control matrix keeps failed documents editable and running documents locked", () => {
+    expect(isPlanSourceEditable("idle_empty", false, false)).toBe(true);
+    expect(isPlanSourceEditable("idle_empty", false, true)).toBe(false);
+    expect(isPlanSourceEditable("error", true, false)).toBe(true);
+    expect(isPlanSourceEditable("error", false, false)).toBe(false);
+    expect(isPlanSourceEditable("generating", true, false)).toBe(false);
+    expect(isPlanSourceEditable("revising", true, false)).toBe(false);
+    expect(isPlanSourceEditable("ready", true, false)).toBe(true);
+    expect(derivePlanUiPhase({ status: "generating", draft: "" }, "", "preview", false)).toBe("generating");
+    expect(derivePlanUiPhase({ status: "generating", draft: "# Stream" }, "# Stream", "preview", false)).toBe("streaming");
+    expect(derivePlanUiPhase({ status: "revising", draft: "x" }, "x", "source", true)).toBe("revising");
+    expect(derivePlanUiPhase({ status: "failed", draft: "" }, "# Keep", "source", false)).toBe("error");
+    expect(derivePlanUiPhase({ status: "ready", draft: "" }, "# Ready", "source", true)).toBe("editing");
+    const clearedPhase = derivePlanUiPhase({ status: "pending", draft: "" }, "", "source", true);
+    expect(clearedPhase).toBe("idle_empty");
+    expect(isPlanSourceEditable(clearedPhase, false, false)).toBe(true);
+
+    const finishReady = editablePlanSession();
+    expect(isPlanFinishEnabled(finishReady, "ready", false)).toBe(true);
+    finishReady.stages.tasks.accepted = false;
+    expect(isPlanFinishEnabled(finishReady, "ready", false)).toBe(true);
+    finishReady.activeStage = "design";
+    expect(isPlanFinishEnabled(finishReady, "ready", false)).toBe(false);
+    finishReady.activeStage = "tasks";
+    finishReady.stages.tasks.accepted = true;
+    finishReady.stages.design.accepted = false;
+    expect(isPlanFinishEnabled(finishReady, "ready", false)).toBe(false);
+    finishReady.stages.design.accepted = true;
+    finishReady.plan.tasks = "   ";
+    expect(isPlanFinishEnabled(finishReady, "ready", false)).toBe(false);
+    expect(isPlanFinishEnabled(editablePlanSession(), "revising", false)).toBe(false);
+  });
+
+  it("scopes Plan composer state to the session and active section only", async () => {
+    const scopeKey = Reflect.get(AppModule, "planViewScopeKey") as
+      | undefined
+      | ((session: Pick<PlanSession, "id" | "activeStage">) => string);
+    expect(scopeKey).toBeTypeOf("function");
+    if (!scopeKey) return;
+
+    const session = editablePlanSession();
+    const tasksScope = scopeKey(session);
+    session.stages.tasks.status = "revising";
+    expect(scopeKey(session)).toBe(tasksScope);
+    session.stages.tasks.status = "failed";
+    expect(scopeKey(session)).toBe(tasksScope);
+
+    session.activeStage = "design";
+    expect(scopeKey(session)).not.toBe(tasksScope);
+    session.activeStage = "tasks";
+    session.id = "another-plan-session";
+    expect(scopeKey(session)).not.toBe(tasksScope);
+
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain("key={planViewScopeKey(activeSession)}");
   });
 
   it.each([
@@ -917,12 +1079,88 @@ describe("UI source validation", () => {
       planView.indexOf("async function submitRevision"),
       planView.indexOf("function requestAgentRevision"),
     );
+    const retryFailed = planView.slice(
+      planView.indexOf("async function retryFailedOperation"),
+      planView.indexOf("const nextStep ="),
+    );
 
     expect(submitRevision).toContain("!revisionAvailable");
     expect(submitRevision).toContain("onRevise(activeStep.key, instruction)");
+    expect(submitRevision).toContain("setPreservedFailedInstruction(instruction)");
     expect(submitRevision).not.toContain("onGenerate");
-    expect(planView).toContain("readOnly={interactionLocked || !revisionAvailable}");
-    expect(planView).toMatch(/disabled=\{[\s\S]*?interactionLocked \|\| runActive \|\| !revisionAvailable/);
+    expect(retryFailed).toContain('stageState.operation === "generate"');
+    expect(retryFailed).toContain("onGenerate(activeStep.key)");
+    expect(retryFailed).toContain('stageState.operation === "revise"');
+    expect(retryFailed).toContain("preservedFailedInstruction");
+    expect(retryFailed).toContain("onRevise(activeStep.key, instruction)");
+    expect(planView).toContain("readOnly={interactionLocked || !revisionAvailable || runActive}");
+    expect(planView).toContain("disabled={!sendEnabled}");
+    expect(planView).toContain("disabled={!nextEnabled}");
+    expect(planView).toContain("disabled={!finishEnabled}");
+    expect(planView).toContain("disabled={!undoEnabled}");
+  });
+
+  it("prioritizes runtime recovery for a failed Plan stage without duplicating alerts", async () => {
+    const appSource = await readSource("./App.tsx");
+    const planView = appSource.slice(appSource.indexOf("function PlanView("), appSource.indexOf("function CanvasView("));
+    const runtimeRecovery = planView.slice(
+      planView.indexOf("{runtimeStateError ? ("),
+      planView.indexOf(") : stageState.status === \"failed\" ? ("),
+    );
+
+    expect(planView).toContain('{runtimeStateError ? (');
+    expect(planView).toContain(') : stageState.status === "failed" ? (');
+    expect(planView).not.toContain('runtimeStateError && stageState.status !== "failed"');
+    expect(runtimeRecovery).toContain("{runtimeStateError}");
+    expect(runtimeRecovery).toContain("onClick={() => void onRetryRuntimeState()}");
+    expect(runtimeRecovery).toContain("Retry runtime state");
+    expect(runtimeRecovery).not.toContain("disabled=");
+  });
+
+  it("resets the revision composer height only after a successful revision", async () => {
+    const activeRevision = derivePlanRevisionTracking(null, {
+      status: "revising",
+      operation: "revise",
+      runId: "revision-run",
+      lastRunId: null,
+    });
+    expect(activeRevision).toEqual({ pendingRunId: "revision-run", terminalStatus: null });
+    expect(derivePlanRevisionTracking(activeRevision.pendingRunId, {
+      status: "ready",
+      operation: "revise",
+      runId: null,
+      lastRunId: "revision-run",
+    })).toEqual({ pendingRunId: null, terminalStatus: "ready" });
+    expect(derivePlanRevisionTracking(activeRevision.pendingRunId, {
+      status: "failed",
+      operation: "revise",
+      runId: null,
+      lastRunId: "revision-run",
+    })).toEqual({ pendingRunId: null, terminalStatus: "failed" });
+    expect(derivePlanRevisionTracking(activeRevision.pendingRunId, {
+      status: "ready",
+      operation: "revise",
+      runId: null,
+      lastRunId: "another-run",
+    })).toEqual({ pendingRunId: "revision-run", terminalStatus: null });
+
+    const appSource = await readSource("./App.tsx");
+    const planView = appSource.slice(appSource.indexOf("function PlanView("), appSource.indexOf("function CanvasView("));
+    const revisionResultEffect = planView.slice(
+      planView.indexOf("useEffect(() => {"),
+      planView.indexOf("}, [stageState.lastRunId, stageState.operation, stageState.runId, stageState.status, submittedRevisionRunId]);"),
+    );
+    const successfulRevision = revisionResultEffect.slice(
+      revisionResultEffect.indexOf('if (tracking.terminalStatus === "ready")'),
+      revisionResultEffect.indexOf("setSubmittedRevisionRunId(tracking.pendingRunId)"),
+    );
+
+    expect(revisionResultEffect).toContain("derivePlanRevisionTracking(submittedRevisionRunId, stageState)");
+    expect(successfulRevision).toContain('composerRef.current?.style.removeProperty("height")');
+    expect(successfulRevision).toContain('setAgentInstruction("")');
+    expect(successfulRevision).toContain('setPreservedFailedInstruction("")');
+    expect(revisionResultEffect).not.toContain('if (tracking.terminalStatus === "failed") {\n      setAgentInstruction("")');
+    expect(planView).not.toContain("catch {\n      setSubmittedRevisionRunId(null);");
   });
 
   it("PlanView document editor stays editable after clearing while running and blank completion stay closed", () => {
@@ -940,6 +1178,10 @@ describe("UI source validation", () => {
 
     const readyEditor = renderEditor();
     expect(readyEditor.props.readOnly).toBe(false);
+    expect(readyEditor.props.className).toBe("plan-md-source");
+    expect(readyEditor.props["aria-label"]).toBe("Plan source editor");
+    expect(readyEditor.props.spellCheck).toBe(false);
+    expect(readyEditor.props["aria-readonly"]).toBeUndefined();
     readyEditor.props.onBlur();
     expect(blurCalls).toBe(1);
     readyEditor.props.onChange({ currentTarget: { value: "   " } });
@@ -959,6 +1201,7 @@ describe("UI source validation", () => {
       onChange: () => undefined,
     });
     expect(runningEditor.props.readOnly).toBe(true);
+    expect(runningEditor.props["aria-readonly"]).toBe(true);
 
     const recoveryLockedEditor = PlanDocumentEditor({
       id: "recovery-locked-plan-document",
@@ -968,6 +1211,7 @@ describe("UI source validation", () => {
       onChange: () => undefined,
     });
     expect(recoveryLockedEditor.props.readOnly).toBe(true);
+    expect(recoveryLockedEditor.props["aria-readonly"]).toBe(true);
   });
 
   it("dispatches every committed workspace to main immediately without waiting for an older request", () => {
@@ -1092,6 +1336,14 @@ describe("UI source validation", () => {
     expect(appSource).toContain("Retry runtime state");
     expect(appSource).toContain("!canFinishPlan(accepted)");
     expect(appSource).toContain("capturePlanFinishBoundary(accepted)");
+    const finishPlanBlock = appSource.slice(
+      appSource.indexOf("async function finishPlan(session: PlanSession)"),
+      appSource.indexOf("function updateCanvasSession("),
+    );
+    expect(finishPlanBlock).toContain("registerBackendStartedCanvasRuns(startedBridgeRuns.current, canvas)");
+    expect(finishPlanBlock.indexOf("registerBackendStartedCanvasRuns")).toBeLessThan(
+      finishPlanBlock.indexOf("installFinishedPlanCanvas"),
+    );
     expect(appSource).toContain("installFinishedPlanCanvas(current, boundary, canvas)");
   });
 

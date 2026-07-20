@@ -24,6 +24,7 @@ import {
   CheckCircle2,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Columns2,
   Copy,
@@ -43,6 +44,7 @@ import {
   RefreshCw,
   Settings,
   Square,
+  Undo2,
   WrapText,
   Users,
   Upload,
@@ -65,6 +67,8 @@ import {
   type ReactNode,
 } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeHighlight from "rehype-highlight";
+import remarkGfm from "remark-gfm";
 
 import type { EditorKind, VariantComparisonEvidence } from "@skyturn/git-worktree";
 import {
@@ -87,7 +91,6 @@ import {
   convertPlanToCanvas,
   createFastCanvasSession,
   createPlanSession,
-  formatApprovedPlanWorkflowInput,
 } from "@skyturn/planner";
 import {
   NODE_MODAL_TABS,
@@ -936,6 +939,7 @@ export default function App() {
       if (accepted?.kind !== "plan" || !acceptedResult.snapshot.accepted.tasks || !canFinishPlan(accepted)) return;
       const boundary = capturePlanFinishBoundary(accepted);
       const canvas = await finishPlanSession(project, accepted);
+      registerBackendStartedCanvasRuns(startedBridgeRuns.current, canvas);
       setWorkspace((current) => {
         const result = installFinishedPlanCanvas(current, boundary, canvas);
         workspaceRef.current = result.workspace;
@@ -1381,6 +1385,7 @@ export default function App() {
           )}
           {activeSession?.kind === "plan" && (
             <PlanView
+              key={planViewScopeKey(activeSession)}
               session={activeSession}
               onPlanChange={(section, value) => updatePlanSection(activeSession.id, section, value)}
               onPlanBlur={(stage) => planMutationQueue().persistStage(activeProject.rootPath, activeSession.id, stage)}
@@ -2067,6 +2072,88 @@ function formatRelativeTime(value: string): string {
   return `${Math.floor(days / 30)}mo`;
 }
 
+export type PlanUiPhase =
+  | "idle_empty"
+  | "generating"
+  | "streaming"
+  | "ready"
+  | "editing"
+  | "revising"
+  | "error";
+
+export type PlanViewMode = "preview" | "source";
+
+const PLAN_REMARK_PLUGINS = [remarkGfm];
+const PLAN_REHYPE_PLUGINS = [rehypeHighlight];
+
+export function planViewScopeKey(
+  session: Pick<PlanSession, "id" | "activeStage">,
+): string {
+  return `${session.id}:${session.activeStage}`;
+}
+
+export function derivePlanUiPhase(
+  state: Pick<PlanSession["stages"][PlanStage], "status" | "draft">,
+  markdown: string,
+  viewMode: PlanViewMode,
+  sourceDirty: boolean,
+): PlanUiPhase {
+  if (state.status === "generating") {
+    return state.draft.trim().length > 0 ? "streaming" : "generating";
+  }
+  if (state.status === "revising") return "revising";
+  if (state.status === "failed") return "error";
+  if (state.status === "pending" && !markdown.trim()) return "idle_empty";
+  if (state.status === "ready" || (state.status === "pending" && markdown.trim())) {
+    return viewMode === "source" && sourceDirty ? "editing" : "ready";
+  }
+  return "idle_empty";
+}
+
+export function isPlanSourceEditable(
+  phase: PlanUiPhase,
+  hasBuffer: boolean,
+  locked: boolean,
+): boolean {
+  if (locked) return false;
+  if (phase === "generating" || phase === "streaming" || phase === "revising") return false;
+  if (phase === "error") return hasBuffer;
+  return phase === "idle_empty" || phase === "ready" || phase === "editing";
+}
+
+export function isPlanNextEnabled(
+  phase: PlanUiPhase,
+  markdown: string,
+  operation: PlanSession["stages"][PlanStage]["operation"],
+  locked: boolean,
+): boolean {
+  if (locked || !markdown.trim()) return false;
+  if (phase === "generating" || phase === "streaming" || phase === "revising") return false;
+  if (phase === "error") return operation === "revise";
+  return phase === "ready" || phase === "editing";
+}
+
+export function isPlanFinishEnabled(
+  session: PlanSession,
+  phase: PlanUiPhase,
+  locked: boolean,
+): boolean {
+  if (locked) return false;
+  if (phase === "generating" || phase === "streaming" || phase === "revising") return false;
+  return PLAN_SECTION_STEPS.every(({ key }) => {
+    const stage = session.stages[key];
+    const markdown = session.plan[key].trim();
+    if (!markdown) return false;
+    if (key === "tasks") {
+      // Finish accepts Tasks atomically before conversion; requiring prior acceptance makes it unreachable.
+      return stage.status === "ready" && !stage.runId && (
+        stage.accepted || session.activeStage === "tasks"
+      );
+    }
+    return stage.accepted && stage.status === "ready" && !stage.runId;
+  });
+}
+
 export function PlanDocumentEditor({
   id,
   value,
@@ -2086,9 +2173,12 @@ export function PlanDocumentEditor({
   return (
     <textarea
       id={id}
-      className="plan-editor"
+      className="plan-md-source"
       value={value}
       readOnly={readOnly}
+      aria-label="Plan source editor"
+      aria-readonly={readOnly ? true : undefined}
+      spellCheck={false}
       onChange={(event) => onChange(event.currentTarget.value)}
       onBlur={onBlur}
     />
@@ -2099,6 +2189,40 @@ export function isPlanRevisionAvailable(
   state: Pick<PlanSession["stages"][PlanStage], "status" | "operation">,
 ): boolean {
   return state.status === "ready" || (state.status === "failed" && state.operation === "revise");
+}
+
+export function derivePlanRevisionTracking(
+  pendingRunId: string | null,
+  stage: Pick<
+    PlanSession["stages"][PlanStage],
+    "status" | "operation" | "runId" | "lastRunId"
+  >,
+): { pendingRunId: string | null; terminalStatus: "ready" | "failed" | null } {
+  if (stage.status === "revising" && stage.operation === "revise" && stage.runId) {
+    return { pendingRunId: stage.runId, terminalStatus: null };
+  }
+  if (
+    pendingRunId &&
+    stage.runId === null &&
+    stage.lastRunId === pendingRunId &&
+    (stage.status === "ready" || stage.status === "failed")
+  ) {
+    return { pendingRunId: null, terminalStatus: stage.status };
+  }
+  return { pendingRunId, terminalStatus: null };
+}
+
+export function PlanMarkdownPreview({ markdown }: { markdown: string }) {
+  return (
+    <article className="plan-md-preview" role="article">
+      <ReactMarkdown
+        remarkPlugins={PLAN_REMARK_PLUGINS}
+        rehypePlugins={PLAN_REHYPE_PLUGINS}
+      >
+        {markdown}
+      </ReactMarkdown>
+    </article>
+  );
 }
 
 function PlanView({
@@ -2133,7 +2257,11 @@ function PlanView({
   onRetryRuntimeState: () => Promise<boolean>;
 }) {
   const [agentInstruction, setAgentInstruction] = useState("");
+  const [preservedFailedInstruction, setPreservedFailedInstruction] = useState("");
   const [submittedRevisionRunId, setSubmittedRevisionRunId] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<PlanViewMode>("preview");
+  const [sourceDirty, setSourceDirty] = useState(false);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
   const editorId = useId();
   const requestId = useId();
@@ -2141,17 +2269,45 @@ function PlanView({
   const activeStep = PLAN_SECTION_STEPS[activeIndex] ?? PLAN_SECTION_STEPS[0];
   const stageState = session.stages[activeStep.key];
   const activeText = activePlanMarkdown(session, activeStep.key);
+  const hasBuffer = activeText.trim().length > 0;
   const revisionAvailable = isPlanRevisionAvailable(stageState);
   const runActive = stageState.status === "generating" || stageState.status === "revising";
   const interactionLocked = !runtimeStateReady || finishInFlight;
+  const phase = derivePlanUiPhase(stageState, activeText, viewMode, sourceDirty);
+  const effectiveViewMode: PlanViewMode =
+    phase === "generating" || phase === "streaming" || phase === "revising" || (phase === "error" && !hasBuffer)
+      ? "preview"
+      : viewMode;
+  const sourceEditable = isPlanSourceEditable(phase, hasBuffer, interactionLocked);
+  const nextEnabled = isPlanNextEnabled(phase, activeText, stageState.operation, interactionLocked);
+  const finishEnabled = isPlanFinishEnabled(session, phase, interactionLocked);
+  const undoEnabled = !interactionLocked && !runActive && stageState.checkpoints.length > 0;
+  const sendEnabled =
+    !interactionLocked &&
+    !runActive &&
+    revisionAvailable &&
+    agentInstruction.trim().length > 0 &&
+    hasBuffer;
+  const stopVisible = runActive && !!stageState.runId;
+  const failedOperation = stageState.status === "failed" ? stageState.operation : null;
 
   useEffect(() => {
-    if (!submittedRevisionRunId || stageState.runId) return;
-    if (stageState.status === "ready") setAgentInstruction("");
-    if (stageState.status === "ready" || stageState.status === "failed") {
-      setSubmittedRevisionRunId(null);
+    const tracking = derivePlanRevisionTracking(submittedRevisionRunId, stageState);
+    if (tracking.terminalStatus === "ready") {
+      setAgentInstruction("");
+      setPreservedFailedInstruction("");
+      composerRef.current?.style.removeProperty("height");
     }
-  }, [stageState.runId, stageState.status, submittedRevisionRunId]);
+    if (tracking.pendingRunId !== submittedRevisionRunId) {
+      setSubmittedRevisionRunId(tracking.pendingRunId);
+    }
+  }, [stageState.lastRunId, stageState.operation, stageState.runId, stageState.status, submittedRevisionRunId]);
+
+  useEffect(() => {
+    if (stageState.status === "failed" && stageState.operation === "revise" && agentInstruction.trim()) {
+      setPreservedFailedInstruction(agentInstruction.trim());
+    }
+  }, [stageState.status, stageState.operation, agentInstruction]);
 
   function canAccessSection(section: PlanSectionKey) {
     if (section === "requirements") return true;
@@ -2174,11 +2330,12 @@ function PlanView({
       interactionLocked || runActive || !revisionAvailable ||
       !instruction || !session.plan[activeStep.key].trim()
     ) return;
+    setPreservedFailedInstruction(instruction);
     try {
       const result = await onRevise(activeStep.key, instruction);
       setSubmittedRevisionRunId(result.runId);
     } catch {
-      setSubmittedRevisionRunId(null);
+      /* The rendered durable stage state owns revision tracking after a bound start. */
     }
   }
 
@@ -2187,158 +2344,269 @@ function PlanView({
     void submitRevision();
   }
 
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void submitRevision();
+    }
+  }
+
+  function resizeComposer(element: HTMLTextAreaElement) {
+    element.style.height = "auto";
+    element.style.height = `${Math.min(160, Math.max(44, element.scrollHeight))}px`;
+  }
+
+  async function retryFailedOperation(): Promise<void> {
+    if (interactionLocked || runActive || stageState.status !== "failed") return;
+    if (stageState.operation === "generate") {
+      try {
+        await onGenerate(activeStep.key);
+      } catch {
+        /* surface stays in failed stage state */
+      }
+      return;
+    }
+    if (stageState.operation === "revise") {
+      const instruction = (agentInstruction.trim() || preservedFailedInstruction).trim();
+      if (!instruction || !hasBuffer) return;
+      setAgentInstruction(instruction);
+      setPreservedFailedInstruction(instruction);
+      try {
+        const result = await onRevise(activeStep.key, instruction);
+        setSubmittedRevisionRunId(result.runId);
+      } catch {
+        /* The rendered durable stage state owns revision tracking after a bound start. */
+      }
+    }
+  }
+
+  const nextStep = PLAN_SECTION_STEPS[activeIndex + 1];
+  const prevStep = PLAN_SECTION_STEPS[activeIndex - 1];
+  const statusLiveText =
+    phase === "revising" ? "Revising…"
+      : phase === "generating" || phase === "streaming" ? "Generating…"
+        : finishInFlight ? "Finishing…"
+          : null;
+
   return (
     <section className="plan-view">
-      <div className="plan-header">
-        <div>
-          <p className="eyebrow">Plan</p>
-          <h2>{session.title}</h2>
-          <p>Review one plan page at a time.</p>
-        </div>
-      </div>
-
-      <div className="plan-stepbar" aria-label="Plan progress">
-        <span>
-          Step {activeIndex + 1} of {PLAN_SECTION_STEPS.length}
-        </span>
-        <div className="plan-step-buttons">
+      <div className="plan-toolbar">
+        <nav className="plan-stage-progress" aria-label="Plan progress">
           {PLAN_SECTION_STEPS.map((step, index) => {
             const isApproved = session.stages[step.key].accepted;
             const isAccessible = canAccessSection(step.key);
+            const isCurrent = step.key === activeStep.key;
             return (
               <button
                 key={step.key}
-                className={step.key === activeStep.key ? "active" : ""}
+                className={[
+                  "plan-stage-progress-button",
+                  isCurrent ? "active" : "",
+                  isApproved ? "accepted" : "",
+                ].filter(Boolean).join(" ")}
                 type="button"
-                aria-current={step.key === activeStep.key ? "step" : undefined}
+                aria-current={isCurrent ? "step" : undefined}
+                aria-label={step.label}
                 disabled={interactionLocked || !isAccessible || runActive}
                 onClick={() => changeActiveSection(step.key)}
               >
-                <span>{isApproved ? <CheckCircle2 size={12} /> : index + 1}</span>
+                <span className="plan-stage-progress-marker" aria-hidden="true">
+                  {isApproved ? <Check size={12} /> : index + 1}
+                </span>
                 {step.label}
               </button>
             );
           })}
+        </nav>
+
+        <div className="plan-toolbar-actions">
+          <button
+            className="plan-undo-revision"
+            type="button"
+            aria-label="Undo last revision"
+            disabled={!undoEnabled}
+            onClick={() => void onUndo(activeStep.key)}
+          >
+            <Undo2 size={16} />
+            Undo
+          </button>
+
+          <div className="plan-view-toggle" role="group" aria-label="Document view">
+            <button
+              type="button"
+              aria-label="Preview mode"
+              aria-pressed={effectiveViewMode === "preview"}
+              disabled={interactionLocked || runActive}
+              onClick={() => setViewMode("preview")}
+            >
+              <Eye size={14} />
+              Preview
+            </button>
+            <button
+              type="button"
+              aria-label="Source mode"
+              aria-pressed={effectiveViewMode === "source"}
+              disabled={
+                interactionLocked ||
+                runActive ||
+                phase === "generating" ||
+                phase === "streaming" ||
+                phase === "revising" ||
+                (phase === "error" && !hasBuffer)
+              }
+              onClick={() => setViewMode("source")}
+            >
+              <FileText size={14} />
+              Source
+            </button>
+          </div>
+
+          {stopVisible && (
+            <button
+              className="plan-stop-button"
+              type="button"
+              aria-label="Stop"
+              disabled={interactionLocked}
+              onClick={() => void onCancel(stageState.runId!)}
+            >
+              <Square size={14} />
+              Stop
+            </button>
+          )}
+
+          <div className="plan-stage-actions">
+            {activeIndex > 0 && (
+              <button
+                type="button"
+                aria-label={prevStep ? `Back to ${prevStep.label}` : "Back"}
+                disabled={interactionLocked || runActive}
+                onClick={() => changeActiveSection(prevStep?.key ?? activeStep.key)}
+              >
+                <ChevronLeft size={14} />
+                Back
+              </button>
+            )}
+            {activeStep.key === "tasks" ? (
+              <button
+                className="plan-finish-button"
+                type="button"
+                aria-label="Finish plan and convert to canvas"
+                disabled={!finishEnabled}
+                onClick={() => void onContinue(activeStep.key)}
+              >
+                <Check size={14} />
+                Finish Plan
+              </button>
+            ) : (
+              <button
+                className="plan-next-button"
+                type="button"
+                aria-label={nextStep ? `Approve and continue to ${nextStep.label}` : "Next"}
+                disabled={!nextEnabled}
+                onClick={() => void onContinue(activeStep.key)}
+              >
+                Next
+                <ChevronRight size={14} />
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
-      <div className="plan-workspace">
-        <div className="plan-editor-card">
-          <div className="plan-section-heading">
-            <div>
-              <p className="eyebrow">{activeStep.label}</p>
-              <h3>{activeStep.label}</h3>
-            </div>
-            <div className="plan-step-actions">
-              <button
-                type="button"
-                disabled={interactionLocked || runActive || stageState.checkpoints.length === 0}
-                onClick={() => void onUndo(activeStep.key)}
-              >
-                Undo
-              </button>
-              <button
-                type="button"
-                disabled={interactionLocked || runActive || activeIndex === 0}
-                onClick={() => changeActiveSection(PLAN_SECTION_STEPS[activeIndex - 1]?.key ?? activeStep.key)}
-              >
-                Back
-              </button>
-              {runActive && stageState.runId ? (
-                <button
-                  type="button"
-                  disabled={interactionLocked}
-                  onClick={() => void onCancel(stageState.runId!)}
-                >
-                  Cancel
-                </button>
-              ) : stageState.status === "failed" && stageState.operation === "generate" ? (
-                <button
-                  type="button"
-                  disabled={interactionLocked}
-                  onClick={() => void onGenerate(activeStep.key)}
-                >
-                  Retry
-                </button>
-              ) : activeStep.key === "tasks" ? (
-                <button
-                  className="plan-approve-button"
-                  type="button"
-                  disabled={interactionLocked || stageState.status !== "ready" || !activeText.trim()}
-                  onClick={() => void onContinue(activeStep.key)}
-                >
-                  <CheckCircle2 size={16} />
-                  Finish
-                </button>
-              ) : (
-                <button
-                  className="plan-approve-button"
-                  type="button"
-                  disabled={interactionLocked || stageState.status !== "ready" || !activeText.trim()}
-                  onClick={() => void onContinue(activeStep.key)}
-                >
-                  <CheckCircle2 size={16} />
-                  Next
-                </button>
-              )}
-            </div>
+      <div
+        className="plan-document"
+        data-phase={phase}
+        data-view={effectiveViewMode}
+      >
+        {runtimeStateError ? (
+          <div className="plan-error-banner" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>{runtimeStateError}</span>
+            <button type="button" onClick={() => void onRetryRuntimeState()}>
+              Retry runtime state
+            </button>
           </div>
-          <label className="plan-editor-label" htmlFor={editorId}>
-            Edit this page
-          </label>
+        ) : stageState.status === "failed" ? (
+          <div className="plan-error-banner" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>
+              {stageState.error
+                ?? (failedOperation === "revise"
+                  ? "Revision failed. Retry to continue."
+                  : "Generation failed. Retry to continue.")}
+            </span>
+            <button
+              type="button"
+              aria-label={failedOperation === "revise" ? "Retry revision" : "Retry generation"}
+              disabled={
+                interactionLocked ||
+                (failedOperation === "revise" && !(agentInstruction.trim() || preservedFailedInstruction).trim())
+              }
+              onClick={() => void retryFailedOperation()}
+            >
+              <RefreshCw size={14} />
+              Retry
+            </button>
+          </div>
+        ) : null}
+
+        {finishError && (
+          <div className="plan-error-banner" role="alert">
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>{finishError}</span>
+          </div>
+        )}
+
+        {effectiveViewMode === "source" ? (
           <PlanDocumentEditor
             id={editorId}
             value={activeText}
             status={stageState.status}
-            locked={interactionLocked}
+            locked={!sourceEditable}
             onChange={(value) => {
-              if (!interactionLocked) onPlanChange(activeStep.key, value);
+              if (!sourceEditable) return;
+              setSourceDirty(true);
+              onPlanChange(activeStep.key, value);
             }}
             onBlur={() => {
               if (!interactionLocked) void onPlanBlur(activeStep.key);
             }}
           />
-        </div>
-
-        <div className="plan-preview-card" aria-label={`${activeStep.label} preview`}>
-          <ReactMarkdown>{activeText}</ReactMarkdown>
-        </div>
+        ) : (
+          <PlanMarkdownPreview markdown={activeText} />
+        )}
       </div>
 
-      <form className="plan-agent-panel" onSubmit={requestAgentRevision}>
-        <div>
-          <label htmlFor={requestId}>Ask agent to revise this page</label>
-          <p>Convert only after the plan is acceptable.</p>
-        </div>
-        <textarea
-          id={requestId}
-          value={agentInstruction}
-          readOnly={interactionLocked || !revisionAvailable}
-          onChange={(event) => setAgentInstruction(event.currentTarget.value)}
-          placeholder={`Request changes to ${activeStep.label.toLowerCase()}`}
-        />
-        <div className="plan-agent-actions">
-          {runtimeStateError && (
-            <span role="alert">
-              {runtimeStateError}
-              <button type="button" onClick={() => void onRetryRuntimeState()}>
-                Retry runtime state
-              </button>
-            </span>
-          )}
-          {stageState.error && <span>{stageState.error}</span>}
-          {finishError && <span role="alert">{finishError}</span>}
-          {finishInFlight && <span>Finishing…</span>}
-          {runActive && <span>{stageState.status === "revising" ? "Revising…" : "Generating…"}</span>}
+      <form className="plan-composer" onSubmit={requestAgentRevision}>
+        {statusLiveText && (
+          <div className="plan-composer-status" aria-live="polite">
+            {statusLiveText}
+          </div>
+        )}
+        <div className="plan-composer-field">
+          <textarea
+            id={requestId}
+            ref={composerRef}
+            className="plan-composer-input"
+            value={agentInstruction}
+            readOnly={interactionLocked || !revisionAvailable || runActive}
+            aria-label="Revision instruction"
+            placeholder="Revise with instruction"
+            rows={1}
+            onChange={(event) => {
+              setAgentInstruction(event.currentTarget.value);
+              resizeComposer(event.currentTarget);
+            }}
+            onKeyDown={handleComposerKeyDown}
+          />
           <button
-            className="primary-action compact-action"
+            className="plan-composer-send"
             type="submit"
-            disabled={
-              interactionLocked || runActive || !revisionAvailable ||
-              !agentInstruction.trim() || !session.plan[activeStep.key].trim()
-            }
+            aria-label="Send revision"
+            disabled={!sendEnabled}
+            aria-busy={phase === "revising" || undefined}
           >
-            {stageState.status === "failed" && stageState.operation === "revise" ? "Retry" : "Request revision"}
+            <ArrowUp size={18} strokeWidth={2.5} />
           </button>
         </div>
       </form>
@@ -6100,10 +6368,20 @@ function ModeSwitch({
 }) {
   return (
     <div className={`mode-segmented-switch ${compact ? "compact" : ""}`} role="group" aria-label="Mode">
-      <button className={`mode-segment-btn ${mode === "fast" ? "active" : ""}`} onClick={() => onChange("fast")} type="button">
-        Fast
+      <button
+        className={`mode-segment-btn ${mode === "fast" ? "active" : ""}`}
+        onClick={() => onChange("fast")}
+        type="button"
+        aria-pressed={mode === "fast"}
+      >
+        Canvas
       </button>
-      <button className={`mode-segment-btn ${mode === "plan" ? "active" : ""}`} onClick={() => onChange("plan")} type="button">
+      <button
+        className={`mode-segment-btn ${mode === "plan" ? "active" : ""}`}
+        onClick={() => onChange("plan")}
+        type="button"
+        aria-pressed={mode === "plan"}
+      >
         Plan
       </button>
     </div>
@@ -6196,6 +6474,14 @@ export function installFinishedPlanCanvas(
   };
 }
 
+export function registerBackendStartedCanvasRuns(startedRuns: Set<string>, canvas: CanvasSession): void {
+  for (const node of canvas.nodes) {
+    if ((node.status === "running" || node.status === "retrying") && node.runId) {
+      startedRuns.add(node.runId);
+    }
+  }
+}
+
 function planMatchesFinishBoundary(session: PlanSession, boundary: PlanFinishBoundary): boolean {
   if (
     session.id !== boundary.planSessionId ||
@@ -6259,13 +6545,22 @@ export async function finishPlanSession(
 ): Promise<CanvasSession> {
   if (!canFinishPlan(session)) throw new Error("Approved Plan is invalid.");
   const canvas = convertPlanToCanvas(session);
-  return persistCanvasWorkflowSession(
-    project,
-    canvas,
-    "plan-confirm",
-    formatApprovedPlanWorkflowInput(session),
-    true,
-  );
+  if (!window.devflow) return canvas;
+  const result = await window.devflow.finishPlanWorkflow(project.rootPath, {
+    planSessionId: session.id,
+    session: {
+      id: canvas.id,
+      projectId: canvas.projectId,
+      title: canvas.title,
+      goal: canvas.goal,
+      mode: canvas.mode,
+      target: canvas.target,
+    },
+  });
+  if (!isCanvasSession(result.canvasSession) || result.canvasSession.id !== session.id) {
+    throw new Error("Authoritative canvas session was not returned.");
+  }
+  return result.canvasSession;
 }
 
 async function persistCanvasWorkflowSession(
