@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -84,7 +85,11 @@ export type WorkflowAuditEventKind =
   | "workflow.run.start_reconciliation_failed"
   | "workflow.node.checkpoint_failed";
 
-export type WorkflowInternalEventKind = "workflow.user_input.delivered";
+export type WorkflowInternalEventKind =
+  | "workflow.user_input.delivered"
+  | "workflow.plan_finish.bound"
+  | "workflow.plan_finish.launch_accepted"
+  | "workflow.planner_intent.reconciled";
 
 export type WorkflowEventKind =
   | "user_input"
@@ -164,6 +169,7 @@ export interface WorkflowStoreOptions {
     overrideHermesHandleCheckpointResult?: (
       phase: "initial" | "final",
     ) => WalCheckpointRow[] | undefined;
+    beforePlanFinishBinding?: () => void;
   };
 }
 
@@ -186,9 +192,14 @@ export interface CreateWorkflowSessionInput {
   transport: HermesPlannerTransport;
   processId?: number;
   opaqueHandle?: string;
+  hasOpaqueHandle?: boolean;
   recoveryReason?: string;
   target?: SessionTarget;
   now: string;
+}
+
+export interface CreatePlanFinishWorkflowSessionInput extends CreateWorkflowSessionInput {
+  planSessionId: string;
 }
 
 export interface WorkflowSessionRecord {
@@ -279,6 +290,7 @@ export interface RunningWorkflowSegment {
 }
 
 export type RunCheckpointEnrichmentCandidate = Omit<RunningWorkflowSegment, "status">;
+export type PlannerIntentReconciliationCandidate = RunCheckpointEnrichmentCandidate;
 
 export interface WorkflowCardToolContext {
   sourceRunId: string;
@@ -595,6 +607,7 @@ interface WalCheckpointRow {
 }
 
 const hermesHandlePhysicalCleanup = "hermes_handle_physical_cleanup_v1";
+const plannerIntentReconciliationPrefix = "planner_intent_reconciliation:";
 const redactHermesHandlesSql =
   "UPDATE hermes_sessions SET opaque_handle = '[redacted]' WHERE opaque_handle IS NOT NULL AND opaque_handle != '[redacted]'";
 const checkpointHermesHandlesSql = "PRAGMA wal_checkpoint(TRUNCATE)";
@@ -714,6 +727,10 @@ interface WorkflowStoreStatements {
   getSegmentByRunId: Database.Statement;
   listSegments: Database.Statement;
   listRunningPlannerSegments: Database.Statement;
+  listPendingPlannerIntentReconciliations: Database.Statement;
+  getPlannerIntentReconciliation: Database.Statement;
+  insertPlannerIntentReconciliation: Database.Statement;
+  deletePlannerIntentReconciliation: Database.Statement;
   insertSegment: Database.Statement;
   updateSegmentEvidence: Database.Statement;
   finishSegment: Database.Statement;
@@ -773,74 +790,56 @@ export class WorkflowStore {
   createWorkflowSession(input: CreateWorkflowSessionInput): WorkflowSessionRecord {
     validateHermesTransport(input);
     const existing = this.getWorkflowSession(input.id);
-    if (existing) return existing;
+    if (existing) {
+      if (this.getEventByIdempotencyKey(input.id, planFinishBindingIdempotencyKey)) {
+        throw new Error(`Workflow session ${input.id} is bound by Plan Finish and cannot use generic session creation.`);
+      }
+      return existing;
+    }
     const target = normalizeSessionTarget(input.target);
 
     const tx = this.db.transaction(() => {
-      const hermesSessionId = `hermes-${input.id}`;
-      const plannerLaneId = "node-1";
-      this.statements.insertSession.run({
-        id: input.id,
-        project_id: input.projectId,
-        hermes_session_id: hermesSessionId,
-        planner_lane_id: plannerLaneId,
-        title: input.title,
-        goal: input.goal,
-        mode: input.mode,
-        execution_target: target.executionTarget,
-        selected_branch: target.selectedBranch,
-        base_ref: target.baseRef ?? null,
-        created_at: input.now,
-        updated_at: input.now,
-      });
-      this.statements.insertHermesSession.run({
-        id: hermesSessionId,
-        workflow_session_id: input.id,
-        transport: input.transport,
-        planner_profile: input.plannerProfile,
-        process_id: input.processId ?? null,
-        opaque_handle: input.opaqueHandle ? "[redacted]" : null,
-        status: input.transport === "hermes_replay_recovery" ? "recovered" : "running",
-        started_at: input.now,
-        last_seen_at: input.now,
-        ended_at: null,
-        recovery_reason: input.recoveryReason ?? null,
-        metadata_json: stableJson({}),
-      });
-      this.insertEventInTransaction({
-        sessionId: input.id,
-        kind: "hermes_session_started",
-        source: "workflow_store",
-        payload: {
-          hermesSessionId,
-          plannerLaneId,
-          transport: input.transport,
-          recoveryReason: input.recoveryReason ?? null,
-          target,
-        },
-        idempotencyKey: `session:${input.id}:hermes-started`,
-        now: input.now,
-      });
-      this.statements.insertLane.run({
-        id: plannerLaneId,
-        session_id: input.id,
-        node_id: "node-1",
-        semantic_key: "planner:root",
-        lane_kind: "planner",
-        agent_kind: "hermes",
-        title: "Hermes planner",
-        brief: input.goal,
-        status: "running",
-        phase: "Planning",
-        archived: 0,
-        created_at: input.now,
-        updated_at: input.now,
-      });
+      this.insertWorkflowSessionInTransaction(input, target);
     });
     tx();
     const created = this.getWorkflowSession(input.id);
     if (!created) throw new Error(`Failed to create workflow session ${input.id}.`);
     return created;
+  }
+
+  assertPlanFinishWorkflowSessionAvailable(input: CreatePlanFinishWorkflowSessionInput): WorkflowSessionRecord | null {
+    validateHermesTransport(input);
+    const target = normalizeSessionTarget(input.target);
+    const existing = this.getWorkflowSession(input.id);
+    if (!existing) return null;
+    this.assertMatchingPlanFinishBinding(input, target, existing);
+    return existing;
+  }
+
+  createPlanFinishWorkflowSession(input: CreatePlanFinishWorkflowSessionInput): WorkflowSessionRecord {
+    validateHermesTransport(input);
+    const target = normalizeSessionTarget(input.target);
+    const tx = this.db.transaction(() => {
+      const existing = this.getWorkflowSession(input.id);
+      if (existing) {
+        this.assertMatchingPlanFinishBinding(input, target, existing);
+        return existing;
+      }
+      this.insertWorkflowSessionInTransaction(input, target);
+      this.faultInjection?.beforePlanFinishBinding?.();
+      this.insertEventInTransaction({
+        sessionId: input.id,
+        kind: "workflow.plan_finish.bound",
+        source: "workflow_store",
+        idempotencyKey: planFinishBindingIdempotencyKey,
+        payload: planFinishBindingPayload(input, target),
+        now: input.now,
+      });
+      const created = this.getWorkflowSession(input.id);
+      if (!created) throw new Error(`Failed to create Plan Finish workflow session ${input.id}.`);
+      return created;
+    });
+    return tx();
   }
 
   getWorkflowSession(sessionId: string): WorkflowSessionRecord | null {
@@ -1537,6 +1536,20 @@ export class WorkflowStore {
         payload: { status: laneStatus, reason: "planner run evidence" },
         now: input.now,
       });
+      if (status === "succeeded") {
+        const candidate: PlannerIntentReconciliationCandidate = {
+          sessionId: input.sessionId,
+          laneId: input.laneId,
+          segmentId: input.segmentId,
+          runId: input.runId,
+          agentKind: input.agentKind,
+        };
+        this.statements.insertPlannerIntentReconciliation.run({
+          name: plannerIntentReconciliationName(candidate),
+          state: stableJson(candidate),
+          completed_at: input.now,
+        });
+      }
     });
     tx();
     return this.materializeFlowProjection(input.sessionId);
@@ -1823,6 +1836,46 @@ export class WorkflowStore {
         });
     });
     return [...plannerSegments, ...flowSegments];
+  }
+
+  listPendingPlannerIntentReconciliations(): PlannerIntentReconciliationCandidate[] {
+    return (this.statements.listPendingPlannerIntentReconciliations.all(
+      plannerIntentReconciliationPrefix,
+    ) as Array<{ state: string }>).map((row) => parsePlannerIntentReconciliationCandidate(row.state));
+  }
+
+  recordPlannerIntentReconciled(
+    candidate: PlannerIntentReconciliationCandidate,
+    now: string,
+  ): WorkflowEventRecord {
+    const normalized = normalizePlannerIntentReconciliationCandidate(candidate);
+    const name = plannerIntentReconciliationName(normalized);
+    const idempotencyKey = plannerIntentReconciliationIdempotencyKey(normalized.runId);
+    return this.db.transaction(() => {
+      const existing = this.getEventByIdempotencyKey(normalized.sessionId, idempotencyKey);
+      if (existing) {
+        assertMatchingPlannerIntentReconciliationEvent(existing, normalized);
+        this.statements.deletePlannerIntentReconciliation.run(name, stableJson(normalized));
+        return existing;
+      }
+      const pending = this.statements.getPlannerIntentReconciliation.get(name) as { state: string } | undefined;
+      if (!pending || pending.state !== stableJson(normalized)) {
+        throw new Error("Planner intent reconciliation state is missing or conflicts with the terminal run.");
+      }
+      const event = this.insertEventInTransaction({
+        sessionId: normalized.sessionId,
+        kind: "workflow.planner_intent.reconciled",
+        source: "electron-main",
+        laneId: normalized.laneId,
+        segmentId: normalized.segmentId,
+        idempotencyKey,
+        payload: { runId: normalized.runId },
+        now,
+      });
+      const removed = this.statements.deletePlannerIntentReconciliation.run(name, pending.state);
+      if (removed.changes !== 1) throw new Error("Planner intent reconciliation state could not be completed.");
+      return event;
+    })();
   }
 
   listPendingRunCheckpointEnrichments(): RunCheckpointEnrichmentCandidate[] {
@@ -2817,6 +2870,94 @@ export class WorkflowStore {
         phase: phaseForLaneStatus(input.status),
         updated_at: input.now,
       });
+  }
+
+  private insertWorkflowSessionInTransaction(
+    input: CreateWorkflowSessionInput,
+    target: SessionTarget,
+  ): void {
+    const hermesSessionId = `hermes-${input.id}`;
+    const plannerLaneId = "node-1";
+    this.statements.insertSession.run({
+      id: input.id,
+      project_id: input.projectId,
+      hermes_session_id: hermesSessionId,
+      planner_lane_id: plannerLaneId,
+      title: input.title,
+      goal: input.goal,
+      mode: input.mode,
+      execution_target: target.executionTarget,
+      selected_branch: target.selectedBranch,
+      base_ref: target.baseRef ?? null,
+      created_at: input.now,
+      updated_at: input.now,
+    });
+    this.statements.insertHermesSession.run({
+      id: hermesSessionId,
+      workflow_session_id: input.id,
+      transport: input.transport,
+      planner_profile: input.plannerProfile,
+      process_id: input.processId ?? null,
+      opaque_handle: input.opaqueHandle || input.hasOpaqueHandle ? "[redacted]" : null,
+      status: input.transport === "hermes_replay_recovery" ? "recovered" : "running",
+      started_at: input.now,
+      last_seen_at: input.now,
+      ended_at: null,
+      recovery_reason: input.recoveryReason ?? null,
+      metadata_json: stableJson({}),
+    });
+    this.insertEventInTransaction({
+      sessionId: input.id,
+      kind: "hermes_session_started",
+      source: "workflow_store",
+      payload: {
+        hermesSessionId,
+        plannerLaneId,
+        transport: input.transport,
+        recoveryReason: input.recoveryReason ?? null,
+        target,
+      },
+      idempotencyKey: `session:${input.id}:hermes-started`,
+      now: input.now,
+    });
+    this.statements.insertLane.run({
+      id: plannerLaneId,
+      session_id: input.id,
+      node_id: "node-1",
+      semantic_key: "planner:root",
+      lane_kind: "planner",
+      agent_kind: "hermes",
+      title: "Hermes planner",
+      brief: input.goal,
+      status: "running",
+      phase: "Planning",
+      archived: 0,
+      created_at: input.now,
+      updated_at: input.now,
+    });
+  }
+
+  private assertMatchingPlanFinishBinding(
+    input: CreatePlanFinishWorkflowSessionInput,
+    target: SessionTarget,
+    existing: WorkflowSessionRecord,
+  ): void {
+    const binding = this.getEventByIdempotencyKey(input.id, planFinishBindingIdempotencyKey);
+    if (!binding) {
+      throw new Error(`Workflow session ${input.id} was not bound by Plan Finish.`);
+    }
+    const expectedPayload = planFinishBindingPayload(input, target);
+    if (
+      binding.kind !== "workflow.plan_finish.bound" ||
+      binding.source !== "workflow_store" ||
+      binding.sessionId !== input.id ||
+      binding.idempotencyKey !== planFinishBindingIdempotencyKey ||
+      stableJson(binding.payload) !== stableJson(expectedPayload) ||
+      stableJson(planFinishWorkflowSessionIdentity(existing)) !== stableJson(expectedPayload.workflowSession) ||
+      stableJson(planFinishPlannerIdentity(this.listHermesSessions(input.id))) !== stableJson(expectedPayload.planner)
+    ) {
+      throw new Error(`Workflow session ${input.id} Plan Finish binding conflicts with the requested identity.`);
+    }
   }
 
   private setLaneStatus(sessionId: string, laneId: string, status: WorkflowLaneStatus, now: string): void {
@@ -3991,6 +4132,7 @@ function applyMigrations(
   const requiresHermesHandlePhysicalCleanup = applyHermesHandleRedactionMigration(db, faultInjection);
   applyHistoricalOutputDeltaMigration(db);
   applyHistoricalLaneRequiredEvidenceMigration(db);
+  applyPlannerIntentReconciliationMigration(db);
   return requiresHermesHandlePhysicalCleanup;
 }
 
@@ -4222,6 +4364,46 @@ function applyHistoricalLaneRequiredEvidenceMigration(db: Database.Database): vo
   migrate();
 }
 
+function applyPlannerIntentReconciliationMigration(db: Database.Database): void {
+  if (db.prepare("SELECT 1 FROM schema_migrations WHERE version = 8").get()) return;
+  const migrate = db.transaction(() => {
+    const rows = db.prepare([
+      "SELECT workflow_segments.* FROM workflow_segments",
+      "JOIN workflow_lanes ON workflow_lanes.session_id = workflow_segments.session_id",
+      "AND workflow_lanes.id = workflow_segments.lane_id",
+      "WHERE workflow_segments.status = 'succeeded'",
+      "AND workflow_segments.agent_kind = 'hermes'",
+      "AND workflow_lanes.lane_kind = 'planner'",
+      "AND NOT EXISTS (",
+      "SELECT 1 FROM workflow_events",
+      "WHERE workflow_events.session_id = workflow_segments.session_id",
+      "AND workflow_events.idempotency_key = 'planner-intent:' || workflow_segments.run_id || ':reconciled'",
+      ")",
+      "ORDER BY workflow_segments.ended_at, workflow_segments.id",
+    ].join(" ")).all() as SegmentRow[];
+    const insert = db.prepare([
+      "INSERT OR IGNORE INTO workflow_maintenance(name, state, completed_at)",
+      "VALUES (@name, @state, @completed_at)",
+    ].join(" "));
+    for (const row of rows) {
+      const candidate: PlannerIntentReconciliationCandidate = {
+        sessionId: row.session_id,
+        laneId: row.lane_id,
+        segmentId: row.id,
+        runId: row.run_id,
+        agentKind: row.agent_kind,
+      };
+      insert.run({
+        name: plannerIntentReconciliationName(candidate),
+        state: stableJson(candidate),
+        completed_at: row.ended_at ?? row.started_at,
+      });
+    }
+    db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (8, datetime('now'))").run();
+  });
+  migrate();
+}
+
 function checkpointRedactedHermesHandles(
   db: Database.Database,
   phase: "initial" | "final",
@@ -4334,6 +4516,18 @@ function prepareStatements(db: Database.Database): WorkflowStoreStatements {
         "WHERE workflow_segments.status = 'running' AND workflow_lanes.lane_kind = 'planner'",
         "ORDER BY workflow_segments.started_at, workflow_segments.id",
       ].join(" "),
+    ),
+    listPendingPlannerIntentReconciliations: db.prepare(
+      "SELECT state FROM workflow_maintenance WHERE name LIKE ? || '%' ORDER BY completed_at, name",
+    ),
+    getPlannerIntentReconciliation: db.prepare(
+      "SELECT state FROM workflow_maintenance WHERE name = ?",
+    ),
+    insertPlannerIntentReconciliation: db.prepare(
+      "INSERT OR IGNORE INTO workflow_maintenance(name, state, completed_at) VALUES (@name, @state, @completed_at)",
+    ),
+    deletePlannerIntentReconciliation: db.prepare(
+      "DELETE FROM workflow_maintenance WHERE name = ? AND state = ?",
     ),
     insertSegment: db.prepare(
       [
@@ -4453,10 +4647,11 @@ function laneHasTrustedEvidence(laneId: string, segments: WorkflowSegmentRecord[
 }
 
 function validateHermesTransport(input: CreateWorkflowSessionInput): void {
-  if (input.transport === "hermes_live_chat" && !input.processId && !input.opaqueHandle) {
+  const hasOpaqueHandle = Boolean(input.opaqueHandle || input.hasOpaqueHandle);
+  if (input.transport === "hermes_live_chat" && !input.processId && !hasOpaqueHandle) {
     throw new Error("hermes_live_chat requires a process id or live handle.");
   }
-  if (input.transport === "hermes_session_resume" && !input.opaqueHandle) {
+  if (input.transport === "hermes_session_resume" && !hasOpaqueHandle) {
     throw new Error("hermes_session_resume requires an opaque handle.");
   }
   if (input.transport === "hermes_replay_recovery" && !input.recoveryReason) {
@@ -4680,6 +4875,107 @@ function workflowIntentId(intent: unknown): string {
   return isRecord(intent) && typeof intent.intentId === "string" ? intent.intentId : "unknown-intent";
 }
 
+const planFinishBindingIdempotencyKey = "plan-finish:binding";
+
+function planFinishBindingPayload(
+  input: CreatePlanFinishWorkflowSessionInput,
+  target: SessionTarget,
+) {
+  return {
+    planSessionId: requireIdentifier(input.planSessionId, "planSessionId"),
+    workflowSession: {
+      id: input.id,
+      projectId: input.projectId,
+      hermesSessionId: `hermes-${input.id}`,
+      plannerLaneId: "node-1",
+      title: input.title,
+      goal: input.goal,
+      mode: input.mode,
+      target,
+    },
+    planner: {
+      plannerProfile: input.plannerProfile,
+      transport: input.transport,
+      processId: input.processId ?? null,
+      hasOpaqueHandle: Boolean(input.opaqueHandle || input.hasOpaqueHandle),
+      recoveryReason: input.recoveryReason ?? null,
+    },
+  };
+}
+
+function planFinishWorkflowSessionIdentity(session: WorkflowSessionRecord) {
+  return {
+    id: session.id,
+    projectId: session.projectId,
+    hermesSessionId: session.hermesSessionId,
+    plannerLaneId: session.plannerLaneId,
+    title: session.title,
+    goal: session.goal,
+    mode: session.mode,
+    target: session.target,
+  };
+}
+
+function planFinishPlannerIdentity(sessions: HermesSessionRecord[]) {
+  if (sessions.length !== 1 || !sessions[0]) return null;
+  const session = sessions[0];
+  return {
+    plannerProfile: session.plannerProfile,
+    transport: session.transport,
+    processId: session.processId,
+    hasOpaqueHandle: session.opaqueHandle === "[redacted]",
+    recoveryReason: session.recoveryReason,
+  };
+}
+
+function plannerIntentReconciliationName(candidate: PlannerIntentReconciliationCandidate): string {
+  const identity = stableJson({
+    sessionId: candidate.sessionId,
+    laneId: candidate.laneId,
+    segmentId: candidate.segmentId,
+    runId: candidate.runId,
+  });
+  return `${plannerIntentReconciliationPrefix}${createHash("sha256").update(identity).digest("hex")}`;
+}
+
+function plannerIntentReconciliationIdempotencyKey(runId: string): string {
+  return `planner-intent:${runId}:reconciled`;
+}
+
+function parsePlannerIntentReconciliationCandidate(state: string): PlannerIntentReconciliationCandidate {
+  const candidate = parseJson(state);
+  if (Object.keys(candidate).length !== 5) throw new Error("Planner intent reconciliation state is invalid.");
+  return normalizePlannerIntentReconciliationCandidate(candidate as unknown as PlannerIntentReconciliationCandidate);
+}
+
+function normalizePlannerIntentReconciliationCandidate(
+  candidate: PlannerIntentReconciliationCandidate,
+): PlannerIntentReconciliationCandidate {
+  return {
+    sessionId: requireIdentifier(candidate.sessionId, "planner intent sessionId"),
+    laneId: requireIdentifier(candidate.laneId, "planner intent laneId"),
+    segmentId: requireIdentifier(candidate.segmentId, "planner intent segmentId"),
+    runId: requireIdentifier(candidate.runId, "planner intent runId"),
+    agentKind: requireAgent(candidate.agentKind),
+  };
+}
+
+function assertMatchingPlannerIntentReconciliationEvent(
+  event: WorkflowEventRecord,
+  candidate: PlannerIntentReconciliationCandidate,
+): void {
+  if (
+    event.kind !== "workflow.planner_intent.reconciled" ||
+    event.sessionId !== candidate.sessionId ||
+    event.laneId !== candidate.laneId ||
+    event.segmentId !== candidate.segmentId ||
+    event.idempotencyKey !== plannerIntentReconciliationIdempotencyKey(candidate.runId) ||
+    event.payload.runId !== candidate.runId
+  ) {
+    throw new Error("Planner intent reconciliation marker conflicts with the terminal run.");
+  }
+}
+
 function isFlowEventKind(kind: WorkflowEventKind): kind is FlowEventKind {
   return kind.startsWith("workflow.") &&
     !isWorkflowAuditEventKind(kind) &&
@@ -4693,7 +4989,10 @@ function isWorkflowAuditEventKind(kind: WorkflowEventKind): kind is WorkflowAudi
 }
 
 function isWorkflowInternalEventKind(kind: WorkflowEventKind): kind is WorkflowInternalEventKind {
-  return kind === "workflow.user_input.delivered";
+  return kind === "workflow.user_input.delivered" ||
+    kind === "workflow.plan_finish.bound" ||
+    kind === "workflow.plan_finish.launch_accepted" ||
+    kind === "workflow.planner_intent.reconciled";
 }
 
 function userInputDeliveredIdempotencyKey(inputId: string): string {

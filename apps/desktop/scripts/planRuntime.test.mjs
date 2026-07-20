@@ -350,6 +350,48 @@ test("Plan runtime persists a private opaque mapping and reuses it after restart
   }
 });
 
+test("Plan runtime authorizes Finish only from a durable, fully accepted idle snapshot", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-handoff-"));
+  const client = new FakeAcpClient();
+  const events = [];
+  try {
+    const runtime = createPlanRuntime(runtimeOptions(stateRoot, client, events));
+    await assert.rejects(
+      runtime.readFinishPlanHandoff({ planSessionId: "plan-session-1", projectRoot: "/repo" }),
+      /Approved Plan handoff is unavailable/i,
+    );
+
+    await terminalEvent(events, (await runtime.generate(generateRequest())).runId);
+    await runtime.acceptStage({ ...generateRequest(), stage: "requirements", expectedStateVersion: 1 });
+    client.chunks = ["# Design"];
+    await terminalEvent(events, (await runtime.generate({ ...generateRequest(), stage: "design", expectedStateVersion: 2 })).runId);
+    await runtime.acceptStage({ ...generateRequest(), stage: "design", expectedStateVersion: 3 });
+    client.chunks = ["# Tasks"];
+    await terminalEvent(events, (await runtime.generate({ ...generateRequest(), stage: "tasks", expectedStateVersion: 4 })).runId);
+    await runtime.acceptStage({ ...generateRequest(), stage: "tasks", expectedStateVersion: 5 });
+
+    const handoff = await runtime.readFinishPlanHandoff({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(handoff.hermesSessionHandle, client.sessionId);
+    assert.deepEqual(toPlain(handoff.snapshot.plan), {
+      requirements: "# Requirements", design: "# Design", tasks: "# Tasks",
+    });
+    handoff.snapshot.plan.requirements = "forged renderer mutation";
+    assert.equal((await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" })).snapshot.plan.requirements, "# Requirements");
+    await assert.rejects(
+      runtime.readFinishPlanHandoff({ planSessionId: "plan-session-1", projectRoot: "/other-repo" }),
+      /mapping project does not match/i,
+    );
+    await runtime.close();
+    await assert.rejects(
+      runtime.readFinishPlanHandoff({ planSessionId: "plan-session-1", projectRoot: "/repo" }),
+      /shut down/i,
+    );
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
 test("Plan runtime rejects a mapping from another project before any ACP session call", async () => {
   const { createPlanRuntime } = await loadPlanRuntime();
   const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));

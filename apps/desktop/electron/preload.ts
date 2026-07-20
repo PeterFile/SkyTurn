@@ -60,6 +60,7 @@ const reassignLane: WorkflowApi["reassignLane"] = reassignWorkflowLane;
 
 const workflow = {
   createSession: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:createSession", projectRoot, input),
+  finishPlan: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:finishPlan", projectRoot, input),
   appendUserInput: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:appendUserInput", projectRoot, input),
   getLedger: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:ledger", projectRoot, sessionId),
   applyIntent: (projectRoot: string, intent: unknown) => ipcRenderer.invoke("workflow:applyIntent", projectRoot, intent),
@@ -132,6 +133,7 @@ contextBridge.exposeInMainWorld("devflow", {
   listAgentRuns: () => ipcRenderer.invoke("run:list"),
   getRunEvidence: (projectRoot: string, runId: string) => ipcRenderer.invoke("run:evidence", projectRoot, runId),
   createWorkflowSession: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:createSession", projectRoot, input),
+  finishPlanWorkflow: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:finishPlan", projectRoot, input),
   appendWorkflowUserInput: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:appendUserInput", projectRoot, input),
   getWorkflowLedger: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:ledger", projectRoot, sessionId),
   getChangeset: (projectRoot: string, node: unknown) => ipcRenderer.invoke("changeset:get", projectRoot, node),
