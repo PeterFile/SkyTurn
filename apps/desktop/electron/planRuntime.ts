@@ -484,6 +484,27 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
   }
 
   return {
+    async readFinishPlanHandoff(request: { planSessionId: string; projectRoot: string }): Promise<{
+      hermesSessionHandle: string;
+      snapshot: PlanStateSnapshot;
+    }> {
+      return serializeState(async () => {
+        if (closed) throw new Error(runtimeShutdownError);
+        const bound = await readBoundPlanState(request.planSessionId, request.projectRoot);
+        if (bound.read.status !== "valid" || bound.state.active) {
+          throw new Error("Approved Plan handoff is unavailable.");
+        }
+        if (bound.mapping.status !== "valid") throw new Error("Plan conversation mapping is missing.");
+        const snapshot = bound.state.snapshot;
+        if (planStages.some((stage) => !snapshot.accepted[stage] || !snapshot.plan[stage].trim())) {
+          throw new Error("Approved Plan handoff is unavailable.");
+        }
+        return {
+          hermesSessionHandle: bound.mapping.mapping.acpSessionId,
+          snapshot: cloneSnapshot(snapshot),
+        };
+      });
+    },
     generate(request: PlanGenerateRequest): Promise<PlanRunStartResult> {
       return start(request);
     },

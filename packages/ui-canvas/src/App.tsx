@@ -91,7 +91,6 @@ import {
   convertPlanToCanvas,
   createFastCanvasSession,
   createPlanSession,
-  formatApprovedPlanWorkflowInput,
 } from "@skyturn/planner";
 import {
   NODE_MODAL_TABS,
@@ -940,6 +939,7 @@ export default function App() {
       if (accepted?.kind !== "plan" || !acceptedResult.snapshot.accepted.tasks || !canFinishPlan(accepted)) return;
       const boundary = capturePlanFinishBoundary(accepted);
       const canvas = await finishPlanSession(project, accepted);
+      registerBackendStartedCanvasRuns(startedBridgeRuns.current, canvas);
       setWorkspace((current) => {
         const result = installFinishedPlanCanvas(current, boundary, canvas);
         workspaceRef.current = result.workspace;
@@ -6474,6 +6474,14 @@ export function installFinishedPlanCanvas(
   };
 }
 
+export function registerBackendStartedCanvasRuns(startedRuns: Set<string>, canvas: CanvasSession): void {
+  for (const node of canvas.nodes) {
+    if ((node.status === "running" || node.status === "retrying") && node.runId) {
+      startedRuns.add(node.runId);
+    }
+  }
+}
+
 function planMatchesFinishBoundary(session: PlanSession, boundary: PlanFinishBoundary): boolean {
   if (
     session.id !== boundary.planSessionId ||
@@ -6537,13 +6545,22 @@ export async function finishPlanSession(
 ): Promise<CanvasSession> {
   if (!canFinishPlan(session)) throw new Error("Approved Plan is invalid.");
   const canvas = convertPlanToCanvas(session);
-  return persistCanvasWorkflowSession(
-    project,
-    canvas,
-    "plan-confirm",
-    formatApprovedPlanWorkflowInput(session),
-    true,
-  );
+  if (!window.devflow) return canvas;
+  const result = await window.devflow.finishPlanWorkflow(project.rootPath, {
+    planSessionId: session.id,
+    session: {
+      id: canvas.id,
+      projectId: canvas.projectId,
+      title: canvas.title,
+      goal: canvas.goal,
+      mode: canvas.mode,
+      target: canvas.target,
+    },
+  });
+  if (!isCanvasSession(result.canvasSession) || result.canvasSession.id !== session.id) {
+    throw new Error("Authoritative canvas session was not returned.");
+  }
+  return result.canvasSession;
 }
 
 async function persistCanvasWorkflowSession(

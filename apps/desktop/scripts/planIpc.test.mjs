@@ -1268,6 +1268,42 @@ test("workspace save rejects malformed envelopes and sessions without replacing 
   }
 });
 
+test("workspace save accepts a converted Plan Canvas without treating it as a Plan document", async () => {
+  const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-workspace-save-plan-canvas-"));
+  const projectRoot = join(userDataPath, "project");
+  const target = join(userDataPath, "workspace.json");
+  const workspace = workspaceSnapshot(projectRoot, "converted-plan-canvas");
+  workspace.sessions = [{
+    id: "plan-1",
+    projectId: "project-1",
+    title: "Converted Plan",
+    goal: "Deliver the approved plan",
+    mode: "plan",
+    kind: "canvas",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    createdAt: "2026-07-17T00:00:00.000Z",
+    updatedAt: "2026-07-17T00:00:00.000Z",
+    hermesPlannerSessionId: "hermes-planner-plan-1",
+    plannerNodeId: "planner-1",
+    nodes: [],
+    edges: [],
+    activeNodeId: null,
+  }];
+  workspace.activeSessionId = "plan-1";
+  try {
+    await mkdir(projectRoot);
+    await writeFile(target, JSON.stringify(workspaceSnapshot(projectRoot, "prior"), null, 2), "utf8");
+    const loaded = await loadMainModule([], { userDataPath });
+    await loaded.ipcHandlers.get("workspace:load")();
+
+    await loaded.ipcHandlers.get("workspace:save")({}, workspace);
+
+    assert.deepEqual(toPlain(JSON.parse(await readFile(target, "utf8"))), workspace);
+  } finally {
+    await rm(userDataPath, { recursive: true, force: true });
+  }
+});
+
 test("Open Project roots can be added to the trusted workspace", async () => {
   const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-workspace-open-project-"));
   const openedRoot = join(userDataPath, "opened-project");
@@ -1330,6 +1366,466 @@ test("workflow user input durable delivery suppresses a response-loss retry", as
     assert.deepEqual(toPlain(retry.event), toPlain(first.event));
     assert.deepEqual(terminalWrites, [{ sessionId: "session-1", text: "Deliver this once.\n" }]);
   } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("Finish Plan uses only the authoritative PlanRuntime snapshot and never exposes its ACP handle", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-finish-plan-handoff-"));
+  const rawHandle = "acp-private-finish-plan-handle";
+  const starts = [];
+  const handleReads = [];
+  const order = [];
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      createPlanRuntime: () => ({
+        readFinishPlanHandoff: async (request) => {
+          handleReads.push(request);
+          return {
+            hermesSessionHandle: rawHandle,
+            snapshot: {
+              version: 3,
+              plan: {
+                requirements: "Exact approved requirements.",
+                design: "Exact approved design.",
+                tasks: "Exact approved tasks.",
+              },
+              accepted: { requirements: true, design: true, tasks: true },
+              checkpoints: { requirements: [], design: [], tasks: [] },
+            },
+          };
+        },
+        close: async () => undefined,
+      }),
+      createRunStartHandler: () => async (input) => {
+        starts.push(input);
+        order.push("agent-bridge-accepted");
+        return { id: input.runId };
+      },
+      terminalRuntime: {
+        startHermesPlannerForWorkflowSession: async () => {
+          throw new Error("Finish Plan must not start a terminal transport.");
+        },
+        sendWorkflowUserInput: async () => {
+          throw new Error("Finish Plan must not send PTY input.");
+        },
+        hermesPlannerTerminalSessionId: () => null,
+        close: async () => undefined,
+      },
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const input = {
+      planSessionId: "plan-1",
+      session: {
+        id: "plan-1",
+        projectId: "project-1",
+        title: "Approved Plan",
+        goal: "Finish the approved plan",
+        mode: "plan",
+        target: { executionTarget: "current_branch", selectedBranch: "main" },
+      },
+    };
+
+    const first = await loaded.ipcHandlers.get("workflow:finishPlan")({}, projectRoot, input);
+    const retry = await loaded.ipcHandlers.get("workflow:finishPlan")({}, projectRoot, input);
+    const eventsBeforeConflict = await loaded.ipcHandlers.get("workflow:events")({}, projectRoot, "plan-1");
+    await assert.rejects(
+      loaded.ipcHandlers.get("workflow:finishPlan")({}, projectRoot, {
+        ...input,
+        session: { ...input.session, title: "Forged retry title" },
+      }),
+      /Plan Finish binding conflicts/i,
+    );
+    const eventsAfterConflict = await loaded.ipcHandlers.get("workflow:events")({}, projectRoot, "plan-1");
+
+    assert.deepEqual(toPlain(handleReads), [
+      { planSessionId: "plan-1", projectRoot },
+      { planSessionId: "plan-1", projectRoot },
+    ]);
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].hermesSessionHandle, rawHandle);
+    assert.equal(starts[0].prompt.includes("Exact approved requirements."), true);
+    assert.equal(starts[0].prompt.includes("Exact approved design."), true);
+    assert.equal(starts[0].prompt.includes("Exact approved tasks."), true);
+    const { createAgentRunStartFingerprint } = await import("@skyturn/agent-bridge");
+    assert.equal(starts[0].transport, "exec-json");
+    assert.doesNotThrow(() => createAgentRunStartFingerprint(starts[0]));
+    assert.throws(
+      () => createAgentRunStartFingerprint({ ...starts[0], transport: "hermes_session_resume" }),
+      /Run start fingerprint transport is invalid\./,
+    );
+    assert.deepEqual(order, ["agent-bridge-accepted"]);
+    assert.equal(JSON.stringify({ first, retry }).includes(rawHandle), false);
+    assert.deepEqual(first.event, retry.event);
+    assert.deepEqual(toPlain(eventsAfterConflict), toPlain(eventsBeforeConflict));
+
+    await loaded.exports.closeWorkflowStores();
+    const reopenedRetry = await loaded.ipcHandlers.get("workflow:finishPlan")({}, projectRoot, input);
+    assert.equal(starts.length, 1);
+    assert.deepEqual(reopenedRetry.event, first.event);
+    await loaded.exports.closeWorkflowStores();
+    const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+    const reopened = createWorkflowStore({ projectRoot });
+    assert.equal(JSON.stringify({ events: reopened.listEvents("plan-1"), canvas: reopened.materializeCanvasSession("plan-1") }).includes(rawHandle), false);
+    assert.equal(reopened.listEvents("plan-1").some((event) => event.kind === "workflow.user_input.delivered"), true);
+    assert.equal(reopened.listEvents("plan-1").filter((event) => event.kind === "workflow.plan_finish.bound").length, 1);
+    assert.equal(reopened.listEvents("plan-1").filter((event) => event.kind === "workflow.plan_finish.launch_accepted").length, 1);
+    reopened.close();
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("generic workflow creation cannot reuse a bound Finish Plan session", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-finish-plan-generic-reuse-"));
+  const agentBridgeStarts = [];
+  const terminalStarts = [];
+  let workflowStore;
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      createPlanRuntime: () => approvedFinishPlanRuntime(),
+      createRunStartHandler: () => async (run) => {
+        agentBridgeStarts.push(run);
+        return { id: run.runId };
+      },
+      terminalRuntime: {
+        startHermesPlannerForWorkflowSession: async (input) => {
+          terminalStarts.push(input);
+        },
+        sendWorkflowUserInput: async () => undefined,
+        hermesPlannerTerminalSessionId: () => null,
+        close: async () => undefined,
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          workflowStore = module.createWorkflowStore(options);
+          return workflowStore;
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const input = finishPlanInput();
+    await loaded.ipcHandlers.get("workflow:finishPlan")({}, projectRoot, input);
+    const eventsBefore = toPlain(workflowStore.listEvents(input.session.id));
+    const canvasBefore = toPlain(workflowStore.materializeCanvasSession(input.session.id));
+
+    await assert.rejects(
+      loaded.ipcHandlers.get("workflow:createSession")({}, projectRoot, {
+        ...input.session,
+        plannerProfile: "default",
+        transport: "hermes_live_chat",
+        opaqueHandle: "caller-supplied-fake-opaque-handle",
+      }),
+      /bound by Plan Finish/i,
+    );
+
+    assert.equal(agentBridgeStarts.length, 1);
+    assert.deepEqual(terminalStarts, []);
+    assert.deepEqual(toPlain(workflowStore.listEvents(input.session.id)), eventsBefore);
+    assert.deepEqual(toPlain(workflowStore.materializeCanvasSession(input.session.id)), canvasBefore);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+for (const preclaimMode of ["fast", "plan"]) {
+  test(`Finish Plan rejects a matching-looking generic ${preclaimMode} session preclaim before capability use`, async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), `skyturn-finish-plan-preclaim-${preclaimMode}-`));
+    const starts = [];
+    let handoffReads = 0;
+    let loaded;
+    try {
+      loaded = await loadMainModule([], {
+        createPlanRuntime: () => ({
+          ...approvedFinishPlanRuntime(),
+          readFinishPlanHandoff: async () => {
+            handoffReads += 1;
+            return approvedFinishPlanRuntime().readFinishPlanHandoff();
+          },
+        }),
+        createRunStartHandler: () => async (run) => {
+          starts.push(run);
+          return { id: run.runId };
+        },
+      });
+      loaded.exports.openedProjectRoots.add(projectRoot);
+      const finishInput = finishPlanInput();
+      await loaded.ipcHandlers.get("workflow:createSession")({}, projectRoot, {
+        ...finishInput.session,
+        mode: preclaimMode,
+        plannerProfile: "default",
+        transport: "hermes_replay_recovery",
+        recoveryReason: "Generic renderer-created workflow session.",
+      });
+
+      await assert.rejects(
+        loaded.ipcHandlers.get("workflow:finishPlan")({}, projectRoot, finishInput),
+        /not bound by Plan Finish/i,
+      );
+      const { events } = await loaded.ipcHandlers.get("workflow:events")({}, projectRoot, finishInput.session.id);
+      assert.equal(handoffReads, 0);
+      assert.deepEqual(starts, []);
+      assert.equal(events.some((event) => event.kind === "workflow.user_input"), false);
+      assert.equal(events.some((event) => event.kind === "workflow.user_input.delivered"), false);
+      assert.equal(events.some((event) => event.kind === "workflow.plan_finish.launch_accepted"), false);
+      assert.equal(events.some((event) => event.kind === "workflow.plan_finish.bound"), false);
+    } finally {
+      await loaded?.exports.closeWorkflowStores();
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+}
+
+test("Finish Plan rejects unaccepted or forged renderer input before any workflow write or AgentBridge start", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-finish-plan-authority-"));
+  const starts = [];
+  let handoffReads = 0;
+  let loaded;
+  const input = {
+    planSessionId: "plan-1",
+    session: {
+      id: "plan-1",
+      projectId: "project-1",
+      title: "Approved Plan",
+      goal: "Finish the approved plan",
+      mode: "plan",
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+    },
+  };
+  try {
+    loaded = await loadMainModule([], {
+      createPlanRuntime: () => ({
+        readFinishPlanHandoff: async () => {
+          handoffReads += 1;
+          throw new Error("Approved Plan handoff is unavailable.");
+        },
+        close: async () => undefined,
+      }),
+      createRunStartHandler: () => async (run) => {
+        starts.push(run);
+        return { id: run.runId };
+      },
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    await assert.rejects(
+      loaded.ipcHandlers.get("workflow:finishPlan")({}, projectRoot, input),
+      /Approved Plan handoff is unavailable/i,
+    );
+    await assert.rejects(
+      loaded.ipcHandlers.get("workflow:finishPlan")({}, projectRoot, {
+        ...input,
+        text: "# Forged approved Plan",
+      }),
+      /unsupported fields/i,
+    );
+    assert.equal(handoffReads, 1);
+    assert.deepEqual(starts, []);
+
+    const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+    const reopened = createWorkflowStore({ projectRoot });
+    assert.equal(reopened.getWorkflowSession("plan-1"), null);
+    reopened.close();
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("Finish Plan retries a compensated failed launch with exactly one deterministic next attempt", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-finish-plan-retry-"));
+  const starts = [];
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      createPlanRuntime: () => approvedFinishPlanRuntime(),
+      createRunStartHandler: (config) => async (run) => {
+        starts.push(run);
+        const store = await config.acquireStore({ projectRoot: run.projectRoot });
+        const { segment } = store.claimPlannerRunStart({
+          sessionId: run.sessionId,
+          laneId: run.nodeId,
+          runId: run.runId,
+          agentKind: "hermes",
+          worktreePath: run.worktreePath,
+          now: "2026-07-18T00:00:01.000Z",
+        });
+        if (starts.length === 1) {
+          store.recordRunResult({
+            sessionId: segment.sessionId,
+            laneId: segment.laneId,
+            segmentId: segment.segmentId,
+            runId: segment.runId,
+            agentKind: "hermes",
+            outputSummary: "",
+            runEvents: [],
+            evidence: failedHermesEvidence(segment.runId),
+            now: "2026-07-18T00:00:02.000Z",
+          });
+          throw new Error("injected synchronous start failure");
+        }
+        return { id: run.runId };
+      },
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const finish = loaded.ipcHandlers.get("workflow:finishPlan");
+    await assert.rejects(finish({}, projectRoot, finishPlanInput()), /injected synchronous start failure/);
+    await finish({}, projectRoot, finishPlanInput());
+    assert.deepEqual(starts.map((run) => run.runId), [
+      "hermes-plan-finish-plan-1-attempt-1",
+      "hermes-plan-finish-plan-1-attempt-2",
+    ]);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("Finish Plan retries delivery persistence after an accepted start without launching a duplicate", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-finish-plan-delivery-"));
+  const starts = [];
+  let failDelivery = true;
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      createPlanRuntime: () => approvedFinishPlanRuntime(),
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          const store = module.createWorkflowStore(options);
+          return new Proxy(store, {
+            get(target, property, receiver) {
+              if (property === "recordUserInputDelivered") {
+                return (input) => {
+                  if (failDelivery) {
+                    failDelivery = false;
+                    throw new Error("injected delivery persistence failure");
+                  }
+                  return target.recordUserInputDelivered(input);
+                };
+              }
+              const value = Reflect.get(target, property, receiver);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      }),
+      createRunStartHandler: () => async (run) => {
+        starts.push(run);
+        return { id: run.runId };
+      },
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const finish = loaded.ipcHandlers.get("workflow:finishPlan");
+    await assert.rejects(finish({}, projectRoot, finishPlanInput()), /delivery persistence failure/);
+    await finish({}, projectRoot, finishPlanInput());
+    assert.equal(starts.length, 1);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("terminal Finish planner output is applied and scheduled by Electron main without renderer timing", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-finish-plan-terminal-"));
+  let loaded;
+  let store;
+  try {
+    loaded = await loadMainModule([]);
+    const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+    store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: "session-1",
+      projectId: "project-1",
+      title: "Finish Plan",
+      goal: "Apply this approved Plan",
+      mode: "plan",
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Test has no native Plan handle.",
+      now: "2026-07-18T00:00:00.000Z",
+    });
+    const runId = "hermes-plan-finish-session-1";
+    const { segment } = store.claimPlannerRunStart({
+      sessionId: "session-1",
+      laneId: "node-1",
+      runId,
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-07-18T00:00:01.000Z",
+    });
+    const intent = {
+      intentId: "finish-plan-intent-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Implement the approved Plan." },
+        {
+          type: "DiscoverProject",
+          profile: {
+            languages: ["TypeScript"],
+            capabilities: ["desktop"],
+            packages: ["@skyturn/desktop"],
+            hasFrontend: true,
+            hasBackend: true,
+            hasPersistence: true,
+          },
+        },
+        {
+          type: "ProposeLanes",
+          lanes: [
+            {
+              id: "lane-review-a",
+              kind: "review",
+              title: "Review approved Plan A",
+              agentKind: "hermes",
+            },
+            {
+              id: "lane-review-b",
+              kind: "review",
+              title: "Review approved Plan B",
+              agentKind: "hermes",
+            },
+          ],
+        },
+      ],
+    };
+    const bridge = {
+      loadEvents: async () => [{
+        protocolVersion: 1,
+        runId,
+        seq: 1,
+        timestamp: "2026-07-18T00:00:02.000Z",
+        kind: "output",
+        payload: { text: JSON.stringify(intent) },
+      }],
+      getEvidence: async () => ({
+        runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-07-18T00:00:02.000Z",
+      }),
+    };
+
+    await loaded.exports.reconcileTerminalWorkflowRun(store, bridge, projectRoot, segment);
+
+    const projection = store.materializeFlowProjection("session-1");
+    expectFlowLane(projection, "lane-review-a", "running");
+    expectFlowLane(projection, "lane-review-b", "running");
+    assert.equal(store.listEvents("session-1").some((event) => event.kind === "workflow.intent.accepted"), true);
+  } finally {
+    store?.close();
     await loaded?.exports.closeWorkflowStores();
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2409,13 +2905,67 @@ async function loadContracts() {
   return module.exports;
 }
 
+function finishPlanInput() {
+  return {
+    planSessionId: "plan-1",
+    session: {
+      id: "plan-1",
+      projectId: "project-1",
+      title: "Approved Plan",
+      goal: "Finish the approved plan",
+      mode: "plan",
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+    },
+  };
+}
+
+function approvedFinishPlanRuntime() {
+  return {
+    readFinishPlanHandoff: async () => ({
+      hermesSessionHandle: "acp-private-finish-plan-handle",
+      snapshot: {
+        version: 3,
+        plan: {
+          requirements: "Exact approved requirements.",
+          design: "Exact approved design.",
+          tasks: "Exact approved tasks.",
+        },
+        accepted: { requirements: true, design: true, tasks: true },
+        checkpoints: { requirements: [], design: [], tasks: [] },
+      },
+    }),
+    close: async () => undefined,
+  };
+}
+
+function failedHermesEvidence(runId) {
+  return {
+    runId,
+    status: "failed",
+    exitCode: 1,
+    changesetId: null,
+    checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "failed" }],
+    artifacts: [],
+    review: null,
+    errorReason: "injected synchronous start failure",
+    cancelReason: null,
+    completedAt: "2026-07-18T00:00:02.000Z",
+  };
+}
+
 async function loadMainModule(windows, options = {}) {
   const contracts = await loadContracts();
+  const workflowContracts = await loadWorkflowContracts();
   const persistence = await import("@skyturn/persistence");
   const workflowStore = await import("@skyturn/persistence/workflow-store");
+  const selectedWorkflowStore = options.wrapWorkflowStoreModule
+    ? options.wrapWorkflowStoreModule(workflowStore)
+    : workflowStore;
   const projectCore = await import("@skyturn/project-core");
+  const orchestrator = await import("@skyturn/orchestrator");
+  const uiCanvasWorkflowRuntime = await import("@skyturn/ui-canvas/workflow-runtime");
   const source = `${await readFile(join(root, "electron", "main.ts"), "utf8")}
-export { broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, openedProjectRoots, workspaceSaveWriter };`;
+export { broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, openedProjectRoots, reconcileTerminalWorkflowRun, workspaceSaveWriter };`;
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -2444,7 +2994,7 @@ export { broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, creat
   const genericModule = new Proxy({}, {
     get: (_target, property) => {
       if (property === "createTerminalRuntime") return () => terminalRuntime;
-      if (property === "createRunStartHandler") return () => async () => ({});
+      if (property === "createRunStartHandler") return options.createRunStartHandler ?? (() => async () => ({}));
       if (property === "createPlanProjectIdentityRegistry") {
         return () => options.projectIdentityRegistry ?? {
           canonicalize: async (value) => value,
@@ -2503,12 +3053,15 @@ export { broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, creat
         if (specifier === "node:fs/promises" && options.fsPromises) return options.fsPromises;
         if (specifier.startsWith("node:")) return require(specifier);
         if (specifier === "./planIpcContracts") return contracts;
+        if (specifier === "./workflowIpcContracts") return workflowContracts;
         if (specifier === "./planRuntime" && options.createPlanRuntime) {
           return { createPlanRuntime: options.createPlanRuntime };
         }
         if (specifier === "@skyturn/persistence") return persistence;
-        if (specifier === "@skyturn/persistence/workflow-store") return workflowStore;
+        if (specifier === "@skyturn/persistence/workflow-store") return selectedWorkflowStore;
         if (specifier === "@skyturn/project-core") return projectCore;
+        if (specifier === "@skyturn/orchestrator") return orchestrator;
+        if (specifier === "@skyturn/ui-canvas/workflow-runtime") return uiCanvasWorkflowRuntime;
         if (specifier === "@skyturn/agent-bridge") return agentBridgeModule;
         return genericModule;
       },
@@ -2526,6 +3079,17 @@ export { broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, creat
     { filename: "main.ts" },
   );
   return { appListeners, appState, exports: module.exports, ipcHandlers };
+}
+
+async function loadWorkflowContracts() {
+  const source = await readFile(join(root, "electron", "workflowIpcContracts.ts"), "utf8");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, { module, exports: module.exports }, { filename: "workflowIpcContracts.ts" });
+  return module.exports;
 }
 
 function legacyPlanWorkspace(projectRoot, planSessionId) {
@@ -2724,4 +3288,9 @@ function instrumentWorkspaceWrites({
 
 function toPlain(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+function expectFlowLane(projection, laneId, status) {
+  const lane = projection.lanes.find((candidate) => candidate.id === laneId);
+  assert.equal(lane?.status, status);
 }

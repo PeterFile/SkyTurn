@@ -743,6 +743,121 @@ test("getWorkflowStore completes pending checkpoint enrichment without waiting o
   }
 });
 
+test("getWorkflowStore recovers a terminal Finish planner intent and schedules its lanes", async () => {
+  const root = await makeRoot();
+  let harness;
+  try {
+    const { segment } = seedRunningFinishPlannerStore(root);
+    const bridge = await finishPlannerBridge(root, segment);
+    harness = await loadMainWorkflowStoreHarness({ getAgentBridge: async () => bridge });
+
+    const recovered = await harness.getWorkflowStore(root);
+
+    assertFinishPlannerConverged(recovered, segment);
+  } finally {
+    harness?.closeWorkflowStores();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("getWorkflowStore applies a Finish planner intent when RunEvidence was committed before the crash", async () => {
+  const root = await makeRoot();
+  let harness;
+  try {
+    const { store, segment } = seedRunningFinishPlannerStore(root, { keepOpen: true });
+    const bridge = await finishPlannerBridge(root, segment);
+    const [events, evidence] = await Promise.all([
+      bridge.loadEvents(root, segment.runId),
+      bridge.getEvidence(root, segment.runId),
+    ]);
+    store.recordRunResult({
+      ...segment,
+      outputSummary: "terminal result persisted before planner intent reconciliation",
+      runEvents: events,
+      evidence,
+      now: evidence.completedAt,
+    });
+    assert.equal(store.listEvents(segment.sessionId).some((event) => event.kind === "workflow.intent.accepted"), false);
+    store.close();
+
+    harness = await loadMainWorkflowStoreHarness({ getAgentBridge: async () => bridge });
+    const recovered = await harness.getWorkflowStore(root);
+
+    assertFinishPlannerConverged(recovered, segment);
+  } finally {
+    harness?.closeWorkflowStores();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+for (const crashWindow of ["intent-applied", "lanes-scheduled"]) {
+  test(`getWorkflowStore converges when a crash leaves Finish planner ${crashWindow} without reconciliation`, async () => {
+    const root = await makeRoot();
+    let harness;
+    try {
+      const { store, segment } = seedRunningFinishPlannerStore(root, { keepOpen: true });
+      const bridge = await finishPlannerBridge(root, segment);
+      const [events, evidence] = await Promise.all([
+        bridge.loadEvents(root, segment.runId),
+        bridge.getEvidence(root, segment.runId),
+      ]);
+      store.recordRunResult({
+        ...segment,
+        outputSummary: "terminal result persisted before planner intent reconciliation",
+        runEvents: events,
+        evidence,
+        now: evidence.completedAt,
+      });
+      store.applyWorkflowIntent(finishPlannerIntent(segment.sessionId), evidence.completedAt);
+      if (crashWindow === "lanes-scheduled") {
+        store.scheduleReadyLanes(segment.sessionId, { allowedParallelism: 2, now: evidence.completedAt });
+      }
+      store.close();
+
+      harness = await loadMainWorkflowStoreHarness({ getAgentBridge: async () => bridge });
+      const recovered = await harness.getWorkflowStore(root);
+
+      assertFinishPlannerConverged(recovered, segment);
+      const recoveredEvents = recovered.listEvents(segment.sessionId);
+      assert.equal(recoveredEvents.filter((event) => event.kind === "workflow.intent.accepted").length, 1);
+      assert.equal(recoveredEvents.filter((event) => event.kind === "workflow.lane.declared").length, 2);
+      assert.equal(recoveredEvents.filter((event) => event.kind === "workflow.segment.started").length, 2);
+    } finally {
+      harness?.closeWorkflowStores();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("repeated getWorkflowStore reopen recovery keeps one Finish planner graph and launch set", async () => {
+  const root = await makeRoot();
+  let firstHarness;
+  let secondHarness;
+  try {
+    const { segment } = seedRunningFinishPlannerStore(root);
+    const bridge = await finishPlannerBridge(root, segment);
+    firstHarness = await loadMainWorkflowStoreHarness({ getAgentBridge: async () => bridge });
+    const first = await firstHarness.getWorkflowStore(root);
+    assertFinishPlannerConverged(first, segment);
+    firstHarness.closeWorkflowStores();
+    firstHarness = undefined;
+
+    secondHarness = await loadMainWorkflowStoreHarness({ getAgentBridge: async () => bridge });
+    const reopened = await secondHarness.getWorkflowStore(root);
+
+    assertFinishPlannerConverged(reopened, segment);
+    const events = reopened.listEvents(segment.sessionId);
+    assert.equal(events.filter((event) => event.kind === "workflow.intent.accepted").length, 1);
+    assert.equal(events.filter((event) => event.kind === "workflow.lane.declared").length, 2);
+    assert.equal(events.filter((event) => event.kind === "workflow.segment.started").length, 2);
+    assert.equal(events.filter((event) => event.kind === "workflow.plan_finish.launch_accepted").length, 1);
+  } finally {
+    firstHarness?.closeWorkflowStores();
+    secondHarness?.closeWorkflowStores();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("concurrent getWorkflowStore callers share one unpublished recovery barrier", { timeout: 10_000 }, async () => {
   const root = await makeRoot();
   const storeCreated = deferred();
@@ -1200,6 +1315,111 @@ function runResult(segment, status) {
   };
 }
 
+function seedRunningFinishPlannerStore(projectRoot, options = {}) {
+  const store = createWorkflowStore({ projectRoot });
+  store.createPlanFinishWorkflowSession({
+    id: "finish-session-1",
+    planSessionId: "finish-session-1",
+    projectId: "project-1",
+    title: "Finish approved Plan",
+    goal: "Apply the approved Plan",
+    mode: "plan",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    plannerProfile: "default",
+    transport: "hermes_replay_recovery",
+    recoveryReason: "Test has no native Plan handle.",
+    now: "2026-07-18T00:00:00.000Z",
+  });
+  store.appendWorkflowEvent({
+    sessionId: "finish-session-1",
+    kind: "workflow.plan_finish.launch_accepted",
+    source: "electron-main",
+    idempotencyKey: "plan-finish:finish-input-1:launch-accepted",
+    payload: { inputId: "finish-input-1", runId: "hermes-plan-finish-finish-session-1-attempt-1" },
+    now: "2026-07-18T00:00:01.000Z",
+  });
+  const claimed = store.claimPlannerRunStart({
+    sessionId: "finish-session-1",
+    laneId: "node-1",
+    runId: "hermes-plan-finish-finish-session-1-attempt-1",
+    agentKind: "hermes",
+    worktreePath: projectRoot,
+    now: "2026-07-18T00:00:01.000Z",
+  });
+  if (!options.keepOpen) store.close();
+  return { store, segment: claimed.segment };
+}
+
+async function finishPlannerBridge(projectRoot, segment) {
+  const base = createMockAgentAdapter();
+  const bridge = new AgentBridge({
+    adapters: [{
+      ...base,
+      kind: "hermes",
+      label: "Test Hermes Agent",
+      async startRun(_input, sink) {
+        await sink.emit({ kind: "output", payload: { text: JSON.stringify(finishPlannerIntent(segment.sessionId)) } });
+        await sink.emit({
+          kind: "evidence",
+          payload: {
+            exitCode: 0,
+            checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+          },
+        });
+        await sink.emit({ kind: "status", payload: { status: "succeeded", exitCode: 0 } });
+        return { async cancel() {} };
+      },
+    }],
+  });
+  await bridge.startRun({
+    protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+    runId: segment.runId,
+    nodeId: segment.laneId,
+    sessionId: segment.sessionId,
+    projectRoot,
+    worktreePath: projectRoot,
+    agentKind: "hermes",
+    prompt: "Finish the approved Plan.",
+  });
+  return bridge;
+}
+
+function finishPlannerIntent(sessionId) {
+  return {
+    intentId: "finish-plan-intent-1",
+    sessionId,
+    operations: [
+      { type: "AnalyzeRequirement", requirement: "Implement the approved Plan." },
+      {
+        type: "DiscoverProject",
+        profile: {
+          languages: ["TypeScript"],
+          capabilities: ["desktop"],
+          packages: ["@skyturn/desktop"],
+          hasFrontend: true,
+          hasBackend: true,
+          hasPersistence: true,
+        },
+      },
+      {
+        type: "ProposeLanes",
+        lanes: [
+          { id: "lane-review-a", kind: "review", title: "Review approved Plan A", agentKind: "hermes" },
+          { id: "lane-review-b", kind: "review", title: "Review approved Plan B", agentKind: "hermes" },
+        ],
+      },
+    ],
+  };
+}
+
+function assertFinishPlannerConverged(store, segment) {
+  const projection = store.materializeFlowProjection(segment.sessionId);
+  assert.equal(store.listSegments(segment.sessionId, segment.laneId).find((item) => item.id === segment.segmentId)?.status, "succeeded");
+  assert.equal(projection.lanes.find((lane) => lane.id === "lane-review-a")?.status, "running");
+  assert.equal(projection.lanes.find((lane) => lane.id === "lane-review-b")?.status, "running");
+  assert.equal(store.listEvents(segment.sessionId).filter((event) => event.kind === "workflow.intent.accepted").length, 1);
+}
+
 async function makeRoot() {
   return mkdtemp(join(tmpdir(), "skyturn-recovery-"));
 }
@@ -1230,6 +1450,8 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     "function assertWorkflowAgentKind(value) { return value; }",
     "function optionalText(value) { return typeof value === 'string' && value ? value : undefined; }",
     "function readField(value, key) { return value && typeof value === 'object' ? value[key] : undefined; }",
+    "function isRecord(value) { return typeof value === 'object' && value !== null && !Array.isArray(value); }",
+    "function workflowIpcError(_code, message) { return new Error(message); }",
     `async function resolveExecutableRunIdentity(input, _phase, knownStore) {
       if (!knownStore) await getWorkflowStore(input.projectRoot);
       resolverReceivedKnownStore = knownStore !== undefined;
@@ -1274,6 +1496,8 @@ async function loadMainWorkflowStoreHarness(options = {}) {
         now,
       };
     }`,
+    extractSourceRange(main, "async function reconcileTerminalWorkflowRun", "async function enrichTerminalWorkflowRun"),
+    extractSourceRange(main, "function assertTerminalRunEvidence", "async function verifyRunGitIdentityAtCheckpoint"),
     getWorkflowStoreSource,
     extractSourceRange(main, "async function enrichTerminalWorkflowRun", "async function workflowStoreIdentity"),
     "function closeWorkflowStores() { for (const store of workflowStores.values()) store.close(); workflowStores.clear(); workflowStoreInitializations.clear(); }",
@@ -1297,6 +1521,8 @@ async function loadMainWorkflowStoreHarness(options = {}) {
       return store;
     },
   };
+  const orchestratorModule = await import("@skyturn/orchestrator");
+  const workflowRuntimeModule = await import("@skyturn/ui-canvas/workflow-runtime");
   vm.runInNewContext(output, {
     bridge,
     bridgeProvider,
@@ -1308,6 +1534,11 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     exports: module.exports,
     persistenceModule,
     recoverTerminalWorkflowRuns,
+    require(specifier) {
+      if (specifier === "@skyturn/orchestrator") return orchestratorModule;
+      if (specifier === "@skyturn/ui-canvas/workflow-runtime") return workflowRuntimeModule;
+      throw new Error(`Unexpected harness import: ${specifier}`);
+    },
   }, { filename: "main.workflowStoreHarness.ts" });
   return module.exports;
 }

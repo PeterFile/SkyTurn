@@ -211,7 +211,27 @@ describe("Plan finish workflow handoff", () => {
     expect(stale.workspace.sessions[0]).toEqual(changedPlan);
   });
 
-  it("appends the exact approved Plan and returns the authoritative backend canvas", async () => {
+  it("registers only backend-started Finish Canvas runs before installation", () => {
+    const register = Reflect.get(AppModule, "registerBackendStartedCanvasRuns") as undefined | ((
+      startedRuns: Set<string>,
+      canvas: ReturnType<typeof convertPlanToCanvas>,
+    ) => void);
+    expect(register).toBeTypeOf("function");
+    if (!register) return;
+    const plan = editablePlanSession();
+    const canvas = convertPlanToCanvas(plan);
+    canvas.nodes = [
+      { ...mockNode("hermes"), id: "planner", runId: "planner-run", status: "running" },
+      { ...mockNode("codex"), id: "scheduled", runId: "scheduled-run", status: "pending" },
+    ];
+    const startedRuns = new Set<string>(["already-started"]);
+
+    register(startedRuns, canvas);
+
+    expect([...startedRuns]).toEqual(["already-started", "planner-run"]);
+  });
+
+  it("hands the exact approved Plan to the dedicated backend finish boundary and returns its authoritative canvas", async () => {
     const finish = Reflect.get(AppModule, "finishPlanSession") as undefined | ((
       project: { id: string; name: string; rootPath: string; devflowPath: string; openedAt: string },
       session: PlanSession,
@@ -236,12 +256,8 @@ describe("Plan finish workflow handoff", () => {
     const calls: Array<{ kind: string; input: unknown }> = [];
     vi.stubGlobal("window", {
       devflow: {
-        createWorkflowSession: async (_projectRoot: string, input: unknown) => {
-          calls.push({ kind: "create", input });
-          return { protocolVersion: 1, session: {}, projection: {}, canvasSession: localCanvas };
-        },
-        appendWorkflowUserInput: async (_projectRoot: string, input: unknown) => {
-          calls.push({ kind: "append", input });
+        finishPlanWorkflow: async (_projectRoot: string, input: unknown) => {
+          calls.push({ kind: "finish", input });
           return { protocolVersion: 1, event: {}, ledger: {}, projection: {}, canvasSession: authoritativeCanvas };
         },
       },
@@ -259,29 +275,20 @@ describe("Plan finish workflow handoff", () => {
       expect((result as typeof authoritativeCanvas).nodes.map((node) => node.title)).toEqual([
         "Authoritative backend planner",
       ]);
-      expect(calls[1]).toEqual({
-        kind: "append",
+      expect(calls).toEqual([{
+        kind: "finish",
         input: {
-          sessionId: plan.id,
-          inputId: `plan-confirm-${plan.id}`,
-          text: [
-            "# Approved Plan",
-            "",
-            "## Goal",
-            "Repair Plan editing",
-            "",
-            "## Requirements",
-            "# Requirements",
-            "",
-            "## Design",
-            "# Design",
-            "",
-            "## Tasks",
-            "# Tasks",
-          ].join("\n"),
-          now: plan.createdAt,
+          planSessionId: plan.id,
+          session: {
+            id: localCanvas.id,
+            projectId: localCanvas.projectId,
+            title: localCanvas.title,
+            goal: localCanvas.goal,
+            mode: localCanvas.mode,
+            target: localCanvas.target,
+          },
         },
-      });
+      }]);
     } finally {
       vi.unstubAllGlobals();
     }
@@ -293,8 +300,7 @@ describe("Plan finish workflow handoff", () => {
     if (!finish) return;
     vi.stubGlobal("window", {
       devflow: {
-        createWorkflowSession: async () => ({ canvasSession: convertPlanToCanvas(editablePlanSession()) }),
-        appendWorkflowUserInput: async () => ({ canvasSession: null }),
+        finishPlanWorkflow: async () => ({ canvasSession: null }),
       },
     });
     try {
@@ -1330,6 +1336,14 @@ describe("UI source validation", () => {
     expect(appSource).toContain("Retry runtime state");
     expect(appSource).toContain("!canFinishPlan(accepted)");
     expect(appSource).toContain("capturePlanFinishBoundary(accepted)");
+    const finishPlanBlock = appSource.slice(
+      appSource.indexOf("async function finishPlan(session: PlanSession)"),
+      appSource.indexOf("function updateCanvasSession("),
+    );
+    expect(finishPlanBlock).toContain("registerBackendStartedCanvasRuns(startedBridgeRuns.current, canvas)");
+    expect(finishPlanBlock.indexOf("registerBackendStartedCanvasRuns")).toBeLessThan(
+      finishPlanBlock.indexOf("installFinishedPlanCanvas"),
+    );
     expect(appSource).toContain("installFinishedPlanCanvas(current, boundary, canvas)");
   });
 
