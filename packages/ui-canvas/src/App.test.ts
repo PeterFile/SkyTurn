@@ -882,6 +882,11 @@ describe("UI source validation", () => {
     expect(planView).toContain('aria-pressed={effectiveViewMode === "preview"}');
     expect(planView).toContain('aria-pressed={effectiveViewMode === "source"}');
     expect(planView).toContain('aria-current={isCurrent ? "step" : undefined}');
+    expect(planView).toContain('return session.stages.requirements.accepted;');
+    expect(planView).toContain('return session.stages.design.accepted;');
+    expect(planView).not.toContain('status !== "pending"');
+    expect(planView).not.toContain('\n              Preview\n');
+    expect(planView).not.toContain('\n              Source\n');
     expect(planView).not.toContain('role="list"');
     expect(planView).not.toContain('role="listitem"');
     expect(planView).toContain('aria-live="polite"');

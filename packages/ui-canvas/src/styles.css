@@ -7215,7 +7215,7 @@ select:focus-visible,
   grid-template-columns: minmax(0, 1fr) !important;
   gap: 0 !important;
   overflow: hidden !important;
-  padding: 12px 16px 0 !important;
+  padding: 8px 16px 0 !important;
   background: var(--sk-bg) !important;
   background-image: none !important;
   color: var(--sk-text) !important;
@@ -7230,8 +7230,8 @@ select:focus-visible,
   flex-wrap: nowrap;
   align-items: center;
   gap: 8px;
-  min-height: 44px;
-  padding: 4px 0 10px;
+  min-height: 36px;
+  padding: 4px 0 8px;
   border-bottom: 1px solid var(--sk-border-muted);
   background: var(--sk-bg);
   background-image: none;
@@ -7263,8 +7263,8 @@ select:focus-visible,
 .plan-stage-actions button,
 .plan-error-banner button,
 .plan-composer-send {
-  min-height: 44px;
-  min-width: 44px;
+  min-height: 32px;
+  min-width: 32px;
   border-radius: var(--sk-radius-sm);
   box-shadow: none !important;
   background-image: none !important;
@@ -7281,7 +7281,7 @@ select:focus-visible,
   border: 1px solid var(--sk-border);
   background: var(--sk-surface);
   color: var(--sk-text);
-  padding: 8px 12px;
+  padding: 4px 10px;
   font-size: 13px;
   font-weight: 650;
 }
@@ -7349,7 +7349,7 @@ select:focus-visible,
   border-radius: var(--sk-radius-none);
   background: transparent;
   color: var(--sk-text);
-  padding: 8px 12px;
+  padding: 4px 10px;
 }
 
 .plan-view-toggle button[aria-pressed="true"] {
@@ -7370,13 +7370,13 @@ select:focus-visible,
 }
 
 .plan-document {
-  width: min(100%, 48rem);
+  width: min(100%, 64rem);
   min-height: max(320px, 100%);
   margin-inline: auto;
   overflow: auto;
-  border: 1px solid var(--sk-border);
-  border-radius: var(--sk-radius-md);
-  background: var(--sk-surface) !important;
+  border: none;
+  border-radius: var(--sk-radius-none);
+  background: transparent !important;
   background-image: none !important;
   padding: 20px 24px 32px;
   box-shadow: none !important;
@@ -7559,7 +7559,7 @@ select:focus-visible,
 }
 
 .plan-composer {
-  width: min(100%, 48rem);
+  width: min(100%, 64rem);
   margin: 0 auto;
   padding: 12px 0 16px;
 }
@@ -7596,7 +7596,7 @@ select:focus-visible,
   border-radius: var(--sk-radius-md);
   background: transparent !important;
   color: var(--sk-text) !important;
-  padding: 10px 52px 10px 12px;
+  padding: 10px 46px 10px 12px;
   resize: none;
   outline: none !important;
   box-shadow: none !important;
@@ -7612,13 +7612,13 @@ select:focus-visible,
 
 .plan-composer-send {
   position: absolute;
-  right: 4px;
-  bottom: 4px;
+  right: 6px;
+  bottom: 6px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 44px;
-  height: 44px;
+  width: 32px;
+  height: 32px;
   border: 0;
   background: var(--sk-accent) !important;
   color: var(--sk-text-inverse-warm) !important;
