@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createServer } from "vite";
+import { createServer, loadConfigFromFile } from "vite";
 
 import { findAvailablePort, makeDevServerUrl, rendererDevCommand } from "./devServer.mjs";
 
@@ -42,6 +42,38 @@ test("desktop Electron build script force-rebuilds stale incremental output", as
   const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 
   assert.equal(packageJson.scripts["build:electron"], "tsc -b tsconfig.electron.json --force");
+});
+
+test("root dev refreshes desktop dependencies and the ui-canvas source root", async () => {
+  const repositoryRoot = join(root, "..", "..");
+  const turboJson = JSON.parse(await readFile(join(repositoryRoot, "turbo.json"), "utf8"));
+
+  assert.deepEqual(turboJson.tasks.dev.dependsOn, ["^build"]);
+
+  const loadedConfig = await loadConfigFromFile(
+    { command: "serve", mode: "development" },
+    join(root, "vite.config.ts"),
+  );
+  assert.ok(loadedConfig);
+
+  const aliases = loadedConfig.config.resolve?.alias;
+  assert.ok(Array.isArray(aliases));
+  const uiCanvasAlias = aliases.find(
+    (alias) => alias.find instanceof RegExp && alias.find.test("@skyturn/ui-canvas"),
+  );
+  assert.ok(uiCanvasAlias);
+  assert.equal(
+    uiCanvasAlias.replacement,
+    join(repositoryRoot, "packages", "ui-canvas", "src", "index.ts"),
+  );
+  assert.equal(uiCanvasAlias.find.test("@skyturn/ui-canvas/workflow-runtime"), false);
+
+  const loadedBuildConfig = await loadConfigFromFile(
+    { command: "build", mode: "production" },
+    join(root, "vite.config.ts"),
+  );
+  assert.ok(loadedBuildConfig);
+  assert.equal(loadedBuildConfig.config.resolve?.alias, undefined);
 });
 
 test("desktop dev HTML initializes Vite React refresh before the renderer entry", async () => {

@@ -7584,7 +7584,7 @@ select:focus-visible,
 }
 
 .plan-composer-field:focus-within {
-  border-color: var(--sk-accent);
+  border-color: color-mix(in srgb, var(--sk-text) 22%, var(--sk-border));
   box-shadow: none !important;
 }
 
@@ -7630,7 +7630,6 @@ select:focus-visible,
 }
 
 .plan-view button:focus-visible,
-.plan-view textarea:focus-visible,
 .plan-view [role="button"]:focus-visible {
   outline: 2px solid var(--sk-accent) !important;
   outline-offset: 1px;
