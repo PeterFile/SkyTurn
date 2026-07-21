@@ -2312,10 +2312,10 @@ function PlanView({
   function canAccessSection(section: PlanSectionKey) {
     if (section === "requirements") return true;
     if (section === "design") {
-      return session.stages.requirements.accepted || session.stages.design.status !== "pending";
+      return session.stages.requirements.accepted;
     }
     if (section === "tasks") {
-      return session.stages.design.accepted || session.stages.tasks.status !== "pending";
+      return session.stages.design.accepted;
     }
     return false;
   }
@@ -2435,16 +2435,17 @@ function PlanView({
             <button
               type="button"
               aria-label="Preview mode"
+              title="Preview mode"
               aria-pressed={effectiveViewMode === "preview"}
               disabled={interactionLocked || runActive}
               onClick={() => setViewMode("preview")}
             >
               <Eye size={14} />
-              Preview
             </button>
             <button
               type="button"
               aria-label="Source mode"
+              title="Source mode"
               aria-pressed={effectiveViewMode === "source"}
               disabled={
                 interactionLocked ||
@@ -2457,7 +2458,6 @@ function PlanView({
               onClick={() => setViewMode("source")}
             >
               <FileText size={14} />
-              Source
             </button>
           </div>
 

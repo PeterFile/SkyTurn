@@ -50,7 +50,7 @@ describe("SkyTurn UI style tokens", () => {
 
     const planCascade = styles.slice(styles.indexOf("/* Plan mode — flat single-column document surface (final cascade). */"));
     expect(planCascade).toContain("grid-template-columns: minmax(0, 1fr) !important");
-    expect(planCascade).toContain("width: min(100%, 48rem)");
+    expect(planCascade).toContain("width: min(100%, 64rem)");
     expect(planCascade).toContain("min-height: max(320px, 100%)");
     expect(planCascade).toContain("background: var(--sk-bg) !important");
     expect(planCascade).toContain("background: var(--sk-surface) !important");
@@ -70,6 +70,19 @@ describe("SkyTurn UI style tokens", () => {
     expect(backdropValues.every((value) => value === "none" || value === "none !important")).toBe(true);
     expect(planCascade).not.toContain("linear-gradient");
     expect(planCascade).not.toContain("grid-template-columns: 1fr 1fr");
+
+    const planDocument = lastCssBlock(planCascade, ".plan-document");
+    const planComposer = lastCssBlock(planCascade, ".plan-composer");
+    const planComposerSend = lastCssBlock(planCascade, ".plan-composer-send");
+    expect(planDocument).toContain("width: min(100%, 64rem)");
+    expect(planDocument).toContain("border: none");
+    expect(planDocument).toContain("border-radius: var(--sk-radius-none)");
+    expect(planDocument).toContain("background: transparent !important");
+    expect(planComposer).toContain("width: min(100%, 64rem)");
+    expect(planComposerSend).toContain("right: 6px");
+    expect(planComposerSend).toContain("bottom: 6px");
+    expect(planComposerSend).toContain("width: 32px");
+    expect(planComposerSend).toContain("height: 32px");
   });
 
   it("keeps the Plan toolbar to one row on wide desktops and two explicit rows on compact desktops", async () => {
