@@ -120,6 +120,25 @@ describe("SkyTurn UI style tokens", () => {
     expect(primaryHover).not.toContain("box-shadow");
   });
 
+  it("keeps Plan composer text focus flat without accent ring", async () => {
+    const styles = await readSource("./styles.css");
+    const planCascade = styles.slice(styles.indexOf("/* Plan mode — flat single-column document surface (final cascade). */"));
+    const fieldFocus = lastCssRuleForSelector(planCascade, ".plan-composer-field:focus-within");
+    const inputFocus = lastCssRuleForSelector(planCascade, ".plan-composer-input:focus-visible");
+    const buttonFocus = lastCssRuleForSelector(planCascade, ".plan-view button:focus-visible");
+
+    expect(fieldFocus).toContain("border-color: color-mix(");
+    expect(fieldFocus).toContain("var(--sk-text)");
+    expect(fieldFocus).toContain("var(--sk-border)");
+    expect(fieldFocus).not.toContain("var(--sk-accent)");
+    expect(fieldFocus).toContain("box-shadow: none !important");
+    expect(inputFocus).toContain("outline: none !important");
+    expect(inputFocus).toContain("box-shadow: none !important");
+    expect(planCascade).not.toContain(".plan-view textarea:focus-visible");
+    expect(buttonFocus).toContain("outline: 2px solid var(--sk-accent) !important");
+    expect(buttonFocus).toContain("box-shadow: none !important");
+  });
+
   it("uses modern dark tokens instead of paper collage material tokens", async () => {
     const styles = await readSource("./styles.css");
 

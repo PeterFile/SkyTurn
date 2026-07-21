@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 import react from "@vitejs/plugin-react";
 import { defineConfig, type PluginOption } from "vite";
 
@@ -30,10 +32,21 @@ function desktopReactRefreshPreamble(): PluginOption {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   plugins: [react(), desktopReactRefreshPreamble()],
+  resolve:
+    command === "serve"
+      ? {
+          alias: [
+            {
+              find: /^@skyturn\/ui-canvas$/,
+              replacement: fileURLToPath(new URL("../../packages/ui-canvas/src/index.ts", import.meta.url)),
+            },
+          ],
+        }
+      : undefined,
   server: {
     host: "127.0.0.1",
     port: 5173,
-  }
-});
+  },
+}));
