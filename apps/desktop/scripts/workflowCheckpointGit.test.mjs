@@ -26,7 +26,7 @@ test("current-branch checkpoint evidence excludes volatile runtime and preserves
     git(root, "commit", "-m", "initial");
 
     const store = createWorkflowStore({ projectRoot: root });
-    seedExecutableRun(store);
+    seedExecutableRun(store, root);
     await mkdir(join(root, ".devflow", "runs", "run-session-1-lane-implementation"), { recursive: true });
     await mkdir(join(root, ".devflow", "tasks", "lane-implementation"), { recursive: true });
     await writeFile(join(root, ".devflow", "runs", "run-session-1-lane-implementation", "events.ndjson"), "{}\n", "utf8");
@@ -95,8 +95,8 @@ test("current-branch checkpoint evidence excludes volatile runtime and preserves
   }
 });
 
-function seedExecutableRun(store) {
-  store.createWorkflowSession({
+function seedExecutableRun(store, projectRoot) {
+  const session = store.createWorkflowSession({
     id: "session-1",
     projectId: "project-1",
     title: "Current branch run",
@@ -108,6 +108,32 @@ function seedExecutableRun(store) {
     target: { executionTarget: "current_branch", selectedBranch: "main" },
     now: "2026-07-13T01:00:00.000Z",
   });
+  const plannerRunId = "run-session-1-initial-planner-turn";
+  const { segment: plannerSegment } = store.claimPlannerRunStart({
+    sessionId: session.id,
+    laneId: session.plannerLaneId,
+    runId: plannerRunId,
+    agentKind: "hermes",
+    worktreePath: projectRoot,
+    now: "2026-07-13T01:00:00.025Z",
+  });
+  store.recordRunResult({
+    ...plannerSegment,
+    evidence: {
+      runId: plannerRunId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-07-13T01:00:00.050Z",
+    },
+    now: "2026-07-13T01:00:00.050Z",
+  });
+  store.recordPlannerIntentReconciled(plannerSegment, "2026-07-13T01:00:00.075Z");
   store.appendWorkflowEvent({
     sessionId: "session-1",
     kind: "workflow.lane.declared",

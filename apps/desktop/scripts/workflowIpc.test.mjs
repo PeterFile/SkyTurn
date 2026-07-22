@@ -17,9 +17,6 @@ test("Electron main owns natural workflow IPC channels", async () => {
     "workflow:createSession",
     "workflow:appendUserInput",
     "workflow:ledger",
-    "workflow:applyIntent",
-    "workflow:scheduleReady",
-    "workflow:recordRunResult",
     "workflow:nodePosition:update",
     "workflow:projection",
     "workflow:events",
@@ -49,6 +46,9 @@ test("Electron main owns natural workflow IPC channels", async () => {
   ]) {
     assert.match(main, new RegExp(`ipcMain\\.handle\\("${escapeRegExp(channel)}"`));
   }
+  for (const channel of ["workflow:applyIntent", "workflow:scheduleReady", "workflow:recordRunResult"]) {
+    assert.doesNotMatch(main, new RegExp(`ipcMain\\.handle\\("${escapeRegExp(channel)}"`));
+  }
   assert.match(main, /applyWorkflowIntent/);
   assert.match(main, /buildLedgerSummary/);
   assert.match(main, /scheduleReadyLanes/);
@@ -74,19 +74,16 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(agentHealthHandler, /readiness/);
   assert.doesNotMatch(agentHealthHandler, /spawn|execFile|createWorkflowStore|better-sqlite3/);
 
-  const recordRunResultHandler = main.slice(
-    main.indexOf('ipcMain.handle("workflow:recordRunResult"'),
-    main.indexOf('ipcMain.handle("workflow:projection"'),
+  const terminalReconciliation = main.slice(
+    main.indexOf("async function reconcileTerminalWorkflowRun"),
+    main.indexOf("async function advanceWorkflowSession"),
   );
-  assert.match(recordRunResultHandler, /bridge\.getEvidence\(projectRoot,\s*runId\)/);
-  assert.match(recordRunResultHandler, /bridge\.loadEvents\(projectRoot,\s*runId\)/);
-  assert.match(recordRunResultHandler, /enrichTerminalWorkflowRun/);
-  assert.ok(
-    recordRunResultHandler.indexOf("store.recordRunResult") < recordRunResultHandler.indexOf("enrichTerminalWorkflowRun"),
-    "terminal RunEvidence must be persisted before optional git reconciliation",
-  );
-  assert.match(recordRunResultHandler, /recordRunCheckpointFailure/);
-  assert.doesNotMatch(recordRunResultHandler, /store\.recordRunResult\(input\)/);
+  assert.match(terminalReconciliation, /bridge\.getEvidence\(projectRoot,\s*segment\.runId\)/);
+  assert.match(terminalReconciliation, /bridge\.loadEvents\(projectRoot,\s*segment\.runId\)/);
+  assert.match(terminalReconciliation, /store\.recordRunResult/);
+  assert.match(terminalReconciliation, /reconcilePendingPlannerWorkflowIntent/);
+  assert.match(terminalReconciliation, /store\.completePlannerIntentReconciliation/);
+  assert.match(terminalReconciliation, /await advanceWorkflowSession/);
 
   const workflowStoreFactory = main.slice(
     main.indexOf("async function getWorkflowStore"),
@@ -305,6 +302,56 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(deliverySyncMainHandler, /status:\s*"synced"/);
   assert.doesNotMatch(deliverySyncMainHandler, /cleanManagedWorktree/);
   assert.doesNotMatch(deliverySyncMainHandler, /deleteBranch/);
+});
+
+test("public run:start and private planner delivery have separate main-only authority", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const privatePlanner = main.slice(
+    main.indexOf("const plannerRunStartHandler"),
+    main.indexOf("const scheduledWorkflowRunStartHandler"),
+  );
+  const privateScheduler = main.slice(
+    main.indexOf("const scheduledWorkflowRunStartHandler"),
+    main.indexOf("const publicRunStartHandler"),
+  );
+  const publicStart = main.slice(
+    main.indexOf("const publicRunStartHandler"),
+    main.indexOf('ipcMain.handle("run:start"'),
+  );
+  const publicIpc = main.slice(
+    main.indexOf('ipcMain.handle("run:start"'),
+    main.indexOf('ipcMain.handle("run:send"'),
+  );
+
+  assert.match(privatePlanner, /claimUnscheduledStart/);
+  assert.match(privatePlanner, /claimPlannerRunStart/);
+  assert.doesNotMatch(privateScheduler, /claimUnscheduledStart|claimPlannerRunStart/);
+  assert.doesNotMatch(publicStart, /claimUnscheduledStart|claimPlannerRunStart/);
+  assert.match(publicStart, /isWorkflowPlannerRootStartTarget/);
+  assert.match(publicStart, /assertPublicRunStartIsNotScheduled\(input, store\)/);
+  assert.match(publicStart, /renderer.*workflow|workflow.*renderer/i);
+  assert.match(publicIpc, /publicRunStartHandler\(input\)/);
+  assert.doesNotMatch(publicIpc, /plannerRunStartHandler|scheduledWorkflowRunStartHandler/);
+  const plannerDelivery = main.slice(
+    main.indexOf("async function deliverWorkflowUserInputToPlanner"),
+    main.indexOf("function workflowPlannerProjectIdentity"),
+  );
+  assert.match(plannerDelivery, /plannerRunStartHandler/);
+  assert.doesNotMatch(plannerDelivery, /publicRunStartHandler|scheduledWorkflowRunStartHandler/);
+
+  const scheduler = main.slice(
+    main.indexOf("async function advanceOneWorkflowSession"),
+    main.indexOf("async function compensateScheduledWorkflowStartBuildFailure"),
+  );
+  assert.match(scheduler, /buildScheduledWorkflowRunStartInput/);
+  assert.match(scheduler, /scheduledWorkflowRunStartHandler\(input, \{ store, segment, identity \}\)/);
+  assert.doesNotMatch(scheduler, /publicRunStartHandler|plannerRunStartHandler/);
+  const scheduledInputBuilder = main.slice(
+    main.indexOf("async function buildScheduledWorkflowRunStartInput"),
+    main.indexOf("async function resolveScheduledWorkflowWorktree"),
+  );
+  assert.match(scheduledInputBuilder, /runtime\.sandboxForNodeRun\(node\)/);
+  assert.match(scheduledInputBuilder, /prompt:\s*runtime\.buildPromptForNodeRun\(session, node, ledger\)/);
 });
 
 test("MVP demo links the temporary React app to desktop package dependencies", async () => {
@@ -798,15 +845,19 @@ test("workflow checkpoint resolution persists a legacy HEAD branch before identi
   assert.ok(branchValidationIndex > canvasIndex, "checkpoint branch validation must use persisted authority");
 });
 
-test("workflow create and append bind Hermes planner terminal only through main runtime", async () => {
+test("workflow create and append launch Hermes through AgentBridge while PTY stays optional", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const createSessionHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:createSession"'),
-    main.indexOf('ipcMain.handle("workflow:appendUserInput"'),
+    main.indexOf('ipcMain.handle("workflow:finishPlan"'),
   );
   const appendHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:appendUserInput"'),
     main.indexOf('ipcMain.handle("workflow:ledger"'),
+  );
+  const deliveryHelper = main.slice(
+    main.indexOf("async function deliverWorkflowUserInputToPlanner"),
+    main.indexOf("function workflowPlannerProjectIdentity"),
   );
   const projectionBroadcaster = main.slice(
     main.indexOf("function broadcastWorkflowProjection"),
@@ -818,30 +869,38 @@ test("workflow create and append bind Hermes planner terminal only through main 
   );
 
   assert.match(main, /createTerminalRuntime/);
-  assert.match(createSessionHandler, /terminalRuntime\.startHermesPlannerForWorkflowSession/);
+  assert.match(createSessionHandler, /deliverWorkflowUserInputToPlanner/);
   assert.match(createSessionHandler, /materializeRendererCanvasSession/);
-  assert.match(appendHandler, /terminalRuntime\.sendWorkflowUserInput/);
+  assert.match(appendHandler, /deliverWorkflowUserInputToPlanner/);
   assert.match(appendHandler, /materializeRendererCanvasSession/);
+  assert.match(deliveryHelper, /input\.store\.claimUserInput/);
+  assert.match(deliveryHelper, /buildHermesWorkflowPrompt/);
+  assert.match(deliveryHelper, /plannerRunStartHandler/);
+  assert.doesNotMatch(deliveryHelper, /publicRunStartHandler/);
+  assert.match(deliveryHelper, /input\.store\.recordUserInputDelivered/);
   assert.match(projectionBroadcaster, /materializeRendererCanvasSession/);
   assert.match(materializer, /augmentCanvasSessionWithHermesTerminal/);
   assert.match(materializer, /terminalRuntime\.hermesPlannerTerminalSessionId/);
-  assert.doesNotMatch(createSessionHandler, /terminalRuntime\.start\(/);
-  assert.doesNotMatch(appendHandler, /terminalRuntime\.start|terminal:start/);
+  assert.doesNotMatch(createSessionHandler, /terminalRuntime\.|terminal:start/);
+  assert.doesNotMatch(appendHandler, /terminalRuntime\.|terminal:start/);
 });
 
-test("workflow create keeps generated SkyTurn opaque handles out of Hermes PTY resume", async () => {
+test("ordinary workflow creation never forwards renderer opaque handles to planner runs", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const createSessionHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:createSession"'),
+    main.indexOf('ipcMain.handle("workflow:finishPlan"'),
+  );
+  const appendHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:appendUserInput"'),
+    main.indexOf('ipcMain.handle("workflow:ledger"'),
   );
 
   assert.match(createSessionHandler, /const inputOpaqueHandle = optionalText\(input\.opaqueHandle\)/);
   assert.match(createSessionHandler, /const opaqueHandle = inputOpaqueHandle \?\? `skyturn-ipc:\$\{sessionId\}`/);
-  assert.match(createSessionHandler, /const hermesSessionHandle = explicitHermesSessionHandle\(inputOpaqueHandle\)/);
-  assert.match(createSessionHandler, /\.\.\.\(hermesSessionHandle \? \{ hermesSessionHandle \} : \{\}\)/);
-  assert.doesNotMatch(createSessionHandler, /hermesSessionHandle:\s*opaqueHandle/);
-  assert.match(main, /function explicitHermesSessionHandle\(value: unknown\): string \| undefined/);
+  assert.doesNotMatch(createSessionHandler, /hermesSessionHandle/);
+  assert.doesNotMatch(appendHandler, /hermesSessionHandle/);
+  assert.doesNotMatch(main, /function explicitHermesSessionHandle/);
 });
 
 test("workflow projection responses keep the Hermes planner terminal binding", async () => {
@@ -912,9 +971,6 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "createWorkflowSession",
     "appendWorkflowUserInput",
     "getWorkflowLedger",
-    "applyWorkflowIntent",
-    "scheduleWorkflowReadyLanes",
-    "recordWorkflowRunResult",
     "getWorkflowProjection",
     "getWorkflowEvents",
     "getCheckpoints",
@@ -928,9 +984,6 @@ test("preload exposes narrow natural workflow wrappers", async () => {
     "createSession",
     "appendUserInput",
     "getLedger",
-    "applyIntent",
-    "scheduleReady",
-    "recordRunResult",
     "updateNodePosition",
     "getProjection",
     "getEvents",
@@ -964,6 +1017,19 @@ test("preload exposes narrow natural workflow wrappers", async () => {
   ]) {
     assert.match(preload, new RegExp(`${wrapper}\\s*:`));
   }
+  for (const wrapper of [
+    "applyWorkflowIntent",
+    "scheduleWorkflowReadyLanes",
+    "recordWorkflowRunResult",
+    "applyIntent",
+    "scheduleReady",
+    "recordRunResult",
+  ]) {
+    assert.doesNotMatch(preload, new RegExp(`${wrapper}\\s*:`));
+  }
+  for (const channel of ["workflow:applyIntent", "workflow:scheduleReady", "workflow:recordRunResult"]) {
+    assert.doesNotMatch(preload, new RegExp(escapeRegExp(channel)));
+  }
   assert.doesNotMatch(preload, /ipcRenderer\s*:/);
   assert.doesNotMatch(preload, /return\s+ipcRenderer/);
   assert.doesNotMatch(preload, /execFile|spawn|shell|fs\./);
@@ -974,6 +1040,24 @@ test("preload position update wrapper is compile-time checked against WorkflowAp
   assert.match(preloadSource, /WorkflowApi,[\s\S]*WorkflowNodePositionUpdateRequest,[\s\S]*resolution-mode/);
   assert.match(preloadSource, /input: WorkflowNodePositionUpdateRequest/);
   assert.match(preloadSource, /satisfies WorkflowApi/);
+});
+
+test("renderer workflow types expose no backend apply, schedule, or result mutators", async () => {
+  const source = await readFile(join(root, "..", "..", "packages", "persistence", "src", "index.ts"), "utf8");
+  const workflowApi = source.slice(source.indexOf("export interface WorkflowApi"), source.indexOf("export interface DevflowApi"));
+  const devflowApi = source.slice(source.indexOf("export interface DevflowApi"), source.indexOf("declare global"));
+
+  for (const mutator of [
+    "applyIntent",
+    "scheduleReady",
+    "recordRunResult",
+    "applyWorkflowIntent",
+    "scheduleWorkflowReadyLanes",
+    "recordWorkflowRunResult",
+  ]) {
+    assert.doesNotMatch(workflowApi, new RegExp(`${mutator}\\s*:`));
+    assert.doesNotMatch(devflowApi, new RegExp(`${mutator}\\s*:`));
+  }
 });
 
 test("node position IPC returns the authoritative session without a duplicate renderer broadcast", async () => {
@@ -1117,7 +1201,7 @@ test("workflow insert-before contract is narrow and returns authoritative lane i
   );
   const result = persistence.slice(
     persistence.indexOf("export interface WorkflowInsertBeforeResult"),
-    persistence.indexOf("export interface WorkflowRunResultRecordRequest"),
+    persistence.indexOf("export interface WorkflowNodePositionUpdateRequest"),
   );
 
   assert.match(request, /sessionId:\s*string/);
@@ -2266,6 +2350,9 @@ test("workflow IPC contract errors are recognizable and block decision nodes", a
   assert.equal(contracts.WORKFLOW_IPC_CHANNELS.worktreeCreate, "workflow:worktree:create");
   assert.equal(contracts.WORKFLOW_IPC_CHANNELS.updateNodePosition, "workflow:nodePosition:update");
   assert.equal(contracts.WORKFLOW_IPC_CHANNELS.deliveryCommit, "workflow:delivery:commit");
+  assert.equal(Object.hasOwn(contracts.WORKFLOW_IPC_CHANNELS, "applyIntent"), false);
+  assert.equal(Object.hasOwn(contracts.WORKFLOW_IPC_CHANNELS, "scheduleReady"), false);
+  assert.equal(Object.hasOwn(contracts.WORKFLOW_IPC_CHANNELS, "recordRunResult"), false);
   assert.deepEqual(
     toPlain(contracts.normalizeWorkflowNodePositionUpdate({
       sessionId: " session-1 ",
@@ -2297,7 +2384,7 @@ test("workflow IPC contract errors are recognizable and block decision nodes", a
   );
 });
 
-test("run start guard trusts only the SQLite planner root CanvasSession fallback", async () => {
+test("run start guard trusts the raw SQLite planner identity before Canvas materialization", async () => {
   const contracts = await loadWorkflowIpcContracts();
   const input = {
     sessionId: "session-1",
@@ -2308,22 +2395,19 @@ test("run start guard trusts only the SQLite planner root CanvasSession fallback
     plannerInputId: "run-session-1-node-1-20260713090000",
   };
   const store = {
-    materializeCanvasSession(sessionId) {
+    getPlannerStartAuthorization(sessionId) {
       assert.equal(sessionId, "session-1");
       return {
-        id: "session-1",
         plannerNodeId: "node-1",
-        hermesPlannerSessionId: "hermes-session-1",
-        edges: [],
-        nodes: [
-          {
-            id: "node-1",
-            agent: "hermes",
-            status: "completed",
-            context: { dependencies: [] },
-          },
-        ],
+        plannerSessionId: "hermes-session-1",
+        agentKind: "hermes",
+        executable: true,
+        dependencies: [],
+        hasIncomingEdges: false,
       };
+    },
+    materializeCanvasSession() {
+      throw new Error("Canvas materialization must not authorize an unclaimed planner turn.");
     },
   };
 
@@ -2342,12 +2426,14 @@ test("run start guard rejects planner starts without concrete turn identity or g
     plannerInputId: "run-session-1-node-1-20260713090000",
   };
   const makeStore = (overrides = {}) => ({
-    materializeCanvasSession() {
+    getPlannerStartAuthorization() {
       return {
         plannerNodeId: "node-1",
-        hermesPlannerSessionId: "hermes-session-1",
-        edges: [],
-        nodes: [{ id: "node-1", agent: "hermes", status: "completed", context: { dependencies: [] } }],
+        plannerSessionId: "hermes-session-1",
+        agentKind: "hermes",
+        executable: true,
+        dependencies: [],
+        hasIncomingEdges: false,
         ...overrides,
       };
     },
@@ -2355,26 +2441,13 @@ test("run start guard rejects planner starts without concrete turn identity or g
 
   assert.equal(contracts.isTrustedPlannerRootStartInput({ ...validInput, plannerInputId: "" }, makeStore()), false);
   assert.equal(contracts.isTrustedPlannerRootStartInput({ ...validInput, plannerSessionId: "other" }, makeStore()), false);
-  assert.equal(contracts.isTrustedPlannerRootStartInput(validInput, makeStore({
-    edges: [{ id: "edge-1", source: "node-2", target: "node-1" }],
-  })), false);
+  assert.equal(contracts.isTrustedPlannerRootStartInput(validInput, makeStore({ hasIncomingEdges: true })), false);
 });
 
 test("run start guard keeps rejecting missing non-planner projection nodes", async () => {
   const contracts = await loadWorkflowIpcContracts();
   const store = {
-    materializeCanvasSession() {
-      return {
-        plannerNodeId: "node-1",
-        nodes: [
-          {
-            id: "node-1",
-            agent: "hermes",
-            status: "running",
-          },
-        ],
-      };
-    },
+    getPlannerStartAuthorization: () => null,
   };
 
   assert.equal(
@@ -2387,29 +2460,24 @@ test("run start guard keeps rejecting missing non-planner projection nodes", asy
   );
 });
 
-test("run start guard rejects non-executable planner-like fallback nodes", async () => {
+test("run start guard rejects non-executable raw planner identities", async () => {
   const contracts = await loadWorkflowIpcContracts();
-  const makeStore = (node) => ({
-    materializeCanvasSession() {
-      return {
-        plannerNodeId: "node-1",
-        nodes: [node],
-      };
-    },
-  });
-  const input = { sessionId: "session-1", nodeId: "node-1" };
+  const makeStore = (authorization) => ({ getPlannerStartAuthorization: () => authorization });
+  const input = {
+    sessionId: "session-1",
+    nodeId: "node-1",
+    runId: "run-1",
+    agentKind: "hermes",
+    plannerSessionId: "hermes-session-1",
+    plannerInputId: "run-1",
+  };
 
-  for (const node of [
-    { id: "node-1", agent: "hermes", nodeKind: "user_decision", status: "running" },
-    { id: "node-1", agent: "hermes", executable: false, status: "running" },
-    {
-      id: "node-1",
-      agent: "hermes",
-      runtimePolicy: { executable: false },
-      status: "running",
-    },
+  for (const authorization of [
+    { plannerNodeId: "node-1", plannerSessionId: "hermes-session-1", agentKind: "hermes", executable: false, dependencies: [], hasIncomingEdges: false },
+    { plannerNodeId: "node-1", plannerSessionId: "hermes-session-1", agentKind: "hermes", executable: true, dependencies: ["node-2"], hasIncomingEdges: false },
+    { plannerNodeId: "node-1", plannerSessionId: "hermes-session-1", agentKind: "hermes", executable: true, dependencies: [], hasIncomingEdges: true },
   ]) {
-    assert.equal(contracts.isTrustedPlannerRootStartInput(input, makeStore(node)), false);
+    assert.equal(contracts.isTrustedPlannerRootStartInput(input, makeStore(authorization)), false);
   }
 });
 

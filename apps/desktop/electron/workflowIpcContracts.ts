@@ -5,9 +5,6 @@ export const WORKFLOW_IPC_CHANNELS = {
   finishPlan: "workflow:finishPlan",
   appendUserInput: "workflow:appendUserInput",
   ledger: "workflow:ledger",
-  applyIntent: "workflow:applyIntent",
-  scheduleReady: "workflow:scheduleReady",
-  recordRunResult: "workflow:recordRunResult",
   updateNodePosition: "workflow:nodePosition:update",
   projection: "workflow:projection",
   events: "workflow:events",
@@ -64,6 +61,7 @@ export type WorkflowIpcErrorCode =
   | "UNKNOWN_SESSION"
   | "NON_EXECUTABLE_NODE"
   | "UNSAFE_WORKTREE_PATH"
+  | "UNAVAILABLE"
   | "DELIVERY_REJECTED"
   | "GH_UNAVAILABLE"
   | "AUTH_REQUIRED"
@@ -110,10 +108,11 @@ export function rejectMissingWorkflowProjectionNode(input: unknown, workflowEven
 }
 
 export interface TrustedPlannerRootStartStore {
-  materializeCanvasSession(sessionId: string): unknown;
+  getPlannerStartAuthorization(sessionId: string): unknown;
 }
 
 export interface ExpectedArtifactRunStartStore extends TrustedPlannerRootStartStore {
+  materializeCanvasSession(sessionId: string): unknown;
   materializeFlowProjection(sessionId: string): unknown;
 }
 
@@ -163,26 +162,15 @@ export function isTrustedPlannerRootStartInput(input: unknown, store: TrustedPla
     return false;
   }
 
-  const canvasSession = store.materializeCanvasSession(input.sessionId);
-  if (!isRecord(canvasSession)) return false;
-  if (canvasSession.plannerNodeId !== input.nodeId) return false;
-  if (canvasSession.hermesPlannerSessionId !== input.plannerSessionId) return false;
-  if (!Array.isArray(canvasSession.nodes)) return false;
-  if (Array.isArray(canvasSession.edges) && canvasSession.edges.some((edge) => isRecord(edge) && edge.target === input.nodeId)) {
-    return false;
-  }
-
-  const plannerNode = canvasSession.nodes.find((node) =>
-    isRecord(node) && node.id === input.nodeId
-  );
-  if (!isRecord(plannerNode)) return false;
-  if (plannerNode.agent !== "hermes") return false;
-  if (plannerNode.nodeKind === "user_decision") return false;
-  if (plannerNode.executable === false) return false;
-  if (isRecord(plannerNode.runtimePolicy) && plannerNode.runtimePolicy.executable === false) return false;
-  if (!isRecord(plannerNode.context) || !Array.isArray(plannerNode.context.dependencies)) return false;
-  if (plannerNode.context.dependencies.length > 0) return false;
-  return new Set(["running", "retrying", "completed", "failed"]).has(String(plannerNode.status));
+  const authorization = store.getPlannerStartAuthorization(input.sessionId);
+  if (!isRecord(authorization)) return false;
+  return authorization.plannerNodeId === input.nodeId &&
+    authorization.plannerSessionId === input.plannerSessionId &&
+    authorization.agentKind === "hermes" &&
+    authorization.executable === true &&
+    Array.isArray(authorization.dependencies) &&
+    authorization.dependencies.length === 0 &&
+    authorization.hasIncomingEdges === false;
 }
 
 function authoritativeRunStartRequiredEvidence(
@@ -190,6 +178,7 @@ function authoritativeRunStartRequiredEvidence(
   store: ExpectedArtifactRunStartStore,
 ): string[] {
   if (!isNonEmptyString(input.sessionId) || !isNonEmptyString(input.nodeId)) return [];
+  if (isTrustedPlannerRootStartInput(input, store)) return [];
   const projection = store.materializeFlowProjection(input.sessionId);
   const lane = isRecord(projection) && Array.isArray(projection.lanes)
     ? projection.lanes.find((candidate) => isRecord(candidate) && candidate.id === input.nodeId)

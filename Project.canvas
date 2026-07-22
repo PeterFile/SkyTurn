@@ -137,8 +137,8 @@
       "y": 500,
       "width": 360,
       "height": 210,
-      "color": "6",
-      "text": "Task: Harden current-branch real loop\nState: Proposed\nOwner: Hermes/Codex\nDepends: Workflow Kernel, Agent Bridge, Persistence\nEvidence: README capability map\nRisk: experimental-run and fallback boundaries"
+      "color": "3",
+      "text": "Task: Backend-owned planner turns\nState: Verify\nOwner: Hermes/Codex\nDepends: Workflow Kernel, Agent Bridge, Persistence\nEvidence: real New Session UI acceptance plus full repository gates\nRisk: renderer single-authority hardening continues in the delivery plan"
     },
     {
       "id": "1000000000000010",
@@ -168,7 +168,7 @@
       "width": 360,
       "height": 200,
       "color": "4",
-      "text": "Evidence: Live repo baseline\ncommit: 1fc533c feat(ui-canvas): clarify explicit delivery gates\ntest: git status --short --branch -> ## main...origin/main\nartifact: README.md current scope and capability map"
+      "text": "Evidence: Backend-owned planner turns\nmanual: real Electron New Session UI with PTY disabled, two planner turns, stable planner identity, downstream completion, and exact reopen\ntest: pnpm run build; pnpm run typecheck; pnpm run lint; pnpm run test; pnpm flow-kernel:acceptance; pnpm --filter @skyturn/desktop run acceptance:new-session-ui\nartifact: README.md, Project.canvas, and apps/desktop/scripts/newSessionUiAcceptance.mjs\ndelivery: commit, PR, checks, review, merge, and main sync remain explicit actions"
     },
     {
       "id": "1000000000000013",
@@ -198,7 +198,7 @@
       "width": 360,
       "height": 190,
       "color": "1",
-      "text": "Risk: Real agent path is experimental-run\nImpact: local credentials/CLI drift can break demos\nMitigation: verify with demo:mvp before product claims\nStatus: Open"
+      "text": "Risk: Real agent path is experimental-run\nImpact: local credentials, CLI drift, or native ABI setup can block product acceptance\nMitigation: rebuild Electron native deps, then run acceptance:new-session-ui exactly once\nStatus: Open"
     },
     {
       "id": "1000000000000016",
@@ -288,12 +288,12 @@
 
     {
       "id": "2000000000000009",
-      "fromNode": "1000000000000012",
-      "fromSide": "right",
-      "toNode": "1000000000000009",
-      "toSide": "left",
+      "fromNode": "1000000000000009",
+      "fromSide": "bottom",
+      "toNode": "1000000000000012",
+      "toSide": "top",
       "toEnd": "arrow",
-      "label": "baseline"
+      "label": "evidence"
     },
     {
       "id": "2000000000000010",

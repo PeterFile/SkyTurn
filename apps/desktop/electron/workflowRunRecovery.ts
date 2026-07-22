@@ -1,3 +1,5 @@
+import { realpath } from "node:fs/promises";
+
 interface RunSegmentIdentity {
   sessionId: string;
   laneId: string;
@@ -11,6 +13,7 @@ type RunningSegment = RunSegmentIdentity & { status?: "running" };
 interface RecoveryBridge {
   getEvidence(projectRoot: string, runId: string): Promise<unknown>;
   loadEvents(projectRoot: string, runId: string): Promise<unknown[]>;
+  listRuns?(): unknown[];
 }
 
 interface RecoveryStore {
@@ -31,8 +34,15 @@ interface RecoveryStore {
   appendWorkflowEvent(input: Record<string, unknown>): unknown;
 }
 
+type ExactRunCatalogState =
+  | "exact-running"
+  | "exact-terminal-evidence-pending"
+  | "known-absent-or-conflict"
+  | "unknown-unavailable";
+
 const TERMINAL_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed-out"]);
 const INVALID_RUN_START_CLAIM_REASON = "run-start-claim-invalid";
+const INTERRUPTED_RUN_RECOVERY_REASON = "run-recovery-interrupted";
 
 export function compensateFailedWorkflowRun(
   store: RecoveryStore,
@@ -77,24 +87,63 @@ export async function recoverTerminalWorkflowRuns(
   now: () => string = () => new Date().toISOString(),
   enrichAfterCheckpoint?: (segment: RunSegmentIdentity) => Promise<void>,
   reconcilePendingPlannerIntent?: (segment: RunSegmentIdentity) => Promise<void>,
+  reconcileTerminalRun?: (segment: RunSegmentIdentity, evidence: unknown) => Promise<void>,
 ): Promise<void> {
   for (const segment of store.listRunningSegments()) {
     try {
-      const evidence = await bridge.getEvidence(projectRoot, segment.runId);
-      if (!isTerminalEvidence(evidence, segment.runId)) continue;
-      const events = await bridge.loadEvents(projectRoot, segment.runId);
-      store.recordRunResult({
-        ...segment,
-        outputSummary: summarizeOutput(events) ?? "",
-        runEvents: events,
-        evidence,
-        now: completedAt(evidence) ?? now(),
-      });
+      const initialEvidence = await bridge.getEvidence(projectRoot, segment.runId);
+      let terminalEvidence = isTerminalEvidence(initialEvidence, segment.runId) ? initialEvidence : null;
+      if (!terminalEvidence) {
+        const catalogState = await exactRunCatalogState(bridge, projectRoot, segment);
+        if (catalogState === "exact-running" || catalogState === "unknown-unavailable") continue;
+        const refreshedEvidence = await bridge.getEvidence(projectRoot, segment.runId);
+        if (isTerminalEvidence(refreshedEvidence, segment.runId)) {
+          terminalEvidence = refreshedEvidence;
+        } else {
+          const refreshedCatalogState = await exactRunCatalogState(bridge, projectRoot, segment);
+          if (refreshedCatalogState !== "known-absent-or-conflict") continue;
+          compensateFailedWorkflowRun(store, segment, new Error(INTERRUPTED_RUN_RECOVERY_REASON), now);
+          try {
+            store.appendWorkflowEvent({
+              sessionId: segment.sessionId,
+              kind: "workflow.run.recovery_failed",
+              source: "electron-main",
+              laneId: segment.laneId,
+              segmentId: segment.segmentId,
+              idempotencyKey: `run-recovery:${segment.runId}:interrupted`,
+              payload: {
+                runId: segment.runId,
+                status: "failed",
+                reason: INTERRUPTED_RUN_RECOVERY_REASON,
+              },
+              now: now(),
+            });
+          } catch {
+            // Terminal compensation is authoritative; recovery audit is best-effort.
+          }
+          continue;
+        }
+      }
+      if (reconcileTerminalRun) {
+        await reconcileTerminalRun(segment, terminalEvidence);
+      } else {
+        const events = await bridge.loadEvents(projectRoot, segment.runId);
+        store.recordRunResult({
+          ...segment,
+          outputSummary: summarizeOutput(events) ?? "",
+          runEvents: events,
+          evidence: terminalEvidence,
+          now: completedAt(terminalEvidence) ?? now(),
+        });
+      }
     } catch (error) {
       const invalidRunStartClaim = isInvalidRunStartClaimError(error);
-      if (invalidRunStartClaim) {
-        compensateFailedWorkflowRun(store, segment, new Error(INVALID_RUN_START_CLAIM_REASON), now);
-      }
+      const catalogState = invalidRunStartClaim
+        ? "known-absent-or-conflict"
+        : await exactRunCatalogState(bridge, projectRoot, segment);
+      const shouldCompensate = invalidRunStartClaim || catalogState === "known-absent-or-conflict";
+      const reason = recoveryFailureReason(catalogState, invalidRunStartClaim);
+      if (shouldCompensate) compensateFailedWorkflowRun(store, segment, new Error(reason), now);
       store.appendWorkflowEvent({
         sessionId: segment.sessionId,
         kind: "workflow.run.recovery_failed",
@@ -104,30 +153,16 @@ export async function recoverTerminalWorkflowRuns(
         idempotencyKey: `run-recovery:${segment.runId}:failed`,
         payload: {
           runId: segment.runId,
-          status: "failed",
-          reason: invalidRunStartClaim ? INVALID_RUN_START_CLAIM_REASON : "terminal-recovery-failed",
+          status: shouldCompensate ? "failed" : "running",
+          reason,
+          ...(!shouldCompensate ? { retryable: true, terminalRunPreserved: true } : {}),
         },
         now: now(),
       });
     }
   }
   if (reconcilePendingPlannerIntent) {
-    for (const segment of store.listPendingPlannerIntentReconciliations()) {
-      try {
-        await reconcilePendingPlannerIntent(segment);
-      } catch {
-        store.appendWorkflowEvent({
-          sessionId: segment.sessionId,
-          kind: "workflow.run.recovery_failed",
-          source: "electron-main",
-          laneId: segment.laneId,
-          segmentId: segment.segmentId,
-          idempotencyKey: `planner-intent-recovery:${segment.runId}:failed`,
-          payload: { runId: segment.runId, status: "failed", reason: "planner-intent-recovery-failed" },
-          now: now(),
-        });
-      }
-    }
+    await recoverPendingPlannerIntentReconciliations(store, reconcilePendingPlannerIntent, now);
   }
   if (!enrichAfterCheckpoint) return;
   for (const segment of store.listPendingRunCheckpointEnrichments()) {
@@ -153,6 +188,93 @@ export async function recoverTerminalWorkflowRuns(
       });
     }
   }
+}
+
+export async function recoverPendingPlannerIntentReconciliations(
+  store: RecoveryStore,
+  reconcilePendingPlannerIntent: (segment: RunSegmentIdentity) => Promise<void>,
+  now: () => string = () => new Date().toISOString(),
+): Promise<void> {
+  for (const segment of store.listPendingPlannerIntentReconciliations()) {
+    try {
+      await reconcilePendingPlannerIntent(segment);
+    } catch {
+      store.appendWorkflowEvent({
+        sessionId: segment.sessionId,
+        kind: "workflow.run.recovery_failed",
+        source: "electron-main",
+        laneId: segment.laneId,
+        segmentId: segment.segmentId,
+        idempotencyKey: `planner-intent-recovery:${segment.runId}:failed`,
+        payload: { runId: segment.runId, status: "failed", reason: "planner-intent-recovery-failed" },
+        now: now(),
+      });
+    }
+  }
+}
+
+function recoveryFailureReason(catalogState: ExactRunCatalogState, invalidRunStartClaim: boolean): string {
+  if (invalidRunStartClaim) return INVALID_RUN_START_CLAIM_REASON;
+  if (catalogState === "known-absent-or-conflict") return INTERRUPTED_RUN_RECOVERY_REASON;
+  if (catalogState === "exact-terminal-evidence-pending") return "terminal-evidence-pending";
+  if (catalogState === "unknown-unavailable") return "terminal-recovery-unavailable";
+  return "terminal-recovery-failed";
+}
+
+async function exactRunCatalogState(
+  bridge: RecoveryBridge,
+  projectRoot: string,
+  segment: RunningSegment,
+): Promise<ExactRunCatalogState> {
+  let runs: unknown;
+  try {
+    runs = bridge.listRuns?.();
+  } catch {
+    return "unknown-unavailable";
+  }
+  if (!Array.isArray(runs)) return "unknown-unavailable";
+
+  let canonicalProjectRoot: string;
+  try {
+    canonicalProjectRoot = await realpath(projectRoot);
+  } catch {
+    return "unknown-unavailable";
+  }
+
+  let exactState: ExactRunCatalogState | null = null;
+  for (const run of runs) {
+    if (!isRecord(run)) continue;
+    const hasId = Object.hasOwn(run, "id");
+    const hasRunId = Object.hasOwn(run, "runId");
+    if (!hasId && !hasRunId) continue;
+    const mentionsRunId = (hasId && run.id === segment.runId) || (hasRunId && run.runId === segment.runId);
+    if (!mentionsRunId) continue;
+    if (
+      (hasId && run.id !== segment.runId) ||
+      (hasRunId && run.runId !== segment.runId) ||
+      run.sessionId !== segment.sessionId ||
+      run.nodeId !== segment.laneId ||
+      run.agentKind !== segment.agentKind ||
+      typeof run.projectRoot !== "string"
+    ) {
+      return "known-absent-or-conflict";
+    }
+    let runProjectRoot: string;
+    try {
+      runProjectRoot = await realpath(run.projectRoot);
+    } catch {
+      return "unknown-unavailable";
+    }
+    if (runProjectRoot !== canonicalProjectRoot) return "known-absent-or-conflict";
+    const candidateState = run.status === "running"
+      ? "exact-running"
+      : TERMINAL_STATUSES.has(String(run.status))
+        ? "exact-terminal-evidence-pending"
+        : "unknown-unavailable";
+    if (exactState !== null) return "known-absent-or-conflict";
+    exactState = candidateState;
+  }
+  return exactState ?? "known-absent-or-conflict";
 }
 
 function isInvalidRunStartClaimError(error: unknown): boolean {

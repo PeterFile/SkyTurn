@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const helpers = ["artifact-gate"];
-const windowsHelper = join(packageRoot, "src/native/artifact-gate.ps1");
+const windowsHelpers = ["artifact-gate.ps1", "job-object-host.ps1"];
 for (const legacyPath of [
   join(packageRoot, "src/native/durable-run-claim"),
   join(packageRoot, "dist/native/durable-run-claim"),
@@ -13,7 +13,11 @@ for (const legacyPath of [
   rmSync(legacyPath, { force: true });
 }
 
-if (!existsSync(windowsHelper)) throw new Error("Windows artifact verifier source is missing.");
+for (const helper of windowsHelpers) {
+  if (!existsSync(join(packageRoot, "src/native", helper))) {
+    throw new Error(`Windows native helper source is missing: ${helper}`);
+  }
+}
 
 if (process.platform !== "win32") {
   const compiler = process.env.CC || "cc";
@@ -36,7 +40,10 @@ if (process.platform !== "win32") {
 }
 
 if (process.argv.includes("--copy-dist")) {
-  const distWindowsHelper = join(packageRoot, "dist/native/artifact-gate.ps1");
-  mkdirSync(dirname(distWindowsHelper), { recursive: true });
-  copyFileSync(windowsHelper, distWindowsHelper);
+  for (const helper of windowsHelpers) {
+    const source = join(packageRoot, "src/native", helper);
+    const destination = join(packageRoot, "dist/native", helper);
+    mkdirSync(dirname(destination), { recursive: true });
+    copyFileSync(source, destination);
+  }
 }

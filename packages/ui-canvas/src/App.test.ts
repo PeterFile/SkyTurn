@@ -8,7 +8,12 @@ import {
   formatTerminalMessage,
   plannerSessionStatusForSnapshot,
 } from "./terminalInspector.js";
-import { normalizeWorkspaceState, type TerminalSnapshotResult } from "@skyturn/persistence";
+import {
+  emptyWorkspace,
+  normalizeWorkspaceState,
+  type TerminalSnapshotResult,
+  type WorkspaceState,
+} from "@skyturn/persistence";
 import type { VariantComparisonEvidence } from "@skyturn/git-worktree";
 import {
   REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE,
@@ -41,11 +46,73 @@ import {
 } from "./App.js";
 import * as AppModule from "./App.js";
 import { parsePlanBootstrapSession } from "@skyturn/project-core";
-import type { CanvasNode, Changeset, FinalChangesetReconciliation, PlanSession, RunEvidence } from "@skyturn/project-core";
+import type { CanvasNode, CanvasSession, Changeset, FinalChangesetReconciliation, PlanSession, RunEvidence } from "@skyturn/project-core";
 import type { DeliveryCommitSummary } from "./deliveryPanel.js";
 import type { SelectedNodeActionState } from "./nodeActionState.js";
 import { acceptPlanStage, canFinishPlan, editPlanStage } from "./planRuntime.js";
 import { convertPlanToCanvas } from "@skyturn/planner";
+
+interface BottomComposerSubmissionStateForTest {
+  inputId: string;
+  text: string;
+  busy: boolean;
+  error: string | null;
+}
+
+type SubmitBottomComposerAttempt = <T>(options: {
+  states: Map<string, BottomComposerSubmissionStateForTest>;
+  scope: string;
+  text: string;
+  createInputId: () => string;
+  submit: (inputId: string) => Promise<T>;
+  onStateChange?: () => void;
+}) => Promise<T | null>;
+
+function submitBottomComposerAttemptForTest(): SubmitBottomComposerAttempt {
+  const helper = Reflect.get(AppModule, "submitBottomComposerAttempt");
+  expect(helper).toBeTypeOf("function");
+  return helper as SubmitBottomComposerAttempt;
+}
+
+interface NewSessionSubmissionStateForTest {
+  session: CanvasSession;
+  inputId: string;
+  busy: boolean;
+  error: string | null;
+}
+
+type SubmitNewSessionAttempt = (options: {
+  states: Map<string, NewSessionSubmissionStateForTest>;
+  scope: string;
+  createAttempt: () => Pick<NewSessionSubmissionStateForTest, "session" | "inputId">;
+  submit: (attempt: Pick<NewSessionSubmissionStateForTest, "session" | "inputId">) => Promise<CanvasSession>;
+  onStateChange?: () => void;
+}) => Promise<CanvasSession | null>;
+
+function submitNewSessionAttemptForTest(): SubmitNewSessionAttempt {
+  const helper = Reflect.get(AppModule, "submitNewSessionAttempt");
+  expect(helper).toBeTypeOf("function");
+  return helper as SubmitNewSessionAttempt;
+}
+
+function canvasSessionForTest(id: string, projectId = "project-1"): CanvasSession {
+  return {
+    id,
+    projectId,
+    title: id,
+    goal: "Build it",
+    mode: "fast",
+    kind: "canvas",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    createdAt: "2026-07-21T00:00:00.000Z",
+    updatedAt: "2026-07-21T00:00:00.000Z",
+    hermesPlannerSessionId: `hermes-${id}`,
+    plannerNodeId: `planner-${id}`,
+    nodes: [],
+    edges: [],
+    activeNodeId: null,
+  };
+}
 
 function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
   return {
@@ -209,26 +276,6 @@ describe("Plan finish workflow handoff", () => {
     expect(stale.installed).toBe(false);
     expect(stale.workspace).toBe(changedWorkspace);
     expect(stale.workspace.sessions[0]).toEqual(changedPlan);
-  });
-
-  it("registers only backend-started Finish Canvas runs before installation", () => {
-    const register = Reflect.get(AppModule, "registerBackendStartedCanvasRuns") as undefined | ((
-      startedRuns: Set<string>,
-      canvas: ReturnType<typeof convertPlanToCanvas>,
-    ) => void);
-    expect(register).toBeTypeOf("function");
-    if (!register) return;
-    const plan = editablePlanSession();
-    const canvas = convertPlanToCanvas(plan);
-    canvas.nodes = [
-      { ...mockNode("hermes"), id: "planner", runId: "planner-run", status: "running" },
-      { ...mockNode("codex"), id: "scheduled", runId: "scheduled-run", status: "pending" },
-    ];
-    const startedRuns = new Set<string>(["already-started"]);
-
-    register(startedRuns, canvas);
-
-    expect([...startedRuns]).toEqual(["already-started", "planner-run"]);
   });
 
   it("hands the exact approved Plan to the dedicated backend finish boundary and returns its authoritative canvas", async () => {
@@ -1345,10 +1392,8 @@ describe("UI source validation", () => {
       appSource.indexOf("async function finishPlan(session: PlanSession)"),
       appSource.indexOf("function updateCanvasSession("),
     );
-    expect(finishPlanBlock).toContain("registerBackendStartedCanvasRuns(startedBridgeRuns.current, canvas)");
-    expect(finishPlanBlock.indexOf("registerBackendStartedCanvasRuns")).toBeLessThan(
-      finishPlanBlock.indexOf("installFinishedPlanCanvas"),
-    );
+    expect(finishPlanBlock).not.toContain("registerBackendStartedCanvasRuns");
+    expect(finishPlanBlock).not.toContain("startedBridgeRuns");
     expect(appSource).toContain("installFinishedPlanCanvas(current, boundary, canvas)");
   });
 
@@ -1365,19 +1410,77 @@ describe("UI source validation", () => {
     expect(healthEffect).not.toContain("window.devflow.discoverAgents()");
   });
 
-  it("starts every running or retrying workflow node instead of only the active node", async () => {
+  it("never starts workflow executor runs from the desktop renderer", async () => {
     const appSource = await readSource("./App.tsx");
-    const bridgeStartEffect = appSource.slice(
-      appSource.indexOf("for (const node of activeSession.nodes)"),
-      appSource.indexOf("}, [activeProject, activeSession]);"),
+
+    expect(appSource).not.toContain("startedBridgeRuns");
+    expect(appSource).not.toContain("startBridgeRun(activeProject, activeSession, node)");
+    expect(appSource).not.toContain("applyBridgeRunResult(current, result)");
+    expect(appSource).not.toContain("registerBackendStartedCanvasRuns");
+  });
+
+  it("does not apply the legacy renderer retry policy to an authoritative desktop session", () => {
+    const retryNodeForRuntime = Reflect.get(AppModule, "retryCanvasNodeForRuntime") as undefined | ((
+      session: CanvasSession,
+      nodeId: string,
+      now: string,
+      desktopBackendAvailable: boolean,
+    ) => CanvasSession);
+    expect(retryNodeForRuntime).toBeTypeOf("function");
+    if (!retryNodeForRuntime) return;
+    const node = {
+      ...mockNode("codex"),
+      status: "failed" as const,
+      runId: "authoritative-run",
+      progress: "Authoritative failure",
+      output: ["Authoritative output"],
+    };
+    const session = { ...canvasSessionForTest("session-retry"), nodes: [node] };
+
+    const next = retryNodeForRuntime(session, node.id, "2026-07-23T08:00:00.000Z", true);
+
+    expect(next).toBe(session);
+    expect(next.nodes[0]).toMatchObject({
+      status: "failed",
+      runId: "authoritative-run",
+      progress: "Authoritative failure",
+      output: ["Authoritative output"],
+    });
+  });
+
+  it("disables Node Modal Retry with an explicit accessible desktop-backend reason", async () => {
+    const appSource = await readSource("./App.tsx");
+    const retryHandler = appSource.slice(appSource.indexOf("function retryNode("), appSource.indexOf("function answerUserDecision("));
+    const nodeModal = appSource.slice(appSource.indexOf("function NodeModal("), appSource.indexOf("function OutputTab("));
+
+    expect(retryHandler).toContain("if (window.devflow) return;");
+    expect(appSource).toContain("retryUnavailableReason={window.devflow ? DESKTOP_RETRY_UNAVAILABLE_REASON : null}");
+    expect(nodeModal).toContain("disabled={!canExecute || retryUnavailableReason !== null}");
+    expect(nodeModal).toContain("title={retryUnavailableReason ?? undefined}");
+    expect(nodeModal).toContain("aria-describedby={retryUnavailableReason ? retryUnavailableReasonId : undefined}");
+    expect(nodeModal).toContain('className="sr-only"');
+    expect(appSource).toContain("Use checkpoint-driven Repair in the bottom composer when available.");
+  });
+
+  it("keeps workflow broadcasts authoritative and removes renderer terminal persistence", async () => {
+    const appSource = await readSource("./App.tsx");
+    const runEventEffect = appSource.slice(
+      appSource.indexOf("window.devflow.onRunEvent"),
+      appSource.indexOf("window.devflow.onWorkflowEvent"),
+    );
+    const workflowEventEffect = appSource.slice(
+      appSource.indexOf("window.devflow.onWorkflowEvent"),
+      appSource.indexOf("window.devflow.onPlanEvent"),
     );
 
-    expect(bridgeStartEffect).toContain("for (const node of activeSession.nodes)");
-    expect(bridgeStartEffect).toContain('node.status !== "running" && node.status !== "retrying"');
-    expect(bridgeStartEffect).toContain("startedBridgeRuns.current.has(node.runId)");
-    expect(bridgeStartEffect).toContain("startBridgeRun(activeProject, activeSession, node)");
-    expect(bridgeStartEffect).not.toContain("selectedNode");
-    expect(bridgeStartEffect).not.toContain("activeSession.activeNodeId");
+    expect(runEventEffect).not.toMatch(
+      /claimCompletedBridgeRunPersistence|persistCompletedBridgeRunResult|applyCompletedBridgeRunPersistenceResult/,
+    );
+    expect(appSource).not.toMatch(
+      /claimCompletedBridgeRunPersistence|persistCompletedBridgeRunResult|applyCompletedBridgeRunPersistenceResult/,
+    );
+    expect(workflowEventEffect).toContain("applyAuthoritativeWorkflowBroadcast");
+    expect(workflowEventEffect).toContain("workflowProjectionGenerationRef.current.set");
   });
 
   it("renders compact agent readiness near canvas composer but not on start page", async () => {
@@ -1424,7 +1527,8 @@ describe("UI source validation", () => {
 
     expect(fnBody).toContain("const { canvasSession } = result");
     expect(fnBody).toContain("if (canvasSession)");
-    expect(fnBody).toContain("setWorkspace((current) =>");
+    expect(fnBody).toContain("captureWorkflowSessionResponseGuard(activeSession.id, activeSession)");
+    expect(fnBody).toContain("applyGuardedWorkflowSessionResponse(canvasSession, responseGuard)");
 
     const devflowCheck = fnBody.indexOf("if (window.devflow");
     const fallbackUpdate = fnBody.indexOf("updateCanvasSession(activeSession.id");
@@ -1443,7 +1547,8 @@ describe("UI source validation", () => {
     expect(fnBody).toContain("laneId: nodeId");
     expect(fnBody).toContain("agentKind: nextAgent");
     expect(fnBody).toContain("const { canvasSession } = result");
-    expect(fnBody).toContain("setWorkspace((current) =>");
+    expect(fnBody).toContain("captureWorkflowSessionResponseGuard(activeSession.id, activeSession)");
+    expect(fnBody).toContain("applyGuardedWorkflowSessionResponse(canvasSession, responseGuard)");
 
     expect(fnBody).toContain('setNodeActionError("Workflow backend unavailable.")');
     expect(fnBody).toContain(".catch((error)");
@@ -1796,6 +1901,418 @@ describe("UI source validation", () => {
 });
 
 describe("Slice C UI behavior", () => {
+  it("creates real Fast caller identities uniquely across success, scope, and project boundaries", () => {
+    const createSession = Reflect.get(AppModule, "createSession") as undefined | ((
+      projectId: string,
+      goal: string,
+      mode: "fast" | "plan",
+      target: { executionTarget: "current_branch"; selectedBranch: string },
+      options: { createdAt: string; randomUUID: () => string },
+    ) => CanvasSession);
+    expect(createSession).toBeTypeOf("function");
+    if (!createSession) return;
+    const createdAt = "2026-07-21T18:30:00.000Z";
+    const target = { executionTarget: "current_branch" as const, selectedBranch: "main" };
+    const ids = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ];
+    const next = () => ids.shift()!;
+
+    const first = createSession("project-1", "Goal A", "fast", target, { createdAt, randomUUID: next });
+    const afterSuccess = createSession("project-1", "Goal A", "fast", target, { createdAt, randomUUID: next });
+    const otherProject = createSession("project-2", "Goal A", "fast", target, { createdAt, randomUUID: next });
+
+    expect([first.id, afterSuccess.id, otherProject.id]).toEqual([
+      "fast-202607211830-11111111-1111-4111-8111-111111111111",
+      "fast-202607211830-22222222-2222-4222-8222-222222222222",
+      "fast-202607211830-33333333-3333-4333-8333-333333333333",
+    ]);
+    expect(new Set([first.id, afterSuccess.id, otherProject.id]).size).toBe(3);
+  });
+
+  it("keeps a newer workflow broadcast when an older mutation response arrives last", () => {
+    const applyResponse = Reflect.get(AppModule, "applyAuthoritativeWorkflowSessionResponse") as undefined | ((
+      workspace: { sessions: Array<CanvasSession | PlanSession> },
+      response: CanvasSession,
+      guard: { sessionId: string; requestSession: CanvasSession | null; generation: number },
+      currentGeneration: number,
+    ) => { sessions: Array<CanvasSession | PlanSession> });
+    expect(applyResponse).toBeTypeOf("function");
+    if (!applyResponse) return;
+    const requested = canvasSessionForTest("session-race");
+    const staleResponse = { ...requested, title: "stale mutation response" };
+    const broadcast = { ...requested, title: "newer workflow broadcast" };
+    const workspace = { sessions: [broadcast] };
+
+    const next = applyResponse(workspace, staleResponse, {
+      sessionId: requested.id,
+      requestSession: requested,
+      generation: 7,
+    }, 8);
+
+    expect(next).toBe(workspace);
+    expect(next.sessions[0]).toBe(broadcast);
+  });
+
+  it("applies a matching authoritative mutation response and rejects a switched request session", () => {
+    const applyResponse = Reflect.get(AppModule, "applyAuthoritativeWorkflowSessionResponse") as undefined | ((
+      workspace: { sessions: Array<CanvasSession | PlanSession> },
+      response: CanvasSession,
+      guard: { sessionId: string; requestSession: CanvasSession | null; generation: number },
+      currentGeneration: number,
+    ) => { sessions: Array<CanvasSession | PlanSession> });
+    expect(applyResponse).toBeTypeOf("function");
+    if (!applyResponse) return;
+    const requested = canvasSessionForTest("session-race");
+    const response = { ...requested, title: "authoritative response" };
+    const workspace = { sessions: [requested] };
+
+    expect(applyResponse(workspace, response, {
+      sessionId: requested.id,
+      requestSession: requested,
+      generation: 2,
+    }, 2).sessions[0]).toBe(response);
+
+    const switched = { sessions: [{ ...requested, title: "switched away and back" }] };
+    expect(applyResponse(switched, response, {
+      sessionId: requested.id,
+      requestSession: requested,
+      generation: 2,
+    }, 2)).toBe(switched);
+  });
+
+  it("retries a failed New Session with the same session and input identities", async () => {
+    const submitNewSessionAttempt = submitNewSessionAttemptForTest();
+    const states = new Map<string, NewSessionSubmissionStateForTest>();
+    const seed = canvasSessionForTest("session-retry");
+    const createAttempt = vi.fn(() => ({ session: seed, inputId: "composer-session-retry" }));
+    const firstSubmit = vi.fn(async () => {
+      throw new Error("planner start failed");
+    });
+
+    await expect(submitNewSessionAttempt({
+      states,
+      scope: "project-1:goal:fast:current_branch:main",
+      createAttempt,
+      submit: firstSubmit,
+    })).resolves.toBeNull();
+    expect(states.get("project-1:goal:fast:current_branch:main")).toMatchObject({
+      session: seed,
+      inputId: "composer-session-retry",
+      busy: false,
+      error: "Couldn’t create session. Retry with the same settings.",
+    });
+
+    const retrySubmit = vi.fn(async (attempt) => attempt.session);
+    await expect(submitNewSessionAttempt({
+      states,
+      scope: "project-1:goal:fast:current_branch:main",
+      createAttempt,
+      submit: retrySubmit,
+    })).resolves.toBe(seed);
+    expect(retrySubmit).toHaveBeenCalledWith({ session: seed, inputId: "composer-session-retry" });
+    expect(createAttempt).toHaveBeenCalledTimes(1);
+    expect(states.has("project-1:goal:fast:current_branch:main")).toBe(false);
+  });
+
+  it("blocks duplicate New Session submission while busy and reports bounded failure", async () => {
+    const submitNewSessionAttempt = submitNewSessionAttemptForTest();
+    const states = new Map<string, NewSessionSubmissionStateForTest>();
+    const seed = canvasSessionForTest("session-busy");
+    let rejectSubmit: ((reason: Error) => void) | null = null;
+    const submit = vi.fn(() => new Promise<CanvasSession>((_resolve, reject) => {
+      rejectSubmit = reject;
+    }));
+    const first = submitNewSessionAttempt({
+      states,
+      scope: "busy-scope",
+      createAttempt: () => ({ session: seed, inputId: "input-busy" }),
+      submit,
+    });
+
+    expect(states.get("busy-scope")).toMatchObject({ busy: true, error: null });
+    await expect(submitNewSessionAttempt({
+      states,
+      scope: "busy-scope",
+      createAttempt: () => ({ session: canvasSessionForTest("unexpected"), inputId: "unexpected" }),
+      submit,
+    })).resolves.toBeNull();
+    expect(submit).toHaveBeenCalledTimes(1);
+
+    rejectSubmit?.(new Error("failed"));
+    await expect(first).resolves.toBeNull();
+    expect(states.get("busy-scope")?.error).toBe("Couldn’t create session. Retry with the same settings.");
+  });
+
+  it("uses a fresh New Session identity when scope changes and after success", async () => {
+    const submitNewSessionAttempt = submitNewSessionAttemptForTest();
+    const states = new Map<string, NewSessionSubmissionStateForTest>();
+    const identities = ["session-a", "session-b", "session-c"];
+    const createAttempt = vi.fn(() => {
+      const id = identities.shift() ?? "unexpected";
+      return { session: canvasSessionForTest(id), inputId: `input-${id}` };
+    });
+    const fail = async () => { throw new Error("failed"); };
+
+    await submitNewSessionAttempt({
+      states,
+      scope: "project-1:goal-a:fast:current_branch:main",
+      createAttempt,
+      submit: fail,
+    });
+    const changed = await submitNewSessionAttempt({
+      states,
+      scope: "project-1:goal-b:fast:new_worktree:main",
+      createAttempt,
+      submit: async (attempt) => attempt.session,
+    });
+    const afterSuccess = await submitNewSessionAttempt({
+      states,
+      scope: "project-1:goal-b:fast:new_worktree:main",
+      createAttempt,
+      submit: async (attempt) => attempt.session,
+    });
+
+    expect(changed?.id).toBe("session-b");
+    expect(afterSuccess?.id).toBe("session-c");
+    expect(states.get("project-1:goal-a:fast:current_branch:main")?.session.id).toBe("session-a");
+  });
+
+  it("upserts authoritative canvas sessions by replacing or inserting", () => {
+    const upsertCanvasSession = Reflect.get(AppModule, "upsertCanvasSession") as undefined | ((
+      sessions: Array<CanvasSession | PlanSession>,
+      session: CanvasSession,
+    ) => Array<CanvasSession | PlanSession>);
+    expect(upsertCanvasSession).toBeTypeOf("function");
+    const original = canvasSessionForTest("session-1");
+    const replacement = { ...original, title: "Authoritative replacement" };
+    const inserted = canvasSessionForTest("session-2");
+
+    expect(upsertCanvasSession!([original], replacement)).toEqual([replacement]);
+    expect(upsertCanvasSession!([original], inserted)).toEqual([original, inserted]);
+  });
+
+  it("activates a busy New Session from its authoritative broadcast and rejects the stale create response", () => {
+    const applyBroadcast = Reflect.get(AppModule, "applyAuthoritativeWorkflowBroadcast") as undefined | ((
+      workspace: WorkspaceState,
+      session: CanvasSession,
+      submissions: ReadonlyMap<string, NewSessionSubmissionStateForTest>,
+    ) => WorkspaceState);
+    const applyResponse = Reflect.get(AppModule, "applyAuthoritativeWorkflowSessionResponse") as undefined | ((
+      workspace: WorkspaceState,
+      response: CanvasSession,
+      guard: { sessionId: string; requestSession: CanvasSession | null; generation: number },
+      currentGeneration: number,
+    ) => WorkspaceState);
+    expect(applyBroadcast).toBeTypeOf("function");
+    expect(applyResponse).toBeTypeOf("function");
+    if (!applyBroadcast || !applyResponse) return;
+
+    const seed = canvasSessionForTest("session-broadcast");
+    const authoritative = { ...seed, title: "Authoritative planner projection" };
+    const workspace: WorkspaceState = {
+      ...emptyWorkspace(),
+      projects: [{
+        id: "project-1",
+        name: "Project",
+        rootPath: "/repo",
+        devflowPath: "/repo/.devflow",
+        openedAt: "2026-07-21T00:00:00.000Z",
+      }],
+      activeProjectId: "project-1",
+    };
+    const submissions = new Map<string, NewSessionSubmissionStateForTest>([["scope", {
+      session: seed,
+      inputId: "composer-session-broadcast",
+      busy: true,
+      error: null,
+    }]]);
+
+    const broadcastWorkspace = applyBroadcast(workspace, authoritative, submissions);
+    expect(broadcastWorkspace.activeProjectId).toBe(authoritative.projectId);
+    expect(broadcastWorkspace.activeSessionId).toBe(authoritative.id);
+    expect(broadcastWorkspace.sessions).toEqual([authoritative]);
+
+    const staleResponse = { ...authoritative, title: "Stale create response" };
+    const afterStaleResponse = applyResponse(broadcastWorkspace, staleResponse, {
+      sessionId: seed.id,
+      requestSession: null,
+      generation: 0,
+    }, 1);
+    expect(afterStaleResponse).toBe(broadcastWorkspace);
+    expect(afterStaleResponse.activeSessionId).toBe(authoritative.id);
+    expect(afterStaleResponse.sessions).toEqual([authoritative]);
+  });
+
+  it.each([
+    ["finished attempt", { busy: false }],
+    ["different attempt session", { sessionId: "session-other" }],
+    ["different attempt project", { attemptProjectId: "project-2" }],
+    ["switched project", { activeProjectId: "project-2" }],
+    ["opened session", { activeSessionId: "session-existing" }],
+  ])("only upserts a workflow broadcast for a %s", (_label, override) => {
+    const applyBroadcast = Reflect.get(AppModule, "applyAuthoritativeWorkflowBroadcast") as undefined | ((
+      workspace: WorkspaceState,
+      session: CanvasSession,
+      submissions: ReadonlyMap<string, NewSessionSubmissionStateForTest>,
+    ) => WorkspaceState);
+    expect(applyBroadcast).toBeTypeOf("function");
+    if (!applyBroadcast) return;
+
+    const authoritative = canvasSessionForTest("session-broadcast");
+    const attempt = canvasSessionForTest(
+      override.sessionId ?? authoritative.id,
+      override.attemptProjectId ?? authoritative.projectId,
+    );
+    const workspace: WorkspaceState = {
+      ...emptyWorkspace(),
+      activeProjectId: override.activeProjectId ?? authoritative.projectId,
+      activeSessionId: override.activeSessionId ?? null,
+    };
+    const submissions = new Map<string, NewSessionSubmissionStateForTest>([["scope", {
+      session: attempt,
+      inputId: "composer-session-broadcast",
+      busy: override.busy ?? true,
+      error: null,
+    }]]);
+
+    const next = applyBroadcast(workspace, authoritative, submissions);
+    expect(next.sessions).toEqual([authoritative]);
+    expect(next.activeProjectId).toBe(workspace.activeProjectId);
+    expect(next.activeSessionId).toBe(workspace.activeSessionId);
+  });
+
+  it("rejects a projection response after the requested session identity or generation changes", () => {
+    const shouldApplyWorkflowProjection = Reflect.get(AppModule, "shouldApplyWorkflowProjection") as undefined | ((
+      requestedSession: CanvasSession,
+      currentSession: CanvasSession | null,
+      requestedGeneration: number,
+      currentGeneration: number,
+    ) => boolean);
+    expect(shouldApplyWorkflowProjection).toBeTypeOf("function");
+    const requested = canvasSessionForTest("session-1");
+
+    expect(shouldApplyWorkflowProjection!(requested, requested, 3, 3)).toBe(true);
+    expect(shouldApplyWorkflowProjection!(requested, { ...requested }, 3, 3)).toBe(false);
+    expect(shouldApplyWorkflowProjection!(requested, requested, 3, 4)).toBe(false);
+  });
+
+  it("catches a failed bottom submission and reuses its input id on retry", async () => {
+    const submitBottomComposerAttempt = submitBottomComposerAttemptForTest();
+    const states = new Map<string, BottomComposerSubmissionStateForTest>();
+    const createInputId = vi.fn(() => "input-retry-1");
+    let rejectRequest: ((reason: Error) => void) | null = null;
+    const submit = vi.fn((inputId: string) => new Promise<string>((_resolve, reject) => {
+      expect(inputId).toBe("input-retry-1");
+      rejectRequest = reject;
+    }));
+
+    const first = submitBottomComposerAttempt({
+      states,
+      scope: "project-1:session-1",
+      text: "Keep this requirement",
+      createInputId,
+      submit,
+    });
+    expect(states.get("project-1:session-1")).toMatchObject({ busy: true, error: null });
+    await expect(submitBottomComposerAttempt({
+      states,
+      scope: "project-1:session-1",
+      text: "Keep this requirement",
+      createInputId,
+      submit,
+    })).resolves.toBeNull();
+    expect(submit).toHaveBeenCalledTimes(1);
+
+    rejectRequest?.(new Error("UNAVAILABLE"));
+    await expect(first).resolves.toBeNull();
+    expect(states.get("project-1:session-1")).toEqual({
+      inputId: "input-retry-1",
+      text: "Keep this requirement",
+      busy: false,
+      error: "Couldn’t submit requirement. Retry with the same text.",
+    });
+
+    await expect(submitBottomComposerAttempt({
+      states,
+      scope: "project-1:session-1",
+      text: "Keep this requirement",
+      createInputId,
+      submit: async (inputId) => inputId,
+    })).resolves.toBe("input-retry-1");
+    expect(createInputId).toHaveBeenCalledTimes(1);
+
+    const appSource = await readSource("./App.tsx");
+    expect(appSource).toContain('role="alert"');
+    expect(appSource).toContain("bottomComposerState.error");
+  });
+
+  it("clears a successful bottom attempt so identical later text gets a fresh input id", async () => {
+    const submitBottomComposerAttempt = submitBottomComposerAttemptForTest();
+    const states = new Map<string, BottomComposerSubmissionStateForTest>();
+    const inputIds = ["input-success-1", "input-success-2"];
+    const createInputId = vi.fn(() => inputIds.shift() ?? "unexpected");
+    const submittedIds: string[] = [];
+    const submit = async (inputId: string) => {
+      submittedIds.push(inputId);
+      return inputId;
+    };
+
+    await expect(submitBottomComposerAttempt({
+      states,
+      scope: "project-1:session-1",
+      text: "Repeatable requirement",
+      createInputId,
+      submit,
+    })).resolves.toBe("input-success-1");
+    expect(states.has("project-1:session-1")).toBe(false);
+
+    await expect(submitBottomComposerAttempt({
+      states,
+      scope: "project-1:session-1",
+      text: "Repeatable requirement",
+      createInputId,
+      submit,
+    })).resolves.toBe("input-success-2");
+    expect(submittedIds).toEqual(["input-success-1", "input-success-2"]);
+  });
+
+  it("keeps failed bottom attempts isolated by project and session", async () => {
+    const submitBottomComposerAttempt = submitBottomComposerAttemptForTest();
+    const states = new Map<string, BottomComposerSubmissionStateForTest>();
+    const inputIds = ["input-session-1", "input-session-2"];
+    const createInputId = vi.fn(() => inputIds.shift() ?? "unexpected");
+    const reject = async () => {
+      throw new Error("UNAVAILABLE");
+    };
+
+    await submitBottomComposerAttempt({
+      states,
+      scope: "project-1:session-1",
+      text: "Session one text",
+      createInputId,
+      submit: reject,
+    });
+    await submitBottomComposerAttempt({
+      states,
+      scope: "project-1:session-2",
+      text: "Session two text",
+      createInputId,
+      submit: reject,
+    });
+
+    expect(states.get("project-1:session-1")).toMatchObject({
+      inputId: "input-session-1",
+      text: "Session one text",
+    });
+    expect(states.get("project-1:session-2")).toMatchObject({
+      inputId: "input-session-2",
+      text: "Session two text",
+    });
+  });
+
   it("clicking a node selects it and does not open modal/details", async () => {
     const appSource = await readSource("./App.tsx");
     const nodeCard = appSource.slice(appSource.indexOf('className="agent-card-select"'), appSource.indexOf('className="evidence-marker"'));
@@ -1864,7 +2381,7 @@ describe("Slice C UI behavior", () => {
     expect(submitHandler).toContain("nodeActionPayloadMatchesSelection(selectedNodeActionScopeRef.current, actionScope.sessionId, actionScope.nodeId) &&");
     expect(submitHandler).toContain("selectedNodeActionGenerationRef.current === actionGeneration");
     expect(submitHandler).toContain("if (!actionStillCurrent()) return;");
-    expect(submitHandler).toContain("applyWorkflowActionResult(result, actionStillCurrent)");
+    expect(submitHandler).toContain("applyWorkflowActionResult(result, workflowResponseGuard, actionStillCurrent)");
     expect(submitHandler).toContain("await refreshWorkflowProjection(actionStillCurrent)");
     expect(submitHandler).toContain("if (actionStillCurrent()) setNodeActionError");
     expect(submitHandler).toContain("if (actionStillCurrent()) setNodeActionBusy(null)");
@@ -1875,6 +2392,34 @@ describe("Slice C UI behavior", () => {
     expect(composer).toContain("}, [selectedNodeActionScopeKey]);");
     expect(composer).toContain("const actionAvailability = selectedNodeActionAvailability");
     expect(composer).toContain("disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}");
+  });
+
+  it("installs only backend-authoritative canvas sessions for Electron creation and bottom input", async () => {
+    const appSource = await readSource("./App.tsx");
+    const importProject = appSource.slice(appSource.indexOf("async function importProject"), appSource.indexOf("function openProjectStartPage"));
+    const addSession = appSource.slice(appSource.indexOf("async function addSessionFromComposer"), appSource.indexOf("function updatePlanSection"));
+    const appendRequirement = appSource.slice(appSource.indexOf("async function appendRequirementNode"), appSource.indexOf("async function submitSelectedNodeAction"));
+    const persistSession = appSource.slice(appSource.indexOf("async function persistCanvasWorkflowSession"), appSource.indexOf("function canvasSessionFromWorkflowEvent"));
+
+    expect(importProject).toContain("initialSession = await persistCanvasWorkflowSession");
+    expect(addSession).toContain("const session = await submitNewSessionAttempt");
+    expect(addSession).toContain("const createResponseGuard = captureWorkflowSessionResponseGuard");
+    expect(addSession).toContain("installAuthoritativeSession(session, createResponseGuard)");
+    expect(addSession).not.toContain("appendResponseGuard");
+    expect(addSession).not.toContain("createdSession");
+    expect(addSession).toContain("inputId: `composer-${seed.id}`");
+    expect(appendRequirement).toContain("const authoritativeSession = await submitBottomComposerAttempt");
+    expect(appendRequirement).toContain("return result.canvasSession");
+    expect(appendRequirement).toContain("applyGuardedWorkflowSessionResponse(authoritativeSession, responseGuard)");
+    expect(appendRequirement).toContain("return;");
+    expect(appendRequirement.indexOf("return;")).toBeLessThan(appendRequirement.indexOf("addRequirementPlanningNode"));
+    expect(persistSession).toContain("const created = await window.devflow.createWorkflowSession");
+    expect(persistSession).toContain("created.canvasSession");
+    expect(persistSession).toContain("inputId");
+    expect(persistSession).not.toContain("appendWorkflowUserInput");
+    expect(persistSession).not.toContain("onCreated");
+    expect(persistSession).toContain("throw new Error(\"Authoritative canvas session was not returned.\")");
+    expect(persistSession).not.toContain("requireAuthoritativeCanvas");
   });
 
   it("More button remains outside the node selection target", async () => {

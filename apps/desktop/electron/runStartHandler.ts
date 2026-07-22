@@ -25,14 +25,49 @@ export interface ClaimedRunStartSegment {
   created: boolean;
 }
 
+export interface OwnedScheduledRunStart<Store> {
+  store: Store;
+  segment: ScheduledRunSegment;
+  identity: TrustedRunStartIdentity;
+}
+
 interface RunStartStore {
   listRunningSegments(): ScheduledRunSegment[];
 }
 
-interface RunStartDependencies<Input, Run, Store extends RunStartStore> {
+interface PublicRunStartTarget {
+  sessionId?: unknown;
+  nodeId?: unknown;
+  runId?: unknown;
+}
+
+const scheduledRunStartAuthorityError = "Electron main owns workflow-scheduled run starts.";
+
+export function assertPublicRunStartIsNotScheduled(
+  input: unknown,
+  store: RunStartStore,
+): void {
+  if (typeof input !== "object" || input === null) return;
+  const target = input as PublicRunStartTarget;
+  if (
+    typeof target.sessionId !== "string" ||
+    typeof target.nodeId !== "string" ||
+    typeof target.runId !== "string"
+  ) return;
+  if (store.listRunningSegments().some((segment) =>
+    segment.sessionId === target.sessionId &&
+    segment.laneId === target.nodeId &&
+    segment.runId === target.runId
+  )) {
+    throw new Error(scheduledRunStartAuthorityError);
+  }
+}
+
+export interface RunStartDependencies<Input, Run, Store extends RunStartStore> {
   preAuthorizeStart?(input: Input): void | Promise<void>;
-  authorizeStartInput?(input: Input): Input | Promise<Input>;
-  resolveIdentity(input: Input): TrustedRunStartIdentity | Promise<TrustedRunStartIdentity>;
+  authorizeStartInput?(input: Input, knownStore?: Store): Input | Promise<Input>;
+  scheduledStartsRequireOwnership?: boolean;
+  resolveIdentity(input: Input, knownStore?: Store): TrustedRunStartIdentity | Promise<TrustedRunStartIdentity>;
   acquireStore(identity: TrustedRunStartIdentity): Promise<Store>;
   reopenStore(identity: TrustedRunStartIdentity): Promise<Store>;
   assertStartInput(input: Input, store: Store): Promise<void>;
@@ -53,19 +88,22 @@ interface RunStartDependencies<Input, Run, Store extends RunStartStore> {
 
 export function createRunStartHandler<Input, Run, Store extends RunStartStore>(
   dependencies: RunStartDependencies<Input, Run, Store>,
-): (input: Input) => Promise<Run> {
+): (input: Input, ownership?: OwnedScheduledRunStart<Store>) => Promise<Run> {
   const startFlights = new Map<string, { fingerprint: string; promise: Promise<Run> }>();
-  return async (input) => {
+  return async (input, ownership) => {
     let authorizedInput: Input;
     let identity: TrustedRunStartIdentity;
     try {
       await dependencies.preAuthorizeStart?.(input);
       authorizedInput = dependencies.authorizeStartInput
-        ? await dependencies.authorizeStartInput(input)
+        ? await dependencies.authorizeStartInput(input, ownership?.store)
         : input;
-      identity = await dependencies.resolveIdentity(authorizedInput);
+      identity = await dependencies.resolveIdentity(authorizedInput, ownership?.store);
+      if (ownership) assertOwnedStartIdentity(ownership, identity);
     } catch (error) {
-      return Promise.reject(error);
+      if (!ownership || isRunStartIdentityConflict(error)) return Promise.reject(error);
+      await settleOwnedStartFailure(dependencies, ownership.store, ownership.segment, ownership.identity, error);
+      return Promise.reject(await publicOwnedRunStartError(error));
     }
     const active = startFlights.get(identity.runId);
     if (active) {
@@ -74,7 +112,7 @@ export function createRunStartHandler<Input, Run, Store extends RunStartStore>(
       }
       return active.promise;
     }
-    const promise = runStartOnce(dependencies, authorizedInput, identity);
+    const promise = runStartOnce(dependencies, authorizedInput, identity, ownership);
     startFlights.set(identity.runId, { fingerprint: identity.startFingerprint, promise });
     void promise.then(
       () => clearStartFlight(startFlights, identity.runId, promise),
@@ -88,14 +126,20 @@ async function runStartOnce<Input, Run, Store extends RunStartStore>(
   dependencies: RunStartDependencies<Input, Run, Store>,
   input: Input,
   identity: TrustedRunStartIdentity,
+  ownership?: OwnedScheduledRunStart<Store>,
 ): Promise<Run> {
-  let store: Store | null = null;
-  let segment: ScheduledRunSegment | null = null;
-  let compensationOwned = false;
+  let store: Store | null = ownership?.store ?? null;
+  let segment: ScheduledRunSegment | null = ownership?.segment ?? null;
+  let compensationOwned = ownership !== undefined;
   try {
-    store = await dependencies.acquireStore(identity);
+    store ??= await dependencies.acquireStore(identity);
+    if (!ownership && dependencies.scheduledStartsRequireOwnership) {
+      assertPublicRunStartIsNotScheduled(input, store);
+    }
     await dependencies.assertStartInput(input, store);
-    const target = await findOrClaimStartSegment(dependencies, input, store, identity);
+    const target = ownership
+      ? findOwnedScheduledSegment(store, ownership, identity)
+      : await findOrClaimStartSegment(dependencies, input, store, identity);
     segment = target.segment;
     compensationOwned = target.claimed;
     try {
@@ -115,30 +159,45 @@ async function runStartOnce<Input, Run, Store extends RunStartStore>(
       throw error;
     }
   } catch (error) {
+    if (isRunStartIdentityConflict(error)) throw error;
     if (!store || !segment || !compensationOwned) {
       throw isOwnedRunStartFailure(error) ? await publicOwnedRunStartError(error) : error;
     }
-    try {
-      await dependencies.reconcileTerminal(store, segment, identity);
-    } catch (reconciliationError) {
-      await persistCompensation(dependencies, identity, store, segment, runStartCompensationError(error));
-      try {
-        dependencies.recordReconciliationFailure?.(store, segment, reconciliationError);
-      } catch {
-        // Terminal state is already durable; audit enrichment is best-effort.
-      }
-    }
-    try {
-      await dependencies.enrichAfterCheckpoint(store, segment, identity);
-    } catch (enrichmentError) {
-      try {
-        dependencies.recordAfterCheckpointFailure(store, segment, enrichmentError);
-      } catch {
-        // Terminal state is already durable; checkpoint enrichment is best-effort.
-      }
-    }
+    await settleOwnedStartFailure(dependencies, store, segment, identity, error);
     throw await publicOwnedRunStartError(error);
   }
+}
+
+function assertOwnedStartIdentity<Store>(
+  ownership: OwnedScheduledRunStart<Store>,
+  identity: TrustedRunStartIdentity,
+): void {
+  if (
+    ownership.identity.projectRoot !== identity.projectRoot ||
+    ownership.identity.sessionId !== identity.sessionId ||
+    ownership.identity.laneId !== identity.laneId ||
+    ownership.identity.runId !== identity.runId ||
+    ownership.identity.agentKind !== identity.agentKind ||
+    ownership.identity.startFingerprint !== identity.startFingerprint ||
+    ownership.segment.sessionId !== identity.sessionId ||
+    ownership.segment.laneId !== identity.laneId ||
+    ownership.segment.runId !== identity.runId ||
+    ownership.segment.agentKind !== identity.agentKind
+  ) {
+    throw new Error("Main-owned workflow run start identity mismatch.");
+  }
+}
+
+function findOwnedScheduledSegment<Store extends RunStartStore>(
+  store: Store,
+  ownership: OwnedScheduledRunStart<Store>,
+  identity: TrustedRunStartIdentity,
+): { segment: ScheduledRunSegment; claimed: boolean } {
+  const scheduled = findScheduledSegment(store, identity);
+  if (scheduled.segmentId !== ownership.segment.segmentId) {
+    throw new Error("Main-owned workflow run segment identity mismatch.");
+  }
+  return { segment: scheduled, claimed: true };
 }
 
 function clearStartFlight<Run>(
@@ -183,6 +242,9 @@ async function findOrClaimStartSegment<Input, Run, Store extends RunStartStore>(
     candidate.runId === identity.runId
   );
   if (scheduled) {
+    if (dependencies.scheduledStartsRequireOwnership) {
+      throw new Error(scheduledRunStartAuthorityError);
+    }
     if (scheduled.agentKind !== identity.agentKind) throw new Error("Workflow run agent identity mismatch.");
     return { segment: scheduled, claimed: false };
   }
@@ -192,6 +254,11 @@ async function findOrClaimStartSegment<Input, Run, Store extends RunStartStore>(
 function isOwnedRunStartFailure(error: unknown): boolean {
   return typeof error === "object" && error !== null &&
     "durableRunClaimOwned" in error && error.durableRunClaimOwned === true;
+}
+
+function isRunStartIdentityConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^Run .+ is already (?:claimed with different identity|active or durably claimed)\.$/.test(message);
 }
 
 function runStartCompensationError(error: unknown): unknown {
@@ -213,6 +280,34 @@ async function publicOwnedRunStartError(error: unknown): Promise<Error & { durab
   publicError.name = error instanceof Error ? error.name : "OwnedAgentRunStartError";
   publicError.durableRunClaimOwned = true;
   return publicError;
+}
+
+async function settleOwnedStartFailure<Input, Run, Store extends RunStartStore>(
+  dependencies: RunStartDependencies<Input, Run, Store>,
+  store: Store,
+  segment: ScheduledRunSegment,
+  identity: TrustedRunStartIdentity,
+  error: unknown,
+): Promise<void> {
+  try {
+    await dependencies.reconcileTerminal(store, segment, identity);
+  } catch (reconciliationError) {
+    await persistCompensation(dependencies, identity, store, segment, runStartCompensationError(error));
+    try {
+      dependencies.recordReconciliationFailure?.(store, segment, reconciliationError);
+    } catch {
+      // Terminal state is already durable; audit enrichment is best-effort.
+    }
+  }
+  try {
+    await dependencies.enrichAfterCheckpoint(store, segment, identity);
+  } catch (enrichmentError) {
+    try {
+      dependencies.recordAfterCheckpointFailure(store, segment, enrichmentError);
+    } catch {
+      // Terminal state is already durable; checkpoint enrichment is best-effort.
+    }
+  }
 }
 
 async function persistCompensation<Input, Run, Store extends RunStartStore>(

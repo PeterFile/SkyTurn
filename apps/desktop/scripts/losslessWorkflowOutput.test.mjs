@@ -403,7 +403,7 @@ function runInput(projectRoot, agentKind = "codex") {
 
 function seedRunningStore(projectRoot, agentKind = "codex") {
   const store = createWorkflowStore({ projectRoot });
-  store.createWorkflowSession({
+  const session = store.createWorkflowSession({
     id: "session-1",
     projectId: "project-lossless",
     title: "Lossless output",
@@ -414,6 +414,32 @@ function seedRunningStore(projectRoot, agentKind = "codex") {
     recoveryReason: "Test setup has no live Hermes session.",
     now: "2026-07-15T00:00:00.000Z",
   });
+  const plannerRunId = "run-session-1-initial-planner-turn";
+  const { segment: plannerSegment } = store.claimPlannerRunStart({
+    sessionId: session.id,
+    laneId: session.plannerLaneId,
+    runId: plannerRunId,
+    agentKind: "hermes",
+    worktreePath: projectRoot,
+    now: "2026-07-15T00:00:00.250Z",
+  });
+  store.recordRunResult({
+    ...plannerSegment,
+    evidence: {
+      runId: plannerRunId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-07-15T00:00:00.500Z",
+    },
+    now: "2026-07-15T00:00:00.500Z",
+  });
+  store.recordPlannerIntentReconciled(plannerSegment, "2026-07-15T00:00:00.750Z");
   store.appendWorkflowEvent({
     sessionId: "session-1",
     kind: "workflow.lane.declared",

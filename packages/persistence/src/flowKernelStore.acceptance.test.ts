@@ -72,7 +72,7 @@ describe("Flow Kernel SQLite acceptance", () => {
   it("replays an eligible after checkpoint for a failed executable run without duplicating completion", async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-failed-run-checkpoint-"));
     const store = createWorkflowStore({ projectRoot });
-    store.createWorkflowSession({
+    const session = store.createWorkflowSession({
       id: "session-failed-run",
       projectId: "project-failed-run",
       title: "Failed run checkpoint",
@@ -83,6 +83,31 @@ describe("Flow Kernel SQLite acceptance", () => {
       recoveryReason: "Acceptance fixture.",
       now: "2026-06-14T00:00:00.000Z",
     });
+    const { segment: plannerSegment } = store.claimPlannerRunStart({
+      sessionId: session.id,
+      laneId: session.plannerLaneId,
+      runId: "run-planner",
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-06-14T00:00:00.250Z",
+    });
+    store.recordRunResult({
+      ...plannerSegment,
+      evidence: {
+        runId: plannerSegment.runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-14T00:00:00.500Z",
+      },
+      now: "2026-06-14T00:00:00.500Z",
+    });
+    store.recordPlannerIntentReconciled(plannerSegment, "2026-06-14T00:00:00.750Z");
     store.appendWorkflowEvent({
       sessionId: "session-failed-run",
       kind: "workflow.lane.declared",

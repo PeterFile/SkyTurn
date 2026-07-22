@@ -29,6 +29,10 @@ export interface CreatePlanSessionOptions {
   randomUUID?: () => string;
 }
 
+export interface CreateFastCanvasSessionOptions {
+  randomUUID?: () => string;
+}
+
 interface TaskSeed {
   id: string;
   title: string;
@@ -154,8 +158,11 @@ const planSeeds: TaskSeed[] = [
   },
 ];
 
-export function createFastCanvasSession(input: CreateSessionInput): CanvasSession {
-  const sessionId = makeSessionId("fast", input.createdAt);
+export function createFastCanvasSession(
+  input: CreateSessionInput,
+  options: CreateFastCanvasSessionOptions = {},
+): CanvasSession {
+  const sessionId = `${makeSessionId("fast", input.createdAt)}-${(options.randomUUID ?? defaultRandomUUID)()}`;
   return createCanvasSession({
     input,
     sessionId,

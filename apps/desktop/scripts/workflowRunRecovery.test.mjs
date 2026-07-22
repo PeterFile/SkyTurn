@@ -18,7 +18,11 @@ import {
 } from "@skyturn/agent-bridge";
 import { createWorkflowStore } from "@skyturn/persistence/workflow-store";
 
-import { compensateFailedWorkflowRun, recoverTerminalWorkflowRuns } from "../dist-electron/electron/workflowRunRecovery.js";
+import {
+  compensateFailedWorkflowRun,
+  recoverPendingPlannerIntentReconciliations,
+  recoverTerminalWorkflowRuns,
+} from "../dist-electron/electron/workflowRunRecovery.js";
 
 const require = createRequire(import.meta.url);
 const previousStateHome = process.env.SKYTURN_STATE_HOME;
@@ -60,6 +64,341 @@ for (const status of ["succeeded", "failed", "cancelled", "timed-out"]) {
     }
   });
 }
+
+test("restart recovery preserves an exact live in-process run", async () => {
+  const root = await makeRoot();
+  let recordRunResultCount = 0;
+  let adapterStarts = 0;
+  try {
+    const store = seedRunningStore(root);
+    const recordRunResult = store.recordRunResult.bind(store);
+    store.recordRunResult = (input) => {
+      recordRunResultCount += 1;
+      return recordRunResult(input);
+    };
+    const input = runInput(root);
+    const bridge = {
+      async getEvidence() {
+        return { runId: input.runId, status: "running" };
+      },
+      async loadEvents() {
+        assert.fail("live nonterminal recovery must not load terminal events");
+      },
+      listRuns() {
+        return [{
+          id: input.runId,
+          projectRoot: `${root}/.`,
+          sessionId: input.sessionId,
+          nodeId: input.nodeId,
+          agentKind: input.agentKind,
+          status: "running",
+        }];
+      },
+      async startRun() {
+        adapterStarts += 1;
+      },
+    };
+
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "unused");
+
+    assert.equal(store.listRunningSegments().length, 1);
+    assert.equal(segmentStatus(store), "running");
+    assert.equal(recordRunResultCount, 0);
+    assert.equal(adapterStarts, 0);
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 0);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery re-reads authoritative evidence when a nonterminal run disappears", async () => {
+  const root = await makeRoot();
+  let evidenceReads = 0;
+  let listRunsCalls = 0;
+  try {
+    const store = seedRunningStore(root);
+    const input = runInput(root);
+    const terminal = runResult(store.listRunningSegments()[0], "succeeded").evidence;
+    const bridge = {
+      async getEvidence() {
+        evidenceReads += 1;
+        return evidenceReads === 1
+          ? { runId: input.runId, status: "running" }
+          : terminal;
+      },
+      async loadEvents() {
+        return [];
+      },
+      listRuns() {
+        listRunsCalls += 1;
+        return [];
+      },
+    };
+
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "terminal after live removal");
+
+    assert.equal(evidenceReads, 2);
+    assert.equal(listRunsCalls, 1);
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(segmentStatus(store), "succeeded");
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 0);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery preserves exact terminal catalog state until terminal evidence is durable", async () => {
+  const root = await makeRoot();
+  let evidenceReads = 0;
+  try {
+    const store = seedRunningStore(root);
+    const input = runInput(root);
+    const terminal = runResult(store.listRunningSegments()[0], "succeeded").evidence;
+    const bridge = {
+      async getEvidence() {
+        evidenceReads += 1;
+        return evidenceReads <= 2
+          ? { runId: input.runId, status: "running" }
+          : terminal;
+      },
+      async loadEvents() {
+        return [];
+      },
+      listRuns() {
+        return [{
+          id: input.runId,
+          projectRoot: root,
+          sessionId: input.sessionId,
+          nodeId: input.nodeId,
+          agentKind: input.agentKind,
+          status: "succeeded",
+        }];
+      },
+    };
+
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "pending terminal output");
+
+    assert.equal(evidenceReads, 2);
+    assert.equal(store.listRunningSegments().length, 1);
+    assert.equal(segmentStatus(store), "running");
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 0);
+
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "durable terminal output");
+
+    assert.equal(evidenceReads, 3);
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(segmentStatus(store), "succeeded");
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery preserves SQLite running state while the run catalog is unavailable", async () => {
+  const root = await makeRoot();
+  let evidenceReads = 0;
+  let listRunsCalls = 0;
+  try {
+    const store = seedRunningStore(root);
+    const input = runInput(root);
+    const terminal = runResult(store.listRunningSegments()[0], "succeeded").evidence;
+    const bridge = {
+      async getEvidence() {
+        evidenceReads += 1;
+        return evidenceReads <= 2
+          ? { runId: input.runId, status: "running" }
+          : terminal;
+      },
+      async loadEvents() {
+        return [];
+      },
+      listRuns() {
+        listRunsCalls += 1;
+        if (listRunsCalls === 1) throw new Error("run catalog temporarily unavailable");
+        return [{
+          id: input.runId,
+          projectRoot: root,
+          sessionId: input.sessionId,
+          nodeId: input.nodeId,
+          agentKind: input.agentKind,
+          status: "succeeded",
+        }];
+      },
+    };
+
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "catalog unavailable");
+
+    assert.equal(evidenceReads, 1);
+    assert.equal(store.listRunningSegments().length, 1);
+    assert.equal(segmentStatus(store), "running");
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 0);
+
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "catalog recovered");
+
+    assert.equal(evidenceReads, 3);
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(segmentStatus(store), "succeeded");
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery compensates an orphaned nonterminal run exactly once across reopen", async () => {
+  const root = await makeRoot();
+  const input = runInput(root);
+  const bridge = {
+    async getEvidence() {
+      return { runId: input.runId, status: "running" };
+    },
+    async loadEvents() {
+      assert.fail("orphan compensation must not load terminal events");
+    },
+    listRuns() {
+      return [];
+    },
+  };
+  try {
+    let store = seedRunningStore(root);
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "unused", () => "2026-07-21T00:00:01.000Z");
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "duplicate", () => "2026-07-21T00:00:02.000Z");
+
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(segmentStatus(store), "failed");
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 1);
+    assert.match(JSON.stringify(store.listEvents("session-1")), /run-recovery-interrupted/);
+    store.close();
+
+    store = createWorkflowStore({ projectRoot: root });
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "reopened duplicate", () => "2026-07-21T00:00:03.000Z");
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(segmentStatus(store), "failed");
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed").length, 1);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery compensates an orphan when durable evidence cannot be read", async () => {
+  const root = await makeRoot();
+  try {
+    const store = seedRunningStore(root);
+    const bridge = {
+      async getEvidence() {
+        throw new Error("Run durable state is invalid.");
+      },
+      async loadEvents() {
+        assert.fail("unreadable orphan must not load terminal events");
+      },
+      listRuns() {
+        return [];
+      },
+    };
+
+    await recoverTerminalWorkflowRuns(root, store, bridge, () => "unused", () => "2026-07-21T00:00:03.000Z");
+
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(segmentStatus(store), "failed");
+    assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    assert.match(JSON.stringify(store.listEvents("session-1")), /run-recovery-interrupted/);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery does not trust incomplete live run identity", async () => {
+  for (const omitted of ["sessionId", "nodeId", "agentKind"]) {
+    const root = await makeRoot();
+    try {
+      const store = seedRunningStore(root);
+      const input = runInput(root);
+      const liveRun = {
+        id: input.runId,
+        projectRoot: root,
+        sessionId: input.sessionId,
+        nodeId: input.nodeId,
+        agentKind: input.agentKind,
+        status: "running",
+      };
+      delete liveRun[omitted];
+      const bridge = {
+        async getEvidence() {
+          return { runId: input.runId, status: "running" };
+        },
+        async loadEvents() {
+          assert.fail("incomplete live identity must not load terminal events");
+        },
+        listRuns() {
+          return [liveRun];
+        },
+      };
+
+      await recoverTerminalWorkflowRuns(root, store, bridge, () => "unused", () => "2026-07-21T00:00:04.000Z");
+
+      assert.equal(store.listRunningSegments().length, 0, omitted);
+      assert.equal(segmentStatus(store), "failed", omitted);
+      assert.match(JSON.stringify(store.listEvents("session-1")), /run-recovery-interrupted/);
+      store.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("restart recovery rejects live run identity conflicts", async () => {
+  const mismatches = [
+    { projectRoot: tmpdir() },
+    { runId: "different-run" },
+    { sessionId: "different-session" },
+    { nodeId: "different-node" },
+    { agentKind: "hermes" },
+  ];
+  for (const mismatch of mismatches) {
+    const root = await makeRoot();
+    try {
+      const store = seedRunningStore(root);
+      const input = runInput(root);
+      const bridge = {
+        async getEvidence() {
+          return { runId: input.runId, status: "running" };
+        },
+        async loadEvents() {
+          assert.fail("identity conflict must not load terminal events");
+        },
+        listRuns() {
+          return [{
+            id: input.runId,
+            projectRoot: root,
+            sessionId: input.sessionId,
+            nodeId: input.nodeId,
+            agentKind: input.agentKind,
+            status: "running",
+            ...mismatch,
+          }];
+        },
+      };
+
+      await recoverTerminalWorkflowRuns(root, store, bridge, () => "unused", () => "2026-07-21T00:00:04.000Z");
+
+      assert.equal(store.listRunningSegments().length, 0, JSON.stringify(mismatch));
+      assert.equal(segmentStatus(store), "failed", JSON.stringify(mismatch));
+      assert.equal(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length, 1);
+      assert.match(JSON.stringify(store.listEvents("session-1")), /run-recovery-interrupted/);
+      store.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
 
 test("restart recovery reconciles permanent child-close terminal persistence failure exactly once", async () => {
   const root = await makeRoot();
@@ -743,6 +1082,60 @@ test("getWorkflowStore completes pending checkpoint enrichment without waiting o
   }
 });
 
+test("getWorkflowStore schedules downstream work after a committed terminal result without duplicating on reopen", async () => {
+  const root = await makeRoot();
+  let firstHarness;
+  let secondHarness;
+  try {
+    const store = seedRunningStore(root);
+    declareDownstreamLane(store);
+    const segment = store.listRunningSegments()[0];
+    assert.ok(segment);
+    store.recordRunResult(runResult(segment, "succeeded"));
+    store.close();
+
+    firstHarness = await loadMainWorkflowStoreHarness();
+    const recovered = await firstHarness.getWorkflowStore(root);
+    const recoveredProjection = recovered.materializeFlowProjection("session-1");
+    assert.equal(recoveredProjection.lanes.find((lane) => lane.id === "lane-downstream")?.status, "running");
+    const downstream = recovered.listRunningSegments().find((candidate) => candidate.laneId === "lane-downstream");
+    assert.ok(downstream);
+    assert.equal(recoveredProjection.segments.filter((candidate) => candidate.laneId === "lane-downstream").length, 1);
+    firstHarness.closeWorkflowStores();
+    firstHarness = undefined;
+
+    secondHarness = await loadMainWorkflowStoreHarness({
+      getAgentBridge: async () => ({
+        async getEvidence() {
+          return { runId: downstream.runId, status: "running" };
+        },
+        async loadEvents() {
+          assert.fail("an exact live recovery must not load terminal events");
+        },
+        listRuns() {
+          return [{
+            id: downstream.runId,
+            projectRoot: root,
+            sessionId: downstream.sessionId,
+            nodeId: downstream.laneId,
+            agentKind: downstream.agentKind,
+            status: "running",
+          }];
+        },
+      }),
+    });
+    const reopened = await secondHarness.getWorkflowStore(root);
+    const reopenedProjection = reopened.materializeFlowProjection("session-1");
+    assert.equal(reopenedProjection.lanes.find((lane) => lane.id === "lane-downstream")?.status, "running");
+    assert.equal(reopenedProjection.segments.filter((candidate) => candidate.laneId === "lane-downstream").length, 1);
+    assert.equal(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.segment.started").length, 2);
+  } finally {
+    firstHarness?.closeWorkflowStores();
+    secondHarness?.closeWorkflowStores();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("getWorkflowStore recovers a terminal Finish planner intent and schedules its lanes", async () => {
   const root = await makeRoot();
   let harness;
@@ -790,6 +1183,237 @@ test("getWorkflowStore applies a Finish planner intent when RunEvidence was comm
   }
 });
 
+test("getWorkflowStore converges an invalid SQLite planner candidate without AgentBridge and does no work after reopen", async () => {
+  const root = await makeRoot();
+  let firstHarness;
+  let secondHarness;
+  let bridgeAttempts = 0;
+  try {
+    const { store, segment } = seedRunningFinishPlannerStore(root, { keepOpen: true });
+    const completedAt = "2026-07-22T03:00:02.000Z";
+    const evidence = {
+      runId: segment.runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt,
+    };
+    store.recordRunResult({
+      ...segment,
+      outputSummary: "malformed planner output",
+      runEvents: [{
+        protocolVersion: 1,
+        runId: segment.runId,
+        seq: 1,
+        timestamp: completedAt,
+        kind: "output",
+        payload: { text: "malformed planner output" },
+      }],
+      evidence,
+      now: completedAt,
+    });
+    store.close();
+
+    const unavailableBridge = async () => {
+      bridgeAttempts += 1;
+      throw new Error("AgentBridge unavailable");
+    };
+    firstHarness = await loadMainWorkflowStoreHarness({ getAgentBridge: unavailableBridge });
+    const recovered = await firstHarness.getWorkflowStore(root);
+    const firstEvents = structuredClone(recovered.listEvents(segment.sessionId));
+
+    assert.equal(bridgeAttempts, 0);
+    assert.deepEqual(recovered.listPendingPlannerIntentReconciliations(), []);
+    assert.equal(recovered.listSegments(segment.sessionId, segment.laneId).at(-1)?.status, "succeeded");
+    assert.equal(recovered.materializeCanvasSession(segment.sessionId).nodes.find((node) => node.id === segment.laneId)?.status, "failed");
+    assert.deepEqual(firstEvents.find((event) => event.kind === "workflow.planner_intent.reconciled")?.payload, {
+      runId: segment.runId,
+      agentKind: "hermes",
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    });
+    firstHarness.closeWorkflowStores();
+    firstHarness = undefined;
+
+    secondHarness = await loadMainWorkflowStoreHarness({ getAgentBridge: unavailableBridge });
+    const reopened = await secondHarness.getWorkflowStore(root);
+    assert.equal(bridgeAttempts, 0);
+    assert.deepEqual(reopened.listEvents(segment.sessionId), firstEvents);
+  } finally {
+    firstHarness?.closeWorkflowStores();
+    secondHarness?.closeWorkflowStores();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("getWorkflowStore invalidates a cross-run intentId reuse without AgentBridge or topology changes", async () => {
+  const root = await makeRoot();
+  let firstHarness;
+  let secondHarness;
+  let bridgeAttempts = 0;
+  try {
+    const store = createWorkflowStore({ projectRoot: root });
+    const session = store.createWorkflowSession({
+      id: "session-intent-reuse",
+      projectId: "project-1",
+      title: "Planner intent reuse",
+      goal: "Reject a reused planner intent id",
+      mode: "plan",
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Test setup has no live Hermes session.",
+      now: "2026-07-22T03:00:00.000Z",
+    });
+    const intentId = "intent-bound-to-first-run";
+    const firstIntent = {
+      intentId,
+      sessionId: session.id,
+      operations: [{ type: "AnalyzeRequirement", requirement: "Bind this intent to the first run." }],
+    };
+    const first = store.claimPlannerRunStart({
+      sessionId: session.id,
+      laneId: session.plannerLaneId,
+      runId: "run-intent-owner",
+      agentKind: "hermes",
+      worktreePath: root,
+      now: "2026-07-22T03:00:01.000Z",
+    }).segment;
+    const firstCompletedAt = "2026-07-22T03:00:02.000Z";
+    store.recordRunResult({
+      ...first,
+      runEvents: [{
+        protocolVersion: 1,
+        runId: first.runId,
+        seq: 1,
+        timestamp: firstCompletedAt,
+        kind: "output",
+        payload: { text: JSON.stringify(firstIntent) },
+      }],
+      evidence: {
+        runId: first.runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: firstCompletedAt,
+      },
+      now: firstCompletedAt,
+    });
+    store.applyWorkflowIntent({ ...firstIntent, causationId: first.runId }, firstCompletedAt);
+    store.completePlannerIntentReconciliation(first, {
+      disposition: "applied",
+      intentId,
+    }, firstCompletedAt);
+
+    const secondIntent = {
+      intentId,
+      sessionId: session.id,
+      operations: [{
+        type: "ProposeLanes",
+        lanes: [{ id: "lane-must-not-exist", kind: "review", title: "Must not exist", agentKind: "hermes" }],
+      }],
+    };
+    const second = store.claimPlannerRunStart({
+      sessionId: session.id,
+      laneId: session.plannerLaneId,
+      runId: "run-intent-reuser",
+      agentKind: "hermes",
+      worktreePath: root,
+      now: "2026-07-22T03:00:03.000Z",
+    }).segment;
+    const secondCompletedAt = "2026-07-22T03:00:04.000Z";
+    const secondEvidence = {
+      runId: second.runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: secondCompletedAt,
+    };
+    const secondOutput = JSON.stringify(secondIntent);
+    store.recordRunResult({
+      ...second,
+      runEvents: [{
+        protocolVersion: 1,
+        runId: second.runId,
+        seq: 1,
+        timestamp: secondCompletedAt,
+        kind: "output",
+        payload: { text: secondOutput },
+      }],
+      evidence: secondEvidence,
+      now: secondCompletedAt,
+    });
+    const topologyBeforeRecovery = {
+      lanes: store.materializeFlowProjection(session.id).lanes,
+      edges: store.materializeFlowProjection(session.id).edges,
+    };
+    store.close();
+
+    const unavailableBridge = async () => {
+      bridgeAttempts += 1;
+      throw new Error("AgentBridge unavailable");
+    };
+    firstHarness = await loadMainWorkflowStoreHarness({ getAgentBridge: unavailableBridge });
+    const recovered = await firstHarness.getWorkflowStore(root);
+    const firstEvents = structuredClone(recovered.listEvents(session.id));
+    const persistedSecond = recovered.listSegments(session.id, session.plannerLaneId)
+      .find((segment) => segment.runId === second.runId);
+
+    assert.equal(bridgeAttempts, 0);
+    assert.deepEqual(recovered.listPendingPlannerIntentReconciliations(), []);
+    assert.deepEqual({
+      lanes: recovered.materializeFlowProjection(session.id).lanes,
+      edges: recovered.materializeFlowProjection(session.id).edges,
+    }, topologyBeforeRecovery);
+    assert.equal(recovered.materializeFlowProjection(session.id).lanes.some((lane) => lane.id === "lane-must-not-exist"), false);
+    assert.equal(firstEvents.filter((event) => event.kind === "workflow.intent.accepted").length, 1);
+    assert.equal(firstEvents.some((event) => event.kind === "workflow.intent.rejected"), false);
+    assert.deepEqual(firstEvents.find((event) =>
+      event.kind === "workflow.planner_intent.reconciled" && event.payload.runId === second.runId
+    )?.payload, {
+      runId: second.runId,
+      agentKind: "hermes",
+      disposition: "invalid",
+      intentId,
+      reasonCode: "intent_id_reused",
+    });
+    assert.equal(persistedSecond?.status, "succeeded");
+    assert.deepEqual(persistedSecond?.evidence, secondEvidence);
+    const plannerNode = recovered.materializeCanvasSession(session.id).nodes
+      .find((node) => node.id === session.plannerLaneId);
+    assert.equal(plannerNode?.status, "failed");
+    assert.equal(plannerNode?.output.at(-1), secondOutput);
+    firstHarness.closeWorkflowStores();
+    firstHarness = undefined;
+
+    secondHarness = await loadMainWorkflowStoreHarness({ getAgentBridge: unavailableBridge });
+    const reopened = await secondHarness.getWorkflowStore(root);
+    assert.equal(bridgeAttempts, 0);
+    assert.deepEqual(reopened.listEvents(session.id), firstEvents);
+    assert.deepEqual(reopened.listSegments(session.id, session.plannerLaneId)
+      .find((segment) => segment.runId === second.runId)?.evidence, secondEvidence);
+  } finally {
+    firstHarness?.closeWorkflowStores();
+    secondHarness?.closeWorkflowStores();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 for (const crashWindow of ["intent-applied", "lanes-scheduled"]) {
   test(`getWorkflowStore converges when a crash leaves Finish planner ${crashWindow} without reconciliation`, async () => {
     const root = await makeRoot();
@@ -808,7 +1432,10 @@ for (const crashWindow of ["intent-applied", "lanes-scheduled"]) {
         evidence,
         now: evidence.completedAt,
       });
-      store.applyWorkflowIntent(finishPlannerIntent(segment.sessionId), evidence.completedAt);
+      store.applyWorkflowIntent({
+        ...finishPlannerIntent(segment.sessionId),
+        causationId: segment.runId,
+      }, evidence.completedAt);
       if (crashWindow === "lanes-scheduled") {
         store.scheduleReadyLanes(segment.sessionId, { allowedParallelism: 2, now: evidence.completedAt });
       }
@@ -817,7 +1444,11 @@ for (const crashWindow of ["intent-applied", "lanes-scheduled"]) {
       harness = await loadMainWorkflowStoreHarness({ getAgentBridge: async () => bridge });
       const recovered = await harness.getWorkflowStore(root);
 
-      assertFinishPlannerConverged(recovered, segment);
+      assertFinishPlannerConverged(
+        recovered,
+        segment,
+        crashWindow === "lanes-scheduled" ? "failed" : "running",
+      );
       const recoveredEvents = recovered.listEvents(segment.sessionId);
       assert.equal(recoveredEvents.filter((event) => event.kind === "workflow.intent.accepted").length, 1);
       assert.equal(recoveredEvents.filter((event) => event.kind === "workflow.lane.declared").length, 2);
@@ -845,7 +1476,7 @@ test("repeated getWorkflowStore reopen recovery keeps one Finish planner graph a
     secondHarness = await loadMainWorkflowStoreHarness({ getAgentBridge: async () => bridge });
     const reopened = await secondHarness.getWorkflowStore(root);
 
-    assertFinishPlannerConverged(reopened, segment);
+    assertFinishPlannerConverged(reopened, segment, "failed");
     const events = reopened.listEvents(segment.sessionId);
     assert.equal(events.filter((event) => event.kind === "workflow.intent.accepted").length, 1);
     assert.equal(events.filter((event) => event.kind === "workflow.lane.declared").length, 2);
@@ -934,6 +1565,8 @@ test("concurrent getWorkflowStore callers share one unpublished recovery barrier
 
 test("failed getWorkflowStore initialization closes partial state and permits a clean retry", async () => {
   const root = await makeRoot();
+  const seed = seedRunningStore(root);
+  seed.close();
   let bridgeAttempts = 0;
   let createCount = 0;
   let closeCount = 0;
@@ -1077,10 +1710,11 @@ test("restart recovery ignores missing, mismatched, and corrupt workspace event 
       const reopened = createWorkflowStore({ projectRoot: root });
       await recoverTerminalWorkflowRuns(root, reopened, bridge, () => "must not recover", () => "2026-06-14T00:00:05.000Z");
 
-      assert.equal(reopened.listRunningSegments().length, 1, evidenceCase);
-      assert.equal(segmentStatus(reopened), "running", evidenceCase);
+      assert.equal(reopened.listRunningSegments().length, 0, evidenceCase);
+      assert.equal(segmentStatus(reopened), "failed", evidenceCase);
       const recoveryFailures = reopened.listEvents("session-1").filter((event) => event.kind === "workflow.run.recovery_failed");
-      assert.equal(recoveryFailures.length, 0, evidenceCase);
+      assert.equal(recoveryFailures.length, 1, evidenceCase);
+      assert.match(JSON.stringify(recoveryFailures), /run-recovery-interrupted/, evidenceCase);
       reopened.close();
       if (evidenceCase !== "missing") assert.ok((await readFile(eventsPath, "utf8")).length > 0);
     } finally {
@@ -1207,7 +1841,7 @@ function runInput(projectRoot) {
 
 function seedRunningStore(projectRoot) {
   const store = createWorkflowStore({ projectRoot });
-  store.createWorkflowSession({
+  const session = store.createWorkflowSession({
     id: "session-1",
     projectId: "project-1",
     title: "Recovery",
@@ -1218,6 +1852,33 @@ function seedRunningStore(projectRoot) {
     recoveryReason: "Test restart recovery.",
     now: "2026-06-14T00:00:00.000Z",
   });
+  const plannerRunId = "run-session-1-initial-planner-turn";
+  const { segment: plannerSegment } = store.claimPlannerRunStart({
+    sessionId: session.id,
+    laneId: session.plannerLaneId,
+    runId: plannerRunId,
+    agentKind: "hermes",
+    worktreePath: projectRoot,
+    now: "2026-06-14T00:00:00.500Z",
+  });
+  store.recordRunResult({
+    ...plannerSegment,
+    outputSummary: "Initial planner turn completed.",
+    evidence: {
+      runId: plannerRunId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-06-14T00:00:01.000Z",
+    },
+    now: "2026-06-14T00:00:01.000Z",
+  });
+  store.recordPlannerIntentReconciled(plannerSegment, "2026-06-14T00:00:01.500Z");
   store.appendWorkflowEvent({
     sessionId: "session-1",
     kind: "workflow.lane.declared",
@@ -1412,12 +2073,17 @@ function finishPlannerIntent(sessionId) {
   };
 }
 
-function assertFinishPlannerConverged(store, segment) {
+function assertFinishPlannerConverged(store, segment, laneStatus = "running") {
   const projection = store.materializeFlowProjection(segment.sessionId);
   assert.equal(store.listSegments(segment.sessionId, segment.laneId).find((item) => item.id === segment.segmentId)?.status, "succeeded");
-  assert.equal(projection.lanes.find((lane) => lane.id === "lane-review-a")?.status, "running");
-  assert.equal(projection.lanes.find((lane) => lane.id === "lane-review-b")?.status, "running");
-  assert.equal(store.listEvents(segment.sessionId).filter((event) => event.kind === "workflow.intent.accepted").length, 1);
+  assert.equal(projection.lanes.find((lane) => lane.id === "lane-review-a")?.status, laneStatus);
+  assert.equal(projection.lanes.find((lane) => lane.id === "lane-review-b")?.status, laneStatus);
+  const plannerFacts = store.listEvents(segment.sessionId).filter((event) =>
+    event.kind === "workflow.intent.accepted" || event.kind === "workflow.lane.declared"
+  );
+  assert.equal(plannerFacts.filter((event) => event.kind === "workflow.intent.accepted").length, 1);
+  assert.equal(plannerFacts.filter((event) => event.kind === "workflow.lane.declared").length, 2);
+  assert.equal(plannerFacts.every((event) => event.causationId === segment.runId), true);
 }
 
 async function makeRoot() {
@@ -1442,6 +2108,11 @@ async function loadMainWorkflowStoreHarness(options = {}) {
   const source = [
     "const workflowStores = new Map();",
     "const workflowStoreInitializations = new Map();",
+    "const workflowSessionAdvanceFlights = new Map();",
+    "const workflowProjectAdvanceTails = new Map();",
+    "const MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT = 4;",
+    "const RUN_PROTOCOL_VERSION = 1;",
+    "const launchedRuns = [];",
     "let resolverReceivedKnownStore = false;",
     "async function workflowStoreIdentity(projectRoot) { return projectRoot; }",
     "async function getAgentBridge() { return bridgeProvider(); }",
@@ -1452,6 +2123,11 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     "function readField(value, key) { return value && typeof value === 'object' ? value[key] : undefined; }",
     "function isRecord(value) { return typeof value === 'object' && value !== null && !Array.isArray(value); }",
     "function workflowIpcError(_code, message) { return new Error(message); }",
+    "function broadcastWorkflowProjection() {}",
+    "function requireWorkflowCanvasSession(store, sessionId) { const session = store.materializeCanvasSession(sessionId); if (!session || session.kind !== 'canvas') throw new Error('missing CanvasSession'); return session; }",
+    "function compensateFailedWorkflowRun(store, segment, error) { store.recordRunResult({ ...segment, evidence: { runId: segment.runId, status: 'failed', exitCode: 1, changesetId: null, checks: [{ kind: 'run-exit', name: 'Coordinator start', status: 'failed' }], artifacts: [], review: null, errorReason: error instanceof Error ? error.message : String(error), cancelReason: null, completedAt: new Date().toISOString() }, now: new Date().toISOString() }); }",
+    "async function publicRunStartHandler(input, ownership) { launchedRuns.push({ input, ownership }); return { id: input.runId, status: 'running' }; }",
+    "async function trustedRunStartIdentity(input) { return { projectRoot: input.projectRoot, sessionId: input.sessionId, laneId: input.nodeId, runId: input.runId, agentKind: input.agentKind, worktreePath: input.worktreePath, startFingerprint: `test:${input.runId}` }; }",
     `async function resolveExecutableRunIdentity(input, _phase, knownStore) {
       if (!knownStore) await getWorkflowStore(input.projectRoot);
       resolverReceivedKnownStore = knownStore !== undefined;
@@ -1500,8 +2176,8 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     extractSourceRange(main, "function assertTerminalRunEvidence", "async function verifyRunGitIdentityAtCheckpoint"),
     getWorkflowStoreSource,
     extractSourceRange(main, "async function enrichTerminalWorkflowRun", "async function workflowStoreIdentity"),
-    "function closeWorkflowStores() { for (const store of workflowStores.values()) store.close(); workflowStores.clear(); workflowStoreInitializations.clear(); }",
-    "module.exports = { getWorkflowStore, closeWorkflowStores, hasPublishedStore: (root) => workflowStores.get(root) ?? false, resolverReceivedKnownStore: () => resolverReceivedKnownStore };",
+    "function closeWorkflowStores() { for (const store of workflowStores.values()) store.close(); workflowStores.clear(); workflowStoreInitializations.clear(); workflowSessionAdvanceFlights.clear(); workflowProjectAdvanceTails.clear(); }",
+    "module.exports = { getWorkflowStore, closeWorkflowStores, hasPublishedStore: (root) => workflowStores.get(root) ?? false, resolverReceivedKnownStore: () => resolverReceivedKnownStore, launchedRuns: () => launchedRuns };",
   ].join("\n");
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
@@ -1515,6 +2191,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
   const bridgeProvider = options.getAgentBridge ?? (async () => bridge);
   const onStoreCreated = options.onStoreCreated ?? (() => {});
   const persistenceModule = {
+    ...(await import("@skyturn/persistence/workflow-store")),
     createWorkflowStore(input) {
       const store = createWorkflowStore(input);
       onStoreCreated(store);
@@ -1522,6 +2199,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     },
   };
   const orchestratorModule = await import("@skyturn/orchestrator");
+  const projectCoreModule = await import("@skyturn/project-core");
   const workflowRuntimeModule = await import("@skyturn/ui-canvas/workflow-runtime");
   vm.runInNewContext(output, {
     bridge,
@@ -1530,12 +2208,17 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     Error,
     Map,
     Promise,
+    path: { isAbsolute: (value) => typeof value === "string" && value.startsWith("/") },
+    fs: { realpath: async (value) => value },
     module,
     exports: module.exports,
     persistenceModule,
+    recoverPendingPlannerIntentReconciliations,
     recoverTerminalWorkflowRuns,
     require(specifier) {
+      if (specifier === "@skyturn/persistence/workflow-store") return persistenceModule;
       if (specifier === "@skyturn/orchestrator") return orchestratorModule;
+      if (specifier === "@skyturn/project-core") return projectCoreModule;
       if (specifier === "@skyturn/ui-canvas/workflow-runtime") return workflowRuntimeModule;
       throw new Error(`Unexpected harness import: ${specifier}`);
     },

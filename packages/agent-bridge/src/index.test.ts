@@ -58,6 +58,25 @@ import {
 import { createDurableRunClaimStore, defaultDurableRunClaimRoot } from "./durableRunClaim.js";
 import { assertWindowsExpectedArtifactVerifierCapability } from "./internal/windowsExpectedArtifactVerifier.js";
 
+type SpawnWindowsJobObjectProcess = typeof import(
+  "./internal/windowsJobObjectProcess.js"
+)["spawnWindowsJobObjectProcess"];
+
+const windowsJobObjectProcessMock = vi.hoisted(() => ({
+  spawn: null as SpawnWindowsJobObjectProcess | null,
+}));
+
+vi.mock("./internal/windowsJobObjectProcess.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./internal/windowsJobObjectProcess.js")>();
+  return {
+    ...original,
+    spawnWindowsJobObjectProcess: (...args: Parameters<SpawnWindowsJobObjectProcess>) =>
+      windowsJobObjectProcessMock.spawn
+        ? windowsJobObjectProcessMock.spawn(...args)
+        : original.spawnWindowsJobObjectProcess(...args),
+  };
+});
+
 const roots: string[] = [];
 const testDefaultWatchdogTimeoutMs = 250;
 const previousStateHome = process.env.SKYTURN_STATE_HOME;
@@ -231,6 +250,7 @@ async function readWorkspaceRunEvents(projectRoot: string, runId: string): Promi
 
 afterEach(async () => {
   vi.useRealTimers();
+  windowsJobObjectProcessMock.spawn = null;
   await Promise.all(roots.map((root) => rm(root, { force: true, recursive: true })));
   roots.length = 0;
   if (previousStateHome === undefined) delete process.env.SKYTURN_STATE_HOME;
@@ -473,6 +493,124 @@ describe("agent bridge", () => {
       status: "running",
     })]);
     await bridge.cancelRun(input.runId, "test cleanup");
+  });
+
+  it("joins cancellation requested before a delayed adapter publishes its handle", async () => {
+    const projectRoot = await makeTempRoot();
+    const handlePublication = deferred<void>();
+    const privateRunEventStore = inMemoryPrivateRunEventStore();
+    const liveEvents: RunEvent[] = [];
+    let cancelCalls = 0;
+    const bridge = new AgentBridge({
+      privateRunEventStore,
+      adapters: [{
+        ...createMockAgentAdapter({ holdOpen: true }),
+        async startRun(_input, sink) {
+          await handlePublication.promise;
+          await sink.emit({ kind: "status", payload: { status: "running" } });
+          return {
+            async cancel(reason) {
+              cancelCalls += 1;
+              await sink.emit({
+                kind: "evidence",
+                payload: {
+                  exitCode: null,
+                  checks: [{ kind: "run-exit", name: "Delayed adapter exit", status: "skipped", detail: reason }],
+                },
+              });
+              await sink.emit({ kind: "status", payload: { status: "cancelled", reason } });
+            },
+          };
+        },
+      }],
+    });
+    bridge.onRunEvent((event) => liveEvents.push(event));
+    const input = explicitRunInput(projectRoot, "cancel-before-handle-publication");
+
+    const start = bridge.startRun(input);
+    await waitForCondition(
+      () => bridge.listRuns().some((run) => run.id === input.runId && run.status === "running"),
+      "starting run publication",
+    );
+    let cancelSettled = false;
+    const cancellation = bridge.cancelRun(input.runId, "cancel during adapter start").then((evidence) => {
+      cancelSettled = true;
+      return evidence;
+    });
+    await flushStartCancellation();
+
+    expect(cancelSettled).toBe(false);
+    expect(cancelCalls).toBe(0);
+
+    handlePublication.resolve();
+    const [started, evidence] = await Promise.all([start, cancellation]);
+    await bridge.cancelRun(input.runId, "duplicate cancellation");
+    const events = await bridge.loadEvents(projectRoot, input.runId);
+    const terminalIndex = events.findIndex(isTerminalRunStatusEvent);
+
+    expect(started.status).toBe("cancelled");
+    expect(evidence.status).toBe("cancelled");
+    expect(cancelCalls).toBe(1);
+    expect(terminalRunStatuses(events)).toHaveLength(1);
+    expect(terminalRunStatuses(liveEvents)).toHaveLength(1);
+    expect(events.filter((event) => event.kind === "evidence")).toHaveLength(1);
+    expect(liveEvents.filter((event) => event.kind === "evidence")).toHaveLength(1);
+    expect(events.slice(terminalIndex + 1)).not.toContainEqual(
+      expect.objectContaining({ kind: "status", payload: expect.objectContaining({ status: "running" }) }),
+    );
+    expect(bridge.listRuns()).toEqual([
+      expect.objectContaining({ id: input.runId, status: "cancelled" }),
+    ]);
+  });
+
+  it("joins cancellation requested before a delayed adapter start rejection", async () => {
+    const projectRoot = await makeTempRoot();
+    const startRejection = deferred<void>();
+    const privateRunEventStore = inMemoryPrivateRunEventStore();
+    const bridge = new AgentBridge({
+      privateRunEventStore,
+      adapters: [{
+        ...createMockAgentAdapter({ holdOpen: true }),
+        async startRun() {
+          await startRejection.promise;
+          throw new Error("delayed adapter start failed");
+        },
+      }],
+    });
+    const input = explicitRunInput(projectRoot, "cancel-before-start-rejection");
+
+    const start = bridge.startRun(input).then(
+      (run) => ({ kind: "fulfilled" as const, run }),
+      (error: unknown) => ({ kind: "rejected" as const, error }),
+    );
+    await waitForCondition(
+      () => bridge.listRuns().some((run) => run.id === input.runId && run.status === "running"),
+      "starting run publication",
+    );
+    let cancelSettled = false;
+    const cancellation = bridge.cancelRun(input.runId, "cancel during adapter start").then((evidence) => {
+      cancelSettled = true;
+      return evidence;
+    });
+    await flushStartCancellation();
+
+    expect(cancelSettled).toBe(false);
+
+    startRejection.resolve();
+    const [startOutcome, evidence] = await Promise.all([start, cancellation]);
+    const events = await bridge.loadEvents(projectRoot, input.runId);
+
+    expect(startOutcome).toMatchObject({
+      kind: "rejected",
+      error: expect.objectContaining({ message: "delayed adapter start failed" }),
+    });
+    expect(evidence).toMatchObject({ status: "failed", errorReason: "delayed adapter start failed" });
+    expect(terminalRunStatuses(events)).toEqual([
+      expect.objectContaining({ kind: "status", payload: expect.objectContaining({ status: "failed" }) }),
+    ]);
+    expect(bridge.listRuns()).toEqual([
+      expect.objectContaining({ id: input.runId, status: "failed" }),
+    ]);
   });
 
   it.each(["codex", "hermes"] as const)(
@@ -3833,46 +3971,62 @@ describe("agent bridge", () => {
     expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
   });
 
-  it.each([
-    ["cancelled", "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n"],
-    ["timed-out", "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n"],
-  ] as const)("closes the retained worktree fd when a run is %s", async (terminalStatus, script) => {
-    const projectRoot = await makeTempRoot();
-    await mkdir(join(projectRoot, ".git"));
-    const binRoot = await makeTempRoot();
-    const codexPath = join(binRoot, "codex");
-    await writeFile(codexPath, script, { mode: 0o755 });
-    let retainedFd = -1;
-    const bridge = new AgentBridge({
-      adapters: [
-        createCodexCliAdapter({
-          executablePath: codexPath,
-          timeoutMs: terminalStatus === "timed-out" ? 50 : 5_000,
-          killTimeoutMs: 25,
-          artifactVerificationHooks: { afterWorktreeOpen: (fd) => void (retainedFd = fd) },
-        }),
-      ],
-    });
-    const terminal = waitForEvent(
-      bridge,
-      (event) => event.kind === "status" && event.payload.status === terminalStatus,
-    );
-    const run = await bridge.startRun({
-      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
-      nodeId: `node-fd-${terminalStatus}`,
-      sessionId: "session-1",
-      projectRoot,
-      worktreePath: projectRoot,
-      agentKind: "codex",
-      prompt: terminalStatus,
-      expectedArtifacts: [".devflow/acceptance/missing.png"],
-    });
-    if (terminalStatus === "cancelled") await bridge.cancelRun(run.id, "Cancel fd test");
-    await terminal;
+  it.each(["cancelled", "timed-out"] as const)(
+    "reaps the child and closes the retained worktree fd when a run is %s",
+    async (terminalStatus) => {
+      const projectRoot = await makeTempRoot();
+      await mkdir(join(projectRoot, ".git"));
+      const binRoot = await makeTempRoot();
+      const codexPath = join(binRoot, "codex");
+      const pidPath = join(binRoot, `codex-${terminalStatus}.pid`);
+      await writeFile(
+        codexPath,
+        [
+          "#!/usr/bin/env node",
+          "const fs = require('node:fs');",
+          `fs.writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+          terminalStatus === "cancelled"
+            ? "process.on('SIGTERM', () => process.exit(0));"
+            : "process.on('SIGTERM', () => {});",
+          "setInterval(() => {}, 1000);",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      let retainedFd = -1;
+      const bridge = new AgentBridge({
+        adapters: [
+          createCodexCliAdapter({
+            executablePath: codexPath,
+            timeoutMs: terminalStatus === "timed-out" ? 50 : 5_000,
+            killTimeoutMs: 25,
+            artifactVerificationHooks: { afterWorktreeOpen: (fd) => void (retainedFd = fd) },
+          }),
+        ],
+      });
+      const terminal = waitForEvent(
+        bridge,
+        (event) => event.kind === "status" && event.payload.status === terminalStatus,
+      );
+      const run = await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: `node-fd-${terminalStatus}`,
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "codex",
+        prompt: terminalStatus,
+        expectedArtifacts: [".devflow/acceptance/missing.png"],
+      });
+      const childPid = Number(await waitForFile(pidPath));
+      if (terminalStatus === "cancelled") await bridge.cancelRun(run.id, "Cancel fd test");
+      await terminal;
 
-    expect(retainedFd).toBeGreaterThan(2);
-    expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
-  });
+      expect(retainedFd).toBeGreaterThan(2);
+      expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
+      expect(isPidAlive(childPid)).toBe(false);
+    },
+    15_000,
+  );
 
   it("closes the retained worktree fd after a successful run", async () => {
     const projectRoot = await makeTempRoot();
@@ -3905,6 +4059,177 @@ describe("agent bridge", () => {
 
     expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
   });
+
+  it.each(["codex", "hermes"] as const)(
+    "%s persists one sanitized failed terminal when the process boundary rejects after helper close",
+    async (agentKind) => {
+      const durableRunClaimStore = testDurableRunClaimStore();
+      await durableRunClaimStore.initialize();
+      const privateRunEventStore = createPrivateRunEventStore({
+        durableRunClaimStore,
+        platform: process.platform,
+      });
+      await withProcessPlatform("win32", async () => {
+        const projectRoot = await makeTempRoot();
+        if (agentKind === "codex") await mkdir(join(projectRoot, ".git"));
+        const binRoot = await makeTempRoot();
+        const executablePath = join(binRoot, agentKind);
+        await writeFile(executablePath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        const boundary = rejectedWindowsProcessBoundary();
+        windowsJobObjectProcessMock.spawn = boundary.spawn;
+        let retainedFd = -1;
+        const adapterOptions = {
+          executablePath,
+          timeoutMs: 0,
+          artifactVerificationHooks: {
+            platform: "linux" as const,
+            afterWorktreeOpen: (fd: number) => void (retainedFd = fd),
+          },
+        };
+        const bridge = new AgentBridge({
+          durableRunClaimStore,
+          privateRunEventStore,
+          adapters: [agentKind === "codex"
+            ? createCodexCliAdapter(adapterOptions)
+            : createHermesCliAdapter(adapterOptions)],
+        });
+        const liveEvents: RunEvent[] = [];
+        const unsubscribe = bridge.onRunEvent((event) => liveEvents.push(event));
+        const unhandledRejections: unknown[] = [];
+        const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+        process.on("unhandledRejection", onUnhandledRejection);
+        const rawCause = "helper protocol token=private-boundary-secret at C:\\Users\\alice\\private\\repo";
+        const prompt = "Do not expose prompt-secret-123456";
+        const input = {
+          ...explicitRunInput(projectRoot, `${agentKind}-process-boundary-failure`, agentKind),
+          prompt,
+          ...(agentKind === "hermes" ? { hermesSessionHandle: "hermes-resume-secret-123456" } : {}),
+        };
+
+        try {
+          const run = await bridge.startRun(input);
+          boundary.rejectAfterHelperClose(new Error(rawCause));
+          await waitForCondition(
+            () => liveEvents.some((event) => event.kind === "status" && event.payload.status === "failed"),
+            `${agentKind} process-boundary terminal`,
+          );
+          await flushAsyncEvents();
+          await flushAsyncEvents();
+
+          const events = await bridge.loadEvents(projectRoot, run.id);
+          const evidence = await bridge.getEvidence(projectRoot, run.id);
+          const repeatedCompletion = await bridge.cancelRun(run.id, "late cancel must not replace boundary failure");
+          const publicState = JSON.stringify({ events, liveEvents, evidence, repeatedCompletion });
+
+          expect(boundary.helperClosed).toBe(true);
+          expect(boundary.terminateAndReap).not.toHaveBeenCalled();
+          expect(boundary.child.kill).not.toHaveBeenCalled();
+          expect(terminalRunStatuses(events)).toEqual([
+            expect.objectContaining({
+              payload: expect.objectContaining({
+                status: "failed",
+                exitCode: null,
+                category: "process-boundary-failure",
+                reason: "process-boundary-failure",
+              }),
+            }),
+          ]);
+          expect(terminalRunStatuses(liveEvents)).toHaveLength(1);
+          expect(evidence).toMatchObject({
+            status: "failed",
+            exitCode: null,
+            errorReason: "process-boundary-failure",
+            checks: expect.arrayContaining([
+              expect.objectContaining({
+                kind: "run-exit",
+                status: "failed",
+                detail: "process-boundary-failure",
+              }),
+            ]),
+          });
+          expect(repeatedCompletion.status).toBe("failed");
+          expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
+          expect(boundary.child.stdout?.listenerCount("data")).toBe(0);
+          expect(boundary.child.stderr?.listenerCount("data")).toBe(0);
+          expect(publicState).not.toMatch(
+            /private-boundary-secret|alice|prompt-secret-123456|hermes-resume-secret-123456/,
+          );
+          expect(unhandledRejections).toEqual([]);
+        } finally {
+          unsubscribe();
+          process.off("unhandledRejection", onUnhandledRejection);
+        }
+      });
+    },
+  );
+
+  it.each(["codex", "hermes"] as const)(
+    "%s keeps an owned cancellation authoritative when process-boundary rejection races helper close",
+    async (agentKind) => {
+      const durableRunClaimStore = testDurableRunClaimStore();
+      await durableRunClaimStore.initialize();
+      const privateRunEventStore = createPrivateRunEventStore({
+        durableRunClaimStore,
+        platform: process.platform,
+      });
+      await withProcessPlatform("win32", async () => {
+        const projectRoot = await makeTempRoot();
+        if (agentKind === "codex") await mkdir(join(projectRoot, ".git"));
+        const binRoot = await makeTempRoot();
+        const executablePath = join(binRoot, agentKind);
+        await writeFile(executablePath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+        const boundary = rejectedWindowsProcessBoundary();
+        windowsJobObjectProcessMock.spawn = boundary.spawn;
+        let retainedFd = -1;
+        const adapterOptions = {
+          executablePath,
+          timeoutMs: 0,
+          artifactVerificationHooks: {
+            platform: "linux" as const,
+            afterWorktreeOpen: (fd: number) => void (retainedFd = fd),
+          },
+        };
+        const bridge = new AgentBridge({
+          durableRunClaimStore,
+          privateRunEventStore,
+          adapters: [agentKind === "codex"
+            ? createCodexCliAdapter(adapterOptions)
+            : createHermesCliAdapter(adapterOptions)],
+        });
+        const unhandledRejections: unknown[] = [];
+        const onUnhandledRejection = (reason: unknown) => unhandledRejections.push(reason);
+        process.on("unhandledRejection", onUnhandledRejection);
+
+        try {
+          const run = await bridge.startRun(
+            explicitRunInput(projectRoot, `${agentKind}-cancel-boundary-race`, agentKind),
+          );
+          const cancellation = bridge.cancelRun(run.id, "User cancelled first");
+          await waitForCondition(
+            () => boundary.terminateAndReap.mock.calls.length === 1,
+            `${agentKind} cancellation ownership`,
+          );
+          boundary.rejectAfterHelperClose(new Error("raw helper failure token=race-secret-123456"));
+          const evidence = await cancellation;
+          await flushAsyncEvents();
+          await flushAsyncEvents();
+
+          const events = await bridge.loadEvents(projectRoot, run.id);
+          expect(evidence.status).toBe("cancelled");
+          expect(terminalRunStatuses(events)).toEqual([
+            expect.objectContaining({ payload: expect.objectContaining({ status: "cancelled" }) }),
+          ]);
+          expect(boundary.terminateAndReap).toHaveBeenCalledTimes(1);
+          expect(boundary.child.kill).not.toHaveBeenCalled();
+          expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
+          expect(JSON.stringify({ events, evidence })).not.toMatch(/race-secret-123456|process-boundary-failure/);
+          expect(unhandledRejections).toEqual([]);
+        } finally {
+          process.off("unhandledRejection", onUnhandledRejection);
+        }
+      });
+    },
+  );
 
   it("closes the retained worktree fd when executable preflight fails", async () => {
     const projectRoot = await makeTempRoot();
@@ -6602,6 +6927,213 @@ describe("agent bridge", () => {
     }
   });
 
+  it("joins cancel to an in-flight timeout until the parent and stubborn child are reaped", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const parentPidPath = join(binRoot, "timeout-parent.pid");
+    const childPidPath = join(binRoot, "timeout-child.pid");
+    const childReadyPath = join(binRoot, "timeout-child.ready");
+    const childPath = join(binRoot, "timeout-stubborn-child.js");
+    const codexPath = join(binRoot, "codex-timeout-race");
+    await writeFile(
+      childPath,
+      [
+        "const fs = require('node:fs');",
+        "process.on('SIGTERM', () => {});",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_READY_PATH, 'ready');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "fs.writeFileSync(process.env.SKYTURN_PARENT_PID_PATH, String(process.pid));",
+        "const child = spawn(process.execPath, [process.env.SKYTURN_CHILD_PATH], { env: process.env, stdio: 'ignore' });",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_PID_PATH, String(child.pid));",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    let retainedFd = -1;
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {
+            SKYTURN_PARENT_PID_PATH: parentPidPath,
+            SKYTURN_CHILD_PATH: childPath,
+            SKYTURN_CHILD_PID_PATH: childPidPath,
+            SKYTURN_CHILD_READY_PATH: childReadyPath,
+          },
+          timeoutMs: 500,
+          killTimeoutMs: 500,
+          artifactVerificationHooks: { afterWorktreeOpen: (fd) => void (retainedFd = fd) },
+        }),
+      ],
+    });
+    const liveEvents: RunEvent[] = [];
+    const unsubscribe = bridge.onRunEvent((event) => liveEvents.push(event));
+    const timedOut = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "timed-out",
+    );
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-cancel-during-timeout",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Timeout before cancellation",
+    });
+    const parentPid = Number(await waitForFile(parentPidPath));
+    const childPid = Number(await waitForFile(childPidPath));
+    await waitForFile(childReadyPath);
+
+    try {
+      await waitForCondition(
+        () => !isPidAlive(parentPid) && isPidAlive(childPid),
+        "timeout parent exit before stubborn child",
+      );
+      let cancelSettled = false;
+      const cancelPromise = bridge.cancelRun(run.id, "Cancel during timeout").then((evidence) => {
+        cancelSettled = true;
+        return evidence;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const cancelSettledBeforeReap = cancelSettled;
+      const fdClosedBeforeReap = isFileDescriptorClosed(retainedFd);
+
+      const cancelEvidence = await cancelPromise;
+      await timedOut;
+      unsubscribe();
+      const persistedEvents = await loadRunEvents(projectRoot, run.id);
+
+      expect(cancelSettledBeforeReap).toBe(false);
+      expect(fdClosedBeforeReap).toBe(false);
+      expect(isPidAlive(parentPid)).toBe(false);
+      expect(isPidAlive(childPid)).toBe(false);
+      expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
+      expect(cancelEvidence.status).toBe("timed-out");
+      for (const events of [liveEvents, persistedEvents]) {
+        expect(events.filter((event) => event.kind === "evidence")).toHaveLength(1);
+        expect(terminalRunStatuses(events).map((event) => event.payload.status)).toEqual(["timed-out"]);
+      }
+    } finally {
+      unsubscribe();
+      killPid(parentPid);
+      killPid(childPid);
+    }
+  }, 15_000);
+
+  it("keeps cancel authoritative when the timeout deadline passes before a stubborn child is reaped", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const parentPidPath = join(binRoot, "cancel-parent.pid");
+    const childPidPath = join(binRoot, "cancel-child.pid");
+    const childReadyPath = join(binRoot, "cancel-child.ready");
+    const childPath = join(binRoot, "cancel-stubborn-child.js");
+    const codexPath = join(binRoot, "codex-cancel-race");
+    await writeFile(
+      childPath,
+      [
+        "const fs = require('node:fs');",
+        "process.on('SIGTERM', () => {});",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_READY_PATH, 'ready');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "const { spawn } = require('node:child_process');",
+        "fs.writeFileSync(process.env.SKYTURN_PARENT_PID_PATH, String(process.pid));",
+        "const child = spawn(process.execPath, [process.env.SKYTURN_CHILD_PATH], { env: process.env, stdio: 'ignore' });",
+        "fs.writeFileSync(process.env.SKYTURN_CHILD_PID_PATH, String(child.pid));",
+        "process.stdout.write('{\"type\":\"turn.started\"}\\n');",
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    let retainedFd = -1;
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: {
+            SKYTURN_PARENT_PID_PATH: parentPidPath,
+            SKYTURN_CHILD_PATH: childPath,
+            SKYTURN_CHILD_PID_PATH: childPidPath,
+            SKYTURN_CHILD_READY_PATH: childReadyPath,
+          },
+          timeoutMs: 500,
+          killTimeoutMs: 800,
+          artifactVerificationHooks: { afterWorktreeOpen: (fd) => void (retainedFd = fd) },
+        }),
+      ],
+    });
+    const liveEvents: RunEvent[] = [];
+    const unsubscribe = bridge.onRunEvent((event) => liveEvents.push(event));
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-timeout-during-cancel",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Cancel before timeout",
+    });
+    const parentPid = Number(await waitForFile(parentPidPath));
+    const childPid = Number(await waitForFile(childPidPath));
+    await waitForFile(childReadyPath);
+
+    try {
+      let cancelSettled = false;
+      const cancelStartedAt = Date.now();
+      const cancelPromise = bridge.cancelRun(run.id, "Cancel before timeout").then((evidence) => {
+        cancelSettled = true;
+        return evidence;
+      });
+      await waitForCondition(
+        () => !isPidAlive(parentPid) && isPidAlive(childPid),
+        "cancelled parent exit before stubborn child",
+      );
+      const timeoutDeadlineDelay = Math.max(0, 550 - (Date.now() - cancelStartedAt));
+      await new Promise((resolve) => setTimeout(resolve, timeoutDeadlineDelay));
+      const cancelSettledBeforeReap = cancelSettled;
+      const fdClosedBeforeReap = isFileDescriptorClosed(retainedFd);
+
+      const cancelEvidence = await cancelPromise;
+      unsubscribe();
+      const persistedEvents = await loadRunEvents(projectRoot, run.id);
+
+      expect(cancelSettledBeforeReap).toBe(false);
+      expect(fdClosedBeforeReap).toBe(false);
+      expect(isPidAlive(parentPid)).toBe(false);
+      expect(isPidAlive(childPid)).toBe(false);
+      expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
+      expect(cancelEvidence.status).toBe("cancelled");
+      for (const events of [liveEvents, persistedEvents]) {
+        expect(events.filter((event) => event.kind === "evidence")).toHaveLength(1);
+        expect(terminalRunStatuses(events).map((event) => event.payload.status)).toEqual(["cancelled"]);
+      }
+    } finally {
+      unsubscribe();
+      killPid(parentPid);
+      killPid(childPid);
+    }
+  }, 15_000);
+
   it("runs Hermes chat planning without oneshot -z and marks replay recovery honestly", async () => {
     const projectRoot = await makeTempRoot();
     const binRoot = await makeTempRoot();
@@ -8740,6 +9272,39 @@ function terminalRunStatuses(events: RunEvent[]): RunEvent[] {
   );
 }
 
+function isTerminalRunStatusEvent(event: RunEvent): boolean {
+  return terminalRunStatuses([event]).length === 1;
+}
+
+function inMemoryPrivateRunEventStore(): PrivateRunEventStore {
+  const events = new Map<string, RunEvent[]>();
+  return {
+    async prepare() {},
+    async eventPath(_projectRoot, runId) {
+      return `/private/${runId}.events.ndjson`;
+    },
+    async append(_projectRoot, event) {
+      const runEvents = events.get(event.runId) ?? [];
+      const existing = runEvents.find((candidate) => candidate.seq === event.seq);
+      if (existing) {
+        if (JSON.stringify(existing) !== JSON.stringify(event)) throw new Error("Private run event conflict.");
+        return "exists";
+      }
+      runEvents.push(event);
+      events.set(event.runId, runEvents);
+      return "exists";
+    },
+    async read(_projectRoot, runId) {
+      const runEvents = events.get(runId);
+      return runEvents ? { kind: "valid" as const, events: runEvents } : { kind: "missing" as const };
+    },
+  };
+}
+
+async function flushStartCancellation(): Promise<void> {
+  for (let index = 0; index < 50; index += 1) await Promise.resolve();
+}
+
 function laneDeclaredEvent(): FlowEvent {
   return {
     id: "session-1:flow-event:00000001",
@@ -8894,6 +9459,16 @@ function isPidAlive(pid: number): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+function isFileDescriptorClosed(fd: number): boolean {
+  try {
+    fstatSync(fd);
+    return false;
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "EBADF") return true;
+    throw error;
   }
 }
 
@@ -9239,6 +9814,45 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function rejectedWindowsProcessBoundary() {
+  const child = new EventEmitter() as ChildProcess;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const kill = vi.fn(() => true);
+  Object.assign(child, {
+    stdout,
+    stderr,
+    stdin: null,
+    pid: 4242,
+    exitCode: null,
+    signalCode: null,
+    kill,
+  });
+  const closed = deferred<{ exitCode: number | null; signalCode: NodeJS.Signals | null }>();
+  const terminateAndReap = vi.fn(() => closed.promise.then(() => undefined));
+  let helperClosed = false;
+  const spawn: SpawnWindowsJobObjectProcess = vi.fn(async () => ({
+    child,
+    closed: closed.promise,
+    terminateAndReap,
+  }));
+
+  return {
+    child,
+    get helperClosed() {
+      return helperClosed;
+    },
+    rejectAfterHelperClose(error) {
+      helperClosed = true;
+      Object.assign(child, { exitCode: 70, signalCode: null });
+      child.emit("close", 70, null);
+      closed.reject(error);
+    },
+    spawn,
+    terminateAndReap,
+  };
 }
 
 const detachedSpawnErrorProbeSecret = "spawn-error-private-secret-123456";

@@ -193,14 +193,9 @@ import {
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
 import { agentIdentityForNode, canUseAgentNodeActions, nodeFooterForNode } from "./nodeDisplay.js";
 import {
-  applyCompletedBridgeRunPersistenceResult,
-  applyBridgeRunResult,
   applyRunEventToWorkspace,
-  claimCompletedBridgeRunPersistence,
   mergeRunEventsIntoWorkspace,
-  persistCompletedBridgeRunResult,
   retryCanvasNode,
-  startBridgeRun,
 } from "./workflowRuntime.js";
 import { addRequirementPlanningNode } from "./composer.js";
 import {
@@ -209,6 +204,8 @@ import {
 } from "./nodeActionState.js";
 
 export const INSERT_BEFORE_UNAVAILABLE_ERROR = "Insert before is unavailable because the desktop workflow backend is not connected.";
+export const DESKTOP_RETRY_UNAVAILABLE_REASON =
+  "Desktop workflow Retry is unavailable. Use checkpoint-driven Repair in the bottom composer when available.";
 
 gsap.registerPlugin(useGSAP);
 
@@ -241,6 +238,15 @@ const edgeTypes: EdgeTypes = {
   agent: MemoAgentEdge,
 };
 
+export function retryCanvasNodeForRuntime(
+  session: CanvasSession,
+  nodeId: string,
+  now: string,
+  desktopBackendAvailable: boolean,
+): CanvasSession {
+  return desktopBackendAvailable ? session : retryCanvasNode(session, nodeId, now);
+}
+
 type PlanSectionKey = PlanStage;
 
 const PLAN_SECTION_STEPS: Array<{ key: PlanSectionKey; label: string }> = [
@@ -248,6 +254,196 @@ const PLAN_SECTION_STEPS: Array<{ key: PlanSectionKey; label: string }> = [
   { key: "design", label: "Design" },
   { key: "tasks", label: "Tasks" },
 ];
+
+export interface BottomComposerSubmissionState {
+  inputId: string;
+  text: string;
+  busy: boolean;
+  error: string | null;
+}
+
+export async function submitBottomComposerAttempt<T>({
+  states,
+  scope,
+  text,
+  createInputId,
+  submit,
+  onStateChange,
+}: {
+  states: Map<string, BottomComposerSubmissionState>;
+  scope: string;
+  text: string;
+  createInputId: () => string;
+  submit: (inputId: string) => Promise<T>;
+  onStateChange?: () => void;
+}): Promise<T | null> {
+  const current = states.get(scope);
+  if (current?.busy) return null;
+  const inputId = current?.text === text ? current.inputId : createInputId();
+  states.set(scope, { inputId, text, busy: true, error: null });
+  onStateChange?.();
+
+  try {
+    const result = await submit(inputId);
+    if (states.get(scope)?.inputId === inputId) states.delete(scope);
+    onStateChange?.();
+    return result;
+  } catch {
+    const pending = states.get(scope);
+    if (pending?.inputId === inputId) {
+      states.set(scope, {
+        ...pending,
+        busy: false,
+        error: "Couldn’t submit requirement. Retry with the same text.",
+      });
+    }
+    onStateChange?.();
+    return null;
+  }
+}
+
+function bottomComposerSubmissionScope(projectId: string, sessionId: string): string {
+  return JSON.stringify([projectId, sessionId]);
+}
+
+export interface NewSessionSubmissionState {
+  session: CanvasSession;
+  inputId: string;
+  busy: boolean;
+  error: string | null;
+}
+
+export async function submitNewSessionAttempt({
+  states,
+  scope,
+  createAttempt,
+  submit,
+  onStateChange,
+}: {
+  states: Map<string, NewSessionSubmissionState>;
+  scope: string;
+  createAttempt: () => Pick<NewSessionSubmissionState, "session" | "inputId">;
+  submit: (attempt: Pick<NewSessionSubmissionState, "session" | "inputId">) => Promise<CanvasSession>;
+  onStateChange?: () => void;
+}): Promise<CanvasSession | null> {
+  const current = states.get(scope);
+  if (current?.busy) return null;
+  const attempt = current ?? {
+    ...createAttempt(),
+    busy: false,
+    error: null,
+  };
+  states.set(scope, { ...attempt, busy: true, error: null });
+  onStateChange?.();
+
+  try {
+    const result = await submit({ session: attempt.session, inputId: attempt.inputId });
+    if (states.get(scope)?.inputId === attempt.inputId) states.delete(scope);
+    onStateChange?.();
+    return result;
+  } catch {
+    const pending = states.get(scope);
+    if (pending?.inputId === attempt.inputId) {
+      states.set(scope, {
+        ...pending,
+        busy: false,
+        error: "Couldn’t create session. Retry with the same settings.",
+      });
+    }
+    onStateChange?.();
+    return null;
+  }
+}
+
+export function newSessionSubmissionScope(
+  projectId: string,
+  goal: string,
+  mode: WorkflowMode,
+  target: SessionTarget,
+): string {
+  return JSON.stringify([
+    projectId,
+    goal.trim(),
+    mode,
+    target.executionTarget,
+    target.selectedBranch,
+    target.executionTarget === "new_worktree" ? target.baseRef : null,
+  ]);
+}
+
+export function upsertCanvasSession(
+  sessions: CanvasSessionTab[],
+  authoritative: CanvasSession,
+): CanvasSessionTab[] {
+  return sessions.some((session) => session.id === authoritative.id)
+    ? sessions.map((session) => (session.id === authoritative.id ? authoritative : session))
+    : [...sessions, authoritative];
+}
+
+export function applyAuthoritativeWorkflowBroadcast(
+  workspace: WorkspaceState,
+  authoritative: CanvasSession,
+  submissions: ReadonlyMap<string, NewSessionSubmissionState>,
+): WorkspaceState {
+  const sessions = upsertCanvasSession(workspace.sessions, authoritative);
+  let pendingActivation = false;
+  for (const submission of submissions.values()) {
+    if (
+      submission.busy &&
+      submission.session.id === authoritative.id &&
+      submission.session.projectId === authoritative.projectId
+    ) {
+      pendingActivation = true;
+      break;
+    }
+  }
+  if (
+    !pendingActivation ||
+    workspace.activeProjectId !== authoritative.projectId ||
+    workspace.activeSessionId !== null
+  ) {
+    return { ...workspace, sessions };
+  }
+  return {
+    ...workspace,
+    sessions,
+    changesets: { ...workspace.changesets, ...changesetsForSession(authoritative) },
+    activeProjectId: authoritative.projectId,
+    activeSessionId: authoritative.id,
+  };
+}
+
+export interface WorkflowSessionResponseGuard {
+  sessionId: string;
+  requestSession: CanvasSession | null;
+  generation: number;
+}
+
+export function applyAuthoritativeWorkflowSessionResponse<T extends { sessions: CanvasSessionTab[] }>(
+  workspace: T,
+  authoritative: CanvasSession,
+  guard: WorkflowSessionResponseGuard,
+  currentGeneration: number,
+): T {
+  if (authoritative.id !== guard.sessionId) return workspace;
+  const current = workspace.sessions.find((session) => session.id === guard.sessionId);
+  if (!shouldApplyWorkflowProjection(
+    guard.requestSession,
+    current?.kind === "canvas" ? current : null,
+    guard.generation,
+    currentGeneration,
+  )) return workspace;
+  return { ...workspace, sessions: upsertCanvasSession(workspace.sessions, authoritative) };
+}
+
+export function shouldApplyWorkflowProjection(
+  requestedSession: CanvasSession | null,
+  currentSession: CanvasSession | null,
+  requestedGeneration: number,
+  currentGeneration: number,
+): boolean {
+  return currentSession === requestedSession && currentGeneration === requestedGeneration;
+}
 
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(() => {
@@ -270,6 +466,8 @@ export default function App() {
   const [nodeActionBusy, setNodeActionBusy] = useState<Exclude<ComposerAction, null> | null>(null);
   const [nodeActionError, setNodeActionError] = useState<string | null>(null);
   const [nodeActionStatus, setNodeActionStatus] = useState<string | null>(null);
+  const [, refreshBottomComposerState] = useReducer((revision: number) => revision + 1, 0);
+  const [, refreshNewSessionState] = useReducer((revision: number) => revision + 1, 0);
   const [planRuntimeRecovery, dispatchPlanRuntimeRecovery] = useReducer(
     planRuntimeRecoveryReducer,
     initialPlanRuntimeRecovery,
@@ -277,12 +475,14 @@ export default function App() {
   const [finishingPlanSessionIds, setFinishingPlanSessionIds] = useState<ReadonlySet<string>>(() => new Set());
   const [planFinishError, setPlanFinishError] = useState<{ sessionId: string; message: string } | null>(null);
   const [workspaceSaveError, setWorkspaceSaveError] = useState<string | null>(null);
-  const startedBridgeRuns = useRef(new Set<string>());
-  const completedBridgeRunPersistenceClaims = useRef(new Set<string>());
   const insertBeforeIntentRequests = useRef(createInsertBeforeIntentRequestTracker(() => globalThis.crypto.randomUUID()));
   const workspaceRef = useRef(workspace);
   const selectedNodeActionScopeRef = useRef<{ sessionId: string; nodeId: string } | null>(null);
   const selectedNodeActionGenerationRef = useRef(0);
+  const bottomComposerSubmissionsRef = useRef(new Map<string, BottomComposerSubmissionState>());
+  const activeBottomComposerScopeRef = useRef<string | null>(null);
+  const newSessionSubmissionsRef = useRef(new Map<string, NewSessionSubmissionState>());
+  const workflowProjectionGenerationRef = useRef(new Map<string, number>());
   const planRuntimeRecoveryGeneration = useRef(0);
   const planAdapterRef = useRef<ReturnType<typeof createPlanAdapter> | null>(null);
   const planMutationQueueRef = useRef<ReturnType<typeof createPlanMutationQueue> | null>(null);
@@ -333,6 +533,13 @@ export default function App() {
   const activePlanScope = activeProject && activeSession?.kind === "plan"
     ? `${activeProject.id}:${activeSession.id}`
     : null;
+  const bottomComposerScope = activeProject && activeSession?.kind === "canvas"
+    ? bottomComposerSubmissionScope(activeProject.id, activeSession.id)
+    : null;
+  activeBottomComposerScopeRef.current = bottomComposerScope;
+  const bottomComposerState = bottomComposerScope
+    ? bottomComposerSubmissionsRef.current.get(bottomComposerScope) ?? null
+    : null;
   const selectedNode =
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
@@ -349,6 +556,41 @@ export default function App() {
     newTaskProjectId,
     workspace.activeProjectId,
   );
+  const activeNewSessionFailure = activeSession?.kind === "canvas"
+    ? [...newSessionSubmissionsRef.current.values()].find((attempt) => (
+        attempt.session.id === activeSession.id && attempt.error !== null
+      )) ?? null
+    : null;
+
+  function captureWorkflowSessionResponseGuard(
+    sessionId: string,
+    requestSession: CanvasSession | null,
+  ): WorkflowSessionResponseGuard {
+    return {
+      sessionId,
+      requestSession,
+      generation: workflowProjectionGenerationRef.current.get(sessionId) ?? 0,
+    };
+  }
+
+  function applyGuardedWorkflowSessionResponse(
+    authoritative: CanvasSession,
+    guard: WorkflowSessionResponseGuard,
+    decorate?: (workspace: WorkspaceState) => WorkspaceState,
+  ): void {
+    setWorkspace((current) => {
+      const guarded = applyAuthoritativeWorkflowSessionResponse(
+        current,
+        authoritative,
+        guard,
+        workflowProjectionGenerationRef.current.get(guard.sessionId) ?? 0,
+      );
+      if (guarded === current) return current;
+      const next = decorate ? decorate(guarded) : guarded;
+      workspaceRef.current = next;
+      return next;
+    });
+  }
 
   useEffect(() => {
     let active = true;
@@ -408,19 +650,10 @@ export default function App() {
   useEffect(() => {
     if (!window.devflow) return;
     return window.devflow.onRunEvent((event) => {
-      setWorkspace((current) => applyRunEventToWorkspace(current, event));
-      const claim = claimCompletedBridgeRunPersistence(
-        workspaceRef.current,
-        event,
-        completedBridgeRunPersistenceClaims.current,
-      );
-      if (!claim) return;
-      void persistCompletedBridgeRunResult(claim.project, claim.session, claim.node).then((result) => {
-        if (!result) {
-          completedBridgeRunPersistenceClaims.current.delete(claim.runId);
-          return;
-        }
-        setWorkspace((current) => applyCompletedBridgeRunPersistenceResult(current, claim.runId, result));
+      setWorkspace((current) => {
+        const next = applyRunEventToWorkspace(current, event);
+        workspaceRef.current = next;
+        return next;
       });
     });
   }, []);
@@ -430,10 +663,19 @@ export default function App() {
     return window.devflow.onWorkflowEvent((event) => {
       const canvasSession = canvasSessionFromWorkflowEvent(event);
       if (!canvasSession) return;
-      setWorkspace((current) => ({
-        ...current,
-        sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
-      }));
+      workflowProjectionGenerationRef.current.set(
+        canvasSession.id,
+        (workflowProjectionGenerationRef.current.get(canvasSession.id) ?? 0) + 1,
+      );
+      setWorkspace((current) => {
+        const next = applyAuthoritativeWorkflowBroadcast(
+          current,
+          canvasSession,
+          newSessionSubmissionsRef.current,
+        );
+        workspaceRef.current = next;
+        return next;
+      });
     });
   }, []);
 
@@ -518,31 +760,15 @@ export default function App() {
   useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
     let active = true;
+    const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, activeSession);
     void window.devflow.getWorkflowProjection(activeProject.rootPath, activeSession.id).then((result) => {
       if (!active || !result.canvasSession) return;
-      setWorkspace((current) => ({
-        ...current,
-        sessions: current.sessions.map((session) => (session.id === result.canvasSession?.id ? result.canvasSession : session)),
-      }));
+      applyGuardedWorkflowSessionResponse(result.canvasSession, responseGuard);
     });
     return () => {
       active = false;
     };
   }, [activeProject?.id, activeSession?.id]);
-
-  useEffect(() => {
-    if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
-    for (const node of activeSession.nodes) {
-      if (!canUseAgentNodeActions(node)) continue;
-      if (node.status !== "running" && node.status !== "retrying") continue;
-      if (startedBridgeRuns.current.has(node.runId)) continue;
-      startedBridgeRuns.current.add(node.runId);
-      void startBridgeRun(activeProject, activeSession, node).then((result) => {
-        if (!result) return;
-        setWorkspace((current) => applyBridgeRunResult(current, result));
-      });
-    }
-  }, [activeProject, activeSession]);
 
   useEffect(() => {
     if (!window.devflow || !activeProject || !selectedNode) return;
@@ -637,6 +863,9 @@ export default function App() {
       const workflow = window.devflow?.workflow;
 
       if (workflow && activeProject) {
+        const requestSession = workspaceRef.current.sessions.find((session) => session.id === activeCanvasSessionId);
+        if (requestSession?.kind !== "canvas") throw new Error("Canvas session is unavailable.");
+        const responseGuard = captureWorkflowSessionResponseGuard(activeCanvasSessionId, requestSession);
         const updateId = crypto.randomUUID();
         const persistPosition = () => workflow.updateNodePosition(activeProject.rootPath, {
           sessionId: activeCanvasSessionId,
@@ -658,12 +887,7 @@ export default function App() {
           throw new Error("Saved canvas node was not returned.");
         }
 
-        setWorkspace((current) => ({
-          ...current,
-          sessions: current.sessions.map((session) =>
-            session.id === activeCanvasSessionId ? persistedSession : session,
-          ),
-        }));
+        applyGuardedWorkflowSessionResponse(persistedSession, responseGuard);
         return;
       }
 
@@ -700,26 +924,44 @@ export default function App() {
       } catch (e) {}
     }
 
-    const initialSession = goal
+    let initialSession = goal
       ? createSession(project.id, goal, initialMode, target)
       : null;
+    const initialResponseGuard = initialSession?.kind === "canvas"
+      ? captureWorkflowSessionResponseGuard(initialSession.id, null)
+      : null;
     if (initialSession?.kind === "canvas") {
-      await persistCanvasWorkflowSession(project, initialSession, "initial");
+      initialSession = await persistCanvasWorkflowSession(
+        project,
+        initialSession,
+        `initial-${initialSession.id}`,
+      );
     }
 
     setWorkspace((current) => {
-      const sessions = initialSession ? [...current.sessions, initialSession] : current.sessions;
-      return {
-        ...current,
-        projects: upsertProject(current.projects, project),
-        sessions,
+      const withProject = { ...current, projects: upsertProject(current.projects, project) };
+      const withInitialSession = initialSession?.kind === "canvas" && initialResponseGuard
+        ? applyAuthoritativeWorkflowSessionResponse(
+            withProject,
+            initialSession,
+            initialResponseGuard,
+            workflowProjectionGenerationRef.current.get(initialSession.id) ?? 0,
+          )
+        : initialSession
+          ? { ...withProject, sessions: [...withProject.sessions, initialSession] }
+          : withProject;
+      const sessions = withInitialSession.sessions;
+      const next = {
+        ...withInitialSession,
         changesets: initialSession
-          ? { ...current.changesets, ...changesetsForSession(initialSession) }
-          : current.changesets,
+          ? { ...withInitialSession.changesets, ...changesetsForSession(initialSession) }
+          : withInitialSession.changesets,
         activeProjectId: project.id,
         activeSessionId:
           initialSession?.id ?? chooseActiveSessionIdForProject(sessions, current.activeSessionId, project.id),
       };
+      workspaceRef.current = next;
+      return next;
     });
   }
 
@@ -741,18 +983,65 @@ export default function App() {
     const goal = newTaskGoal.trim();
     if (!resolvedNewTaskProjectId || !goal) return;
     const projectId = resolvedNewTaskProjectId;
-    const project = workspace.projects.find((item) => item.id === projectId);
-    const session = createSession(projectId, goal, newTaskMode, target);
-    if (project && session.kind === "canvas") {
-      await persistCanvasWorkflowSession(project, session, "composer");
+    const project = workspaceRef.current.projects.find((item) => item.id === projectId);
+    if (!project) return;
+    const scope = newSessionSubmissionScope(projectId, goal, newTaskMode, target);
+    const seed = newSessionSubmissionsRef.current.get(scope)?.session ??
+      createSession(projectId, goal, newTaskMode, target);
+    if (seed.kind !== "canvas") {
+      setWorkspace((current) => ({
+        ...current,
+        sessions: [...current.sessions, seed],
+        changesets: { ...current.changesets, ...changesetsForSession(seed) },
+        activeProjectId: projectId,
+        activeSessionId: seed.id,
+      }));
+      setNewTaskGoal("");
+      return;
     }
-    setWorkspace((current) => ({
-      ...current,
-      sessions: [...current.sessions, session],
-      changesets: { ...current.changesets, ...changesetsForSession(session) },
-      activeProjectId: projectId,
-      activeSessionId: session.id,
-    }));
+    const existingSeedSession = workspaceRef.current.sessions.find((session) => session.id === seed.id);
+    const createResponseGuard = captureWorkflowSessionResponseGuard(
+      seed.id,
+      existingSeedSession?.kind === "canvas" ? existingSeedSession : null,
+    );
+    const installAuthoritativeSession = (
+      session: CanvasSession,
+      responseGuard: WorkflowSessionResponseGuard,
+    ): void => {
+      applyGuardedWorkflowSessionResponse(session, responseGuard, (current) => ({
+        ...current,
+        changesets: { ...current.changesets, ...changesetsForSession(session) },
+        activeProjectId: projectId,
+        activeSessionId: session.id,
+      }));
+    };
+    const session = await submitNewSessionAttempt({
+      states: newSessionSubmissionsRef.current,
+      scope,
+      createAttempt: () => ({ session: seed, inputId: `composer-${seed.id}` }),
+      submit: (attempt) => persistCanvasWorkflowSession(
+        project,
+        attempt.session,
+        attempt.inputId,
+      ),
+      onStateChange: refreshNewSessionState,
+    });
+    if (!session) return;
+    if (window.devflow) {
+      installAuthoritativeSession(session, createResponseGuard);
+    } else {
+      setWorkspace((current) => {
+        const next = {
+          ...current,
+          sessions: upsertCanvasSession(current.sessions, session),
+          changesets: { ...current.changesets, ...changesetsForSession(session) },
+          activeProjectId: projectId,
+          activeSessionId: session.id,
+        };
+        workspaceRef.current = next;
+        return next;
+      });
+    }
     setNewTaskGoal("");
   }
 
@@ -938,9 +1227,10 @@ export default function App() {
       const accepted = workspaceRef.current.sessions.find((item) => item.id === session.id);
       if (accepted?.kind !== "plan" || !acceptedResult.snapshot.accepted.tasks || !canFinishPlan(accepted)) return;
       const boundary = capturePlanFinishBoundary(accepted);
+      const responseGeneration = workflowProjectionGenerationRef.current.get(accepted.id) ?? 0;
       const canvas = await finishPlanSession(project, accepted);
-      registerBackendStartedCanvasRuns(startedBridgeRuns.current, canvas);
       setWorkspace((current) => {
+        if ((workflowProjectionGenerationRef.current.get(accepted.id) ?? 0) !== responseGeneration) return current;
         const result = installFinishedPlanCanvas(current, boundary, canvas);
         workspaceRef.current = result.workspace;
         return result.workspace;
@@ -966,13 +1256,6 @@ export default function App() {
       sessions: current.sessions.map((session) =>
         session.id === sessionId && session.kind === "canvas" ? updater(session) : session,
       ),
-    }));
-  }
-
-  function replaceCanvasSession(session: CanvasSession) {
-    setWorkspace((current) => ({
-      ...current,
-      sessions: current.sessions.map((item) => (item.id === session.id ? session : item)),
     }));
   }
 
@@ -1031,13 +1314,37 @@ export default function App() {
       await submitSelectedNodeAction(action, text);
       return;
     }
-    if (window.devflow && activeProject) {
-      await window.devflow.appendWorkflowUserInput(activeProject.rootPath, {
-        sessionId: activeSession.id,
-        inputId: `bottom-${Date.now()}`,
+    if (window.devflow) {
+      const devflow = window.devflow;
+      if (!activeProject || !bottomComposerScope) return;
+      const projectRoot = activeProject.rootPath;
+      const sessionId = activeSession.id;
+      const responseGuard = captureWorkflowSessionResponseGuard(sessionId, activeSession);
+      const authoritativeSession = await submitBottomComposerAttempt({
+        states: bottomComposerSubmissionsRef.current,
+        scope: bottomComposerScope,
         text,
-        now: new Date().toISOString(),
+        createInputId: () => `bottom-${globalThis.crypto.randomUUID()}`,
+        submit: async (inputId) => {
+          const result = await devflow.appendWorkflowUserInput(projectRoot, {
+            sessionId,
+            inputId,
+            text,
+            now: new Date().toISOString(),
+          });
+          if (!isCanvasSession(result.canvasSession) || result.canvasSession.id !== sessionId) {
+            throw new Error("Authoritative canvas session was not returned.");
+          }
+          return result.canvasSession;
+        },
+        onStateChange: refreshBottomComposerState,
       });
+      if (!authoritativeSession) return;
+      applyGuardedWorkflowSessionResponse(authoritativeSession, responseGuard);
+      if (activeBottomComposerScopeRef.current === bottomComposerScope) {
+        setBottomGoal((current) => current.trim() === text ? "" : current);
+      }
+      return;
     }
     const result = addRequirementPlanningNode(activeSession, text, {
       now: new Date().toISOString(),
@@ -1062,6 +1369,7 @@ export default function App() {
 
     const actionState = selectedNodeActionState;
     const actionScope = { sessionId: activeSession.id, nodeId: selectedNode.id };
+    const workflowResponseGuard = captureWorkflowSessionResponseGuard(activeSession.id, activeSession);
     const actionGeneration = selectedNodeActionGenerationRef.current + 1;
     selectedNodeActionGenerationRef.current = actionGeneration;
     const actionStillCurrent = () =>
@@ -1088,7 +1396,7 @@ export default function App() {
           instruction: requestText,
         });
         if (!actionStillCurrent()) return;
-        applyWorkflowActionResult(result, actionStillCurrent);
+        applyWorkflowActionResult(result, workflowResponseGuard, actionStillCurrent);
         setNodeActionStatus("Repair lane requested.");
         setNodeActionText("");
         return;
@@ -1109,7 +1417,7 @@ export default function App() {
           instruction: requestText,
         });
         if (!actionStillCurrent()) return;
-        applyWorkflowActionResult(result, actionStillCurrent);
+        applyWorkflowActionResult(result, workflowResponseGuard, actionStillCurrent);
         setNodeActionStatus("Variant lane requested.");
         setNodeActionText("");
         return;
@@ -1135,7 +1443,7 @@ export default function App() {
         await refreshWorkflowProjection(actionStillCurrent);
         return;
       }
-      applyWorkflowActionResult(result, actionStillCurrent);
+      applyWorkflowActionResult(result, workflowResponseGuard, actionStillCurrent);
       setNodeActionStatus("Rollback affects selected and downstream workflow state, not evidence/history.");
       setNodeActionText("");
     } catch (error) {
@@ -1145,14 +1453,15 @@ export default function App() {
     }
   }
 
-  function applyWorkflowActionResult(result: unknown, shouldApply?: () => boolean) {
+  function applyWorkflowActionResult(
+    result: unknown,
+    responseGuard: WorkflowSessionResponseGuard,
+    shouldApply?: () => boolean,
+  ) {
     if (shouldApply && !shouldApply()) return;
     const canvasSession = canvasSessionFromWorkflowResult(result);
     if (canvasSession) {
-      setWorkspace((current) => ({
-        ...current,
-        sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
-      }));
+      applyGuardedWorkflowSessionResponse(canvasSession, responseGuard);
       return;
     }
     void refreshWorkflowProjection(shouldApply);
@@ -1161,19 +1470,21 @@ export default function App() {
   async function refreshWorkflowProjection(shouldApply?: () => boolean) {
     if (shouldApply && !shouldApply()) return;
     if (!activeProject || activeSession?.kind !== "canvas" || !window.devflow?.workflow) return;
+    const requestSession = workspaceRef.current.sessions.find((session) => session.id === activeSession.id);
+    if (requestSession?.kind !== "canvas") return;
+    const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, requestSession);
     const result = await window.devflow.workflow.getProjection(activeProject.rootPath, activeSession.id);
     if (shouldApply && !shouldApply()) return;
     if (!result.canvasSession) return;
-    const canvasSession = result.canvasSession;
-    setWorkspace((current) => ({
-      ...current,
-      sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
-    }));
+    applyGuardedWorkflowSessionResponse(result.canvasSession, responseGuard);
   }
 
   function retryNode(nodeId: string) {
     if (!activeSession || activeSession.kind !== "canvas") return;
-    updateCanvasSession(activeSession.id, (session) => retryCanvasNode(session, nodeId, new Date().toISOString()));
+    if (window.devflow) return;
+    updateCanvasSession(activeSession.id, (session) =>
+      retryCanvasNodeForRuntime(session, nodeId, new Date().toISOString(), false),
+    );
   }
 
   function answerUserDecision(nodeId: string, selectedOption: string) {
@@ -1181,6 +1492,7 @@ export default function App() {
     const action = actionForDecisionOption(selectedOption);
 
     if (window.devflow && activeProject) {
+      const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, activeSession);
       void window.devflow.workflow.answerUserDecision(activeProject.rootPath, {
         sessionId: activeSession.id,
         decisionId: nodeId,
@@ -1189,11 +1501,7 @@ export default function App() {
       }).then((result) => {
         const { canvasSession } = result;
         if (canvasSession) {
-          const updatedSession = canvasSession;
-          setWorkspace((current) => ({
-            ...current,
-            sessions: current.sessions.map((session) => (session.id === updatedSession.id ? updatedSession : session)),
-          }));
+          applyGuardedWorkflowSessionResponse(canvasSession, responseGuard);
         }
       });
       return;
@@ -1235,6 +1543,7 @@ export default function App() {
 
     setNodeActionError(null);
     const requestId = crypto.randomUUID();
+    const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, activeSession);
     void window.devflow.workflow.reassignLane(activeProject.rootPath, {
       requestId,
       sessionId: activeSession.id,
@@ -1242,10 +1551,7 @@ export default function App() {
       agentKind: nextAgent,
     }).then((result) => {
       const { canvasSession } = result;
-      setWorkspace((current) => ({
-        ...current,
-        sessions: current.sessions.map((session) => (session.id === canvasSession.id ? canvasSession : session)),
-      }));
+      applyGuardedWorkflowSessionResponse(canvasSession, responseGuard);
     }).catch((error) => {
       setNodeActionError(error instanceof Error ? error.message : "Failed to reassign workflow lane.");
     });
@@ -1269,6 +1575,9 @@ export default function App() {
           nodeId,
           pending.requestId ?? undefined,
         );
+        const requestSession = workspaceRef.current.sessions.find((session) => session.id === activeSession.id);
+        if (requestSession?.kind !== "canvas") return;
+        const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, requestSession);
         await submitInsertBeforeIntent({
           projectRoot: activeProject.rootPath,
           sessionId: activeSession.id,
@@ -1276,7 +1585,7 @@ export default function App() {
           requestId,
           insertBefore: desktopInsertBefore,
           replaceCanvasSession: (session) => {
-            replaceCanvasSession(session);
+            applyGuardedWorkflowSessionResponse(session, responseGuard);
             insertBeforeIntentRequests.current.clear(activeSession.id, nodeId);
           },
         });
@@ -1408,12 +1717,25 @@ export default function App() {
               onRetryRuntimeState={() => recoverPlanRuntime(activeProject, activeSession.id)}
             />
           )}
+          {activeNewSessionFailure && (
+            <p className="composer-action-message error" role="alert">
+              {activeNewSessionFailure.error}
+              <button
+                className="send-stamp-btn"
+                type="button"
+                onClick={() => { void addSessionFromComposer(activeNewSessionFailure.session.target); }}
+              >
+                Retry
+              </button>
+            </p>
+          )}
           {activeSession?.kind === "canvas" && (
             <CanvasView
               session={activeSession}
               agentReadiness={agentReadiness}
               composerValue={selectedNode ? nodeActionText : bottomGoal}
-              composerDisabled={false}
+              composerDisabled={!selectedNode && bottomComposerState?.busy === true}
+              bottomComposerState={bottomComposerState}
               selectedNode={selectedNode}
               selectedRunEvidence={selectedNode ? workspace.runEvidence?.[selectedNode.runId] ?? null : null}
               selectedNodeActionScopeKey={selectedNodeActionScopeKey}
@@ -1448,6 +1770,7 @@ export default function App() {
               onGoalChange={setNewTaskGoal}
               onModeChange={setNewTaskMode}
               onProjectChange={setNewTaskProjectId}
+              submissionStates={newSessionSubmissionsRef.current}
               onCreate={addSessionFromComposer}
             />
           )}
@@ -1466,6 +1789,7 @@ export default function App() {
           onClose={() => setInspectedNodeId(null)}
           onStop={() => stopNodeRun(inspectedNode)}
           onRetry={() => retryNode(inspectedNode.id)}
+          retryUnavailableReason={window.devflow ? DESKTOP_RETRY_UNAVAILABLE_REASON : null}
           onReassign={() => reassignNode(inspectedNode.id)}
           onInsertBefore={() => insertBefore(inspectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
@@ -1694,6 +2018,7 @@ function ProjectStartPage({
   onGoalChange,
   onModeChange,
   onProjectChange,
+  submissionStates,
   onCreate,
 }: {
   goal: string;
@@ -1703,7 +2028,8 @@ function ProjectStartPage({
   onGoalChange: (goal: string) => void;
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
-  onCreate: (target: SessionTarget) => void;
+  submissionStates: Map<string, NewSessionSubmissionState>;
+  onCreate: (target: SessionTarget) => Promise<void>;
 }) {
   return (
     <section className="empty-stage">
@@ -1719,6 +2045,7 @@ function ProjectStartPage({
           onGoalChange={onGoalChange}
           onModeChange={onModeChange}
           onProjectChange={onProjectChange}
+          submissionStates={submissionStates}
           onCreate={onCreate}
         />
       </div>
@@ -1866,6 +2193,7 @@ function SessionComposer({
   onGoalChange,
   onModeChange,
   onProjectChange,
+  submissionStates,
   onClose,
   onCreate,
 }: {
@@ -1878,13 +2206,13 @@ function SessionComposer({
   onGoalChange: (goal: string) => void;
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
+  submissionStates: Map<string, NewSessionSubmissionState>;
   onClose?: () => void;
-  onCreate: (target: SessionTarget) => void;
+  onCreate: (target: SessionTarget) => Promise<void>;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const hasGoal = goal.trim().length > 0;
-  const canCreate = hasGoal && selectedProjectId !== null;
 
   const [executionTarget, setExecutionTarget] = useState<"current_branch" | "new_worktree">("current_branch");
   const [selectedBranch, setSelectedBranch] = useState<string>("HEAD");
@@ -1909,6 +2237,11 @@ function SessionComposer({
   }, [selectedProjectId, projects]);
 
   const activeTarget = deriveSessionTarget(executionTarget, selectedBranch);
+  const submissionScope = selectedProjectId
+    ? newSessionSubmissionScope(selectedProjectId, goal, mode, activeTarget)
+    : null;
+  const submissionState = submissionScope ? submissionStates.get(submissionScope) ?? null : null;
+  const canCreate = hasGoal && selectedProjectId !== null && submissionState?.busy !== true;
   const className = [
     "new-session-intake",
     variant === "inline" ? "inline-session-intake" : "",
@@ -1955,12 +2288,12 @@ function SessionComposer({
           rotation: -0.8,
           duration: 0.18,
           ease: "power2.in",
-          onComplete: () => onCreate(activeTarget),
+          onComplete: () => { void onCreate(activeTarget); },
         });
         return;
       }
     }
-    onCreate(activeTarget);
+    void onCreate(activeTarget);
   });
 
   return (
@@ -2052,6 +2385,11 @@ function SessionComposer({
           </button>
         </div>
       </div>
+      {submissionState?.error ? (
+        <p className="composer-action-message error" role="alert">{submissionState.error}</p>
+      ) : submissionState?.busy ? (
+        <p className="composer-action-message" role="status">Creating session…</p>
+      ) : null}
     </form>
   );
 }
@@ -2619,6 +2957,7 @@ function CanvasView({
   agentReadiness,
   composerValue,
   composerDisabled,
+  bottomComposerState,
   selectedNode,
   selectedRunEvidence,
   selectedNodeActionScopeKey,
@@ -2640,6 +2979,7 @@ function CanvasView({
   agentReadiness: AgentWorkflowReadinessSummary | null;
   composerValue: string;
   composerDisabled: boolean;
+  bottomComposerState: BottomComposerSubmissionState | null;
   selectedNode: CanvasNode | null;
   selectedRunEvidence: RunEvidence | null;
   selectedNodeActionScopeKey: string | null;
@@ -2772,6 +3112,7 @@ function CanvasView({
       <CanvasComposer
         value={composerValue}
         disabled={composerDisabled}
+        bottomComposerState={bottomComposerState}
         selectedNode={selectedNode}
         selectedRunEvidence={selectedRunEvidence}
         selectedNodeActionScopeKey={selectedNodeActionScopeKey}
@@ -3558,6 +3899,7 @@ function NodeModal({
   onClose,
   onStop,
   onRetry,
+  retryUnavailableReason,
   onReassign,
   onInsertBefore,
   onOpenEditor,
@@ -3573,6 +3915,7 @@ function NodeModal({
   onClose: () => void;
   onStop: () => void;
   onRetry: () => void;
+  retryUnavailableReason: string | null;
   onReassign: () => void;
   onInsertBefore: () => void;
   onOpenEditor: (editor: EditorKind) => void;
@@ -3585,6 +3928,7 @@ function NodeModal({
   const nodeFailureSummary = failureSummaryForNode(node, runEvidence);
   const nodeLatestFailedCheck = latestFailedCheckForDisplay(runEvidence);
   const nodeLastEvidence = lastRunEvidenceForDisplay(runEvidence);
+  const retryUnavailableReasonId = `node-retry-unavailable-${stableId(node.id)}`;
 
   useGSAP(
     () => {
@@ -3640,10 +3984,20 @@ function NodeModal({
             <Square size={15} />
             Stop
           </button>
-          <button onClick={onRetry} disabled={!canExecute}>
+          <button
+            onClick={onRetry}
+            disabled={!canExecute || retryUnavailableReason !== null}
+            title={retryUnavailableReason ?? undefined}
+            aria-describedby={retryUnavailableReason ? retryUnavailableReasonId : undefined}
+          >
             <RefreshCw size={15} />
             Retry
           </button>
+          {retryUnavailableReason && (
+            <span id={retryUnavailableReasonId} className="sr-only">
+              {retryUnavailableReason}
+            </span>
+          )}
           <button onClick={onReassign} disabled={!canExecute}>
             <Users size={15} />
             Reassign
@@ -5802,6 +6156,7 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
 function CanvasComposer({
   value,
   disabled,
+  bottomComposerState,
   selectedNode,
   selectedRunEvidence,
   selectedNodeActionScopeKey,
@@ -5816,6 +6171,7 @@ function CanvasComposer({
 }: {
   value: string;
   disabled: boolean;
+  bottomComposerState: BottomComposerSubmissionState | null;
   selectedNode: CanvasNode | null;
   selectedRunEvidence: RunEvidence | null;
   selectedNodeActionScopeKey: string | null;
@@ -6011,6 +6367,11 @@ function CanvasComposer({
           </div>
         </div>
       )}
+      {!selectedNode && bottomComposerState?.error ? (
+        <p className="composer-action-message error" role="alert">{bottomComposerState.error}</p>
+      ) : !selectedNode && bottomComposerState?.busy ? (
+        <p className="composer-action-message" role="status">Submitting requirement…</p>
+      ) : null}
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
         <input
           className="canvas-composer-input"
@@ -6474,14 +6835,6 @@ export function installFinishedPlanCanvas(
   };
 }
 
-export function registerBackendStartedCanvasRuns(startedRuns: Set<string>, canvas: CanvasSession): void {
-  for (const node of canvas.nodes) {
-    if ((node.status === "running" || node.status === "retrying") && node.runId) {
-      startedRuns.add(node.runId);
-    }
-  }
-}
-
 function planMatchesFinishBoundary(session: PlanSession, boundary: PlanFinishBoundary): boolean {
   if (
     session.id !== boundary.planSessionId ||
@@ -6566,12 +6919,10 @@ export async function finishPlanSession(
 async function persistCanvasWorkflowSession(
   project: ImportedProject,
   session: CanvasSession,
-  inputSource: string,
-  workflowInput = session.goal,
-  requireAuthoritativeCanvas = false,
+  inputId: string,
 ): Promise<CanvasSession> {
   if (!window.devflow) return session;
-  await window.devflow.createWorkflowSession(project.rootPath, {
+  const created = await window.devflow.createWorkflowSession(project.rootPath, {
     id: session.id,
     projectId: session.projectId,
     title: session.title,
@@ -6581,19 +6932,13 @@ async function persistCanvasWorkflowSession(
     plannerProfile: "default",
     transport: "hermes_replay_recovery",
     recoveryReason: "SkyTurn event ledger initializes planner continuity.",
+    inputId,
     now: session.createdAt,
   });
-  const result = await window.devflow.appendWorkflowUserInput(project.rootPath, {
-    sessionId: session.id,
-    inputId: `${inputSource}-${session.id}`,
-    text: workflowInput,
-    now: session.createdAt,
-  });
-  if (!isCanvasSession(result.canvasSession) || result.canvasSession.id !== session.id) {
-    if (requireAuthoritativeCanvas) throw new Error("Authoritative canvas session was not returned.");
-    return session;
+  if (!isCanvasSession(created.canvasSession) || created.canvasSession.id !== session.id) {
+    throw new Error("Authoritative canvas session was not returned.");
   }
-  return result.canvasSession;
+  return created.canvasSession;
 }
 
 function canvasSessionFromWorkflowEvent(event: unknown): CanvasSession | null {
@@ -6646,11 +6991,18 @@ export function applyPlanEventToWorkspace(workspace: WorkspaceState, event: Plan
   return changed ? { ...workspace, sessions } : workspace;
 }
 
-function createSession(projectId: string, goal: string, mode: WorkflowMode, target: SessionTarget): CanvasSessionTab {
-  const createdAt = new Date().toISOString();
+export function createSession(
+  projectId: string,
+  goal: string,
+  mode: WorkflowMode,
+  target: SessionTarget,
+  options: { createdAt?: string; randomUUID?: () => string } = {},
+): CanvasSessionTab {
+  const createdAt = options.createdAt ?? new Date().toISOString();
+  const randomUUID = options.randomUUID ?? (() => globalThis.crypto.randomUUID());
   return mode === "fast"
-    ? createFastCanvasSession({ projectId, goal, createdAt, target })
-    : createPlanSession({ projectId, goal, createdAt, target });
+    ? createFastCanvasSession({ projectId, goal, createdAt, target }, { randomUUID })
+    : createPlanSession({ projectId, goal, createdAt, target }, { randomUUID });
 }
 
 function changesetsForSession(session: CanvasSessionTab): WorkspaceState["changesets"] {

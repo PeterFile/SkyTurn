@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -32,8 +32,17 @@ import {
 } from "./workflowIpcContracts";
 import { compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
 import { createTerminalRuntime } from "./terminalRuntime";
-import { compensateFailedWorkflowRun, recoverTerminalWorkflowRuns } from "./workflowRunRecovery";
-import { createRunStartHandler, type TrustedRunStartIdentity } from "./runStartHandler";
+import {
+  compensateFailedWorkflowRun,
+  recoverPendingPlannerIntentReconciliations,
+  recoverTerminalWorkflowRuns,
+} from "./workflowRunRecovery";
+import {
+  assertPublicRunStartIsNotScheduled,
+  createRunStartHandler,
+  type RunStartDependencies,
+  type TrustedRunStartIdentity,
+} from "./runStartHandler";
 import { resolveCurrentBranchRunBaseline } from "./workflowCheckpointRuntime";
 import {
   parsePlanBootstrapRequest,
@@ -98,6 +107,8 @@ interface WorkflowSessionCreateInput {
   processId?: unknown;
   opaqueHandle?: unknown;
   recoveryReason?: unknown;
+  inputId?: unknown;
+  now?: unknown;
 }
 
 interface WorkflowAppendUserInput {
@@ -111,15 +122,6 @@ interface WorkflowAppendUserInput {
 interface WorkflowFinishPlanInput {
   planSessionId?: unknown;
   session?: unknown;
-}
-
-interface WorkflowRecordRunResultInput {
-  sessionId?: unknown;
-  laneId?: unknown;
-  segmentId?: unknown;
-  runId?: unknown;
-  agentKind?: unknown;
-  now?: unknown;
 }
 
 interface WorkflowLaneReassignInput {
@@ -566,7 +568,6 @@ interface ValidatedWorkspaceCollections {
 
 const RUN_PROTOCOL_VERSION = 1;
 const planRuntimeShutdownError = "Plan runtime is unavailable while SkyTurn is shutting down.";
-const workflowUserInputDeliveryError = "Workflow user input could not be delivered.";
 const workspaceLoadError = "Workspace could not be loaded.";
 const workspaceSaveError = "Workspace could not be saved.";
 const workspaceSaveUnavailableError = "Workspace saving is unavailable while SkyTurn is shutting down.";
@@ -581,6 +582,9 @@ let planRuntime: ReturnType<typeof createPlanRuntime> | null = null;
 let workflowStoresClosePromise: Promise<void> | null = null;
 const workflowStores = new Map<string, WorkflowStoreHost>();
 const workflowStoreInitializations = new Map<string, Promise<WorkflowStoreHost>>();
+const workflowSessionAdvanceFlights = new Map<string, Promise<void>>();
+const workflowProjectAdvanceTails = new Map<string, Promise<void>>();
+const MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT = 4;
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
 const workflowSessionMutationLocks = new Map<string, Promise<void>>();
 let remoteSideEffectSequence = 0;
@@ -612,8 +616,19 @@ interface TerminalPersistenceFailureLike {
   evidence: unknown;
 }
 
+interface WorkflowSegmentRendererFacts {
+  laneId: string;
+  segmentId: string;
+  runId: string;
+  status: string;
+  exitCode: number | null;
+  evidence: unknown;
+}
+
 interface WorkflowStoreHost {
+  listWorkflowSessionIds(): string[];
   createWorkflowSession(input: unknown): unknown;
+  getPlannerStartAuthorization(sessionId: string): unknown;
   assertPlanFinishWorkflowSessionAvailable(input: unknown): unknown;
   createPlanFinishWorkflowSession(input: unknown): unknown;
   appendUserInput(input: unknown): unknown;
@@ -622,7 +637,10 @@ interface WorkflowStoreHost {
   buildLedgerSummary(sessionId: string): WorkflowLedgerSummary;
   appendWorkflowEvent(input: unknown): unknown;
   applyWorkflowIntent(intent: unknown, now: string): { ok: boolean };
-  scheduleReadyLanes(sessionId: string, input: unknown): unknown;
+  scheduleReadyLanes(sessionId: string, input: unknown): {
+    readyLanes: Array<{ id: string; runId: string; segmentId: string }>;
+    projection: unknown;
+  };
   recordRunResult(input: unknown): unknown;
   claimPlannerRunStart(input: unknown): {
     segment: {
@@ -640,7 +658,7 @@ interface WorkflowStoreHost {
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
-  listSegments(sessionId: string, laneId: string): Array<{ runId: string; status: string }>;
+  listSegments(sessionId: string, laneId: string): WorkflowSegmentRendererFacts[];
   listRunningSegments(): Array<{
     sessionId: string;
     laneId: string;
@@ -655,6 +673,12 @@ interface WorkflowStoreHost {
     runId: string;
     agentKind: string;
   }>;
+  getPlannerIntentReconciliationFacts(segment: unknown): {
+    evidence: unknown;
+    output: string;
+    completedAt: string;
+  };
+  completePlannerIntentReconciliation(segment: unknown, disposition: unknown, now: string): unknown;
   recordPlannerIntentReconciled(segment: unknown, now: string): unknown;
   listPendingRunCheckpointEnrichments(): Array<{
     sessionId: string;
@@ -701,10 +725,13 @@ async function createMainWindow(): Promise<void> {
 }
 
 ipcMain.handle("project:open", async (): Promise<OpenProjectResult> => {
-  const result = await dialog.showOpenDialog({
-    title: "Open Project",
-    properties: ["openDirectory"],
-  });
+  const acceptanceProjectRoot = newSessionUiAcceptanceProjectRoot();
+  const result = acceptanceProjectRoot
+    ? { canceled: false, filePaths: [acceptanceProjectRoot] }
+    : await dialog.showOpenDialog({
+        title: "Open Project",
+        properties: ["openDirectory"],
+      });
 
   if (result.canceled || result.filePaths.length === 0) {
     return { canceled: true };
@@ -713,6 +740,7 @@ ipcMain.handle("project:open", async (): Promise<OpenProjectResult> => {
   const rootPath = result.filePaths[0];
   const canonicalRootPath = await planProjectIdentities.remember(rootPath);
   openedProjectRoots.add(rootPath);
+  openedProjectRoots.add(canonicalRootPath);
   return {
     canceled: false,
     project: {
@@ -779,22 +807,59 @@ ipcMain.handle("agent:health", async () => {
   };
 });
 
-const runStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
-  preAuthorizeStart: async (input) => {
-    const { assertExpectedArtifactVerifierCapability } = await import("@skyturn/agent-bridge");
-    await assertExpectedArtifactVerifierCapability(input.expectedArtifacts);
-  },
-  authorizeStartInput: async (input) => {
-    assertKnownProjectRoot(input.projectRoot);
-    return authorizeRunStartExpectedArtifacts(input, await getWorkflowStore(input.projectRoot));
-  },
-  resolveIdentity: trustedRunStartIdentity,
-  acquireStore: (identity) => getWorkflowStore(identity.projectRoot),
-  reopenStore: reopenWorkflowStore,
-  assertStartInput: async (input, store) => {
-    await assertExecutableStartInput(input, store);
-    await assertTrustedScheduledRunStartIdentity(input, store);
-  },
+function workflowRunStartDependencies(): Omit<
+  RunStartDependencies<StartAgentRunInput, unknown, WorkflowStoreHost>,
+  "authorizeStartInput" | "claimUnscheduledStart"
+> {
+  return {
+    resolveIdentity: (input, knownStore) => trustedRunStartIdentity(input, knownStore === undefined),
+    acquireStore: (identity) => getWorkflowStore(identity.projectRoot),
+    reopenStore: reopenWorkflowStore,
+    assertStartInput: async (input, store) => {
+      await assertExecutableStartInput(input, store);
+      await assertTrustedScheduledRunStartIdentity(input, store);
+    },
+    prepareBeforeCheckpoint: async (input, store) => {
+      if (!isExecutableCheckpointLane(store, input.sessionId, input.nodeId)) return false;
+      const identity = await resolveExecutableRunIdentity(input, "before", store);
+      const changeset = await reconcileRunChangeset(input.projectRoot, identity, []);
+      const stableIdentity = await verifyRunGitIdentityAtCheckpoint(identity);
+      const changesetEvidenceId = recordRunChangesetEvidence(store, stableIdentity, "before", changeset);
+      store.recordRunCheckpoint(runCheckpointInput(stableIdentity, "before", changesetEvidenceId, new Date().toISOString()));
+      return true;
+    },
+    startRun: async (input) => (await getAgentBridge()).startRun(input),
+    reconcileTerminal: async (store, segment, identity) => {
+      await reconcileTerminalWorkflowRun(store, await getAgentBridge(), identity.projectRoot, segment);
+    },
+    compensateTerminal: compensateFailedWorkflowRun,
+    recordReconciliationFailure: (store, segment, error) => {
+      store.appendWorkflowEvent({
+        sessionId: segment.sessionId,
+        kind: "workflow.run.start_reconciliation_failed",
+        source: "electron-main",
+        laneId: segment.laneId,
+        segmentId: segment.segmentId,
+        idempotencyKey: `run-start:${segment.runId}:reconciliation-failed`,
+        payload: { runId: segment.runId, status: "failed", reason: "terminal-recovery-failed" },
+        now: new Date().toISOString(),
+      });
+    },
+    enrichAfterCheckpoint: async (store, segment, identity) => {
+      await enrichTerminalWorkflowRun(store, await getAgentBridge().catch(() => null), identity.projectRoot, segment);
+    },
+    recordBeforeCheckpointFailure: (store, segment, error) => recordRunCheckpointFailure(store, {
+      ...segment, phase: "before", error, now: new Date().toISOString(),
+    }),
+    recordAfterCheckpointFailure: (store, segment, error) => recordRunCheckpointFailure(store, {
+      ...segment, phase: "after", error, now: new Date().toISOString(),
+    }),
+  };
+}
+
+const plannerRunStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
+  ...workflowRunStartDependencies(),
+  authorizeStartInput: (input, knownStore) => authorizeWorkflowRunStartInput(input, "planner", knownStore),
   claimUnscheduledStart: (input, store, identity) => {
     if (!isTrustedPlannerRootStartInput(input, store)) return null;
     return store.claimPlannerRunStart({
@@ -804,45 +869,50 @@ const runStartHandler = createRunStartHandler<StartAgentRunInput, unknown, Workf
       now: new Date().toISOString(),
     });
   },
-  prepareBeforeCheckpoint: async (input, store) => {
-    if (!isExecutableCheckpointLane(store, input.sessionId, input.nodeId)) return false;
-    const identity = await resolveExecutableRunIdentity(input, "before", store);
-    const changeset = await reconcileRunChangeset(input.projectRoot, identity, []);
-    const stableIdentity = await verifyRunGitIdentityAtCheckpoint(identity);
-    const changesetEvidenceId = recordRunChangesetEvidence(store, stableIdentity, "before", changeset);
-    store.recordRunCheckpoint(runCheckpointInput(stableIdentity, "before", changesetEvidenceId, new Date().toISOString()));
-    return true;
-  },
-  startRun: async (input) => (await getAgentBridge()).startRun(input),
-  reconcileTerminal: async (store, segment, identity) => {
-    await reconcileTerminalWorkflowRun(store, await getAgentBridge(), identity.projectRoot, segment);
-  },
-  compensateTerminal: compensateFailedWorkflowRun,
-  recordReconciliationFailure: (store, segment, error) => {
-    store.appendWorkflowEvent({
-      sessionId: segment.sessionId,
-      kind: "workflow.run.start_reconciliation_failed",
-      source: "electron-main",
-      laneId: segment.laneId,
-      segmentId: segment.segmentId,
-      idempotencyKey: `run-start:${segment.runId}:reconciliation-failed`,
-      payload: { runId: segment.runId, status: "failed", reason: "terminal-recovery-failed" },
-      now: new Date().toISOString(),
-    });
-  },
-  enrichAfterCheckpoint: async (store, segment, identity) => {
-    await enrichTerminalWorkflowRun(store, await getAgentBridge().catch(() => null), identity.projectRoot, segment);
-  },
-  recordBeforeCheckpointFailure: (store, segment, error) => recordRunCheckpointFailure(store, {
-    ...segment, phase: "before", error, now: new Date().toISOString(),
-  }),
-  recordAfterCheckpointFailure: (store, segment, error) => recordRunCheckpointFailure(store, {
-    ...segment, phase: "after", error, now: new Date().toISOString(),
-  }),
 });
 
+const scheduledWorkflowRunStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
+  ...workflowRunStartDependencies(),
+  authorizeStartInput: (input, knownStore) => authorizeWorkflowRunStartInput(input, "scheduler", knownStore),
+  scheduledStartsRequireOwnership: true,
+});
+
+const publicRunStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
+  ...workflowRunStartDependencies(),
+  authorizeStartInput: (input, knownStore) => authorizeWorkflowRunStartInput(input, "renderer", knownStore),
+  scheduledStartsRequireOwnership: true,
+});
+
+async function authorizeWorkflowRunStartInput(
+  input: StartAgentRunInput,
+  authority: "planner" | "scheduler" | "renderer",
+  knownStore?: WorkflowStoreHost,
+): Promise<StartAgentRunInput> {
+  if (!knownStore) assertKnownProjectRoot(input.projectRoot);
+  const store = knownStore ?? await getWorkflowStore(input.projectRoot);
+  if (authority === "renderer") {
+    if (isWorkflowPlannerRootStartTarget(input, store)) {
+      throw workflowIpcError("DELIVERY_REJECTED", "The renderer cannot start the workflow planner root.");
+    }
+    assertPublicRunStartIsNotScheduled(input, store);
+  }
+  const authorized = await authorizeRunStartExpectedArtifacts(input, store);
+  const { assertExpectedArtifactVerifierCapability } = await import("@skyturn/agent-bridge");
+  await assertExpectedArtifactVerifierCapability(authorized.expectedArtifacts);
+  return authorized;
+}
+
+function isWorkflowPlannerRootStartTarget(
+  input: StartAgentRunInput,
+  store: WorkflowStoreHost,
+): boolean {
+  if (typeof input.sessionId !== "string" || typeof input.nodeId !== "string") return false;
+  const authorization = store.getPlannerStartAuthorization(input.sessionId);
+  return isRecord(authorization) && authorization.plannerNodeId === input.nodeId;
+}
+
 ipcMain.handle("run:start", async (_event, input: StartAgentRunInput) => {
-  const run = await runStartHandler(input);
+  const run = await publicRunStartHandler(input);
   return { protocolVersion: RUN_PROTOCOL_VERSION, run };
 });
 
@@ -966,18 +1036,20 @@ ipcMain.handle("plan:getState", async (_event, input: unknown) => {
 ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, input: WorkflowSessionCreateInput) => {
   assertKnownProjectRoot(projectRoot);
   const sessionId = assertWorkflowSessionId(input.id ?? input.sessionId);
+  const goal = requireText(input.goal, "workflow session goal");
+  const inputId = optionalText(input.inputId) ?? `initial-${sessionId}`;
+  const now = optionalText(input.now) ?? new Date().toISOString();
   const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
   return await withWorkflowSessionMutationLock(workflowProjectRoot, sessionId, async () => {
     const store = await getWorkflowStore(projectRoot);
     const inputOpaqueHandle = optionalText(input.opaqueHandle);
     const opaqueHandle = inputOpaqueHandle ?? `skyturn-ipc:${sessionId}`;
-    const hermesSessionHandle = explicitHermesSessionHandle(inputOpaqueHandle);
     const target = await resolveAuthoritativeWorkflowSessionTarget(projectRoot, input.target);
     const session = store.createWorkflowSession({
       id: sessionId,
       projectId: optionalText(input.projectId) ?? path.basename(projectRoot),
       title: optionalText(input.title) ?? "Workflow session",
-      goal: requireText(input.goal, "workflow session goal"),
+      goal,
       mode: input.mode === "plan" ? "plan" : "fast",
       target,
       plannerProfile: optionalText(input.plannerProfile) ?? "default",
@@ -985,16 +1057,23 @@ ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, inp
       processId: typeof input.processId === "number" ? input.processId : undefined,
       opaqueHandle,
       recoveryReason: optionalText(input.recoveryReason),
-      now: optionalText(readField(input, "now")) ?? new Date().toISOString(),
+      now,
     });
-    const materializedSession = store.materializeCanvasSession(sessionId);
-    await terminalRuntime.startHermesPlannerForWorkflowSession({
+    const plannerSessionId = requireText(readField(session, "hermesSessionId"), "workflow planner session id");
+    const plannerNodeId = requireText(readField(session, "plannerLaneId"), "workflow planner node id");
+    await deliverWorkflowUserInputToPlanner({
+      store,
       projectRoot,
-      canvasSessionId: sessionId,
-      runId: `hermes-planner-${sessionId}`,
-      plannerSessionId: isRecord(materializedSession) ? optionalText(materializedSession.hermesPlannerSessionId) ?? undefined : undefined,
-      ...(hermesSessionHandle ? { hermesSessionHandle } : {}),
+      projectIdentity: workflowPlannerProjectIdentity(workflowProjectRoot),
+      sessionId,
+      inputId,
+      text: goal,
+      now,
+      plannerSessionId,
+      plannerNodeId,
+      existingNodes: [],
     });
+    broadcastWorkflowProjection(projectRoot, sessionId, store);
     return {
       protocolVersion: RUN_PROTOCOL_VERSION,
       session,
@@ -1048,13 +1127,8 @@ ipcMain.handle("workflow:finishPlan", async (_event, projectRoot: string, input:
           now: new Date().toISOString(),
         });
       } else {
-        const canvasSession = materializeRendererCanvasSession(store, handoff.session.id);
-        const plannerSessionId = isRecord(canvasSession)
-          ? optionalText(canvasSession.hermesPlannerSessionId)
-          : null;
-        const plannerNodeId = isRecord(canvasSession)
-          ? optionalText(canvasSession.plannerNodeId)
-          : null;
+        const plannerSessionId = optionalText(readField(session, "hermesSessionId"));
+        const plannerNodeId = optionalText(readField(session, "plannerLaneId"));
         if (!plannerSessionId || !plannerNodeId) {
           throw workflowIpcError("UNKNOWN_SESSION", "Workflow planner identity is unavailable.");
         }
@@ -1068,7 +1142,7 @@ ipcMain.handle("workflow:finishPlan", async (_event, projectRoot: string, input:
           existingNodes: [],
           sessionLedger: store.buildLedgerSummary(handoff.session.id),
         });
-        await runStartHandler({
+        await plannerRunStartHandler({
           protocolVersion: RUN_PROTOCOL_VERSION,
           runId,
           nodeId: plannerNodeId,
@@ -1111,17 +1185,26 @@ ipcMain.handle("workflow:appendUserInput", async (_event, projectRoot: string, i
   const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
   return await withWorkflowSessionMutationLock(workflowProjectRoot, sessionId, async () => {
     const store = await getWorkflowStore(projectRoot);
-    const claim = store.claimUserInput({ sessionId, inputId, text, now });
-    if (claim.ownsDelivery) {
-      let delivery: Awaited<ReturnType<typeof terminalRuntime.sendWorkflowUserInput>>;
-      try {
-        delivery = await terminalRuntime.sendWorkflowUserInput(sessionId, `${text}\n`);
-      } catch {
-        throw new Error(workflowUserInputDeliveryError);
-      }
-      if (!delivery.ok) throw new Error(workflowUserInputDeliveryError);
-      store.recordUserInputDelivered({ sessionId, inputId, now: new Date().toISOString() });
-    }
+    const canvasSession = requireWorkflowCanvasSession(store, sessionId);
+    const claim = await deliverWorkflowUserInputToPlanner({
+      store,
+      projectRoot,
+      projectIdentity: workflowPlannerProjectIdentity(workflowProjectRoot),
+      sessionId,
+      inputId,
+      text,
+      now,
+      plannerSessionId: requireText(canvasSession.hermesPlannerSessionId, "workflow planner session id"),
+      plannerNodeId: requireText(canvasSession.plannerNodeId, "workflow planner node id"),
+      existingNodes: canvasSession.nodes.map((node) => ({
+        id: node.id,
+        title: node.title,
+        agent: node.agent,
+        status: node.status,
+        ...(node.workflowTrace?.taskKey ? { taskKey: node.workflowTrace.taskKey } : {}),
+        dependencies: node.context.dependencies,
+      })),
+    });
     broadcastWorkflowProjection(projectRoot, sessionId, store);
     return {
       protocolVersion: RUN_PROTOCOL_VERSION,
@@ -1174,83 +1257,6 @@ ipcMain.handle("workflow:changeset:reconcileFinal", workflowHandler(async (proje
   return { protocolVersion: RUN_PROTOCOL_VERSION, reconciliation };
 }));
 
-ipcMain.handle("workflow:applyIntent", async (_event, projectRoot: string, intent: { sessionId?: unknown }) => {
-  assertKnownProjectRoot(projectRoot);
-  const sessionId = assertWorkflowSessionId(intent?.sessionId);
-  const store = await getWorkflowStore(projectRoot);
-  const result = store.applyWorkflowIntent(intent, new Date().toISOString());
-  const projection = store.materializeFlowProjection(sessionId);
-  broadcastWorkflowProjection(projectRoot, sessionId, store);
-  return {
-    protocolVersion: RUN_PROTOCOL_VERSION,
-    result,
-    projection,
-    canvasSession: materializeRendererCanvasSession(store, sessionId),
-  };
-});
-
-ipcMain.handle("workflow:scheduleReady", async (_event, projectRoot: string, sessionIdOrInput: unknown, maybeInput?: unknown) => {
-  assertKnownProjectRoot(projectRoot);
-  const workflowSessionId = typeof sessionIdOrInput === "string"
-    ? assertWorkflowSessionId(sessionIdOrInput)
-    : assertWorkflowSessionId(readField(sessionIdOrInput, "sessionId"));
-  const input = typeof sessionIdOrInput === "string" ? maybeInput : sessionIdOrInput;
-  const store = await getWorkflowStore(projectRoot);
-  const result = store.scheduleReadyLanes(workflowSessionId, {
-    ...(isRecord(input) ? input : {}),
-    now: optionalText(readField(input, "now")) ?? new Date().toISOString(),
-  });
-  broadcastWorkflowProjection(projectRoot, workflowSessionId, store);
-  return {
-    protocolVersion: RUN_PROTOCOL_VERSION,
-    result,
-    projection: store.materializeFlowProjection(workflowSessionId),
-    canvasSession: materializeRendererCanvasSession(store, workflowSessionId),
-  };
-});
-
-ipcMain.handle("workflow:recordRunResult", async (_event, projectRoot: string, input: WorkflowRecordRunResultInput) => {
-  assertKnownProjectRoot(projectRoot);
-  const sessionId = assertWorkflowSessionId(input.sessionId);
-  const laneId = assertRequiredText(input.laneId, "Workflow laneId is required.");
-  const segmentId = assertRequiredText(input.segmentId, "Workflow segmentId is required.");
-  const runId = assertRequiredText(input.runId, "Workflow runId is required.");
-  const agentKind = assertWorkflowAgentKind(input.agentKind);
-  const now = typeof input.now === "string" && input.now.trim() ? input.now : new Date().toISOString();
-  const bridge = await getAgentBridge();
-  const [events, evidence] = await Promise.all([
-    bridge.loadEvents(projectRoot, runId),
-    bridge.getEvidence(projectRoot, runId),
-  ]);
-  assertTerminalRunEvidence(evidence, runId);
-  const store = await getWorkflowStore(projectRoot);
-  store.recordRunResult({
-    sessionId,
-    laneId,
-    segmentId,
-    runId,
-    agentKind,
-    outputSummary: summarizeRunOutput(events),
-    runEvents: events,
-    evidence,
-    now,
-  });
-  if (isExecutableCheckpointLane(store, sessionId, laneId)) {
-    try {
-      await enrichTerminalWorkflowRun(store, bridge, projectRoot, { sessionId, laneId, segmentId, runId, agentKind }, events, evidence);
-    } catch (error) {
-      recordRunCheckpointFailure(store, { sessionId, laneId, segmentId, runId, phase: "after", error, now });
-    }
-  }
-  const projection = store.materializeFlowProjection(sessionId);
-  broadcastWorkflowProjection(projectRoot, sessionId, store);
-  return {
-    protocolVersion: RUN_PROTOCOL_VERSION,
-    projection,
-    canvasSession: materializeRendererCanvasSession(store, sessionId),
-  };
-});
-
 ipcMain.handle("workflow:nodePosition:update", workflowHandler(async (projectRoot: string, input: unknown) => {
   assertKnownProjectRoot(projectRoot);
   const normalized = normalizeWorkflowNodePositionUpdate(input);
@@ -1272,6 +1278,7 @@ ipcMain.handle("workflow:projection", workflowHandler(async (projectRoot: string
   assertKnownProjectRoot(projectRoot);
   const workflowSessionId = assertWorkflowSessionId(sessionId);
   const store = await getWorkflowStore(projectRoot);
+  await advanceWorkflowSession(projectRoot, store, workflowSessionId);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     projection: store.materializeFlowProjection(workflowSessionId),
@@ -1283,11 +1290,13 @@ ipcMain.handle("workflow:events", workflowHandler(async (projectRoot: string, se
   assertKnownProjectRoot(projectRoot);
   const workflowSessionId = assertWorkflowSessionId(sessionId);
   const store = await getWorkflowStore(projectRoot);
+  const events = store.listEvents(workflowSessionId).filter(isWorkflowEventRecord);
+  const plannerLaneId = reconciledPlannerLaneIdForRenderer(events);
+  const plannerSegments = plannerLaneId ? store.listSegments(workflowSessionId, plannerLaneId) : [];
+  const plannerSegmentsById = new Map(plannerSegments.map((segment) => [segment.segmentId, segment]));
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
-    events: store.listEvents(workflowSessionId)
-      .filter(isWorkflowEventRecord)
-      .map(redactWorkflowEventForRenderer),
+    events: events.map((event) => redactWorkflowEventForRenderer(event, plannerSegmentsById)),
   };
 }));
 
@@ -1609,52 +1618,15 @@ ipcMain.handle("workflow:worktree:create", workflowHandler(async (projectRoot: s
   const repoRoot = await fs.realpath(path.resolve(optionalText(readField(input, "repoRoot")) ?? projectRoot));
   if (repoRoot !== realProjectRoot) throw workflowIpcError("UNKNOWN_PROJECT", "Worktree repoRoot must match the open project root.");
   const store = await getWorkflowStore(projectRoot);
-  const branchName = `skyturn/${sessionId}/${variantId}`;
-  const worktreeId = `worktree-${sessionId}-${variantId}`;
-  const baseCommit = await resolveGitCommit(repoRoot, baseRef).catch((error) => {
-    recordWorktreeCreateFailure(store, {
-      sessionId,
-      worktreeId,
-      variantId,
-      repoRoot,
-      branchName,
-      baseCommit: baseRef,
-      parentLaneId,
-      ...(parentSegmentId ? { parentSegmentId } : {}),
-      reason: error instanceof Error ? error.message : String(error),
-    });
-    throw error;
-  });
-  const existingEvents = store.listEvents(sessionId);
-  const appendedEvents: unknown[] = [];
-  const { createNodeGitWorktreeService } = await import("@skyturn/git-worktree/node");
-  const service = createNodeGitWorktreeService({
-    initialEvents: managedWorktreeEventsFromStore(existingEvents),
-    eventSink: {
-      append: async (event) => {
-        appendedEvents.push(store.appendWorkflowEvent({
-          sessionId: event.sessionId ?? sessionId,
-          kind: event.kind,
-          source: event.source,
-          idempotencyKey: event.idempotencyKey,
-          payload: event.payload,
-          now: event.createdAt,
-        }));
-      },
-    },
-  });
   try {
-    const worktree = await service.createManagedWorktree({
+    const worktree = await createManagedWorkflowWorktreeForRun(projectRoot, store, {
       sessionId,
       variantId,
-      repoRoot,
-      baseCommit,
-      branchName,
+      baseRef,
       parentLaneId,
       ...(parentSegmentId ? { parentSegmentId } : {}),
     });
-    const event = findWorktreeCreatedEvent(appendedEvents, worktree.worktreeId)
-      ?? findWorktreeCreatedEvent(store.listEvents(sessionId), worktree.worktreeId);
+    const event = findWorktreeCreatedEvent(store.listEvents(sessionId), worktree.worktreeId);
     broadcastWorkflowProjection(projectRoot, sessionId, store);
     return { protocolVersion: RUN_PROTOCOL_VERSION, status: "created", event, worktree };
   } catch (error) {
@@ -1662,6 +1634,58 @@ ipcMain.handle("workflow:worktree:create", workflowHandler(async (projectRoot: s
     throw error;
   }
 }));
+
+async function createManagedWorkflowWorktreeForRun(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  input: {
+    sessionId: string;
+    variantId: string;
+    baseRef: string;
+    parentLaneId: string;
+    parentSegmentId?: string;
+  },
+): Promise<WorkflowWorktreeIdentity> {
+  const repoRoot = await fs.realpath(projectRoot);
+  const branchName = `skyturn/${input.sessionId}/${input.variantId}`;
+  const worktreeId = `worktree-${input.sessionId}-${input.variantId}`;
+  const baseCommit = await resolveGitCommit(repoRoot, input.baseRef).catch((error) => {
+    recordWorktreeCreateFailure(store, {
+      ...input,
+      worktreeId,
+      repoRoot,
+      branchName,
+      baseCommit: input.baseRef,
+      reason: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  });
+  const { createNodeGitWorktreeService } = await import("@skyturn/git-worktree/node");
+  const service = createNodeGitWorktreeService({
+    initialEvents: managedWorktreeEventsFromStore(store.listEvents(input.sessionId)),
+    eventSink: {
+      append: async (event) => {
+        store.appendWorkflowEvent({
+          sessionId: event.sessionId ?? input.sessionId,
+          kind: event.kind,
+          source: event.source,
+          idempotencyKey: event.idempotencyKey,
+          payload: event.payload,
+          now: event.createdAt,
+        });
+      },
+    },
+  });
+  return service.createManagedWorktree({
+    sessionId: input.sessionId,
+    variantId: input.variantId,
+    repoRoot,
+    baseCommit,
+    branchName,
+    parentLaneId: input.parentLaneId,
+    ...(input.parentSegmentId ? { parentSegmentId: input.parentSegmentId } : {}),
+  });
+}
 
 ipcMain.handle("workflow:worktree:compare", workflowHandler(async (projectRoot: string, input: unknown) => {
   return compareWorkflowWorktrees({
@@ -2229,7 +2253,11 @@ ipcMain.handle("workspace:load", async () => {
       await ensurePlanBootstrap(source.request, source.snapshot);
     }
     publishWorkspaceProjectRoots(projectRoots);
-    return sanitizeWorkspaceStateForPersistence(state);
+    const safeState = sanitizeWorkspaceStateForPersistence(state);
+    const storedActiveSessionId = isRecord(state) && typeof state.activeSessionId === "string"
+      ? state.activeSessionId
+      : null;
+    return await reconcileWorkspaceWorkflowSessions(safeState, projectRoots, storedActiveSessionId);
   } catch (error) {
     if (isRecord(error) && error.code === "ENOENT") return null;
     throw new Error(workspaceLoadError);
@@ -2496,7 +2524,12 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
       createHermesCliAdapter,
       createPrivateRunEventStore,
     } = await import("@skyturn/agent-bridge");
+    const configuredWatchdogTimeoutMs = Number(process.env.SKYTURN_AGENT_WATCHDOG_TIMEOUT_MS);
+    const watchdogOptions = Number.isSafeInteger(configuredWatchdogTimeoutMs) && configuredWatchdogTimeoutMs > 0
+      ? { defaultWatchdogTimeoutMs: configuredWatchdogTimeoutMs }
+      : {};
     const codexOptions = {
+      ...watchdogOptions,
       ...(process.env.SKYTURN_CODEX_SANDBOX === "workspace-write" ? { sandbox: "workspace-write" as const } : {}),
       ...(process.env.SKYTURN_CODEX_IGNORE_USER_CONFIG === "1" ? { extraArgs: ["--ignore-user-config"] } : {}),
     };
@@ -2506,7 +2539,7 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
     await durableRunClaimStore.initialize();
     const privateRunEventStore = createPrivateRunEventStore({ durableRunClaimStore });
     const bridge = new AgentBridge({
-      adapters: [createHermesCliAdapter(), createCodexCliAdapter(codexOptions)],
+      adapters: [createHermesCliAdapter(watchdogOptions), createCodexCliAdapter(codexOptions)],
       durableRunClaimStore,
       privateRunEventStore,
       onTerminalPersistenceFailure: compensateTerminalPersistenceFailure,
@@ -2569,6 +2602,7 @@ async function compensateTerminalPersistenceFailure(failure: TerminalPersistence
         reopened.close();
       }
     }
+    await advanceWorkflowSession(projectRoot, store, segment.sessionId);
     broadcastWorkflowProjection(projectRoot, segment.sessionId, store);
   } catch {
     console.error("terminal-persistence-failed");
@@ -2585,58 +2619,96 @@ async function reconcileTerminalRunEvent(bridge: AgentBridgeHost, event: unknown
   const liveProjectRoot = isRecord(liveRun) ? optionalText(liveRun.projectRoot) : null;
   if (!liveProjectRoot) return;
   const projectRoot = await workflowStoreIdentity(liveProjectRoot);
-  const store = workflowStores.get(projectRoot);
-  const segment = store?.listRunningSegments().find((item) => item.runId === runId);
-  if (!store || !segment) return;
-  try {
-    await reconcileTerminalWorkflowRun(store, bridge, projectRoot, segment);
-  } catch {
-    store.appendWorkflowEvent({
-      sessionId: segment.sessionId,
-      kind: "workflow.run.recovery_failed",
-      source: "electron-main",
-      laneId: segment.laneId,
-      segmentId: segment.segmentId,
-      idempotencyKey: `run-live-recovery:${segment.runId}:failed`,
-      payload: { runId: segment.runId, status: "failed", reason: "terminal-recovery-failed" },
-      now: new Date().toISOString(),
-    });
-    return;
+  let store = workflowStores.get(projectRoot);
+  if (!store) {
+    const initialization = workflowStoreInitializations.get(projectRoot);
+    if (!initialization) return;
+    try {
+      store = await initialization;
+    } catch {
+      return;
+    }
   }
-  try {
-    await enrichTerminalWorkflowRun(store, bridge, projectRoot, segment);
-  } catch (error) {
-    recordRunCheckpointFailure(store, {
-      ...segment,
-      phase: "after",
-      error,
-      now: new Date().toISOString(),
-    });
+  const readyStore = store;
+  const initialSegment = readyStore.listRunningSegments().find((item) => item.runId === runId);
+  if (!initialSegment) return;
+  let reconciled = false;
+  let advancedDuringReconciliation = false;
+  await withWorkflowSessionMutationLock(projectRoot, initialSegment.sessionId, async () => {
+    const segment = readyStore.listRunningSegments().find((item) => item.runId === runId);
+    if (!segment) return;
+    try {
+      advancedDuringReconciliation = await reconcileTerminalWorkflowRun(readyStore, bridge, projectRoot, segment);
+    } catch {
+      readyStore.appendWorkflowEvent({
+        sessionId: segment.sessionId,
+        kind: "workflow.run.recovery_failed",
+        source: "electron-main",
+        laneId: segment.laneId,
+        segmentId: segment.segmentId,
+        idempotencyKey: `run-live-recovery:${segment.runId}:failed`,
+        payload: { runId: segment.runId, status: "failed", reason: "terminal-recovery-failed" },
+        now: new Date().toISOString(),
+      });
+      return;
+    }
+    try {
+      await enrichTerminalWorkflowRun(readyStore, bridge, projectRoot, segment);
+    } catch (error) {
+      recordRunCheckpointFailure(readyStore, {
+        ...segment,
+        phase: "after",
+        error,
+        now: new Date().toISOString(),
+      });
+    }
+    reconciled = true;
+  });
+  if (reconciled) {
+    if (!advancedDuringReconciliation) {
+      await advanceWorkflowSession(projectRoot, readyStore, initialSegment.sessionId);
+    }
+    broadcastWorkflowProjection(projectRoot, initialSegment.sessionId, readyStore);
   }
-  broadcastWorkflowProjection(projectRoot, segment.sessionId, store);
 }
 
 async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost> {
   const storeIdentity = await workflowStoreIdentity(projectRoot);
-  const existing = workflowStores.get(storeIdentity);
-  if (existing) return existing;
   const pending = workflowStoreInitializations.get(storeIdentity);
   if (pending) return pending;
+  const existing = workflowStores.get(storeIdentity);
+  if (existing) return existing;
   const initialization = Promise.resolve().then(async () => {
     const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
     const store = createWorkflowStore({ projectRoot: storeIdentity }) as WorkflowStoreHost;
     try {
-      const bridge = await getAgentBridge();
-      await recoverTerminalWorkflowRuns(
-        storeIdentity,
+      await recoverPendingPlannerIntentReconciliations(
         store,
-        bridge,
-        summarizeRunOutput,
-        undefined,
-        (segment) => enrichTerminalWorkflowRun(store, bridge, storeIdentity, segment),
-        (segment) => reconcileTerminalWorkflowRun(store, bridge, storeIdentity, segment),
+        async (segment) => { await reconcilePendingPlannerWorkflowIntent(storeIdentity, store, segment, true); },
       );
+      if (
+        store.listRunningSegments().length > 0 ||
+        store.listPendingPlannerIntentReconciliations().length > 0 ||
+        store.listPendingRunCheckpointEnrichments().length > 0
+      ) {
+        const bridge = await getAgentBridge();
+        await recoverTerminalWorkflowRuns(
+          storeIdentity,
+          store,
+          bridge,
+          summarizeRunOutput,
+          undefined,
+          (segment) => enrichTerminalWorkflowRun(store, bridge, storeIdentity, segment),
+          async (segment) => { await reconcilePendingPlannerWorkflowIntent(storeIdentity, store, segment); },
+          async (segment, evidence) => {
+            await reconcileTerminalWorkflowRun(store, bridge, storeIdentity, segment, evidence);
+          },
+        );
+      }
       workflowStores.set(storeIdentity, store);
+      for (const sessionId of store.listWorkflowSessionIds()) {
+        await advanceWorkflowSession(projectRoot, store, sessionId);
+      }
       return store;
     } catch (error) {
       if (workflowStores.get(storeIdentity) === store) workflowStores.delete(storeIdentity);
@@ -2670,12 +2742,13 @@ async function reconcileTerminalWorkflowRun(
   projectRoot: string,
   segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
   knownEvidence?: unknown,
-): Promise<void> {
+): Promise<boolean> {
   const [events, evidence] = await Promise.all([
     bridge.loadEvents(projectRoot, segment.runId),
     knownEvidence === undefined ? bridge.getEvidence(projectRoot, segment.runId) : Promise.resolve(knownEvidence),
   ]);
   assertTerminalRunEvidence(evidence, segment.runId);
+  const now = optionalText(readField(evidence, "completedAt")) ?? new Date().toISOString();
   store.recordRunResult({
     sessionId: segment.sessionId,
     laneId: segment.laneId,
@@ -2685,42 +2758,313 @@ async function reconcileTerminalWorkflowRun(
     outputSummary: summarizeRunOutput(events),
     runEvents: events,
     evidence,
-    now: optionalText(readField(evidence, "completedAt")) ?? new Date().toISOString(),
+    now,
   });
-  await applyTerminalPlannerWorkflowIntent(store, segment, events, evidence);
+  return reconcilePendingPlannerWorkflowIntent(projectRoot, store, segment);
 }
 
-async function applyTerminalPlannerWorkflowIntent(
+async function reconcilePendingPlannerWorkflowIntent(
+  projectRoot: string,
   store: WorkflowStoreHost,
   segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
-  events: unknown[],
-  evidence: unknown,
-): Promise<void> {
-  if (segment.agentKind !== "hermes" || readField(evidence, "status") !== "succeeded") return;
-  const canvasSession = store.materializeCanvasSession(segment.sessionId);
-  if (!isRecord(canvasSession) || canvasSession.plannerNodeId !== segment.laneId) return;
-  const output = events.flatMap((event) => {
-    if (!isRecord(event) || event.kind !== "output" || !isRecord(event.payload)) return [];
-    return typeof event.payload.text === "string" ? [event.payload.text] : [];
-  }).join("");
+  deferApplied = false,
+): Promise<boolean> {
+  const candidate = store.listPendingPlannerIntentReconciliations().find((pending) =>
+    pending.sessionId === segment.sessionId &&
+    pending.laneId === segment.laneId &&
+    pending.segmentId === segment.segmentId &&
+    pending.runId === segment.runId &&
+    pending.agentKind === segment.agentKind
+  );
+  if (!candidate) return false;
+  const facts = store.getPlannerIntentReconciliationFacts(candidate);
   const { parseHermesWorkflowIntent } = await import("@skyturn/orchestrator");
-  const parsed = parseHermesWorkflowIntent(output);
-  const now = optionalText(readField(evidence, "completedAt")) ?? new Date().toISOString();
-  if (parsed.ok && parsed.intent.sessionId === segment.sessionId) {
-    const applied = store.applyWorkflowIntent(parsed.intent, now);
-    if (applied.ok) {
-      const scheduledCanvas = store.materializeCanvasSession(segment.sessionId);
-      if (!isRecord(scheduledCanvas) || scheduledCanvas.kind !== "canvas") {
-        throw new Error("Planner intent reconciliation could not materialize its CanvasSession.");
+  const parsed = parseHermesWorkflowIntent(facts.output);
+  if (!parsed.ok) {
+    store.completePlannerIntentReconciliation(candidate, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, facts.completedAt);
+    return false;
+  }
+  if (parsed.intent.sessionId !== segment.sessionId) {
+    store.completePlannerIntentReconciliation(candidate, {
+      disposition: "invalid",
+      intentId: parsed.intent.intentId,
+      reasonCode: "session_mismatch",
+    }, facts.completedAt);
+    return false;
+  }
+  let applied: { ok: boolean };
+  try {
+    applied = store.applyWorkflowIntent({
+      ...parsed.intent,
+      causationId: segment.runId,
+    }, facts.completedAt);
+  } catch (error) {
+    const { WorkflowIntentCausationConflictError } = await import("@skyturn/persistence/workflow-store");
+    if (!(error instanceof WorkflowIntentCausationConflictError)) throw error;
+    store.completePlannerIntentReconciliation(candidate, {
+      disposition: "invalid",
+      intentId: parsed.intent.intentId,
+      reasonCode: "intent_id_reused",
+    }, facts.completedAt);
+    return false;
+  }
+  if (!applied.ok) {
+    store.completePlannerIntentReconciliation(candidate, {
+      disposition: "rejected",
+      intentId: parsed.intent.intentId,
+      reasonCode: "policy_rejected",
+    }, facts.completedAt);
+    return false;
+  }
+  if (deferApplied) return false;
+  await advanceWorkflowSession(projectRoot, store, segment.sessionId, true);
+  store.completePlannerIntentReconciliation(candidate, {
+    disposition: "applied",
+    intentId: parsed.intent.intentId,
+  }, facts.completedAt);
+  return true;
+}
+
+async function advanceWorkflowSession(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  sessionId: string,
+  strictTarget = false,
+): Promise<void> {
+  const projectIdentity = await workflowStoreIdentity(projectRoot);
+  const flightKey = `${projectIdentity}\0${sessionId}`;
+  const existing = workflowSessionAdvanceFlights.get(flightKey);
+  if (existing) return existing;
+  const flight = enqueueWorkflowProjectAdvance(projectIdentity, async () => {
+    const sessionIds = [
+      sessionId,
+      ...store.listWorkflowSessionIds().filter((candidate) => candidate !== sessionId),
+    ];
+    for (const candidate of sessionIds) {
+      try {
+        await advanceOneWorkflowSession(projectRoot, store, candidate);
+      } catch (error) {
+        if (strictTarget && candidate === sessionId) throw error;
+        // A corrupt durable session must not block recovery and launch for its siblings.
       }
-      const { workflowSchedulingPolicyForSession } = await import("@skyturn/ui-canvas/workflow-runtime");
-      store.scheduleReadyLanes(segment.sessionId, {
-        allowedParallelism: workflowSchedulingPolicyForSession(scheduledCanvas as unknown as CanvasSession).allowedParallelism,
-        now,
-      });
+    }
+  });
+  workflowSessionAdvanceFlights.set(flightKey, flight);
+  try {
+    await flight;
+  } finally {
+    if (workflowSessionAdvanceFlights.get(flightKey) === flight) {
+      workflowSessionAdvanceFlights.delete(flightKey);
     }
   }
-  store.recordPlannerIntentReconciled(segment, now);
+}
+
+function enqueueWorkflowProjectAdvance(projectRoot: string, task: () => Promise<void>): Promise<void> {
+  const previous = workflowProjectAdvanceTails.get(projectRoot) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(task);
+  workflowProjectAdvanceTails.set(projectRoot, next);
+  void next.finally(() => {
+    if (workflowProjectAdvanceTails.get(projectRoot) === next) workflowProjectAdvanceTails.delete(projectRoot);
+  }).catch(() => undefined);
+  return next;
+}
+
+async function advanceOneWorkflowSession(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  sessionId: string,
+): Promise<void> {
+  while (true) {
+    const canvasSession = store.materializeCanvasSession(sessionId);
+    if (!isRecord(canvasSession) || canvasSession.kind !== "canvas") return;
+    const remainingProjectCapacity = Math.max(
+      0,
+      MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT - store.listRunningSegments().length,
+    );
+    if (remainingProjectCapacity === 0) return;
+    const runtime = await import("@skyturn/ui-canvas/workflow-runtime");
+    const authoritativeSession = canvasSession as unknown as CanvasSession;
+    if (
+      hasRunningSharedWorkflowWriter(store, runtime.sandboxForNodeRun) &&
+      hasReadySharedWorkflowWriter(authoritativeSession, runtime.sandboxForNodeRun)
+    ) return;
+    const policy = runtime.workflowSchedulingPolicyForSession(authoritativeSession);
+    const allowedParallelism = Math.min(policy.allowedParallelism, remainingProjectCapacity);
+    if (allowedParallelism === 0) return;
+    const scheduled = store.scheduleReadyLanes(sessionId, {
+      allowedParallelism,
+      now: new Date().toISOString(),
+    });
+    if (scheduled.readyLanes.length === 0) return;
+    for (const lane of scheduled.readyLanes) {
+      const segment = store.listRunningSegments().find((candidate) =>
+        candidate.sessionId === sessionId &&
+        candidate.laneId === lane.id &&
+        candidate.segmentId === lane.segmentId &&
+        candidate.runId === lane.runId
+      );
+      if (!segment) throw new Error("Newly scheduled workflow segment is not durable.");
+      let input: StartAgentRunInput;
+      let identity: TrustedRunStartIdentity;
+      try {
+        input = await buildScheduledWorkflowRunStartInput(projectRoot, store, segment);
+        identity = await trustedRunStartIdentity(input, false);
+      } catch (error) {
+        await compensateScheduledWorkflowStartBuildFailure(projectRoot, store, segment, error);
+        continue;
+      }
+      try {
+        await scheduledWorkflowRunStartHandler(input, { store, segment, identity });
+      } catch {
+        // The run-start boundary owns compensation; claim conflicts preserve the existing owner.
+      }
+    }
+    broadcastWorkflowProjection(projectRoot, sessionId, store);
+  }
+}
+
+async function compensateScheduledWorkflowStartBuildFailure(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
+  error: unknown,
+): Promise<void> {
+  try {
+    compensateFailedWorkflowRun(store, segment, error);
+    return;
+  } catch {
+    const reopened = await reopenWorkflowStore({
+      projectRoot,
+      sessionId: segment.sessionId,
+      laneId: segment.laneId,
+      runId: segment.runId,
+      agentKind: segment.agentKind,
+      worktreePath: projectRoot,
+      startFingerprint: "scheduled-build-failure",
+    });
+    try {
+      const owned = reopened.listRunningSegments().find((candidate) =>
+        candidate.sessionId === segment.sessionId &&
+        candidate.laneId === segment.laneId &&
+        candidate.segmentId === segment.segmentId &&
+        candidate.runId === segment.runId &&
+        candidate.agentKind === segment.agentKind
+      );
+      if (!owned) throw new Error("Scheduled workflow start failure lost its durable owner segment.");
+      compensateFailedWorkflowRun(reopened, owned, error);
+    } finally {
+      reopened.close();
+    }
+  }
+}
+
+function hasRunningSharedWorkflowWriter(
+  store: WorkflowStoreHost,
+  sandboxForNodeRun: (node: CanvasSession["nodes"][number]) => string | undefined,
+): boolean {
+  return store.listRunningSegments().some((segment) => {
+    const session = store.materializeCanvasSession(segment.sessionId);
+    if (!isRecord(session) || session.kind !== "canvas") return false;
+    const canvasSession = session as unknown as CanvasSession;
+    const node = canvasSession.nodes.find((candidate) => candidate.id === segment.laneId);
+    return node ? isSharedWorkflowWriter(canvasSession, node, sandboxForNodeRun) : false;
+  });
+}
+
+function hasReadySharedWorkflowWriter(
+  session: CanvasSession,
+  sandboxForNodeRun: (node: CanvasSession["nodes"][number]) => string | undefined,
+): boolean {
+  const nodesById = new Map(session.nodes.map((node) => [node.id, node]));
+  return session.nodes.some((node) =>
+    node.status === "pending" &&
+    node.context.dependencies.every((dependencyId) => nodesById.get(dependencyId)?.status === "completed") &&
+    isSharedWorkflowWriter(session, node, sandboxForNodeRun)
+  );
+}
+
+function isSharedWorkflowWriter(
+  session: CanvasSession,
+  node: CanvasSession["nodes"][number],
+  sandboxForNodeRun: (node: CanvasSession["nodes"][number]) => string | undefined,
+): boolean {
+  const executionTarget = node.worktree.executionTarget ?? session.target.executionTarget;
+  const sandbox = sandboxForNodeRun(node);
+  return executionTarget === "current_branch" &&
+    (sandbox === "workspace-write" || sandbox === "danger-full-access");
+}
+
+async function buildScheduledWorkflowRunStartInput(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
+): Promise<StartAgentRunInput> {
+  const session = requireWorkflowCanvasSession(store, segment.sessionId);
+  const node = session.nodes.find((candidate) => candidate.id === segment.laneId);
+  if (!node || node.runId !== segment.runId || node.agent !== segment.agentKind) {
+    throw new Error("Scheduled workflow node identity mismatch.");
+  }
+  if (node.id === session.plannerNodeId) throw new Error("Planner roots require the private planner delivery path.");
+  const worktreePath = await resolveScheduledWorkflowWorktree(projectRoot, store, session, node, segment.segmentId);
+  const [{ expectedArtifactContractForRequiredEvidence }, runtime] = await Promise.all([
+    import("@skyturn/project-core"),
+    import("@skyturn/ui-canvas/workflow-runtime"),
+  ]);
+  const artifactContract = expectedArtifactContractForRequiredEvidence(node.requiredEvidence);
+  if (artifactContract.required && artifactContract.declarations.length === 0) {
+    throw new Error("Scheduled workflow lane requires a concrete expected artifact declaration.");
+  }
+  const ledger = node.agent === "hermes" ? store.buildLedgerSummary(session.id) : undefined;
+  const sandbox = runtime.sandboxForNodeRun(node);
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    runId: segment.runId,
+    nodeId: node.id,
+    sessionId: session.id,
+    ...(node.agent === "hermes"
+      ? {
+          plannerSessionId: session.hermesPlannerSessionId,
+          plannerInputId: segment.runId,
+        }
+      : {}),
+    projectRoot,
+    worktreePath,
+    agentKind: assertWorkflowAgentKind(node.agent),
+    ...(sandbox ? { sandbox } : {}),
+    ...(artifactContract.declarations.length > 0
+      ? { expectedArtifacts: artifactContract.declarations }
+      : {}),
+    prompt: runtime.buildPromptForNodeRun(session, node, ledger),
+  };
+}
+
+async function resolveScheduledWorkflowWorktree(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  session: CanvasSession,
+  node: CanvasSession["nodes"][number],
+  segmentId: string,
+): Promise<string> {
+  const realProjectRoot = await fs.realpath(projectRoot);
+  const executionTarget = node.worktree.executionTarget ?? session.target.executionTarget;
+  if (executionTarget === "current_branch") return realProjectRoot;
+  const existingPath = node.worktree.realPath ?? node.worktree.path;
+  if (path.isAbsolute(existingPath)) return fs.realpath(existingPath);
+  const worktree = await createManagedWorkflowWorktreeForRun(projectRoot, store, {
+    sessionId: session.id,
+    variantId: node.id,
+    baseRef: node.worktree.baseRef ?? session.target.baseRef ?? node.worktree.baseCommit,
+    parentLaneId: node.id,
+    parentSegmentId: segmentId,
+  });
+  const createdPath = optionalText(readField(worktree, "realPath")) ?? optionalText(readField(worktree, "path"));
+  if (!createdPath || !path.isAbsolute(createdPath)) {
+    throw new Error("Managed workflow worktree did not return an absolute path.");
+  }
+  return fs.realpath(createdPath);
 }
 
 async function enrichTerminalWorkflowRun(
@@ -2893,6 +3237,108 @@ function recordFinishPlanLaunchAccepted(
   }
 }
 
+function requireWorkflowCanvasSession(store: WorkflowStoreHost, sessionId: string): CanvasSession {
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  if (!isRecord(canvasSession) || canvasSession.kind !== "canvas") {
+    throw workflowIpcError("UNKNOWN_SESSION", "Workflow planner identity is unavailable.");
+  }
+  return canvasSession as unknown as CanvasSession;
+}
+
+async function deliverWorkflowUserInputToPlanner(input: {
+  store: WorkflowStoreHost;
+  projectRoot: string;
+  projectIdentity: string;
+  sessionId: string;
+  inputId: string;
+  text: string;
+  now: string;
+  plannerSessionId: string;
+  plannerNodeId: string;
+  existingNodes: Array<{
+    id: string;
+    title: string;
+    agent: CanvasSession["nodes"][number]["agent"];
+    status: CanvasSession["nodes"][number]["status"];
+    taskKey?: string;
+    dependencies: string[];
+  }>;
+}): Promise<{ event: unknown; created: boolean; ownsDelivery: boolean }> {
+  const claim = input.store.claimUserInput({
+    sessionId: input.sessionId,
+    inputId: input.inputId,
+    text: input.text,
+    now: input.now,
+  });
+  if (!claim.ownsDelivery) return claim;
+
+  const runId = workflowPlannerTurnRunId(
+    input.projectIdentity,
+    input.sessionId,
+    input.plannerNodeId,
+    input.inputId,
+  );
+  const plannerSegments = input.store.listSegments(input.sessionId, input.plannerNodeId);
+  const existingSegment = plannerSegments.find((segment) => segment.runId === runId);
+  if (
+    !existingSegment &&
+    plannerSegments.some((segment) => segment.runId !== runId && segment.status === "running")
+  ) {
+    throw workflowIpcError("UNAVAILABLE", "Workflow planner lane already has a running turn.");
+  }
+  if (!existingSegment) {
+    const { buildHermesWorkflowPrompt } = await import("@skyturn/orchestrator");
+    const prompt = buildHermesWorkflowPrompt({
+      goal: input.text,
+      sessionId: input.sessionId,
+      plannerSessionId: input.plannerSessionId,
+      nodeId: input.plannerNodeId,
+      existingNodes: input.existingNodes,
+      sessionLedger: input.store.buildLedgerSummary(input.sessionId),
+    });
+    await plannerRunStartHandler({
+      protocolVersion: RUN_PROTOCOL_VERSION,
+      runId,
+      nodeId: input.plannerNodeId,
+      sessionId: input.sessionId,
+      plannerSessionId: input.plannerSessionId,
+      plannerInputId: runId,
+      projectRoot: input.projectRoot,
+      worktreePath: input.projectRoot,
+      agentKind: "hermes",
+      transport: "exec-json",
+      prompt,
+    });
+  }
+  input.store.recordUserInputDelivered({
+    sessionId: input.sessionId,
+    inputId: input.inputId,
+    now: new Date().toISOString(),
+  });
+  return claim;
+}
+
+function workflowPlannerProjectIdentity(canonicalProjectRoot: string): string {
+  const identity = JSON.stringify(["skyturn-workflow-project-identity-v1", canonicalProjectRoot]);
+  return createHash("sha256").update(identity).digest("hex");
+}
+
+function workflowPlannerTurnRunId(
+  projectIdentity: string,
+  sessionId: string,
+  plannerNodeId: string,
+  inputId: string,
+): string {
+  const identity = JSON.stringify([
+    "skyturn-workflow-planner-turn-v2",
+    projectIdentity,
+    sessionId,
+    plannerNodeId,
+    inputId,
+  ]);
+  return `hermes-planner-turn-${createHash("sha256").update(identity).digest("hex")}`;
+}
+
 function nextFinishPlanAttemptRunId(store: WorkflowStoreHost, sessionId: string, plannerNodeId: string): string {
   const prefix = `hermes-plan-finish-${sessionId}-attempt-`;
   const attempts = store.listSegments(sessionId, plannerNodeId)
@@ -2923,12 +3369,6 @@ function assertExactRecordKeys(value: Record<string, unknown>, keys: string[]): 
 function assertWorkflowSessionId(value: unknown): string {
   if (typeof value !== "string" || !value.trim()) throw new Error("Workflow sessionId is required.");
   return value;
-}
-
-function explicitHermesSessionHandle(value: unknown): string | undefined {
-  const handle = optionalText(value);
-  if (!handle || handle.startsWith("skyturn-ipc:")) return undefined;
-  return handle;
 }
 
 function assertRequiredText(value: unknown, message: string): string {
@@ -3087,8 +3527,25 @@ function isWorkflowEventRecord(event: unknown): event is Record<string, unknown>
     (event as { kind: string }).kind !== "workflow.user_input.delivered";
 }
 
-function redactWorkflowEventForRenderer(event: Record<string, unknown> & { kind: string }): Record<string, unknown> {
+function reconciledPlannerLaneIdForRenderer(
+  events: Array<Record<string, unknown> & { kind: string }>,
+): string | null {
+  let plannerLaneId: string | null = null;
+  for (const event of events) {
+    if (event.kind !== "workflow.planner_intent.reconciled") continue;
+    if (typeof event.laneId !== "string" || !event.laneId) return null;
+    if (plannerLaneId !== null && plannerLaneId !== event.laneId) return null;
+    plannerLaneId = event.laneId;
+  }
+  return plannerLaneId;
+}
+
+function redactWorkflowEventForRenderer(
+  event: Record<string, unknown> & { kind: string },
+  plannerSegmentsById: ReadonlyMap<string, WorkflowSegmentRendererFacts> = new Map(),
+): Record<string, unknown> {
   const delivery = deliveryLifecycleFactsForRenderer(event);
+  const plannerTurn = plannerTurnFactsForRenderer(event, plannerSegmentsById);
   return {
     id: event.id,
     sessionId: event.sessionId,
@@ -3104,7 +3561,83 @@ function redactWorkflowEventForRenderer(event: Record<string, unknown> & { kind:
       redacted: true,
       summary: workflowEventSummary(event.kind),
       ...(delivery ? { delivery } : {}),
+      ...(plannerTurn ? { plannerTurn } : {}),
     },
+  };
+}
+
+function plannerTurnFactsForRenderer(
+  event: Record<string, unknown> & { kind: string },
+  plannerSegmentsById: ReadonlyMap<string, WorkflowSegmentRendererFacts>,
+): {
+  runId: string;
+  segmentId: string;
+  status: string;
+  exitCode: number | null;
+  hermesCliExitPassed: boolean;
+  intentDisposition: "applied" | "invalid" | "rejected";
+  intentReasonCode?: "parse_invalid" | "session_mismatch" | "intent_id_reused" | "policy_rejected";
+} | null {
+  if (
+    event.kind !== "workflow.planner_intent.reconciled" ||
+    typeof event.segmentId !== "string" || !event.segmentId ||
+    typeof event.laneId !== "string" || !event.laneId ||
+    !isRecord(event.payload) ||
+    typeof event.payload.runId !== "string" || !event.payload.runId
+  ) {
+    return null;
+  }
+  const segment = plannerSegmentsById.get(event.segmentId);
+  if (
+    !segment ||
+    segment.segmentId !== event.segmentId ||
+    segment.laneId !== event.laneId ||
+    segment.runId !== event.payload.runId ||
+    !isRecord(segment.evidence) ||
+    segment.evidence.runId !== segment.runId ||
+    !new Set(["succeeded", "failed", "cancelled", "timed-out"]).has(segment.status) ||
+    (segment.exitCode !== null && (typeof segment.exitCode !== "number" || !Number.isFinite(segment.exitCode)))
+  ) {
+    return null;
+  }
+  const hermesCliExitPassed = Array.isArray(segment.evidence.checks) && segment.evidence.checks.some((check) =>
+    isRecord(check) &&
+    check.kind === "run-exit" &&
+    check.status === "passed" &&
+    typeof check.name === "string" &&
+    check.name.includes("Hermes CLI exit")
+  );
+  const intentDisposition = event.payload.disposition === undefined
+    ? "applied"
+    : event.payload.disposition;
+  if (intentDisposition !== "applied" && intentDisposition !== "invalid" && intentDisposition !== "rejected") {
+    return null;
+  }
+  const intentReasonCode = event.payload.reasonCode;
+  if (
+    (intentDisposition === "applied" && intentReasonCode !== undefined) ||
+    (intentDisposition === "invalid" &&
+      intentReasonCode !== "parse_invalid" &&
+      intentReasonCode !== "session_mismatch" &&
+      intentReasonCode !== "intent_id_reused") ||
+    (intentDisposition === "rejected" && intentReasonCode !== "policy_rejected")
+  ) {
+    return null;
+  }
+  const safeIntentReasonCode = intentReasonCode === "parse_invalid" ||
+    intentReasonCode === "session_mismatch" ||
+    intentReasonCode === "intent_id_reused" ||
+    intentReasonCode === "policy_rejected"
+    ? intentReasonCode
+    : undefined;
+  return {
+    runId: segment.runId,
+    segmentId: segment.segmentId,
+    status: segment.status,
+    exitCode: segment.exitCode,
+    hermesCliExitPassed,
+    intentDisposition,
+    ...(safeIntentReasonCode ? { intentReasonCode: safeIntentReasonCode } : {}),
   };
 }
 
@@ -4311,6 +4844,68 @@ function sanitizeWorkspaceStateForPersistence(state: unknown): unknown {
   };
 }
 
+async function reconcileWorkspaceWorkflowSessions(
+  state: unknown,
+  projectRoots: readonly WorkspaceProjectRootDiscovery[],
+  storedActiveSessionId: string | null,
+): Promise<unknown> {
+  if (!isRecord(state) || !Array.isArray(state.sessions)) return state;
+  const sessions = [...state.sessions];
+  const durableSessionIdsByProject = new Map<string, string[]>();
+
+  for (const { project } of projectRoots) {
+    const store = await getWorkflowStore(project.rootPath);
+    const durableSessionIds: string[] = [];
+    for (const sessionId of store.listWorkflowSessionIds()) {
+      const existingIndex = sessions.findIndex((session) => isRecord(session) && session.id === sessionId);
+      let canvasSession: unknown;
+      try {
+        canvasSession = materializeRendererCanvasSession(store, sessionId);
+      } catch {
+        const existing = existingIndex === -1 ? null : sessions[existingIndex];
+        if (isRecord(existing) && existing.kind === "canvas" && existing.projectId === project.id) {
+          sessions.splice(existingIndex, 1);
+        }
+        continue;
+      }
+      if (
+        !isRecord(canvasSession) ||
+        canvasSession.kind !== "canvas" ||
+        canvasSession.id !== sessionId ||
+        canvasSession.projectId !== project.id
+      ) {
+        const existing = existingIndex === -1 ? null : sessions[existingIndex];
+        if (isRecord(existing) && existing.kind === "canvas" && existing.projectId === project.id) {
+          sessions.splice(existingIndex, 1);
+        }
+        continue;
+      }
+      if (existingIndex === -1) {
+        sessions.push(canvasSession);
+      } else {
+        const existing = sessions[existingIndex];
+        if (!isRecord(existing) || existing.projectId !== project.id) continue;
+        sessions[existingIndex] = canvasSession;
+      }
+      durableSessionIds.push(sessionId);
+    }
+    durableSessionIdsByProject.set(project.id, durableSessionIds);
+  }
+
+  const activeProjectId = typeof state.activeProjectId === "string" ? state.activeProjectId : null;
+  const storedActiveSessionIsValid = activeProjectId !== null && storedActiveSessionId !== null &&
+    sessions.some((session) => (
+      isRecord(session) && session.id === storedActiveSessionId && session.projectId === activeProjectId
+    ));
+  const activeSessionId = storedActiveSessionIsValid
+    ? storedActiveSessionId
+    : activeProjectId
+      ? durableSessionIdsByProject.get(activeProjectId)?.at(-1) ?? null
+      : null;
+
+  return { ...state, sessions, activeSessionId };
+}
+
 async function authorizeWorkspaceStateForSave(state: unknown): Promise<unknown> {
   try {
     await validateWorkspaceCollections(state, false);
@@ -4507,8 +5102,11 @@ function isPersistedWorkspaceProject(value: unknown): value is PersistedWorkspac
   );
 }
 
-async function trustedRunStartIdentity(input: StartAgentRunInput): Promise<TrustedRunStartIdentity> {
-  assertKnownProjectRoot(input.projectRoot);
+async function trustedRunStartIdentity(
+  input: StartAgentRunInput,
+  requireOpenProject = true,
+): Promise<TrustedRunStartIdentity> {
+  if (requireOpenProject) assertKnownProjectRoot(input.projectRoot);
   const sessionId = assertWorkflowSessionId(input.sessionId);
   const laneId = assertRequiredText(input.nodeId, "Workflow nodeId is required.");
   const runId = assertRequiredText(input.runId, "Workflow runId is required.");
@@ -4557,15 +5155,7 @@ async function assertTrustedScheduledRunStartIdentity(
   if (!isTrustedPlannerRootStartInput(input, store)) return;
   const projectRoot = await fs.realpath(input.projectRoot);
   const worktreePath = await fs.realpath(assertRequiredText(input.worktreePath, "Workflow worktreePath is required."));
-  const canvasSession = store.materializeCanvasSession(assertWorkflowSessionId(input.sessionId));
-  const plannerNode = isRecord(canvasSession) && Array.isArray(canvasSession.nodes)
-    ? canvasSession.nodes.find((node) => isRecord(node) && node.id === input.nodeId)
-    : null;
-  const recordedPath = isRecord(plannerNode) && isRecord(plannerNode.worktree)
-    ? optionalText(plannerNode.worktree.realPath) ?? optionalText(plannerNode.worktree.path)
-    : null;
-  const expectedPath = recordedPath ? await resolveChangesetWorktreePath(projectRoot, recordedPath) : projectRoot;
-  if (worktreePath !== expectedPath) {
+  if (worktreePath !== projectRoot) {
     throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Workflow planner worktree path does not match backend state.");
   }
 }
@@ -4893,6 +5483,15 @@ function assertTerminalSnapshotInput(input: unknown): TerminalSnapshotInput {
 
 function terminalPtyFeatureEnabled(): boolean {
   return process.env.SKYTURN_ENABLE_PTY_INTERACTIVE === "1";
+}
+
+function newSessionUiAcceptanceProjectRoot(): string | null {
+  if (process.env.SKYTURN_NEW_SESSION_UI_ACCEPTANCE !== "1") return null;
+  const projectRoot = process.env.SKYTURN_NEW_SESSION_UI_PROJECT_ROOT;
+  if (!projectRoot || !path.isAbsolute(projectRoot)) {
+    throw new Error("New Session UI acceptance project root is invalid.");
+  }
+  return projectRoot;
 }
 
 function workflowEventsOnly(events: unknown[]): unknown[] {
@@ -6046,12 +6645,15 @@ function closeWorkflowStores(): Promise<void> {
       const closingPlanRuntime = planRuntime;
       await closingPlanRuntime?.close();
       if (planRuntime === closingPlanRuntime) planRuntime = null;
+      await Promise.allSettled([...new Set(workflowProjectAdvanceTails.values())]);
       for (const [projectRoot, store] of workflowStores) {
         store.close();
         workflowStores.delete(projectRoot);
         workflowStoreInitializations.delete(projectRoot);
       }
       workflowStoreInitializations.clear();
+      workflowSessionAdvanceFlights.clear();
+      workflowProjectAdvanceTails.clear();
     } catch (error) {
       workspaceSaveWriter.reopenAdmission();
       throw error;
