@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,6 +8,10 @@ import {
   createCodexCliAdapter,
   createHermesCliAdapter,
 } from "../dist/index.js";
+import {
+  buildWindowsFixtureInvocation,
+  formatWindowsFixtureStartFailure,
+} from "../dist/internal/windowsProcessTreeIntegrationSupport.js";
 
 if (process.platform !== "win32") {
   throw new Error("Windows process-tree integration tests require Windows.");
@@ -30,35 +34,29 @@ async function runProcessTreeCase(agentKind, terminalPath) {
   let terminalTimer = null;
   try {
     await mkdir(join(root, ".git"));
+    const canonicalRoot = await realpath(root);
     const prompt = "Quoted \"prompt\" with trailing slash\\ and Unicode 雪\nsecond line";
     const resumeHandle = "resume \"capability\" with slash\\ and Unicode 水";
     const environmentMarker = "env value with \"quotes\", slash\\, spaces, and Unicode 火";
     const stdoutMarker = `stdout-${agentKind}-${terminalPath}-雪`;
     const stderrMarker = `stderr-${agentKind}-${terminalPath}-火`;
-    const expectedArgs = agentKind === "codex"
-      ? [
-          "--json",
-          "--ephemeral",
-          "--color",
-          "never",
-          "--sandbox",
-          "read-only",
-          "-c",
-          "approval_policy=never",
-          "-C",
-          root,
-          prompt,
-        ]
-      : ["-q", prompt, "--quiet", "--source", "skyturn", "--resume", resumeHandle];
+    const fixturePath = join(canonicalRoot, "agent-fixture.cjs");
+    const invocation = buildWindowsFixtureInvocation({
+      agentKind,
+      canonicalWorkdir: canonicalRoot,
+      fixturePath,
+      prompt,
+      resumeHandle,
+    });
     const fixture = fixtureSource({
       environmentMarker,
-      expectedArgs,
+      expectedArgs: invocation.expectedFixtureArgv,
       stderrMarker,
       stdoutMarker,
       terminalPath,
     });
-    await writeFile(join(root, "exec"), fixture, "utf8");
-    await writeFile(join(root, "chat"), fixture, "utf8");
+    await writeFile(fixturePath, fixture, "utf8");
+    await writeFile(join(canonicalRoot, invocation.entryPoint), fixtureLauncherSource(), "utf8");
     const events = [];
     let resolveTerminal;
     let rejectTerminal;
@@ -72,6 +70,7 @@ async function runProcessTreeCase(agentKind, terminalPath) {
     );
     const options = {
       executablePath: process.execPath,
+      extraArgs: invocation.extraArgs,
       env: {
         SKYTURN_PARENT_PID_PATH: parentPidPath,
         SKYTURN_CHILD_PID_PATH: childPidPath,
@@ -110,8 +109,14 @@ async function runProcessTreeCase(agentKind, terminalPath) {
         return event;
       },
     });
-    parentPid = Number(await waitForFile(parentPidPath));
-    childPid = Number(await waitForFile(childPidPath));
+    const diagnosticInput = {
+      agentKind,
+      terminalPath,
+      events,
+      sensitiveValues: [prompt, resumeHandle, environmentMarker, root, canonicalRoot, fixturePath],
+    };
+    parentPid = Number(await waitForFixtureFile(parentPidPath, "parent.pid", diagnosticInput));
+    childPid = Number(await waitForFixtureFile(childPidPath, "child.pid", diagnosticInput));
     assert.ok(isPidAlive(parentPid), `${agentKind} fixture parent did not stay alive.`);
     assert.ok(isPidAlive(childPid), `${agentKind} fixture descendant did not stay alive.`);
     await waitForCondition(
@@ -136,6 +141,7 @@ async function runProcessTreeCase(agentKind, terminalPath) {
     await cancellation;
     assert.equal(JSON.stringify(events).includes(prompt), false, `${agentKind} leaked the raw prompt.`);
     assert.equal(JSON.stringify(events).includes(resumeHandle), false, `${agentKind} leaked the resume capability.`);
+    assert.equal(JSON.stringify(events).includes(environmentMarker), false, `${agentKind} leaked the environment marker.`);
     if (terminalPath === "normal-root-exit") {
       const exitEvidence = events.find((event) => event.kind === "evidence" && event.payload.exitCode === 17);
       assert.ok(exitEvidence, `${agentKind} did not preserve the actual root exit code.`);
@@ -151,6 +157,14 @@ async function runProcessTreeCase(agentKind, terminalPath) {
     killPid(childPid);
     await rm(root, { recursive: true, force: true });
   }
+}
+
+function fixtureLauncherSource() {
+  return [
+    "const fixturePath = process.argv.find((argument) => argument.endsWith('agent-fixture.cjs'));",
+    "if (!fixturePath) throw new Error('Windows integration fixture argument missing.');",
+    "require(fixturePath);",
+  ].join("\n");
 }
 
 function fixtureSource({ environmentMarker, expectedArgs, stderrMarker, stdoutMarker, terminalPath }) {
@@ -185,6 +199,17 @@ async function waitForFile(path) {
       if (Date.now() >= deadline) throw error;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+  }
+}
+
+async function waitForFixtureFile(path, missingMarker, diagnosticInput) {
+  try {
+    return await waitForFile(path);
+  } catch {
+    throw new Error(formatWindowsFixtureStartFailure({
+      ...diagnosticInput,
+      missingMarker,
+    }));
   }
 }
 
