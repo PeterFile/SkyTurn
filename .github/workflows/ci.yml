@@ -149,7 +149,7 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile --prefer-offline
+        run: pnpm install --frozen-lockfile --prefer-offline --ignore-scripts
 
       - name: Build AgentBridge and dependencies
         run: pnpm exec turbo run build --filter=@skyturn/agent-bridge...
