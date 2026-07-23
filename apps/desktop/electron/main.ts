@@ -573,6 +573,13 @@ const workspaceLoadError = "Workspace could not be loaded.";
 const workspaceSaveError = "Workspace could not be saved.";
 const workspaceSaveUnavailableError = "Workspace saving is unavailable while SkyTurn is shutting down.";
 const workspaceProjectAuthorizationError = "Workspace contains a project that is not open in SkyTurn.";
+const workflowAdvanceShutdownError = "Workflow advancement is unavailable while SkyTurn is shutting down.";
+type WorkflowBroadcastCause =
+  | "repair-request"
+  | "terminal-reconciliation"
+  | "projection-query"
+  | "workflow-mutation"
+  | "workflow-advance";
 const openedProjectRoots = new Set<string>();
 const planProjectIdentities = createPlanProjectIdentityRegistry();
 let agentBridge: AgentBridgeHost | null = null;
@@ -585,6 +592,10 @@ const workflowStores = new Map<string, WorkflowStoreHost>();
 const workflowStoreInitializations = new Map<string, Promise<WorkflowStoreHost>>();
 const workflowSessionAdvanceFlights = new Map<string, Promise<void>>();
 const workflowProjectAdvanceTails = new Map<string, Promise<void>>();
+const workflowStoreOperationTasks = new Set<Promise<unknown>>();
+const workflowTerminalReconciliationTasks = new Set<Promise<void>>();
+let workflowAdvanceAdmissionOpen = true;
+let workflowAdvanceAdmissionEpoch = 0;
 const MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT = 4;
 const DANGER_FULL_ACCESS_AUTHORIZATION_OPTION = "Authorize this run";
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
@@ -922,8 +933,10 @@ function isWorkflowPlannerRootStartTarget(
 }
 
 ipcMain.handle("run:start", async (_event, input: StartAgentRunInput) => {
-  const run = await publicRunStartHandler(input);
-  return { protocolVersion: RUN_PROTOCOL_VERSION, run };
+  return await registerWorkflowStoreOperation(async () => {
+    const run = await publicRunStartHandler(input);
+    return { protocolVersion: RUN_PROTOCOL_VERSION, run };
+  });
 });
 
 ipcMain.handle("run:send", async (_event, runId: string, message: string) => {
@@ -1043,7 +1056,7 @@ ipcMain.handle("plan:getState", async (_event, input: unknown) => {
   });
 });
 
-ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, input: WorkflowSessionCreateInput) => {
+ipcMain.handle("workflow:createSession", workflowHandler(async (projectRoot: string, input: WorkflowSessionCreateInput) => {
   assertKnownProjectRoot(projectRoot);
   const sessionId = assertWorkflowSessionId(input.id ?? input.sessionId);
   const goal = requireText(input.goal, "workflow session goal");
@@ -1091,9 +1104,9 @@ ipcMain.handle("workflow:createSession", async (_event, projectRoot: string, inp
       canvasSession: materializeRendererCanvasSession(store, sessionId),
     };
   });
-});
+}));
 
-ipcMain.handle("workflow:finishPlan", async (_event, projectRoot: string, input: WorkflowFinishPlanInput) => {
+ipcMain.handle("workflow:finishPlan", workflowHandler(async (projectRoot: string, input: WorkflowFinishPlanInput) => {
   assertKnownProjectRoot(projectRoot);
   const handoff = parseFinishPlanHandoffInput(input);
   const canonicalPlanProjectRoot = await planProjectIdentities.canonicalize(projectRoot);
@@ -1184,9 +1197,9 @@ ipcMain.handle("workflow:finishPlan", async (_event, projectRoot: string, input:
       canvasSession: materializeRendererCanvasSession(store, handoff.session.id),
     };
   });
-});
+}));
 
-ipcMain.handle("workflow:appendUserInput", async (_event, projectRoot: string, input: WorkflowAppendUserInput) => {
+ipcMain.handle("workflow:appendUserInput", workflowHandler(async (projectRoot: string, input: WorkflowAppendUserInput) => {
   assertKnownProjectRoot(projectRoot);
   const sessionId = assertWorkflowSessionId(input.sessionId);
   const text = requireText(input.text, "workflow user input");
@@ -1224,9 +1237,9 @@ ipcMain.handle("workflow:appendUserInput", async (_event, projectRoot: string, i
       canvasSession: materializeRendererCanvasSession(store, sessionId),
     };
   });
-});
+}));
 
-ipcMain.handle("workflow:ledger", async (_event, projectRoot: string, sessionId: string) => {
+ipcMain.handle("workflow:ledger", workflowHandler(async (projectRoot: string, sessionId: string) => {
   assertKnownProjectRoot(projectRoot);
   const workflowSessionId = assertWorkflowSessionId(sessionId);
   const store = await getWorkflowStore(projectRoot);
@@ -1234,7 +1247,7 @@ ipcMain.handle("workflow:ledger", async (_event, projectRoot: string, sessionId:
     protocolVersion: RUN_PROTOCOL_VERSION,
     ledger: store.buildLedgerSummary(workflowSessionId),
   };
-});
+}));
 
 ipcMain.handle("changeset:get", async (_event, projectRoot: string, node: unknown) => {
   assertKnownProjectRoot(projectRoot);
@@ -1288,7 +1301,7 @@ ipcMain.handle("workflow:projection", workflowHandler(async (projectRoot: string
   assertKnownProjectRoot(projectRoot);
   const workflowSessionId = assertWorkflowSessionId(sessionId);
   const store = await getWorkflowStore(projectRoot);
-  await advanceWorkflowSession(projectRoot, store, workflowSessionId);
+  await advanceWorkflowSession(projectRoot, store, workflowSessionId, false, "projection-query");
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     projection: store.materializeFlowProjection(workflowSessionId),
@@ -1558,12 +1571,14 @@ ipcMain.handle("workflow:repair:create", workflowHandler(async (projectRoot: str
   const store = await getWorkflowStore(projectRoot);
   assertKnownWorkflowCanvasSession(store, normalized.sessionId);
   const result = store.requestNodeRepair(normalized);
-  broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
+  await advanceWorkflowSession(projectRoot, store, normalized.sessionId, true, "repair-request");
+  const projection = store.materializeFlowProjection(normalized.sessionId);
+  broadcastWorkflowProjection(projectRoot, normalized.sessionId, store, "repair-request");
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     status: "requested",
     event: result.event,
-    projection: result.projection,
+    projection,
     canvasSession: materializeRendererCanvasSession(store, normalized.sessionId),
   };
 }));
@@ -1750,7 +1765,7 @@ ipcMain.handle("workflow:worktree:adopt", workflowHandler(async (projectRoot: st
   } catch (error) {
     recordVariantAdoptFailure(store, sessionId, adoption, error);
     broadcastWorkflowProjection(projectRoot, sessionId, store);
-    throw normalizeWorkflowIpcError(error);
+    throw error;
   }
   const appendedEvents: unknown[] = [];
   const { createNodeGitWorktreeService } = await import("@skyturn/git-worktree/node");
@@ -1777,7 +1792,7 @@ ipcMain.handle("workflow:worktree:adopt", workflowHandler(async (projectRoot: st
     return { protocolVersion: RUN_PROTOCOL_VERSION, status: result.status, event, adoption: result };
   } catch (error) {
     broadcastWorkflowProjection(projectRoot, sessionId, store);
-    throw normalizeWorkflowIpcError(error);
+    throw error;
   }
 }));
 
@@ -1791,7 +1806,7 @@ ipcMain.handle("workflow:worktree:clean", workflowHandler(async (projectRoot: st
   } catch (error) {
     recordWorktreeCleanFailure(store, sessionId, worktree, error);
     broadcastWorkflowProjection(projectRoot, sessionId, store);
-    throw normalizeWorkflowIpcError(error);
+    throw error;
   }
   const existingEvents = store.listEvents(sessionId);
   const appendedEvents: unknown[] = [];
@@ -2286,19 +2301,21 @@ ipcMain.handle("workflow:changeset", workflowHandler(async (projectRoot: string,
 
 ipcMain.handle("workspace:load", async () => {
   try {
-    const value = await fs.readFile(workspaceStorePath(), "utf8");
-    const state = JSON.parse(value) as unknown;
-    const projectRoots = await discoverWorkspaceProjectRoots(state);
-    const sources = await planBootstrapSourcesFromWorkspace(state, projectRoots);
-    for (const source of sources) {
-      await ensurePlanBootstrap(source.request, source.snapshot);
-    }
-    publishWorkspaceProjectRoots(projectRoots);
-    const safeState = sanitizeWorkspaceStateForPersistence(state);
-    const storedActiveSessionId = isRecord(state) && typeof state.activeSessionId === "string"
-      ? state.activeSessionId
-      : null;
-    return await reconcileWorkspaceWorkflowSessions(safeState, projectRoots, storedActiveSessionId);
+    return await registerWorkflowStoreOperation(async () => {
+      const value = await fs.readFile(workspaceStorePath(), "utf8");
+      const state = JSON.parse(value) as unknown;
+      const projectRoots = await discoverWorkspaceProjectRoots(state);
+      const sources = await planBootstrapSourcesFromWorkspace(state, projectRoots);
+      for (const source of sources) {
+        await ensurePlanBootstrap(source.request, source.snapshot);
+      }
+      publishWorkspaceProjectRoots(projectRoots);
+      const safeState = sanitizeWorkspaceStateForPersistence(state);
+      const storedActiveSessionId = isRecord(state) && typeof state.activeSessionId === "string"
+        ? state.activeSessionId
+        : null;
+      return await reconcileWorkspaceWorkflowSessions(safeState, projectRoots, storedActiveSessionId);
+    });
   } catch (error) {
     if (isRecord(error) && error.code === "ENOENT") return null;
     throw new Error(workspaceLoadError);
@@ -2583,13 +2600,16 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
       adapters: [createHermesCliAdapter(watchdogOptions), createCodexCliAdapter(codexOptions)],
       durableRunClaimStore,
       privateRunEventStore,
-      onTerminalPersistenceFailure: compensateTerminalPersistenceFailure,
+      onTerminalPersistenceFailure: (failure: TerminalPersistenceFailureLike) =>
+        registerWorkflowTerminalReconciliation(() => compensateTerminalPersistenceFailure(failure)),
     }) as AgentBridgeHost;
     bridge.onRunEvent((event) => {
       for (const window of BrowserWindow.getAllWindows()) {
         window.webContents.send("run:event", event);
       }
-      void reconcileTerminalRunEvent(bridge, event);
+      void registerWorkflowTerminalReconciliation(() => reconcileTerminalRunEvent(bridge, event)).catch(() => {
+        console.error("workflow-terminal-reconciliation-failed");
+      });
     });
     agentBridge = bridge;
   }
@@ -2643,8 +2663,10 @@ async function compensateTerminalPersistenceFailure(failure: TerminalPersistence
         reopened.close();
       }
     }
-    await advanceWorkflowSession(projectRoot, store, segment.sessionId);
-    broadcastWorkflowProjection(projectRoot, segment.sessionId, store);
+    if (!workflowAdvanceAdmissionOpen) return;
+    const cause = terminalWorkflowBroadcastCause(store, segment);
+    await advanceWorkflowSession(projectRoot, store, segment.sessionId, false, cause);
+    broadcastWorkflowProjection(projectRoot, segment.sessionId, store, cause);
   } catch {
     console.error("terminal-persistence-failed");
     throw new Error("terminal-persistence-failed");
@@ -2706,15 +2728,19 @@ async function reconcileTerminalRunEvent(bridge: AgentBridgeHost, event: unknown
     reconciled = true;
   });
   if (reconciled) {
+    if (!workflowAdvanceAdmissionOpen) return;
+    const cause = terminalWorkflowBroadcastCause(readyStore, initialSegment);
     if (!advancedDuringReconciliation) {
-      await advanceWorkflowSession(projectRoot, readyStore, initialSegment.sessionId);
+      await advanceWorkflowSession(projectRoot, readyStore, initialSegment.sessionId, false, cause);
     }
-    broadcastWorkflowProjection(projectRoot, initialSegment.sessionId, readyStore);
+    broadcastWorkflowProjection(projectRoot, initialSegment.sessionId, readyStore, cause);
   }
 }
 
 async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost> {
+  const admissionEpoch = assertWorkflowAdvanceAdmissionOpen();
   const storeIdentity = await workflowStoreIdentity(projectRoot);
+  assertWorkflowAdvanceAdmissionOpen(admissionEpoch);
   const pending = workflowStoreInitializations.get(storeIdentity);
   if (pending) return pending;
   const existing = workflowStores.get(storeIdentity);
@@ -2746,6 +2772,7 @@ async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost>
           },
         );
       }
+      assertWorkflowAdvanceAdmissionOpen(admissionEpoch);
       workflowStores.set(storeIdentity, store);
       for (const sessionId of store.listWorkflowSessionIds()) {
         await advanceWorkflowSession(projectRoot, store, sessionId);
@@ -2874,30 +2901,33 @@ async function advanceWorkflowSession(
   store: WorkflowStoreHost,
   sessionId: string,
   strictTarget = false,
+  cause: WorkflowBroadcastCause = "workflow-advance",
 ): Promise<void> {
-  const projectIdentity = await workflowStoreIdentity(projectRoot);
+  const admissionEpoch = assertWorkflowAdvanceAdmissionOpen();
+  const publishedProjectIdentity = [...workflowStores.entries()].find(([, candidate]) => candidate === store)?.[0];
+  const projectIdentity = publishedProjectIdentity ?? await workflowStoreIdentity(projectRoot);
+  assertWorkflowAdvanceAdmissionOpen(admissionEpoch);
   const flightKey = `${projectIdentity}\0${sessionId}`;
-  const existing = workflowSessionAdvanceFlights.get(flightKey);
-  if (existing) return existing;
-  const flight = enqueueWorkflowProjectAdvance(projectIdentity, async () => {
+  const previous = workflowSessionAdvanceFlights.get(flightKey) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(() => enqueueWorkflowProjectAdvance(projectIdentity, async () => {
     const sessionIds = [
       sessionId,
       ...store.listWorkflowSessionIds().filter((candidate) => candidate !== sessionId),
     ];
     for (const candidate of sessionIds) {
       try {
-        await advanceOneWorkflowSession(projectRoot, store, candidate);
+        await advanceOneWorkflowSession(projectRoot, store, candidate, cause);
       } catch (error) {
         if (strictTarget && candidate === sessionId) throw error;
         // A corrupt durable session must not block recovery and launch for its siblings.
       }
     }
-  });
-  workflowSessionAdvanceFlights.set(flightKey, flight);
+  }));
+  workflowSessionAdvanceFlights.set(flightKey, current);
   try {
-    await flight;
+    await current;
   } finally {
-    if (workflowSessionAdvanceFlights.get(flightKey) === flight) {
+    if (workflowSessionAdvanceFlights.get(flightKey) === current) {
       workflowSessionAdvanceFlights.delete(flightKey);
     }
   }
@@ -2917,6 +2947,7 @@ async function advanceOneWorkflowSession(
   projectRoot: string,
   store: WorkflowStoreHost,
   sessionId: string,
+  cause: WorkflowBroadcastCause,
 ): Promise<void> {
   while (true) {
     const canvasSession = store.materializeCanvasSession(sessionId);
@@ -2971,7 +3002,7 @@ async function advanceOneWorkflowSession(
       if (authorization === "requested") requestedAuthorization = true;
     }
     if (authorizedLaneIds.length === 0) {
-      broadcastWorkflowProjection(projectRoot, sessionId, store);
+      broadcastWorkflowProjection(projectRoot, sessionId, store, cause);
       if (requestedAuthorization) continue;
       return;
     }
@@ -3007,7 +3038,7 @@ async function advanceOneWorkflowSession(
         // The run-start boundary owns compensation; claim conflicts preserve the existing owner.
       }
     }
-    broadcastWorkflowProjection(projectRoot, sessionId, store);
+    broadcastWorkflowProjection(projectRoot, sessionId, store, cause);
   }
 }
 
@@ -3314,11 +3345,29 @@ async function workflowStoreIdentity(projectRoot: string): Promise<string> {
   return await fs.realpath(projectRoot).catch(() => path.resolve(projectRoot));
 }
 
-function broadcastWorkflowProjection(projectRoot: string, sessionId: string, store: WorkflowStoreHost): void {
+function terminalWorkflowBroadcastCause(
+  store: WorkflowStoreHost,
+  segment: { sessionId: string; laneId: string },
+): WorkflowBroadcastCause {
+  try {
+    const authorization = store.getPlannerStartAuthorization(segment.sessionId);
+    if (isRecord(authorization) && authorization.plannerNodeId === segment.laneId) return "workflow-advance";
+  } catch {
+    return "workflow-advance";
+  }
+  return "terminal-reconciliation";
+}
+
+function broadcastWorkflowProjection(
+  projectRoot: string,
+  sessionId: string,
+  store: WorkflowStoreHost,
+  cause: WorkflowBroadcastCause = "workflow-mutation",
+): void {
   const projection = store.materializeFlowProjection(sessionId);
   const canvasSession = materializeRendererCanvasSession(store, sessionId);
   for (const window of BrowserWindow.getAllWindows()) {
-    window.webContents.send("workflow:event", { projectRoot, sessionId, projection, canvasSession });
+    window.webContents.send("workflow:event", { projectRoot, sessionId, cause, projection, canvasSession });
   }
 }
 
@@ -5644,11 +5693,25 @@ function workflowHandler<T extends unknown[], R>(
 ): (_event: Electron.IpcMainInvokeEvent, ...args: T) => Promise<R> {
   return async (_event, ...args) => {
     try {
-      return await handler(...args);
+      return await registerWorkflowStoreOperation(() => handler(...args));
     } catch (error) {
       throw normalizeWorkflowIpcError(error);
     }
   };
+}
+
+function registerWorkflowStoreOperation<R>(task: () => Promise<R> | R): Promise<R> {
+  const admissionEpoch = assertWorkflowAdvanceAdmissionOpen();
+  const operation = Promise.resolve().then(async () => {
+    assertWorkflowAdvanceAdmissionOpen(admissionEpoch);
+    return await task();
+  });
+  workflowStoreOperationTasks.add(operation);
+  void operation.then(
+    () => { workflowStoreOperationTasks.delete(operation); },
+    () => { workflowStoreOperationTasks.delete(operation); },
+  );
+  return operation;
 }
 
 function terminalHandler<T extends unknown[], R>(
@@ -6769,6 +6832,7 @@ if (!hasSingleInstanceLock) {
           return;
         }
         workspaceSaveWriter.reopenAdmission();
+        reopenWorkflowAdvanceAdmission();
         appShutdownRequested = false;
       },
       () => {
@@ -6805,6 +6869,7 @@ function requestFailedWindowCloseRecovery(): void {
       return;
     }
     workspaceSaveWriter.reopenAdmission();
+    reopenWorkflowAdvanceAdmission();
     windowCloseRecoveryState = "idle";
     appShutdownRequested = false;
     await createMainWindow();
@@ -6850,24 +6915,24 @@ function createBeforeQuitHandler(
 
 function closeWorkflowStores(): Promise<void> {
   if (workflowStoresClosePromise) return workflowStoresClosePromise;
+  closeWorkflowAdvanceAdmission();
   const closing = (async () => {
     workspaceSaveWriter.closeAdmission();
     try {
       await workspaceSaveWriter.drain();
+      await drainWorkflowTasks();
       const closingPlanRuntime = planRuntime;
       await closingPlanRuntime?.close();
       if (planRuntime === closingPlanRuntime) planRuntime = null;
-      await Promise.allSettled([...new Set(workflowProjectAdvanceTails.values())]);
+      await drainWorkflowTasks();
       for (const [projectRoot, store] of workflowStores) {
         store.close();
         workflowStores.delete(projectRoot);
-        workflowStoreInitializations.delete(projectRoot);
       }
-      workflowStoreInitializations.clear();
-      workflowSessionAdvanceFlights.clear();
-      workflowProjectAdvanceTails.clear();
+      if (!appShutdownRequested) reopenWorkflowAdvanceAdmission();
     } catch (error) {
       workspaceSaveWriter.reopenAdmission();
+      reopenWorkflowAdvanceAdmission();
       throw error;
     }
   })();
@@ -6877,4 +6942,57 @@ function closeWorkflowStores(): Promise<void> {
   };
   void closing.then(reset, reset);
   return closing;
+}
+
+function closeWorkflowAdvanceAdmission(): void {
+  workflowAdvanceAdmissionOpen = false;
+  workflowAdvanceAdmissionEpoch += 1;
+}
+
+function reopenWorkflowAdvanceAdmission(): void {
+  workflowAdvanceAdmissionOpen = true;
+}
+
+function isWorkflowAdvanceAdmissionOpen(): boolean {
+  return workflowAdvanceAdmissionOpen;
+}
+
+function assertWorkflowAdvanceAdmissionOpen(expectedEpoch = workflowAdvanceAdmissionEpoch): number {
+  if (!workflowAdvanceAdmissionOpen || workflowAdvanceAdmissionEpoch !== expectedEpoch) {
+    throw new Error(workflowAdvanceShutdownError);
+  }
+  return expectedEpoch;
+}
+
+function registerWorkflowTerminalReconciliation(task: () => Promise<void>): Promise<void> {
+  if (!workflowAdvanceAdmissionOpen) return Promise.resolve();
+  const reconciliation = Promise.resolve().then(task);
+  workflowTerminalReconciliationTasks.add(reconciliation);
+  void reconciliation.then(
+    () => { workflowTerminalReconciliationTasks.delete(reconciliation); },
+    () => { workflowTerminalReconciliationTasks.delete(reconciliation); },
+  );
+  return reconciliation;
+}
+
+async function drainWorkflowTasks(): Promise<void> {
+  while (
+    workflowStoreOperationTasks.size > 0 ||
+    workflowTerminalReconciliationTasks.size > 0 ||
+    workflowStoreInitializations.size > 0 ||
+    workflowSessionMutationLocks.size > 0 ||
+    workflowSessionAdvanceFlights.size > 0 ||
+    workflowProjectAdvanceTails.size > 0
+  ) {
+    const tasks = new Set<Promise<unknown>>([
+      ...workflowStoreOperationTasks,
+      ...workflowTerminalReconciliationTasks,
+      ...workflowStoreInitializations.values(),
+      ...workflowSessionMutationLocks.values(),
+      ...workflowSessionAdvanceFlights.values(),
+      ...workflowProjectAdvanceTails.values(),
+    ]);
+    if (tasks.size > 0) await Promise.allSettled(tasks);
+    await Promise.resolve();
+  }
 }

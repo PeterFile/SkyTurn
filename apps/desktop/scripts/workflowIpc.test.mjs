@@ -9,7 +9,7 @@ import vm from "node:vm";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
 
-test("Electron main owns natural workflow IPC channels", async () => {
+test("Electron main tracks every top-level workflow store operation, not only workflow IPC", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
 
   assert.match(main, /createWorkflowStore/);
@@ -46,6 +46,38 @@ test("Electron main owns natural workflow IPC channels", async () => {
   ]) {
     assert.match(main, new RegExp(`ipcMain\\.handle\\("${escapeRegExp(channel)}"`));
   }
+  const workflowChannels = [...main.matchAll(/ipcMain\.handle\("workflow:[^"]+"/g)];
+  const registeredWorkflowHandlers = [
+    ...main.matchAll(/ipcMain\.handle\("workflow:[^"]+",\s*workflowHandler\(/g),
+  ];
+  assert.equal(workflowChannels.length, 28);
+  assert.equal(registeredWorkflowHandlers.length, workflowChannels.length);
+  assert.match(main, /const workflowStoreOperationTasks = new Set<Promise<unknown>>\(\)/);
+  assert.match(main, /return await registerWorkflowStoreOperation\(\(\) => handler\(\.\.\.args\)\)/);
+  assert.match(main, /workflowStoreOperationTasks\.add\(operation\)/);
+  const workflowOperationRegistry = main.slice(
+    main.indexOf("function registerWorkflowStoreOperation"),
+    main.indexOf("function terminalHandler"),
+  );
+  assert.match(workflowOperationRegistry, /const admissionEpoch = assertWorkflowAdvanceAdmissionOpen\(\)/);
+  assert.match(workflowOperationRegistry, /Promise\.resolve\(\)\.then\(async \(\) => \{/);
+  assert.match(workflowOperationRegistry, /assertWorkflowAdvanceAdmissionOpen\(admissionEpoch\)/);
+  assert.match(workflowOperationRegistry, /return await task\(\)/);
+  assert.doesNotMatch(workflowOperationRegistry, /normalizeWorkflowIpcError/);
+  const runStartHandler = main.slice(
+    main.indexOf('ipcMain.handle("run:start"'),
+    main.indexOf('ipcMain.handle("run:send"'),
+  );
+  assert.match(runStartHandler, /registerWorkflowStoreOperation\(async \(\) => \{/);
+  assert.match(runStartHandler, /publicRunStartHandler\(input\)/);
+  assert.doesNotMatch(runStartHandler, /normalizeWorkflowIpcError/);
+  const workspaceLoadHandler = main.slice(
+    main.indexOf('ipcMain.handle("workspace:load"'),
+    main.indexOf('ipcMain.handle("workspace:save"'),
+  );
+  assert.match(workspaceLoadHandler, /registerWorkflowStoreOperation\(async \(\) => \{\s*const value = await fs\.readFile/);
+  assert.match(workspaceLoadHandler, /error\.code === "ENOENT"\) return null/);
+  assert.match(workspaceLoadHandler, /throw new Error\(workspaceLoadError\)/);
   for (const channel of ["workflow:applyIntent", "workflow:scheduleReady", "workflow:recordRunResult"]) {
     assert.doesNotMatch(main, new RegExp(`ipcMain\\.handle\\("${escapeRegExp(channel)}"`));
   }
@@ -119,6 +151,24 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(workflowEventsHandler, /redactWorkflowEventForRenderer/);
   assert.doesNotMatch(workflowEventsHandler, /events:\s*store\.listEvents\(sessionId\)\.filter/);
 
+  const projectionHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:projection"'),
+    main.indexOf('ipcMain.handle("workflow:events"'),
+  );
+  assert.match(
+    projectionHandler,
+    /advanceWorkflowSession\(projectRoot,\s*store,\s*workflowSessionId,\s*false,\s*"projection-query"\)/,
+  );
+  const workflowBroadcast = main.slice(
+    main.indexOf("function terminalWorkflowBroadcastCause"),
+    main.indexOf("function broadcastTerminalEvent"),
+  );
+  assert.match(workflowBroadcast, /cause:\s*WorkflowBroadcastCause\s*=\s*"workflow-mutation"/);
+  assert.match(
+    workflowBroadcast,
+    /send\("workflow:event",\s*\{\s*projectRoot,\s*sessionId,\s*cause,\s*projection,\s*canvasSession\s*\}\)/,
+  );
+
   const checkpointHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:checkpoints"'),
     main.indexOf('ipcMain.handle("workflow:rollback:eligibility"'),
@@ -170,7 +220,26 @@ test("Electron main owns natural workflow IPC channels", async () => {
   );
   assert.match(repairHandler, /requestNodeRepair/);
   assert.match(repairHandler, /workflow\.node\.repair_requested|requestNodeRepair/);
-  assert.match(repairHandler, /broadcastWorkflowProjection/);
+  assert.match(
+    repairHandler,
+    /await advanceWorkflowSession\(projectRoot,\s*store,\s*normalized\.sessionId,\s*true,\s*"repair-request"\)/,
+  );
+  assert.match(repairHandler, /const projection = store\.materializeFlowProjection\(normalized\.sessionId\)/);
+  assert.match(
+    repairHandler,
+    /broadcastWorkflowProjection\(projectRoot,\s*normalized\.sessionId,\s*store,\s*"repair-request"\)/,
+  );
+  assert.doesNotMatch(repairHandler, /projection:\s*result\.projection/);
+  const repairRequestIndex = repairHandler.indexOf("store.requestNodeRepair(normalized)");
+  const repairAdvanceIndex = repairHandler.indexOf("await advanceWorkflowSession");
+  const repairProjectionIndex = repairHandler.indexOf("store.materializeFlowProjection(normalized.sessionId)");
+  const repairBroadcastIndex = repairHandler.indexOf("broadcastWorkflowProjection");
+  const repairReturnIndex = repairHandler.indexOf("return {");
+  assert.ok(repairRequestIndex >= 0, "repair intent must be durable before scheduling");
+  assert.ok(repairAdvanceIndex > repairRequestIndex, "repair scheduling must follow durable repair creation");
+  assert.ok(repairProjectionIndex > repairAdvanceIndex, "repair response must materialize after scheduling");
+  assert.ok(repairBroadcastIndex > repairProjectionIndex, "repair broadcast must use advanced authoritative state");
+  assert.ok(repairReturnIndex > repairBroadcastIndex, "repair response must follow the authoritative broadcast");
 
   const variantHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:variant:create"'),
@@ -214,7 +283,8 @@ test("Electron main owns natural workflow IPC channels", async () => {
   assert.match(worktreeAdoptHandler, /recordVariantAdoptFailure/);
   assert.match(worktreeAdoptHandler, /adoptVariant/);
   assert.match(worktreeAdoptHandler, /findVariantAdoptionEvent/);
-  assert.match(worktreeAdoptHandler, /catch\s*\(error\)\s*\{[\s\S]*broadcastWorkflowProjection\(projectRoot,\s*sessionId,\s*store\);[\s\S]*throw normalizeWorkflowIpcError\(error\);[\s\S]*\}/);
+  assert.match(worktreeAdoptHandler, /catch\s*\(error\)\s*\{[\s\S]*broadcastWorkflowProjection\(projectRoot,\s*sessionId,\s*store\);[\s\S]*throw error;[\s\S]*\}/);
+  assert.doesNotMatch(worktreeAdoptHandler, /normalizeWorkflowIpcError/);
   assert.doesNotMatch(worktreeAdoptHandler, /status:\s*"requested"/);
 
   const worktreeCleanHandler = main.slice(
@@ -2221,7 +2291,7 @@ test("workflow adopt IPC records a failed adoption before rejecting boundary vio
   assert.match(helperSource, /workflow\.variant\.adopt_failed/);
 
   const failureIndex = worktreeAdoptHandler.indexOf("recordVariantAdoptFailure");
-  const throwIndex = worktreeAdoptHandler.indexOf("throw normalizeWorkflowIpcError");
+  const throwIndex = worktreeAdoptHandler.indexOf("throw error");
   assert.ok(failureIndex >= 0, "boundary rejection must append workflow.variant.adopt_failed");
   assert.ok(failureIndex < throwIndex, "adopt_failed must be recorded before the normalized IPC error is thrown");
 });
@@ -2243,7 +2313,7 @@ test("workflow adopt IPC audits missing created worktree identity before rejecti
   const catchIndex = preService.indexOf("catch (error)");
   const failureIndex = preService.indexOf("recordVariantAdoptFailure");
   const broadcastIndex = preService.indexOf("broadcastWorkflowProjection");
-  const throwIndex = preService.indexOf("throw normalizeWorkflowIpcError");
+  const throwIndex = preService.indexOf("throw error");
 
   assert.ok(tryIndex >= 0, "adopt identity lookup must be inside an audited try/catch");
   assert.ok(lookupIndex > tryIndex, "missing/non-created worktree identity must be caught and audited");
@@ -2275,7 +2345,7 @@ test("workflow clean IPC audits boundary rejection before service removal", asyn
   const catchIndex = preService.indexOf("catch (error)");
   const failureIndex = preService.indexOf("recordWorktreeCleanFailure");
   const broadcastIndex = preService.indexOf("broadcastWorkflowProjection");
-  const throwIndex = preService.indexOf("throw normalizeWorkflowIpcError");
+  const throwIndex = preService.indexOf("throw error");
 
   assert.ok(storeIndex >= 0, "clean IPC must open the workflow store before auditable boundary preflight");
   assert.ok(tryIndex > storeIndex, "clean boundary preflight must run inside an audited try/catch");
