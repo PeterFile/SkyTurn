@@ -137,7 +137,9 @@ test("New Session UI acceptance passes live CDP into workflow completion and dri
     },
   };
 
-  await authorizePendingDangerRunThroughUi(cdp, pendingDangerAuthorizationNode());
+  await authorizePendingDangerRunThroughUi(cdp, pendingDangerAuthorizationNode(), {
+    now: () => 1_000,
+  });
 
   assert.match(source, /waitForWorkflowCompletion\(\{\s*\n\s*cdp: liveCdp,/);
   assert.match(source, /async function waitForWorkflowCompletion\(\{ cdp,/);
@@ -148,10 +150,56 @@ test("New Session UI acceptance passes live CDP into workflow completion and dri
   assert.match(expression, /findExactAriaLabel\('\.node-modal\[aria-label\]', title\)/);
   assert.match(expression, /querySelectorAll\('\.decision-panel\[aria-label\]'\)/);
   assert.match(expression, /Authorize this run/);
+  assert.match(expression, /const authorizationDeadline = 76000/);
+  assert.doesNotMatch(expression, /const authorizationDeadline = Date\.now\(\)/);
+  assert.doesNotMatch(expression, /const deadline = Date\.now\(\) \+ 15000/);
+  assert.doesNotMatch(expression, /requestAnimationFrame/);
+  assert.match(expression, /setTimeout\(callback, 16\)/);
+  assert.match(expression, /if \(now\(\) >= deadline\)/);
+  assert.ok(expression.indexOf("if (now() >= deadline)") < expression.indexOf("const value = probe()"));
+  assert.ok(
+    expression.indexOf("assertBeforeDeadline(authorizationDeadline)") <
+      expression.indexOf("authorizationButton.dispatchEvent"),
+  );
   assert.match(expression, /if \(!authorizationButton\.disabled\)/);
   assert.match(expression, /authorizationButton\.disabled/);
-  assert.deepEqual(evaluationOptions, { awaitPromise: true, returnByValue: true });
+  assert.deepEqual(evaluationOptions, {
+    awaitPromise: true,
+    returnByValue: true,
+    requestTimeoutMs: 90_000,
+  });
   assert.doesNotMatch(expression, /workflow:userDecision:answer|answerUserDecision|createWorkflowSession/);
+});
+
+test("danger authorization wait rejects an expired deadline before probing or scheduling", async () => {
+  const { assertBrowserDeadline, waitForBrowserProbe } = await import("./newSessionUiAcceptance.mjs");
+  let probeCalls = 0;
+  let scheduleCalls = 0;
+
+  await assert.rejects(
+    waitForBrowserProbe(
+      () => {
+        probeCalls += 1;
+        return true;
+      },
+      "danger authorization",
+      {
+        deadline: 75,
+        now: () => 75,
+        schedule: () => {
+          scheduleCalls += 1;
+        },
+      },
+    ),
+    /Timed out waiting for danger authorization/,
+  );
+  assert.equal(probeCalls, 0);
+  assert.equal(scheduleCalls, 0);
+  assert.throws(
+    () => assertBrowserDeadline(75, { now: () => 75 }),
+    /Danger authorization deadline expired/,
+  );
+  assert.doesNotThrow(() => assertBrowserDeadline(75, { now: () => 74 }));
 });
 
 test("New Session UI acceptance disables PTY and scopes the dialog override to its temporary project", async () => {
@@ -1754,6 +1802,39 @@ test("CDP requests time out and drain only their pending entry", async () => {
     );
     assert.equal(client.pending.size, 0);
   } finally {
+    client?.destroy();
+    await peer.close();
+  }
+});
+
+test("CDP evaluate supports a bounded per-request timeout without changing the client default", async () => {
+  const { CdpClient } = await import("./newSessionUiAcceptance.mjs");
+  const peer = await createCdpWebSocketPeer((request, reply) => {
+    setTimeout(() => reply(request.id, { result: { value: "ready" } }), 50);
+  });
+  let client = null;
+  const defaultClient = new CdpClient(peer.url);
+
+  try {
+    assert.equal(defaultClient.requestTimeoutMs, 30_000);
+    client = await CdpClient.connect(peer.url, 30);
+    assert.equal(
+      await client.evaluate("'ready'", { requestTimeoutMs: 80 }),
+      "ready",
+    );
+    await assert.rejects(
+      client.evaluate("'uses default'"),
+      /CDP request Runtime\.evaluate timed out after 30 ms\./,
+    );
+    for (const requestTimeoutMs of [0, -0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      await assert.rejects(
+        client.evaluate("'invalid override'", { requestTimeoutMs }),
+        /CDP request timeout must be a positive finite number\./,
+      );
+    }
+    assert.equal(client.pending.size, 0);
+  } finally {
+    defaultClient.destroy();
     client?.destroy();
     await peer.close();
   }
