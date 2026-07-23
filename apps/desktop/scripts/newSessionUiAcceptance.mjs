@@ -22,8 +22,40 @@ const agentWatchdogTimeoutMs = Math.max(1_000, Math.min(12 * 60 * 1_000, waitTim
 const pollIntervalMs = Number(process.env.SKYTURN_NEW_SESSION_UI_POLL_MS ?? 2_000);
 const commandOutputLimitBytes = Number(process.env.SKYTURN_NEW_SESSION_UI_OUTPUT_LIMIT_BYTES ?? 4_000);
 const defaultCdpRequestTimeoutMs = 30_000;
+const dangerAuthorizationUiTimeoutMs = 75_000;
+const dangerAuthorizationCdpTimeoutMs = 90_000;
 const dangerAuthorizationOption = "Authorize this run";
 const expectedChangedFiles = ["src/App.css", "src/App.jsx"];
+
+export function waitForBrowserProbe(probe, label, {
+  deadline,
+  now = () => Date.now(),
+  schedule = (callback) => setTimeout(callback, 16),
+} = {}) {
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (now() >= deadline) {
+        reject(new Error(`Timed out waiting for ${label}`));
+        return;
+      }
+      const value = probe();
+      if (value) {
+        resolve(value);
+        return;
+      }
+      schedule(tick);
+    };
+    tick();
+  });
+}
+
+export function assertBrowserDeadline(deadline, {
+  now = () => Date.now(),
+} = {}) {
+  if (now() >= deadline) {
+    throw new Error("Danger authorization deadline expired.");
+  }
+}
 const requiredLaneKinds = ["implementation", "validation", "browser_validation", "review", "commit"];
 const browserScreenshotArtifact = ".devflow/acceptance/react-app.png";
 
@@ -648,7 +680,10 @@ export function pendingDangerAuthorizationNodes(session) {
   });
 }
 
-export async function authorizePendingDangerRunThroughUi(cdp, node) {
+export async function authorizePendingDangerRunThroughUi(cdp, node, {
+  now = () => Date.now(),
+} = {}) {
+  const authorizationDeadline = now() + dangerAuthorizationUiTimeoutMs;
   const result = await cdp.evaluate(`
     (async () => {
       const nodeId = ${JSON.stringify(node.id)};
@@ -656,6 +691,9 @@ export async function authorizePendingDangerRunThroughUi(cdp, node) {
       const decisionPrompt = ${JSON.stringify(node.userDecision.prompt)};
       const moreDetailsLabel = 'More details for ' + title;
       const authorizationOption = ${JSON.stringify(dangerAuthorizationOption)};
+      const authorizationDeadline = ${authorizationDeadline};
+      const waitFor = (${waitForBrowserProbe.toString()});
+      const assertBeforeDeadline = (${assertBrowserDeadline.toString()});
       const findExactAriaLabel = (selector, label) => [...document.querySelectorAll(selector)]
         .find((element) => element.getAttribute('aria-label') === label);
       const findNodeContainer = () => [...document.querySelectorAll('.react-flow__node[data-id]')]
@@ -675,19 +713,22 @@ export async function authorizePendingDangerRunThroughUi(cdp, node) {
       const moreDetailsButton = await waitFor(
         findMoreDetailsButton,
         'decision node More details button for ' + title,
+        { deadline: authorizationDeadline },
       );
       moreDetailsButton.dispatchEvent(new MouseEvent('click', {
         bubbles: true,
         cancelable: true,
         view: window,
       }));
-      await waitFor(findModal, 'decision modal for ' + title);
+      await waitFor(findModal, 'decision modal for ' + title, { deadline: authorizationDeadline });
       const authorizationButton = await waitFor(
         findAuthorizationButton,
         'exact danger authorization option for ' + title,
+        { deadline: authorizationDeadline },
       );
       const outcome = authorizationButton.disabled ? 'already-disabled' : 'submitted';
       if (!authorizationButton.disabled) {
+        assertBeforeDeadline(authorizationDeadline);
         authorizationButton.dispatchEvent(new MouseEvent('click', {
           bubbles: true,
           cancelable: true,
@@ -700,7 +741,7 @@ export async function authorizePendingDangerRunThroughUi(cdp, node) {
         if (!findDecisionPanel()) return 'decision-panel-removed';
         const currentButton = findAuthorizationButton();
         return !currentButton || currentButton.disabled ? 'authoritative-renderer-update' : null;
-      }, 'danger authorization renderer update for ' + title);
+      }, 'danger authorization renderer update for ' + title, { deadline: authorizationDeadline });
 
       const modal = findModal();
       if (modal) {
@@ -708,36 +749,26 @@ export async function authorizePendingDangerRunThroughUi(cdp, node) {
           () => [...modal.querySelectorAll('button[aria-label]')]
             .find((button) => button.getAttribute('aria-label') === 'Close'),
           'decision modal Close button for ' + title,
+          { deadline: authorizationDeadline },
         );
         closeButton.dispatchEvent(new MouseEvent('click', {
           bubbles: true,
           cancelable: true,
           view: window,
         }));
-        await waitFor(() => !findModal(), 'decision modal close for ' + title);
+        await waitFor(
+          () => !findModal(),
+          'decision modal close for ' + title,
+          { deadline: authorizationDeadline },
+        );
       }
       return { outcome, modalClosed: !findModal() };
-
-      function waitFor(probe, label) {
-        const deadline = Date.now() + 15000;
-        return new Promise((resolve, reject) => {
-          const tick = () => {
-            const value = probe();
-            if (value) {
-              resolve(value);
-              return;
-            }
-            if (Date.now() > deadline) {
-              reject(new Error('Timed out waiting for ' + label));
-              return;
-            }
-            requestAnimationFrame(tick);
-          };
-          tick();
-        });
-      }
     })()
-  `, { awaitPromise: true, returnByValue: true });
+  `, {
+    awaitPromise: true,
+    returnByValue: true,
+    requestTimeoutMs: dangerAuthorizationCdpTimeoutMs,
+  });
   if (!result?.modalClosed || !["submitted", "already-disabled"].includes(result.outcome)) {
     throw new Error("Danger authorization UI did not reach a confirmed renderer state.");
   }
@@ -2529,7 +2560,10 @@ export class CdpClient {
     });
   }
 
-  call(method, params = {}) {
+  call(method, params = {}, requestTimeoutMs = this.requestTimeoutMs) {
+    if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
+      throw new Error("CDP request timeout must be a positive finite number.");
+    }
     const id = this.nextId;
     this.nextId += 1;
     const payload = JSON.stringify({ id, method, params });
@@ -2538,8 +2572,8 @@ export class CdpClient {
       entry.timer = setTimeout(() => {
         if (this.pending.get(id) !== entry) return;
         this.pending.delete(id);
-        reject(new Error(`CDP request ${safeCdpMethodName(method)} timed out after ${this.requestTimeoutMs} ms.`));
-      }, this.requestTimeoutMs);
+        reject(new Error(`CDP request ${safeCdpMethodName(method)} timed out after ${requestTimeoutMs} ms.`));
+      }, requestTimeoutMs);
       this.pending.set(id, entry);
       try {
         this.writeFrame(Buffer.from(payload));
@@ -2558,7 +2592,7 @@ export class CdpClient {
       expression,
       awaitPromise: options.awaitPromise === true,
       returnByValue: options.returnByValue !== false,
-    });
+    }, options.requestTimeoutMs);
     if (response.result?.exceptionDetails) {
       throw new Error(response.result.exceptionDetails.text ?? "Runtime.evaluate failed.");
     }
