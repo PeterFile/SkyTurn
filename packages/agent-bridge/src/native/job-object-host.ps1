@@ -73,6 +73,7 @@ public static class SkyTurnJobObjectHost
         IntPtr stderrWrite = IntPtr.Zero;
         IntPtr nullInput = new IntPtr(-1);
         bool assigned = false;
+        JobTerminationState terminationState = new JobTerminationState();
         Pump stdoutPump = null;
         Pump stderrPump = null;
         ControlState control = null;
@@ -159,7 +160,7 @@ public static class SkyTurnJobObjectHost
             string termination;
             if (cancellation)
             {
-                TerminateAndVerify(job, cleanupTimeoutMs);
+                TerminateAndVerify(job, cleanupTimeoutMs, terminationState);
                 termination = "cancelled";
             }
             else
@@ -169,7 +170,7 @@ public static class SkyTurnJobObjectHost
                 uint activeProcesses = QueryActiveProcesses(job);
                 if (activeProcesses > 0)
                 {
-                    TerminateAndVerify(job, cleanupTimeoutMs);
+                    TerminateAndVerify(job, cleanupTimeoutMs, terminationState);
                     termination = "descendants-terminated";
                 }
                 else
@@ -186,7 +187,7 @@ public static class SkyTurnJobObjectHost
         }
         catch
         {
-            bool treeEmpty = ReapAfterFailure(job, processHandle, assigned, cleanupTimeoutMs);
+            bool treeEmpty = ReapAfterFailure(job, processHandle, assigned, cleanupTimeoutMs, terminationState);
             try
             {
                 WriteFailed(controlWriter, token, treeEmpty);
@@ -270,10 +271,16 @@ public static class SkyTurnJobObjectHost
         return accounting.ActiveProcesses;
     }
 
-    private static void TerminateAndVerify(IntPtr job, int timeoutMs)
+    private static void TerminateAndVerify(IntPtr job, int timeoutMs, JobTerminationState terminationState)
     {
-        if (QueryActiveProcesses(job) > 0) Ensure(NativeMethods.TerminateJobObject(job, TerminatedExitCode));
+        if (QueryActiveProcesses(job) > 0) Ensure(TerminateJobObjectOnce(job, terminationState));
         if (!WaitForTreeEmpty(job, timeoutMs)) throw new InvalidOperationException();
+    }
+
+    private static bool TerminateJobObjectOnce(IntPtr job, JobTerminationState terminationState)
+    {
+        if (!terminationState.TryBegin()) return true;
+        return NativeMethods.TerminateJobObject(job, TerminatedExitCode);
     }
 
     private static bool WaitForTreeEmpty(IntPtr job, int timeoutMs)
@@ -329,17 +336,37 @@ public static class SkyTurnJobObjectHost
         }
     }
 
-    private static bool ReapAfterFailure(IntPtr job, IntPtr processHandle, bool assigned, int timeoutMs)
+    private sealed class JobTerminationState
+    {
+        public bool Attempted { get; private set; }
+
+        public bool TryBegin()
+        {
+            if (Attempted) return false;
+            Attempted = true;
+            return true;
+        }
+    }
+
+    private static bool ReapAfterFailure(
+        IntPtr job,
+        IntPtr processHandle,
+        bool assigned,
+        int timeoutMs,
+        JobTerminationState terminationState)
     {
         if (assigned && job != IntPtr.Zero)
         {
-            try
+            if (!terminationState.Attempted)
             {
-                if (QueryActiveProcesses(job) > 0 && !NativeMethods.TerminateJobObject(job, TerminatedExitCode)) return false;
-            }
-            catch
-            {
-                return false;
+                try
+                {
+                    if (QueryActiveProcesses(job) > 0 && !TerminateJobObjectOnce(job, terminationState)) return false;
+                }
+                catch
+                {
+                    return false;
+                }
             }
             return WaitForTreeEmpty(job, timeoutMs);
         }

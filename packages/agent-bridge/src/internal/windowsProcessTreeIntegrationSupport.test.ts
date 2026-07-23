@@ -257,6 +257,27 @@ describe("Windows process-tree integration support", () => {
     expect(diagnostic).not.toContain(canonicalWorkdir);
     expect(diagnostic).not.toContain(fixturePath);
   });
+
+  it("starts the terminal deadline only after the bounded Windows setup completes", async () => {
+    const source = await readFile(
+      new URL("../../scripts/windowsProcessTreeIntegration.mjs", import.meta.url),
+      "utf8",
+    );
+    const setupCompletion = source.indexOf("handle = await setupFailure;");
+    const setupTimerCleanup = source.indexOf("clearTimeout(setupTimer);");
+    const terminalTimer = source.indexOf("terminalTimer = setTimeout(");
+
+    expect(source).toContain("setupTimer = setTimeout(");
+    expect(source).toContain("35_000");
+    expect(source).toContain("new Promise((resolve, reject) => {");
+    expect(source).not.toContain("new Promise((_, reject) => {");
+    expect(source).toMatch(
+      /try\s*\{\s*handle = await setupFailure;\s*\}\s*finally\s*\{\s*clearTimeout\(setupTimer\);\s*\}/,
+    );
+    expect(setupCompletion).toBeGreaterThan(-1);
+    expect(setupTimerCleanup).toBeGreaterThan(setupCompletion);
+    expect(terminalTimer).toBeGreaterThan(setupTimerCleanup);
+  });
 });
 
 function captureErrorMessage(callback: () => void): string {

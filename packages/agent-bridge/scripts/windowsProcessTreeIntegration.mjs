@@ -64,10 +64,6 @@ async function runProcessTreeCase(agentKind, terminalPath) {
       resolveTerminal = resolve;
       rejectTerminal = reject;
     });
-    terminalTimer = setTimeout(
-      () => rejectTerminal(new Error(`${agentKind} ${terminalPath} terminal event timed out.`)),
-      20_000,
-    );
     const options = {
       executablePath: process.execPath,
       extraArgs: invocation.extraArgs,
@@ -83,32 +79,53 @@ async function runProcessTreeCase(agentKind, terminalPath) {
     const adapter = agentKind === "codex"
       ? createCodexCliAdapter(options)
       : createHermesCliAdapter(options);
-    const handle = await adapter.startRun({
-      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
-      runId: `run-${agentKind}-${terminalPath}`,
-      nodeId: `node-${agentKind}-${terminalPath}`,
-      sessionId: "session-windows-process-tree",
-      projectRoot: root,
-      worktreePath: root,
-      agentKind,
-      prompt,
-      ...(agentKind === "hermes" ? { hermesSessionHandle: resumeHandle } : {}),
-    }, {
-      async emit(event) {
-        events.push(event);
-        if (
-          event.kind === "status" &&
-          (
-            event.payload.status === "cancelled" ||
-            event.payload.status === "timed-out" ||
-            (terminalPath === "normal-root-exit" && event.payload.status === "failed")
-          )
-        ) {
-          resolveTerminal(event);
-        }
-        return event;
-      },
+    let setupTimer;
+    const setupFailure = new Promise((resolve, reject) => {
+      setupTimer = setTimeout(
+        () => reject(new Error(`${agentKind} ${terminalPath} setup timed out.`)),
+        35_000,
+      );
+      setupTimer.unref?.();
+      void adapter.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        runId: `run-${agentKind}-${terminalPath}`,
+        nodeId: `node-${agentKind}-${terminalPath}`,
+        sessionId: "session-windows-process-tree",
+        projectRoot: root,
+        worktreePath: root,
+        agentKind,
+        prompt,
+        ...(agentKind === "hermes" ? { hermesSessionHandle: resumeHandle } : {}),
+      }, {
+        async emit(event) {
+          events.push(event);
+          if (
+            event.kind === "status" &&
+            (
+              event.payload.status === "cancelled" ||
+              event.payload.status === "timed-out" ||
+              (terminalPath === "normal-root-exit" && event.payload.status === "failed")
+            )
+          ) {
+            resolveTerminal(event);
+          }
+          return event;
+        },
+      }).then(
+        resolve,
+        reject,
+      );
     });
+    let handle;
+    try {
+      handle = await setupFailure;
+    } finally {
+      clearTimeout(setupTimer);
+    }
+    terminalTimer = setTimeout(
+      () => rejectTerminal(new Error(`${agentKind} ${terminalPath} terminal event timed out.`)),
+      20_000,
+    );
     const diagnosticInput = {
       agentKind,
       terminalPath,

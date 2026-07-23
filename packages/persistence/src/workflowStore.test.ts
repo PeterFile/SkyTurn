@@ -1388,6 +1388,104 @@ describe("SQLite workflow store", () => {
     store.close();
   });
 
+  it("persists exact run authorization decisions across reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const authorization = {
+      sandbox: "danger-full-access",
+      runId: "run-session-1-lane-commit",
+      startFingerprint: "a".repeat(64),
+    };
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.user_decision.requested",
+      source: "electron-main",
+      idempotencyKey: "danger-run:requested",
+      payload: {
+        decisionId: "decision-danger-run",
+        prompt: "Authorize full host access?",
+        options: ["Authorize this run"],
+        reason: "This run can modify host state outside the project.",
+        targetLaneId: "lane-commit",
+        targetSegmentId: "segment-session-1-lane-commit",
+        runAuthorization: authorization,
+      },
+      now: "2026-07-23T00:00:00.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.user_decision.answered",
+      source: "renderer",
+      idempotencyKey: "danger-run:answered",
+      payload: {
+        decisionId: "decision-danger-run",
+        selectedOption: "Authorize this run",
+        action: "continue",
+        targetLaneId: "lane-commit",
+        targetSegmentId: "segment-session-1-lane-commit",
+        runAuthorization: authorization,
+      },
+      now: "2026-07-23T00:00:01.000Z",
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const decision = reopened.materializeFlowProjection("session-1").userDecisions[0];
+    const canvasDecision = reopened.materializeCanvasSession("session-1")?.nodes
+      .find((node) => node.id === "decision-danger-run")?.userDecision;
+
+    expect(decision).toMatchObject({ status: "answered", runAuthorization: authorization });
+    expect(canvasDecision).toMatchObject({ status: "answered", runAuthorization: authorization });
+    reopened.close();
+  });
+
+  it("fails closed for dangerous ready lanes until the backend authorizes them", async () => {
+    const store = await makeSeededStore();
+    for (const lane of [
+      { id: "lane-implementation", kind: "implementation" },
+      { id: "lane-commit", kind: "commit" },
+    ]) {
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind: "workflow.lane.declared",
+        source: "test",
+        idempotencyKey: `lane:${lane.id}`,
+        payload: {
+          lane: {
+            ...lane,
+            semanticKey: lane.id,
+            title: lane.id,
+            agentKind: "codex",
+            status: "pending",
+          },
+        },
+        now: "2026-07-23T00:00:00.000Z",
+      });
+    }
+
+    const unauthorized = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      now: "2026-07-23T00:00:01.000Z",
+    });
+
+    expect(unauthorized.readyLanes.map((lane) => lane.id)).toEqual(["lane-implementation"]);
+    expect(store.listRunningSegments().map((segment) => segment.laneId)).toEqual(["lane-implementation"]);
+
+    const authorized = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      authorizedLaneIds: ["lane-commit"],
+      now: "2026-07-23T00:00:02.000Z",
+    });
+
+    expect(authorized.readyLanes.map((lane) => lane.id)).toEqual(["lane-commit"]);
+    expect(store.listRunningSegments().map((segment) => segment.laneId).sort()).toEqual([
+      "lane-commit",
+      "lane-implementation",
+    ]);
+    store.close();
+  });
+
   it.each(["running", "waiting_input", "completed", "failed", "blocked"] as const)(
     "rejects reassignment for a lane in %s state",
     async (status) => {
@@ -5301,8 +5399,12 @@ describe("SQLite workflow store", () => {
     declareCodeChangeWorkflow(store);
     const completedLaneIds: string[] = [];
     for (let index = 0; index < 8; index += 1) {
+      const readyLaneIds = store.previewReadyLanes("session-1", {
+        allowedParallelism: 1,
+      }).readyLanes.map((lane) => lane.id);
       const scheduled = store.scheduleReadyLanes("session-1", {
         allowedParallelism: 1,
+        authorizedLaneIds: readyLaneIds,
         now: `2026-06-14T00:00:${String(3 + index * 2).padStart(2, "0")}.000Z`,
       });
       if (scheduled.readyLanes.length === 0) break;

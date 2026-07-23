@@ -4154,7 +4154,7 @@ function OutputTab({
   );
 }
 
-function UserDecisionPanel({
+export function UserDecisionPanel({
   node,
   onDecisionAnswer,
 }: {

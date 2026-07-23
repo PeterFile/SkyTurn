@@ -2959,12 +2959,16 @@ test("terminal planner reconciliation serializes intent scheduling before the ne
   }
 });
 
-test("terminal non-planner Hermes reconciliation schedules its downstream lane without renderer workflow IPC", async () => {
+test("terminal non-planner Hermes reconciliation requests durable danger authorization without renderer workflow IPC", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-non-planner-terminal-"));
+  const starts = [];
   let loaded;
   try {
     loaded = await loadMainModule([], {
-      createRunStartHandler: () => async (input) => ({ id: input.runId, status: "running" }),
+      createRunStartHandler: () => async (input) => {
+        starts.push(input);
+        return { id: input.runId, status: "running" };
+      },
     });
     loaded.exports.openedProjectRoots.add(projectRoot);
     loaded.exports.openedProjectRoots.add(await realFs.realpath(projectRoot));
@@ -3071,14 +3075,44 @@ test("terminal non-planner Hermes reconciliation schedules its downstream lane w
 
     const afterTerminal = store.materializeFlowProjection("session-1");
     expectFlowLane(afterTerminal, "lane-review", "completed");
-    expectFlowLane(afterTerminal, "lane-commit", "running");
-    assert.equal(afterTerminal.segments.filter((item) => item.laneId === "lane-commit").length, 1);
+    expectFlowLane(afterTerminal, "lane-commit", "pending");
+    assert.equal(afterTerminal.segments.filter((item) => item.laneId === "lane-commit").length, 0);
+    assert.equal(starts.length, 0);
+    assert.equal(afterTerminal.userDecisions.length, 1);
+    assert.deepEqual(toPlain(afterTerminal.userDecisions[0]), {
+      decisionId: afterTerminal.userDecisions[0].decisionId,
+      prompt: "Authorize full host access for Commit?",
+      options: ["Authorize this run"],
+      reason: "This run can modify host state outside the project.",
+      status: "waiting_input",
+      targetLaneId: "lane-commit",
+      targetSegmentId: "segment-session-1-lane-commit",
+      runAuthorization: {
+        sandbox: "danger-full-access",
+        runId: "run-session-1-lane-commit",
+        startFingerprint: afterTerminal.userDecisions[0].runAuthorization.startFingerprint,
+      },
+    });
+    assert.match(afterTerminal.userDecisions[0].runAuthorization.startFingerprint, /^[0-9a-f]{64}$/);
+    assert.equal(
+      store.listEvents("session-1").filter((event) =>
+        event.kind === "workflow.user_decision.requested" && event.source === "electron-main"
+      ).length,
+      1,
+    );
     assert.equal(store.listEvents("session-1").some((event) => event.kind === "workflow.planner_intent.reconciled"), false);
 
     await loaded.exports.reconcileTerminalRunEvent(bridge, terminalEvent);
 
     const afterReplay = store.materializeFlowProjection("session-1");
-    assert.equal(afterReplay.segments.filter((item) => item.laneId === "lane-commit").length, 1);
+    expectFlowLane(afterReplay, "lane-commit", "pending");
+    assert.equal(afterReplay.segments.filter((item) => item.laneId === "lane-commit").length, 0);
+    assert.equal(afterReplay.userDecisions.length, 1);
+    assert.equal(starts.length, 0);
+    assert.equal(
+      store.listEvents("session-1").filter((event) => event.kind === "workflow.user_decision.requested").length,
+      1,
+    );
     assert.equal(
       store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.finished").length,
       1,
@@ -4043,6 +4077,230 @@ test("generic workflow creation durable delivery survives store reopen and suppr
   } finally {
     await reopenedLoaded?.exports.closeWorkflowStores();
     await firstLoaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("danger-full-access scheduling waits for an exact durable user authorization before launch side effects", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-danger-run-authorization-"));
+  const starts = [];
+  let capabilityChecks = 0;
+  let checkpointCalls = 0;
+  let loaded;
+  try {
+    const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+      "../dist-electron/electron/runStartHandler.js"
+    );
+    loaded = await loadMainModule([], {
+      assertExpectedArtifactVerifierCapability: async () => {
+        capabilityChecks += 1;
+      },
+      createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
+        ...dependencies,
+        assertStartInput: async () => undefined,
+        prepareBeforeCheckpoint: async () => {
+          checkpointCalls += 1;
+          return true;
+        },
+        startRun: async (input) => {
+          starts.push(input);
+          return { id: input.runId, status: "running" };
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedScheduledLane(store, projectRoot, {
+      id: "lane-commit",
+      kind: "commit",
+      title: "Commit verified changes",
+    });
+
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+
+    const decision = store.materializeFlowProjection(session.id).userDecisions[0];
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(starts.length, 0);
+    assert.equal(capabilityChecks, 0);
+    assert.equal(checkpointCalls, 0);
+    assert.deepEqual(toPlain(decision), {
+      decisionId: decision.decisionId,
+      prompt: "Authorize full host access for Commit verified changes?",
+      options: ["Authorize this run"],
+      reason: "This run can modify host state outside the project.",
+      status: "waiting_input",
+      targetLaneId: "lane-commit",
+      targetSegmentId: "segment-session-1-lane-commit",
+      runAuthorization: {
+        sandbox: "danger-full-access",
+        runId: "run-session-1-lane-commit",
+        startFingerprint: decision.runAuthorization.startFingerprint,
+      },
+    });
+
+    await loaded.ipcHandlers.get("workflow:userDecision:answer")({}, projectRoot, {
+      sessionId: session.id,
+      decisionId: decision.decisionId,
+      selectedOption: "Authorize this run",
+      action: "continue",
+    });
+
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].runId, "run-session-1-lane-commit");
+    assert.equal(starts[0].sandbox, "danger-full-access");
+    assert.equal(capabilityChecks, 1);
+    assert.equal(checkpointCalls, 1);
+    assert.deepEqual(store.listRunningSegments().map((segment) => segment.laneId), ["lane-commit"]);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("danger-full-access scheduling leaves artifact lanes unauthorized when preauthorization input construction fails", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-danger-run-preauthorization-failure-"));
+  const starts = [];
+  let capabilityChecks = 0;
+  let checkpointCalls = 0;
+  let loaded;
+  try {
+    const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+      "../dist-electron/electron/runStartHandler.js"
+    );
+    loaded = await loadMainModule([], {
+      assertExpectedArtifactVerifierCapability: async () => {
+        capabilityChecks += 1;
+      },
+      createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
+        ...dependencies,
+        assertStartInput: async () => undefined,
+        prepareBeforeCheckpoint: async () => {
+          checkpointCalls += 1;
+          return true;
+        },
+        startRun: async (input) => {
+          starts.push(input);
+          return { id: input.runId, status: "running" };
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedScheduledLane(store, projectRoot, {
+      id: "lane-commit",
+      kind: "commit",
+      title: "Commit verified changes",
+      requiredEvidence: ["artifact"],
+    });
+
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+
+    const projection = store.materializeFlowProjection(session.id);
+    assert.equal(projection.userDecisions.length, 0);
+    assert.equal(projection.segments.filter((segment) => segment.laneId === "lane-commit").length, 0);
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(starts.length, 0);
+    assert.equal(capabilityChecks, 0);
+    assert.equal(checkpointCalls, 0);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("danger-full-access scheduling rejects stale durable authorization bindings", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-danger-run-stale-authorization-"));
+  let starts = 0;
+  let loaded;
+  try {
+    const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+      "../dist-electron/electron/runStartHandler.js"
+    );
+    loaded = await loadMainModule([], {
+      createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
+        ...dependencies,
+        assertStartInput: async () => undefined,
+        prepareBeforeCheckpoint: async () => true,
+        startRun: async (input) => {
+          starts += 1;
+          return { id: input.runId, status: "running" };
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedScheduledLane(store, projectRoot, {
+      id: "lane-commit",
+      kind: "commit",
+      title: "Commit verified changes",
+    });
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+    const decision = store.materializeFlowProjection(session.id).userDecisions[0];
+    store.appendWorkflowEvent({
+      sessionId: session.id,
+      kind: "workflow.user_decision.answered",
+      source: "renderer",
+      idempotencyKey: `decision:${decision.decisionId}:answered`,
+      payload: {
+        decisionId: decision.decisionId,
+        selectedOption: "Authorize this run",
+        action: "continue",
+        targetLaneId: decision.targetLaneId,
+        targetSegmentId: decision.targetSegmentId,
+        runAuthorization: {
+          ...decision.runAuthorization,
+          startFingerprint: "f".repeat(64),
+        },
+      },
+      now: "2026-07-23T00:00:02.000Z",
+    });
+
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+
+    assert.equal(store.materializeFlowProjection(session.id).userDecisions[0].status, "waiting_input");
+    assert.equal(store.listRunningSegments().length, 0);
+    assert.equal(starts, 0);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("ordinary workspace-write scheduling remains automatic", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-ordinary-run-scheduling-"));
+  const starts = [];
+  let loaded;
+  try {
+    const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+      "../dist-electron/electron/runStartHandler.js"
+    );
+    loaded = await loadMainModule([], {
+      createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
+        ...dependencies,
+        assertStartInput: async () => undefined,
+        prepareBeforeCheckpoint: async () => true,
+        startRun: async (input) => {
+          starts.push(input);
+          return { id: input.runId, status: "running" };
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedScheduledLane(store, projectRoot, {
+      id: "lane-implementation",
+      kind: "implementation",
+      title: "Implement the change",
+    });
+
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].sandbox, "workspace-write");
+    assert.equal(store.materializeFlowProjection(session.id).userDecisions.length, 0);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
@@ -5019,6 +5277,38 @@ function completePlannerTurnForTest(store, session, projectRoot) {
   });
 }
 
+function seedScheduledLane(store, projectRoot, lane) {
+  const session = store.createWorkflowSession({
+    id: "session-1",
+    projectId: "project-1",
+    title: "Backend scheduling",
+    goal: "Start the backend-owned lane",
+    mode: "fast",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    plannerProfile: "default",
+    transport: "hermes_replay_recovery",
+    recoveryReason: "Test setup has no live Hermes session.",
+    now: "2026-07-23T00:00:00.000Z",
+  });
+  completePlannerTurnForTest(store, session, projectRoot);
+  store.appendWorkflowEvent({
+    sessionId: session.id,
+    kind: "workflow.lane.declared",
+    source: "test",
+    idempotencyKey: `lane:${lane.id}`,
+    payload: {
+      lane: {
+        ...lane,
+        semanticKey: lane.id,
+        agentKind: "codex",
+        status: "pending",
+      },
+    },
+    now: "2026-07-23T00:00:01.000Z",
+  });
+  return session;
+}
+
 function plannerStartIdentity(input) {
   return {
     projectRoot: input.projectRoot,
@@ -5046,7 +5336,7 @@ async function loadMainModule(windows, options = {}) {
   const orchestrator = await import("@skyturn/orchestrator");
   const uiCanvasWorkflowRuntime = await import("@skyturn/ui-canvas/workflow-runtime");
   const source = `${await readFile(join(root, "electron", "main.ts"), "utf8")}
-export { broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getWorkflowStore, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workspaceSaveWriter };`;
+export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getWorkflowStore, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workspaceSaveWriter };`;
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -5081,6 +5371,9 @@ export { broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, creat
     createHermesCliAdapter: () => ({}),
     createDurableRunClaimStore: () => ({ initialize: async () => undefined }),
     createPrivateRunEventStore: () => ({}),
+    ...(options.assertExpectedArtifactVerifierCapability
+      ? { assertExpectedArtifactVerifierCapability: options.assertExpectedArtifactVerifierCapability }
+      : {}),
   };
   const genericModule = new Proxy({}, {
     get: (_target, property) => {

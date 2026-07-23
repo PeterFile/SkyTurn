@@ -584,6 +584,7 @@ function userDecisionRequestedPayload(decision: UserDecisionProjection): Record<
     reason: decision.reason,
     ...(decision.targetLaneId ? { targetLaneId: decision.targetLaneId } : {}),
     ...(decision.targetSegmentId ? { targetSegmentId: decision.targetSegmentId } : {}),
+    ...(decision.runAuthorization ? { runAuthorization: decision.runAuthorization } : {}),
   };
 }
 
@@ -596,6 +597,7 @@ function userDecisionAnsweredPayload(decision: UserDecisionProjection): Record<s
     ...(decision.comment ? { comment: decision.comment } : {}),
     ...(decision.targetLaneId ? { targetLaneId: decision.targetLaneId } : {}),
     ...(decision.targetSegmentId ? { targetSegmentId: decision.targetSegmentId } : {}),
+    ...(decision.runAuthorization ? { runAuthorization: decision.runAuthorization } : {}),
   };
 }
 

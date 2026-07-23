@@ -155,7 +155,6 @@ interface AgentRunTerminalRequest {
   kind: AgentRunTerminalKind;
   terminate: boolean;
   closeBeforeDrain?: boolean;
-  helperClosed?: boolean;
   prepare?: () => Promise<void>;
   persist?: () => Promise<void>;
 }
@@ -1872,9 +1871,7 @@ class AgentRunWatchdog {
     const reason = "process-boundary-failure";
     return this.completeTerminal({
       kind: "process-boundary-failure",
-      terminate: false,
-      // A rejected Job Object boundary proves helper close, not tree-empty cleanup.
-      helperClosed: true,
+      terminate: true,
       persist: async () => {
         await emitRunEventBestEffort(this.emit, {
           kind: "error",
@@ -2016,13 +2013,18 @@ class AgentRunWatchdog {
     request: AgentRunTerminalRequest,
     generation: number,
   ): Promise<AgentRunTerminalKind | null> {
-    if (!request.helperClosed) {
+    try {
       if (request.terminate) {
-        await this.terminateAndReapForTerminal();
+        await this.terminateAndReap();
       } else {
         await this.childClosed;
         if (isProcessGroupAlive(this.child)) await this.terminateAndReap();
       }
+    } catch (error) {
+      state.phase = "closing";
+      await this.closeRunResources().catch(() => undefined);
+      if (this.processBoundary.windowsJob) throw new Error("process-boundary-failure");
+      throw error;
     }
     if (!this.ownsTerminalExecution(state, generation)) return null;
 
@@ -2052,19 +2054,6 @@ class AgentRunWatchdog {
     return request.kind;
   }
 
-  private async terminateAndReapForTerminal(): Promise<void> {
-    try {
-      await this.terminateAndReap();
-    } catch (error) {
-      if (!this.processBoundary.windowsJob) throw error;
-      try {
-        await this.childClosed;
-      } catch {
-        return;
-      }
-      throw error;
-    }
-  }
 
   private ownsTerminalExecution(state: AgentRunTerminalState, generation: number): boolean {
     return this.terminalState === state && state.generation === generation && state.phase !== "settled";

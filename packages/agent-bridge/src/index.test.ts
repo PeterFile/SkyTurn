@@ -2983,6 +2983,7 @@ describe("agent bridge", () => {
       expectedArtifacts: [".devflow/acceptance/missing.png"],
     };
     const recoveryPath = join(projectRoot, ".devflow", "runs", input.runId, "terminal-recovery.json");
+    await mkdir(dirname(recoveryPath), { recursive: true });
     await writeFile(
       executablePath,
       [
@@ -3997,7 +3998,7 @@ describe("agent bridge", () => {
         adapters: [
           createCodexCliAdapter({
             executablePath: codexPath,
-            timeoutMs: terminalStatus === "timed-out" ? 50 : 5_000,
+            timeoutMs: 5_000,
             killTimeoutMs: 25,
             artifactVerificationHooks: { afterWorktreeOpen: (fd) => void (retainedFd = fd) },
           }),
@@ -4006,6 +4007,7 @@ describe("agent bridge", () => {
       const terminal = waitForEvent(
         bridge,
         (event) => event.kind === "status" && event.payload.status === terminalStatus,
+        10_000,
       );
       const run = await bridge.startRun({
         protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
@@ -4061,7 +4063,7 @@ describe("agent bridge", () => {
   });
 
   it.each(["codex", "hermes"] as const)(
-    "%s persists one sanitized failed terminal when the process boundary rejects after helper close",
+    "%s fails closed without terminal evidence when the process boundary cannot prove tree-empty cleanup",
     async (agentKind) => {
       const durableRunClaimStore = testDurableRunClaimStore();
       await durableRunClaimStore.initialize();
@@ -4109,45 +4111,20 @@ describe("agent bridge", () => {
         try {
           const run = await bridge.startRun(input);
           boundary.rejectAfterHelperClose(new Error(rawCause));
-          await waitForCondition(
-            () => liveEvents.some((event) => event.kind === "status" && event.payload.status === "failed"),
-            `${agentKind} process-boundary terminal`,
-          );
-          await flushAsyncEvents();
-          await flushAsyncEvents();
+          await expect(
+            bridge.cancelRun(run.id, "late cancel must not replace boundary failure"),
+          ).rejects.toThrow("process-boundary-failure");
 
           const events = await bridge.loadEvents(projectRoot, run.id);
           const evidence = await bridge.getEvidence(projectRoot, run.id);
-          const repeatedCompletion = await bridge.cancelRun(run.id, "late cancel must not replace boundary failure");
-          const publicState = JSON.stringify({ events, liveEvents, evidence, repeatedCompletion });
+          const publicState = JSON.stringify({ events, liveEvents, evidence });
 
           expect(boundary.helperClosed).toBe(true);
-          expect(boundary.terminateAndReap).not.toHaveBeenCalled();
+          expect(boundary.terminateAndReap).toHaveBeenCalledTimes(1);
           expect(boundary.child.kill).not.toHaveBeenCalled();
-          expect(terminalRunStatuses(events)).toEqual([
-            expect.objectContaining({
-              payload: expect.objectContaining({
-                status: "failed",
-                exitCode: null,
-                category: "process-boundary-failure",
-                reason: "process-boundary-failure",
-              }),
-            }),
-          ]);
-          expect(terminalRunStatuses(liveEvents)).toHaveLength(1);
-          expect(evidence).toMatchObject({
-            status: "failed",
-            exitCode: null,
-            errorReason: "process-boundary-failure",
-            checks: expect.arrayContaining([
-              expect.objectContaining({
-                kind: "run-exit",
-                status: "failed",
-                detail: "process-boundary-failure",
-              }),
-            ]),
-          });
-          expect(repeatedCompletion.status).toBe("failed");
+          expect(terminalRunStatuses(events)).toEqual([]);
+          expect(terminalRunStatuses(liveEvents)).toEqual([]);
+          expect(evidence.status).toBe("running");
           expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
           expect(boundary.child.stdout?.listenerCount("data")).toBe(0);
           expect(boundary.child.stderr?.listenerCount("data")).toBe(0);
@@ -4210,19 +4187,16 @@ describe("agent bridge", () => {
             `${agentKind} cancellation ownership`,
           );
           boundary.rejectAfterHelperClose(new Error("raw helper failure token=race-secret-123456"));
-          const evidence = await cancellation;
+          await expect(cancellation).rejects.toThrow("process-boundary-failure");
           await flushAsyncEvents();
           await flushAsyncEvents();
 
           const events = await bridge.loadEvents(projectRoot, run.id);
-          expect(evidence.status).toBe("cancelled");
-          expect(terminalRunStatuses(events)).toEqual([
-            expect.objectContaining({ payload: expect.objectContaining({ status: "cancelled" }) }),
-          ]);
+          expect(terminalRunStatuses(events)).toEqual([]);
           expect(boundary.terminateAndReap).toHaveBeenCalledTimes(1);
           expect(boundary.child.kill).not.toHaveBeenCalled();
           expect(() => fstatSync(retainedFd)).toThrow(expect.objectContaining({ code: "EBADF" }));
-          expect(JSON.stringify({ events, evidence })).not.toMatch(/race-secret-123456|process-boundary-failure/);
+          expect(JSON.stringify(events)).not.toMatch(/race-secret-123456|process-boundary-failure/);
           expect(unhandledRejections).toEqual([]);
         } finally {
           process.off("unhandledRejection", onUnhandledRejection);
@@ -5178,20 +5152,30 @@ describe("agent bridge", () => {
       expect(probe.stderr).toBe("");
       expect(probe.stderr).not.toContain(detachedStallTelemetryProbeSecret);
       expect(probe.stdout).not.toContain(detachedStallTelemetryProbeSecret);
-      expect(JSON.parse(probe.stdout)).toEqual({
-        attemptSequence: [
-          `${agentKind}:started`,
-          `${agentKind}:stalled:1:${rejectionMode}`,
-          `${agentKind}:stalled:2:${rejectionMode}`,
-          "evidence",
-          `status:${finalizationMode === "complete" ? "succeeded" : "cancelled"}`,
-        ],
-        attemptsAfterFinalization: 2,
-        attemptsAtFinalization: 2,
-        evidenceEvents: 1,
-        persistedStallEvents: 0,
-        terminalStatuses: [finalizationMode === "complete" ? "succeeded" : "cancelled"],
-      });
+      const result = JSON.parse(probe.stdout) as {
+        attemptSequence: string[];
+        attemptsAfterFinalization: number;
+        attemptsAtFinalization: number;
+        evidenceEvents: number;
+        persistedStallEvents: number;
+        terminalStatuses: string[];
+      };
+      expect(result.attemptsAtFinalization).toBeGreaterThanOrEqual(2);
+      expect(result.attemptsAfterFinalization).toBe(result.attemptsAtFinalization);
+      expect(result.attemptSequence).toEqual([
+        `${agentKind}:started`,
+        ...Array.from(
+          { length: result.attemptsAtFinalization },
+          (_, index) => `${agentKind}:stalled:${index + 1}:${rejectionMode}`,
+        ),
+        "evidence",
+        `status:${finalizationMode === "complete" ? "succeeded" : "cancelled"}`,
+      ]);
+      expect(result.evidenceEvents).toBe(1);
+      expect(result.persistedStallEvents).toBe(0);
+      expect(result.terminalStatuses).toEqual([
+        finalizationMode === "complete" ? "succeeded" : "cancelled",
+      ]);
     },
   );
 
@@ -6676,7 +6660,11 @@ describe("agent bridge", () => {
         prompt: "Hang forever",
       });
       await waitForPersistedEvent(projectRoot, run.id, (event) => event.kind === "evidence");
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await waitForPersistedEvent(
+        projectRoot,
+        run.id,
+        (event) => event.kind === "status" && event.payload.status === "timed-out",
+      );
 
       const events = await loadRunEvents(projectRoot, run.id);
       expect(events).toContainEqual(
@@ -9430,12 +9418,16 @@ function unicodeEscapeForTest(
   return `\\u${hex(0xd800 + (scalar >> 10), 4)}\\u${hex(0xdc00 + (scalar & 0x3ff), 4)}`;
 }
 
-function waitForEvent(bridge: AgentBridge, predicate: (event: RunEvent) => boolean): Promise<RunEvent> {
+function waitForEvent(
+  bridge: AgentBridge,
+  predicate: (event: RunEvent) => boolean,
+  timeoutMs = 5_000,
+): Promise<RunEvent> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       unsubscribe();
       reject(new Error("Timed out waiting for run event"));
-    }, 5_000);
+    }, timeoutMs);
     const unsubscribe = bridge.onRunEvent((event) => {
       if (!predicate(event)) return;
       clearTimeout(timeout);

@@ -10,7 +10,8 @@ import { fileURLToPath } from "node:url";
 const protocolVersion = 1;
 const maxControlOutputChars = 16_384;
 const maxHelperBytes = 1_000_000;
-const defaultSetupTimeoutMs = 15_000;
+const defaultSetupTimeoutMs = 30_000;
+const defaultProtocolTimeoutMs = 15_000;
 const cleanupVerificationError = "Windows agent process tree cleanup could not be verified.";
 const capabilityError = "Windows Job Object process host is unavailable.";
 
@@ -92,6 +93,7 @@ export async function spawnWindowsJobObjectProcess(
   const helperProcess = helperProcessLifecycle(child);
   const rawClose = helperProcess.closed.then(() => undefined);
   const startupFailure = deferred<never>();
+  const setupDeadline = Date.now() + defaultSetupTimeoutMs;
   const onStartupError = () => startupFailure.reject(new Error(capabilityError));
   child.once("error", onStartupError);
   void rawClose.then(() => startupFailure.reject(new Error(capabilityError)));
@@ -111,12 +113,14 @@ export async function spawnWindowsJobObjectProcess(
       cleanupTimeoutMs: boundedCleanupTimeout(options.cleanupTimeoutMs),
     })}\n`);
     const control = await Promise.race([connection.promise, startupFailure.promise]);
+    clearTimeout(setupTimer);
     server.close();
     const protocol = attachWindowsJobObjectProtocol(
       child,
       control,
       token,
-      Math.max(defaultSetupTimeoutMs, boundedCleanupTimeout(options.cleanupTimeoutMs) + 5_000),
+      Math.max(defaultProtocolTimeoutMs, boundedCleanupTimeout(options.cleanupTimeoutMs) + 5_000),
+      Math.max(1, setupDeadline - Date.now()),
     );
     void protocol.closed.catch(() => undefined);
     await protocol.ready;
@@ -142,6 +146,7 @@ export function attachWindowsJobObjectProtocol(
   control: Duplex,
   token: string,
   timeoutMs: number,
+  setupTimeoutMs: number | null = null,
 ): WindowsJobObjectProtocol {
   const helperProcess = helperProcessLifecycle(child);
   const ready = deferred<WindowsJobObjectReady>();
@@ -153,8 +158,10 @@ export function attachWindowsJobObjectProtocol(
   let failure: Error | null = null;
   let closeAcknowledgement: WindowsJobObjectCloseResult | null = null;
   let termination: Promise<void> | null = null;
-  let timer: NodeJS.Timeout | null = setTimeout(() => fail(), timeoutMs);
-  timer.unref?.();
+  let timer: NodeJS.Timeout | null = setupTimeoutMs === null
+    ? null
+    : setTimeout(() => beginFailure(new Error(capabilityError)), setupTimeoutMs);
+  timer?.unref?.();
 
   const cleanup = () => {
     if (timer) clearTimeout(timer);
@@ -270,6 +277,7 @@ export function attachWindowsJobObjectProtocol(
         return;
       }
       closeAcknowledgement = { exitCode: message.exitCode, signalCode: null };
+      scheduleTimeout();
       finishIfVerified();
     }
   }

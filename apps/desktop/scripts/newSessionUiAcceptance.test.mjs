@@ -43,6 +43,117 @@ test("New Session UI acceptance opens the project and drives both real renderer 
   assert.doesNotMatch(source, /createWorkflowSession\(/);
 });
 
+test("New Session UI acceptance clears the selected node through the pane before submitting a follow-up", async () => {
+  const { submitCanvasInput } = await import("./newSessionUiAcceptance.mjs");
+  let expression = "";
+  const cdp = {
+    async evaluate(value) {
+      expression = value;
+    },
+  };
+
+  await submitCanvasInput(cdp, "Follow-up requirement");
+
+  const paneIndex = expression.indexOf("document.querySelector('.react-flow__pane')");
+  const paneClickIndex = expression.indexOf("pane.dispatchEvent(new MouseEvent('click'");
+  const modalClosedIndex = expression.indexOf("!document.querySelector('.node-modal')");
+  const genericComposerIndex = expression.indexOf(
+    "document.querySelector('input[aria-label=\"Insert requirement or node\"]')",
+  );
+
+  assert.ok(paneIndex >= 0);
+  assert.ok(paneClickIndex > paneIndex);
+  assert.ok(modalClosedIndex > paneClickIndex);
+  assert.ok(genericComposerIndex > modalClosedIndex);
+  assert.match(expression, /'Canvas pane'/);
+  assert.match(expression, /'node modal close'/);
+  assert.match(expression, /'generic Canvas input'/);
+  assert.match(expression, /const deadline = Date\.now\(\) \+ 15000/);
+  assert.match(expression, /reject\(new Error\('Timed out waiting for ' \+ label\)\)/);
+  assert.match(expression, /new InputEvent\('input'/);
+  assert.match(expression, /new Event\('change'/);
+  assert.match(expression, /button\.dispatchEvent\(new MouseEvent\('click'/);
+  assert.doesNotMatch(
+    expression,
+    /window\.devflow|workflow:|session:|decision:|answerUserDecision|createWorkflowSession/,
+  );
+});
+
+test("New Session UI acceptance selects only exact pending danger run authorizations", async () => {
+  const { pendingDangerAuthorizationNodes } = await import("./newSessionUiAcceptance.mjs");
+  const exact = pendingDangerAuthorizationNode();
+  const session = {
+    kind: "canvas",
+    nodes: [
+      exact,
+      pendingDangerAuthorizationNode({
+        id: "decision-answered",
+        userDecision: { status: "answered" },
+      }),
+      pendingDangerAuthorizationNode({
+        id: "decision-ordinary",
+        userDecision: { runAuthorization: undefined },
+      }),
+      pendingDangerAuthorizationNode({
+        id: "decision-workspace-write",
+        userDecision: { runAuthorization: { sandbox: "workspace-write" } },
+      }),
+      pendingDangerAuthorizationNode({
+        id: "decision-inexact-option",
+        userDecision: { options: ["Authorize this run "] },
+      }),
+    ],
+  };
+
+  assert.deepEqual(pendingDangerAuthorizationNodes(session), [exact]);
+});
+
+test("New Session UI acceptance rejects unbound danger run authorizations", async () => {
+  const { pendingDangerAuthorizationNodes } = await import("./newSessionUiAcceptance.mjs");
+  const cases = [
+    ["decision id", { userDecision: { decisionId: "decision-stale" } }],
+    ["lane", { userDecision: { targetLaneId: undefined } }],
+    ["segment", { userDecision: { targetSegmentId: undefined } }],
+    ["run", { userDecision: { runAuthorization: { runId: undefined } } }],
+    ["fingerprint", { userDecision: { runAuthorization: { startFingerprint: undefined } } }],
+  ];
+
+  for (const [name, overrides] of cases) {
+    const session = { kind: "canvas", nodes: [pendingDangerAuthorizationNode(overrides)] };
+    assert.deepEqual(pendingDangerAuthorizationNodes(session), [], name);
+  }
+});
+
+test("New Session UI acceptance passes live CDP into workflow completion and drives the real decision DOM", async () => {
+  const { authorizePendingDangerRunThroughUi } = await import("./newSessionUiAcceptance.mjs");
+  const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
+  let expression = "";
+  let evaluationOptions = null;
+  const cdp = {
+    async evaluate(value, options) {
+      expression = value;
+      evaluationOptions = options;
+      return { outcome: "submitted", modalClosed: true };
+    },
+  };
+
+  await authorizePendingDangerRunThroughUi(cdp, pendingDangerAuthorizationNode());
+
+  assert.match(source, /waitForWorkflowCompletion\(\{\s*\n\s*cdp: liveCdp,/);
+  assert.match(source, /async function waitForWorkflowCompletion\(\{ cdp,/);
+  assert.match(source, /authorizePendingDangerRunThroughUi\(cdp, pendingDangerNodes\[0\]\)/);
+  assert.match(expression, /querySelectorAll\('button\[aria-label\]'\)/);
+  assert.match(expression, /More details for/);
+  assert.match(expression, /querySelectorAll\('\.react-flow__node\[data-id\]'\)/);
+  assert.match(expression, /findExactAriaLabel\('\.node-modal\[aria-label\]', title\)/);
+  assert.match(expression, /querySelectorAll\('\.decision-panel\[aria-label\]'\)/);
+  assert.match(expression, /Authorize this run/);
+  assert.match(expression, /if \(!authorizationButton\.disabled\)/);
+  assert.match(expression, /authorizationButton\.disabled/);
+  assert.deepEqual(evaluationOptions, { awaitPromise: true, returnByValue: true });
+  assert.doesNotMatch(expression, /workflow:userDecision:answer|answerUserDecision|createWorkflowSession/);
+});
+
 test("New Session UI acceptance disables PTY and scopes the dialog override to its temporary project", async () => {
   const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
 
@@ -83,6 +194,13 @@ test("New Session UI acceptance waits for terminal checkpoint enrichment before 
       nodes: [
         { id: "planner", status: "completed" },
         { id: "lane-1", runId, status: "completed" },
+        {
+          id: "manual-decision",
+          nodeKind: "user_decision",
+          laneKind: "decision",
+          status: "pending",
+          userDecision: { status: "waiting_input" },
+        },
       ],
     },
     projection: {
@@ -110,6 +228,9 @@ test("New Session UI acceptance waits for terminal checkpoint enrichment before 
       { kind: "changeset", id: "changeset-lane-1" },
     ],
   });
+  assert.equal(authoritativeWorkflowSettled(state), false);
+  state.canvasSession.nodes[2].status = "completed";
+  state.canvasSession.nodes[2].userDecision.status = "answered";
   assert.equal(authoritativeWorkflowSettled(state), true);
 });
 
@@ -482,6 +603,7 @@ test("New Session UI acceptance requires the explicit five-lane delivery chain",
 
   assert.match(source, /sessionTarget\?\.executionTarget === "current_branch"/);
   assert.match(source, /implementation -> validation -> browser_validation -> review -> commit/);
+  assert.match(source, /do not emit StartImplementation, RequestValidation, RequestReview, or Commit operations/);
   assert.match(source, /\.devflow\/acceptance\/react-app\.png/);
   assert.match(source, /laneKindEvidence/);
   assert.match(source, /secondTurnLaneIds: replay\.secondTurnLaneIds/);
@@ -762,6 +884,126 @@ test("New Session UI acceptance strict oracle accepts opaque ids and arbitrary t
   assert.equal(result.followUp.nodeId, fixture.secondTurnLaneIds[0]);
   assert.equal(result.deliveryCheckpoints.ok, true);
   assert.equal(result.deliveryCheckpoints.deliveryCommitCount, 1);
+});
+
+test("New Session UI acceptance excludes authorization decisions from executable graph and strict lane oracles", async () => {
+  const {
+    executableWorkflowSession,
+    strictWorkflowAcceptanceSummary,
+  } = await import("./newSessionUiAcceptance.mjs");
+  const { flowKernelGraphSummary } = await import("./mvpWorkflowDemo.mjs");
+  const graphSession = {
+    plannerNodeId: "planner",
+    nodes: [
+      {
+        id: "planner",
+        agent: "hermes",
+        title: "Planner",
+        context: { brief: "planner", dependencies: [] },
+        display: { meta: ["planner"] },
+      },
+      {
+        id: "implementation",
+        nodeKind: "agent_task",
+        agent: "codex",
+        title: "Implementation",
+        context: { brief: "implementation", dependencies: [] },
+        display: { meta: ["implementation", "flow-kernel"] },
+      },
+      {
+        id: "validation",
+        nodeKind: "agent_task",
+        agent: "codex",
+        title: "Validation",
+        context: { brief: "validation", dependencies: ["implementation"] },
+        display: { meta: ["validation", "flow-kernel"] },
+      },
+      {
+        id: "danger-full-access-decision",
+        nodeKind: "user_decision",
+        agent: "hermes",
+        context: { brief: "authorization", dependencies: ["implementation"] },
+        display: { meta: ["decision", "flow-kernel"] },
+      },
+      {
+        id: "disabled-node",
+        nodeKind: "agent_task",
+        executable: false,
+        agent: "codex",
+        title: "Disabled",
+        context: { brief: "disabled", dependencies: [] },
+        display: { meta: ["implementation", "flow-kernel"] },
+      },
+      {
+        id: "runtime-disabled-node",
+        nodeKind: "agent_task",
+        runtimePolicy: { executable: false, sandbox: "read-only" },
+        agent: "codex",
+        title: "Runtime disabled",
+        context: { brief: "runtime disabled", dependencies: [] },
+        display: { meta: ["validation", "flow-kernel"] },
+      },
+    ],
+    edges: [{ id: "edge-implementation-validation", source: "implementation", target: "validation" }],
+  };
+
+  const executableSession = executableWorkflowSession(graphSession);
+  const graph = flowKernelGraphSummary(executableSession, graphSession.plannerNodeId);
+  assert.deepEqual(executableSession.nodes.map((node) => node.id), ["planner", "implementation", "validation"]);
+  assert.equal(graph.connected, true);
+  assert.deepEqual(graph.dependencyMismatchIds, []);
+
+  const fixture = strictWorkflowFixture();
+  fixture.session.nodes.push(
+    pendingDangerAuthorizationNode({
+      id: "danger-full-access-browser",
+      status: "completed",
+      runId: "decision-run-browser",
+      userDecision: { status: "answered" },
+    }),
+    pendingDangerAuthorizationNode({
+      id: "danger-full-access-commit",
+      status: "completed",
+      runId: "decision-run-commit",
+      userDecision: { status: "answered" },
+    }),
+    {
+      id: "disabled-node",
+      nodeKind: "agent_task",
+      executable: false,
+    },
+    {
+      id: "runtime-disabled-node",
+      nodeKind: "agent_task",
+      runtimePolicy: { executable: false, sandbox: "read-only" },
+    },
+  );
+
+  const result = strictWorkflowAcceptanceSummary(fixture);
+  assert.equal(result.ok, true);
+  assert.equal(result.nonPlannerNodeCount, 6);
+  assert.equal(result.initialNodeCount, 5);
+});
+
+test("New Session UI acceptance rejects an unresolved ordinary user decision", async () => {
+  const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = strictWorkflowFixture();
+  fixture.session.nodes.push({
+    id: "manual-decision",
+    nodeKind: "user_decision",
+    status: "pending",
+    userDecision: {
+      decisionId: "manual-decision",
+      prompt: "Choose a delivery option.",
+      options: ["Continue"],
+      reason: "A user choice is required.",
+      status: "waiting_input",
+    },
+  });
+
+  const result = strictWorkflowAcceptanceSummary(fixture);
+  assert.equal(result.ok, false);
+  assert.equal(result.failures.includes("user-decisions-not-settled"), true);
 });
 
 test("New Session UI acceptance rejects an implementation commit followed by a commit-lane no-op", async () => {
@@ -1883,6 +2125,40 @@ function strictWorkflowFixture() {
     baselineCommitSha: baselineHead,
     finalHeadCommitSha: finalHead,
     deliveryCommitCount: 1,
+  };
+}
+
+function pendingDangerAuthorizationNode(overrides = {}) {
+  const id = overrides.id ?? "decision-danger-run";
+  const runAuthorization = {
+    sandbox: "danger-full-access",
+    runId: "run-danger",
+    startFingerprint: "a".repeat(64),
+    ...(overrides.userDecision?.runAuthorization ?? {}),
+  };
+  const userDecision = {
+    decisionId: id,
+    prompt: "Authorize full host access for Commit verified changes?",
+    options: ["Authorize this run"],
+    reason: "This run can modify host state outside the project.",
+    status: "waiting_input",
+    targetLaneId: "lane-commit",
+    targetSegmentId: "segment-commit",
+    runAuthorization,
+    ...overrides.userDecision,
+  };
+  if (overrides.userDecision && Object.hasOwn(overrides.userDecision, "runAuthorization")) {
+    userDecision.runAuthorization = overrides.userDecision.runAuthorization === undefined
+      ? undefined
+      : runAuthorization;
+  }
+  return {
+    id,
+    title: "User decision required",
+    status: "pending",
+    nodeKind: "user_decision",
+    ...overrides,
+    userDecision,
   };
 }
 

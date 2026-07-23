@@ -390,6 +390,7 @@ export interface ScheduledWorkflowLane extends FlowLane {
 
 export interface ScheduleReadyWorkflowLanesInput {
   allowedParallelism?: number;
+  authorizedLaneIds?: string[];
   now: string;
 }
 
@@ -1222,20 +1223,14 @@ export class WorkflowStore {
     sessionId: string,
     input: ScheduleReadyWorkflowLanesInput,
   ): ScheduleReadyWorkflowLanesResult {
-    const projection = this.materializeFlowProjection(sessionId);
-    const runningScopes = projection.lanes
-      .filter((lane) => lane.status === "running")
-      .map((lane) => ({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes }));
-    const ready = scheduleFlowReadyLanes(projection, {
-      allowedParallelism: input.allowedParallelism ?? 1,
-      runningScopes,
-    });
-    const scheduled = ready.map((lane) => ({
-      ...lane,
-      runId: runIdForLane(sessionId, lane.id),
-      segmentId: segmentIdForLane(sessionId, lane.id),
-    }));
-    if (scheduled.length === 0) return { readyLanes: [], projection };
+    const preview = this.previewReadyLanes(sessionId, input);
+    const authorizedLaneIds = input.authorizedLaneIds === undefined
+      ? null
+      : new Set(input.authorizedLaneIds.map((laneId) => requireIdentifier(laneId, "authorizedLaneId")));
+    const scheduled = preview.readyLanes.filter((lane) => authorizedLaneIds
+      ? authorizedLaneIds.has(lane.id)
+      : lane.runtimePolicy.sandbox !== "danger-full-access");
+    if (scheduled.length === 0) return { readyLanes: [], projection: preview.projection };
 
     const owned: ScheduledWorkflowLane[] = [];
     const tx = this.db.transaction(() => {
@@ -1284,6 +1279,26 @@ export class WorkflowStore {
       readyLanes: owned,
       projection: this.materializeFlowProjection(sessionId),
     };
+  }
+
+  previewReadyLanes(
+    sessionId: string,
+    input: Pick<ScheduleReadyWorkflowLanesInput, "allowedParallelism">,
+  ): ScheduleReadyWorkflowLanesResult {
+    const projection = this.materializeFlowProjection(sessionId);
+    const runningScopes = projection.lanes
+      .filter((lane) => lane.status === "running")
+      .map((lane) => ({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes }));
+    const ready = scheduleFlowReadyLanes(projection, {
+      allowedParallelism: input.allowedParallelism ?? 1,
+      runningScopes,
+    });
+    const scheduled = ready.map((lane) => ({
+      ...lane,
+      runId: runIdForLane(sessionId, lane.id),
+      segmentId: segmentIdForLane(sessionId, lane.id),
+    }));
+    return { readyLanes: scheduled, projection };
   }
 
   reassignWorkflowLane(input: WorkflowLaneReassignmentInput): WorkflowLaneReassignmentResult {

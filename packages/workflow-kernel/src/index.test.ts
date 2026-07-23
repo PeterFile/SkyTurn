@@ -2526,6 +2526,149 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(scheduleReadyLanes(answered, { allowedParallelism: 1 }).map((item) => item.id)).toEqual(["lane-validation"]);
   });
 
+  it("requires an exact durable run authorization before answering a safety-gate decision", () => {
+    const authorization = {
+      sandbox: "danger-full-access",
+      runId: "run-session-1-lane-commit",
+      startFingerprint: "a".repeat(64),
+    };
+    const requested = {
+      ...event("workflow.user_decision.requested", {
+        decisionId: "decision-danger-run",
+        prompt: "Authorize full host access?",
+        options: ["Authorize this run"],
+        reason: "This run can modify host state outside the project.",
+        targetLaneId: "lane-commit",
+        targetSegmentId: "segment-session-1-lane-commit",
+        runAuthorization: authorization,
+      }),
+      source: "electron-main",
+    };
+    const mismatched = reduceWorkflowEvents([
+      requested,
+      {
+        ...event("workflow.user_decision.answered", {
+          decisionId: "decision-danger-run",
+          selectedOption: "Authorize this run",
+          action: "continue",
+          targetLaneId: "lane-commit",
+          targetSegmentId: "segment-session-1-lane-commit",
+          runAuthorization: { ...authorization, startFingerprint: "b".repeat(64) },
+        }),
+        source: "renderer",
+      },
+    ]);
+    const authorized = reduceWorkflowEvents([
+      requested,
+      {
+        ...event("workflow.user_decision.answered", {
+          decisionId: "decision-danger-run",
+          selectedOption: "Authorize this run",
+          action: "continue",
+          targetLaneId: "lane-commit",
+          targetSegmentId: "segment-session-1-lane-commit",
+          runAuthorization: authorization,
+        }),
+        source: "renderer",
+      },
+    ]);
+
+    expect(mismatched.userDecisions[0]).toMatchObject({
+      status: "waiting_input",
+      runAuthorization: authorization,
+    });
+    expect(authorized.userDecisions[0]).toMatchObject({
+      status: "answered",
+      selectedOption: "Authorize this run",
+      runAuthorization: authorization,
+    });
+  });
+
+  it("does not upgrade an ordinary user decision with injected run authorization", () => {
+    const requested = event("workflow.user_decision.requested", {
+      decisionId: "decision-ordinary",
+      prompt: "Continue?",
+      options: ["Continue"],
+      reason: "The workflow needs user input.",
+      targetLaneId: "lane-review",
+    });
+    const injected = reduceWorkflowEvents([
+      requested,
+      {
+        ...event("workflow.user_decision.answered", {
+          decisionId: "decision-ordinary",
+          selectedOption: "Continue",
+          action: "continue",
+          targetLaneId: "lane-review",
+          runAuthorization: {
+            sandbox: "danger-full-access",
+            runId: "run-injected",
+            startFingerprint: "c".repeat(64),
+          },
+        }),
+        source: "renderer",
+      },
+    ]);
+    const ordinary = reduceWorkflowEvents([
+      requested,
+      event("workflow.user_decision.answered", {
+        decisionId: "decision-ordinary",
+        selectedOption: "Continue",
+        action: "continue",
+        targetLaneId: "lane-review",
+      }),
+    ]);
+
+    expect(injected.userDecisions[0]).toEqual(expect.objectContaining({
+      status: "waiting_input",
+    }));
+    expect(injected.userDecisions[0]?.runAuthorization).toBeUndefined();
+    expect(ordinary.userDecisions[0]).toEqual(expect.objectContaining({
+      status: "answered",
+      selectedOption: "Continue",
+      action: "continue",
+    }));
+    expect(ordinary.userDecisions[0]?.runAuthorization).toBeUndefined();
+  });
+
+  it("trusts run authorization only from the backend request and renderer answer sources", () => {
+    const authorization = {
+      sandbox: "danger-full-access",
+      runId: "run-session-1-lane-commit",
+      startFingerprint: "d".repeat(64),
+    };
+    const requestPayload = {
+      decisionId: "decision-source-bound",
+      prompt: "Authorize full host access?",
+      options: ["Authorize this run"],
+      reason: "This run can modify host state outside the project.",
+      targetLaneId: "lane-commit",
+      targetSegmentId: "segment-session-1-lane-commit",
+      runAuthorization: authorization,
+    };
+    const answerPayload = {
+      decisionId: "decision-source-bound",
+      selectedOption: "Authorize this run",
+      action: "continue",
+      targetLaneId: "lane-commit",
+      targetSegmentId: "segment-session-1-lane-commit",
+      runAuthorization: authorization,
+    };
+    const untrustedRequest = reduceWorkflowEvents([
+      { ...event("workflow.user_decision.requested", requestPayload), source: "workflow-kernel" },
+    ]);
+    const untrustedAnswer = reduceWorkflowEvents([
+      { ...event("workflow.user_decision.requested", requestPayload), source: "electron-main" },
+      { ...event("workflow.user_decision.answered", answerPayload), source: "hermes" },
+    ]);
+
+    expect(untrustedRequest.userDecisions[0]?.runAuthorization).toBeUndefined();
+    expect(untrustedAnswer.userDecisions[0]).toMatchObject({
+      status: "waiting_input",
+      runAuthorization: authorization,
+    });
+  });
+
   it("ignores answered user decisions that were never requested", () => {
     const projection = reduceWorkflowEvents([
       event("workflow.user_decision.answered", {

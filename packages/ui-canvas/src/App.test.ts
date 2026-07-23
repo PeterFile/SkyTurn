@@ -43,6 +43,7 @@ import {
   isPlanSourceEditable,
   isPlanNextEnabled,
   isPlanFinishEnabled,
+  UserDecisionPanel,
 } from "./App.js";
 import * as AppModule from "./App.js";
 import { parsePlanBootstrapSession } from "@skyturn/project-core";
@@ -1534,6 +1535,35 @@ describe("UI source validation", () => {
     const fallbackUpdate = fnBody.indexOf("updateCanvasSession(activeSession.id");
     expect(fallbackUpdate).toBeGreaterThan(devflowCheck);
     expect(fnBody.slice(devflowCheck, fallbackUpdate)).toContain("return;");
+  });
+
+  it("renders a durable danger-full-access authorization in the existing decision surface", () => {
+    const node = mockNode();
+    node.nodeKind = "user_decision";
+    node.executable = false;
+    node.userDecision = {
+      decisionId: "decision-danger-run",
+      prompt: "Authorize full host access for Commit verified changes?",
+      options: ["Authorize this run"],
+      reason: "This run can modify host state outside the project.",
+      status: "waiting_input",
+      targetLaneId: "lane-commit",
+      targetSegmentId: "segment-session-1-lane-commit",
+      runAuthorization: {
+        sandbox: "danger-full-access",
+        runId: "run-session-1-lane-commit",
+        startFingerprint: "a".repeat(64),
+      },
+    } as CanvasNode["userDecision"];
+
+    const html = renderToStaticMarkup(createElement(UserDecisionPanel, {
+      node,
+      onDecisionAnswer: vi.fn(),
+    }));
+
+    expect(html).toContain("Authorize full host access for Commit verified changes?");
+    expect(html).toContain("This run can modify host state outside the project.");
+    expect(html).toContain("Authorize this run");
   });
 
   it("implements reassignNode with desktop write-through and authoritative session replacement", async () => {

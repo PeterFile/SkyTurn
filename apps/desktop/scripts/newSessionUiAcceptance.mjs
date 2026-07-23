@@ -22,6 +22,7 @@ const agentWatchdogTimeoutMs = Math.max(1_000, Math.min(12 * 60 * 1_000, waitTim
 const pollIntervalMs = Number(process.env.SKYTURN_NEW_SESSION_UI_POLL_MS ?? 2_000);
 const commandOutputLimitBytes = Number(process.env.SKYTURN_NEW_SESSION_UI_OUTPUT_LIMIT_BYTES ?? 4_000);
 const defaultCdpRequestTimeoutMs = 30_000;
+const dangerAuthorizationOption = "Authorize this run";
 const expectedChangedFiles = ["src/App.css", "src/App.jsx"];
 const requiredLaneKinds = ["implementation", "validation", "browser_validation", "review", "commit"];
 const browserScreenshotArtifact = ".devflow/acceptance/react-app.png";
@@ -34,6 +35,7 @@ const requirement = [
   "Only src/App.jsx and src/App.css may be changed or committed.",
   "Do not modify scripts/verify.mjs or scripts/capture-screenshot.mjs; they are fixed validation contracts.",
   "Plan exactly this serial lane chain: implementation -> validation -> browser_validation -> review -> commit.",
+  "In this planning turn, declare only the lanes and their dependency edges; do not emit StartImplementation, RequestValidation, RequestReview, or Commit operations because the scheduler executes the accepted lanes.",
   "The browser_validation lane must declare browser and screenshot evidence, run the fixed capture helper, and produce .devflow/acceptance/react-app.png.",
   "The commit lane must commit only src/App.jsx and src/App.css after review succeeds.",
 ].join("\n");
@@ -117,6 +119,7 @@ export async function runNewSessionUiAcceptance() {
         await openProjectThroughUi(liveCdp, projectRoot);
         await fillTextareaAndClickCreate(liveCdp, requirement);
         const firstWorkspace = await waitForWorkflowCompletion({
+          cdp: liveCdp,
           baselineCommitSha,
           workspacePath,
           projectRoot,
@@ -587,7 +590,10 @@ export async function fillTextareaAndClickCreate(cdp, text) {
 export async function submitCanvasInput(cdp, text) {
   await cdp.evaluate(`
     (async () => {
-      const input = await waitFor(() => document.querySelector('input[aria-label="Insert requirement or node"]'), 'Canvas input');
+      const pane = await waitFor(() => document.querySelector('.react-flow__pane'), 'Canvas pane');
+      pane.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      await waitFor(() => !document.querySelector('.node-modal'), 'node modal close');
+      const input = await waitFor(() => document.querySelector('input[aria-label="Insert requirement or node"]'), 'generic Canvas input');
       const button = await waitFor(() => document.querySelector('button[aria-label="Submit"]'), 'Canvas submit button');
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
       input.focus();
@@ -619,6 +625,123 @@ export async function submitCanvasInput(cdp, text) {
       }
     })()
   `, { awaitPromise: true });
+}
+
+export function pendingDangerAuthorizationNodes(session) {
+  if (session?.kind !== "canvas" || !Array.isArray(session.nodes)) return [];
+  return session.nodes.filter((node) => {
+    const decision = node?.userDecision;
+    const authorization = decision?.runAuthorization;
+    return node?.nodeKind === "user_decision" &&
+      node.status === "pending" &&
+      typeof node.title === "string" && node.title.length > 0 &&
+      decision?.decisionId === node.id &&
+      typeof decision.prompt === "string" && decision.prompt.length > 0 &&
+      decision.status === "waiting_input" &&
+      Array.isArray(decision.options) && decision.options.includes(dangerAuthorizationOption) &&
+      typeof decision.targetLaneId === "string" && decision.targetLaneId.length > 0 &&
+      typeof decision.targetSegmentId === "string" && decision.targetSegmentId.length > 0 &&
+      authorization?.sandbox === "danger-full-access" &&
+      typeof authorization.runId === "string" && authorization.runId.length > 0 &&
+      typeof authorization.startFingerprint === "string" &&
+      /^[0-9a-f]{64}$/.test(authorization.startFingerprint);
+  });
+}
+
+export async function authorizePendingDangerRunThroughUi(cdp, node) {
+  const result = await cdp.evaluate(`
+    (async () => {
+      const nodeId = ${JSON.stringify(node.id)};
+      const title = ${JSON.stringify(node.title)};
+      const decisionPrompt = ${JSON.stringify(node.userDecision.prompt)};
+      const moreDetailsLabel = 'More details for ' + title;
+      const authorizationOption = ${JSON.stringify(dangerAuthorizationOption)};
+      const findExactAriaLabel = (selector, label) => [...document.querySelectorAll(selector)]
+        .find((element) => element.getAttribute('aria-label') === label);
+      const findNodeContainer = () => [...document.querySelectorAll('.react-flow__node[data-id]')]
+        .find((element) => element.getAttribute('data-id') === nodeId);
+      const findMoreDetailsButton = () => [...(findNodeContainer()?.querySelectorAll('button[aria-label]') ?? [])]
+        .find((button) => button.getAttribute('aria-label') === moreDetailsLabel);
+      const findModal = () => findExactAriaLabel('.node-modal[aria-label]', title);
+      const findDecisionPanel = () => [...(findModal()?.querySelectorAll('.decision-panel[aria-label]') ?? [])]
+        .find((panel) => panel.getAttribute('aria-label') === decisionPrompt);
+      const findAuthorizationButton = () => {
+        const panel = findDecisionPanel();
+        if (!panel) return null;
+        return [...panel.querySelectorAll('button')]
+          .find((button) => button.textContent?.trim() === authorizationOption) ?? null;
+      };
+
+      const moreDetailsButton = await waitFor(
+        findMoreDetailsButton,
+        'decision node More details button for ' + title,
+      );
+      moreDetailsButton.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+      }));
+      await waitFor(findModal, 'decision modal for ' + title);
+      const authorizationButton = await waitFor(
+        findAuthorizationButton,
+        'exact danger authorization option for ' + title,
+      );
+      const outcome = authorizationButton.disabled ? 'already-disabled' : 'submitted';
+      if (!authorizationButton.disabled) {
+        authorizationButton.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+        }));
+      }
+      await waitFor(() => {
+        const modal = findModal();
+        if (!modal) return 'modal-removed';
+        if (!findDecisionPanel()) return 'decision-panel-removed';
+        const currentButton = findAuthorizationButton();
+        return !currentButton || currentButton.disabled ? 'authoritative-renderer-update' : null;
+      }, 'danger authorization renderer update for ' + title);
+
+      const modal = findModal();
+      if (modal) {
+        const closeButton = await waitFor(
+          () => [...modal.querySelectorAll('button[aria-label]')]
+            .find((button) => button.getAttribute('aria-label') === 'Close'),
+          'decision modal Close button for ' + title,
+        );
+        closeButton.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+        }));
+        await waitFor(() => !findModal(), 'decision modal close for ' + title);
+      }
+      return { outcome, modalClosed: !findModal() };
+
+      function waitFor(probe, label) {
+        const deadline = Date.now() + 15000;
+        return new Promise((resolve, reject) => {
+          const tick = () => {
+            const value = probe();
+            if (value) {
+              resolve(value);
+              return;
+            }
+            if (Date.now() > deadline) {
+              reject(new Error('Timed out waiting for ' + label));
+              return;
+            }
+            requestAnimationFrame(tick);
+          };
+          tick();
+        });
+      }
+    })()
+  `, { awaitPromise: true, returnByValue: true });
+  if (!result?.modalClosed || !["submitted", "already-disabled"].includes(result.outcome)) {
+    throw new Error("Danger authorization UI did not reach a confirmed renderer state.");
+  }
+  return result;
 }
 
 async function loadDemoHelpers() {
@@ -848,13 +971,45 @@ export function authoritativePlannerTurnCount(state) {
   return plannerTurnRecords(state).filter((turn) => terminalSegmentStatus(turn.status)).length;
 }
 
+export function executableWorkflowNodes(session) {
+  const nodes = Array.isArray(session?.nodes) ? session.nodes : [];
+  return nodes.filter((node) =>
+    node?.id !== session?.plannerNodeId &&
+    node?.nodeKind !== "user_decision" &&
+    node?.executable !== false &&
+    node?.runtimePolicy?.executable !== false
+  );
+}
+
+function userDecisionsSettled(session) {
+  const nodes = Array.isArray(session?.nodes) ? session.nodes : [];
+  return nodes
+    .filter((node) => node?.nodeKind === "user_decision")
+    .every((node) => node?.status === "completed" && node?.userDecision?.status === "answered");
+}
+
+export function executableWorkflowSession(session) {
+  if (!session || !Array.isArray(session.nodes)) return session;
+  const nodeIds = new Set([
+    session.plannerNodeId,
+    ...executableWorkflowNodes(session).map((node) => node.id),
+  ]);
+  return {
+    ...session,
+    nodes: session.nodes.filter((node) => nodeIds.has(node?.id)),
+    edges: Array.isArray(session.edges)
+      ? session.edges.filter((edge) => nodeIds.has(edge?.source) && nodeIds.has(edge?.target))
+      : [],
+  };
+}
+
 export function authoritativeWorkflowSettled(state) {
   const nodes = state?.canvasSession?.nodes;
   if (!Array.isArray(nodes) || nodes.length === 0) return false;
   if (!nodes.every((node) => node?.status !== "running" && node?.status !== "retrying")) return false;
-  const plannerNodeId = state?.canvasSession?.plannerNodeId;
-  const executableNodes = nodes.filter((node) =>
-    node?.id !== plannerNodeId && typeof node?.runId === "string" && node.runId.length > 0
+  if (!userDecisionsSettled(state?.canvasSession)) return false;
+  const executableNodes = executableWorkflowNodes(state?.canvasSession).filter((node) =>
+    typeof node?.runId === "string" && node.runId.length > 0
   );
   return executableNodes.length > 0 && executableNodes.every((node) => {
     const segment = state?.projection?.segments?.find((candidate) =>
@@ -1171,7 +1326,7 @@ function stableJson(value) {
   });
 }
 
-async function waitForWorkflowCompletion({ baselineCommitSha, workspacePath, projectRoot, graphSummary, readiness }) {
+async function waitForWorkflowCompletion({ cdp, baselineCommitSha, workspacePath, projectRoot, graphSummary, readiness }) {
   const deadline = Date.now() + waitTimeoutMs;
   let lastWorkspace = null;
   while (Date.now() < deadline) {
@@ -1179,8 +1334,14 @@ async function waitForWorkflowCompletion({ baselineCommitSha, workspacePath, pro
     lastWorkspace = workspace ?? lastWorkspace;
     const session = activeCanvasSession(workspace);
     if (session) {
-      const flowNodes = session.nodes.filter((node) => node.display?.meta?.includes("flow-kernel"));
-      const graph = graphSummary(session, session.plannerNodeId);
+      const pendingDangerNodes = pendingDangerAuthorizationNodes(session);
+      if (pendingDangerNodes.length > 0) {
+        await authorizePendingDangerRunThroughUi(cdp, pendingDangerNodes[0]);
+        await delay(pollIntervalMs);
+        continue;
+      }
+      const flowNodes = executableWorkflowNodes(session);
+      const graph = graphSummary(executableWorkflowSession(session), session.plannerNodeId);
       const commitCount = await gitCommitCount(projectRoot).catch(() => 0);
       const terminalFailure = terminalWorkflowFailure(session, workspace);
       if (terminalFailure) {
@@ -1355,13 +1516,14 @@ export function strictWorkflowAcceptanceSummary({
 }) {
   const nodes = Array.isArray(session?.nodes) ? session.nodes : [];
   const plannerNodeId = typeof session?.plannerNodeId === "string" ? session.plannerNodeId : null;
+  const decisionsSettled = userDecisionsSettled(session);
   secondTurnLaneIds = Array.isArray(secondTurnLaneIds) ? secondTurnLaneIds : [];
   const secondTurnLaneSetValid = secondTurnLaneIds.length === 1 &&
     new Set(secondTurnLaneIds).size === secondTurnLaneIds.length &&
     replay?.ok === true &&
     exactStringArray(replay?.secondTurnLaneIds, secondTurnLaneIds);
   const followUpId = secondTurnLaneSetValid ? secondTurnLaneIds[0] : null;
-  const nonPlannerNodes = plannerNodeId === null ? [] : nodes.filter((node) => node?.id !== plannerNodeId);
+  const nonPlannerNodes = plannerNodeId === null ? [] : executableWorkflowNodes(session);
   const followUpNodes = followUpId === null ? [] : nonPlannerNodes.filter((node) => node?.id === followUpId);
   const initialNodes = followUpId === null ? nonPlannerNodes : nonPlannerNodes.filter((node) => node?.id !== followUpId);
   const initialLaneEvidence = requiredLaneEvidenceSummary(session, workspace, secondTurnLaneIds);
@@ -1407,8 +1569,9 @@ export function strictWorkflowAcceptanceSummary({
         [initialByRole.commit.id, followUp.id],
       ]
     : [];
-  const actualEdgePairs = Array.isArray(session?.edges)
-    ? session.edges.map((edge) => [edge?.source, edge?.target])
+  const executableSession = executableWorkflowSession(session);
+  const actualEdgePairs = Array.isArray(executableSession?.edges)
+    ? executableSession.edges.map((edge) => [edge?.source, edge?.target])
     : [];
   const encodedExpectedEdgePairs = expectedEdgePairs.map(encodeEdgePair).sort();
   const encodedActualEdgePairs = actualEdgePairs.map(encodeEdgePair).sort();
@@ -1445,6 +1608,7 @@ export function strictWorkflowAcceptanceSummary({
     sessionId: session?.id,
   });
   const failures = [
+    decisionsSettled ? null : "user-decisions-not-settled",
     secondTurnLaneSetValid ? null : "second-turn-lane-set-invalid",
     initialLaneSetValid ? null : "initial-lane-set-invalid",
     agentMappingValid ? null : "agent-mapping-invalid",
@@ -1659,9 +1823,11 @@ async function collectFinalVerification({
   const gitStatusValue = (await demo.runCapture("git", ["status", "--short"], projectRoot)).stdout.trim();
   const gitStatus = { clean: gitStatusValue === "", value: gitStatusValue };
   const appSource = await readFile(join(projectRoot, "src", "App.jsx"), "utf8");
-  const graph = session ? demo.flowKernelGraphSummary(session, session.plannerNodeId) : null;
+  const graph = session
+    ? demo.flowKernelGraphSummary(executableWorkflowSession(session), session.plannerNodeId)
+    : null;
   const graphAcceptance = workflowGraphAcceptanceSummary(graph);
-  const flowNodes = session?.nodes.filter((node) => node?.id !== session?.plannerNodeId) ?? [];
+  const flowNodes = executableWorkflowNodes(session);
   const sessionTarget = session?.target ?? null;
   const strictWorkflow = strictWorkflowAcceptanceSummary({
     baselineCommitSha,
@@ -1872,8 +2038,9 @@ function activeCanvasSession(workspace) {
 
 function laneStatuses(session) {
   if (!session) return [];
+  const executableNodeIds = new Set(executableWorkflowNodes(session).map((node) => node.id));
   return session.nodes
-    .filter((node) => node.display?.meta?.includes("flow-kernel") || node.id === session.plannerNodeId)
+    .filter((node) => node.id === session.plannerNodeId || executableNodeIds.has(node.id))
     .map((node) => ({
       id: node.id,
       runId: node.runId,

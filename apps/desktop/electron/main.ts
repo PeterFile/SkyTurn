@@ -285,6 +285,7 @@ interface FlowProjectionLike {
     runId: string;
     status: string;
   }>;
+  userDecisions?: unknown[];
 }
 
 interface ExecutableRunIdentity {
@@ -585,6 +586,7 @@ const workflowStoreInitializations = new Map<string, Promise<WorkflowStoreHost>>
 const workflowSessionAdvanceFlights = new Map<string, Promise<void>>();
 const workflowProjectAdvanceTails = new Map<string, Promise<void>>();
 const MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT = 4;
+const DANGER_FULL_ACCESS_AUTHORIZATION_OPTION = "Authorize this run";
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
 const workflowSessionMutationLocks = new Map<string, Promise<void>>();
 let remoteSideEffectSequence = 0;
@@ -638,6 +640,10 @@ interface WorkflowStoreHost {
   appendWorkflowEvent(input: unknown): unknown;
   applyWorkflowIntent(intent: unknown, now: string): { ok: boolean };
   scheduleReadyLanes(sessionId: string, input: unknown): {
+    readyLanes: Array<{ id: string; runId: string; segmentId: string }>;
+    projection: unknown;
+  };
+  previewReadyLanes(sessionId: string, input: unknown): {
     readyLanes: Array<{ id: string; runId: string; segmentId: string }>;
     projection: unknown;
   };
@@ -895,6 +901,10 @@ async function authorizeWorkflowRunStartInput(
       throw workflowIpcError("DELIVERY_REJECTED", "The renderer cannot start the workflow planner root.");
     }
     assertPublicRunStartIsNotScheduled(input, store);
+  }
+  if (input.sandbox === "danger-full-access") {
+    const identity = await trustedRunStartIdentity(input, false);
+    assertDangerousRunAuthorization(store, identity);
   }
   const authorized = await authorizeRunStartExpectedArtifacts(input, store);
   const { assertExpectedArtifactVerifierCapability } = await import("@skyturn/agent-bridge");
@@ -1576,19 +1586,46 @@ ipcMain.handle("workflow:variant:create", workflowHandler(async (projectRoot: st
 
 ipcMain.handle("workflow:userDecision:answer", workflowHandler(async (projectRoot: string, input: unknown) => {
   assertKnownProjectRoot(projectRoot);
+  if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "User decision input is invalid.");
+  const allowedKeys = new Set(["sessionId", "decisionId", "selectedOption", "action", "comment"]);
+  if (Object.keys(input).some((key) => !allowedKeys.has(key))) {
+    throw workflowIpcError("INVALID_INPUT", "User decision input contains unsupported fields.");
+  }
   const sessionId = requireText(readField(input, "sessionId"), "workflow session id");
   const decisionId = requireText(readField(input, "decisionId"), "decision id");
   const selectedOption = requireText(readField(input, "selectedOption"), "selected option");
   const action = normalizeUserDecisionAction(readField(input, "action"));
+  const store = await getWorkflowStore(projectRoot);
+  const projection = store.materializeFlowProjection(sessionId);
+  const decisions = isRecord(projection) && Array.isArray(projection.userDecisions)
+    ? projection.userDecisions
+    : [];
+  const decision = decisions.find((candidate) => isRecord(candidate) && candidate.decisionId === decisionId);
+  if (!isRecord(decision) || decision.status !== "waiting_input") {
+    throw workflowIpcError("DELIVERY_REJECTED", "User decision is not waiting for input.");
+  }
+  if (!Array.isArray(decision.options) || !decision.options.includes(selectedOption)) {
+    throw workflowIpcError("INVALID_INPUT", "Selected user decision option is not available.");
+  }
+  if (decision.runAuthorization !== undefined && (
+    !isExactDangerousRunAuthorization(decision.runAuthorization) ||
+    selectedOption !== DANGER_FULL_ACCESS_AUTHORIZATION_OPTION ||
+    action !== "continue"
+  )) {
+    throw workflowIpcError("DELIVERY_REJECTED", "Dangerous run authorization input is invalid.");
+  }
+  const comment = optionalText(readField(input, "comment"));
   const payload = {
     decisionId,
     selectedOption,
     action,
-    ...(optionalText(readField(input, "comment")) ? { comment: optionalText(readField(input, "comment")) } : {}),
-    ...(optionalText(readField(input, "targetLaneId")) ? { targetLaneId: optionalText(readField(input, "targetLaneId")) } : {}),
-    ...(optionalText(readField(input, "targetSegmentId")) ? { targetSegmentId: optionalText(readField(input, "targetSegmentId")) } : {}),
+    ...(comment ? { comment } : {}),
+    ...(optionalText(decision.targetLaneId) ? { targetLaneId: optionalText(decision.targetLaneId) } : {}),
+    ...(optionalText(decision.targetSegmentId) ? { targetSegmentId: optionalText(decision.targetSegmentId) } : {}),
+    ...(isExactDangerousRunAuthorization(decision.runAuthorization)
+      ? { runAuthorization: decision.runAuthorization }
+      : {}),
   };
-  const store = await getWorkflowStore(projectRoot);
   const event = store.appendWorkflowEvent({
     sessionId,
     kind: "workflow.user_decision.answered",
@@ -1597,12 +1634,16 @@ ipcMain.handle("workflow:userDecision:answer", workflowHandler(async (projectRoo
     payload,
     now: new Date().toISOString(),
   });
-  const projection = store.materializeFlowProjection(sessionId);
+  if (!isRecord(event) || event.kind !== "workflow.user_decision.answered" || stableJson(event.payload) !== stableJson(payload)) {
+    throw workflowIpcError("DELIVERY_REJECTED", "User decision answer conflicts with durable state.");
+  }
+  await advanceWorkflowSession(projectRoot, store, sessionId);
+  const answeredProjection = store.materializeFlowProjection(sessionId);
   broadcastWorkflowProjection(projectRoot, sessionId, store);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     event,
-    projection,
+    projection: answeredProjection,
     canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
 }));
@@ -2894,11 +2935,55 @@ async function advanceOneWorkflowSession(
     const policy = runtime.workflowSchedulingPolicyForSession(authoritativeSession);
     const allowedParallelism = Math.min(policy.allowedParallelism, remainingProjectCapacity);
     if (allowedParallelism === 0) return;
+    const preview = store.previewReadyLanes(sessionId, {
+      allowedParallelism,
+    });
+    if (preview.readyLanes.length === 0) return;
+    const authorizedLaneIds: string[] = [];
+    let requestedAuthorization = false;
+    for (const lane of preview.readyLanes) {
+      const node = authoritativeSession.nodes.find((candidate) => candidate.id === lane.id);
+      if (!node || runtime.sandboxForNodeRun(node) !== "danger-full-access") {
+        authorizedLaneIds.push(lane.id);
+        continue;
+      }
+      let identity: TrustedRunStartIdentity;
+      try {
+        const input = await buildScheduledWorkflowRunStartInput(projectRoot, store, {
+          sessionId,
+          laneId: lane.id,
+          segmentId: lane.segmentId,
+          runId: lane.runId,
+          agentKind: node.agent,
+        });
+        identity = await trustedRunStartIdentity(input, false);
+      } catch {
+        // Dangerous lanes stay unauthorized when their exact launch identity cannot be built.
+        continue;
+      }
+      let authorization: "authorized" | "requested" | "blocked" = "blocked";
+      try {
+        authorization = ensureDangerousRunAuthorization(store, node.title, identity, lane.segmentId);
+      } catch {
+        // Durable authorization failures stay blocked before scheduling or start side effects.
+      }
+      if (authorization === "authorized") authorizedLaneIds.push(lane.id);
+      if (authorization === "requested") requestedAuthorization = true;
+    }
+    if (authorizedLaneIds.length === 0) {
+      broadcastWorkflowProjection(projectRoot, sessionId, store);
+      if (requestedAuthorization) continue;
+      return;
+    }
     const scheduled = store.scheduleReadyLanes(sessionId, {
       allowedParallelism,
+      authorizedLaneIds,
       now: new Date().toISOString(),
     });
-    if (scheduled.readyLanes.length === 0) return;
+    if (scheduled.readyLanes.length === 0) {
+      if (requestedAuthorization) continue;
+      return;
+    }
     for (const lane of scheduled.readyLanes) {
       const segment = store.listRunningSegments().find((candidate) =>
         candidate.sessionId === sessionId &&
@@ -2924,6 +3009,133 @@ async function advanceOneWorkflowSession(
     }
     broadcastWorkflowProjection(projectRoot, sessionId, store);
   }
+}
+
+function ensureDangerousRunAuthorization(
+  store: WorkflowStoreHost,
+  laneTitle: string,
+  identity: TrustedRunStartIdentity,
+  segmentId: string,
+): "authorized" | "requested" | "blocked" {
+  const decisionId = dangerousRunAuthorizationDecisionId(identity, segmentId);
+  const projection = store.materializeFlowProjection(identity.sessionId);
+  const decisions = isRecord(projection) && Array.isArray(projection.userDecisions)
+    ? projection.userDecisions
+    : [];
+  const existing = decisions.find((candidate) => isRecord(candidate) && candidate.decisionId === decisionId);
+  if (existing) {
+    return dangerousRunAuthorizationMatches(existing, identity, segmentId, true) ? "authorized" : "blocked";
+  }
+  const payload = dangerousRunAuthorizationRequestPayload(decisionId, laneTitle, identity, segmentId);
+  const event = store.appendWorkflowEvent({
+    sessionId: identity.sessionId,
+    kind: "workflow.user_decision.requested",
+    source: "electron-main",
+    idempotencyKey: `decision:${decisionId}:requested`,
+    payload,
+    now: new Date().toISOString(),
+  });
+  if (!isRecord(event) || event.kind !== "workflow.user_decision.requested" || stableJson(event.payload) !== stableJson(payload)) {
+    return "blocked";
+  }
+  const recorded = store.materializeFlowProjection(identity.sessionId);
+  const recordedDecision = isRecord(recorded) && Array.isArray(recorded.userDecisions)
+    ? recorded.userDecisions.find((candidate) => isRecord(candidate) && candidate.decisionId === decisionId)
+    : undefined;
+  return isRecord(recordedDecision) && dangerousRunAuthorizationMatches(recordedDecision, identity, segmentId, false)
+    ? "requested"
+    : "blocked";
+}
+
+function assertDangerousRunAuthorization(
+  store: WorkflowStoreHost,
+  identity: TrustedRunStartIdentity,
+): void {
+  const segment = store.listRunningSegments().find((candidate) =>
+    candidate.sessionId === identity.sessionId &&
+    candidate.laneId === identity.laneId &&
+    candidate.runId === identity.runId &&
+    candidate.agentKind === identity.agentKind
+  );
+  if (!segment) {
+    throw workflowIpcError("DELIVERY_REJECTED", "Dangerous run authorization is not bound to a scheduled segment.");
+  }
+  const projection = store.materializeFlowProjection(identity.sessionId);
+  const decisionId = dangerousRunAuthorizationDecisionId(identity, segment.segmentId);
+  const decision = isRecord(projection) && Array.isArray(projection.userDecisions)
+    ? projection.userDecisions.find((candidate) => isRecord(candidate) && candidate.decisionId === decisionId)
+    : undefined;
+  if (!isRecord(decision) || !dangerousRunAuthorizationMatches(decision, identity, segment.segmentId, true)) {
+    throw workflowIpcError("DELIVERY_REJECTED", "Dangerous run authorization is missing or stale.");
+  }
+}
+
+function dangerousRunAuthorizationDecisionId(
+  identity: TrustedRunStartIdentity,
+  segmentId: string,
+): string {
+  const value = JSON.stringify([
+    "skyturn-danger-full-access-authorization-v1",
+    identity.sessionId,
+    identity.laneId,
+    segmentId,
+    identity.runId,
+    identity.startFingerprint,
+  ]);
+  return `danger-full-access-${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
+}
+
+function dangerousRunAuthorizationRequestPayload(
+  decisionId: string,
+  laneTitle: string,
+  identity: TrustedRunStartIdentity,
+  segmentId: string,
+): Record<string, unknown> {
+  return {
+    decisionId,
+    prompt: `Authorize full host access for ${laneTitle.trim() || identity.laneId}?`,
+    options: [DANGER_FULL_ACCESS_AUTHORIZATION_OPTION],
+    reason: "This run can modify host state outside the project.",
+    targetLaneId: identity.laneId,
+    targetSegmentId: segmentId,
+    runAuthorization: {
+      sandbox: "danger-full-access",
+      runId: identity.runId,
+      startFingerprint: identity.startFingerprint,
+    },
+  };
+}
+
+function dangerousRunAuthorizationMatches(
+  decision: Record<string, unknown>,
+  identity: TrustedRunStartIdentity,
+  segmentId: string,
+  requireAnswer: boolean,
+): boolean {
+  if (
+    decision.targetLaneId !== identity.laneId ||
+    decision.targetSegmentId !== segmentId ||
+    !isExactDangerousRunAuthorization(decision.runAuthorization) ||
+    decision.runAuthorization.runId !== identity.runId ||
+    decision.runAuthorization.startFingerprint !== identity.startFingerprint
+  ) return false;
+  if (!requireAnswer) return decision.status === "waiting_input";
+  return decision.status === "answered" &&
+    decision.selectedOption === DANGER_FULL_ACCESS_AUTHORIZATION_OPTION &&
+    decision.action === "continue";
+}
+
+function isExactDangerousRunAuthorization(value: unknown): value is {
+  sandbox: "danger-full-access";
+  runId: string;
+  startFingerprint: string;
+} {
+  return isRecord(value) &&
+    value.sandbox === "danger-full-access" &&
+    typeof value.runId === "string" &&
+    value.runId.length > 0 &&
+    typeof value.startFingerprint === "string" &&
+    /^[0-9a-f]{64}$/.test(value.startFingerprint);
 }
 
 async function compensateScheduledWorkflowStartBuildFailure(

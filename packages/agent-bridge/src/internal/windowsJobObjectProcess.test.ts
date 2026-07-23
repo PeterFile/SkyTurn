@@ -163,6 +163,198 @@ describe("Windows Job Object host protocol", () => {
     await expect(protocol.closed).resolves.toEqual({ exitCode: 23, signalCode: null });
   });
 
+  it("kills a hung helper once after an acknowledgement and rejects only after real close", async () => {
+    vi.useFakeTimers();
+    const token = "test-token";
+    const { child, emitClose, killSignals } = fakeChild({
+      closeOnKill: false,
+      killResult: false,
+    });
+    const { control, inbound } = fakeControlChannel();
+    const protocol = attachWindowsJobObjectProtocol(child, control, token, 25);
+    let closedState: "pending" | "resolved" | "rejected" = "pending";
+    const closedOutcome = protocol.closed.then(
+      () => {
+        closedState = "resolved";
+        return { status: "resolved" as const };
+      },
+      (error: unknown) => {
+        closedState = "rejected";
+        return { status: "rejected" as const, error };
+      },
+    );
+
+    try {
+      inbound.write(protocolLine(token, { kind: "ready", rootPid: 4242 }));
+      await expect(protocol.ready).resolves.toEqual({ rootPid: 4242 });
+      inbound.write(protocolLine(token, {
+        kind: "closed",
+        exitCode: 0,
+        termination: "normal",
+        treeEmpty: true,
+      }));
+
+      await vi.advanceTimersByTimeAsync(24);
+      expect(killSignals).toEqual([]);
+      expect(closedState).toBe("pending");
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(killSignals).toEqual(["SIGKILL"]);
+      expect(closedState).toBe("pending");
+
+      await vi.advanceTimersByTimeAsync(25);
+      expect(killSignals).toEqual(["SIGKILL"]);
+      expect(closedState).toBe("pending");
+
+      emitClose(null, "SIGKILL");
+      await expect(closedOutcome).resolves.toEqual({
+        status: "rejected",
+        error: expect.objectContaining({
+          message: "Windows agent process tree cleanup could not be verified.",
+        }),
+      });
+      expect(closedState).toBe("rejected");
+    } finally {
+      emitClose(null, "SIGKILL");
+      inbound.destroy();
+      control.destroy();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds setup after pipe connection when the helper never sends ready", async () => {
+    vi.useFakeTimers();
+    const token = "test-token";
+    const { child, emitClose, killSignals } = fakeChild({
+      closeOnKill: false,
+      killResult: false,
+    });
+    const { control, inbound } = fakeControlChannel();
+    const protocol = attachWindowsJobObjectProtocol(child, control, token, 1_000, 25);
+    let readyState: "pending" | "rejected" = "pending";
+    let closedState: "pending" | "rejected" = "pending";
+    const readyOutcome = protocol.ready.then(
+      () => ({ status: "resolved" as const }),
+      (error: unknown) => {
+        readyState = "rejected";
+        return { status: "rejected" as const, error };
+      },
+    );
+    const closedOutcome = protocol.closed.then(
+      () => ({ status: "resolved" as const }),
+      (error: unknown) => {
+        closedState = "rejected";
+        return { status: "rejected" as const, error };
+      },
+    );
+
+    try {
+      await vi.advanceTimersByTimeAsync(24);
+      expect(killSignals).toEqual([]);
+      expect(readyState).toBe("pending");
+      expect(closedState).toBe("pending");
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(killSignals).toEqual(["SIGKILL"]);
+      expect(readyState).toBe("pending");
+      expect(closedState).toBe("pending");
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(killSignals).toEqual(["SIGKILL"]);
+      emitClose(null, "SIGKILL");
+
+      await expect(readyOutcome).resolves.toEqual({
+        status: "rejected",
+        error: expect.objectContaining({
+          message: "Windows Job Object process host is unavailable.",
+        }),
+      });
+      await expect(closedOutcome).resolves.toEqual({
+        status: "rejected",
+        error: expect.objectContaining({
+          message: "Windows Job Object process host is unavailable.",
+        }),
+      });
+      expect(readyState).toBe("rejected");
+      expect(closedState).toBe("rejected");
+      expect(killSignals).toEqual(["SIGKILL"]);
+    } finally {
+      emitClose(null, "SIGKILL");
+      inbound.destroy();
+      control.destroy();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("starts the protocol timeout only for cleanup after the first valid ready message", async () => {
+    vi.useFakeTimers();
+    const token = "test-token";
+    const { child, emitClose, killSignals } = fakeChild({
+      closeOnKill: false,
+      killResult: false,
+    });
+    const { control, inbound } = fakeControlChannel();
+    const protocol = attachWindowsJobObjectProtocol(child, control, token, 25);
+    let readyState: "pending" | "resolved" | "rejected" = "pending";
+    let closedState: "pending" | "resolved" | "rejected" = "pending";
+    void protocol.ready.then(
+      () => {
+        readyState = "resolved";
+      },
+      () => {
+        readyState = "rejected";
+      },
+    );
+    const closedOutcome = protocol.closed.then(
+      () => {
+        closedState = "resolved";
+        return { status: "resolved" as const };
+      },
+      (error: unknown) => {
+        closedState = "rejected";
+        return { status: "rejected" as const, error };
+      },
+    );
+
+    try {
+      await vi.advanceTimersByTimeAsync(50);
+      expect(readyState).toBe("pending");
+      expect(closedState).toBe("pending");
+      expect(killSignals).toEqual([]);
+
+      inbound.write(protocolLine(token, { kind: "ready", rootPid: 4242 }));
+      await expect(protocol.ready).resolves.toEqual({ rootPid: 4242 });
+      expect(readyState).toBe("resolved");
+
+      await vi.advanceTimersByTimeAsync(50);
+      expect(killSignals).toEqual([]);
+
+      void protocol.terminateAndReap().catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(24);
+      expect(killSignals).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(killSignals).toEqual(["SIGKILL"]);
+      expect(closedState).toBe("pending");
+
+      emitClose(null, "SIGKILL");
+      await expect(closedOutcome).resolves.toEqual({
+        status: "rejected",
+        error: expect.objectContaining({
+          message: "Windows agent process tree cleanup could not be verified.",
+        }),
+      });
+      expect(closedState).toBe("rejected");
+    } finally {
+      emitClose(null, "SIGKILL");
+      inbound.destroy();
+      control.destroy();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
   it("kills a hung helper once after the close acknowledgement timeout and rejects only after close", async () => {
     vi.useFakeTimers();
     try {
@@ -305,6 +497,12 @@ describe("Windows Job Object host protocol", () => {
     expect(helper).toContain("while (!deadline.IsReached())");
     expect(helper).toContain("Int64.MaxValue / frequency");
     expect(helper).toContain("Int64.MaxValue - timeoutTicks");
+    expect(helper).toContain("private sealed class JobTerminationState");
+    expect(helper).toContain("if (!terminationState.TryBegin()) return true;");
+    expect(helper).toContain("TerminateAndVerify(job, cleanupTimeoutMs, terminationState);");
+    expect(helper).toContain("ReapAfterFailure(job, processHandle, assigned, cleanupTimeoutMs, terminationState);");
+    const directTerminationCalls = helper.match(/NativeMethods\.TerminateJobObject\(job, TerminatedExitCode\)/g) ?? [];
+    expect(directTerminationCalls).toHaveLength(1);
     const suspendedCreate = helper.indexOf("CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT");
     const assignment = helper.indexOf("Ensure(NativeMethods.AssignProcessToJobObject(job, processHandle));");
     const membershipCheck = helper.indexOf("if (QueryActiveProcesses(job) != 1) throw new InvalidOperationException();");
@@ -317,6 +515,19 @@ describe("Windows Job Object host protocol", () => {
     expect(packageJson).toMatch(/dist\/native\/job-object-host\.ps1/);
     await expect(stat(new URL("../../dist/native/job-object-host.ps1", import.meta.url)))
       .resolves.toEqual(expect.objectContaining({ size: expect.any(Number) }));
+  });
+
+  it("keeps the 30-second setup budget separate from the attached protocol timeout floor", async () => {
+    const source = await readFile(new URL("./windowsJobObjectProcess.ts", import.meta.url), "utf8");
+
+    expect(source).toContain("const defaultSetupTimeoutMs = 30_000;");
+    expect(source).toContain("const defaultProtocolTimeoutMs = 15_000;");
+    expect(source).toContain(
+      "setTimeout(() => startupFailure.reject(new Error(capabilityError)), defaultSetupTimeoutMs)",
+    );
+    expect(source).toContain(
+      "Math.max(defaultProtocolTimeoutMs, boundedCleanupTimeout(options.cleanupTimeoutMs) + 5_000)",
+    );
   });
 });
 
