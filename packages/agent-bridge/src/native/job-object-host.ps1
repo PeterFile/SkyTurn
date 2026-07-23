@@ -30,6 +30,15 @@ public static class SkyTurnJobObjectHost
     private const uint TerminatedExitCode = 0xC000013A;
     private const uint SetupFailureExitCode = 0xC0000142;
 
+    public static string ReadRequestLine()
+    {
+        using (Stream input = Console.OpenStandardInput())
+        using (StreamReader reader = new StreamReader(input, new UTF8Encoding(false, true), false, 1024, false))
+        {
+            return reader.ReadLine();
+        }
+    }
+
     public static int Run(
         string token,
         string pipeName,
@@ -697,7 +706,7 @@ public static class SkyTurnJobObjectHost
 
 try {
     Add-Type -TypeDefinition $source -Language CSharp
-    $requestLine = [Console]::In.ReadLine()
+    $requestLine = [SkyTurnJobObjectHost]::ReadRequestLine()
     if ($null -eq $requestLine -or $requestLine.Length -gt 262144) { throw "invalid request" }
     $request = $requestLine | ConvertFrom-Json
     if ($request.version -ne 1) { throw "invalid request" }

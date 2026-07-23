@@ -507,10 +507,17 @@ describe("Windows Job Object host protocol", () => {
     const assignment = helper.indexOf("Ensure(NativeMethods.AssignProcessToJobObject(job, processHandle));");
     const membershipCheck = helper.indexOf("if (QueryActiveProcesses(job) != 1) throw new InvalidOperationException();");
     const resume = helper.indexOf("if (NativeMethods.ResumeThread(threadHandle) == UInt32.MaxValue)");
+    const utf8Input = helper.indexOf("new UTF8Encoding(false, true)");
+    const requestRead = helper.indexOf("$requestLine = [SkyTurnJobObjectHost]::ReadRequestLine()");
+    const requestParse = helper.indexOf("$request = $requestLine | ConvertFrom-Json");
     expect(suspendedCreate).toBeGreaterThan(-1);
     expect(suspendedCreate).toBeLessThan(assignment);
     expect(assignment).toBeLessThan(membershipCheck);
     expect(membershipCheck).toBeLessThan(resume);
+    expect(utf8Input).toBeGreaterThan(-1);
+    expect(utf8Input).toBeLessThan(requestRead);
+    expect(requestRead).toBeLessThan(requestParse);
+    expect(helper).not.toContain("[Console]::InputEncoding");
     expect(buildScript).toMatch(/job-object-host\.ps1/);
     expect(packageJson).toMatch(/dist\/native\/job-object-host\.ps1/);
     await expect(stat(new URL("../../dist/native/job-object-host.ps1", import.meta.url)))
