@@ -305,7 +305,7 @@ test("production Hermes recovery redacts ambiguous literal escapes before every 
         "  const split = Math.floor(windowsPath.length / 2);",
         "  process.stdout.write(`repo=${windowsPath.slice(0, split)}`);",
         "  await wait();",
-        "  process.stderr.write(`${windowsPath.slice(split)}\\r\\n`);",
+        "  process.stdout.write(`${windowsPath.slice(split)}\\r\\n`);",
         "})();",
       ].join("\n"),
       { mode: 0o755 },

@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { inspect } from "node:util";
 
 import { sanitizePublicPayloadText } from "@skyturn/project-core";
@@ -10,8 +11,8 @@ const maxDiagnosticStringChars = 1_024;
 
 interface WindowsFixtureInvocationInput {
   agentKind: FixtureAgentKind;
+  argumentMarker: string;
   canonicalWorkdir: string;
-  fixturePath: string;
   prompt: string;
   resumeHandle: string;
 }
@@ -20,6 +21,14 @@ interface WindowsFixtureInvocation {
   entryPoint: "exec" | "chat";
   extraArgs: string[];
   expectedFixtureArgv: string[];
+  pathArgumentIndexes: number[];
+}
+
+interface WindowsFixtureArgvValidationInput {
+  actualArgs: readonly string[];
+  expectedArgs: readonly string[];
+  pathArgumentIndexes: readonly number[];
+  resolvePathIdentity?: (path: string) => string;
 }
 
 interface WindowsFixtureStartFailureInput {
@@ -33,7 +42,7 @@ interface WindowsFixtureStartFailureInput {
 export function buildWindowsFixtureInvocation(
   input: WindowsFixtureInvocationInput,
 ): WindowsFixtureInvocation {
-  const extraArgs = [input.fixturePath];
+  const extraArgs = [input.argumentMarker];
   if (input.agentKind === "codex") {
     return {
       entryPoint: "exec",
@@ -47,11 +56,12 @@ export function buildWindowsFixtureInvocation(
         "read-only",
         "-c",
         "approval_policy=never",
-        input.fixturePath,
+        input.argumentMarker,
         "-C",
         input.canonicalWorkdir,
         input.prompt,
       ],
+      pathArgumentIndexes: [10],
     };
   }
   return {
@@ -65,9 +75,42 @@ export function buildWindowsFixtureInvocation(
       "skyturn",
       "--resume",
       input.resumeHandle,
-      input.fixturePath,
+      input.argumentMarker,
     ],
+    pathArgumentIndexes: [],
   };
+}
+
+export function validateWindowsFixtureArgv(input: WindowsFixtureArgvValidationInput): void {
+  if (input.actualArgs.length !== input.expectedArgs.length) {
+    throw new Error(
+      `Windows fixture argv length mismatch (actual ${input.actualArgs.length}, expected ${input.expectedArgs.length}).`,
+    );
+  }
+  const pathArgumentIndexes = new Set(input.pathArgumentIndexes);
+  const resolvePathIdentity = input.resolvePathIdentity ?? ((path: string) => realpathSync.native(path));
+  for (let index = 0; index < input.expectedArgs.length; index += 1) {
+    if (!pathArgumentIndexes.has(index)) {
+      if (input.actualArgs[index] !== input.expectedArgs[index]) {
+        throw new Error(`Windows fixture argv mismatch at index ${index}.`);
+      }
+      continue;
+    }
+    let actualIdentity: string;
+    let expectedIdentity: string;
+    try {
+      actualIdentity = resolvePathIdentity(input.actualArgs[index]);
+      expectedIdentity = resolvePathIdentity(input.expectedArgs[index]);
+    } catch {
+      throw new Error(`Windows fixture argv path identity mismatch at index ${index}.`);
+    }
+    const pathsMatch = process.platform === "win32"
+      ? actualIdentity.toLowerCase() === expectedIdentity.toLowerCase()
+      : actualIdentity === expectedIdentity;
+    if (!pathsMatch) {
+      throw new Error(`Windows fixture argv path identity mismatch at index ${index}.`);
+    }
+  }
 }
 
 export function formatWindowsFixtureStartFailure(

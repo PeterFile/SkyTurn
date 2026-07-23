@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,24 +14,25 @@ import {
 import {
   buildWindowsFixtureInvocation,
   formatWindowsFixtureStartFailure,
+  validateWindowsFixtureArgv,
 } from "./windowsProcessTreeIntegrationSupport.js";
 
 describe("Windows process-tree integration support", () => {
   const canonicalWorkdir = "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\skyturn case 雪";
-  const fixturePath = `${canonicalWorkdir}\\agent-fixture.cjs`;
   const prompt = "Quoted \"prompt\" with trailing slash\\ and Unicode 雪\nsecond line";
   const resumeHandle = "resume \"capability\" with slash\\ and Unicode 水";
+  const argumentMarker = "marker \"argument\" with slash\\ and Unicode 火";
 
   it("places the explicit Codex fixture at the adapter extra-argument boundary", () => {
     expect(buildWindowsFixtureInvocation({
       agentKind: "codex",
+      argumentMarker,
       canonicalWorkdir,
-      fixturePath,
       prompt,
       resumeHandle,
     })).toEqual({
       entryPoint: "exec",
-      extraArgs: [fixturePath],
+      extraArgs: [argumentMarker],
       expectedFixtureArgv: [
         "--json",
         "--ephemeral",
@@ -41,24 +42,25 @@ describe("Windows process-tree integration support", () => {
         "read-only",
         "-c",
         "approval_policy=never",
-        fixturePath,
+        argumentMarker,
         "-C",
         canonicalWorkdir,
         prompt,
       ],
+      pathArgumentIndexes: [10],
     });
   });
 
   it("places the explicit Hermes fixture after the resume argument", () => {
     expect(buildWindowsFixtureInvocation({
       agentKind: "hermes",
+      argumentMarker,
       canonicalWorkdir,
-      fixturePath,
       prompt,
       resumeHandle,
     })).toEqual({
       entryPoint: "chat",
-      extraArgs: [fixturePath],
+      extraArgs: [argumentMarker],
       expectedFixtureArgv: [
         "-q",
         prompt,
@@ -67,8 +69,9 @@ describe("Windows process-tree integration support", () => {
         "skyturn",
         "--resume",
         resumeHandle,
-        fixturePath,
+        argumentMarker,
       ],
+      pathArgumentIndexes: [],
     });
   });
 
@@ -82,11 +85,10 @@ describe("Windows process-tree integration support", () => {
         const canonicalRoot = await realpath(projectRoot);
         const argsPath = join(binRoot, "args.json");
         const executablePath = join(binRoot, "agent");
-        const fixturePath = join(canonicalRoot, "agent-fixture.cjs");
         const invocation = buildWindowsFixtureInvocation({
           agentKind,
+          argumentMarker,
           canonicalWorkdir: canonicalRoot,
-          fixturePath,
           prompt,
           resumeHandle,
         });
@@ -136,10 +138,13 @@ describe("Windows process-tree integration support", () => {
         }, sink);
         await terminal.promise;
 
-        expect(JSON.parse(await readFile(argsPath, "utf8"))).toEqual([
-          invocation.entryPoint,
-          ...invocation.expectedFixtureArgv,
-        ]);
+        const actualArgs = JSON.parse(await readFile(argsPath, "utf8")) as string[];
+        expect(actualArgs.shift()).toBe(invocation.entryPoint);
+        expect(() => validateWindowsFixtureArgv({
+          actualArgs,
+          expectedArgs: invocation.expectedFixtureArgv,
+          pathArgumentIndexes: invocation.pathArgumentIndexes,
+        })).not.toThrow();
       } finally {
         await Promise.all([
           rm(projectRoot, { recursive: true, force: true }),
@@ -149,9 +154,70 @@ describe("Windows process-tree integration support", () => {
     },
   );
 
+  it("accepts filesystem aliases only for declared path arguments", async () => {
+    const root = await mkdtemp(join(tmpdir(), "skyturn-windows-fixture-path-"));
+    const alias = `${root}-alias`;
+    try {
+      await symlink(root, alias, "dir");
+      const canonicalRoot = await realpath(root);
+      expect(() => validateWindowsFixtureArgv({
+        actualArgs: ["-C", alias, argumentMarker],
+        expectedArgs: ["-C", canonicalRoot, argumentMarker],
+        pathArgumentIndexes: [1],
+      })).not.toThrow();
+      expect(() => validateWindowsFixtureArgv({
+        actualArgs: ["-C", root, alias],
+        expectedArgs: ["-C", root, canonicalRoot],
+        pathArgumentIndexes: [1],
+      })).toThrow("Windows fixture argv mismatch at index 2.");
+    } finally {
+      await Promise.all([
+        rm(alias, { force: true }),
+        rm(root, { recursive: true, force: true }),
+      ]);
+    }
+  });
+
+  it("reports only bounded generic fixture validation mismatches", () => {
+    const privateActual = `${prompt}${resumeHandle}${argumentMarker}`;
+    const failures = [
+      () => validateWindowsFixtureArgv({
+        actualArgs: [privateActual],
+        expectedArgs: [],
+        pathArgumentIndexes: [],
+      }),
+      () => validateWindowsFixtureArgv({
+        actualArgs: [privateActual],
+        expectedArgs: [argumentMarker],
+        pathArgumentIndexes: [],
+      }),
+      () => validateWindowsFixtureArgv({
+        actualArgs: [canonicalWorkdir],
+        expectedArgs: ["Z:\\private\\absolute\\path"],
+        pathArgumentIndexes: [0],
+        resolvePathIdentity: (value) => value,
+      }),
+    ];
+
+    expect(failures.map((failure) => captureErrorMessage(failure))).toEqual([
+      "Windows fixture argv length mismatch (actual 1, expected 0).",
+      "Windows fixture argv mismatch at index 0.",
+      "Windows fixture argv path identity mismatch at index 0.",
+    ]);
+    for (const failure of failures) {
+      const message = captureErrorMessage(failure);
+      expect(message.length).toBeLessThan(128);
+      expect(message).not.toContain(prompt);
+      expect(message).not.toContain(resumeHandle);
+      expect(message).not.toContain(argumentMarker);
+      expect(message).not.toContain(canonicalWorkdir);
+    }
+  });
+
   it("bounds authoritative fixture-start diagnostics and redacts every private marker", () => {
     const rawRoot = "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\skyturn-codex-cancel-secret";
     const environmentMarker = "env value with \"quotes\", slash\\, spaces, and Unicode 火";
+    const fixturePath = `${canonicalWorkdir}\\agent-fixture.cjs`;
     const events = [
       {
         kind: "progress",
@@ -192,6 +258,15 @@ describe("Windows process-tree integration support", () => {
     expect(diagnostic).not.toContain(fixturePath);
   });
 });
+
+function captureErrorMessage(callback: () => void): string {
+  try {
+    callback();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  throw new Error("Expected fixture validation to fail.");
+}
 
 function deferredRunEvent(): {
   promise: Promise<RunEvent>;

@@ -37,20 +37,20 @@ async function runProcessTreeCase(agentKind, terminalPath) {
     const canonicalRoot = await realpath(root);
     const prompt = "Quoted \"prompt\" with trailing slash\\ and Unicode 雪\nsecond line";
     const resumeHandle = "resume \"capability\" with slash\\ and Unicode 水";
-    const environmentMarker = "env value with \"quotes\", slash\\, spaces, and Unicode 火";
+    const argumentMarker = "marker \"argument\" with slash\\, spaces, and Unicode 火";
     const stdoutMarker = `stdout-${agentKind}-${terminalPath}-雪`;
     const stderrMarker = `stderr-${agentKind}-${terminalPath}-火`;
     const fixturePath = join(canonicalRoot, "agent-fixture.cjs");
     const invocation = buildWindowsFixtureInvocation({
       agentKind,
+      argumentMarker,
       canonicalWorkdir: canonicalRoot,
-      fixturePath,
       prompt,
       resumeHandle,
     });
     const fixture = fixtureSource({
-      environmentMarker,
       expectedArgs: invocation.expectedFixtureArgv,
+      pathArgumentIndexes: invocation.pathArgumentIndexes,
       stderrMarker,
       stdoutMarker,
       terminalPath,
@@ -74,7 +74,7 @@ async function runProcessTreeCase(agentKind, terminalPath) {
       env: {
         SKYTURN_PARENT_PID_PATH: parentPidPath,
         SKYTURN_CHILD_PID_PATH: childPidPath,
-        SKYTURN_ARGUMENT_ENV_MARKER: environmentMarker,
+        SKYTURN_WINDOWS_FIXTURE_CJS_PATH: fixturePath,
       },
       timeoutMs: terminalPath === "timeout" ? 1_500 : 20_000,
       killTimeoutMs: 1_000,
@@ -113,7 +113,7 @@ async function runProcessTreeCase(agentKind, terminalPath) {
       agentKind,
       terminalPath,
       events,
-      sensitiveValues: [prompt, resumeHandle, environmentMarker, root, canonicalRoot, fixturePath],
+      sensitiveValues: [prompt, resumeHandle, argumentMarker, root, canonicalRoot, fixturePath],
     };
     parentPid = Number(await waitForFixtureFile(parentPidPath, "parent.pid", diagnosticInput));
     childPid = Number(await waitForFixtureFile(childPidPath, "child.pid", diagnosticInput));
@@ -141,7 +141,7 @@ async function runProcessTreeCase(agentKind, terminalPath) {
     await cancellation;
     assert.equal(JSON.stringify(events).includes(prompt), false, `${agentKind} leaked the raw prompt.`);
     assert.equal(JSON.stringify(events).includes(resumeHandle), false, `${agentKind} leaked the resume capability.`);
-    assert.equal(JSON.stringify(events).includes(environmentMarker), false, `${agentKind} leaked the environment marker.`);
+    assert.equal(JSON.stringify(events).includes(argumentMarker), false, `${agentKind} leaked the argument marker.`);
     if (terminalPath === "normal-root-exit") {
       const exitEvidence = events.find((event) => event.kind === "evidence" && event.payload.exitCode === 17);
       assert.ok(exitEvidence, `${agentKind} did not preserve the actual root exit code.`);
@@ -161,19 +161,32 @@ async function runProcessTreeCase(agentKind, terminalPath) {
 
 function fixtureLauncherSource() {
   return [
-    "const fixturePath = process.argv.find((argument) => argument.endsWith('agent-fixture.cjs'));",
-    "if (!fixturePath) throw new Error('Windows integration fixture argument missing.');",
-    "require(fixturePath);",
+    "const fixturePath = process.env.SKYTURN_WINDOWS_FIXTURE_CJS_PATH;",
+    "if (typeof fixturePath !== 'string' || !fixturePath.toLowerCase().endsWith('.cjs')) {",
+    "  process.stderr.write('Windows integration fixture path is unavailable.\\n');",
+    "  process.exit(1);",
+    "}",
+    "try {",
+    "  require(fixturePath);",
+    "} catch {",
+    "  process.stderr.write('Windows integration fixture failed to load.\\n');",
+    "  process.exit(1);",
+    "}",
   ].join("\n");
 }
 
-function fixtureSource({ environmentMarker, expectedArgs, stderrMarker, stdoutMarker, terminalPath }) {
+function fixtureSource({ expectedArgs, pathArgumentIndexes, stderrMarker, stdoutMarker, terminalPath }) {
+  const supportModuleUrl = new URL("../dist/internal/windowsProcessTreeIntegrationSupport.js", import.meta.url).href;
   return [
-    "const assert = require('node:assert/strict');",
     "const { spawn } = require('node:child_process');",
     "const { writeFileSync } = require('node:fs');",
-    `assert.deepEqual(process.argv.slice(2), ${JSON.stringify(expectedArgs)});`,
-    `assert.equal(process.env.SKYTURN_ARGUMENT_ENV_MARKER, ${JSON.stringify(environmentMarker)});`,
+    "void (async () => {",
+    `const { validateWindowsFixtureArgv } = await import(${JSON.stringify(supportModuleUrl)});`,
+    "validateWindowsFixtureArgv({",
+    "  actualArgs: process.argv.slice(2),",
+    `  expectedArgs: ${JSON.stringify(expectedArgs)},`,
+    `  pathArgumentIndexes: ${JSON.stringify(pathArgumentIndexes)},`,
+    "});",
     "writeFileSync(process.env.SKYTURN_PARENT_PID_PATH, String(process.pid));",
     "const child = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)\"], { detached: true, stdio: 'ignore' });",
     "child.unref();",
@@ -187,6 +200,14 @@ function fixtureSource({ environmentMarker, expectedArgs, stderrMarker, stdoutMa
     terminalPath === "normal-root-exit"
       ? "setTimeout(() => process.exit(17), 1000);"
       : "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);",
+    "})().catch((error) => {",
+    "  const message = error instanceof Error ? error.message : '';",
+    "  const safeMessage = /^Windows fixture argv (?:length mismatch \\(actual \\d+, expected \\d+\\)|mismatch at index \\d+|path identity mismatch at index \\d+)\\.$/.test(message)",
+    "    ? message",
+    "    : 'Windows fixture setup failed.';",
+    "  process.stderr.write(`${safeMessage}\\n`);",
+    "  process.exit(1);",
+    "});",
   ].join("\n");
 }
 
