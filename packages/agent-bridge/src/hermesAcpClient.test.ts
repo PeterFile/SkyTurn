@@ -81,7 +81,7 @@ describe("Hermes ACP client", () => {
   });
 
   it("reports a distinct bounded safe session loading timeout", async () => {
-    const client = await testClient(agentScript({ hangLoad: true }), { sessionRequestTimeoutMs: 20 });
+    const client = await testClient(agentScript({ hangLoad: true }), { sessionRequestTimeoutMs: 500 });
     const sessionId = await client.newSession("/tmp");
 
     await expect(client.loadSession("/private/project-root", sessionId)).rejects.toThrow(

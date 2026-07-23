@@ -76,6 +76,11 @@ import {
   StreamingSensitiveOutputRedactor,
   type RedactedTerminalChunk,
 } from "./internal/streamingSensitiveOutputRedactor.js";
+import {
+  assertVerifiedPtyProcessBoundary,
+  spawnWindowsJobObjectProcess,
+  type WindowsJobObjectProcess,
+} from "./internal/windowsJobObjectProcess.js";
 
 export { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/project-core";
 export {
@@ -138,6 +143,44 @@ interface AgentRunWatchdogPolicy {
   killTimeoutMs: number;
 }
 
+type AgentRunTerminalKind =
+  | "child-close"
+  | "timeout"
+  | "cancel"
+  | "start-abort"
+  | "spawn-error"
+  | "process-boundary-failure";
+
+interface AgentRunTerminalRequest {
+  kind: AgentRunTerminalKind;
+  terminate: boolean;
+  closeBeforeDrain?: boolean;
+  prepare?: () => Promise<void>;
+  persist?: () => Promise<void>;
+}
+
+type AgentRunTerminalPhase = "process" | "drain" | "prepare" | "closing" | "persisting" | "settled";
+
+interface AgentRunTerminalState {
+  completion: Promise<AgentRunTerminalKind>;
+  generation: number;
+  phase: AgentRunTerminalPhase;
+  reject: (error: unknown) => void;
+  request: AgentRunTerminalRequest;
+  resolve: (kind: AgentRunTerminalKind) => void;
+}
+
+interface AgentCliProcessBoundary {
+  child: ChildProcess;
+  closed: Promise<AgentCliProcessCloseResult>;
+  windowsJob: WindowsJobObjectProcess | null;
+}
+
+interface AgentCliProcessCloseResult {
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+}
+
 export interface DiscoveryOptions {
   pathValue?: string;
   env?: NodeJS.ProcessEnv;
@@ -168,6 +211,14 @@ export interface TerminalPersistenceFailure {
   agentKind: AgentKind;
   reason: "terminal-persistence-failed";
   evidence: RunEvidence;
+}
+
+interface DeferredAgentRunStartOwner {
+  cancellationReason: string | null;
+  completion: Promise<void>;
+  reject: (error: unknown) => void;
+  resolve: () => void;
+  settled: boolean;
 }
 
 export type CodexCliSandbox = AgentRunSandbox;
@@ -503,6 +554,7 @@ export class AgentBridge {
   private readonly runs = new Map<string, AgentRun>();
   private readonly handles = new Map<string, AgentRunHandle>();
   private readonly startFlights = new Map<string, { fingerprint: string; promise: Promise<AgentRun> }>();
+  private readonly startOwners = new Map<string, DeferredAgentRunStartOwner>();
   private readonly runStartFingerprints = new Map<string, string>();
   private readonly terminalPersistenceEvidence = new Map<string, RunEvidence>();
   private readonly listeners = new Set<(event: RunEvent) => void>();
@@ -677,6 +729,8 @@ export class AgentBridge {
     }
     if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
     this.runs.set(run.id, run);
+    const startOwner = createDeferredAgentRunStartOwner();
+    this.startOwners.set(run.id, startOwner);
 
     const sink: RunEventSink = {
       emit: (event) => this.recordEvent(run.id, event),
@@ -707,10 +761,45 @@ export class AgentBridge {
       } catch (persistenceError) {
         terminalPersistenceError = persistenceError;
       }
+      this.settleStartOwner(run.id, startOwner);
       throw new OwnedAgentRunStartError(error, terminalPersistenceError, message);
     }
-    this.handles.set(run.id, handle);
+    await this.publishRunHandle(run, handle, startOwner);
     return this.runs.get(run.id) ?? run;
+  }
+
+  private async publishRunHandle(
+    run: AgentRun,
+    handle: AgentRunHandle,
+    startOwner: DeferredAgentRunStartOwner,
+  ): Promise<void> {
+    const cancellationReason = startOwner.cancellationReason;
+    if (cancellationReason === null) {
+      this.handles.set(run.id, handle);
+      this.settleStartOwner(run.id, startOwner);
+      return;
+    }
+    try {
+      await handle.cancel(cancellationReason);
+    } catch (error) {
+      if (!isFinalRunStatus(this.runs.get(run.id)?.status ?? run.status)) this.handles.set(run.id, handle);
+      this.settleStartOwner(run.id, startOwner, error);
+      return;
+    }
+    try {
+      await this.ensureCancelledRunTerminal(run, cancellationReason);
+      this.settleStartOwner(run.id, startOwner);
+    } catch (error) {
+      this.settleStartOwner(run.id, startOwner, error);
+    }
+  }
+
+  private settleStartOwner(runId: string, startOwner: DeferredAgentRunStartOwner, error?: unknown): void {
+    if (startOwner.settled) return;
+    startOwner.settled = true;
+    if (this.startOwners.get(runId) === startOwner) this.startOwners.delete(runId);
+    if (error === undefined) startOwner.resolve();
+    else startOwner.reject(error);
   }
 
   private clearStartFlight(runId: string, flight: Promise<AgentRun>): void {
@@ -729,28 +818,38 @@ export class AgentBridge {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`Unknown run ${runId}`);
     let cancelError: unknown = null;
-    try {
-      await this.handles.get(runId)?.cancel(reason);
-    } catch (error) {
-      cancelError = error;
+    const startOwner = this.startOwners.get(runId);
+    if (startOwner) {
+      if (startOwner.cancellationReason === null) startOwner.cancellationReason = reason;
+      try {
+        await startOwner.completion;
+      } catch (error) {
+        cancelError = error;
+      }
+    } else {
+      try {
+        await this.handles.get(runId)?.cancel(reason);
+      } catch (error) {
+        cancelError = error;
+      }
     }
     const terminalRun = this.runs.get(runId);
     if (terminalRun && isFinalRunStatus(terminalRun.status)) {
       return this.getEvidence(run.projectRoot, runId);
     }
-    let events = await this.loadRunEvents(run.projectRoot, runId);
+    if (cancelError) throw cancelError;
+    await this.ensureCancelledRunTerminal(run, reason);
+    return this.getEvidence(run.projectRoot, runId);
+  }
+
+  private async ensureCancelledRunTerminal(run: AgentRun, reason: string): Promise<void> {
+    const events = await this.loadRunEvents(run.projectRoot, run.id);
     if (!events.some(isFinalStatusEvent)) {
-      try {
-        await this.recordEvent(runId, {
-          kind: "status",
-          payload: { status: "cancelled", reason },
-        });
-      } catch (statusError) {
-        throw cancelError ?? statusError;
-      }
-      events = await this.loadRunEvents(run.projectRoot, runId);
+      await this.recordEvent(run.id, {
+        kind: "status",
+        payload: { status: "cancelled", reason },
+      });
     }
-    return deriveEvidenceFromEvents(this.runs.get(runId) ?? run, events);
   }
 
   async loadEvents(projectRoot: string, runId: string): Promise<RunEvent[]> {
@@ -948,6 +1047,22 @@ export class AgentBridge {
   }
 }
 
+function createDeferredAgentRunStartOwner(): DeferredAgentRunStartOwner {
+  let resolve!: () => void;
+  let reject!: (error: unknown) => void;
+  const completion = new Promise<void>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return {
+    cancellationReason: null,
+    completion,
+    reject,
+    resolve,
+    settled: false,
+  };
+}
+
 export function createMockAgentAdapter(options: { holdOpen?: boolean } = {}): LocalAgentAdapterContract {
   return {
     kind: "codex",
@@ -1092,6 +1207,7 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
   }
 
   async startSession(input: StartPtyTerminalSessionInput): Promise<AgentTerminalSession> {
+    assertVerifiedPtyProcessBoundary();
     const id = input.id ?? `terminal-${input.runId}`;
     if (this.sessions.has(id)) throw new Error(`Terminal session already exists: ${id}`);
     const cols = input.cols ?? defaultTerminalCols;
@@ -1669,28 +1785,35 @@ class HermesPlannerPtyTransportImpl implements HermesPlannerPtyTransport {
 }
 
 class AgentRunWatchdog {
+  private readonly childClosed: Promise<void>;
   private finalized = false;
-  private terminalClaimed = false;
   private killTimer: NodeJS.Timeout | null = null;
+  private killEscalationPromise: Promise<void> | null = null;
+  private terminateAndReapPromise: Promise<void> | null = null;
+  private terminalState: AgentRunTerminalState | null = null;
   private timeoutTimer: NodeJS.Timeout | null = null;
   private stallTimer: NodeJS.Timeout | null = null;
   private lastActivityAt = Date.now();
 
   constructor(
     private readonly child: ChildProcess,
+    private readonly processBoundary: AgentCliProcessBoundary,
     private readonly policy: AgentRunWatchdogPolicy,
     private readonly emit: (draft: RunEventDraft) => Promise<RunEvent>,
     private readonly drain: () => Promise<void>,
     private readonly stopChildOutput: () => void,
     private readonly closeRunResources: () => Promise<void> = async () => undefined,
-  ) {}
+  ) {
+    this.childClosed = processBoundary.closed.then(() => undefined);
+    void this.childClosed.catch(() => undefined);
+  }
 
   start(): void {
     this.markActivity();
     this.scheduleStallTelemetry();
     if (this.policy.timeoutMs <= 0) return;
     this.timeoutTimer = setTimeout(() => {
-      void this.expire();
+      void this.expire().catch(() => undefined);
     }, this.policy.timeoutMs);
   }
 
@@ -1704,87 +1827,236 @@ class AgentRunWatchdog {
 
   async cancel(reason: string): Promise<void> {
     const publicReason = sanitizePublicEvidenceText(reason) || "Run cancelled";
-    this.tryFinalize();
-    if (!this.tryClaimTerminal()) {
-      await this.closeRunResources();
-      return;
-    }
-    this.scheduleKill();
-    await this.drain();
-    await this.closeRunResources();
-    await emitRunEventBestEffort(this.emit, {
-      kind: "evidence",
-      payload: {
-        exitCode: null,
-        checks: [
-          {
-            kind: "run-exit",
-            name: `${this.policy.commandLabel} exit`,
-            status: "skipped",
-            detail: publicReason,
+    await this.completeTerminal({
+      kind: "cancel",
+      terminate: true,
+      persist: async () => {
+        await emitRunEventBestEffort(this.emit, {
+          kind: "evidence",
+          payload: {
+            exitCode: null,
+            checks: [
+              {
+                kind: "run-exit",
+                name: `${this.policy.commandLabel} exit`,
+                status: "skipped",
+                detail: publicReason,
+              },
+            ],
           },
-        ],
+        });
+        await emitRunEventBestEffort(this.emit, {
+          kind: "status",
+          payload: { status: "cancelled", reason: publicReason },
+        });
       },
-    });
-    await emitRunEventBestEffort(this.emit, {
-      kind: "status",
-      payload: { status: "cancelled", reason: publicReason },
     });
   }
 
-  async finalizeChildClose(): Promise<boolean> {
-    await this.drain();
-    return this.tryFinalize();
+  completeChildClose(prepare: () => Promise<void>, persist: () => Promise<void>): Promise<AgentRunTerminalKind> {
+    return this.completeTerminal({ kind: "child-close", terminate: false, prepare, persist });
+  }
+
+  completeSpawnError(prepare: () => Promise<void>, persist: () => Promise<void>): Promise<AgentRunTerminalKind> {
+    return this.completeTerminal({
+      kind: "spawn-error",
+      terminate: true,
+      closeBeforeDrain: true,
+      prepare,
+      persist,
+    });
+  }
+
+  completeProcessBoundaryFailure(): Promise<AgentRunTerminalKind> {
+    const reason = "process-boundary-failure";
+    return this.completeTerminal({
+      kind: "process-boundary-failure",
+      terminate: true,
+      persist: async () => {
+        await emitRunEventBestEffort(this.emit, {
+          kind: "error",
+          payload: {
+            source: this.policy.source,
+            category: reason,
+            message: reason,
+          },
+        });
+        await emitRunEventBestEffort(this.emit, {
+          kind: "evidence",
+          payload: {
+            exitCode: null,
+            checks: [
+              {
+                kind: "run-exit",
+                name: `${this.policy.commandLabel} process boundary`,
+                status: "failed",
+                detail: reason,
+              },
+            ],
+          },
+        });
+        await emitRunEventBestEffort(this.emit, {
+          kind: "status",
+          payload: {
+            status: "failed",
+            exitCode: null,
+            category: reason,
+            reason,
+            errorReason: reason,
+          },
+        });
+      },
+    });
   }
 
   async abortStart(): Promise<void> {
-    this.tryFinalize();
-    this.scheduleKill();
-    await this.drain();
-    await this.closeRunResources();
-  }
-
-  tryFinalize(): boolean {
-    if (this.finalized) return false;
-    this.finalized = true;
-    this.clearLifecycleTimers();
-    this.stopChildOutput();
-    return true;
-  }
-
-  tryClaimTerminal(): boolean {
-    if (this.terminalClaimed) return false;
-    this.terminalClaimed = true;
-    return true;
+    await this.completeTerminal({ kind: "start-abort", terminate: true, closeBeforeDrain: true });
   }
 
   private async expire(): Promise<void> {
-    if (!this.tryFinalize() || !this.tryClaimTerminal()) return;
-    this.scheduleKill();
-    await this.drain();
-    await this.closeRunResources();
-    await emitRunEventBestEffort(this.emit, {
-      kind: "evidence",
-      payload: {
-        exitCode: null,
-        checks: [
-          {
-            kind: "run-timeout",
-            name: this.policy.timeoutCheckName,
-            status: "failed",
-            detail: `timed out after ${this.policy.timeoutMs}ms`,
+    await this.completeTerminal({
+      kind: "timeout",
+      terminate: true,
+      persist: async () => {
+        await emitRunEventBestEffort(this.emit, {
+          kind: "evidence",
+          payload: {
+            exitCode: null,
+            checks: [
+              {
+                kind: "run-timeout",
+                name: this.policy.timeoutCheckName,
+                status: "failed",
+                detail: `timed out after ${this.policy.timeoutMs}ms`,
+              },
+            ],
           },
-        ],
+        });
+        await emitRunEventBestEffort(this.emit, {
+          kind: "status",
+          payload: {
+            status: "timed-out",
+            category: "process-timeout",
+            reason: `${this.policy.commandLabel} timed out after ${this.policy.timeoutMs}ms`,
+          },
+        });
       },
     });
-    await emitRunEventBestEffort(this.emit, {
-      kind: "status",
-      payload: {
-        status: "timed-out",
-        category: "process-timeout",
-        reason: `${this.policy.commandLabel} timed out after ${this.policy.timeoutMs}ms`,
-      },
+  }
+
+  private completeTerminal(request: AgentRunTerminalRequest): Promise<AgentRunTerminalKind> {
+    const existing = this.terminalState;
+    if (existing) {
+      if (this.canPreemptChildClose(existing, request)) {
+        const shouldAbortPreparation = existing.phase === "prepare";
+        existing.generation += 1;
+        existing.phase = "process";
+        existing.request = request;
+        if (shouldAbortPreparation) void this.closeRunResources().catch(() => undefined);
+        this.startTerminalExecution(existing, request, existing.generation);
+      }
+      return existing.completion;
+    }
+
+    let resolve!: (kind: AgentRunTerminalKind) => void;
+    let reject!: (error: unknown) => void;
+    const completion = new Promise<AgentRunTerminalKind>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
     });
+    const state: AgentRunTerminalState = {
+      completion,
+      generation: 1,
+      phase: "process",
+      reject,
+      request,
+      resolve,
+    };
+    this.terminalState = state;
+    this.finalized = true;
+    this.clearLifecycleTimers();
+    this.stopChildOutput();
+    this.startTerminalExecution(state, request, state.generation);
+    return completion;
+  }
+
+  private canPreemptChildClose(state: AgentRunTerminalState, request: AgentRunTerminalRequest): boolean {
+    return (
+      state.request.kind === "child-close" &&
+      request.kind !== "child-close" &&
+      state.phase !== "persisting" &&
+      state.phase !== "settled"
+    );
+  }
+
+  private startTerminalExecution(
+    state: AgentRunTerminalState,
+    request: AgentRunTerminalRequest,
+    generation: number,
+  ): void {
+    void this.executeTerminal(state, request, generation).then(
+      (kind) => {
+        if (!kind || !this.ownsTerminalExecution(state, generation)) return;
+        state.phase = "settled";
+        state.resolve(kind);
+      },
+      (error: unknown) => {
+        if (!this.ownsTerminalExecution(state, generation)) return;
+        state.phase = "settled";
+        state.reject(error);
+      },
+    );
+  }
+
+  private async executeTerminal(
+    state: AgentRunTerminalState,
+    request: AgentRunTerminalRequest,
+    generation: number,
+  ): Promise<AgentRunTerminalKind | null> {
+    try {
+      if (request.terminate) {
+        await this.terminateAndReap();
+      } else {
+        await this.childClosed;
+        if (isProcessGroupAlive(this.child)) await this.terminateAndReap();
+      }
+    } catch (error) {
+      state.phase = "closing";
+      await this.closeRunResources().catch(() => undefined);
+      if (this.processBoundary.windowsJob) throw new Error("process-boundary-failure");
+      throw error;
+    }
+    if (!this.ownsTerminalExecution(state, generation)) return null;
+
+    if (request.closeBeforeDrain) {
+      state.phase = "closing";
+      const preparation = request.prepare?.() ?? Promise.resolve();
+      const resourceClose = this.closeRunResources();
+      await this.drain();
+      await preparation;
+      await resourceClose;
+    } else {
+      state.phase = "drain";
+      await this.drain();
+      if (!this.ownsTerminalExecution(state, generation)) return null;
+      if (request.prepare) {
+        state.phase = "prepare";
+        await request.prepare();
+        if (!this.ownsTerminalExecution(state, generation)) return null;
+      }
+      state.phase = "closing";
+      await this.closeRunResources();
+    }
+    if (!this.ownsTerminalExecution(state, generation)) return null;
+
+    state.phase = "persisting";
+    await request.persist?.();
+    return request.kind;
+  }
+
+
+  private ownsTerminalExecution(state: AgentRunTerminalState, generation: number): boolean {
+    return this.terminalState === state && state.generation === generation && state.phase !== "settled";
   }
 
   private scheduleStallTelemetry(): void {
@@ -1815,13 +2087,31 @@ class AgentRunWatchdog {
     }, this.policy.stallTelemetryMs);
   }
 
-  private scheduleKill(): void {
-    if (this.killTimer) clearTimeout(this.killTimer);
-    terminateProcessTree(this.child, "SIGTERM", { forceProcessGroup: true });
-    this.killTimer = setTimeout(() => {
-      terminateProcessTree(this.child, "SIGKILL", { forceProcessGroup: true });
-    }, this.policy.killTimeoutMs);
-    this.killTimer.unref();
+  private terminateAndReap(): Promise<void> {
+    if (this.terminateAndReapPromise) return this.terminateAndReapPromise;
+    if (this.processBoundary.windowsJob) {
+      this.terminateAndReapPromise = this.processBoundary.windowsJob.terminateAndReap();
+      return this.terminateAndReapPromise;
+    }
+    this.terminateAndReapPromise = (async () => {
+      terminateProcessTree(this.child, "SIGTERM", { forceProcessGroup: true });
+      this.killEscalationPromise = new Promise((resolve) => {
+        this.killTimer = setTimeout(() => {
+          this.killTimer = null;
+          terminateProcessTree(this.child, "SIGKILL", { forceProcessGroup: true });
+          resolve();
+        }, this.policy.killTimeoutMs);
+      });
+      await this.childClosed;
+      if (!isProcessGroupAlive(this.child)) {
+        if (this.killTimer) clearTimeout(this.killTimer);
+        this.killTimer = null;
+        return;
+      }
+      await this.killEscalationPromise;
+      await waitForProcessGroupExit(this.child, Math.max(1_000, this.policy.killTimeoutMs));
+    })();
+    return this.terminateAndReapPromise;
   }
 
   private clearLifecycleTimers(): void {
@@ -1830,6 +2120,18 @@ class AgentRunWatchdog {
     this.timeoutTimer = null;
     this.stallTimer = null;
   }
+}
+
+function observeAgentCliProcessBoundary(
+  processBoundary: AgentCliProcessBoundary,
+  watchdog: AgentRunWatchdog,
+  onClose: (result: AgentCliProcessCloseResult) => Promise<AgentRunTerminalKind | void>,
+): void {
+  const settlement = processBoundary.closed.then(
+    onClose,
+    () => watchdog.completeProcessBoundaryFailure(),
+  );
+  void settlement.catch(() => undefined);
 }
 
 export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): LocalAgentAdapterContract {
@@ -1921,19 +2223,20 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         workdir,
         extraArgs: options.extraArgs,
       });
-      let child: ChildProcess;
+      let processBoundary: AgentCliProcessBoundary;
       try {
-        child = spawn(executablePath, args, {
-          cwd: workdir,
-          env: { ...process.env, ...options.env },
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
+        processBoundary = await spawnAgentCliProcess(
+          executablePath,
+          args,
+          workdir,
+          { ...process.env, ...options.env },
+          options.killTimeoutMs ?? defaultKillTimeoutMs,
+        );
       } catch (error) {
         await closeRunResources();
         throw error;
       }
+      const child = processBoundary.child;
       let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
       const outputReaders: Interface[] = [];
@@ -1941,6 +2244,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       let stdoutFailureCategory: CliFailureCategory | null = null;
       const watchdog = new AgentRunWatchdog(
         child,
+        processBoundary,
         {
           source: "codex",
           commandLabel: "Codex CLI",
@@ -1988,97 +2292,104 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         });
       }
 
-      child.once("error", (error) => {
+      if (!processBoundary.windowsJob) child.once("error", (error) => {
         spawnFailed = true;
-        if (!watchdog.tryFinalize() || !watchdog.tryClaimTerminal()) return;
         const category = errorCategoryFromSpawnError(error);
         const publicMessage = sanitizePublicEvidenceText(error.message) || "Codex CLI spawn failed";
-        void emitRunEventBestEffort(emit, {
-          kind: "error",
-          payload: { source: "codex", message: publicMessage, code: error.name, category },
-        });
-        void emitRunEventBestEffort(emit, {
-          kind: "evidence",
-          payload: {
-            exitCode: null,
-            checks: [
-              {
-                kind: "run-exit",
-                name: "Codex CLI spawn",
-                status: "failed",
-                detail: `${category}: ${publicMessage}`,
-              },
-            ],
-          },
-        });
-        void closeRunResources().then(async () => {
-          await emitRunEventBestEffort(emit, { kind: "status", payload: { status: "failed", reason: category } });
-        });
-      });
-
-      child.once("close", (code, signal) => {
-        void (async () => {
-          if (!(await watchdog.finalizeChildClose())) return;
-          if (spawnFailed) return;
-          const exitCode = typeof code === "number" ? code : null;
-          const checkStatus = exitCode === 0 ? "passed" : "failed";
-          const failureCategory = exitCode === 0 ? null : stdoutFailureCategory ?? processFailureCategory(stderrLines);
-          if (failureCategory && !stdoutFailureCategory) {
+        void watchdog.completeSpawnError(
+          async () => {
             await emitRunEventBestEffort(emit, {
               kind: "error",
+              payload: { source: "codex", message: publicMessage, code: error.name, category },
+            });
+            await emitRunEventBestEffort(emit, {
+              kind: "evidence",
               payload: {
-                source: "codex",
-                category: failureCategory,
-                message: sanitizePublicProcessText(
-                  formatProcessFailureMessage("Codex CLI", exitCode, signal, stderrLines),
-                ),
+                exitCode: null,
+                checks: [
+                  {
+                    kind: "run-exit",
+                    name: "Codex CLI spawn",
+                    status: "failed",
+                    detail: `${category}: ${publicMessage}`,
+                  },
+                ],
               },
             });
-          }
-          let artifactVerification: ExpectedArtifactVerification;
-          try {
-            artifactVerification = await verifyExpectedArtifacts(
-              input,
-              workdir,
-              retainedWorktree?.fd ?? null,
-              exitCode,
-              artifactVerificationHooks,
-              windowsVerifier,
-              artifactVerificationAbort.signal,
-            );
-          } catch {
-            artifactVerification = expectedArtifactVerificationFailure();
-          }
-          await closeRunResources();
-          if (!watchdog.tryClaimTerminal()) return;
-          const succeeded = exitCode === 0 && artifactVerification.passed;
-          await emitRunEventBestEffort(emit, {
-            kind: "evidence",
-            payload: {
-              exitCode,
-              checks: [
-                {
-                  kind: "run-exit",
-                  name: "Codex CLI exit",
-                  status: checkStatus,
-                  detail: formatExitDetail(code, signal),
+          },
+          async () => {
+            await emitRunEventBestEffort(emit, {
+              kind: "status",
+              payload: { status: "failed", reason: category },
+            });
+          },
+        ).catch(() => undefined);
+      });
+
+      observeAgentCliProcessBoundary(processBoundary, watchdog, async ({ exitCode: code, signalCode: signal }) => {
+        if (spawnFailed) return;
+        const exitCode = typeof code === "number" ? code : null;
+        const checkStatus = exitCode === 0 ? "passed" : "failed";
+        const failureCategory = exitCode === 0 ? null : stdoutFailureCategory ?? processFailureCategory(stderrLines);
+        let artifactVerification = expectedArtifactVerificationFailure();
+        return watchdog.completeChildClose(
+          async () => {
+            if (failureCategory && !stdoutFailureCategory) {
+              await emitRunEventBestEffort(emit, {
+                kind: "error",
+                payload: {
+                  source: "codex",
+                  category: failureCategory,
+                  message: sanitizePublicProcessText(
+                    formatProcessFailureMessage("Codex CLI", exitCode, signal, stderrLines),
+                  ),
                 },
-                ...(artifactVerification.check ? [artifactVerification.check] : []),
-              ],
-              ...(artifactVerification.artifacts.length > 0 ? { artifacts: artifactVerification.artifacts } : {}),
-            },
-          });
-          await emitRunEventBestEffort(emit, {
-            kind: "status",
-            payload: {
-              status: succeeded ? "succeeded" : "failed",
-              exitCode,
-              signal,
-              ...(failureCategory ? { reason: failureCategory } : {}),
-              ...(!artifactVerification.passed ? { reason: "expected-artifact-failure" } : {}),
-            },
-          });
-        })();
+              });
+            }
+            try {
+              artifactVerification = await verifyExpectedArtifacts(
+                input,
+                workdir,
+                retainedWorktree?.fd ?? null,
+                exitCode,
+                artifactVerificationHooks,
+                windowsVerifier,
+                artifactVerificationAbort.signal,
+              );
+            } catch {
+              artifactVerification = expectedArtifactVerificationFailure();
+            }
+          },
+          async () => {
+            const succeeded = exitCode === 0 && artifactVerification.passed;
+            await emitRunEventBestEffort(emit, {
+              kind: "evidence",
+              payload: {
+                exitCode,
+                checks: [
+                  {
+                    kind: "run-exit",
+                    name: "Codex CLI exit",
+                    status: checkStatus,
+                    detail: formatExitDetail(code, signal),
+                  },
+                  ...(artifactVerification.check ? [artifactVerification.check] : []),
+                ],
+                ...(artifactVerification.artifacts.length > 0 ? { artifacts: artifactVerification.artifacts } : {}),
+              },
+            });
+            await emitRunEventBestEffort(emit, {
+              kind: "status",
+              payload: {
+                status: succeeded ? "succeeded" : "failed",
+                exitCode,
+                signal,
+                ...(failureCategory ? { reason: failureCategory } : {}),
+                ...(!artifactVerification.passed ? { reason: "expected-artifact-failure" } : {}),
+              },
+            });
+          },
+        );
       });
 
       const started = emit({
@@ -2089,7 +2400,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       try {
         await started;
       } catch (error) {
-        await watchdog.abortStart();
+        await watchdog.abortStart().catch(() => undefined);
         throw error;
       }
 
@@ -2183,19 +2494,20 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         source: options.source ?? "skyturn",
       });
       const transport = input.hermesSessionHandle ? "hermes_session_resume" : "hermes_replay_recovery";
-      let child: ChildProcess;
+      let processBoundary: AgentCliProcessBoundary;
       try {
-        child = spawn(executablePath, args, {
-          cwd: workdir,
-          env: { ...process.env, ...options.env },
-          detached: process.platform !== "win32",
-          shell: false,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
+        processBoundary = await spawnAgentCliProcess(
+          executablePath,
+          args,
+          workdir,
+          { ...process.env, ...options.env },
+          options.killTimeoutMs ?? defaultKillTimeoutMs,
+        );
       } catch (error) {
         await closeRunResources();
         throw error;
       }
+      const child = processBoundary.child;
       let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
       const stderrLines: string[] = [];
@@ -2217,6 +2529,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       };
       watchdog = new AgentRunWatchdog(
         child,
+        processBoundary,
         {
           source: "hermes",
           commandLabel: "Hermes CLI",
@@ -2242,101 +2555,108 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       child.stdout?.on("data", onStdoutData);
       child.stderr?.on("data", onStderrData);
 
-      child.once("error", (error) => {
+      if (!processBoundary.windowsJob) child.once("error", (error) => {
         spawnFailed = true;
-        if (!watchdog.tryFinalize() || !watchdog.tryClaimTerminal()) return;
         artifactVerificationAbort.abort();
         const category = errorCategoryFromSpawnError(error);
         const publicMessage = sanitizePublicProcessTextWithSensitiveValues(
           error.message,
           input.hermesSessionHandle ? [input.hermesSessionHandle] : [],
         ) || "Hermes CLI spawn failed";
-        void emitRunEventBestEffort(emit, {
-          kind: "error",
-          payload: { source: "hermes", message: publicMessage, code: error.name, category },
-        });
-        void emitRunEventBestEffort(emit, {
-          kind: "evidence",
-          payload: {
-            exitCode: null,
-            checks: [
-              {
-                kind: "run-exit",
-                name: "Hermes CLI spawn",
-                status: "failed",
-                detail: `${category}: ${publicMessage}`,
-              },
-            ],
-          },
-        });
-        void closeRunResources().then(async () => {
-          await emitRunEventBestEffort(emit, { kind: "status", payload: { status: "failed", reason: category } });
-        });
-      });
-
-      child.once("close", (code, signal) => {
-        void (async () => {
-          if (!(await watchdog.finalizeChildClose())) return;
-          if (spawnFailed) return;
-          const exitCode = typeof code === "number" ? code : null;
-          const checkStatus = exitCode === 0 ? "passed" : "failed";
-          const failureCategory = exitCode === 0 ? null : processFailureCategory(stderrLines);
-          if (failureCategory) {
+        void watchdog.completeSpawnError(
+          async () => {
             await emitRunEventBestEffort(emit, {
               kind: "error",
+              payload: { source: "hermes", message: publicMessage, code: error.name, category },
+            });
+            await emitRunEventBestEffort(emit, {
+              kind: "evidence",
               payload: {
-                source: "hermes",
-                category: failureCategory,
-                message: sanitizePublicProcessText(
-                  formatProcessFailureMessage("Hermes CLI", exitCode, signal, stderrLines),
-                ),
+                exitCode: null,
+                checks: [
+                  {
+                    kind: "run-exit",
+                    name: "Hermes CLI spawn",
+                    status: "failed",
+                    detail: `${category}: ${publicMessage}`,
+                  },
+                ],
               },
             });
-          }
-          let artifactVerification: ExpectedArtifactVerification;
-          try {
-            artifactVerification = await verifyExpectedArtifacts(
-              input,
-              workdir,
-              retainedWorktree?.fd ?? null,
-              exitCode,
-              artifactVerificationHooks,
-              windowsVerifier,
-              artifactVerificationAbort.signal,
-            );
-          } catch {
-            artifactVerification = expectedArtifactVerificationFailure();
-          }
-          await closeRunResources();
-          if (!watchdog.tryClaimTerminal()) return;
-          const succeeded = exitCode === 0 && artifactVerification.passed;
-          await emitRunEventBestEffort(emit, {
-            kind: "evidence",
-            payload: {
-              exitCode,
-              checks: [
-                {
-                  kind: "run-exit",
-                  name: "Hermes CLI exit",
-                  status: checkStatus,
-                  detail: formatExitDetail(code, signal),
+          },
+          async () => {
+            await emitRunEventBestEffort(emit, {
+              kind: "status",
+              payload: { status: "failed", reason: category },
+            });
+          },
+        ).catch(() => undefined);
+      });
+
+      observeAgentCliProcessBoundary(processBoundary, watchdog, async ({ exitCode: code, signalCode: signal }) => {
+        if (spawnFailed) return;
+        const exitCode = typeof code === "number" ? code : null;
+        const checkStatus = exitCode === 0 ? "passed" : "failed";
+        const failureCategory = exitCode === 0 ? null : processFailureCategory(stderrLines);
+        let artifactVerification = expectedArtifactVerificationFailure();
+        return watchdog.completeChildClose(
+          async () => {
+            if (failureCategory) {
+              await emitRunEventBestEffort(emit, {
+                kind: "error",
+                payload: {
+                  source: "hermes",
+                  category: failureCategory,
+                  message: sanitizePublicProcessText(
+                    formatProcessFailureMessage("Hermes CLI", exitCode, signal, stderrLines),
+                  ),
                 },
-                ...(artifactVerification.check ? [artifactVerification.check] : []),
-              ],
-              ...(artifactVerification.artifacts.length > 0 ? { artifacts: artifactVerification.artifacts } : {}),
-            },
-          });
-          await emitRunEventBestEffort(emit, {
-            kind: "status",
-            payload: {
-              status: succeeded ? "succeeded" : "failed",
-              exitCode,
-              signal,
-              ...(failureCategory ? { reason: failureCategory } : {}),
-              ...(!artifactVerification.passed ? { reason: "expected-artifact-failure" } : {}),
-            },
-          });
-        })();
+              });
+            }
+            try {
+              artifactVerification = await verifyExpectedArtifacts(
+                input,
+                workdir,
+                retainedWorktree?.fd ?? null,
+                exitCode,
+                artifactVerificationHooks,
+                windowsVerifier,
+                artifactVerificationAbort.signal,
+              );
+            } catch {
+              artifactVerification = expectedArtifactVerificationFailure();
+            }
+          },
+          async () => {
+            const succeeded = exitCode === 0 && artifactVerification.passed;
+            await emitRunEventBestEffort(emit, {
+              kind: "evidence",
+              payload: {
+                exitCode,
+                checks: [
+                  {
+                    kind: "run-exit",
+                    name: "Hermes CLI exit",
+                    status: checkStatus,
+                    detail: formatExitDetail(code, signal),
+                  },
+                  ...(artifactVerification.check ? [artifactVerification.check] : []),
+                ],
+                ...(artifactVerification.artifacts.length > 0 ? { artifacts: artifactVerification.artifacts } : {}),
+              },
+            });
+            await emitRunEventBestEffort(emit, {
+              kind: "status",
+              payload: {
+                status: succeeded ? "succeeded" : "failed",
+                exitCode,
+                signal,
+                ...(failureCategory ? { reason: failureCategory } : {}),
+                ...(!artifactVerification.passed ? { reason: "expected-artifact-failure" } : {}),
+              },
+            });
+          },
+        );
       });
 
       watchdog.start();
@@ -2360,7 +2680,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           },
         });
       } catch (error) {
-        await watchdog.abortStart();
+        await watchdog.abortStart().catch(() => undefined);
         throw error;
       }
 
@@ -2370,6 +2690,37 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         },
       };
     },
+  };
+}
+
+async function spawnAgentCliProcess(
+  executablePath: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  killTimeoutMs: number,
+): Promise<AgentCliProcessBoundary> {
+  if (process.platform === "win32") {
+    const windowsJob = await spawnWindowsJobObjectProcess(executablePath, args, {
+      cwd,
+      env,
+      cleanupTimeoutMs: killTimeoutMs,
+    });
+    return { child: windowsJob.child, closed: windowsJob.closed, windowsJob };
+  }
+  const child = spawn(executablePath, args, {
+    cwd,
+    env,
+    detached: true,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return {
+    child,
+    closed: new Promise((resolve) => {
+      child.once("close", (exitCode, signalCode) => resolve({ exitCode, signalCode }));
+    }),
+    windowsJob: null,
   };
 }
 
@@ -2391,6 +2742,29 @@ function terminateProcessTree(
   } catch {
     if (child.exitCode === null && child.signalCode === null) child.kill(signal);
   }
+}
+
+function isProcessGroupAlive(child: ChildProcess): boolean {
+  const pid = child.pid;
+  if (!pid || process.platform === "win32") return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error) {
+      if (error.code === "ESRCH") return false;
+      if (error.code === "EPERM") return true;
+    }
+    throw new Error("Agent process group state could not be confirmed.");
+  }
+}
+
+async function waitForProcessGroupExit(child: ChildProcess, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (isProcessGroupAlive(child) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  if (isProcessGroupAlive(child)) throw new Error("Agent process group remained alive after SIGKILL.");
 }
 
 function closeReadlineInterfaces(readers: Interface[]): void {

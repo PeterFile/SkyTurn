@@ -366,7 +366,11 @@ describe("workflow-card tools", () => {
     expect(prompt).toContain("sessionId MUST equal the SkyTurn Canvas Session value");
     expect(prompt).toContain("AnalyzeRequirement MUST be");
     expect(prompt).toContain("DiscoverProject MUST be");
-    expect(prompt).toContain("Allowed operations: AnalyzeRequirement, DiscoverProject, ProposeLanes, SplitLane, JoinLanes, StartImplementation, RequestValidation, RequestReview, RequestUserDecision, ReplanFromEvidence.");
+    expect(prompt).toContain('RequestReview MUST be {"type":"RequestReview","laneId":"the review lane id"}; never use targetLaneId for RequestReview.');
+    expect(prompt).toContain("SplitLane MUST include sourceLaneId and lanes; JoinLanes MUST include joinLaneId and upstreamLaneIds.");
+    expect(prompt).toContain("StartImplementation, RequestValidation, and Commit MUST each include laneId.");
+    expect(prompt).toContain("ReplanFromEvidence MUST include laneId and evidenceId; DeclareEdge MUST include sourceLaneId and targetLaneId.");
+    expect(prompt).toContain("Allowed operations: AnalyzeRequirement, DiscoverProject, ProposeLanes, SplitLane, JoinLanes, StartImplementation, RequestValidation, RequestReview, RequestUserDecision, ReplanFromEvidence, Commit, DeclareEdge.");
     expect(prompt).toContain("operations MUST include AnalyzeRequirement, DiscoverProject, and ProposeLanes.");
     expect(prompt).toContain("ProposeLanes MUST include a lanes array");
     expect(prompt).toContain("Use agentKind codex for implementation, command validation, browser screenshot, and commit lanes");

@@ -13,11 +13,13 @@ describe("canvas session factory", () => {
       projectId: "project-1",
       goal: "Ship the smallest runnable shell",
       createdAt: "2026-06-10T00:00:00.000Z",
-    });
+    }, { randomUUID: () => "11111111-1111-4111-8111-111111111111" });
 
     expect(session.kind).toBe("canvas");
     expect(session.mode).toBe("fast");
-    expect(session.hermesPlannerSessionId).toBe("hermes-planner-fast-202606100000");
+    expect(session.hermesPlannerSessionId).toBe(
+      "hermes-planner-fast-202606100000-11111111-1111-4111-8111-111111111111",
+    );
     expect(session.plannerNodeId).toBe("node-1");
     expect(session.nodes.map((node) => node.title)).toEqual([
       "Plan workflow cards",
@@ -42,6 +44,42 @@ describe("canvas session factory", () => {
     expect(session.edges).toEqual([]);
   });
 
+  it("creates distinct Fast identities at the same timestamp with an injected browser-safe UUID", () => {
+    const createdAt = "2026-06-10T00:00:00.000Z";
+    const first = createFastCanvasSession({
+      projectId: "project-1",
+      goal: "First fast session",
+      createdAt,
+    }, { randomUUID: () => "11111111-1111-4111-8111-111111111111" });
+    const second = createFastCanvasSession({
+      projectId: "project-1",
+      goal: "Second fast session",
+      createdAt,
+    }, { randomUUID: () => "22222222-2222-4222-8222-222222222222" });
+
+    expect(first.id).toBe("fast-202606100000-11111111-1111-4111-8111-111111111111");
+    expect(second.id).toBe("fast-202606100000-22222222-2222-4222-8222-222222222222");
+    expect(first.hermesPlannerSessionId).not.toBe(second.hermesPlannerSessionId);
+    expect(first.nodes[0]?.runId).not.toBe(second.nodes[0]?.runId);
+  });
+
+  it("does not collide Fast identities across projects created in the same minute", () => {
+    const createdAt = "2026-06-10T00:00:00.000Z";
+    const first = createFastCanvasSession({
+      projectId: "project-1",
+      goal: "Shared goal",
+      createdAt,
+    }, { randomUUID: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" });
+    const second = createFastCanvasSession({
+      projectId: "project-2",
+      goal: "Shared goal",
+      createdAt,
+    }, { randomUUID: () => "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" });
+
+    expect(first.id).not.toBe(second.id);
+    expect(first.nodes[0]?.changesetId).not.toBe(second.nodes[0]?.changesetId);
+  });
+
   it("uses selected current branch metadata without inventing a managed worktree", () => {
     const session = createFastCanvasSession({
       projectId: "project-1",
@@ -52,7 +90,7 @@ describe("canvas session factory", () => {
         selectedBranch: "feature/runtime-target",
         baseRef: "main",
       },
-    });
+    }, { randomUUID: () => "11111111-1111-4111-8111-111111111111" });
 
     expect(session.target).toEqual({
       executionTarget: "current_branch",
@@ -78,7 +116,7 @@ describe("canvas session factory", () => {
         selectedBranch: "main",
         baseRef: "origin/main",
       },
-    });
+    }, { randomUUID: () => "11111111-1111-4111-8111-111111111111" });
 
     expect(session.target).toEqual({
       executionTarget: "new_worktree",
@@ -92,8 +130,8 @@ describe("canvas session factory", () => {
       executionTarget: "new_worktree",
       selectedBranch: "main",
       baseRef: "origin/main",
-      worktreeId: "worktree-fast-202606100000-node-1",
-      variantId: "variant-fast-202606100000-node-1",
+      worktreeId: "worktree-fast-202606100000-11111111-1111-4111-8111-111111111111-node-1",
+      variantId: "variant-fast-202606100000-11111111-1111-4111-8111-111111111111-node-1",
     });
     expect(session.nodes[0]?.worktree.realPath).toBeUndefined();
     expect(session.nodes[0]?.worktree.gitdir).toBeUndefined();

@@ -42,8 +42,9 @@ packages/
 - Canvas engine: `@xyflow/react`.
 - Workflow source of truth: SQLite workflow events under `.devflow/skyturn-workflow.sqlite`, exposed through Electron main / Node-only persistence APIs.
 - Orchestration: Hermes produces `WorkflowIntent`; `workflow-kernel` validates, compiles, gates, schedules, and projects lanes/edges.
+- Planner entry: ordinary Electron New Session and Canvas input are durably claimed by the workflow store, launched as backend-owned Hermes turns through `agent-bridge`, and returned to the renderer as authoritative `CanvasSession` projections.
 - Agent bridge: Hermes and Codex CLI have real `experimental-run` adapters; run status is derived from `RunEvidence`, not agent prose.
-- PTY transport: experimental Hermes planner status/inspect/takeover transport only. It is not a terminal dashboard, not completion evidence, and not the Codex default executor.
+- PTY transport: optional experimental Hermes status/inspect/takeover transport only. Ordinary input delivery and planner launch do not require PTY. It is not a terminal dashboard, completion evidence, or the default executor.
 - Changes: the node modal `Changes` tab can use structured live Codex change events plus git-backed final reconciliation.
 - Node interaction: selecting a node only binds the bottom composer to node-scoped actions. Details open through the node card **More** button, not selection.
 - Node checkpoints: before/after checkpoints are user-visible workflow concepts at the node/run boundary. Node-scoped actions repair from the after checkpoint, create variants from the before checkpoint, or roll back the selected node and downstream nodes.
@@ -71,12 +72,14 @@ Implemented in the current code:
 - **Changes** can show structured live run changes, git-backed final reconciliation, mismatch state, sanitized `diff2html` preview, and explicit delivery actions.
 - Selected-node composer actions exist for repair, variant, and rollback. Repair starts from the after checkpoint, variant starts from the before checkpoint, and rollback targets the selected node plus downstream nodes.
 - Electron main owns workflow IPC, git/worktree side effects, delivery gates, rollback safety checks, and run evidence lookup. Renderer code does not execute git, shell, filesystem, or SQLite side effects.
+- Electron New Session and subsequent ordinary Canvas input keep one planner session/node identity while assigning each turn a distinct durable run identity. The backend owns launch, terminal reconciliation, intent application, scheduling, projection, and broadcast; the planner root remains dependency-free.
+- Electron renderer state is installed only from authoritative `CanvasSession` values returned by workflow IPC or workflow events. Browser/mock mode retains its local development fallback.
 - Completion evidence comes from `RunEvidence`, workflow events, git/worktree reconciliation, checks, artifacts, review evidence, and commit evidence. Agent prose and terminal text are output only.
 - Hermes and Codex real CLI adapters are wired through `agent-bridge` as `experimental-run`. The real path is `experimental-run`, not `supported-run`.
 
 Partial and still being hardened:
 
-- Current-branch real loop: Current branch is the default main path, runs against the imported project root, and records real `RunEvidence`, but the desktop product path still has browser/mock fallback and local renderer state that must not become completion truth.
+- Current-branch real loop beyond Phase 1: Current branch is the default main path, runs against the imported project root, and records real `RunEvidence`. Browser/mock fallback remains for development, and failure-repair, artifact, worktree, and delivery product paths still need later-phase hardening.
 - Artifact evidence: `RunEvidence` can carry artifacts and the MVP demo captures a screenshot artifact, but artifact capture/registration is still lane- and script-specific.
 - Failure-to-repair main path: kernel and selected-node foundations exist, but failed node to repair node to regression verification is not yet the default desktop loop.
 - Worktree product loop: create, compare, adopt, clean, and rollback backend boundaries exist, but New worktree is not the current mainline and the compare/adopt/cleanup experience is not complete.
@@ -92,14 +95,16 @@ Not done or explicit non-goals:
 
 ## Four-Track Delivery Plan
 
-1. Current branch main path: make the imported project root and selected branch the default development path. Keep reducing renderer fallback until the desktop path consumes Node-side projection, `RunEvidence`, git reconciliation, and workflow events as facts.
+1. Current branch main path: Phase 1 makes ordinary Electron planner turns backend-owned and consumes authoritative Node-side projection, `RunEvidence`, and workflow events. Later work must not move this authority back into the renderer.
 2. Failure repair and regression: productize the path from failed node to repair node to regression verification. Failed nodes keep evidence and history; repair starts from the after checkpoint, variant starts from the before checkpoint, and rollback covers the selected node plus downstream nodes behind safety gates.
 3. New worktree candidate path: keep New worktree as explicit opt-in for variants and double-track validation. Compare, adopt, and clean must stay behind managed worktree identity checks, artifact/log isolation, and user confirmation.
 4. Explicit delivery gates: commit, push, PR creation, exact-head checks, merge request, post-merge main sync, and cleanup stay separate actions. Checks success must not auto-merge, merge must not auto-sync or auto-clean, and cleanup must not delete branches by default.
 
 ## Verification Surfaces
 
-The real Hermes-to-Codex acceptance path is `pnpm --filter @skyturn/desktop run demo:mvp`. Historical runs have passed on this machine, but do not report a current PR as verified unless that command completes with evidence-backed success for the checkout being reviewed. This path depends on local Hermes/Codex credentials and remains `experimental-run`, not `supported-run`.
+The real New Session product acceptance path is `pnpm --filter @skyturn/desktop run acceptance:new-session-ui`. It initializes a temporary Git project, opens it through the UI, creates a session through real controls, waits for Hermes and downstream execution evidence, submits a second ordinary Canvas input, restarts Electron, and compares the rendered nodes, edges, statuses, and input replay with the reopened SQLite projection. PTY is disabled unless explicitly enabled. The command requires local Hermes/Codex credentials and remains `experimental-run`, not `supported-run`.
+
+`pnpm --filter @skyturn/desktop run demo:mvp` remains the lower-level Hermes-to-Codex runtime acceptance. Neither command makes the later failure-repair, New worktree, or delivery tracks complete.
 
 Browser-only and mock paths still exist for development and tests. Desktop `workflow:worktree:create`, `workflow:worktree:adopt`, and `workflow:worktree:clean` now call `@skyturn/git-worktree/node` and record terminal workflow events from real git/filesystem side effects. The current worktree adopt UI asks for confirmation and sends `strategy: "merge"`; cherry-pick exists in backend contracts but is not exposed in the UI. The full product UI for comparing, adopting, and cleaning managed worktrees is still not complete.
 

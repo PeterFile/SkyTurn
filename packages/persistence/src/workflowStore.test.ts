@@ -28,6 +28,71 @@ afterEach(async () => {
 });
 
 describe("SQLite workflow store", () => {
+  it("materializes a reopened legacy pending planner without fabricating a run", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const session = store.createWorkflowSession({
+      id: "session-legacy-pending",
+      projectId: "project-1",
+      title: "Legacy pending planner",
+      goal: "Wait for the first concrete planner turn",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Legacy durable session has not started a planner turn.",
+      now: "2026-07-21T00:00:00.000Z",
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const canvas = reopened.materializeCanvasSession(session.id);
+    const planner = canvas?.nodes.find((node) => node.id === session.plannerLaneId);
+
+    expect(planner?.status).toBe("pending");
+    expect(planner).not.toHaveProperty("runId");
+    expect(canvas?.activeNodeId).toBeNull();
+    expect(reopened.listSegments(session.id, session.plannerLaneId)).toEqual([]);
+    reopened.close();
+  });
+
+  it("lists workflow session ids in durable creation order across reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    for (const [id, now] of [
+      ["session-later-id", "2026-07-21T00:00:00.000Z"],
+      ["session-earlier-id", "2026-07-21T00:00:01.000Z"],
+    ] as const) {
+      const session = store.createWorkflowSession({
+        id,
+        projectId: "project-1",
+        title: id,
+        goal: `Goal for ${id}`,
+        mode: "fast",
+        plannerProfile: "default",
+        transport: "hermes_replay_recovery",
+        recoveryReason: "Test setup has no live Hermes session.",
+        now,
+      });
+      completeInitialPlannerTurn(store, session);
+    }
+    expect(store.listWorkflowSessionIds()).toEqual(["session-later-id", "session-earlier-id"]);
+    const first = store.getWorkflowSession("session-later-id");
+    const second = store.getWorkflowSession("session-earlier-id");
+    expect(first?.plannerLaneId).toBe("node-1");
+    expect(second?.plannerLaneId).toMatch(/^node-planner-[a-f0-9]{24}$/);
+    expect(second?.plannerLaneId).not.toBe(first?.plannerLaneId);
+    expect(store.materializeCanvasSession("session-later-id")?.plannerNodeId).toBe(first?.plannerLaneId);
+    expect(store.materializeCanvasSession("session-earlier-id")?.plannerNodeId).toBe(second?.plannerLaneId);
+    expect(store.materializeCanvasSession("session-earlier-id")?.nodes.map((node) => node.id)).toContain(second?.plannerLaneId);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listWorkflowSessionIds()).toEqual(["session-later-id", "session-earlier-id"]);
+    expect(reopened.getWorkflowSession("session-later-id")?.plannerLaneId).toBe(first?.plannerLaneId);
+    expect(reopened.getWorkflowSession("session-earlier-id")?.plannerLaneId).toBe(second?.plannerLaneId);
+    reopened.close();
+  });
+
   it("never persists or returns a raw Hermes resume handle", async () => {
     const projectRoot = await makeTempRoot();
     const rawHandle = "Bearer resume-secret path=/Users/alice/private password=hunter2";
@@ -675,7 +740,7 @@ describe("SQLite workflow store", () => {
         laneKind: "planner",
         agentKind: "hermes",
         nodeId: "node-1",
-        status: "running",
+        status: "pending",
       },
     ]);
   });
@@ -708,6 +773,65 @@ describe("SQLite workflow store", () => {
     stores.forEach((store) => store.close());
   });
 
+  it("atomically rejects a different running planner run across SQLite stores and allows the next terminal turn", async () => {
+    const projectRoot = await makeTempRoot();
+    const seed = createWorkflowStore({ projectRoot });
+    const session = seed.createWorkflowSession({
+      id: "session-planner-owner",
+      projectId: "project-1",
+      title: "Planner ownership",
+      goal: "Serialize planner turns",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Test setup has no live Hermes session.",
+      now: "2026-07-22T01:00:00.000Z",
+    });
+    seed.close();
+    const stores = [
+      createWorkflowStore({ projectRoot }),
+      createWorkflowStore({ projectRoot }),
+    ];
+    const claim = (store: ReturnType<typeof createWorkflowStore>, runId: string, now: string) =>
+      store.claimPlannerRunStart({
+        sessionId: session.id,
+        laneId: session.plannerLaneId,
+        runId,
+        agentKind: "hermes",
+        worktreePath: projectRoot,
+        now,
+      });
+
+    const competing = await Promise.allSettled([
+      Promise.resolve().then(() => claim(stores[0]!, "planner-run-owner-a", "2026-07-22T01:00:01.000Z")),
+      Promise.resolve().then(() => claim(stores[1]!, "planner-run-owner-b", "2026-07-22T01:00:01.001Z")),
+    ]);
+
+    expect(competing.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(competing.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(String(competing.find((result) => result.status === "rejected")?.reason)).toMatch(
+      /planner lane.*running|running planner/i,
+    );
+    const owner = competing.find((result): result is PromiseFulfilledResult<ReturnType<typeof claim>> =>
+      result.status === "fulfilled"
+    )!.value;
+    const ownerStore = owner.segment.runId === "planner-run-owner-a" ? stores[0]! : stores[1]!;
+    const retryStore = ownerStore === stores[0] ? stores[1]! : stores[0]!;
+    expect(claim(retryStore, owner.segment.runId, "2026-07-22T01:00:02.000Z").created).toBe(false);
+
+    ownerStore.recordSegmentEvidence({
+      ...owner.segment,
+      transport: "agent-bridge",
+      worktreePath: projectRoot,
+      evidence: plannerRunEvidence(owner.segment.runId, "2026-07-22T01:00:03.000Z"),
+      now: "2026-07-22T01:00:03.000Z",
+    });
+    const next = claim(retryStore, "planner-run-next-turn", "2026-07-22T01:00:04.000Z");
+    expect(next.created).toBe(true);
+    expect(next.segment.runId).toBe("planner-run-next-turn");
+    stores.forEach((store) => store.close());
+  });
+
   it("persists default current branch session target facts", async () => {
     const store = await makeStore();
 
@@ -722,6 +846,7 @@ describe("SQLite workflow store", () => {
       recoveryReason: "Hermes live chat handle was not available during test setup.",
       now: "2026-06-14T00:00:00.000Z",
     });
+    completeInitialPlannerTurn(store, session);
     const canvasSession = store.materializeCanvasSession("session-1");
     const started = store.listEvents("session-1").find((event) => event.kind === "hermes_session_started");
 
@@ -799,6 +924,7 @@ describe("SQLite workflow store", () => {
       },
       now: "2026-06-14T00:00:00.000Z",
     });
+    completeInitialPlannerTurn(store, session);
     const canvasSession = store.materializeCanvasSession("session-1");
     const planner = canvasSession?.nodes.find((node) => node.id === canvasSession.plannerNodeId);
 
@@ -808,7 +934,7 @@ describe("SQLite workflow store", () => {
       baseRef: "origin/main",
     });
     expect(planner?.worktree).toMatchObject({
-      path: ".",
+      path: dirname(dirname(store.databasePath)),
       branchName: "main",
       baseCommit: "origin/main",
       executionTarget: "new_worktree",
@@ -824,7 +950,7 @@ describe("SQLite workflow store", () => {
   it("materializes created managed worktree identities after replay and restart", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
-    store.createWorkflowSession({
+    const session = store.createWorkflowSession({
       id: "session-1",
       projectId: "project-1",
       title: "Persisted workflow",
@@ -840,6 +966,7 @@ describe("SQLite workflow store", () => {
       },
       now: "2026-06-14T00:00:00.000Z",
     });
+    completeInitialPlannerTurn(store, session);
     store.applyWorkflowIntent({
       intentId: "intent-audit-1",
       sessionId: "session-1",
@@ -896,6 +1023,216 @@ describe("SQLite workflow store", () => {
       headCommit: worktree.headCommit,
     });
     reopened.close();
+  });
+
+  it("persists planner intent causation on accepted and declared-lane facts across reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const plannerRunId = "run-planner-semantic-turn-2";
+    const { segment } = store.claimPlannerRunStart({
+      sessionId: "session-1",
+      laneId: "node-1",
+      runId: plannerRunId,
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    store.recordRunResult({
+      ...segment,
+      evidence: {
+        runId: plannerRunId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt: "2026-06-14T00:00:02.000Z",
+      },
+      now: "2026-06-14T00:00:02.000Z",
+    });
+    store.applyWorkflowIntent({
+      causationId: plannerRunId,
+      intentId: "intent-planner-semantic-turn-2",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Add strict causal provenance" },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
+        { type: "ProposeLanes" },
+      ],
+    }, "2026-06-14T00:00:03.000Z");
+
+    const semanticFacts = store.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.intent.accepted" || event.kind === "workflow.lane.declared"
+    );
+    expect(semanticFacts.length).toBeGreaterThan(1);
+    expect(semanticFacts.every((event) => event.causationId === plannerRunId)).toBe(true);
+    expect(semanticFacts.filter((event) => event.kind === "workflow.lane.declared").every((event) =>
+      typeof event.laneId === "string" && event.laneId.length > 0
+    )).toBe(true);
+    const serializedPayloads = JSON.stringify(semanticFacts.map((event) => event.payload));
+    expect(serializedPayloads).not.toContain(plannerRunId);
+    expect(serializedPayloads).not.toContain('"prompt"');
+    expect(serializedPayloads).not.toContain('"path"');
+    expect(serializedPayloads).not.toContain('"handle"');
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const reopenedFacts = reopened.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.intent.accepted" || event.kind === "workflow.lane.declared"
+    );
+    expect(reopenedFacts.map((event) => ({
+      kind: event.kind,
+      laneId: event.laneId,
+      causationId: event.causationId,
+    }))).toEqual(semanticFacts.map((event) => ({
+      kind: event.kind,
+      laneId: event.laneId,
+      causationId: event.causationId,
+    })));
+    reopened.close();
+  });
+
+  it("replays an accepted planner intent with the same causation as a zero-write success after reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const plannerRunId = "run-session-1-initial-planner-turn";
+    const intent = {
+      intentId: "intent-same-planner-causation",
+      sessionId: "session-1",
+      operations: [{ type: "AnalyzeRequirement", requirement: "Preserve exact planner causation" }],
+    };
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.applyWorkflowIntent({ ...intent, causationId: plannerRunId }, "2026-06-14T00:00:01.000Z");
+    const eventsBeforeReopen = store.listEvents("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.applyWorkflowIntent({
+      ...intent,
+      causationId: plannerRunId,
+      operations: [{ type: "AnalyzeRequirement", requirement: "A replay must not replace accepted operations" }],
+    }, "2026-06-14T00:00:02.000Z")).toEqual({ ok: true, events: [] });
+    expect(reopened.listEvents("session-1")).toEqual(eventsBeforeReopen);
+    reopened.close();
+  });
+
+  it("rejects a reused accepted intentId from a different planner causation without transaction writes", async () => {
+    const projectRoot = await makeTempRoot();
+    const firstRunId = "run-session-1-initial-planner-turn";
+    const secondRunId = "run-planner-reused-intent";
+    const intent = {
+      intentId: "intent-reused-by-another-planner-run",
+      sessionId: "session-1",
+      operations: [{ type: "AnalyzeRequirement", requirement: "Bind intent identity to the planner run" }],
+    };
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.applyWorkflowIntent({ ...intent, causationId: firstRunId }, "2026-06-14T00:00:01.000Z");
+    const { segment } = store.claimPlannerRunStart({
+      sessionId: "session-1",
+      laneId: "node-1",
+      runId: secondRunId,
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-06-14T00:00:02.000Z",
+    });
+    store.recordRunResult({
+      ...segment,
+      evidence: plannerRunEvidence(secondRunId, "2026-06-14T00:00:03.000Z"),
+      now: "2026-06-14T00:00:03.000Z",
+    });
+    const eventsBeforeConflict = store.listEvents("session-1");
+    const projectionBeforeConflict = store.materializeFlowProjection("session-1");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    let conflict: unknown;
+    try {
+      reopened.applyWorkflowIntent({
+        ...intent,
+        causationId: secondRunId,
+        operations: [{ type: "ProposeLanes" }],
+      }, "2026-06-14T00:00:04.000Z");
+    } catch (error) {
+      conflict = error;
+    }
+    expect(conflict).toMatchObject({
+      name: "WorkflowIntentCausationConflictError",
+      code: "WORKFLOW_INTENT_CAUSATION_CONFLICT",
+    });
+    expect(String(conflict)).toBe("WorkflowIntentCausationConflictError: WorkflowIntent was already accepted for another planner run.");
+    expect(String(conflict)).not.toMatch(/run-session|run-planner|intent-reused/);
+    expect(reopened.listEvents("session-1")).toEqual(eventsBeforeConflict);
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(projectionBeforeConflict);
+    reopened.close();
+  });
+
+  it("rolls back intent application when the accepted idempotency key is bound to another event", async () => {
+    const store = await makeSeededStore();
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.intent.rejected",
+      source: "test",
+      idempotencyKey: "intent:intent-accepted-key-conflict:accepted",
+      payload: { intentId: "another-intent", reason: "seeded idempotency conflict" },
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    const eventsBeforeConflict = store.listEvents("session-1");
+    const projectionBeforeConflict = store.materializeFlowProjection("session-1");
+
+    expect(() => store.applyWorkflowIntent({
+      intentId: "intent-accepted-key-conflict",
+      sessionId: "session-1",
+      operations: [{ type: "AnalyzeRequirement", requirement: "Do not partially apply" }],
+    }, "2026-06-14T00:00:02.000Z")).toThrow(/accepted idempotency key conflicts/i);
+    expect(store.listEvents("session-1")).toEqual(eventsBeforeConflict);
+    expect(store.materializeFlowProjection("session-1")).toEqual(projectionBeforeConflict);
+    store.close();
+  });
+
+  it("keeps explicit non-planner intent application compatible without invented causation", async () => {
+    const store = await makeSeededStore();
+    store.applyWorkflowIntent({
+      intentId: "intent-explicit-no-planner-cause",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Preserve explicit applyIntent compatibility" },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["code-change"] } },
+        { type: "ProposeLanes" },
+      ],
+    }, "2026-06-14T00:00:01.000Z");
+
+    const semanticFacts = store.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.intent.accepted" || event.kind === "workflow.lane.declared"
+    );
+    expect(semanticFacts.length).toBeGreaterThan(1);
+    expect(semanticFacts.every((event) => event.causationId === null)).toBe(true);
+    store.close();
+  });
+
+  it("rejects an unproven or sensitive planner intent causation before persistence", async () => {
+    const store = await makeSeededStore();
+    const eventCount = store.listEvents("session-1").length;
+    const intent = {
+      intentId: "intent-invalid-planner-cause",
+      sessionId: "session-1",
+      operations: [{ type: "AnalyzeRequirement", requirement: "Do not persist invalid causal metadata" }],
+    };
+
+    expect(() => store.applyWorkflowIntent({
+      ...intent,
+      causationId: "run-not-recorded",
+    }, "2026-06-14T00:00:01.000Z")).toThrow(/terminal planner run/i);
+    expect(() => store.applyWorkflowIntent({
+      ...intent,
+      causationId: "/Users/alice/private/planner-handle",
+    }, "2026-06-14T00:00:01.000Z")).toThrow(/non-sensitive run identifier/i);
+    expect(store.listEvents("session-1")).toHaveLength(eventCount);
+    store.close();
   });
 
   it.each([false, true])(
@@ -1051,6 +1388,104 @@ describe("SQLite workflow store", () => {
     store.close();
   });
 
+  it("persists exact run authorization decisions across reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const authorization = {
+      sandbox: "danger-full-access",
+      runId: "run-session-1-lane-commit",
+      startFingerprint: "a".repeat(64),
+    };
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.user_decision.requested",
+      source: "electron-main",
+      idempotencyKey: "danger-run:requested",
+      payload: {
+        decisionId: "decision-danger-run",
+        prompt: "Authorize full host access?",
+        options: ["Authorize this run"],
+        reason: "This run can modify host state outside the project.",
+        targetLaneId: "lane-commit",
+        targetSegmentId: "segment-session-1-lane-commit",
+        runAuthorization: authorization,
+      },
+      now: "2026-07-23T00:00:00.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.user_decision.answered",
+      source: "renderer",
+      idempotencyKey: "danger-run:answered",
+      payload: {
+        decisionId: "decision-danger-run",
+        selectedOption: "Authorize this run",
+        action: "continue",
+        targetLaneId: "lane-commit",
+        targetSegmentId: "segment-session-1-lane-commit",
+        runAuthorization: authorization,
+      },
+      now: "2026-07-23T00:00:01.000Z",
+    });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const decision = reopened.materializeFlowProjection("session-1").userDecisions[0];
+    const canvasDecision = reopened.materializeCanvasSession("session-1")?.nodes
+      .find((node) => node.id === "decision-danger-run")?.userDecision;
+
+    expect(decision).toMatchObject({ status: "answered", runAuthorization: authorization });
+    expect(canvasDecision).toMatchObject({ status: "answered", runAuthorization: authorization });
+    reopened.close();
+  });
+
+  it("fails closed for dangerous ready lanes until the backend authorizes them", async () => {
+    const store = await makeSeededStore();
+    for (const lane of [
+      { id: "lane-implementation", kind: "implementation" },
+      { id: "lane-commit", kind: "commit" },
+    ]) {
+      store.appendWorkflowEvent({
+        sessionId: "session-1",
+        kind: "workflow.lane.declared",
+        source: "test",
+        idempotencyKey: `lane:${lane.id}`,
+        payload: {
+          lane: {
+            ...lane,
+            semanticKey: lane.id,
+            title: lane.id,
+            agentKind: "codex",
+            status: "pending",
+          },
+        },
+        now: "2026-07-23T00:00:00.000Z",
+      });
+    }
+
+    const unauthorized = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      now: "2026-07-23T00:00:01.000Z",
+    });
+
+    expect(unauthorized.readyLanes.map((lane) => lane.id)).toEqual(["lane-implementation"]);
+    expect(store.listRunningSegments().map((segment) => segment.laneId)).toEqual(["lane-implementation"]);
+
+    const authorized = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      authorizedLaneIds: ["lane-commit"],
+      now: "2026-07-23T00:00:02.000Z",
+    });
+
+    expect(authorized.readyLanes.map((lane) => lane.id)).toEqual(["lane-commit"]);
+    expect(store.listRunningSegments().map((segment) => segment.laneId).sort()).toEqual([
+      "lane-commit",
+      "lane-implementation",
+    ]);
+    store.close();
+  });
+
   it.each(["running", "waiting_input", "completed", "failed", "blocked"] as const)(
     "rejects reassignment for a lane in %s state",
     async (status) => {
@@ -1111,10 +1546,10 @@ describe("SQLite workflow store", () => {
     rolledBackStore.close();
   });
 
-  it("materializes the SQLite planner root before any WorkflowIntent projection nodes exist", async () => {
+  it("materializes a pending planner root before its first concrete segment", async () => {
     const store = await makeStore();
 
-    store.createWorkflowSession({
+    const session = store.createWorkflowSession({
       id: "session-1",
       projectId: "project-1",
       title: "Persisted workflow",
@@ -1126,17 +1561,99 @@ describe("SQLite workflow store", () => {
       now: "2026-06-14T00:00:00.000Z",
     });
     const projection = store.materializeFlowProjection("session-1");
-    const canvasSession = store.materializeCanvasSession("session-1");
 
     expect(projection.projectionNodes).toEqual([]);
+    const pendingCanvasSession = store.materializeCanvasSession("session-1");
+    expect(pendingCanvasSession?.nodes).toMatchObject([{
+      id: "node-1",
+      agent: "hermes",
+      status: "pending",
+    }]);
+    expect(pendingCanvasSession?.nodes[0]).not.toHaveProperty("runId");
+
+    store.claimPlannerRunStart({
+      sessionId: session.id,
+      laneId: session.plannerLaneId,
+      runId: "run-session-1-initial-planner-turn",
+      agentKind: "hermes",
+      worktreePath: store.databasePath,
+      now: "2026-06-14T00:00:01.000Z",
+    });
+    const canvasSession = store.materializeCanvasSession("session-1");
+
     expect(canvasSession?.plannerNodeId).toBe("node-1");
     expect(canvasSession?.nodes).toMatchObject([
       {
         id: "node-1",
         agent: "hermes",
         status: "running",
+        runId: "run-session-1-initial-planner-turn",
       },
     ]);
+  });
+
+  it("advances the planner brief only when a durable user input is delivered, including reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: "session-input-replay",
+      projectId: "project-1",
+      title: "Persisted workflow",
+      goal: "Implement event sourced workflow",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Hermes native resume is unavailable in this test.",
+      now: "2026-07-21T00:00:00.000Z",
+    });
+    store.claimUserInput({
+      sessionId: "session-input-replay",
+      inputId: "input-1",
+      text: "First durable planner requirement",
+      now: "2026-07-21T00:00:01.000Z",
+    });
+    store.recordUserInputDelivered({
+      sessionId: "session-input-replay",
+      inputId: "input-1",
+      now: "2026-07-21T00:00:02.000Z",
+    });
+    store.claimPlannerRunStart({
+      sessionId: "session-input-replay",
+      laneId: "node-1",
+      runId: "run-first-delivered-input",
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-07-21T00:00:03.000Z",
+    });
+    store.claimUserInput({
+      sessionId: "session-input-replay",
+      inputId: "input-2",
+      text: "Second durable planner requirement",
+      now: "2026-07-21T00:00:04.000Z",
+    });
+
+    const whileSecondPending = store.materializeCanvasSession("session-input-replay");
+    const pendingPlanner = whileSecondPending?.nodes.find((node) => node.id === whileSecondPending.plannerNodeId);
+    expect(whileSecondPending?.plannerNodeId).toBe("node-1");
+    expect(whileSecondPending?.nodes.filter((node) => node.id === whileSecondPending.plannerNodeId)).toHaveLength(1);
+    expect(pendingPlanner?.context.brief).toBe("First durable planner requirement");
+    expect(pendingPlanner?.runId).toBe("run-first-delivered-input");
+    expect(pendingPlanner?.context.dependencies).toEqual([]);
+    expect(whileSecondPending?.edges.some((edge) => edge.target === whileSecondPending.plannerNodeId)).toBe(false);
+
+    store.recordUserInputDelivered({
+      sessionId: "session-input-replay",
+      inputId: "input-2",
+      now: "2026-07-21T00:00:05.000Z",
+    });
+    const afterDelivery = store.materializeCanvasSession("session-input-replay");
+    expect(afterDelivery?.nodes.find((node) => node.id === afterDelivery.plannerNodeId)?.context.brief)
+      .toBe("Second durable planner requirement");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeCanvasSession("session-input-replay")).toEqual(afterDelivery);
+    reopened.close();
   });
 
   it("allocates event seq monotonically and dedupes idempotency keys", async () => {
@@ -1169,7 +1686,8 @@ describe("SQLite workflow store", () => {
 
     expect(first.seq).toBeLessThan(second.seq);
     expect(duplicate).toEqual(first);
-    expect(store.listEvents("session-1").map((event) => event.seq)).toEqual([1, 2, 3, 4]);
+    const seqs = store.listEvents("session-1").map((event) => event.seq);
+    expect(seqs).toEqual(seqs.map((_seq, index) => index + 1));
   });
 
   it("replays repeated createWorkflowCard calls without duplicate lanes or duplicate events", async () => {
@@ -3771,11 +4289,298 @@ describe("SQLite workflow store", () => {
       runId: segment.runId,
       agentKind: segment.agentKind,
     }]);
-    store.recordPlannerIntentReconciled(segment, "2026-07-18T00:00:03.000Z");
+    store.completePlannerIntentReconciliation(segment, {
+      disposition: "applied",
+      intentId: "intent-plan-finish",
+    }, "2026-07-18T00:00:03.000Z");
 
     expect(store.listPendingPlannerIntentReconciliations()).toEqual([]);
     expect(store.materializeFlowProjection(session.id)).toEqual(projectionBefore);
     expect(store.buildLedgerSummary(session.id)).toEqual(ledgerBefore);
+    expect(store.listEvents(session.id).at(-1)).toMatchObject({
+      kind: "workflow.planner_intent.reconciled",
+      payload: {
+        runId: segment.runId,
+        agentKind: "hermes",
+        disposition: "applied",
+        intentId: "intent-plan-finish",
+      },
+    });
+    store.close();
+  });
+
+  it("finalizes invalid planner intent without changing exact successful process evidence or output", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const { session, segment, evidence, output } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-invalid",
+      "not a WorkflowIntent\n",
+    );
+    const projectionBefore = store.materializeFlowProjection(session.id);
+
+    const disposition = store.completePlannerIntentReconciliation(segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:00:03.000Z");
+
+    expect(disposition).toMatchObject({
+      kind: "workflow.planner_intent.reconciled",
+      payload: {
+        runId: segment.runId,
+        agentKind: "hermes",
+        disposition: "invalid",
+        reasonCode: "parse_invalid",
+      },
+    });
+    expect(store.listPendingPlannerIntentReconciliations()).toEqual([]);
+    expect(store.materializeFlowProjection(session.id)).toEqual(projectionBefore);
+    const persisted = store.listSegments(session.id, session.plannerLaneId).at(-1);
+    expect(persisted).toMatchObject({ status: "succeeded", exitCode: 0, errorReason: null });
+    expect(persisted?.evidence).toEqual(evidence);
+    expect(store.materializeCanvasSession(session.id)?.nodes.find((node) => node.id === session.plannerLaneId))
+      .toMatchObject({ status: "failed", output: [output] });
+    expect(store.listEvents(session.id).filter((event) =>
+      event.kind === "lane_status_changed" && event.idempotencyKey === `planner-intent:${segment.runId}:lane-failed`
+    )).toEqual([
+      expect.objectContaining({ payload: { status: "failed", reason: "planner-intent-invalid:parse_invalid" } }),
+    ]);
+    store.close();
+  });
+
+  it("makes planner disposition replay zero-write across reopen and rejects conflicts before writes", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    const { session, segment } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-idempotent",
+      "invalid planner output",
+    );
+    const first = store.completePlannerIntentReconciliation(segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:01:03.000Z");
+    const firstEvents = store.listEvents(session.id);
+    const firstLane = store.getLane(session.id, session.plannerLaneId);
+
+    expect(store.completePlannerIntentReconciliation(segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:01:04.000Z")).toEqual(first);
+    expect(store.listEvents(session.id)).toEqual(firstEvents);
+    expect(store.getLane(session.id, session.plannerLaneId)).toEqual(firstLane);
+    expect(() => store.completePlannerIntentReconciliation(segment, {
+      disposition: "rejected",
+      intentId: "intent-conflict",
+      reasonCode: "policy_rejected",
+    }, "2026-07-22T02:01:05.000Z")).toThrow(/conflict/i);
+    expect(() => store.completePlannerIntentReconciliation(segment, {
+      disposition: "invalid",
+      intentId: "intent-conflict",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:01:05.500Z")).toThrow(/conflict/i);
+    expect(() => store.completePlannerIntentReconciliation({ ...segment, laneId: "lane-conflict" }, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:01:06.000Z")).toThrow(/conflict/i);
+    expect(store.listEvents(session.id)).toEqual(firstEvents);
+    store.close();
+
+    store = createWorkflowStore({ projectRoot });
+    expect(store.completePlannerIntentReconciliation(segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:01:07.000Z")).toEqual(first);
+    expect(store.listEvents(session.id)).toEqual(firstEvents);
+    expect(store.getLane(session.id, session.plannerLaneId)).toEqual(firstLane);
+    store.close();
+  });
+
+  it("rolls back disposition event, lane failure, and candidate deletion together on SQLite failure", async () => {
+    const projectRoot = await makeTempRoot();
+    let failCommit = true;
+    const store = createWorkflowStore({
+      projectRoot,
+      faultInjection: {
+        beforePlannerIntentDispositionCommit() {
+          if (failCommit) throw new Error("injected planner disposition transaction failure");
+        },
+      },
+    });
+    const { session, segment, evidence } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-transaction-failure",
+      "invalid transaction output",
+    );
+
+    expect(() => store.completePlannerIntentReconciliation(segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:01:03.000Z")).toThrow("injected planner disposition transaction failure");
+    expect(store.listPendingPlannerIntentReconciliations()).toHaveLength(1);
+    expect(store.listEvents(session.id).some((event) => event.kind === "workflow.planner_intent.reconciled")).toBe(false);
+    expect(store.getLane(session.id, session.plannerLaneId)?.status).toBe("completed");
+    expect(store.listSegments(session.id, session.plannerLaneId).at(-1)?.evidence).toEqual(evidence);
+
+    failCommit = false;
+    store.completePlannerIntentReconciliation(segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:01:04.000Z");
+    expect(store.listPendingPlannerIntentReconciliations()).toEqual([]);
+    expect(store.getLane(session.id, session.plannerLaneId)?.status).toBe("failed");
+    store.close();
+  });
+
+  it("reads historical reconciliation events without disposition as applied zero-write facts", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    const { session, segment } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-legacy-applied",
+      "legacy applied output",
+    );
+    store.completePlannerIntentReconciliation(segment, {
+      disposition: "applied",
+      intentId: "intent-original",
+    }, "2026-07-22T02:01:03.000Z");
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    db.prepare("UPDATE workflow_events SET payload_json = ? WHERE session_id = ? AND idempotency_key = ?")
+      .run(JSON.stringify({ runId: segment.runId }), session.id, `planner-intent:${segment.runId}:reconciled`);
+    db.close();
+
+    store = createWorkflowStore({ projectRoot });
+    const before = store.listEvents(session.id);
+    const legacy = store.completePlannerIntentReconciliation(segment, {
+      disposition: "applied",
+      intentId: "intent-historical-unknown",
+    }, "2026-07-22T02:01:04.000Z");
+    expect(legacy.payload).toEqual({ runId: segment.runId });
+    expect(store.listEvents(session.id)).toEqual(before);
+    expect(store.listPendingPlannerIntentReconciliations()).toEqual([]);
+    store.close();
+  });
+
+  it("does not let an old invalid candidate override a newer planner turn and accepts another turn after failure", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const first = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-old-invalid",
+      "old invalid output",
+    );
+    const secondClaim = store.claimPlannerRunStart({
+      sessionId: first.session.id,
+      laneId: first.session.plannerLaneId,
+      runId: "run-planner-newer",
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-07-22T02:02:03.000Z",
+    });
+
+    store.completePlannerIntentReconciliation(first.segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:02:04.000Z");
+    expect(store.getLane(first.session.id, first.session.plannerLaneId)?.status).toBe("running");
+    expect(store.listEvents(first.session.id).some((event) =>
+      event.idempotencyKey === `planner-intent:${first.segment.runId}:lane-failed`
+    )).toBe(false);
+
+    const secondCompletedAt = "2026-07-22T02:02:05.000Z";
+    const secondEvidence = succeededPlannerRunEvidence(secondClaim.segment.runId, secondCompletedAt);
+    store.recordRunResult({
+      ...secondClaim.segment,
+      outputSummary: "new invalid planner output",
+      runEvents: [plannerOutputEvent(secondClaim.segment.runId, "new invalid planner output", secondCompletedAt)],
+      evidence: secondEvidence,
+      now: secondCompletedAt,
+    });
+    store.completePlannerIntentReconciliation(secondClaim.segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:02:06.000Z");
+    expect(store.getLane(first.session.id, first.session.plannerLaneId)?.status).toBe("failed");
+
+    const third = store.claimPlannerRunStart({
+      sessionId: first.session.id,
+      laneId: first.session.plannerLaneId,
+      runId: "run-planner-after-invalid",
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-07-22T02:02:07.000Z",
+    });
+    expect(third.created).toBe(true);
+    expect(store.getLane(first.session.id, first.session.plannerLaneId)?.status).toBe("running");
+    store.close();
+  });
+
+  it("fails closed on corrupt planner candidate identity without deleting recovery state", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    const { segment } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-corrupt",
+      "corrupt candidate output",
+    );
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    const row = db.prepare("SELECT name, state FROM workflow_maintenance WHERE name LIKE 'planner_intent_reconciliation:%'")
+      .get() as { name: string; state: string };
+    const corrupt = { ...JSON.parse(row.state), laneId: "lane-corrupt" };
+    db.prepare("UPDATE workflow_maintenance SET state = ? WHERE name = ?").run(JSON.stringify(corrupt), row.name);
+    db.close();
+
+    store = createWorkflowStore({ projectRoot });
+    const [candidate] = store.listPendingPlannerIntentReconciliations();
+    expect(() => store.getPlannerIntentReconciliationFacts(candidate!)).toThrow(/identity|planner/i);
+    expect(() => store.completePlannerIntentReconciliation(candidate!, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:03:03.000Z")).toThrow(/identity|planner/i);
+    expect(store.listPendingPlannerIntentReconciliations()).toEqual([candidate]);
+    expect(store.listSegments(segment.sessionId, segment.laneId).at(-1)?.status).toBe("succeeded");
+    store.close();
+  });
+
+  it.each([
+    ["missing segment", "DELETE FROM workflow_segments WHERE run_id = ?"],
+    ["missing evidence", "UPDATE workflow_segments SET evidence_json = NULL WHERE run_id = ?"],
+    ["run identity mismatch", "UPDATE workflow_segments SET run_id = 'run-planner-mismatched' WHERE run_id = ?"],
+  ])("fails closed on %s while preserving the exact pending candidate", async (_label, mutation) => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    const { segment } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      `run-planner-${_label.replaceAll(" ", "-")}`,
+      "planner corruption output",
+    );
+    const [candidate] = store.listPendingPlannerIntentReconciliations();
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    db.prepare(mutation).run(segment.runId);
+    db.close();
+
+    store = createWorkflowStore({ projectRoot });
+    const eventsBefore = store.listEvents(segment.sessionId);
+    expect(() => store.getPlannerIntentReconciliationFacts(candidate!)).toThrow(/identity|evidence/i);
+    expect(() => store.completePlannerIntentReconciliation(candidate!, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+    }, "2026-07-22T02:04:03.000Z")).toThrow(/identity|evidence/i);
+    expect(store.listPendingPlannerIntentReconciliations()).toEqual([candidate]);
+    expect(store.listEvents(segment.sessionId)).toEqual(eventsBefore);
     store.close();
   });
 
@@ -3806,10 +4611,23 @@ describe("SQLite workflow store", () => {
     const projectRoot = await makeTempRoot();
     const input = planFinishWorkflowSessionInput();
     const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: "session-before-plan-finish",
+      projectId: "project-1",
+      title: "Ordinary workflow",
+      goal: "Reserve the legacy first planner lane identity",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Test setup has no live Hermes session.",
+      now: "2026-07-17T23:59:59.000Z",
+    });
     const created = store.createPlanFinishWorkflowSession(input);
     const projection = store.materializeFlowProjection(input.id);
     const ledger = store.buildLedgerSummary(input.id);
 
+    expect(created.plannerLaneId).toMatch(/^node-planner-[a-f0-9]{24}$/);
+    expect(created.plannerLaneId).not.toBe("node-1");
     expect(() => store.createWorkflowSession({ ...input, now: "2026-07-18T00:00:01.000Z" }))
       .toThrow(/bound by Plan Finish/i);
     expect(store.createPlanFinishWorkflowSession({ ...input, now: "2026-07-18T00:00:01.000Z" })).toEqual(created);
@@ -4581,8 +5399,12 @@ describe("SQLite workflow store", () => {
     declareCodeChangeWorkflow(store);
     const completedLaneIds: string[] = [];
     for (let index = 0; index < 8; index += 1) {
+      const readyLaneIds = store.previewReadyLanes("session-1", {
+        allowedParallelism: 1,
+      }).readyLanes.map((lane) => lane.id);
       const scheduled = store.scheduleReadyLanes("session-1", {
         allowedParallelism: 1,
+        authorizedLaneIds: readyLaneIds,
         now: `2026-06-14T00:00:${String(3 + index * 2).padStart(2, "0")}.000Z`,
       });
       if (scheduled.readyLanes.length === 0) break;
@@ -6623,7 +7445,7 @@ function seedStore(
   store: ReturnType<typeof createWorkflowStore>,
   target?: { executionTarget: "new_worktree"; selectedBranch: string; baseRef: string },
 ): void {
-  store.createWorkflowSession({
+  const session = store.createWorkflowSession({
     id: "session-1",
     projectId: "project-1",
     title: "Persisted workflow",
@@ -6635,6 +7457,7 @@ function seedStore(
     ...(target ? { target } : {}),
     now: "2026-06-14T00:00:00.000Z",
   });
+  completeInitialPlannerTurn(store, session);
   store.applyWorkflowCardToolCall(
     "session-1",
     createCard("tool-plan", {
@@ -6647,6 +7470,95 @@ function seedStore(
     }),
     workflowContext("run-planner"),
   );
+}
+
+function completeInitialPlannerTurn(
+  store: ReturnType<typeof createWorkflowStore>,
+  session: { id: string; plannerLaneId: string },
+): void {
+  const runId = `run-${session.id}-initial-planner-turn`;
+  const { segment } = store.claimPlannerRunStart({
+    sessionId: session.id,
+    laneId: session.plannerLaneId,
+    runId,
+    agentKind: "hermes",
+    worktreePath: dirname(dirname(store.databasePath)),
+    now: "2026-06-14T00:00:00.500Z",
+  });
+  store.recordSegmentEvidence({
+    ...segment,
+    transport: "agent-bridge",
+    worktreePath: dirname(dirname(store.databasePath)),
+    evidence: plannerRunEvidence(runId, "2026-06-14T00:00:00.750Z"),
+    now: "2026-06-14T00:00:00.750Z",
+  });
+}
+
+function seedSucceededPlannerIntentCandidate(
+  store: ReturnType<typeof createWorkflowStore>,
+  projectRoot: string,
+  runId: string,
+  output: string,
+) {
+  const session = store.createWorkflowSession({
+    id: `session-${runId}`,
+    projectId: "project-1",
+    title: "Planner disposition",
+    goal: "Classify the terminal planner intent",
+    mode: "plan",
+    target: { executionTarget: "current_branch" as const, selectedBranch: "main" },
+    plannerProfile: "default",
+    transport: "hermes_replay_recovery",
+    recoveryReason: "Test setup has no live Hermes session.",
+    now: "2026-07-22T02:00:00.000Z",
+  });
+  const { segment } = store.claimPlannerRunStart({
+    sessionId: session.id,
+    laneId: session.plannerLaneId,
+    runId,
+    agentKind: "hermes",
+    worktreePath: projectRoot,
+    now: "2026-07-22T02:00:01.000Z",
+  });
+  const completedAt = "2026-07-22T02:00:02.000Z";
+  const evidence = succeededPlannerRunEvidence(runId, completedAt);
+  store.recordRunResult({
+    ...segment,
+    outputSummary: output,
+    runEvents: [plannerOutputEvent(runId, output, completedAt)],
+    evidence,
+    now: completedAt,
+  });
+  return { session, segment, evidence, output };
+}
+
+function succeededPlannerRunEvidence(runId: string, completedAt: string): RunEvidence {
+  return {
+    runId,
+    status: "succeeded",
+    exitCode: 0,
+    changesetId: null,
+    checks: [
+      { kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit=0" },
+      { kind: "test", name: "Planner output persisted", status: "passed", detail: "exact" },
+    ],
+    artifacts: [],
+    review: null,
+    errorReason: null,
+    cancelReason: null,
+    completedAt,
+  };
+}
+
+function plannerOutputEvent(runId: string, text: string, timestamp: string): RunEvent {
+  return {
+    protocolVersion: 1,
+    runId,
+    seq: 1,
+    timestamp,
+    kind: "output",
+    payload: { text },
+  };
 }
 
 function declareCodeChangeWorkflow(store: ReturnType<typeof createWorkflowStore>): void {

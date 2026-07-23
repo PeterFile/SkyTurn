@@ -9,10 +9,10 @@ import {
   RUN_EVENT_PROTOCOL_VERSION,
   deriveRunEvidenceFromRunEvents,
   deriveNodeStatusFromEvidence,
-  hasConcreteRunEvidence,
   isSuccessfulRunEvidence,
   expectedArtifactContractForRequiredEvidence,
   makeHermesPlannerSessionId,
+  parseRunEvent,
   parseRunEvidence,
   type AgentRun,
   type AgentRunSandbox,
@@ -48,19 +48,6 @@ export interface BridgeRunResult {
   workflowSession?: CanvasSession | null;
 }
 
-export interface CompletedBridgeRunPersistenceResult {
-  events: RunEvent[];
-  evidence: RunEvidence;
-  workflowSession?: CanvasSession | null;
-}
-
-export interface CompletedBridgeRunPersistenceClaim {
-  project: ImportedProject;
-  session: CanvasSession;
-  node: CanvasNode;
-  runId: string;
-}
-
 export interface WorkflowSchedulingPolicy {
   allowedParallelism: number;
   runningScopes: Array<{ fileScopes: string[]; packageScopes: string[] }>;
@@ -75,6 +62,7 @@ export async function startBridgeRun(
   session: CanvasSession,
   node: CanvasNode,
 ): Promise<BridgeRunResult | null> {
+  if (window.devflow && isPlannerRootNode(session, node)) return null;
   if (!canStartNodeRun(node)) return null;
   const sandbox = sandboxForNodeRun(node);
   const ledger = node.agent === "hermes" ? await loadWorkflowLedger(project, session.id) : undefined;
@@ -104,72 +92,7 @@ export async function startBridgeRun(
     window.devflow.getRunEvidence(project.rootPath, node.runId),
   ]);
   const evidence = requireRunEvidence(evidenceResult.evidence);
-  const workflowSession = await persistWorkflowRunResult(project, session, node, eventsResult.events, evidence);
-  return { run: result.run, events: eventsResult.events, evidence, workflowSession };
-}
-
-export async function persistCompletedBridgeRunResult(
-  project: ImportedProject,
-  session: CanvasSession,
-  node: CanvasNode,
-): Promise<CompletedBridgeRunPersistenceResult | null> {
-  if (!isExecutableNode(node) || !window.devflow) return null;
-  const [eventsResult, evidenceResult] = await Promise.all([
-    window.devflow.getRunEvents(project.rootPath, node.runId),
-    window.devflow.getRunEvidence(project.rootPath, node.runId),
-  ]);
-  const evidence = requireRunEvidence(evidenceResult.evidence);
-  if (!hasTerminalRunEvidence(evidence)) return null;
-  const workflowSession = await persistWorkflowRunResult(
-    project,
-    session,
-    node,
-    eventsResult.events,
-    evidence,
-  );
-  return { events: eventsResult.events, evidence, workflowSession };
-}
-
-export function claimCompletedBridgeRunPersistence(
-  workspace: WorkspaceState,
-  event: RunEvent,
-  claims: Set<string>,
-): CompletedBridgeRunPersistenceClaim | null {
-  if (!isTerminalRunPersistenceEvent(event) || claims.has(event.runId)) return null;
-  for (const session of workspace.sessions) {
-    if (session.kind !== "canvas") continue;
-    const node = session.nodes.find((candidate) => candidate.runId === event.runId);
-    if (!node || !isExecutableNode(node)) continue;
-    if (node.status !== "running" && node.status !== "retrying") continue;
-    const project = workspace.projects.find((candidate) => candidate.id === session.projectId);
-    if (!project) continue;
-    claims.add(event.runId);
-    return { project, session, node, runId: event.runId };
-  }
-  return null;
-}
-
-export function applyCompletedBridgeRunPersistenceResult(
-  workspace: WorkspaceState,
-  runId: string,
-  result: CompletedBridgeRunPersistenceResult,
-): WorkspaceState {
-  const evidence = firstTerminalRunEvidence(workspace.runEvidence[runId], requireRunEvidence(result.evidence));
-  const withEvents = mergeRunEventsIntoWorkspace(workspace, runId, result.events);
-  const workflowSession = result.workflowSession
-    ? applyTerminalEvidenceToWorkflowSession(result.workflowSession, runId, evidence)
-    : null;
-  return {
-    ...withEvents,
-    sessions: workflowSession
-      ? withEvents.sessions.map((session) =>
-          session.id === workflowSession.id ? workflowSession : session,
-        )
-      : withEvents.sessions.map((session) =>
-          session.kind === "canvas" ? applyTerminalEvidenceToWorkflowSession(session, runId, evidence) : session,
-        ),
-    runEvidence: { ...withEvents.runEvidence, [runId]: evidence },
-  };
+  return { run: result.run, events: eventsResult.events, evidence, workflowSession: null };
 }
 
 export function applyBridgeRunResult(workspace: WorkspaceState, result: BridgeRunResult): WorkspaceState {
@@ -215,72 +138,6 @@ async function loadWorkflowLedger(
   if (!window.devflow || typeof window.devflow.getWorkflowLedger !== "function") return undefined;
   const result = await window.devflow.getWorkflowLedger(project.rootPath, sessionId);
   return isWorkflowLedgerSummary(result.ledger) ? result.ledger : undefined;
-}
-
-async function persistWorkflowRunResult(
-  project: ImportedProject,
-  session: CanvasSession,
-  node: CanvasNode,
-  events: RunEvent[],
-  evidence: RunEvidence,
-): Promise<CanvasSession | null> {
-  if (!window.devflow) return null;
-  const safeEvidence = requireRunEvidence(evidence);
-  if (!hasTerminalRunEvidence(safeEvidence)) return null;
-  const now = safeEvidence.completedAt ?? latestEventTimestamp(events) ?? new Date().toISOString();
-  if (isPlannerRootNode(session, node)) {
-    if (safeEvidence.status !== "succeeded") return null;
-    if (
-      typeof window.devflow.applyWorkflowIntent !== "function" ||
-      typeof window.devflow.recordWorkflowRunResult !== "function" ||
-      typeof window.devflow.scheduleWorkflowReadyLanes !== "function"
-    ) {
-      return null;
-    }
-    const intent = parseHermesWorkflowIntent(outputFromEvents(events).join("\n"));
-    if (!intent.ok) return null;
-    if (intent.intent.sessionId !== session.id) return null;
-    const recorded = await window.devflow.recordWorkflowRunResult(project.rootPath, {
-      sessionId: session.id,
-      laneId: node.id,
-      segmentId: segmentIdForNode(session.id, node.id),
-      runId: node.runId,
-      agentKind: node.agent,
-      now,
-    });
-    const applied = await window.devflow.applyWorkflowIntent(project.rootPath, intent.intent);
-    const schedulingPolicy = workflowSchedulingPolicyForSession(applied.canvasSession ?? recorded.canvasSession ?? session);
-    const scheduled = await window.devflow.scheduleWorkflowReadyLanes(project.rootPath, session.id, {
-      allowedParallelism: schedulingPolicy.allowedParallelism,
-      now,
-    });
-    const workflowSession = scheduled.canvasSession ?? applied.canvasSession ?? recorded.canvasSession ?? null;
-    return workflowSession ? applyTerminalEvidenceToSessionNode(workflowSession, node.id, safeEvidence) : null;
-  }
-
-  if (!node.display?.meta.includes("flow-kernel") || node.executable === false) return null;
-  if (
-    typeof window.devflow.recordWorkflowRunResult !== "function" ||
-    typeof window.devflow.scheduleWorkflowReadyLanes !== "function"
-  ) {
-    return null;
-  }
-  const recorded = await window.devflow.recordWorkflowRunResult(project.rootPath, {
-    sessionId: session.id,
-    laneId: node.id,
-    segmentId: segmentIdForNode(session.id, node.id),
-    runId: node.runId,
-    agentKind: node.agent,
-    now,
-  });
-  const schedulingSession = applyTerminalEvidenceToSessionNode(recorded.canvasSession ?? session, node.id, safeEvidence);
-  const schedulingPolicy = workflowSchedulingPolicyForSession(schedulingSession);
-  const scheduled = await window.devflow.scheduleWorkflowReadyLanes(project.rootPath, session.id, {
-    allowedParallelism: schedulingPolicy.allowedParallelism,
-    now,
-  });
-  const workflowSession = scheduled.canvasSession ?? recorded.canvasSession ?? null;
-  return workflowSession ? applyTerminalEvidenceToSessionNode(workflowSession, node.id, safeEvidence) : null;
 }
 
 function applyTerminalEvidenceToWorkflowSession(
@@ -357,6 +214,7 @@ export function mergeRunEventsIntoWorkspace(
   runId: string,
   events: RunEvent[],
 ): WorkspaceState {
+  const rendererWorkflowProjection = shouldUseRendererWorkflowProjection();
   const deduped = dedupeRunEvents([...(workspace.runEvents[runId] ?? []), ...events]);
   const evidence = evidenceFromRunEvents(runId, deduped, workspace.runEvidence[runId]);
   const sessions = workspace.sessions.map((session) => {
@@ -366,11 +224,15 @@ export function mergeRunEventsIntoWorkspace(
 
     const updatedSession = {
       ...session,
-      nodes: session.nodes.map((node) =>
-        node.runId === runId ? applyRunEventsToNode(node, session, deduped, evidence) : node
-      ),
+      nodes: session.nodes.map((node) => {
+        if (node.runId !== runId) return node;
+        if (!rendererWorkflowProjection && isPlannerRootNode(session, node)) {
+          return applyRunObservabilityToNode(node, deduped);
+        }
+        return applyRunEventsToNode(node, session, deduped, evidence);
+      }),
     };
-    if (!shouldUseRendererWorkflowProjection()) return updatedSession;
+    if (!rendererWorkflowProjection) return updatedSession;
     const projected = isPlannerRootNode(updatedSession, target)
       ? applyHermesWorkflowOutput(updatedSession, target, deduped)
       : updatedSession;
@@ -382,6 +244,16 @@ export function mergeRunEventsIntoWorkspace(
     sessions,
     runEvents: { ...workspace.runEvents, [runId]: deduped },
     runEvidence: evidence ? { ...workspace.runEvidence, [runId]: evidence } : workspace.runEvidence,
+  };
+}
+
+function applyRunObservabilityToNode(node: CanvasNode, events: RunEvent[]): CanvasNode {
+  const output = outputFromEvents(events);
+  const progress = progressPhraseFromEvents(events);
+  return {
+    ...node,
+    output: output.length > 0 ? output : node.output,
+    progress: progress ?? node.progress,
   };
 }
 
@@ -712,6 +584,7 @@ function userDecisionRequestedPayload(decision: UserDecisionProjection): Record<
     reason: decision.reason,
     ...(decision.targetLaneId ? { targetLaneId: decision.targetLaneId } : {}),
     ...(decision.targetSegmentId ? { targetSegmentId: decision.targetSegmentId } : {}),
+    ...(decision.runAuthorization ? { runAuthorization: decision.runAuthorization } : {}),
   };
 }
 
@@ -724,6 +597,7 @@ function userDecisionAnsweredPayload(decision: UserDecisionProjection): Record<s
     ...(decision.comment ? { comment: decision.comment } : {}),
     ...(decision.targetLaneId ? { targetLaneId: decision.targetLaneId } : {}),
     ...(decision.targetSegmentId ? { targetSegmentId: decision.targetSegmentId } : {}),
+    ...(decision.runAuthorization ? { runAuthorization: decision.runAuthorization } : {}),
   };
 }
 
@@ -947,6 +821,9 @@ function promptForNodeRun(
 export function sandboxForNodeRun(node: CanvasNode): AgentRunSandbox | undefined {
   if (node.executable === false || node.runtimePolicy?.executable === false) return undefined;
   if (node.agent !== "codex") return undefined;
+  if (node.requiredEvidence?.some((kind) => kind === "browser" || kind === "screenshot")) {
+    return "danger-full-access";
+  }
   const laneKind = node.display?.meta[0] ?? "";
   const laneText = `${laneKind} ${node.title}`.toLowerCase();
   if (node.runtimePolicy?.source === "workflow_projection" && node.runtimePolicy.trusted) {
@@ -1038,10 +915,6 @@ function dependencyEvidenceForPrompt(session: CanvasSession, node: CanvasNode): 
 function trimForPrompt(value: string, maxLength: number): string {
   if (value.length <= maxLength) return value;
   return `...${value.slice(value.length - maxLength)}`;
-}
-
-function segmentIdForNode(sessionId: string, nodeId: string): string {
-  return `segment-${sessionId}-${nodeId}`;
 }
 
 function isWorkflowLedgerSummary(value: unknown): value is WorkflowLedgerSummary {
@@ -1203,7 +1076,13 @@ function outputEvents(events: RunEvent[]): Array<{ text: string; timestamp: stri
 }
 
 function dedupeRunEvents(events: RunEvent[]): RunEvent[] {
-  return [...new Map(events.map((event) => [event.seq, event])).values()].sort((left, right) => left.seq - right.seq);
+  const deduped = new Map<number, RunEvent>();
+  for (const candidate of events) {
+    const event = parseRunEvent(candidate);
+    if (!event) throw new Error("Invalid RunEvidence event stream.");
+    deduped.set(event.seq, event);
+  }
+  return [...deduped.values()].sort((left, right) => left.seq - right.seq);
 }
 
 function latestEventTimestamp(events: RunEvent[]): string | null {
@@ -1232,25 +1111,6 @@ function isRunStatus(value: unknown): value is AgentRunStatus {
     value === "failed" ||
     value === "cancelled" ||
     value === "timed-out"
-  );
-}
-
-function isTerminalRunPersistenceEvent(event: RunEvent): boolean {
-  if (event.kind === "error") return true;
-  return event.kind === "status" && isRunStatus(event.payload.status) && isFinalRunStatus(event.payload.status);
-}
-
-function hasTerminalRunEvidence(evidence: RunEvidence): boolean {
-  if (!isFinalRunStatus(evidence.status)) return false;
-  if (evidence.status === "succeeded") return hasConcreteRunEvidence(evidence);
-  return Boolean(
-    evidence.completedAt ||
-      evidence.exitCode !== null ||
-      evidence.errorReason ||
-      evidence.cancelReason ||
-      evidence.checks.length > 0 ||
-      evidence.artifacts.length > 0 ||
-      evidence.review,
   );
 }
 

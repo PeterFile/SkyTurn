@@ -9,6 +9,7 @@ import type {
   UserDecisionAnsweredPayload,
   UserDecisionProjection,
   UserDecisionRequestedPayload,
+  WorkflowRunAuthorization,
   WorkflowLaneKind,
   WorkflowLaneSemanticSubtype,
   WorkflowNodeCheckpoint,
@@ -1552,10 +1553,10 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
       restoreRollbackSuccessorsForIntent(projection, intent, declaredLaneStatuses);
     }
     if (event.kind === "workflow.user_decision.requested") {
-      upsertUserDecision(projection, normalizeUserDecisionRequested(event.payload));
+      upsertUserDecision(projection, normalizeUserDecisionRequested(event.payload, event.source === "electron-main"));
     }
     if (event.kind === "workflow.user_decision.answered") {
-      answerUserDecision(projection, normalizeUserDecisionAnswered(event.payload));
+      answerUserDecision(projection, normalizeUserDecisionAnswered(event.payload, event.source === "renderer"));
     }
     if (event.kind === "workflow.delivery.pushed") {
       const evidence = normalizeDeliveryPushEvidence(event);
@@ -2383,9 +2384,15 @@ function normalizeSideEffects(value: unknown, fallback: WorkflowSideEffectKind[]
   return [...new Set(values)];
 }
 
-function normalizeUserDecisionRequested(payload: Record<string, unknown>): UserDecisionProjection {
+function normalizeUserDecisionRequested(
+  payload: Record<string, unknown>,
+  acceptRunAuthorization = false,
+): UserDecisionProjection {
   const requested = payload as Partial<UserDecisionRequestedPayload>;
   const decisionId = requireString(requested.decisionId, "decision.decisionId");
+  const runAuthorization = acceptRunAuthorization
+    ? normalizeWorkflowRunAuthorization(requested.runAuthorization)
+    : undefined;
   return {
     decisionId,
     prompt: typeof requested.prompt === "string" ? requested.prompt : "",
@@ -2394,11 +2401,18 @@ function normalizeUserDecisionRequested(payload: Record<string, unknown>): UserD
     status: "waiting_input",
     ...(typeof requested.targetLaneId === "string" ? { targetLaneId: requested.targetLaneId } : {}),
     ...(typeof requested.targetSegmentId === "string" ? { targetSegmentId: requested.targetSegmentId } : {}),
+    ...(runAuthorization ? { runAuthorization } : {}),
   };
 }
 
-function normalizeUserDecisionAnswered(payload: Record<string, unknown>): UserDecisionAnsweredPayload {
+function normalizeUserDecisionAnswered(
+  payload: Record<string, unknown>,
+  acceptRunAuthorization = false,
+): UserDecisionAnsweredPayload {
   const decisionId = requireString(payload.decisionId, "decision.decisionId");
+  const runAuthorization = acceptRunAuthorization
+    ? normalizeWorkflowRunAuthorization(payload.runAuthorization)
+    : undefined;
   return {
     decisionId,
     selectedOption: typeof payload.selectedOption === "string" ? payload.selectedOption : "",
@@ -2406,6 +2420,7 @@ function normalizeUserDecisionAnswered(payload: Record<string, unknown>): UserDe
     ...(typeof payload.comment === "string" ? { comment: payload.comment } : {}),
     ...(typeof payload.targetLaneId === "string" ? { targetLaneId: payload.targetLaneId } : {}),
     ...(typeof payload.targetSegmentId === "string" ? { targetSegmentId: payload.targetSegmentId } : {}),
+    ...(runAuthorization ? { runAuthorization } : {}),
   };
 }
 
@@ -2422,6 +2437,16 @@ function answerUserDecision(projection: FlowProjection, answer: UserDecisionAnsw
   const index = projection.userDecisions.findIndex((item) => item.decisionId === answer.decisionId);
   if (index === -1) return;
   const existing = projection.userDecisions[index];
+  if (
+    (existing.runAuthorization || answer.runAuthorization) &&
+    (
+      !answer.runAuthorization ||
+      !existing.runAuthorization ||
+      !sameWorkflowRunAuthorization(existing.runAuthorization, answer.runAuthorization) ||
+      answer.targetLaneId !== existing.targetLaneId ||
+      answer.targetSegmentId !== existing.targetSegmentId
+    )
+  ) return;
   const next: UserDecisionProjection = {
     decisionId: answer.decisionId,
     prompt: existing.prompt,
@@ -2433,8 +2458,34 @@ function answerUserDecision(projection: FlowProjection, answer: UserDecisionAnsw
     selectedOption: answer.selectedOption,
     action: answer.action,
     ...(answer.comment ? { comment: answer.comment } : {}),
+    ...(answer.runAuthorization ? { runAuthorization: answer.runAuthorization } : {}),
   };
   projection.userDecisions[index] = next;
+}
+
+function normalizeWorkflowRunAuthorization(value: unknown): WorkflowRunAuthorization | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    value.sandbox !== "danger-full-access" ||
+    typeof value.runId !== "string" ||
+    value.runId.length === 0 ||
+    typeof value.startFingerprint !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.startFingerprint)
+  ) return undefined;
+  return {
+    sandbox: "danger-full-access",
+    runId: value.runId,
+    startFingerprint: value.startFingerprint,
+  };
+}
+
+function sameWorkflowRunAuthorization(
+  left: WorkflowRunAuthorization,
+  right: WorkflowRunAuthorization,
+): boolean {
+  return left.sandbox === right.sandbox &&
+    left.runId === right.runId &&
+    left.startFingerprint === right.startFingerprint;
 }
 
 function refreshProjectionNodes(projection: FlowProjection): void {

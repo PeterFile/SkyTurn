@@ -1613,6 +1613,12 @@ export interface WorkflowRuntimePolicy {
   reason: string;
 }
 
+export interface WorkflowRunAuthorization {
+  sandbox: "danger-full-access";
+  runId: string;
+  startFingerprint: string;
+}
+
 export interface UserDecisionRequestedPayload {
   decisionId: string;
   prompt: string;
@@ -1620,6 +1626,7 @@ export interface UserDecisionRequestedPayload {
   reason: string;
   targetLaneId?: string;
   targetSegmentId?: string;
+  runAuthorization?: WorkflowRunAuthorization;
 }
 
 export interface UserDecisionAnsweredPayload {
@@ -1629,6 +1636,7 @@ export interface UserDecisionAnsweredPayload {
   comment?: string;
   targetLaneId?: string;
   targetSegmentId?: string;
+  runAuthorization?: WorkflowRunAuthorization;
 }
 
 export interface UserDecisionProjection {
@@ -1642,6 +1650,7 @@ export interface UserDecisionProjection {
   selectedOption?: string;
   action?: UserDecisionAction;
   comment?: string;
+  runAuthorization?: WorkflowRunAuthorization;
 }
 
 export interface WorkflowLedgerSummaryEvent {

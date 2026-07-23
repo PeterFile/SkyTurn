@@ -95,15 +95,6 @@ export interface WorkflowInsertBeforeResult {
   canvasSession: CanvasSession | null;
 }
 
-export interface WorkflowRunResultRecordRequest {
-  sessionId: string;
-  laneId: string;
-  segmentId: string;
-  runId: string;
-  agentKind: AgentKind;
-  now: string;
-}
-
 export interface WorkflowNodePositionUpdateRequest {
   sessionId: string;
   updateId: string;
@@ -292,9 +283,6 @@ export interface WorkflowApi {
   finishPlan: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   appendUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   getLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: WorkflowLedgerSummary }>;
-  applyIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  scheduleReady: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  recordRunResult: (projectRoot: string, input: WorkflowRunResultRecordRequest) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) => Promise<{ protocolVersion: number; event: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
   getProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
@@ -372,9 +360,6 @@ export interface DevflowApi {
   getWorkflowLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: unknown }>;
   getChangeset: (projectRoot: string, node: CanvasNode) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
-  applyWorkflowIntent: (projectRoot: string, intent: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  scheduleWorkflowReadyLanes: (projectRoot: string, sessionId: string, input: unknown) => Promise<{ protocolVersion: number; result: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  recordWorkflowRunResult: (projectRoot: string, input: WorkflowRunResultRecordRequest) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
   workflow: WorkflowApi;
   terminal: TerminalApi;

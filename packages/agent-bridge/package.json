@@ -8,6 +8,7 @@
   "files": [
     "dist",
     "dist/native/artifact-gate.ps1",
+    "dist/native/job-object-host.ps1",
     "src"
   ],
   "exports": {
@@ -23,7 +24,8 @@
     "native:copy": "node scripts/buildArtifactGate.mjs --copy-dist",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "pnpm run native:build && vitest run src"
+    "test": "pnpm run native:build && vitest run src",
+    "test:windows": "node scripts/windowsProcessTreeIntegration.mjs"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.2.1",
