@@ -150,7 +150,7 @@ export async function runNewSessionUiAcceptance() {
       try {
         await openProjectThroughUi(liveCdp, projectRoot);
         await fillTextareaAndClickCreate(liveCdp, requirement);
-        const firstWorkspace = await waitForWorkflowCompletion({
+        const firstAuthoritative = await waitForWorkflowCompletion({
           cdp: liveCdp,
           baselineCommitSha,
           workspacePath,
@@ -158,9 +158,8 @@ export async function runNewSessionUiAcceptance() {
           graphSummary: demo.flowKernelGraphSummary,
           readiness: readinessPreflight.readiness,
         });
-        const firstSession = activeCanvasSession(firstWorkspace);
+        const firstSession = firstAuthoritative.canvasSession;
         if (!firstSession) throw new Error("New Session did not create an authoritative CanvasSession.");
-        const firstAuthoritative = await readAuthoritativePlannerState(liveCdp, projectRoot, firstSession.id);
 
         await submitCanvasInput(liveCdp, followUpRequirement);
         const secondAuthoritative = await waitForAuthoritativePlannerTurns({
@@ -197,9 +196,9 @@ export async function runNewSessionUiAcceptance() {
           second: secondAuthoritative,
           reopened: reopenedAuthoritative,
         });
-        const workspace = await readWorkspaceFile(workspacePath);
         const session = reopenedAuthoritative.canvasSession;
         const verification = await collectFinalVerification({
+          authoritativeEvidence: reopenedAuthoritative.authoritativeEvidence,
           baselineCommitSha,
           demo,
           expectedCaptureScriptHash,
@@ -209,7 +208,6 @@ export async function runNewSessionUiAcceptance() {
           replay,
           secondTurnLaneIds: replay.secondTurnLaneIds,
           session,
-          workspace,
         });
         const mockFallback = mockFallbackForReadiness(readinessPreflight.readiness);
         const predicateOk = verification.ok && replay.ok && rendererReplay.ok && mockFallback === false;
@@ -255,8 +253,8 @@ export async function runNewSessionUiAcceptance() {
           laneKindEvidence: verification.laneKindEvidence,
           strictWorkflow: verification.strictWorkflow,
           cleanup: outcomeCleanup,
-          runEvidence: runEvidenceSummary(workspace),
-          agentRunEvidence: agentRunEvidenceSummary(session, workspace),
+          runEvidence: runEvidenceSummary(reopenedAuthoritative.authoritativeEvidence),
+          agentRunEvidence: agentRunEvidenceSummary(session, reopenedAuthoritative.authoritativeEvidence),
           screenshot: {
             path: verification.screenshotPath,
             bytes: verification.screenshotBytes,
@@ -972,7 +970,7 @@ async function assertSkyTurnRendererReady(cdp) {
 }
 
 async function readAuthoritativePlannerState(cdp, projectRoot, sessionId) {
-  return cdp.evaluate(`
+  const state = await cdp.evaluate(`
     Promise.all([
       window.devflow.getWorkflowProjection(${JSON.stringify(projectRoot)}, ${JSON.stringify(sessionId)}),
       window.devflow.getWorkflowEvents(${JSON.stringify(projectRoot)}, ${JSON.stringify(sessionId)}),
@@ -982,6 +980,11 @@ async function readAuthoritativePlannerState(cdp, projectRoot, sessionId) {
       events: eventResult.events,
     }))
   `, { awaitPromise: true, returnByValue: true });
+  const authoritativeEvidence = authoritativeProjectionEvidenceState(state?.projection);
+  if (!authoritativeEvidence.ok) {
+    throw new Error(`Authoritative projection evidence is invalid: ${authoritativeEvidence.failures.join(", ")}`);
+  }
+  return { ...state, authoritativeEvidence };
 }
 
 async function waitForAuthoritativePlannerTurns({ cdp, projectRoot, sessionId, expectedTurns }) {
@@ -1037,28 +1040,53 @@ export function executableWorkflowSession(session) {
 export function authoritativeWorkflowSettled(state) {
   const nodes = state?.canvasSession?.nodes;
   if (!Array.isArray(nodes) || nodes.length === 0) return false;
+  const authoritativeEvidence = state?.authoritativeEvidence ??
+    authoritativeProjectionEvidenceState(state?.projection);
+  if (!authoritativeEvidence.ok) return false;
   if (!nodes.every((node) => node?.status !== "running" && node?.status !== "retrying")) return false;
   if (!userDecisionsSettled(state?.canvasSession)) return false;
-  const executableNodes = executableWorkflowNodes(state?.canvasSession).filter((node) =>
-    typeof node?.runId === "string" && node.runId.length > 0
-  );
+  const planner = nodes.find((node) => node?.id === state?.canvasSession?.plannerNodeId);
+  if (!planner || planner.status !== "completed") return false;
+  const executableNodes = executableWorkflowNodes(state?.canvasSession);
   return executableNodes.length > 0 && executableNodes.every((node) => {
-    const segment = state?.projection?.segments?.find((candidate) =>
-      candidate?.laneId === node.id && candidate?.runId === node.runId &&
-      terminalSegmentStatus(candidate.status)
+    if (
+      node?.status !== "completed" ||
+      typeof node.runId !== "string" ||
+      node.runId.length === 0
+    ) return false;
+    const segments = (state?.projection?.segments ?? []).filter((candidate) =>
+      candidate?.laneId === node.id && candidate?.runId === node.runId
     );
-    if (!segment || typeof segment.id !== "string") return false;
-    const evidence = state?.projection?.evidence?.find((candidate) =>
+    if (segments.length !== 1) return false;
+    const segment = segments[0];
+    if (
+      typeof segment.id !== "string" ||
+      (segment.status !== "succeeded" && segment.status !== "completed")
+    ) return false;
+    const evidenceMatches = (state?.projection?.evidence ?? []).filter((candidate) =>
       candidate?.laneId === node.id && candidate?.segmentId === segment.id &&
       candidate?.status === "passed" && candidate?.runEvidence?.runId === node.runId
     );
-    if (!evidence || typeof evidence.id !== "string") return false;
-    const afterCheckpoint = state?.projection?.checkpoints?.find((candidate) =>
+    if (evidenceMatches.length !== 1) return false;
+    const evidence = evidenceMatches[0];
+    if (
+      typeof evidence.id !== "string" ||
+      stableJson(evidence.runEvidence) !== stableJson(authoritativeEvidence.runEvidence[node.runId])
+    ) return false;
+    const afterCheckpoints = (state?.projection?.checkpoints ?? []).filter((candidate) =>
       candidate?.laneId === node.id && candidate?.runId === node.runId &&
       candidate?.segmentId === segment.id && candidate?.phase === "after"
     );
-    const evidenceRefKinds = new Set((afterCheckpoint?.evidenceRefs ?? []).map((reference) => reference?.kind));
-    return evidenceRefKinds.has("run") && evidenceRefKinds.has("evidence") && evidenceRefKinds.has("changeset");
+    if (afterCheckpoints.length !== 1) return false;
+    const afterCheckpoint = afterCheckpoints[0];
+    return checkpointReferenceFailures({
+      checkpoint: afterCheckpoint,
+      laneId: node.id,
+      phase: "after",
+      projection: state?.projection,
+      runId: node.runId,
+      segmentId: segment.id,
+    }).length === 0;
   });
 }
 
@@ -1357,13 +1385,75 @@ function stableJson(value) {
   });
 }
 
+export function authoritativeProjectionEvidenceState(projection) {
+  const failures = [];
+  const records = [];
+  const seenByRunId = new Map();
+  const passedByRunId = new Map();
+
+  for (const projectedEvidence of Array.isArray(projection?.evidence) ? projection.evidence : []) {
+    const runEvidence = projectedEvidence?.runEvidence;
+    const runId = runEvidence?.runId;
+    if (
+      !runEvidence ||
+      typeof runEvidence !== "object" ||
+      Array.isArray(runEvidence) ||
+      typeof runId !== "string" ||
+      runId.length === 0
+    ) continue;
+
+    const record = {
+      evidenceId: projectedEvidence?.id ?? null,
+      laneId: projectedEvidence?.laneId ?? null,
+      segmentId: projectedEvidence?.segmentId ?? null,
+      status: projectedEvidence?.status ?? null,
+      runEvidence,
+    };
+    const previous = seenByRunId.get(runId);
+    if (previous) {
+      const duplicate = stableJson({
+        laneId: previous.laneId,
+        segmentId: previous.segmentId,
+        status: previous.status,
+        runEvidence: previous.runEvidence,
+      }) === stableJson({
+        laneId: record.laneId,
+        segmentId: record.segmentId,
+        status: record.status,
+        runEvidence: record.runEvidence,
+      });
+      failures.push(`projection-run-evidence-${duplicate ? "duplicate" : "conflict"}:${runId}`);
+    } else {
+      seenByRunId.set(runId, record);
+    }
+    records.push(record);
+    if (!previous && projectedEvidence?.status === "passed") {
+      passedByRunId.set(runId, runEvidence);
+    }
+  }
+
+  return {
+    ok: failures.length === 0,
+    failures,
+    runEvidence: Object.fromEntries(passedByRunId),
+    records,
+  };
+}
+
 async function waitForWorkflowCompletion({ cdp, baselineCommitSha, workspacePath, projectRoot, graphSummary, readiness }) {
   const deadline = Date.now() + waitTimeoutMs;
   let lastWorkspace = null;
+  let lastAuthoritative = null;
+  let sessionId = null;
   while (Date.now() < deadline) {
     const workspace = await readWorkspaceFile(workspacePath);
     lastWorkspace = workspace ?? lastWorkspace;
-    const session = activeCanvasSession(workspace);
+    sessionId ??= activeCanvasSession(workspace)?.id ?? null;
+    const authoritative = sessionId
+      ? await readAuthoritativePlannerState(cdp, projectRoot, sessionId)
+      : null;
+    lastAuthoritative = authoritative ?? lastAuthoritative;
+    const session = authoritative?.canvasSession;
     if (session) {
       const pendingDangerNodes = pendingDangerAuthorizationNodes(session);
       if (pendingDangerNodes.length > 0) {
@@ -1373,41 +1463,65 @@ async function waitForWorkflowCompletion({ cdp, baselineCommitSha, workspacePath
       }
       const flowNodes = executableWorkflowNodes(session);
       const graph = graphSummary(executableWorkflowSession(session), session.plannerNodeId);
+      const graphAcceptance = workflowGraphAcceptanceSummary(graph);
       const commitCount = await gitCommitCount(projectRoot).catch(() => 0);
-      const terminalFailure = terminalWorkflowFailure(session, workspace);
+      const terminalFailure = terminalWorkflowFailure(
+        session,
+        authoritative.projection,
+        authoritative.authoritativeEvidence,
+      );
       if (terminalFailure) {
         const headCommitSha = await gitHeadShaOrNull(projectRoot);
         throw new WorkflowTerminalFailureError(workflowTerminalFailureResult({
+          authoritativeEvidence: authoritative.authoritativeEvidence,
           baselineCommitSha,
           headCommitSha,
+          projection: authoritative.projection,
           projectRoot,
           readiness,
+          session,
           terminalFailure,
           workspacePath,
-          workspace,
         }));
       }
-      const hasTerminalEvidence = Object.values(workspace.runEvidence ?? {}).some((evidence) =>
-        evidence && typeof evidence === "object" &&
-        ["succeeded", "failed", "cancelled", "timed-out"].includes(evidence.status),
-      );
+      const headCommitSha = await gitHeadShaOrNull(projectRoot);
+      const commitAdvanced = isFullGitCommit(headCommitSha) && headCommitSha !== baselineCommitSha;
       const completedFlow = flowNodes.length > 0 && flowNodes.every((node) => node.status === "completed");
-      if (completedFlow && graph.codexLaneCount > 0 && commitCount > 1 && hasTerminalEvidence) {
-        return workspace;
+      const graphReady = graph.connected &&
+        graph.codexLaneCount > 0 &&
+        graph.rootDependencyIds.length === 0 &&
+        graph.rootIncomingEdgeIds.length === 0 &&
+        graphAcceptance.ok;
+      if (
+        completedFlow &&
+        graphReady &&
+        commitCount > 1 &&
+        commitAdvanced &&
+        authoritativePlannerTurnCount(authoritative) >= 1 &&
+        authoritativeWorkflowSettled(authoritative)
+      ) {
+        return authoritative;
       }
     }
     await delay(pollIntervalMs);
   }
-  throw new Error(`Timed out waiting for New Session workflow completion after ${waitTimeoutMs}ms. Last workspace: ${summarizeWorkspace(lastWorkspace)}`);
+  throw new Error(
+    `Timed out waiting for New Session workflow completion after ${waitTimeoutMs}ms. ` +
+    `Last authoritative state: ${boundedDiagnosticText(JSON.stringify(lastAuthoritative), commandOutputLimitBytes)}. ` +
+    `Last workspace: ${summarizeWorkspace(lastWorkspace)}`,
+  );
 }
 
-export function requiredLaneEvidenceSummary(session, workspace, excludedNodeIds = []) {
+export function requiredLaneEvidenceSummary(session, authoritativeEvidence, excludedNodeIds = []) {
   const nodes = Array.isArray(session?.nodes) ? session.nodes : [];
   const excludedNodeIdSet = excludedNodeIds instanceof Set
     ? excludedNodeIds
     : new Set(Array.isArray(excludedNodeIds) ? excludedNodeIds : []);
-  const runEvidence = workspace?.runEvidence && typeof workspace.runEvidence === "object"
-    ? workspace.runEvidence
+  const evidenceStateValid = authoritativeEvidence?.ok === true;
+  const runEvidence = evidenceStateValid &&
+    authoritativeEvidence.runEvidence &&
+    typeof authoritativeEvidence.runEvidence === "object"
+    ? authoritativeEvidence.runEvidence
     : {};
   const candidatesByKind = Object.fromEntries(requiredLaneKinds.map((kind) => {
     const candidates = nodes
@@ -1446,7 +1560,10 @@ export function requiredLaneEvidenceSummary(session, workspace, excludedNodeIds 
     }
   }
   return {
-    ok: requiredLaneKinds.every((kind) => lanes[kind].ok),
+    ok: evidenceStateValid && requiredLaneKinds.every((kind) => lanes[kind].ok),
+    failures: evidenceStateValid
+      ? []
+      : [...(authoritativeEvidence?.failures ?? ["authoritative-evidence-state-missing"])],
     lanes,
   };
 }
@@ -1536,16 +1653,21 @@ function exactStringArray(actual, expected) {
 }
 
 export function strictWorkflowAcceptanceSummary({
+  authoritativeEvidence,
   baselineCommitSha,
   deliveryCommitCount,
   finalHeadCommitSha,
   session,
-  workspace,
   projection,
   replay,
   secondTurnLaneIds = [],
 }) {
   const nodes = Array.isArray(session?.nodes) ? session.nodes : [];
+  const projectedEvidenceState = authoritativeProjectionEvidenceState(projection);
+  const authoritativeEvidenceMatchesProjection =
+    authoritativeEvidence?.ok === true &&
+    projectedEvidenceState.ok &&
+    stableJson(authoritativeEvidence) === stableJson(projectedEvidenceState);
   const plannerNodeId = typeof session?.plannerNodeId === "string" ? session.plannerNodeId : null;
   const decisionsSettled = userDecisionsSettled(session);
   secondTurnLaneIds = Array.isArray(secondTurnLaneIds) ? secondTurnLaneIds : [];
@@ -1557,7 +1679,7 @@ export function strictWorkflowAcceptanceSummary({
   const nonPlannerNodes = plannerNodeId === null ? [] : executableWorkflowNodes(session);
   const followUpNodes = followUpId === null ? [] : nonPlannerNodes.filter((node) => node?.id === followUpId);
   const initialNodes = followUpId === null ? nonPlannerNodes : nonPlannerNodes.filter((node) => node?.id !== followUpId);
-  const initialLaneEvidence = requiredLaneEvidenceSummary(session, workspace, secondTurnLaneIds);
+  const initialLaneEvidence = requiredLaneEvidenceSummary(session, authoritativeEvidence, secondTurnLaneIds);
   const roleNodes = Object.fromEntries(requiredLaneKinds.map((kind) => [
     kind,
     initialNodes.filter((node) => projectedLaneKind(node) === kind),
@@ -1619,16 +1741,16 @@ export function strictWorkflowAcceptanceSummary({
         evidence?.laneId === followUpId && evidence?.segmentId === segment.id
       );
   const projectedRunEvidence = matchingEvidence[0]?.runEvidence ?? null;
-  const workspaceEvidence = typeof followUp?.runId === "string"
-    ? workspace?.runEvidence?.[followUp.runId]
+  const authoritativeRunEvidence = typeof followUp?.runId === "string"
+    ? authoritativeEvidence?.runEvidence?.[followUp.runId]
     : null;
   const followUpEvidenceValid = followUpStructureValid && matchingSegments.length === 1 &&
     matchingEvidence.length === 1 && matchingEvidence[0]?.status === "passed" &&
     typeof followUp.runId === "string" && followUp.runId.length > 0 &&
     segment?.runId === followUp.runId && segment.status === "succeeded" &&
     successfulCodexEvidence(projectedRunEvidence, followUp.runId) &&
-    successfulCodexEvidence(workspaceEvidence, followUp.runId) &&
-    stableJson(projectedRunEvidence) === stableJson(workspaceEvidence);
+    successfulCodexEvidence(authoritativeRunEvidence, followUp.runId) &&
+    stableJson(projectedRunEvidence) === stableJson(authoritativeRunEvidence);
   const deliveryCheckpoints = deliveryCheckpointAcceptanceSummary({
     baselineCommitSha,
     deliveryCommitCount,
@@ -1639,6 +1761,7 @@ export function strictWorkflowAcceptanceSummary({
     sessionId: session?.id,
   });
   const failures = [
+    authoritativeEvidenceMatchesProjection ? null : "authoritative-evidence-invalid",
     decisionsSettled ? null : "user-decisions-not-settled",
     secondTurnLaneSetValid ? null : "second-turn-lane-set-invalid",
     initialLaneSetValid ? null : "initial-lane-set-invalid",
@@ -1747,6 +1870,24 @@ function laneCheckpointAcceptanceSummary({
   const after = checkpointForPhase(checkpoints, "after", failures);
   validateCheckpointIdentity(before, "before", { failures, node, segment, sessionId });
   validateCheckpointIdentity(after, "after", { failures, node, segment, sessionId });
+  failures.push(
+    ...checkpointReferenceFailures({
+      checkpoint: before,
+      laneId: node.id,
+      phase: "before",
+      projection,
+      runId: node.runId,
+      segmentId: segment?.id,
+    }),
+    ...checkpointReferenceFailures({
+      checkpoint: after,
+      laneId: node.id,
+      phase: "after",
+      projection,
+      runId: node.runId,
+      segmentId: segment?.id,
+    }),
+  );
 
   const beforeHead = before?.headCommit ?? null;
   const afterHead = after?.headCommit ?? null;
@@ -1784,6 +1925,85 @@ function validateCheckpointIdentity(checkpoint, phase, { failures, node, segment
   if (checkpoint.executionTarget !== "current_branch") failures.push(`${phase}-target-mismatch`);
 }
 
+function checkpointReferenceFailures({
+  checkpoint,
+  laneId,
+  phase,
+  projection,
+  runId,
+  segmentId,
+}) {
+  if (!checkpoint) return [];
+  const failures = [];
+  const references = Array.isArray(checkpoint.evidenceRefs) ? checkpoint.evidenceRefs : [];
+  requireCheckpointReference(references, "run", runId, phase, failures);
+  requireCheckpointReference(references, "segment", segmentId, phase, failures);
+
+  const changesetEvidenceId = `changeset-evidence:${runId}:${phase}`;
+  requireCheckpointReference(references, "changeset", changesetEvidenceId, phase, failures);
+  const matchingChangesetEvidence = (projection?.changesetEvidence ?? []).filter((record) =>
+    record?.evidenceId === changesetEvidenceId
+  );
+  if (matchingChangesetEvidence.length !== 1) {
+    failures.push(`${phase}-changeset-evidence-count:${matchingChangesetEvidence.length}`);
+  } else if (!validCheckpointChangesetEvidence(matchingChangesetEvidence[0], changesetEvidenceId)) {
+    failures.push(`${phase}-changeset-evidence-invalid`);
+  }
+
+  const evidenceReferences = references.filter((reference) => reference?.kind === "evidence");
+  if (phase === "before") {
+    if (evidenceReferences.length !== 0) {
+      failures.push(`before-evidence-ref-count:${evidenceReferences.length}`);
+    }
+    return failures;
+  }
+
+  const authoritativeEvidence = (projection?.evidence ?? []).filter((record) =>
+    record?.laneId === laneId &&
+    record?.segmentId === segmentId &&
+    record?.status === "passed" &&
+    record?.runEvidence?.runId === runId
+  );
+  if (authoritativeEvidence.length !== 1) {
+    failures.push(`after-authoritative-evidence-count:${authoritativeEvidence.length}`);
+  }
+  const evidenceId = authoritativeEvidence[0]?.id;
+  if (authoritativeEvidence.length === 1 && (typeof evidenceId !== "string" || evidenceId.length === 0)) {
+    failures.push("after-authoritative-evidence-id-invalid");
+  }
+  requireCheckpointReference(references, "evidence", evidenceId, phase, failures);
+  return failures;
+}
+
+function requireCheckpointReference(references, kind, expectedId, phase, failures) {
+  const matches = references.filter((reference) => reference?.kind === kind);
+  if (matches.length !== 1) {
+    failures.push(`${phase}-${kind}-ref-count:${matches.length}`);
+    return;
+  }
+  if (matches[0]?.id !== expectedId) failures.push(`${phase}-${kind}-ref-id-mismatch`);
+}
+
+function validCheckpointChangesetEvidence(record, evidenceId) {
+  const diffStat = record?.diffStat;
+  return !!record &&
+    typeof record === "object" &&
+    !Array.isArray(record) &&
+    record.evidenceId === evidenceId &&
+    typeof record.changesetId === "string" &&
+    record.changesetId.length > 0 &&
+    record.source === "git" &&
+    (record.status === "available" || record.status === "empty") &&
+    Array.isArray(record.files) &&
+    record.files.every((path) => typeof path === "string") &&
+    !!diffStat &&
+    typeof diffStat === "object" &&
+    ["added", "changed", "deleted"].every((key) =>
+      Number.isInteger(diffStat[key]) && diffStat[key] >= 0
+    ) &&
+    typeof record.patchPreviewTruncated === "boolean";
+}
+
 function isFullGitCommit(value) {
   return typeof value === "string" && /^[0-9a-f]{40}$/i.test(value);
 }
@@ -1812,6 +2032,7 @@ export function workflowGraphAcceptanceSummary(graph) {
 }
 
 async function collectFinalVerification({
+  authoritativeEvidence,
   baselineCommitSha,
   demo,
   expectedCaptureScriptHash,
@@ -1821,7 +2042,6 @@ async function collectFinalVerification({
   replay,
   secondTurnLaneIds = [],
   session,
-  workspace,
 }) {
   const verifyScriptPath = join(projectRoot, "scripts", "verify.mjs");
   const captureScriptPath = join(projectRoot, "scripts", "capture-screenshot.mjs");
@@ -1861,11 +2081,11 @@ async function collectFinalVerification({
   const flowNodes = executableWorkflowNodes(session);
   const sessionTarget = session?.target ?? null;
   const strictWorkflow = strictWorkflowAcceptanceSummary({
+    authoritativeEvidence,
     baselineCommitSha,
     deliveryCommitCount,
     finalHeadCommitSha: headCommitSha,
     session,
-    workspace,
     projection,
     replay,
     secondTurnLaneIds,
@@ -2082,32 +2302,39 @@ function laneStatuses(session) {
     }));
 }
 
-function runEvidenceSummary(workspace) {
+function runEvidenceSummary(authoritativeEvidence) {
   return Object.fromEntries(
-    Object.entries(workspace?.runEvidence ?? {}).map(([runId, evidence]) => [
-      runId,
+    (authoritativeEvidence?.records ?? []).map((record) => [
+      record.runEvidence.runId,
       {
-        runId: evidence.runId,
-        status: evidence.status,
-        exitCode: evidence.exitCode,
-        checks: evidence.checks,
-        artifacts: evidence.artifacts,
-        errorReason: evidence.errorReason,
-        cancelReason: evidence.cancelReason,
-        completedAt: evidence.completedAt,
+        projectionEvidenceId: record.evidenceId,
+        projectionLaneId: record.laneId,
+        projectionSegmentId: record.segmentId,
+        projectionStatus: record.status,
+        runId: record.runEvidence.runId,
+        status: record.runEvidence.status,
+        exitCode: record.runEvidence.exitCode,
+        checks: record.runEvidence.checks,
+        artifacts: record.runEvidence.artifacts,
+        errorReason: record.runEvidence.errorReason,
+        cancelReason: record.runEvidence.cancelReason,
+        completedAt: record.runEvidence.completedAt,
       },
     ]),
   );
 }
 
-function agentRunEvidenceSummary(session, workspace) {
+function agentRunEvidenceSummary(session, authoritativeEvidence) {
   const result = { hermes: [], codex: [] };
   for (const node of laneStatuses(session)) {
     if (node.agent !== "hermes" && node.agent !== "codex") continue;
-    const evidence = workspace?.runEvidence?.[node.runId] ?? null;
+    const record = authoritativeEvidenceRecord(authoritativeEvidence, node.runId);
+    const evidence = record?.runEvidence ?? null;
     result[node.agent].push({
       nodeId: node.id,
       runId: node.runId,
+      projectionEvidenceId: record?.evidenceId ?? null,
+      projectionStatus: record?.status ?? null,
       evidenceRunId: evidence?.runId ?? null,
       laneStatus: node.status,
       evidenceStatus: evidence?.status ?? null,
@@ -2122,11 +2349,18 @@ function agentRunEvidenceSummary(session, workspace) {
   return result;
 }
 
-export function hasSuccessfulRunEvidenceForAgent(session, workspace, agent) {
-  return laneStatuses(session).some((node) =>
+export function hasSuccessfulRunEvidenceForAgent(session, authoritativeEvidence, agent) {
+  return authoritativeEvidence?.ok === true && laneStatuses(session).some((node) =>
     node.agent === agent &&
-    hasSuccessfulCliExitEvidence(node, workspace?.runEvidence?.[node.runId] ?? null),
+    hasSuccessfulCliExitEvidence(node, authoritativeEvidence?.runEvidence?.[node.runId] ?? null),
   );
+}
+
+function authoritativeEvidenceRecord(authoritativeEvidence, runId) {
+  if (typeof runId !== "string") return null;
+  return (authoritativeEvidence?.records ?? []).find((record) =>
+    record?.runEvidence?.runId === runId
+  ) ?? null;
 }
 
 function hasSuccessfulCliExitEvidence(node, evidence) {
@@ -2155,10 +2389,9 @@ function emptyAcceptanceResult(projectRoot, readiness) {
     sessionId: null,
     sessionTarget: null,
     laneStatuses: [],
-    laneKindEvidence: requiredLaneEvidenceSummary(null, null),
+    laneKindEvidence: requiredLaneEvidenceSummary(null, authoritativeProjectionEvidenceState(null)),
     runEvidence: {},
     agentRunEvidence: { hermes: [], codex: [] },
-    latestWorkspace: null,
     screenshot: { path: null, bytes: 0 },
     verificationCommand: {
       verify: {
@@ -2189,31 +2422,32 @@ function emptyAcceptanceResult(projectRoot, readiness) {
 }
 
 export function workflowTerminalFailureResult({
+  authoritativeEvidence,
   baselineCommitSha = null,
   headCommitSha = null,
+  projection,
   projectRoot,
   readiness,
+  session,
   terminalFailure = null,
   workspacePath,
-  workspace,
 }) {
-  const session = activeCanvasSession(workspace);
   const sessionTarget = session?.target ?? null;
   return {
     ...emptyAcceptanceResult(projectRoot, readiness),
     failure: {
       code: "WORKFLOW_RUN_FAILED",
       message: "Workflow reached terminal agent failure evidence before completion.",
-      diagnostic: terminalFailure?.diagnostic ?? workflowFailureDiagnostic(session, workspace),
+      diagnostic: terminalFailure?.diagnostic ??
+        workflowFailureDiagnostic(session, projection, authoritativeEvidence),
     },
     workspacePath,
     sessionId: session?.id ?? null,
     sessionTarget,
     laneStatuses: laneStatuses(session),
-    laneKindEvidence: requiredLaneEvidenceSummary(session, workspace),
-    runEvidence: runEvidenceSummary(workspace),
-    agentRunEvidence: agentRunEvidenceSummary(session, workspace),
-    latestWorkspace: workspace ?? null,
+    laneKindEvidence: requiredLaneEvidenceSummary(session, authoritativeEvidence),
+    runEvidence: runEvidenceSummary(authoritativeEvidence),
+    agentRunEvidence: agentRunEvidenceSummary(session, authoritativeEvidence),
     baselineCommitSha,
     headCommitSha,
     commitSha: headCommitSha,
@@ -2228,22 +2462,36 @@ class WorkflowTerminalFailureError extends Error {
   }
 }
 
-function terminalWorkflowFailure(session, workspace) {
+function terminalWorkflowFailure(session, projection, authoritativeEvidence) {
   const lanes = laneStatuses(session);
-  const failedNode = lanes.find((node) => node.status === "failed");
+  const failedNode = lanes.find((node) =>
+    ["failed", "cancelled", "timed-out"].includes(node.status)
+  );
   if (failedNode) {
     return {
       diagnostic: `node-failed:${failedNode.id}:${failedNode.runId}`,
       node: failedNode,
-      evidence: workspace?.runEvidence?.[failedNode.runId] ?? null,
+      evidence: authoritativeEvidenceRecord(authoritativeEvidence, failedNode.runId)?.runEvidence ?? null,
     };
   }
 
   for (const node of lanes) {
-    const evidence = workspace?.runEvidence?.[node.runId] ?? null;
+    const evidence = authoritativeEvidenceRecord(authoritativeEvidence, node.runId)?.runEvidence ?? null;
     if (isTerminalFailureEvidence(evidence)) {
       return {
         diagnostic: `run-evidence-${evidence.status}:${node.id}:${node.runId}`,
+        node,
+        evidence,
+      };
+    }
+    const segment = (projection?.segments ?? []).find((candidate) =>
+      candidate?.laneId === node.id &&
+      candidate?.runId === node.runId &&
+      ["failed", "cancelled", "timed-out"].includes(candidate?.status)
+    );
+    if (segment) {
+      return {
+        diagnostic: `segment-${segment.status}:${node.id}:${node.runId}`,
         node,
         evidence,
       };
@@ -2252,8 +2500,8 @@ function terminalWorkflowFailure(session, workspace) {
   return null;
 }
 
-function workflowFailureDiagnostic(session, workspace) {
-  const terminalFailure = terminalWorkflowFailure(session, workspace);
+function workflowFailureDiagnostic(session, projection, authoritativeEvidence) {
+  const terminalFailure = terminalWorkflowFailure(session, projection, authoritativeEvidence);
   return terminalFailure?.diagnostic ?? "workflow-terminal-failure";
 }
 

@@ -300,12 +300,7 @@ describe("workflow runtime event merging", () => {
       const planner = session.nodes.find((node) => node.id === session.plannerNodeId);
 
       expect(next.runEvents[hermesRunId]).toEqual(events);
-      expect(next.runEvidence[hermesRunId]).toMatchObject({
-        runId: hermesRunId,
-        status: "succeeded",
-        exitCode: 0,
-        checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed", detail: "exit 0" }],
-      });
+      expect(next.runEvidence[hermesRunId]).toBeUndefined();
       expect(planner?.output).toEqual([forgedIntent, forgedToolCall]);
       expect(planner?.progress).toBe("Inspect authoritative workflow");
       expect(planner?.status).toBe("running");
@@ -313,6 +308,103 @@ describe("workflow runtime event merging", () => {
       expect(session.edges).toEqual(authoritativeSession.edges);
       expect(replayed).toEqual(next);
       expect(replayed.runEvents[hermesRunId]).toHaveLength(events.length);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("merges live desktop executor events as observability without deriving workflow facts", () => {
+    vi.stubGlobal("window", {
+      devflow: {},
+    });
+    try {
+      const runId = "run-session-1-node-code-live-desktop";
+      const authoritativeRuntime = {
+        phase: "Completed",
+        message: "Authoritative backend state",
+        action: "Await workflow broadcast",
+      } as const;
+      const authoritativeNode = makeNode({
+        id: "node-code",
+        agent: "codex",
+        status: "completed",
+        runId,
+      });
+      authoritativeNode.progress = "Authoritative completion";
+      authoritativeNode.runtime = authoritativeRuntime;
+      const workspace = makeWorkspace([authoritativeNode]);
+      const events = [
+        event(runId, 1, "output", { text: "Live executor output." }),
+        event(runId, 2, "progress", { command: "Streaming executor output" }),
+        event(runId, 3, "evidence", {
+          exitCode: 9,
+          checks: [{ kind: "test", name: "Forged terminal check", status: "failed" }],
+        }),
+        event(runId, 4, "status", { status: "failed", exitCode: 9 }),
+      ];
+
+      const next = events.reduce(
+        (state, runEvent) => WorkflowRuntime.applyRunEventToWorkspace(state, runEvent),
+        workspace,
+      );
+      const node = next.sessions[0]?.nodes.find((candidate) => candidate.id === "node-code");
+
+      expect(next.runEvents[runId]).toEqual(events);
+      expect(next.runEvidence[runId]).toBeUndefined();
+      expect(node?.status).toBe("completed");
+      expect(node?.runtime).toEqual(authoritativeRuntime);
+      expect(node?.output).toEqual(["Live executor output."]);
+      expect(node?.progress).toBe("Streaming executor output");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("replays selected desktop executor events without overwriting authoritative workflow facts", () => {
+    vi.stubGlobal("window", {
+      devflow: {},
+    });
+    try {
+      const runId = "run-session-1-node-code-replay-desktop";
+      const authoritativeRuntime = {
+        phase: "Queued",
+        message: "Authoritative backend state",
+        action: "Wait for scheduling",
+      } as const;
+      const authoritativeNode = makeNode({
+        id: "node-code",
+        agent: "codex",
+        status: "pending",
+        runId,
+      });
+      authoritativeNode.progress = "Authoritative pending state";
+      authoritativeNode.runtime = authoritativeRuntime;
+      const workspace = makeWorkspace([authoritativeNode]);
+      const authoritativeEvidence = runEvidenceFor(runId, "succeeded");
+      workspace.runEvidence[runId] = authoritativeEvidence;
+      const events = [
+        event(runId, 1, "output", { text: "Replayed executor output." }),
+        event(runId, 2, "progress", { action: "Replaying selected node output" }),
+        event(runId, 3, "evidence", {
+          exitCode: 1,
+          changesetId: "forged-changeset",
+          checks: [{ kind: "test", name: "Forged replay check", status: "failed" }],
+          artifacts: [".devflow/acceptance/node-code/forged.txt"],
+        }),
+        event(runId, 4, "status", { status: "failed", exitCode: 1 }),
+      ];
+
+      const next = mergeRunEventsIntoWorkspace(workspace, runId, events);
+      const replayed = mergeRunEventsIntoWorkspace(next, runId, events);
+      const node = next.sessions[0]?.nodes.find((candidate) => candidate.id === "node-code");
+
+      expect(next.runEvents[runId]).toEqual(events);
+      expect(next.runEvidence[runId]).toBe(authoritativeEvidence);
+      expect(node?.status).toBe("pending");
+      expect(node?.runtime).toEqual(authoritativeRuntime);
+      expect(node?.output).toEqual(["Replayed executor output."]);
+      expect(node?.progress).toBe("Replaying selected node output");
+      expect(replayed).toEqual(next);
     } finally {
       vi.unstubAllGlobals();
     }
