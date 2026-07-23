@@ -236,6 +236,7 @@ test("New Session UI acceptance waits for terminal checkpoint enrichment before 
   const { authoritativeWorkflowSettled } = await import("./newSessionUiAcceptance.mjs");
   const runId = "run-lane-1";
   const segmentId = "segment-lane-1";
+  const evidenceId = "opaque-evidence-lane-1";
   const state = {
     canvasSession: {
       plannerNodeId: "planner",
@@ -254,12 +255,13 @@ test("New Session UI acceptance waits for terminal checkpoint enrichment before 
     projection: {
       segments: [{ id: segmentId, laneId: "lane-1", runId, status: "succeeded", exitCode: 0 }],
       evidence: [{
-        id: "evidence-lane-1",
+        id: evidenceId,
         laneId: "lane-1",
         segmentId,
         status: "passed",
         runEvidence: { runId, status: "succeeded", exitCode: 0, checks: [], artifacts: [] },
       }],
+      changesetEvidence: [],
       checkpoints: [],
     },
   };
@@ -272,14 +274,155 @@ test("New Session UI acceptance waits for terminal checkpoint enrichment before 
     phase: "after",
     evidenceRefs: [
       { kind: "run", id: runId },
-      { kind: "evidence", id: "evidence-lane-1" },
-      { kind: "changeset", id: "changeset-lane-1" },
+      { kind: "segment", id: segmentId },
+      { kind: "changeset", id: `changeset-evidence:${runId}:after` },
+      { kind: "evidence", id: evidenceId },
     ],
   });
+  state.projection.changesetEvidence.push(checkpointChangesetEvidence(runId, "after"));
   assert.equal(authoritativeWorkflowSettled(state), false);
   state.canvasSession.nodes[2].status = "completed";
   state.canvasSession.nodes[2].userDecision.status = "answered";
   assert.equal(authoritativeWorkflowSettled(state), true);
+  state.canvasSession.nodes.push({
+    id: "lane-follow-up",
+    nodeKind: "agent_task",
+    agent: "codex",
+    status: "pending",
+  });
+  assert.equal(authoritativeWorkflowSettled(state), false);
+});
+
+test("New Session UI acceptance rejects malformed authoritative after-checkpoint references", async () => {
+  const { authoritativeWorkflowSettled } = await import("./newSessionUiAcceptance.mjs");
+
+  for (const [name, mutate] of checkpointReferenceMutationCases("lane-1", "after")) {
+    const state = authoritativeSettledFixture();
+    assert.equal(authoritativeWorkflowSettled(state), true, `${name}: valid fixture`);
+    mutate(state);
+    assert.equal(authoritativeWorkflowSettled(state), false, name);
+  }
+});
+
+test("New Session UI acceptance builds its evidence map only from passed authoritative projection evidence", async () => {
+  const { authoritativeProjectionEvidenceState } = await import("./newSessionUiAcceptance.mjs");
+  const passed = successfulOpaqueEvidence("run-projection-passed", "codex");
+  const failed = {
+    ...successfulOpaqueEvidence("run-projection-failed", "codex"),
+    status: "failed",
+    exitCode: 1,
+  };
+  const state = authoritativeProjectionEvidenceState({
+    evidence: [
+      {
+        id: "evidence-passed",
+        laneId: "lane-passed",
+        segmentId: "segment-passed",
+        status: "passed",
+        runEvidence: passed,
+      },
+      {
+        id: "evidence-failed",
+        laneId: "lane-failed",
+        segmentId: "segment-failed",
+        status: "failed",
+        runEvidence: failed,
+      },
+      {
+        id: "evidence-invalid-run-id",
+        laneId: "lane-invalid",
+        segmentId: "segment-invalid",
+        status: "passed",
+        runEvidence: { ...passed, runId: "" },
+      },
+    ],
+  });
+
+  assert.equal(state.ok, true);
+  assert.deepEqual(Object.keys(state.runEvidence), ["run-projection-passed"]);
+  assert.equal(state.runEvidence["run-projection-passed"], passed);
+  assert.deepEqual(state.records.map((record) => record.runEvidence.runId), [
+    "run-projection-passed",
+    "run-projection-failed",
+  ]);
+});
+
+test("New Session UI acceptance fails closed on duplicate or conflicting projection evidence for one run", async () => {
+  const { authoritativeProjectionEvidenceState } = await import("./newSessionUiAcceptance.mjs");
+  const evidence = successfulOpaqueEvidence("run-projection-duplicate", "codex");
+  const cases = [
+    ["duplicate", structuredClone(evidence)],
+    ["conflict", { ...structuredClone(evidence), exitCode: 9 }],
+  ];
+
+  for (const [kind, second] of cases) {
+    const state = authoritativeProjectionEvidenceState({
+      evidence: [
+        {
+          id: "evidence-first",
+          laneId: "lane-first",
+          segmentId: "segment-first",
+          status: "passed",
+          runEvidence: evidence,
+        },
+        {
+          id: "evidence-second",
+          laneId: "lane-first",
+          segmentId: "segment-first",
+          status: "passed",
+          runEvidence: second,
+        },
+      ],
+    });
+
+    assert.equal(state.ok, false, kind);
+    assert.equal(
+      state.failures.includes(`projection-run-evidence-${kind}:run-projection-duplicate`),
+      true,
+      kind,
+    );
+  }
+});
+
+test("New Session UI acceptance ignores empty or forged workspace evidence and requires projection evidence", async () => {
+  const {
+    authoritativeProjectionEvidenceState,
+    strictWorkflowAcceptanceSummary,
+  } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = strictWorkflowFixture();
+  const authoritativeEvidence = authoritativeProjectionEvidenceState(fixture.projection);
+
+  const emptyWorkspaceResult = strictWorkflowAcceptanceSummary({
+    ...fixture,
+    authoritativeEvidence,
+    workspace: { runEvidence: {} },
+  });
+  assert.equal(emptyWorkspaceResult.ok, true);
+
+  const forgedFailureWorkspace = structuredClone(fixture.workspace);
+  for (const evidence of Object.values(forgedFailureWorkspace.runEvidence)) {
+    evidence.status = "failed";
+    evidence.exitCode = 99;
+  }
+  const forgedFailureResult = strictWorkflowAcceptanceSummary({
+    ...fixture,
+    authoritativeEvidence,
+    workspace: forgedFailureWorkspace,
+  });
+  assert.equal(forgedFailureResult.ok, true);
+
+  const missingProjection = structuredClone(fixture.projection);
+  missingProjection.evidence = missingProjection.evidence.filter(
+    (evidence) => evidence.laneId !== strictNodeIds.implementation,
+  );
+  const forgedSuccessResult = strictWorkflowAcceptanceSummary({
+    ...fixture,
+    authoritativeEvidence: authoritativeProjectionEvidenceState(missingProjection),
+    projection: missingProjection,
+    workspace: structuredClone(fixture.workspace),
+  });
+  assert.equal(forgedSuccessResult.ok, false);
+  assert.equal(forgedSuccessResult.failures.includes("initial-lane-evidence-invalid"), true);
 });
 
 test("New Session UI acceptance replaces only the persisted authoritative session with a stale clone", async () => {
@@ -655,7 +798,8 @@ test("New Session UI acceptance requires the explicit five-lane delivery chain",
   assert.match(source, /\.devflow\/acceptance\/react-app\.png/);
   assert.match(source, /laneKindEvidence/);
   assert.match(source, /secondTurnLaneIds: replay\.secondTurnLaneIds/);
-  assert.match(source, /requiredLaneEvidenceSummary\(session, workspace, secondTurnLaneIds\)/);
+  assert.match(source, /requiredLaneEvidenceSummary\(session, authoritativeEvidence, secondTurnLaneIds\)/);
+  assert.doesNotMatch(source, /workspace\??\.runEvidence/);
 });
 
 test("New Session UI acceptance bounds verification command output", async () => {
@@ -707,8 +851,11 @@ test("New Session UI acceptance collects delivery files from baseline range, not
   assert.doesNotMatch(source, /HEAD~1\.\.HEAD/);
 });
 
-test("New Session UI acceptance returns structured failed workflow result with latest evidence", async () => {
-  const { workflowTerminalFailureResult } = await import("./newSessionUiAcceptance.mjs");
+test("New Session UI acceptance omits renderer workspace evidence from terminal failure results", async () => {
+  const {
+    authoritativeProjectionEvidenceState,
+    workflowTerminalFailureResult,
+  } = await import("./newSessionUiAcceptance.mjs");
   const failedEvidence = {
     runId: "run-codex-1",
     status: "failed",
@@ -737,21 +884,51 @@ test("New Session UI acceptance returns structured failed workflow result with l
         display: { meta: ["flow-kernel", "implementation"] },
       }],
     }],
-    runEvidence: { "run-codex-1": failedEvidence },
+    runEvidence: {
+      "run-codex-1": {
+        ...failedEvidence,
+        status: "succeeded",
+        exitCode: 0,
+        rendererForgery: "forged-workspace-evidence",
+      },
+    },
   };
+  const session = workspace.sessions[0];
+  const projection = {
+    segments: [{
+      id: "segment-codex-1",
+      laneId: "node-codex",
+      runId: "run-codex-1",
+      status: "failed",
+      exitCode: 1,
+    }],
+    evidence: [{
+      id: "evidence-codex-1",
+      laneId: "node-codex",
+      segmentId: "segment-codex-1",
+      status: "failed",
+      runEvidence: failedEvidence,
+    }],
+  };
+  const authoritativeEvidence = authoritativeProjectionEvidenceState(projection);
 
   const result = workflowTerminalFailureResult({
+    authoritativeEvidence,
+    projection,
     projectRoot: "/tmp/project",
     readiness: { status: "ready", checks: { mockFallback: false } },
+    session,
     workspacePath: "/tmp/workspace.json",
-    workspace,
   });
 
   assert.equal(result.ok, false);
   assert.equal(result.failure.code, "WORKFLOW_RUN_FAILED");
   assert.equal(result.projectRoot, "/tmp/project");
   assert.equal(result.workspacePath, "/tmp/workspace.json");
-  assert.equal(result.latestWorkspace, workspace);
+  const serializedResult = JSON.stringify(result);
+  assert.equal(Object.hasOwn(result, "latestWorkspace"), false);
+  assert.equal(serializedResult.includes("\"latestWorkspace\""), false);
+  assert.equal(serializedResult.includes("forged-workspace-evidence"), false);
   assert.equal(result.runEvidence["run-codex-1"].status, "failed");
   assert.equal(result.runEvidence["run-codex-1"].exitCode, 1);
   assert.equal(result.agentRunEvidence.codex[0].runId, "run-codex-1");
@@ -792,25 +969,28 @@ test("New Session UI acceptance agent evidence requires matching runId and CLI e
     completedAt: "2026-07-06T00:00:00.000Z",
   };
 
-  assert.equal(hasSuccessfulRunEvidenceForAgent(session, {
-    runEvidence: { "run-hermes-1": { ...baseEvidence, runId: "run-stale" } },
-  }, "hermes"), false);
-  assert.equal(hasSuccessfulRunEvidenceForAgent(session, {
-    runEvidence: { "run-hermes-1": { ...baseEvidence, checks: [{ kind: "test", name: "unit", status: "passed" }] } },
-  }, "hermes"), false);
-  assert.equal(hasSuccessfulRunEvidenceForAgent(session, {
-    runEvidence: { "run-hermes-1": { ...baseEvidence, checks: [{ kind: "run-exit", name: "Mock adapter exit", status: "passed" }] } },
-  }, "hermes"), false);
-  assert.equal(hasSuccessfulRunEvidenceForAgent(session, {
-    runEvidence: { "run-hermes-1": baseEvidence },
-  }, "hermes"), true);
+  assert.equal(hasSuccessfulRunEvidenceForAgent(session, authoritativeEvidenceFixture({
+    "run-hermes-1": { ...baseEvidence, runId: "run-stale" },
+  }), "hermes"), false);
+  assert.equal(hasSuccessfulRunEvidenceForAgent(session, authoritativeEvidenceFixture({
+    "run-hermes-1": { ...baseEvidence, checks: [{ kind: "test", name: "unit", status: "passed" }] },
+  }), "hermes"), false);
+  assert.equal(hasSuccessfulRunEvidenceForAgent(session, authoritativeEvidenceFixture({
+    "run-hermes-1": {
+      ...baseEvidence,
+      checks: [{ kind: "run-exit", name: "Mock adapter exit", status: "passed" }],
+    },
+  }), "hermes"), false);
+  assert.equal(hasSuccessfulRunEvidenceForAgent(session, authoritativeEvidenceFixture({
+    "run-hermes-1": baseEvidence,
+  }), "hermes"), true);
 });
 
 test("New Session UI acceptance validates production-shaped terminal evidence for every required lane kind", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.equal(result.ok, true);
   assert.deepEqual(Object.keys(result.lanes), [
@@ -830,21 +1010,21 @@ test("New Session UI acceptance validates production-shaped terminal evidence fo
 
 test("New Session UI acceptance rejects a duplicate required lane kind even when one candidate succeeded", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
   const implementation = requiredLaneFixtureNode(session, "implementation");
   const duplicate = structuredClone(implementation);
   duplicate.id = "lane-implementation-duplicate";
   duplicate.runId = "run-implementation-duplicate";
   duplicate.status = "failed";
   session.nodes.push(duplicate);
-  workspace.runEvidence[duplicate.runId] = {
-    ...structuredClone(workspace.runEvidence[implementation.runId]),
+  authoritativeEvidence.runEvidence[duplicate.runId] = {
+    ...structuredClone(authoritativeEvidence.runEvidence[implementation.runId]),
     runId: duplicate.runId,
     status: "failed",
     exitCode: 1,
   };
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.equal(result.ok, false);
   assert.equal(result.lanes.implementation.candidateCount, 2);
@@ -853,10 +1033,10 @@ test("New Session UI acceptance rejects a duplicate required lane kind even when
 
 test("New Session UI acceptance rejects parallel required lanes", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
   requiredLaneFixtureNode(session, "validation").context.dependencies = [];
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.equal(result.ok, false);
   assert.equal(result.lanes.validation.failures.includes("dependency-mismatch"), true);
@@ -864,12 +1044,12 @@ test("New Session UI acceptance rejects parallel required lanes", async () => {
 
 test("New Session UI acceptance rejects a required lane wired to the wrong predecessor", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
   requiredLaneFixtureNode(session, "review").context.dependencies = [
     requiredLaneFixtureNode(session, "implementation").id,
   ];
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.equal(result.ok, false);
   assert.equal(result.lanes.review.failures.includes("dependency-mismatch"), true);
@@ -877,7 +1057,7 @@ test("New Session UI acceptance rejects a required lane wired to the wrong prede
 
 test("New Session UI acceptance rejects a second-turn review candidate without an exclusion", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
   session.nodes.push({
     id: "lane-evidence-recheck",
     agent: "codex",
@@ -890,7 +1070,7 @@ test("New Session UI acceptance rejects a second-turn review candidate without a
     context: { dependencies: [requiredLaneFixtureNode(session, "commit").id] },
   });
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.equal(result.ok, false);
   assert.equal(result.lanes.review.candidateCount, 2);
@@ -899,7 +1079,7 @@ test("New Session UI acceptance rejects a second-turn review candidate without a
 
 test("New Session UI acceptance excludes an authoritative second-turn lane id", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
   session.nodes.push({
     id: "lane-evidence-recheck",
     agent: "codex",
@@ -912,7 +1092,7 @@ test("New Session UI acceptance excludes an authoritative second-turn lane id", 
     context: { dependencies: [requiredLaneFixtureNode(session, "commit").id] },
   });
 
-  const result = requiredLaneEvidenceSummary(session, workspace, ["lane-evidence-recheck"]);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence, ["lane-evidence-recheck"]);
 
   assert.equal(result.ok, true);
   assert.equal(result.lanes.review.candidateCount, 1);
@@ -1122,6 +1302,22 @@ test("New Session UI acceptance rejects missing or mismatched checkpoint run ide
   }
 });
 
+test("New Session UI acceptance strict delivery gate rejects malformed checkpoint references", async () => {
+  const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
+
+  for (const phase of ["before", "after"]) {
+    for (const [name, mutate] of checkpointReferenceMutationCases(strictNodeIds.review, phase)) {
+      const fixture = strictWorkflowFixture();
+      assert.equal(strictWorkflowAcceptanceSummary(fixture).ok, true, `${phase} ${name}: valid fixture`);
+      mutate(fixture);
+      const result = strictWorkflowAcceptanceSummary(fixture);
+      assert.equal(result.ok, false, `${phase} ${name}`);
+      assert.equal(result.failures.includes("delivery-checkpoints-invalid"), true, `${phase} ${name}`);
+      assert.equal(result.deliveryCheckpoints.lanes.review.ok, false, `${phase} ${name}`);
+    }
+  }
+});
+
 test("New Session UI acceptance rejects a follow-up HEAD move", async () => {
   const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
   const fixture = strictWorkflowFixture();
@@ -1267,13 +1463,13 @@ test("New Session UI acceptance strict oracle rejects malformed follow-up struct
 test("New Session UI acceptance strict oracle requires independent follow-up terminal evidence", async () => {
   const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
   const cases = [
-    ["missing workspace evidence", (fixture) => { delete fixture.workspace.runEvidence[strictRunIds.followUp]; }],
+    ["missing authoritative evidence", (fixture) => { delete fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp]; }],
     ["node run mismatch", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).runId = "r-stale"; }],
     ["projection run mismatch", (fixture) => { fixture.projection.segments.find((segment) => segment.laneId === strictNodeIds.followUp).runId = "r-stale"; }],
-    ["failed", (fixture) => { fixture.workspace.runEvidence[strictRunIds.followUp].status = "failed"; }],
-    ["nonzero", (fixture) => { fixture.workspace.runEvidence[strictRunIds.followUp].exitCode = 1; }],
-    ["missing cli check", (fixture) => { fixture.workspace.runEvidence[strictRunIds.followUp].checks = []; }],
-    ["wrong cli check", (fixture) => { fixture.workspace.runEvidence[strictRunIds.followUp].checks[0].name = "Hermes CLI exit"; }],
+    ["failed", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].status = "failed"; }],
+    ["nonzero", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].exitCode = 1; }],
+    ["missing cli check", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].checks = []; }],
+    ["wrong cli check", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].checks[0].name = "Hermes CLI exit"; }],
     ["absent projection", (fixture) => { fixture.projection.segments = fixture.projection.segments.filter((segment) => segment.laneId !== strictNodeIds.followUp); }],
     ["duplicate projection", (fixture) => { fixture.projection.segments.push(structuredClone(fixture.projection.segments.at(-1))); }],
     ["missing projection evidence", (fixture) => { fixture.projection.evidence = fixture.projection.evidence.filter((evidence) => evidence.laneId !== strictNodeIds.followUp); }],
@@ -1324,12 +1520,12 @@ test("New Session UI acceptance fails when any required lane kind is missing", a
   const requiredKinds = ["implementation", "validation", "browser_validation", "review", "commit"];
 
   for (const kind of requiredKinds) {
-    const { session, workspace } = completeRequiredLaneEvidenceFixture();
+    const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
     const removed = requiredLaneFixtureNode(session, kind);
     session.nodes = session.nodes.filter((node) => node !== removed);
-    delete workspace.runEvidence[removed.runId];
+    delete authoritativeEvidence.runEvidence[removed.runId];
 
-    const result = requiredLaneEvidenceSummary(session, workspace);
+    const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
     assert.equal(result.ok, false, kind);
     assert.deepEqual(result.lanes[kind].failures, ["missing-lane"], kind);
@@ -1338,10 +1534,10 @@ test("New Session UI acceptance fails when any required lane kind is missing", a
 
 test("New Session UI acceptance rejects lane evidence with a mismatched run id", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
-  workspace.runEvidence["run-validation"].runId = "run-stale-validation";
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
+  authoritativeEvidence.runEvidence["run-validation"].runId = "run-stale-validation";
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.equal(result.ok, false);
   assert.deepEqual(result.lanes.validation.failures, ["run-id-mismatch"]);
@@ -1350,24 +1546,25 @@ test("New Session UI acceptance rejects lane evidence with a mismatched run id",
 test("New Session UI acceptance requires browser declarations, artifact check, and fixed screenshot artifact", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
   const cases = [
-    ["requiredEvidence", (session, workspace) => {
+    ["requiredEvidence", (session, authoritativeEvidence) => {
       const browserNode = requiredLaneFixtureNode(session, "browser_validation");
       browserNode.semanticSubtype = "browser_validation";
       browserNode.requiredEvidence = ["browser"];
     }, "missing-required-evidence:screenshot"],
-    ["artifact check", (session, workspace) => {
-      workspace.runEvidence["run-browser_validation"].checks = workspace.runEvidence["run-browser_validation"].checks
+    ["artifact check", (session, authoritativeEvidence) => {
+      authoritativeEvidence.runEvidence["run-browser_validation"].checks =
+        authoritativeEvidence.runEvidence["run-browser_validation"].checks
         .filter((check) => check.kind !== "artifact");
     }, "missing-passed-artifact-check"],
-    ["artifact path", (session, workspace) => {
-      workspace.runEvidence["run-browser_validation"].artifacts = [];
+    ["artifact path", (session, authoritativeEvidence) => {
+      authoritativeEvidence.runEvidence["run-browser_validation"].artifacts = [];
     }, "missing-screenshot-artifact"],
   ];
 
   for (const [name, mutate, expectedFailure] of cases) {
-    const { session, workspace } = completeRequiredLaneEvidenceFixture();
-    mutate(session, workspace);
-    const result = requiredLaneEvidenceSummary(session, workspace);
+    const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
+    mutate(session, authoritativeEvidence);
+    const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
     assert.equal(result.ok, false, name);
     assert.equal(result.lanes.browser_validation.failures.includes(expectedFailure), true, name);
   }
@@ -1375,9 +1572,9 @@ test("New Session UI acceptance requires browser declarations, artifact check, a
 
 test("New Session UI acceptance does not classify ordinary validation as browser validation", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.equal(result.lanes.validation.nodeId, "lane-validation");
   assert.equal(result.lanes.validation.candidateCount, 1);
@@ -1387,10 +1584,10 @@ test("New Session UI acceptance does not classify ordinary validation as browser
 
 test("New Session UI acceptance does not infer browser validation from evidence when subtype is absent", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
   delete requiredLaneFixtureNode(session, "browser_validation").semanticSubtype;
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.deepEqual(result.lanes.browser_validation.failures, ["missing-lane"]);
   assert.equal(result.lanes.browser_validation.candidateCount, 0);
@@ -1399,12 +1596,12 @@ test("New Session UI acceptance does not infer browser validation from evidence 
 
 test("New Session UI acceptance lets browser subtype override canonical validation lane kind", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, workspace } = completeRequiredLaneEvidenceFixture();
+  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
   const browserNode = requiredLaneFixtureNode(session, "browser_validation");
   browserNode.semanticSubtype = "browser_validation";
   browserNode.requiredEvidence = ["browser"];
 
-  const result = requiredLaneEvidenceSummary(session, workspace);
+  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
 
   assert.equal(result.lanes.browser_validation.nodeId, "lane-browser-validation");
   assert.equal(result.lanes.browser_validation.candidateCount, 1);
@@ -1416,9 +1613,9 @@ test("New Session UI acceptance rejects review and commit lanes without their ow
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
 
   for (const kind of ["review", "commit"]) {
-    const { session, workspace } = completeRequiredLaneEvidenceFixture();
-    delete workspace.runEvidence[`run-${kind}`];
-    const result = requiredLaneEvidenceSummary(session, workspace);
+    const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
+    delete authoritativeEvidence.runEvidence[`run-${kind}`];
+    const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
     assert.equal(result.ok, false, kind);
     assert.deepEqual(result.lanes[kind].failures, ["missing-run-evidence"], kind);
   }
@@ -2157,8 +2354,13 @@ function strictWorkflowFixture() {
       artifacts: node.id === strictNodeIds.browserValidation ? [".devflow/acceptance/react-app.png"] : [],
       runEvidence: structuredClone(runEvidence[node.runId]),
     })),
+    changesetEvidence: nodes.flatMap((node) => [
+      checkpointChangesetEvidence(node.runId, "before"),
+      checkpointChangesetEvidence(node.runId, "after"),
+    ]),
     checkpoints: nodes.flatMap((node) => {
       const segmentId = `s-${node.id}`;
+      const evidenceId = `e-${node.id}`;
       const isCommit = node.id === strictNodeIds.commit;
       const isFollowUp = node.id === strictNodeIds.followUp;
       const beforeHead = isFollowUp ? finalHead : baselineHead;
@@ -2176,7 +2378,12 @@ function strictWorkflowFixture() {
         headCommit: phase === "before" ? beforeHead : afterHead,
         createdAt: "2026-07-22T00:00:00.000Z",
         source: "system",
-        evidenceRefs: [{ kind: "run", id: node.runId }, { kind: "segment", id: segmentId }],
+        evidenceRefs: [
+          { kind: "run", id: node.runId },
+          { kind: "segment", id: segmentId },
+          { kind: "changeset", id: `changeset-evidence:${node.runId}:${phase}` },
+          ...(phase === "after" ? [{ kind: "evidence", id: evidenceId }] : []),
+        ],
       }));
     }),
   };
@@ -2199,7 +2406,8 @@ function strictWorkflowFixture() {
         target: node.id,
       })),
     },
-    workspace: { runEvidence },
+    authoritativeEvidence: authoritativeEvidenceFixture(projection),
+    workspace: { runEvidence: structuredClone(runEvidence) },
     projection,
     replay: { ok: true, secondTurnLaneIds: [strictNodeIds.followUp] },
     secondTurnLaneIds: [strictNodeIds.followUp],
@@ -2261,6 +2469,131 @@ function laneCheckpoint(fixture, nodeId, phase) {
   return fixture.projection.checkpoints.find((checkpoint) =>
     checkpoint.laneId === nodeId && checkpoint.phase === phase
   );
+}
+
+function authoritativeSettledFixture() {
+  const runId = "opaque-run-lane-1";
+  const segmentId = "opaque-segment-lane-1";
+  const evidenceId = "opaque-evidence-record-lane-1";
+  return {
+    canvasSession: {
+      plannerNodeId: "opaque-planner",
+      nodes: [
+        { id: "opaque-planner", status: "completed" },
+        { id: "lane-1", runId, status: "completed" },
+      ],
+    },
+    projection: {
+      segments: [{ id: segmentId, laneId: "lane-1", runId, status: "succeeded", exitCode: 0 }],
+      evidence: [{
+        id: evidenceId,
+        laneId: "lane-1",
+        segmentId,
+        status: "passed",
+        runEvidence: {
+          runId,
+          status: "succeeded",
+          exitCode: 0,
+          checks: [],
+          artifacts: [],
+        },
+      }],
+      changesetEvidence: [checkpointChangesetEvidence(runId, "after")],
+      checkpoints: [{
+        id: "opaque-checkpoint-after",
+        sessionId: "opaque-session",
+        nodeId: "lane-1",
+        laneId: "lane-1",
+        runId,
+        segmentId,
+        phase: "after",
+        executionTarget: "current_branch",
+        branchName: "main",
+        headCommit: baselineHead,
+        createdAt: "2026-07-22T00:00:00.000Z",
+        source: "system",
+        evidenceRefs: [
+          { kind: "run", id: runId },
+          { kind: "segment", id: segmentId },
+          { kind: "changeset", id: `changeset-evidence:${runId}:after` },
+          { kind: "evidence", id: evidenceId },
+        ],
+      }],
+    },
+  };
+}
+
+function checkpointReferenceMutationCases(nodeId, phase) {
+  const requiredKinds = phase === "after"
+    ? ["run", "segment", "changeset", "evidence"]
+    : ["run", "segment", "changeset"];
+  const cases = [];
+  for (const kind of requiredKinds) {
+    cases.push(
+      [`missing ${kind} ref`, (fixture) => {
+        const checkpoint = laneCheckpoint(fixture, nodeId, phase);
+        checkpoint.evidenceRefs = checkpoint.evidenceRefs.filter((reference) => reference.kind !== kind);
+      }],
+      [`wrong ${kind} ref`, (fixture) => {
+        laneCheckpoint(fixture, nodeId, phase).evidenceRefs
+          .find((reference) => reference.kind === kind).id = `wrong-${kind}-id`;
+      }],
+      [`duplicate ${kind} ref`, (fixture) => {
+        const checkpoint = laneCheckpoint(fixture, nodeId, phase);
+        checkpoint.evidenceRefs.push(structuredClone(
+          checkpoint.evidenceRefs.find((reference) => reference.kind === kind),
+        ));
+      }],
+    );
+  }
+  if (phase === "before") {
+    cases.push(["unexpected evidence ref", (fixture) => {
+      const checkpoint = laneCheckpoint(fixture, nodeId, phase);
+      const segment = fixture.projection.segments.find((candidate) => candidate.id === checkpoint.segmentId);
+      const evidence = fixture.projection.evidence.find((candidate) =>
+        candidate.laneId === nodeId && candidate.segmentId === segment.id
+      );
+      checkpoint.evidenceRefs.push({ kind: "evidence", id: evidence.id });
+    }]);
+  }
+  cases.push(
+    ["missing changeset evidence record", (fixture) => {
+      const checkpoint = laneCheckpoint(fixture, nodeId, phase);
+      const evidenceId = `changeset-evidence:${checkpoint.runId}:${phase}`;
+      fixture.projection.changesetEvidence = fixture.projection.changesetEvidence
+        .filter((record) => record.evidenceId !== evidenceId);
+    }],
+    ["wrong changeset evidence record", (fixture) => {
+      const checkpoint = laneCheckpoint(fixture, nodeId, phase);
+      const evidenceId = `changeset-evidence:${checkpoint.runId}:${phase}`;
+      fixture.projection.changesetEvidence
+        .find((record) => record.evidenceId === evidenceId).evidenceId = `wrong-${evidenceId}`;
+    }],
+    ["duplicate changeset evidence record", (fixture) => {
+      const checkpoint = laneCheckpoint(fixture, nodeId, phase);
+      const evidenceId = `changeset-evidence:${checkpoint.runId}:${phase}`;
+      fixture.projection.changesetEvidence.push(structuredClone(
+        fixture.projection.changesetEvidence.find((record) => record.evidenceId === evidenceId),
+      ));
+    }],
+  );
+  return cases;
+}
+
+function checkpointChangesetEvidence(runId, phase) {
+  const available = phase === "after";
+  return {
+    evidenceId: `changeset-evidence:${runId}:${phase}`,
+    changesetId: `changeset-${runId}-${phase}`,
+    source: "git",
+    status: available ? "available" : "empty",
+    files: available ? ["src/App.jsx"] : [],
+    diffStat: available
+      ? { added: 1, changed: 0, deleted: 0 }
+      : { added: 0, changed: 0, deleted: 0 },
+    patchPreviewTruncated: false,
+    collectedAt: "2026-07-22T00:00:00.000Z",
+  };
 }
 
 function setLaneCheckpointHeads(fixture, nodeId, beforeHead, afterHead) {
@@ -2378,7 +2711,38 @@ function completeRequiredLaneEvidenceFixture() {
         target: node.id,
       })),
     },
-    workspace: { runEvidence },
+    authoritativeEvidence: authoritativeEvidenceFixture(runEvidence),
+  };
+}
+
+function authoritativeEvidenceFixture(runEvidenceOrProjection) {
+  const records = Array.isArray(runEvidenceOrProjection?.evidence)
+    ? runEvidenceOrProjection.evidence.flatMap((evidence) => {
+        if (!evidence?.runEvidence?.runId) return [];
+        return [{
+          evidenceId: evidence.id ?? null,
+          laneId: evidence.laneId ?? null,
+          segmentId: evidence.segmentId ?? null,
+          status: evidence.status ?? null,
+          runEvidence: evidence.runEvidence,
+        }];
+      })
+    : Object.values(runEvidenceOrProjection ?? {}).map((runEvidence) => ({
+        evidenceId: null,
+        laneId: null,
+        segmentId: null,
+        status: "passed",
+        runEvidence,
+      }));
+  return {
+    ok: true,
+    failures: [],
+    runEvidence: Object.fromEntries(
+      records
+        .filter((record) => record.status === "passed")
+        .map((record) => [record.runEvidence.runId, record.runEvidence]),
+    ),
+    records,
   };
 }
 

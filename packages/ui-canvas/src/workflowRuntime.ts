@@ -216,7 +216,9 @@ export function mergeRunEventsIntoWorkspace(
 ): WorkspaceState {
   const rendererWorkflowProjection = shouldUseRendererWorkflowProjection();
   const deduped = dedupeRunEvents([...(workspace.runEvents[runId] ?? []), ...events]);
-  const evidence = evidenceFromRunEvents(runId, deduped, workspace.runEvidence[runId]);
+  const evidence = rendererWorkflowProjection
+    ? evidenceFromRunEvents(runId, deduped, workspace.runEvidence[runId])
+    : null;
   const sessions = workspace.sessions.map((session) => {
     if (session.kind !== "canvas") return session;
     const target = session.nodes.find((node) => node.runId === runId);
@@ -226,9 +228,7 @@ export function mergeRunEventsIntoWorkspace(
       ...session,
       nodes: session.nodes.map((node) => {
         if (node.runId !== runId) return node;
-        if (!rendererWorkflowProjection && isPlannerRootNode(session, node)) {
-          return applyRunObservabilityToNode(node, deduped);
-        }
+        if (!rendererWorkflowProjection) return applyRunObservabilityToNode(node, deduped);
         return applyRunEventsToNode(node, session, deduped, evidence);
       }),
     };
