@@ -1910,6 +1910,917 @@ test("main coordinator launches every durable session once and advances an inact
   }
 });
 
+test("workflow create IPC paused in outer identity is observable to shutdown before store publication", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-ipc-create-shutdown-"));
+  const identityGate = deferred();
+  const unhandledRejections = [];
+  let identityCalls = 0;
+  let createCalls = 0;
+  let startCalls = 0;
+  let closeCalls = 0;
+  let loaded;
+  const onUnhandledRejection = (error) => { unhandledRejections.push(error); };
+  process.prependListener("unhandledRejection", onUnhandledRejection);
+  try {
+    loaded = await loadMainModule([], {
+      fsPromises: {
+        ...realFs,
+        async realpath(value) {
+          if (value === projectRoot && ++identityCalls === 1) {
+            identityGate.started.resolve();
+            await identityGate.release.promise;
+          }
+          return realFs.realpath(value);
+        },
+      },
+      createRunStartHandler: () => async () => {
+        startCalls += 1;
+        return { id: "unexpected-run", status: "running" };
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          createCalls += 1;
+          const store = module.createWorkflowStore(options);
+          const close = store.close.bind(store);
+          store.close = () => {
+            closeCalls += 1;
+            close();
+          };
+          return store;
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const createSession = loaded.ipcHandlers.get("workflow:createSession");
+    const creating = createSession({}, projectRoot, {
+      id: "session-create-shutdown",
+      goal: "Do not publish after shutdown.",
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+    });
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 1);
+    await identityGate.started.promise;
+
+    let closeSettled = false;
+    const closing = loaded.exports.closeWorkflowStores();
+    void closing.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), false);
+    await assert.rejects(
+      createSession({}, projectRoot, {
+        id: "session-rejected-after-close",
+        goal: "Must not run.",
+        target: { executionTarget: "current_branch", selectedBranch: "main" },
+      }),
+      /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT: (?:Error: )?Workflow advancement is unavailable while SkyTurn is shutting down/,
+    );
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeSettled, false);
+    assert.equal(closeCalls, 0);
+
+    identityGate.release.resolve();
+    await assert.rejects(
+      creating,
+      /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT: (?:Error: )?Workflow advancement is unavailable while SkyTurn is shutting down/,
+    );
+    await withTimeout(closing, 2_000, "shutdown did not drain the identity-paused workflow IPC");
+
+    assert.equal(createCalls, 0);
+    assert.equal(startCalls, 0);
+    assert.equal(closeCalls, 0);
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 0);
+    assert.equal(loaded.exports.workflowStoreInitializations.size, 0);
+    assert.equal(loaded.exports.workflowStores.size, 0);
+    assert.equal(loaded.exports.workflowSessionMutationLocks.size, 0);
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    identityGate.release.resolve();
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow shutdown drains public run:start after store acquisition and rejects new starts at the shared gate", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-run-start-shutdown-"));
+  const runGate = deferred();
+  const unhandledRejections = [];
+  let factoryCalls = 0;
+  let publicHandlerCalls = 0;
+  let storeClosed = false;
+  let closeCalls = 0;
+  let postCloseAccesses = 0;
+  let loaded;
+  const onUnhandledRejection = (error) => { unhandledRejections.push(error); };
+  process.prependListener("unhandledRejection", onUnhandledRejection);
+  try {
+    loaded = await loadMainModule([], {
+      platform: "linux",
+      createRunStartHandler: (config) => {
+        factoryCalls += 1;
+        if (factoryCalls !== 3) {
+          return async () => { throw new Error("unexpected private run start"); };
+        }
+        return async (input) => {
+          publicHandlerCalls += 1;
+          await config.preAuthorizeStart?.(input);
+          const authorized = config.authorizeStartInput
+            ? await config.authorizeStartInput(input)
+            : input;
+          const identity = await config.resolveIdentity(authorized);
+          const store = await config.acquireStore(identity);
+          runGate.started.resolve();
+          await runGate.release.promise;
+          store.listWorkflowSessionIds();
+          await config.assertStartInput(authorized, store);
+          return { id: authorized.runId, status: "running" };
+        };
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          const store = module.createWorkflowStore(options);
+          return new Proxy(store, {
+            get(target, property) {
+              if (property === "close") {
+                return () => {
+                  closeCalls += 1;
+                  target.close();
+                  storeClosed = true;
+                };
+              }
+              if (storeClosed) {
+                postCloseAccesses += 1;
+                throw new Error(`post-close workflow store access: ${String(property)}`);
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      }),
+    });
+    assert.equal(factoryCalls, 3);
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedCoordinatorSession(store, projectRoot, "session-public-run-shutdown");
+    declareCoordinatorLane(store, session.id, "lane-public-run-shutdown");
+    const input = {
+      protocolVersion: 1,
+      projectRoot,
+      sessionId: session.id,
+      nodeId: "lane-public-run-shutdown",
+      runId: "run-public-shutdown",
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      prompt: "Exercise the public run start shutdown boundary.",
+    };
+
+    const firstStart = loaded.ipcHandlers.get("run:start")({}, input);
+    const firstRejection = assert.rejects(firstStart, /Workflow run segment identity mismatch/);
+    await runGate.started.promise;
+    assert.equal(publicHandlerCalls, 1);
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 1);
+
+    loaded.appListeners.get("window-all-closed")();
+    const closing = loaded.exports.closeWorkflowStores();
+    let closeSettled = false;
+    void closing.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+    await assert.rejects(
+      loaded.ipcHandlers.get("run:start")({}, { ...input, runId: "run-rejected-during-shutdown" }),
+      (error) => {
+        assert.match(error.message, /Workflow advancement is unavailable while SkyTurn is shutting down/);
+        assert.doesNotMatch(error.message, /SKYTURN_WORKFLOW_IPC_ERROR/);
+        return true;
+      },
+    );
+    assert.equal(publicHandlerCalls, 1);
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeSettled, false);
+    assert.equal(storeClosed, false);
+    assert.equal(closeCalls, 0);
+
+    runGate.release.resolve();
+    await firstRejection;
+    await withTimeout(closing, 2_000, "shutdown did not drain public run:start");
+
+    assert.equal(closeCalls, 1);
+    assert.equal(storeClosed, true);
+    assert.equal(postCloseAccesses, 0);
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 0);
+    assert.equal(loaded.exports.workflowStoreInitializations.size, 0);
+    assert.equal(loaded.exports.workflowStores.size, 0);
+    assert.equal(loaded.exports.workflowSessionMutationLocks.size, 0);
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    runGate.release.resolve();
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace:load is a shared workflow store operation and preserves its public shutdown error", async () => {
+  const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-workspace-load-shutdown-"));
+  const projectRoot = join(userDataPath, "project");
+  const identityGate = deferred();
+  const workspacePath = join(userDataPath, "workspace.json");
+  const unhandledRejections = [];
+  let gateIdentity = false;
+  let workspaceReads = 0;
+  let storeClosed = false;
+  let closeCalls = 0;
+  let postCloseAccesses = 0;
+  let loaded;
+  const onUnhandledRejection = (error) => { unhandledRejections.push(error); };
+  process.prependListener("unhandledRejection", onUnhandledRejection);
+  try {
+    await mkdir(projectRoot);
+    await writeFile(workspacePath, JSON.stringify(workspaceSnapshot(projectRoot, "shutdown-load"), null, 2), "utf8");
+    loaded = await loadMainModule([], {
+      platform: "linux",
+      userDataPath,
+      fsPromises: {
+        ...realFs,
+        async readFile(value, ...args) {
+          if (value === workspacePath) workspaceReads += 1;
+          return realFs.readFile(value, ...args);
+        },
+        async realpath(value) {
+          if (value === projectRoot && gateIdentity) {
+            identityGate.started.resolve();
+            await identityGate.release.promise;
+          }
+          return realFs.realpath(value);
+        },
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          const store = module.createWorkflowStore(options);
+          return new Proxy(store, {
+            get(target, property) {
+              if (property === "close") {
+                return () => {
+                  closeCalls += 1;
+                  target.close();
+                  storeClosed = true;
+                };
+              }
+              if (storeClosed) {
+                postCloseAccesses += 1;
+                throw new Error(`post-close workflow store access: ${String(property)}`);
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      }),
+    });
+    await loaded.exports.getWorkflowStore(projectRoot);
+    gateIdentity = true;
+
+    const loading = loaded.ipcHandlers.get("workspace:load")();
+    const loadRejection = assert.rejects(loading, /^Error: Workspace could not be loaded\.$/);
+    await identityGate.started.promise;
+    assert.equal(workspaceReads, 1);
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 1);
+
+    loaded.appListeners.get("window-all-closed")();
+    const closing = loaded.exports.closeWorkflowStores();
+    let closeSettled = false;
+    void closing.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+    await assert.rejects(
+      loaded.ipcHandlers.get("workspace:load")(),
+      /^Error: Workspace could not be loaded\.$/,
+    );
+    assert.equal(workspaceReads, 1);
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeSettled, false);
+    assert.equal(storeClosed, false);
+    assert.equal(closeCalls, 0);
+
+    identityGate.release.resolve();
+    await loadRejection;
+    await withTimeout(closing, 2_000, "shutdown did not drain workspace:load");
+
+    assert.equal(closeCalls, 1);
+    assert.equal(storeClosed, true);
+    assert.equal(postCloseAccesses, 0);
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 0);
+    assert.equal(loaded.exports.workflowStoreInitializations.size, 0);
+    assert.equal(loaded.exports.workflowStores.size, 0);
+    assert.equal(loaded.exports.workflowSessionMutationLocks.size, 0);
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    identityGate.release.resolve();
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    await loaded?.exports.closeWorkflowStores();
+    await rm(userDataPath, { recursive: true, force: true });
+  }
+});
+
+test("workflow rollback eligibility IPC keeps its acquired store open through a later identity await", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-ipc-rollback-shutdown-"));
+  const identityGate = deferred();
+  const unhandledRejections = [];
+  let gateIdentity = false;
+  let ipcIdentityCalls = 0;
+  let storeClosed = false;
+  let closeCalls = 0;
+  let postCloseAccesses = 0;
+  let loaded;
+  const onUnhandledRejection = (error) => { unhandledRejections.push(error); };
+  process.prependListener("unhandledRejection", onUnhandledRejection);
+  try {
+    loaded = await loadMainModule([], {
+      fsPromises: {
+        ...realFs,
+        async realpath(value) {
+          if (value === projectRoot && gateIdentity && ++ipcIdentityCalls === 2) {
+            identityGate.started.resolve();
+            await identityGate.release.promise;
+          }
+          return realFs.realpath(value);
+        },
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          const store = module.createWorkflowStore(options);
+          return new Proxy(store, {
+            get(target, property) {
+              if (property === "close") {
+                return () => {
+                  closeCalls += 1;
+                  target.close();
+                  storeClosed = true;
+                };
+              }
+              if (storeClosed) {
+                postCloseAccesses += 1;
+                throw new Error(`post-close workflow store access: ${String(property)}`);
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedCoordinatorSession(store, projectRoot, "session-rollback-shutdown");
+    gateIdentity = true;
+
+    const eligibility = loaded.ipcHandlers.get("workflow:rollback:eligibility")({}, projectRoot, {
+      sessionId: session.id,
+      nodeId: session.plannerLaneId,
+    });
+    await identityGate.started.promise;
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 1);
+
+    let closeSettled = false;
+    const closing = loaded.exports.closeWorkflowStores();
+    void closing.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeSettled, false);
+    assert.equal(storeClosed, false);
+    assert.equal(closeCalls, 0);
+
+    identityGate.release.resolve();
+    const response = await withTimeout(eligibility, 2_000, "rollback eligibility IPC did not settle");
+    assert.equal(response.protocolVersion, 1);
+    await withTimeout(closing, 2_000, "shutdown did not wait for rollback eligibility IPC");
+
+    assert.equal(closeCalls, 1);
+    assert.equal(storeClosed, true);
+    assert.equal(postCloseAccesses, 0);
+    assert.equal(loaded.exports.workflowStoreOperationTasks.size, 0);
+    assert.equal(loaded.exports.workflowStoreInitializations.size, 0);
+    assert.equal(loaded.exports.workflowStores.size, 0);
+    assert.equal(loaded.exports.workflowSessionMutationLocks.size, 0);
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    identityGate.release.resolve();
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow shutdown drains a queued strict advance before closing its store", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-advance-shutdown-drain-"));
+  const siblingGate = deferred();
+  const starts = [];
+  const unhandledRejections = [];
+  let storeClosed = false;
+  let closeCalls = 0;
+  let postCloseAccesses = 0;
+  let loaded;
+  const onUnhandledRejection = (error) => { unhandledRejections.push(error); };
+  process.prependListener("unhandledRejection", onUnhandledRejection);
+  try {
+    loaded = await loadMainModule([], {
+      createRunStartHandler: () => async (input, ownership) => {
+        assert.ok(ownership);
+        starts.push(input.nodeId);
+        if (input.nodeId === "lane-sibling") {
+          siblingGate.started.resolve();
+          await siblingGate.release.promise;
+        }
+        return { id: input.runId, status: "running" };
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          const store = module.createWorkflowStore(options);
+          return new Proxy(store, {
+            get(target, property) {
+              if (property === "close") {
+                return () => {
+                  closeCalls += 1;
+                  target.close();
+                  storeClosed = true;
+                };
+              }
+              if (storeClosed) {
+                postCloseAccesses += 1;
+                throw new Error(`post-close workflow store access: ${String(property)}`);
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    seedCoordinatorSession(store, projectRoot, "session-target");
+    seedCoordinatorSession(store, projectRoot, "session-sibling");
+    declareCoordinatorLane(store, "session-target", "lane-target-initial");
+    declareCoordinatorLane(store, "session-sibling", "lane-sibling");
+
+    const nonStrictFlight = loaded.exports.advanceWorkflowSession(
+      projectRoot,
+      store,
+      "session-target",
+    );
+    await withTimeout(siblingGate.started.promise, 2_000, "non-strict advance did not reach the sibling lane");
+    assert.equal(starts.filter((laneId) => laneId === "lane-target-initial").length, 1);
+
+    declareCoordinatorLane(store, "session-target", "lane-target-after-call");
+    const strictFlight = loaded.exports.advanceWorkflowSession(
+      projectRoot,
+      store,
+      "session-target",
+      true,
+    );
+    let closeSettled = false;
+    const close = loaded.exports.closeWorkflowStores();
+    void close.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), false);
+    await assert.rejects(
+      loaded.exports.advanceWorkflowSession(projectRoot, store, "session-target", true),
+      /Workflow advancement is unavailable while SkyTurn is shutting down/,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeSettled, false);
+    assert.equal(storeClosed, false);
+
+    siblingGate.release.resolve();
+    await withTimeout(
+      Promise.all([nonStrictFlight, strictFlight, close]),
+      2_000,
+      "shutdown did not drain the queued strict advance",
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(starts.filter((laneId) => laneId === "lane-target-after-call").length, 1);
+    assert.equal(closeCalls, 1);
+    assert.equal(storeClosed, true);
+    assert.equal(postCloseAccesses, 0);
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), true);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    siblingGate.release.resolve();
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow shutdown invalidates getWorkflowStore paused before initialization identity publication", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-unpublished-identity-"));
+  const identityGate = deferred();
+  let createCalls = 0;
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      fsPromises: {
+        ...realFs,
+        async realpath(value) {
+          if (value === projectRoot) {
+            identityGate.started.resolve();
+            await identityGate.release.promise;
+          }
+          return realFs.realpath(value);
+        },
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          createCalls += 1;
+          return module.createWorkflowStore(options);
+        },
+      }),
+    });
+
+    const opening = loaded.exports.getWorkflowStore(projectRoot);
+    const rejectedOpening = assert.rejects(
+      opening,
+      /Workflow advancement is unavailable while SkyTurn is shutting down/,
+    );
+    await identityGate.started.promise;
+    await loaded.exports.closeWorkflowStores();
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), true);
+
+    identityGate.release.resolve();
+    await rejectedOpening;
+
+    assert.equal(createCalls, 0);
+    assert.equal(loaded.exports.workflowStores.size, 0);
+    assert.equal(loaded.exports.workflowStoreInitializations.size, 0);
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+  } finally {
+    identityGate.release.resolve();
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow shutdown invalidates an unpublished advance paused in project identity resolution", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-unpublished-advance-"));
+  const identityGate = deferred();
+  const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+  const store = createWorkflowStore({ projectRoot });
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      fsPromises: {
+        ...realFs,
+        async realpath(value) {
+          if (value === projectRoot) {
+            identityGate.started.resolve();
+            await identityGate.release.promise;
+          }
+          return realFs.realpath(value);
+        },
+      },
+    });
+
+    const advancing = loaded.exports.advanceWorkflowSession(projectRoot, store, "session-unpublished", true);
+    const rejectedAdvance = assert.rejects(
+      advancing,
+      /Workflow advancement is unavailable while SkyTurn is shutting down/,
+    );
+    await identityGate.started.promise;
+    await loaded.exports.closeWorkflowStores();
+    identityGate.release.resolve();
+    await rejectedAdvance;
+
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+  } finally {
+    identityGate.release.resolve();
+    store.close();
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow shutdown drains a registered initialization and prevents late publication", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-initialization-shutdown-"));
+  const recoveryGate = deferred();
+  const recoveryModule = await import("../dist-electron/electron/workflowRunRecovery.js");
+  let closeCalls = 0;
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      workflowRunRecoveryModule: {
+        ...recoveryModule,
+        async recoverPendingPlannerIntentReconciliations() {
+          recoveryGate.started.resolve();
+          await recoveryGate.release.promise;
+        },
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          const store = module.createWorkflowStore(options);
+          const close = store.close.bind(store);
+          store.close = () => {
+            closeCalls += 1;
+            close();
+          };
+          return store;
+        },
+      }),
+    });
+
+    const opening = loaded.exports.getWorkflowStore(projectRoot);
+    const rejectedOpening = assert.rejects(
+      opening,
+      /Workflow advancement is unavailable while SkyTurn is shutting down/,
+    );
+    await recoveryGate.started.promise;
+    assert.equal(loaded.exports.workflowStoreInitializations.size, 1);
+
+    let closeSettled = false;
+    const closing = loaded.exports.closeWorkflowStores();
+    void closing.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeSettled, false);
+    assert.equal(closeCalls, 0);
+
+    recoveryGate.release.resolve();
+    await Promise.all([rejectedOpening, closing]);
+
+    assert.equal(closeCalls, 1);
+    assert.equal(loaded.exports.workflowStores.size, 0);
+    assert.equal(loaded.exports.workflowStoreInitializations.size, 0);
+    assert.equal(loaded.exports.workflowSessionMutationLocks.size, 0);
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+  } finally {
+    recoveryGate.release.resolve();
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow shutdown drains registered terminal reconciliation before closing stores", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-terminal-shutdown-"));
+  const reconciliationGate = deferred();
+  const completedAt = "2026-07-24T00:00:02.000Z";
+  const consoleErrors = [];
+  const unhandledRejections = [];
+  const onUnhandledRejection = (error) => { unhandledRejections.push(error); };
+  process.prependListener("unhandledRejection", onUnhandledRejection);
+  let terminalListener;
+  let segment;
+  let loadEventsCalls = 0;
+  let closeCalls = 0;
+  let bridgeConfig;
+  let loaded;
+  const bridge = {
+    onRunEvent(listener) {
+      terminalListener = listener;
+      return () => undefined;
+    },
+    listRuns() {
+      return segment ? [{
+        id: segment.runId,
+        projectRoot,
+        sessionId: segment.sessionId,
+        nodeId: segment.laneId,
+        agentKind: segment.agentKind,
+        status: "succeeded",
+      }] : [];
+    },
+    async loadEvents() {
+      loadEventsCalls += 1;
+      if (loadEventsCalls === 1) {
+        reconciliationGate.started.resolve();
+        await reconciliationGate.release.promise;
+      }
+      return [];
+    },
+    async getEvidence(_projectRoot, runId) {
+      return {
+        runId,
+        status: "succeeded",
+        exitCode: 0,
+        changesetId: null,
+        checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+        artifacts: [],
+        review: null,
+        errorReason: null,
+        cancelReason: null,
+        completedAt,
+      };
+    },
+  };
+  try {
+    loaded = await loadMainModule([], {
+      agentBridge: bridge,
+      onAgentBridgeCreated(config) { bridgeConfig = config; },
+      platform: "linux",
+      console: {
+        ...console,
+        error(message) { consoleErrors.push(message); },
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          const store = module.createWorkflowStore(options);
+          const close = store.close.bind(store);
+          store.close = () => {
+            closeCalls += 1;
+            close();
+          };
+          return store;
+        },
+      }),
+    });
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    seedCoordinatorSession(store, projectRoot, "session-terminal-shutdown");
+    declareCoordinatorLane(store, "session-terminal-shutdown", "lane-terminal-shutdown");
+    store.scheduleReadyLanes("session-terminal-shutdown", {
+      allowedParallelism: 1,
+      authorizedLaneIds: ["lane-terminal-shutdown"],
+      now: "2026-07-24T00:00:01.000Z",
+    });
+    segment = store.listRunningSegments().find((candidate) => candidate.laneId === "lane-terminal-shutdown");
+    assert.ok(segment);
+    await loaded.exports.getAgentBridge();
+    assert.equal(typeof terminalListener, "function");
+    const persistenceFailure = bridgeConfig.onTerminalPersistenceFailure({});
+    assert.equal(loaded.exports.workflowTerminalReconciliationTasks.size, 1);
+    await assert.rejects(persistenceFailure, /terminal-persistence-failed/);
+    assert.equal(loaded.exports.workflowTerminalReconciliationTasks.size, 0);
+    consoleErrors.length = 0;
+
+    terminalListener({
+      protocolVersion: 1,
+      runId: segment.runId,
+      seq: 2,
+      timestamp: completedAt,
+      kind: "status",
+      payload: { status: "succeeded", exitCode: 0 },
+    });
+    assert.equal(loaded.exports.workflowTerminalReconciliationTasks.size, 1);
+    await reconciliationGate.started.promise;
+
+    loaded.appListeners.get("window-all-closed")();
+    const closing = loaded.exports.closeWorkflowStores();
+    let closeSettled = false;
+    void closing.then(
+      () => { closeSettled = true; },
+      () => { closeSettled = true; },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closeSettled, false);
+    assert.equal(closeCalls, 0);
+
+    reconciliationGate.release.resolve();
+    await closing;
+
+    assert.equal(closeCalls, 1);
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), false);
+    assert.equal(loaded.exports.workflowTerminalReconciliationTasks.size, 0);
+    assert.equal(loaded.exports.workflowStoreInitializations.size, 0);
+    assert.equal(loaded.exports.workflowSessionMutationLocks.size, 0);
+    assert.equal(loaded.exports.workflowSessionAdvanceFlights.size, 0);
+    assert.equal(loaded.exports.workflowProjectAdvanceTails.size, 0);
+    assert.deepEqual(consoleErrors, []);
+
+    const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+    const reopened = createWorkflowStore({ projectRoot });
+    assert.equal(
+      reopened.materializeFlowProjection(segment.sessionId).lanes
+        .find((candidate) => candidate.id === segment.laneId)?.status,
+      "completed",
+    );
+    reopened.close();
+
+    const callsAfterClose = loadEventsCalls;
+    terminalListener({
+      protocolVersion: 1,
+      runId: segment.runId,
+      seq: 3,
+      timestamp: completedAt,
+      kind: "status",
+      payload: { status: "succeeded", exitCode: 0 },
+    });
+    let postCloseRuns = 0;
+    await loaded.exports.registerWorkflowTerminalReconciliation(async () => { postCloseRuns += 1; });
+    await Promise.resolve();
+    assert.equal(loadEventsCalls, callsAfterClose);
+    assert.equal(postCloseRuns, 0);
+    assert.equal(loaded.exports.workflowTerminalReconciliationTasks.size, 0);
+    assert.deepEqual(unhandledRejections, []);
+  } finally {
+    reconciliationGate.release.resolve();
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("strict advance observes its own target failure after a non-strict flight swallowed an earlier failure", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-advance-strict-error-"));
+  const siblingGate = deferred();
+  let injectTargetFailure = false;
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      createRunStartHandler: () => async (input, ownership) => {
+        assert.ok(ownership);
+        if (input.nodeId === "lane-sibling") {
+          siblingGate.started.resolve();
+          await siblingGate.release.promise;
+        }
+        return { id: input.runId, status: "running" };
+      },
+      wrapWorkflowStoreModule: (module) => ({
+        ...module,
+        createWorkflowStore: (options) => {
+          const store = module.createWorkflowStore(options);
+          return new Proxy(store, {
+            get(target, property) {
+              if (property === "materializeCanvasSession") {
+                return (sessionId) => {
+                  if (injectTargetFailure && sessionId === "session-target") {
+                    throw new Error("injected target advance failure");
+                  }
+                  return target.materializeCanvasSession(sessionId);
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    seedCoordinatorSession(store, projectRoot, "session-target");
+    seedCoordinatorSession(store, projectRoot, "session-sibling");
+    declareCoordinatorLane(store, "session-sibling", "lane-sibling");
+    injectTargetFailure = true;
+
+    const nonStrictFlight = loaded.exports.advanceWorkflowSession(
+      projectRoot,
+      store,
+      "session-target",
+    );
+    await withTimeout(siblingGate.started.promise, 2_000, "non-strict advance did not continue to the sibling");
+    const strictFlight = loaded.exports.advanceWorkflowSession(
+      projectRoot,
+      store,
+      "session-target",
+      true,
+    );
+    siblingGate.release.resolve();
+
+    await withTimeout(nonStrictFlight, 2_000, "non-strict advance did not finish");
+    await assert.rejects(
+      withTimeout(strictFlight, 2_000, "queued strict advance did not finish"),
+      /injected target advance failure/,
+    );
+  } finally {
+    siblingGate.release.resolve();
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("planner turn run ids use canonical project identity and terminal reconciliation stays project-local", async () => {
   const firstProjectRoot = await mkdtemp(join(tmpdir(), "skyturn-planner-project-a-"));
   const secondProjectRoot = await mkdtemp(join(tmpdir(), "skyturn-planner-project-b-"));
@@ -2777,10 +3688,18 @@ test("terminal planner reconciliation serializes intent scheduling before the ne
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-planner-terminal-lock-"));
   const reconciliationGate = deferred();
   const starts = [];
+  const workflowBroadcasts = [];
+  const windows = [{
+    webContents: {
+      send: (channel, payload) => {
+        if (channel === "workflow:event") workflowBroadcasts.push(payload);
+      },
+    },
+  }];
   let workflowStore;
   let loaded;
   try {
-    loaded = await loadMainModule([], {
+    loaded = await loadMainModule(windows, {
       createRunStartHandler: (config) => async (input, ownership) => {
         if (ownership) return { id: input.runId, status: "running" };
         const identity = {
@@ -2869,6 +3788,7 @@ test("terminal planner reconciliation serializes intent scheduling before the ne
         };
       },
     };
+    const broadcastsBeforeReconciliation = workflowBroadcasts.length;
     const reconciliation = loaded.exports.reconcileTerminalRunEvent(bridge, {
       protocolVersion: 1,
       runId: firstRun.runId,
@@ -2898,6 +3818,12 @@ test("terminal planner reconciliation serializes intent scheduling before the ne
     await Promise.all([reconciliation, nextTurn]);
     assert.equal(starts.length, 2);
     assert.notEqual(starts[1].runId, starts[0].runId);
+    assert.equal(
+      workflowBroadcasts.slice(broadcastsBeforeReconciliation).some((broadcast) =>
+        broadcast.cause === "terminal-reconciliation"
+      ),
+      false,
+    );
 
     const plannerFacts = workflowStore.listEvents("session-1").filter((event) =>
       event.idempotencyKey === `intent:${intent.intentId}:accepted` ||
@@ -2962,9 +3888,17 @@ test("terminal planner reconciliation serializes intent scheduling before the ne
 test("terminal non-planner Hermes reconciliation requests durable danger authorization without renderer workflow IPC", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-non-planner-terminal-"));
   const starts = [];
+  const workflowBroadcasts = [];
+  const windows = [{
+    webContents: {
+      send: (channel, payload) => {
+        if (channel === "workflow:event") workflowBroadcasts.push(payload);
+      },
+    },
+  }];
   let loaded;
   try {
-    loaded = await loadMainModule([], {
+    loaded = await loadMainModule(windows, {
       createRunStartHandler: () => async (input) => {
         starts.push(input);
         return { id: input.runId, status: "running" };
@@ -3071,6 +4005,7 @@ test("terminal non-planner Hermes reconciliation requests durable danger authori
       payload: { status: "succeeded", exitCode: 0 },
     };
 
+    const broadcastsBeforeTerminal = workflowBroadcasts.length;
     await loaded.exports.reconcileTerminalRunEvent(bridge, terminalEvent);
 
     const afterTerminal = store.materializeFlowProjection("session-1");
@@ -3078,6 +4013,9 @@ test("terminal non-planner Hermes reconciliation requests durable danger authori
     expectFlowLane(afterTerminal, "lane-commit", "pending");
     assert.equal(afterTerminal.segments.filter((item) => item.laneId === "lane-commit").length, 0);
     assert.equal(starts.length, 0);
+    const terminalBroadcasts = workflowBroadcasts.slice(broadcastsBeforeTerminal);
+    assert.ok(terminalBroadcasts.length > 0);
+    assert.equal(terminalBroadcasts.every((broadcast) => broadcast.cause === "terminal-reconciliation"), true);
     assert.equal(afterTerminal.userDecisions.length, 1);
     assert.deepEqual(toPlain(afterTerminal.userDecisions[0]), {
       decisionId: afterTerminal.userDecisions[0].decisionId,
@@ -3899,7 +4837,7 @@ test("workflow user input rejects a conflicting delivered fact before terminal d
         ...input,
         now: "2026-07-17T00:00:03.000Z",
       }),
-      /^Error: Workflow user input delivery id conflicts with existing state: input-delivered-conflict\.$/,
+      /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT: (?:Error: )?Workflow user input delivery id conflicts with existing state: input-delivered-conflict\.$/,
     );
     assert.deepEqual(terminalWrites, []);
     assert.deepEqual(broadcasts, []);
@@ -4672,6 +5610,7 @@ test("before-quit keeps a failed workspace drain retryable without detaching the
     const failedCleanup = loaded.exports.closeWorkflowStores();
     await assert.rejects(failedCleanup, /injected workspace write failure/);
     assert.equal(loaded.appState.quitCalls, 0);
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), true);
     assert.equal(runtimeCloseCalls, 0);
     const recovered = workspaceSnapshot(projectRoot, "recovered-after-failed-drain");
     await loaded.ipcHandlers.get("workspace:save")({}, recovered);
@@ -4682,6 +5621,7 @@ test("before-quit keeps a failed workspace drain retryable without detaching the
     const recoveredCleanup = loaded.exports.closeWorkflowStores();
     await recoveredCleanup;
     assert.equal(loaded.appState.quitCalls, 1);
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), false);
     assert.equal(prevented, 2);
     assert.equal(writeAttempts, 3);
     assert.equal(runtimeStateCalls, 2);
@@ -4813,6 +5753,7 @@ test("activate and second-instance share one failed window-close recovery before
     gate.release.resolve();
     await waitForCondition(() => windows.length === 1, "window-close recovery did not recreate one window");
     assert.equal(loaded.appState.quitCalls, 0);
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), true);
     assert.equal(writeAttempts, 3);
     assert.equal(runtimeFactoryCalls, 1);
     assert.equal(runtimeCloseCalls, 1);
@@ -5034,6 +5975,7 @@ test("direct shutdown rejects concurrent Plan IPC without creating a replacement
   releaseClose();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(factoryCalls, 1);
+  assert.equal(exports.isWorkflowAdvanceAdmissionOpen(), false);
 });
 
 test("macOS activate creates one replacement runtime only after the shared close barrier clears", async (t) => {
@@ -5084,6 +6026,7 @@ test("macOS activate creates one replacement runtime only after the shared close
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(windows.length, 0);
+  assert.equal(exports.isWorkflowAdvanceAdmissionOpen(), true);
   appListeners.get("activate")();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(windows.length, 1);
@@ -5277,6 +6220,43 @@ function completePlannerTurnForTest(store, session, projectRoot) {
   });
 }
 
+function seedCoordinatorSession(store, projectRoot, sessionId) {
+  const session = store.createWorkflowSession({
+    id: sessionId,
+    projectId: "project-1",
+    title: sessionId,
+    goal: `Advance ${sessionId}`,
+    mode: "fast",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    plannerProfile: "default",
+    transport: "hermes_replay_recovery",
+    recoveryReason: "Test setup has no live Hermes session.",
+    now: "2026-07-23T00:00:00.000Z",
+  });
+  completePlannerTurnForTest(store, session, projectRoot);
+  return session;
+}
+
+function declareCoordinatorLane(store, sessionId, laneId) {
+  store.appendWorkflowEvent({
+    sessionId,
+    kind: "workflow.lane.declared",
+    source: "test",
+    idempotencyKey: `lane:${laneId}`,
+    payload: {
+      lane: {
+        id: laneId,
+        semanticKey: laneId,
+        kind: "validation",
+        title: laneId,
+        agentKind: "codex",
+        status: "pending",
+      },
+    },
+    now: "2026-07-23T00:00:01.000Z",
+  });
+}
+
 function seedScheduledLane(store, projectRoot, lane) {
   const session = store.createWorkflowSession({
     id: "session-1",
@@ -5336,7 +6316,7 @@ async function loadMainModule(windows, options = {}) {
   const orchestrator = await import("@skyturn/orchestrator");
   const uiCanvasWorkflowRuntime = await import("@skyturn/ui-canvas/workflow-runtime");
   const source = `${await readFile(join(root, "electron", "main.ts"), "utf8")}
-export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getWorkflowStore, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workspaceSaveWriter };`;
+export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getAgentBridge, getWorkflowStore, isWorkflowAdvanceAdmissionOpen, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, registerWorkflowTerminalReconciliation, workflowStoreOperationTasks, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowProjectAdvanceTails, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workflowTerminalReconciliationTasks, workspaceSaveWriter };`;
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -5460,7 +6440,7 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
         return genericModule;
       },
       process: vmProcess,
-      console,
+      console: options.console ?? console,
       Buffer,
       AbortController,
       AbortSignal,
