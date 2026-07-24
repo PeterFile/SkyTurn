@@ -197,6 +197,35 @@ export function hasSuccessfulCodexCliExitEvidence(runId, evidence) {
   );
 }
 
+export function authoritativeStateDifference(live, reopened) {
+  if (stableJson(live) === stableJson(reopened)) return null;
+  const liveEvents = Array.isArray(live?.projection?.events) ? live.projection.events : [];
+  const reopenedEvents = Array.isArray(reopened?.projection?.events) ? reopened.projection.events : [];
+  const eventCount = Math.max(liveEvents.length, reopenedEvents.length);
+  let firstDifferentEvent = null;
+  for (let index = 0; index < eventCount; index += 1) {
+    const liveEvent = liveEvents[index];
+    const reopenedEvent = reopenedEvents[index];
+    if (stableJson(liveEvent) === stableJson(reopenedEvent)) continue;
+    firstDifferentEvent = {
+      index,
+      liveSequence: liveEvent?.seq ?? null,
+      reopenedSequence: reopenedEvent?.seq ?? null,
+      liveKind: liveEvent?.kind ?? null,
+      reopenedKind: reopenedEvent?.kind ?? null,
+      liveIdempotencyKey: liveEvent?.idempotencyKey ?? null,
+      reopenedIdempotencyKey: reopenedEvent?.idempotencyKey ?? null,
+      differingFields: differingFields(liveEvent, reopenedEvent),
+    };
+    break;
+  }
+  return {
+    firstDifferentEvent,
+    canvasSessionDifferingFields: differingFields(live?.canvasSession, reopened?.canvasSession),
+    projectionDifferingFields: differingFields(live?.projection, reopened?.projection),
+  };
+}
+
 export function assertSeededCheckpointAuthority(projection) {
   const runId = failureRepairRegressionFixture.failedRunId;
   const expectedBaseRefs = [
@@ -594,12 +623,9 @@ export async function runFailureRepairRegressionAcceptance() {
     if (!firstClose.ok) throw new Error(firstClose.diagnostic ?? "First Electron close failed.");
 
     const reopened = await runElectronNodeMode("--inspect", { projectRoot });
-    if (stableJson(reopened.canvasSession) !== stableJson(completed.canvasSession) ||
-        stableJson(reopened.projection) !== stableJson(completed.projection)) {
-      throw new Error(`SQLite reopen did not preserve the completed authoritative projection: ${boundedDiagnostic(JSON.stringify({
-        canvasSession: differingTopLevelKeys(completed.canvasSession, reopened.canvasSession),
-        projection: differingTopLevelKeys(completed.projection, reopened.projection),
-      }))}`);
+    const reopenDifference = authoritativeStateDifference(completed, reopened);
+    if (reopenDifference) {
+      throw new Error(`SQLite reopen did not preserve the completed authoritative projection: ${boundedDiagnostic(JSON.stringify(reopenDifference))}`);
     }
 
     const verification = await collectProjectVerification(projectRoot, baselineHead, testHash);
@@ -619,8 +645,9 @@ export async function runFailureRepairRegressionAcceptance() {
     });
     await waitForStoredProjectRegistration(liveCdp, projectRoot);
     const restarted = await readAuthoritativeState(liveCdp, projectRoot);
-    if (stableJson(restarted) !== stableJson(reopened)) {
-      throw new Error("Electron restart changed the authoritative session or created duplicate workflow facts.");
+    const restartDifference = authoritativeStateDifference(reopened, restarted);
+    if (restartDifference) {
+      throw new Error(`Electron restart changed the authoritative session or created duplicate workflow facts: ${boundedDiagnostic(JSON.stringify(restartDifference))}`);
     }
     const restartChain = repairChainTerminalState(restarted.canvasSession);
     if (!restartChain.completed || restartChain.failures.length > 0) {
@@ -860,11 +887,50 @@ function stableJson(value) {
   });
 }
 
-function differingTopLevelKeys(left, right) {
-  const leftRecord = left && typeof left === "object" && !Array.isArray(left) ? left : {};
-  const rightRecord = right && typeof right === "object" && !Array.isArray(right) ? right : {};
-  return [...new Set([...Object.keys(leftRecord), ...Object.keys(rightRecord)])]
-    .filter((key) => stableJson(leftRecord[key]) !== stableJson(rightRecord[key]));
+function differingFields(live, reopened, path = "$", differences = []) {
+  if (differences.length >= 64 || stableJson(live) === stableJson(reopened)) return differences;
+  const liveArray = Array.isArray(live);
+  const reopenedArray = Array.isArray(reopened);
+  if (liveArray || reopenedArray) {
+    if (!liveArray || !reopenedArray) {
+      differences.push({ path, liveValue: diagnosticValue(live, true), reopenedValue: diagnosticValue(reopened, true) });
+      return differences;
+    }
+    for (let index = 0; index < Math.max(live.length, reopened.length) && differences.length < 64; index += 1) {
+      differingFields(live[index], reopened[index], `${path}[${index}]`, differences);
+    }
+    return differences;
+  }
+  const liveObject = live !== null && typeof live === "object";
+  const reopenedObject = reopened !== null && typeof reopened === "object";
+  if (liveObject || reopenedObject) {
+    if (!liveObject || !reopenedObject) {
+      differences.push({ path, liveValue: diagnosticValue(live, true), reopenedValue: diagnosticValue(reopened, true) });
+      return differences;
+    }
+    const keys = [...new Set([...Object.keys(live), ...Object.keys(reopened)])].sort();
+    for (const key of keys) {
+      if (differences.length >= 64) break;
+      const livePresent = Object.hasOwn(live, key);
+      const reopenedPresent = Object.hasOwn(reopened, key);
+      if (!livePresent || !reopenedPresent) {
+        differences.push({
+          path: `${path}.${key}`,
+          liveValue: diagnosticValue(live[key], livePresent),
+          reopenedValue: diagnosticValue(reopened[key], reopenedPresent),
+        });
+        continue;
+      }
+      differingFields(live[key], reopened[key], `${path}.${key}`, differences);
+    }
+    return differences;
+  }
+  differences.push({ path, liveValue: diagnosticValue(live, true), reopenedValue: diagnosticValue(reopened, true) });
+  return differences;
+}
+
+function diagnosticValue(value, present) {
+  return present ? value : { missing: true };
 }
 
 function boundedDiagnostic(value) {
@@ -878,13 +944,18 @@ function sha256File(path) {
   return readFile(path).then((value) => createHash("sha256").update(value).digest("hex"));
 }
 
+export function collectProcessOutput(stream, append) {
+  stream.setEncoding("utf8");
+  stream.on("data", append);
+}
+
 function runCommand(command, args, cwd, { allowFailure = false, env = process.env } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    collectProcessOutput(child.stdout, (chunk) => { stdout += chunk; });
+    collectProcessOutput(child.stderr, (chunk) => { stderr += chunk; });
     child.once("error", reject);
     child.once("close", (code, signal) => {
       const result = { code: code ?? (signal ? 1 : 0), signal, stdout, stderr };
