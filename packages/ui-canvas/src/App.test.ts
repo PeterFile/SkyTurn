@@ -1679,6 +1679,22 @@ describe("UI source validation", () => {
     expect(panel).toContain("deliveryGateStatusLabel");
   });
 
+  it("DeliveryLifecyclePanel exposes exact renderer-owned session, lane, and SHA identity without changing visible facts", async () => {
+    const appSource = await readSource("./App.tsx");
+    const changesTab = appSource.slice(appSource.indexOf("function ChangesTab("), appSource.indexOf("function DeliveryLifecyclePanel("));
+    const panel = appSource.slice(appSource.indexOf("function DeliveryLifecyclePanel("), appSource.indexOf("function shortSha("));
+
+    expect(changesTab).toContain("sessionId={session.id}");
+    expect(changesTab).toContain("commitLaneId={node.id}");
+    expect(changesTab).toContain("pullRequestLaneId={dependentPrLaneId}");
+    expect(panel).toContain("data-delivery-session-id={sessionId}");
+    expect(panel).toContain("data-delivery-commit-lane-id={commitLaneId}");
+    expect(panel).toContain("data-delivery-pull-request-lane-id={pullRequestLaneId}");
+    expect(panel).toContain("data-delivery-commit-sha={commitEvidence?.commitSha}");
+    expect(panel).toContain("data-delivery-pull-request-head-sha={pullRequest?.headSha}");
+    expect(panel).toContain("data-delivery-checks-expected-head-sha={prChecks?.expectedHeadSha}");
+  });
+
   it("ChangesTab clears stale PR checks when PR status refresh starts or fails", async () => {
     const appSource = await readSource("./App.tsx");
     const handleCheckPrStatus = appSource.slice(appSource.indexOf("async function handleCheckPrStatus()"), appSource.indexOf("async function handleMergePullRequest()"));
