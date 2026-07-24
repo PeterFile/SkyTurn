@@ -4873,6 +4873,9 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
       />
 
       <DeliveryLifecyclePanel
+        sessionId={session.id}
+        commitLaneId={node.id}
+        pullRequestLaneId={dependentPrLaneId}
         state={deliveryState}
         error={deliveryError}
         isMismatch={reconciliation?.status === "mismatch"}
@@ -4952,6 +4955,9 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
 }
 
 function DeliveryLifecyclePanel({
+  sessionId,
+  commitLaneId,
+  pullRequestLaneId,
   state,
   error,
   isMismatch,
@@ -5009,6 +5015,9 @@ function DeliveryLifecyclePanel({
   missingCleanMetadata,
   onCleanup,
 }: {
+  sessionId: string;
+  commitLaneId: string;
+  pullRequestLaneId?: string;
   state: DeliveryPanelState;
   error: string | null;
   isMismatch: boolean;
@@ -5084,7 +5093,16 @@ function DeliveryLifecyclePanel({
   const headSha = pullRequest?.headSha;
 
   return (
-    <section className="delivery-panel" aria-label="Delivery lifecycle">
+    <section
+      className="delivery-panel"
+      aria-label="Delivery lifecycle"
+      data-delivery-session-id={sessionId}
+      data-delivery-commit-lane-id={commitLaneId}
+      data-delivery-pull-request-lane-id={pullRequestLaneId}
+      data-delivery-commit-sha={commitEvidence?.commitSha}
+      data-delivery-pull-request-head-sha={pullRequest?.headSha}
+      data-delivery-checks-expected-head-sha={prChecks?.expectedHeadSha}
+    >
       <header className="delivery-panel-header">
         <div>
           <p className="eyebrow">Delivery</p>

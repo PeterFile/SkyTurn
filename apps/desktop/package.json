@@ -16,6 +16,7 @@
     "acceptance:new-session": "pnpm run acceptance:new-session-ui",
     "acceptance:new-session-ui": "node scripts/newSessionUiAcceptance.mjs",
     "acceptance:failure-repair-regression": "node scripts/failureRepairRegressionAcceptance.mjs",
+    "acceptance:candidate-delivery-pr": "node scripts/candidateDeliveryPrAcceptance.mjs",
     "smoke:github": "node scripts/deliveryGithubSmoke.mjs",
     "lint": "pnpm run typecheck"
   },
