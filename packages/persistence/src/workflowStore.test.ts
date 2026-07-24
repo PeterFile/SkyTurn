@@ -3144,6 +3144,64 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("exactly replays a terminal failed repair regression chain after SQLite reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    store.recordRunResult(runResultInput(store, "lane-implementation", "failed", "2026-06-14T00:00:07.000Z"));
+    recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
+
+    store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "deterministic-repair-intent",
+      successorLaneId: "lane-implementation-repair",
+      successorSemanticKey: "repair:lane-implementation:deterministic",
+      instruction: "Repair the failed implementation and rerun its regression test.",
+      now: "2026-06-14T00:00:20.000Z",
+    });
+    expect(store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:21.000Z",
+    }).readyLanes.map((lane) => lane.id)).toEqual(["lane-implementation-repair"]);
+    store.recordRunResult(runResultInput(
+      store,
+      "lane-implementation-repair",
+      "succeeded",
+      "2026-06-14T00:00:22.000Z",
+    ));
+    expect(store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-06-14T00:00:23.000Z",
+    }).readyLanes.map((lane) => lane.id)).toEqual(["lane-implementation-repair-regression"]);
+    store.recordRunResult(runResultInput(
+      store,
+      "lane-implementation-repair-regression",
+      "succeeded",
+      "2026-06-14T00:00:24.000Z",
+    ));
+
+    const live = {
+      projection: store.materializeFlowProjection("session-1"),
+      canvasSession: store.materializeCanvasSession("session-1"),
+    };
+    expect(live.projection.lanes.find((lane) => lane.id === "lane-implementation")?.status).toBe("failed");
+    expect(live.projection.lanes.find((lane) => lane.id === "lane-implementation-repair")?.status).toBe("completed");
+    expect(live.projection.lanes.find((lane) => lane.id === "lane-implementation-repair-regression")?.status).toBe("completed");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const replayed = {
+      projection: reopened.materializeFlowProjection("session-1"),
+      canvasSession: reopened.materializeCanvasSession("session-1"),
+    };
+    expect(replayed).toEqual(live);
+    reopened.close();
+  });
+
   it("does not create a second repair chain for the same failed evidence", async () => {
     const store = await makeSeededStore();
     declareCodeChangeWorkflow(store);
