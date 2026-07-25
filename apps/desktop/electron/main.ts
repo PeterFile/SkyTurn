@@ -583,6 +583,8 @@ type WorkflowBroadcastCause =
 const openedProjectRoots = new Set<string>();
 const planProjectIdentities = createPlanProjectIdentityRegistry();
 let agentBridge: AgentBridgeHost | null = null;
+let agentBridgeInitialization: Promise<AgentBridgeHost> | null = null;
+let agentBridgeAdmissionOpen = true;
 let appShutdownRequested = false;
 let windowCloseRecoveryState: "idle" | "failed" = "idle";
 let windowCloseRecoveryPromise: Promise<void> | null = null;
@@ -594,8 +596,10 @@ const workflowSessionAdvanceFlights = new Map<string, Promise<void>>();
 const workflowProjectAdvanceTails = new Map<string, Promise<void>>();
 const workflowStoreOperationTasks = new Set<Promise<unknown>>();
 const workflowTerminalReconciliationTasks = new Set<Promise<void>>();
+const workflowTerminalReconciliationFailures: unknown[] = [];
 let workflowAdvanceAdmissionOpen = true;
 let workflowAdvanceAdmissionEpoch = 0;
+let workflowTerminalReconciliationAdmissionOpen = true;
 const MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT = 4;
 const DANGER_FULL_ACCESS_AUTHORIZATION_OPTION = "Authorize this run";
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
@@ -609,6 +613,7 @@ const terminalRuntime = createTerminalRuntime({
 });
 
 interface AgentBridgeHost {
+  close(reason?: string): Promise<void>;
   discoverAgents(): Promise<AgentDescriptor[]>;
   listRuns(): unknown[];
   onRunEvent(listener: (event: unknown) => void): () => void;
@@ -2577,7 +2582,10 @@ async function canonicalizePlanCancelRequest(request: PlanCancelRequest): Promis
 }
 
 async function getAgentBridge(): Promise<AgentBridgeHost> {
-  if (!agentBridge) {
+  if (agentBridge) return agentBridge;
+  if (!agentBridgeAdmissionOpen) throw new Error("Agent bridge is unavailable while SkyTurn is shutting down.");
+  if (!agentBridgeInitialization) {
+    const initialization = (async () => {
     const {
       AgentBridge,
       createCodexCliAdapter,
@@ -2610,13 +2618,17 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
       for (const window of BrowserWindow.getAllWindows()) {
         window.webContents.send("run:event", event);
       }
-      void registerWorkflowTerminalReconciliation(() => reconcileTerminalRunEvent(bridge, event)).catch(() => {
-        console.error("workflow-terminal-reconciliation-failed");
-      });
+      void observeWorkflowTerminalReconciliation(() => reconcileTerminalRunEvent(bridge, event));
     });
     agentBridge = bridge;
+    return bridge;
+    })();
+    agentBridgeInitialization = initialization;
+    void initialization.finally(() => {
+      if (agentBridgeInitialization === initialization) agentBridgeInitialization = null;
+    }).catch(() => undefined);
   }
-  return agentBridge;
+  return agentBridgeInitialization;
 }
 
 async function compensateTerminalPersistenceFailure(failure: TerminalPersistenceFailureLike): Promise<void> {
@@ -6817,12 +6829,7 @@ if (!hasSingleInstanceLock) {
 
   app.on("before-quit", createBeforeQuitHandler(async () => {
     appShutdownRequested = true;
-    try {
-      await closeWorkflowStores();
-    } catch (error) {
-      appShutdownRequested = false;
-      throw error;
-    }
+    await closeWorkflowStores();
   }, () => app.quit()));
 
   app.on("window-all-closed", () => {
@@ -6830,12 +6837,14 @@ if (!hasSingleInstanceLock) {
     windowCloseRecoveryState = "idle";
     void closeWorkflowStores().then(
       () => {
-        if (process.platform !== "darwin") {
+        if (
+          process.platform !== "darwin" ||
+          process.env.SKYTURN_NEW_SESSION_UI_ACCEPTANCE === "1"
+        ) {
           app.quit();
           return;
         }
-        workspaceSaveWriter.reopenAdmission();
-        reopenWorkflowAdvanceAdmission();
+        reopenWindowCloseAdmissions();
         appShutdownRequested = false;
       },
       () => {
@@ -6871,8 +6880,7 @@ function requestFailedWindowCloseRecovery(): void {
       workspaceSaveWriter.closeAdmission();
       return;
     }
-    workspaceSaveWriter.reopenAdmission();
-    reopenWorkflowAdvanceAdmission();
+    reopenWindowCloseAdmissions();
     windowCloseRecoveryState = "idle";
     appShutdownRequested = false;
     await createMainWindow();
@@ -6884,6 +6892,13 @@ function requestFailedWindowCloseRecovery(): void {
     if (windowCloseRecoveryPromise === recovery) windowCloseRecoveryPromise = null;
   };
   void recovery.then(reset, reset);
+}
+
+function reopenWindowCloseAdmissions(): void {
+  workspaceSaveWriter.reopenAdmission();
+  agentBridgeAdmissionOpen = true;
+  reopenWorkflowAdvanceAdmission();
+  reopenWorkflowTerminalReconciliationAdmission();
 }
 
 function createBeforeQuitHandler(
@@ -6919,6 +6934,7 @@ function createBeforeQuitHandler(
 function closeWorkflowStores(): Promise<void> {
   if (workflowStoresClosePromise) return workflowStoresClosePromise;
   closeWorkflowAdvanceAdmission();
+  agentBridgeAdmissionOpen = false;
   const closing = (async () => {
     workspaceSaveWriter.closeAdmission();
     try {
@@ -6928,14 +6944,33 @@ function closeWorkflowStores(): Promise<void> {
       await closingPlanRuntime?.close();
       if (planRuntime === closingPlanRuntime) planRuntime = null;
       await drainWorkflowTasks();
+      const closingAgentBridge = agentBridge ?? (agentBridgeInitialization ? await agentBridgeInitialization : null);
+      await closingAgentBridge?.close("SkyTurn is shutting down.");
+      if (agentBridge === closingAgentBridge) agentBridge = null;
+      await drainWorkflowTasks();
+      if (workflowTerminalReconciliationFailures.length > 0) {
+        throw new AggregateError(
+          [...workflowTerminalReconciliationFailures],
+          "Workflow terminal reconciliation failed during shutdown.",
+        );
+      }
+      closeWorkflowTerminalReconciliationAdmission();
       for (const [projectRoot, store] of workflowStores) {
         store.close();
         workflowStores.delete(projectRoot);
       }
-      if (!appShutdownRequested) reopenWorkflowAdvanceAdmission();
+      if (!appShutdownRequested) {
+        agentBridgeAdmissionOpen = true;
+        reopenWorkflowAdvanceAdmission();
+        reopenWorkflowTerminalReconciliationAdmission();
+      }
     } catch (error) {
-      workspaceSaveWriter.reopenAdmission();
-      reopenWorkflowAdvanceAdmission();
+      if (!appShutdownRequested) {
+        workspaceSaveWriter.reopenAdmission();
+        agentBridgeAdmissionOpen = true;
+        reopenWorkflowAdvanceAdmission();
+        reopenWorkflowTerminalReconciliationAdmission();
+      }
       throw error;
     }
   })();
@@ -6968,7 +7003,7 @@ function assertWorkflowAdvanceAdmissionOpen(expectedEpoch = workflowAdvanceAdmis
 }
 
 function registerWorkflowTerminalReconciliation(task: () => Promise<void>): Promise<void> {
-  if (!workflowAdvanceAdmissionOpen) return Promise.resolve();
+  if (!workflowTerminalReconciliationAdmissionOpen) return Promise.resolve();
   const reconciliation = Promise.resolve().then(task);
   workflowTerminalReconciliationTasks.add(reconciliation);
   void reconciliation.then(
@@ -6976,6 +7011,23 @@ function registerWorkflowTerminalReconciliation(task: () => Promise<void>): Prom
     () => { workflowTerminalReconciliationTasks.delete(reconciliation); },
   );
   return reconciliation;
+}
+
+function observeWorkflowTerminalReconciliation(task: () => Promise<void>): Promise<void> {
+  const reconciliation = registerWorkflowTerminalReconciliation(task);
+  void reconciliation.catch((error) => {
+    workflowTerminalReconciliationFailures.push(error);
+    console.error("workflow-terminal-reconciliation-failed");
+  });
+  return reconciliation;
+}
+
+function closeWorkflowTerminalReconciliationAdmission(): void {
+  workflowTerminalReconciliationAdmissionOpen = false;
+}
+
+function reopenWorkflowTerminalReconciliationAdmission(): void {
+  workflowTerminalReconciliationAdmissionOpen = true;
 }
 
 async function drainWorkflowTasks(): Promise<void> {

@@ -26,7 +26,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RunEventDraft, RunEventSink } from "@skyturn/agent-runtime";
 import { summarizeRunEvidence } from "@skyturn/project-core";
-import type { AgentRun, RunEvent, RunEvidence } from "@skyturn/project-core";
+import type { AgentRun, RunEvent, RunEvidence, StartAgentRunInput } from "@skyturn/project-core";
 import type { TerminalSessionEventDraft } from "@skyturn/project-core";
 import { reduceWorkflowEvents, scheduleReadyLanes, type FlowEvent } from "@skyturn/workflow-kernel";
 
@@ -611,6 +611,200 @@ describe("agent bridge", () => {
     expect(bridge.listRuns()).toEqual([
       expect.objectContaining({ id: input.runId, status: "failed" }),
     ]);
+  });
+
+  it.each(["explicit", "implicit"] as const)(
+    "strictly closes across an invisible pre-owner %s start flight",
+    async (startKind) => {
+      const projectRoot = await makeTempRoot();
+      const prepareEntered = deferred<void>();
+      const prepareRelease = deferred<void>();
+      const baseStore = inMemoryPrivateRunEventStore();
+      const baseAdapter = createMockAgentAdapter({ holdOpen: true });
+      let starts = 0;
+      let cancels = 0;
+      const bridge = new AgentBridge({
+        privateRunEventStore: {
+          ...baseStore,
+          async prepare() {
+            prepareEntered.resolve();
+            await prepareRelease.promise;
+          },
+        },
+        adapters: [{
+          ...baseAdapter,
+          async startRun(input, sink) {
+            starts += 1;
+            const handle = await baseAdapter.startRun(input, sink);
+            return {
+              async cancel(reason) {
+                cancels += 1;
+                await handle.cancel(reason);
+              },
+            };
+          },
+        }],
+      });
+      const explicit = explicitRunInput(projectRoot, `strict-close-${startKind}`);
+      const { runId: _implicitRunId, ...implicit } = explicit;
+      const input = startKind === "explicit"
+        ? explicit
+        : implicit;
+
+      const start = bridge.startRun(input);
+      await prepareEntered.promise;
+      expect(bridge.listRuns()).toEqual([]);
+
+      let closeSettled = false;
+      const closing = bridge.close("desktop shutdown");
+      const duplicateClose = bridge.close("ignored duplicate reason");
+      void closing.finally(() => {
+        closeSettled = true;
+      });
+      await Promise.resolve();
+
+      expect(duplicateClose).toBe(closing);
+      expect(closeSettled).toBe(false);
+      expect(starts).toBe(0);
+
+      prepareRelease.resolve();
+      const run = await start;
+      await closing;
+
+      expect(starts).toBe(1);
+      expect(cancels).toBe(1);
+      expect(run.status).toBe("cancelled");
+      expect(bridge.listRuns()).toEqual([
+        expect.objectContaining({ id: run.id, status: "cancelled" }),
+      ]);
+      await expect(bridge.getEvidence(projectRoot, run.id)).resolves.toMatchObject({
+        status: "cancelled",
+        cancelReason: "desktop shutdown",
+      });
+      await expect(bridge.startRun({
+        ...explicit,
+        runId: `run-post-close-${startKind}`,
+        expectedArtifacts: null as unknown as string[],
+      })).rejects.toThrow("desktop shutdown");
+      expect(bridge.close()).toBe(closing);
+      expect(starts).toBe(1);
+    },
+  );
+
+  it("attempts every active cancellation and aggregates strict close failures", async () => {
+    const projectRoot = await makeTempRoot();
+    const cancelled: string[] = [];
+    const bridge = new AgentBridge({
+      privateRunEventStore: inMemoryPrivateRunEventStore(),
+      adapters: [{
+        ...createMockAgentAdapter({ holdOpen: true }),
+        async startRun(input) {
+          return {
+            async cancel() {
+              cancelled.push(input.runId!);
+              throw new Error(`cannot cancel ${input.runId}`);
+            },
+          };
+        },
+      }],
+    });
+    const first = explicitRunInput(projectRoot, "strict-close-failure-first");
+    const second = explicitRunInput(projectRoot, "strict-close-failure-second");
+    await Promise.all([bridge.startRun(first), bridge.startRun(second)]);
+
+    const closing = bridge.close("strict failure shutdown");
+
+    await expect(closing).rejects.toThrow("AgentBridge close failed");
+    expect(cancelled.sort()).toEqual([first.runId, second.runId].sort());
+    expect(bridge.close()).toBe(closing);
+  });
+
+  it("propagates a tracked start rejection when terminal persistence also fails during close", async () => {
+    const projectRoot = await makeTempRoot();
+    const adapterEntered = deferred<void>();
+    const adapterRelease = deferred<void>();
+    const baseStore = inMemoryPrivateRunEventStore();
+    let appendCalls = 0;
+    const bridge = new AgentBridge({
+      privateRunEventStore: {
+        ...baseStore,
+        async append() {
+          appendCalls += 1;
+          throw new Error("synthetic terminal append failure");
+        },
+      },
+      adapters: [{
+        ...createMockAgentAdapter({ holdOpen: true }),
+        async startRun() {
+          adapterEntered.resolve();
+          await adapterRelease.promise;
+          throw new Error("synthetic adapter start failure");
+        },
+      }],
+    });
+    const input = explicitRunInput(projectRoot, "strict-close-start-terminal-failure");
+    const start = bridge.startRun(input);
+    const startRejection = expect(start).rejects.toThrow("synthetic adapter start failure");
+    await adapterEntered.promise;
+
+    const closing = bridge.close("desktop shutdown");
+    adapterRelease.resolve();
+
+    await startRejection;
+    await expect(closing).rejects.toThrow("AgentBridge close failed");
+    expect(appendCalls).toBeGreaterThanOrEqual(2);
+    expect(bridge.listRuns()).toEqual([
+      expect.objectContaining({ id: input.runId, status: "failed" }),
+    ]);
+    expect(bridge.close()).toBe(closing);
+  });
+
+  it("fails close when a reaped late start cannot persist or compensate its fallback terminal", async () => {
+    const projectRoot = await makeTempRoot();
+    const adapterEntered = deferred<void>();
+    const adapterRelease = deferred<void>();
+    const baseStore = inMemoryPrivateRunEventStore();
+    let cancels = 0;
+    let compensationAttempts = 0;
+    const bridge = new AgentBridge({
+      privateRunEventStore: {
+        ...baseStore,
+        async append() {
+          throw new Error("synthetic fallback terminal append failure");
+        },
+      },
+      async onTerminalPersistenceFailure() {
+        compensationAttempts += 1;
+        throw new Error("synthetic workflow compensation failure");
+      },
+      adapters: [{
+        ...createMockAgentAdapter({ holdOpen: true }),
+        async startRun() {
+          adapterEntered.resolve();
+          await adapterRelease.promise;
+          return {
+            async cancel() {
+              cancels += 1;
+            },
+          };
+        },
+      }],
+    });
+    const input = explicitRunInput(projectRoot, "strict-close-late-handle-terminal-failure");
+    const start = bridge.startRun(input);
+    await adapterEntered.promise;
+
+    const closing = bridge.close("desktop shutdown");
+    adapterRelease.resolve();
+
+    await expect(start).rejects.toThrow("terminal-persistence-failed");
+    await expect(closing).rejects.toThrow("AgentBridge close failed");
+    expect(cancels).toBe(1);
+    expect(compensationAttempts).toBe(1);
+    expect(bridge.listRuns()).toEqual([
+      expect.objectContaining({ id: input.runId, status: "failed" }),
+    ]);
+    expect(bridge.close()).toBe(closing);
   });
 
   it.each(["codex", "hermes"] as const)(
@@ -9571,7 +9765,7 @@ function explicitRunInput(
   projectRoot: string,
   suffix: string,
   agentKind: "codex" | "hermes" = "codex",
-) {
+): StartAgentRunInput & { runId: string } {
   return {
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
     runId: `run-${suffix}`,

@@ -22,8 +22,10 @@ const agentWatchdogTimeoutMs = Math.max(1_000, Math.min(12 * 60 * 1_000, waitTim
 const pollIntervalMs = Number(process.env.SKYTURN_NEW_SESSION_UI_POLL_MS ?? 2_000);
 const commandOutputLimitBytes = Number(process.env.SKYTURN_NEW_SESSION_UI_OUTPUT_LIMIT_BYTES ?? 4_000);
 const defaultCdpRequestTimeoutMs = 30_000;
-const dangerAuthorizationUiTimeoutMs = 75_000;
-const dangerAuthorizationCdpTimeoutMs = 90_000;
+const controlPlaneUiTimeoutMs = 15_000;
+const controlPlaneCdpRequestTimeoutMs = 20_000;
+const failureShutdownTimeoutMs = 30_000;
+const dangerAuthorizationAcknowledgmentBudgetMs = 10_000;
 const dangerAuthorizationOption = "Authorize this run";
 const expectedChangedFiles = ["src/App.css", "src/App.jsx"];
 
@@ -121,6 +123,7 @@ export async function runNewSessionUiAcceptance() {
     let app = null;
     let liveCdp = null;
     let automationCleanupDiagnostic = null;
+    let failureCollection = null;
     try {
       app = await launchElectronAcceptanceApp({ userData, projectRoot });
     } catch (error) {
@@ -280,7 +283,39 @@ export async function runNewSessionUiAcceptance() {
 
         if (!ok) process.exitCode = 1;
       } catch (error) {
-        const outcomeCleanup = await finalizeAcceptanceOutcome({ app, liveCdp, error });
+        let outcomeCleanup;
+        try {
+          const failureOutcome = await shutdownAndCollectFailure({
+            app,
+            liveCdp,
+            collect: (precloseSnapshot) => collectFailureAcceptanceResult({
+              baselineCommitSha,
+              demo,
+              expectedCaptureScriptHash,
+              expectedVerifyScriptHash,
+              precloseSnapshot,
+              projectRoot,
+              readiness: readinessPreflight.readiness,
+              userData,
+            }),
+          });
+          failureCollection = failureOutcome.collection;
+          outcomeCleanup = {
+            ok: true,
+            cleanupConfirmed: true,
+            resourcesKeptAlive: false,
+            cancelledRunIds: [],
+            diagnostic: failureOutcome.diagnostic,
+          };
+        } catch (shutdownError) {
+          outcomeCleanup = {
+            ok: false,
+            cleanupConfirmed: shutdownError?.electronShutdownCompleted === true,
+            resourcesKeptAlive: shutdownError?.electronShutdownCompleted !== true,
+            cancelledRunIds: [],
+            diagnostic: `failure-shutdown-or-collection-failed:${errorText(shutdownError)}`,
+          };
+        }
         if (!outcomeCleanup.cleanupConfirmed) {
           cleanupProject = false;
           cleanupUserData = false;
@@ -294,8 +329,7 @@ export async function runNewSessionUiAcceptance() {
       if (error instanceof WorkflowTerminalFailureError) {
         const failure = appendFailureDiagnostic(error.result.failure, automationCleanupDiagnostic);
         console.log(JSON.stringify({
-          ...error.result,
-          failure,
+          ...mergeWorkflowTerminalFailureResult(error.result, failureCollection, failure),
           userData,
           workspacePath,
         }, null, 2));
@@ -305,9 +339,10 @@ export async function runNewSessionUiAcceptance() {
       const headCommitSha = await gitHeadShaOrNull(projectRoot);
       console.log(JSON.stringify({
         ...emptyAcceptanceResult(projectRoot, readinessPreflight.readiness),
+        ...failureCollection,
         baselineCommitSha,
-        headCommitSha,
-        commitSha: headCommitSha,
+        headCommitSha: failureCollection?.headCommitSha ?? headCommitSha,
+        commitSha: failureCollection?.commitSha ?? headCommitSha,
         failure: {
           code: "RENDERER_AUTOMATION_FAILED",
           message: "Electron renderer automation failed before workflow completion.",
@@ -375,12 +410,99 @@ export async function cancelActiveAgentRuns(cdp, reason) {
   return result.cancelledRunIds;
 }
 
-export async function finalizeAcceptanceOutcome({ app, liveCdp, ok, error = null }) {
+export async function capturePrecloseFailureSnapshot(cdp) {
+  if (!cdp) throw new Error("live-cdp-unavailable");
+  return cdp.evaluate(`
+    (async () => {
+      const workspace = await window.devflow.loadWorkspace();
+      const visibleNodes = [...document.querySelectorAll('.react-flow__node[data-id]')].map((node) => ({
+        id: node.getAttribute('data-id'),
+        text: node.textContent?.replace(/\\s+/g, ' ').trim() ?? '',
+      }));
+      return {
+        workspace,
+        ui: {
+          href: location.origin + location.pathname,
+          title: document.title,
+          visibleNodes,
+          failureBanner: document.querySelector('[role="alert"]')?.textContent?.replace(/\\s+/g, ' ').trim() ?? null,
+        },
+      };
+    })()
+  `, {
+    awaitPromise: true,
+    returnByValue: true,
+    requestTimeoutMs: controlPlaneCdpRequestTimeoutMs,
+  });
+}
+
+export async function shutdownAndCollectFailure({
+  app,
+  liveCdp,
+  collect,
+  capture = capturePrecloseFailureSnapshot,
+}) {
+  if (!app || typeof app.shutdownForFailureCollection !== "function") {
+    throw new Error("Electron failure shutdown is unavailable.");
+  }
+  if (typeof collect !== "function") throw new TypeError("Failure collector is required.");
+
+  let precloseSnapshot;
+  let snapshotDiagnostic = null;
+  try {
+    precloseSnapshot = await capture(liveCdp);
+  } catch (error) {
+    snapshotDiagnostic = `preclose-snapshot-failed:${errorText(error)}`;
+    precloseSnapshot = { workspace: null, ui: null, diagnostic: snapshotDiagnostic };
+  }
+
+  const shutdown = await app.shutdownForFailureCollection(liveCdp);
+  try {
+    const collection = await collect(precloseSnapshot);
+    return {
+      collection,
+      diagnostic: [snapshotDiagnostic, shutdown?.diagnostic].filter(Boolean).join(", ") || null,
+      precloseSnapshot,
+    };
+  } catch (error) {
+    if (error && typeof error === "object") error.electronShutdownCompleted = true;
+    throw error;
+  }
+}
+
+export async function finalizeAcceptanceOutcome({
+  app,
+  liveCdp,
+  ok,
+  error = null,
+  afterRunCleanup = null,
+}) {
   const shouldCancel = error !== null || ok === false;
   const diagnostics = [];
   let cancelledRunIds = [];
   let cleanupConfirmed = !shouldCancel;
   let cleanupError = null;
+
+  if (app && typeof app.shutdownForFailureCollection === "function" && liveCdp) {
+    try {
+      const shutdown = await app.shutdownForFailureCollection(liveCdp);
+      return {
+        ok: true,
+        cleanupConfirmed: true,
+        resourcesKeptAlive: false,
+        cancelledRunIds: [],
+        diagnostic: shutdown?.diagnostic ?? null,
+      };
+    } catch (shutdownError) {
+      return {
+        ok: false,
+        cleanupConfirmed: false,
+        resourcesKeptAlive: true,
+        cancelledRunIds: [],
+        diagnostic: `electron-graceful-shutdown-failed:${errorText(shutdownError)}`,
+      };
+    }
+  }
 
   if (shouldCancel) {
     if (!liveCdp) {
@@ -419,6 +541,14 @@ export async function finalizeAcceptanceOutcome({ app, liveCdp, ok, error = null
     };
   }
 
+  if (typeof afterRunCleanup === "function") {
+    try {
+      await afterRunCleanup();
+    } catch (collectionError) {
+      diagnostics.push(`failure-collection-failed:${errorText(collectionError)}`);
+    }
+  }
+
   try {
     liveCdp?.close();
   } catch (closeError) {
@@ -439,6 +569,18 @@ export async function finalizeAcceptanceOutcome({ app, liveCdp, ok, error = null
   };
 }
 
+export function mergeWorkflowTerminalFailureResult(
+  authoritativeResult,
+  failureCollection,
+  failure = authoritativeResult?.failure,
+) {
+  return {
+    ...(failureCollection ?? {}),
+    ...(authoritativeResult ?? {}),
+    failure,
+  };
+}
+
 function appendFailureDiagnostic(failure, diagnostic) {
   if (!diagnostic) return failure;
   return {
@@ -453,6 +595,14 @@ function errorText(error) {
 
 export async function fileSha256(filePath) {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
+}
+
+async function fileSha256OrNull(filePath) {
+  try {
+    return await fileSha256(filePath);
+  } catch {
+    return null;
+  }
 }
 
 export async function launchElectronAcceptanceApp({ userData, projectRoot }) {
@@ -492,8 +642,11 @@ export async function launchElectronAcceptanceApp({ userData, projectRoot }) {
     });
     await waitForCdp(cdpPort, electron);
   } catch (error) {
-    if (electron) await Promise.allSettled([electron.close(), vite.close()]);
-    else await vite.close();
+    const cleanupResults = await Promise.allSettled(electron ? [electron.close(), vite.close()] : [vite.close()]);
+    const cleanupFailures = cleanupResults.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError([error, ...cleanupFailures], "Electron acceptance launch and cleanup failed.");
+    }
     throw error;
   }
 
@@ -504,9 +657,46 @@ export async function launchElectronAcceptanceApp({ userData, projectRoot }) {
       return [vite.diagnosticOutput(), electron.diagnosticOutput()].filter(Boolean).join("\n");
     },
     async close() {
-      await Promise.allSettled([electron.close(), vite.close()]);
+      await Promise.all([electron.close(), vite.close()]);
+    },
+    async shutdownForFailureCollection(cdp) {
+      return shutdownElectronForFailureCollection({ cdp, electron, vite });
     },
   };
+}
+
+export async function shutdownElectronForFailureCollection({ cdp, electron, vite }) {
+  const closeRequest = Promise.resolve().then(() => cdp.evaluate("window.close()", {
+    awaitPromise: false,
+    returnByValue: true,
+    requestTimeoutMs: controlPlaneCdpRequestTimeoutMs,
+  }));
+  const closeResult = await electron.waitForClose(failureShutdownTimeoutMs);
+  const closeRequestResult = await Promise.allSettled([closeRequest]);
+  const gracefulFailures = [];
+  if (closeRequestResult[0].status === "rejected") {
+    gracefulFailures.push(new Error(`CDP window.close() failed: ${errorText(closeRequestResult[0].reason)}`));
+  }
+  if (!closeResult) {
+    gracefulFailures.push(new Error("Electron did not close after window.close()."));
+  } else if (closeResult.code !== 0 || closeResult.signal !== null) {
+    gracefulFailures.push(new Error(
+      `Electron did not close gracefully (${closeResult.signal ? `signal ${closeResult.signal}` : `exit ${closeResult.code}`}).`,
+    ));
+  }
+  try {
+    cdp.close();
+  } catch {}
+  if (gracefulFailures.length > 0) {
+    const cleanupResults = await Promise.allSettled([electron.close(), vite.close()]);
+    const cleanupFailures = cleanupResults.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    throw new AggregateError(
+      [...gracefulFailures, ...cleanupFailures],
+      `Electron failure shutdown was not graceful: ${gracefulFailures.map(errorText).join("; ")}`,
+    );
+  }
+  await vite.close();
+  return { diagnostic: null };
 }
 
 export async function openProjectThroughUi(cdp, projectRoot) {
@@ -678,10 +868,101 @@ export function pendingDangerAuthorizationNodes(session) {
   });
 }
 
+export function dangerAuthorizationDecisionIdentity(node) {
+  const decision = node?.userDecision;
+  const authorization = decision?.runAuthorization;
+  if (
+    typeof node?.id !== "string" ||
+    typeof decision?.decisionId !== "string" ||
+    typeof decision?.targetLaneId !== "string" ||
+    typeof decision?.targetSegmentId !== "string" ||
+    typeof authorization?.runId !== "string" ||
+    typeof authorization?.startFingerprint !== "string"
+  ) return null;
+  return stableJson({
+    decisionId: decision.decisionId,
+    nodeId: node.id,
+    runId: authorization.runId,
+    startFingerprint: authorization.startFingerprint,
+    targetLaneId: decision.targetLaneId,
+    targetSegmentId: decision.targetSegmentId,
+  });
+}
+
+export async function reconcileDangerAuthorizationAcknowledgments(
+  session,
+  submittedDecisions,
+  {
+    authorize,
+    now = () => Date.now(),
+    acknowledgmentBudgetMs = dangerAuthorizationAcknowledgmentBudgetMs,
+  } = {},
+) {
+  if (!(submittedDecisions instanceof Map)) {
+    throw new TypeError("Danger authorization submissions must be tracked in a Map.");
+  }
+  if (typeof authorize !== "function") {
+    throw new TypeError("Danger authorization UI callback is required.");
+  }
+  if (!Number.isFinite(acknowledgmentBudgetMs) || acknowledgmentBudgetMs <= 0) {
+    throw new RangeError("Danger authorization acknowledgment budget must be positive and finite.");
+  }
+
+  const nodes = Array.isArray(session?.nodes) ? session.nodes : [];
+  const decisionsByIdentity = new Map(nodes.flatMap((node) => {
+    const identity = dangerAuthorizationDecisionIdentity(node);
+    return identity === null ? [] : [[identity, node]];
+  }));
+  const observedAt = now();
+  const acknowledgedDecisionIds = [];
+  for (const [identity, submitted] of submittedDecisions) {
+    const current = decisionsByIdentity.get(identity);
+    if (!current || current.userDecision?.status === "answered") {
+      submittedDecisions.delete(identity);
+      acknowledgedDecisionIds.push(submitted.decisionId);
+      continue;
+    }
+    if (observedAt - submitted.submittedAt >= acknowledgmentBudgetMs) {
+      throw new Error(
+        `Danger authorization acknowledgment timeout for decision ${submitted.decisionId} ` +
+        `(run ${submitted.runId}) after ${acknowledgmentBudgetMs}ms.`,
+      );
+    }
+  }
+
+  const pendingNodes = pendingDangerAuthorizationNodes(session);
+  const pendingControl = pendingNodes.find((node) => {
+    const identity = dangerAuthorizationDecisionIdentity(node);
+    return identity !== null && !submittedDecisions.has(identity);
+  });
+  if (pendingControl) {
+    const identity = dangerAuthorizationDecisionIdentity(pendingControl);
+    const outcome = await authorize(pendingControl);
+    submittedDecisions.set(identity, {
+      decisionId: pendingControl.userDecision.decisionId,
+      nodeId: pendingControl.id,
+      runId: pendingControl.userDecision.runAuthorization.runId,
+      submittedAt: now(),
+      outcome: outcome?.outcome ?? null,
+    });
+    return {
+      acknowledgedDecisionIds,
+      pending: true,
+      submittedDecisionId: pendingControl.userDecision.decisionId,
+    };
+  }
+
+  return {
+    acknowledgedDecisionIds,
+    pending: pendingNodes.length > 0 || submittedDecisions.size > 0,
+    submittedDecisionId: null,
+  };
+}
+
 export async function authorizePendingDangerRunThroughUi(cdp, node, {
   now = () => Date.now(),
 } = {}) {
-  const authorizationDeadline = now() + dangerAuthorizationUiTimeoutMs;
+  const authorizationDeadline = now() + controlPlaneUiTimeoutMs;
   const result = await cdp.evaluate(`
     (async () => {
       const nodeId = ${JSON.stringify(node.id)};
@@ -733,13 +1014,6 @@ export async function authorizePendingDangerRunThroughUi(cdp, node, {
           view: window,
         }));
       }
-      await waitFor(() => {
-        const modal = findModal();
-        if (!modal) return 'modal-removed';
-        if (!findDecisionPanel()) return 'decision-panel-removed';
-        const currentButton = findAuthorizationButton();
-        return !currentButton || currentButton.disabled ? 'authoritative-renderer-update' : null;
-      }, 'danger authorization renderer update for ' + title, { deadline: authorizationDeadline });
 
       const modal = findModal();
       if (modal) {
@@ -765,7 +1039,7 @@ export async function authorizePendingDangerRunThroughUi(cdp, node, {
   `, {
     awaitPromise: true,
     returnByValue: true,
-    requestTimeoutMs: dangerAuthorizationCdpTimeoutMs,
+    requestTimeoutMs: controlPlaneCdpRequestTimeoutMs,
   });
   if (!result?.modalClosed || !["submitted", "already-disabled"].includes(result.outcome)) {
     throw new Error("Danger authorization UI did not reach a confirmed renderer state.");
@@ -970,7 +1244,16 @@ async function assertSkyTurnRendererReady(cdp) {
 }
 
 async function readAuthoritativePlannerState(cdp, projectRoot, sessionId) {
-  const state = await cdp.evaluate(`
+  const state = await readSqliteWorkflowState(cdp, projectRoot, sessionId);
+  const authoritativeEvidence = authoritativeProjectionEvidenceState(state?.projection);
+  if (!authoritativeEvidence.ok) {
+    throw new Error(`Authoritative projection evidence is invalid: ${authoritativeEvidence.failures.join(", ")}`);
+  }
+  return { ...state, authoritativeEvidence };
+}
+
+async function readSqliteWorkflowState(cdp, projectRoot, sessionId) {
+  return cdp.evaluate(`
     Promise.all([
       window.devflow.getWorkflowProjection(${JSON.stringify(projectRoot)}, ${JSON.stringify(sessionId)}),
       window.devflow.getWorkflowEvents(${JSON.stringify(projectRoot)}, ${JSON.stringify(sessionId)}),
@@ -980,11 +1263,6 @@ async function readAuthoritativePlannerState(cdp, projectRoot, sessionId) {
       events: eventResult.events,
     }))
   `, { awaitPromise: true, returnByValue: true });
-  const authoritativeEvidence = authoritativeProjectionEvidenceState(state?.projection);
-  if (!authoritativeEvidence.ok) {
-    throw new Error(`Authoritative projection evidence is invalid: ${authoritativeEvidence.failures.join(", ")}`);
-  }
-  return { ...state, authoritativeEvidence };
 }
 
 async function waitForAuthoritativePlannerTurns({ cdp, projectRoot, sessionId, expectedTurns }) {
@@ -1445,6 +1723,7 @@ async function waitForWorkflowCompletion({ cdp, baselineCommitSha, workspacePath
   let lastWorkspace = null;
   let lastAuthoritative = null;
   let sessionId = null;
+  const submittedDangerAuthorizations = new Map();
   while (Date.now() < deadline) {
     const workspace = await readWorkspaceFile(workspacePath);
     lastWorkspace = workspace ?? lastWorkspace;
@@ -1455,9 +1734,14 @@ async function waitForWorkflowCompletion({ cdp, baselineCommitSha, workspacePath
     lastAuthoritative = authoritative ?? lastAuthoritative;
     const session = authoritative?.canvasSession;
     if (session) {
-      const pendingDangerNodes = pendingDangerAuthorizationNodes(session);
-      if (pendingDangerNodes.length > 0) {
-        await authorizePendingDangerRunThroughUi(cdp, pendingDangerNodes[0]);
+      const dangerAuthorizationState = await reconcileDangerAuthorizationAcknowledgments(
+        session,
+        submittedDangerAuthorizations,
+        {
+          authorize: (pendingControl) => authorizePendingDangerRunThroughUi(cdp, pendingControl),
+        },
+      );
+      if (dangerAuthorizationState.pending) {
         await delay(pollIntervalMs);
         continue;
       }
@@ -2029,6 +2313,291 @@ export function workflowGraphAcceptanceSummary(graph) {
   if (dependencyMismatchIds.length > 0) failures.push(`graph-dependency-mismatch:${dependencyMismatchIds.join("|")}`);
   if (duplicateSemanticKeys.length > 0) failures.push(`duplicate-semantic-keys:${duplicateSemanticKeys.join("|")}`);
   return { ok: failures.length === 0, failures };
+}
+
+export async function collectFailureAcceptanceResult({
+  baselineCommitSha,
+  demo,
+  expectedCaptureScriptHash,
+  expectedVerifyScriptHash,
+  precloseSnapshot,
+  projectRoot,
+  readiness,
+  userData,
+  readSqliteState = readSqliteWorkflowStateAfterClose,
+  collectPrivateFacts = collectPrivateRunFactsAfterClose,
+  collectProjectFacts = collectProjectFailureFacts,
+}) {
+  const collectionErrors = [];
+  const workspace = precloseSnapshot?.workspace ?? null;
+  const workspaceSession = activeCanvasSession(workspace);
+  let sqliteState = null;
+  if (workspaceSession?.id) {
+    try {
+      sqliteState = await readSqliteState(projectRoot, workspaceSession.id);
+    } catch (error) {
+      collectionErrors.push(`sqlite-projection:${errorText(error)}`);
+    }
+  }
+
+  const session = sqliteState?.canvasSession ?? null;
+  const projection = sqliteState?.projection ?? null;
+  const authoritativeEvidence = authoritativeProjectionEvidenceState(projection);
+  const runIds = uniqueSortedStrings([
+    ...laneStatuses(session).map((node) => node.runId),
+    ...authoritativeEvidence.records.map((record) => record.runEvidence.runId),
+  ]);
+  let privateRunFacts = {
+    activeRuns: [],
+    evidence: {},
+    diagnostic: "not-collected-without-authoritative-run-ids",
+  };
+  if (runIds.length > 0) {
+    try {
+      privateRunFacts = await collectPrivateFacts({ projectRoot, runIds, userData });
+    } catch (error) {
+      privateRunFacts = { activeRuns: [], evidence: {}, diagnostic: errorText(error) };
+      collectionErrors.push(`private-run-facts:${errorText(error)}`);
+    }
+  }
+
+  assertNoNonterminalFailureFacts(sqliteState, privateRunFacts);
+
+  let projectFacts = emptyCollectedProjectFacts(projectRoot, baselineCommitSha);
+  try {
+    projectFacts = await collectProjectFacts({
+      baselineCommitSha,
+      demo,
+      expectedCaptureScriptHash,
+      expectedVerifyScriptHash,
+      projectRoot,
+    });
+  } catch (error) {
+    collectionErrors.push(`project-facts:${errorText(error)}`);
+  }
+
+  const laneKindEvidence = requiredLaneEvidenceSummary(session, authoritativeEvidence);
+  return {
+    ...projectFacts,
+    mockFallback: mockFallbackForReadiness(readiness),
+    readiness,
+    sessionId: session?.id ?? null,
+    sessionTarget: session?.target ?? null,
+    laneStatuses: laneStatuses(session),
+    laneKindEvidence,
+    runEvidence: runEvidenceSummary(authoritativeEvidence),
+    agentRunEvidence: agentRunEvidenceSummary(session, authoritativeEvidence),
+    failureCollection: {
+      sourceAvailability: {
+        sqliteProjection: sqliteState !== null,
+        workspace: workspace !== null,
+        project: projectFacts.projectInspected === true,
+        privateRunFacts: privateRunFacts.diagnostic === null,
+      },
+      errors: collectionErrors,
+      preclose: {
+        workspace: workspaceProgressSummary(workspace),
+        ui: precloseSnapshot?.ui ?? null,
+        diagnostic: precloseSnapshot?.diagnostic ?? null,
+      },
+      sqlite: sqliteProgressSummary(sqliteState),
+      privateRuns: privateRunFacts,
+    },
+  };
+}
+
+export async function readSqliteWorkflowStateAfterClose(projectRoot, sessionId) {
+  const electronBinary = require("electron");
+  const script = `
+    (async () => {
+      const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+      const store = createWorkflowStore({ projectRoot: ${JSON.stringify(projectRoot)} });
+      try {
+        process.stdout.write(JSON.stringify({
+          canvasSession: store.materializeCanvasSession(${JSON.stringify(sessionId)}),
+          projection: store.materializeFlowProjection(${JSON.stringify(sessionId)}),
+          events: store.listEvents(${JSON.stringify(sessionId)}),
+        }));
+      } finally {
+        store.close();
+      }
+    })().catch((error) => {
+      process.stderr.write(error instanceof Error ? error.stack ?? error.message : String(error));
+      process.exitCode = 1;
+    });
+  `;
+  const result = await runCapturedProcess(electronBinary, ["-e", script], {
+    cwd: desktopRoot,
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    timeoutMs: controlPlaneCdpRequestTimeoutMs,
+  });
+  return JSON.parse(result.stdout);
+}
+
+export async function collectPrivateRunFactsAfterClose({ projectRoot, runIds, userData }) {
+  const bridgeModule = await import("@skyturn/agent-bridge");
+  const durableRunClaimStore = bridgeModule.createDurableRunClaimStore({ root: join(userData, "run-claims") });
+  const privateRunEventStore = bridgeModule.createPrivateRunEventStore({ durableRunClaimStore });
+  const bridge = new bridgeModule.AgentBridge({
+    adapters: [],
+    durableRunClaimStore,
+    privateRunEventStore,
+  });
+  const entries = await Promise.all(runIds.map(async (runId) => {
+    try {
+      return [runId, await bridge.getEvidence(projectRoot, runId)];
+    } catch (error) {
+      return [runId, { collectionError: errorText(error) }];
+    }
+  }));
+  const evidence = Object.fromEntries(entries);
+  const activeRuns = entries.flatMap(([runId, value]) => (
+    value && typeof value === "object" && !isTerminalCollectedRunStatus(value.status)
+      ? [{ runId, agent: value.agentKind ?? null, status: value.status ?? null }]
+      : []
+  ));
+  return { activeRuns, evidence, diagnostic: null };
+}
+
+export function assertNoNonterminalFailureFacts(sqliteState, privateRunFacts) {
+  const projection = sqliteState?.projection;
+  const nonterminalSegments = (projection?.segments ?? []).filter((segment) =>
+    !new Set(["succeeded", "failed", "cancelled", "timed-out"]).has(segment?.status)
+  );
+  const nonterminalLanes = (projection?.lanes ?? []).filter((lane) =>
+    !new Set(["completed", "failed", "blocked"]).has(lane?.status)
+  );
+  const nonterminalRuns = Array.isArray(privateRunFacts?.activeRuns) ? privateRunFacts.activeRuns : [];
+  if (nonterminalSegments.length > 0 || nonterminalLanes.length > 0 || nonterminalRuns.length > 0) {
+    throw new Error(`after-close-nonterminal-facts:${JSON.stringify({
+      lanes: nonterminalLanes.map((lane) => ({ id: lane?.id ?? null, status: lane?.status ?? null })),
+      runs: nonterminalRuns.map((run) => ({ runId: run?.runId ?? null, status: run?.status ?? null })),
+      segments: nonterminalSegments.map((segment) => ({
+        segmentId: segment?.id ?? null,
+        runId: segment?.runId ?? null,
+        status: segment?.status ?? null,
+      })),
+    })}`);
+  }
+}
+
+function isTerminalCollectedRunStatus(status) {
+  return new Set(["succeeded", "failed", "cancelled", "timed-out"]).has(status);
+}
+
+export async function collectProjectFailureFacts({
+  baselineCommitSha,
+  demo,
+  expectedCaptureScriptHash,
+  expectedVerifyScriptHash,
+  projectRoot,
+}) {
+  const verifyScriptPath = join(projectRoot, "scripts", "verify.mjs");
+  const captureScriptPath = join(projectRoot, "scripts", "capture-screenshot.mjs");
+  const actualVerifyScriptHash = await fileSha256OrNull(verifyScriptPath);
+  const actualCaptureScriptHash = await fileSha256OrNull(captureScriptPath);
+  const verifyScriptUnchanged = actualVerifyScriptHash === expectedVerifyScriptHash;
+  const captureScriptUnchanged = actualCaptureScriptHash === expectedCaptureScriptHash;
+  const skippedVerify = skippedCommandResult(
+    "failure collector reads existing facts only; fixed verification is skipped",
+  );
+  const skippedCapture = skippedCommandResult(
+    "failure collector reads existing facts only; screenshot capture is skipped",
+  );
+  const screenshotPath = join(projectRoot, browserScreenshotArtifact);
+  const screenshotBytes = await fileSizeOrZero(screenshotPath);
+  const commitCount = await gitCommitCount(projectRoot).catch(() => 0);
+  const headCommitSha = await gitHeadShaOrNull(projectRoot);
+  const deliveryFiles = isFullGitCommit(baselineCommitSha) && isFullGitCommit(headCommitSha)
+    ? await collectDeliveryFileRange({ baselineCommitSha, demo, projectRoot })
+    : {
+        deliveryCommitCount: 0,
+        changedFiles: [],
+        unexpectedChangedFiles: [],
+        missingChangedFiles: expectedChangedFiles,
+      };
+  const gitStatusValue = (await demo.runCapture("git", ["status", "--short"], projectRoot, { allowFailure: true })).stdout.trim();
+  return {
+    projectInspected: true,
+    verificationCommand: {
+      verify: {
+        command: `${process.execPath} scripts/verify.mjs`,
+        ...boundedCommandOutput(skippedVerify, commandOutputLimitBytes),
+      },
+      captureScreenshot: {
+        command: `${process.execPath} scripts/capture-screenshot.mjs ${screenshotPath}`,
+        ...boundedCommandOutput(skippedCapture, commandOutputLimitBytes),
+      },
+    },
+    verificationScript: {
+      path: verifyScriptPath,
+      unchanged: verifyScriptUnchanged,
+      expectedSha256: expectedVerifyScriptHash,
+      actualSha256: actualVerifyScriptHash,
+    },
+    captureScript: {
+      path: captureScriptPath,
+      unchanged: captureScriptUnchanged,
+      expectedSha256: expectedCaptureScriptHash,
+      actualSha256: actualCaptureScriptHash,
+    },
+    verificationScriptHashUnchanged: verifyScriptUnchanged,
+    captureScriptHashUnchanged: captureScriptUnchanged,
+    screenshot: { path: screenshotPath, bytes: screenshotBytes },
+    commitCount,
+    deliveryCommitCount: deliveryFiles.deliveryCommitCount,
+    commitSha: headCommitSha,
+    baselineCommitSha,
+    headCommitSha,
+    changedFiles: deliveryFiles.changedFiles,
+    allChangedFilesSinceBaseline: deliveryFiles.changedFiles,
+    expectedChangedFiles,
+    unexpectedChangedFiles: deliveryFiles.unexpectedChangedFiles,
+    missingChangedFiles: deliveryFiles.missingChangedFiles,
+    gitStatus: { clean: gitStatusValue === "", value: gitStatusValue },
+  };
+}
+
+function emptyCollectedProjectFacts(projectRoot, baselineCommitSha) {
+  return {
+    ...emptyAcceptanceResult(projectRoot, null),
+    projectInspected: false,
+    baselineCommitSha,
+  };
+}
+
+function workspaceProgressSummary(workspace) {
+  const session = activeCanvasSession(workspace);
+  return {
+    activeProjectId: workspace?.activeProjectId ?? null,
+    activeSessionId: workspace?.activeSessionId ?? null,
+    sessionId: session?.id ?? null,
+    lanes: laneStatuses(session),
+  };
+}
+
+function sqliteProgressSummary(state) {
+  const projection = state?.projection;
+  return {
+    sessionId: state?.canvasSession?.id ?? null,
+    segments: Array.isArray(projection?.segments)
+      ? projection.segments.map((segment) => ({
+          segmentId: segment?.id ?? null,
+          laneId: segment?.laneId ?? null,
+          runId: segment?.runId ?? null,
+          status: segment?.status ?? null,
+        }))
+      : [],
+    evidence: authoritativeProjectionEvidenceState(projection).records.map((record) => ({
+      evidenceId: record.evidenceId,
+      laneId: record.laneId,
+      segmentId: record.segmentId,
+      runId: record.runEvidence.runId,
+      status: record.runEvidence.status,
+      exitCode: record.runEvidence.exitCode,
+    })),
+    eventKinds: uniqueSortedStrings((state?.events ?? []).map((event) => event?.kind)),
+  };
 }
 
 async function collectFinalVerification({
@@ -2638,35 +3207,41 @@ function spawnManaged(command, args, { cwd, env, label }) {
       throw new Error(`${label} exited before readiness (${reason}): ${this.output()}`);
     },
     close() {
-      return terminateChild(child);
+      return terminateChild(child, () => closed);
+    },
+    async waitForClose(timeoutMs) {
+      if (!closed && !await waitForChildClose(child, timeoutMs, () => closed)) return null;
+      return closeResult;
     },
   };
 }
 
-async function terminateChild(child) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-  const gracefulClose = waitForChildClose(child, 2_000);
-  if (process.platform === "win32") {
-    child.kill();
-  } else {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-    } catch {
-      child.kill("SIGTERM");
+export async function terminateChild(child, closeObserved = () => false) {
+  if (!child.pid || closeObserved()) return;
+  const gracefulClose = waitForChildClose(child, 2_000, closeObserved);
+  if (child.exitCode === null && child.signalCode === null) {
+    if (process.platform === "win32") {
+      child.kill();
+    } else {
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        child.kill("SIGTERM");
+      }
     }
   }
   if (await gracefulClose) return;
-  const forcedClose = waitForChildClose(child, 5_000);
+  const forcedClose = waitForChildClose(child, 5_000, closeObserved);
   try {
     process.kill(process.platform === "win32" ? child.pid : -child.pid, "SIGKILL");
   } catch {
     child.kill("SIGKILL");
   }
-  await forcedClose;
+  if (!await forcedClose) throw new Error("Managed child did not emit close after forced termination.");
 }
 
-function waitForChildClose(child, timeoutMs) {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+function waitForChildClose(child, timeoutMs, closeObserved = () => false) {
+  if (closeObserved()) return Promise.resolve(true);
   return new Promise((resolve) => {
     const finish = (closed) => {
       clearTimeout(timer);
@@ -2676,6 +3251,41 @@ function waitForChildClose(child, timeoutMs) {
     const onClose = () => finish(true);
     const timer = setTimeout(() => finish(false), timeoutMs);
     child.once("close", onClose);
+  });
+}
+
+function runCapturedProcess(command, args, { cwd, env, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(result);
+    };
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code, signal) => {
+      if (code === 0) {
+        finish(null, { stdout, stderr, code, signal });
+        return;
+      }
+      finish(new Error(`Failure collector subprocess exited with ${signal ?? code}: ${boundedText(stderr, commandOutputLimitBytes).value}`));
+    });
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish(new Error(`Failure collector subprocess timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
   });
 }
 

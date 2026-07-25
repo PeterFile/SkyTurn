@@ -138,7 +138,7 @@
       "width": 360,
       "height": 210,
       "color": "3",
-      "text": "Task: Backend-owned planner turns\nState: Verify\nOwner: Hermes/Codex\nDepends: Workflow Kernel, Agent Bridge, Persistence\nEvidence: real New Session UI acceptance plus full repository gates\nRisk: renderer single-authority hardening continues in the delivery plan"
+      "text": "Task: Backend-owned planner turns\nState: Verify\nOwner: Hermes/Codex\nDepends: Workflow Kernel, Agent Bridge, Persistence\nEvidence: deterministic lifecycle suites plus acceptance:new-session-ui real oracle; exact-head PR CI pending\nLevel: Implemented; deterministic Tested; Harness-runnable + Entrypoint-runnable; Experimental, not Supported\nRisk: local credentials, CLI behavior, and Electron native ABI remain required"
     },
     {
       "id": "1000000000000010",
@@ -168,7 +168,7 @@
       "width": 360,
       "height": 200,
       "color": "4",
-      "text": "Evidence: Backend-owned planner turns\nmanual: real Electron New Session UI with PTY disabled, two planner turns, stable planner identity, downstream completion, and exact reopen\ntest: pnpm run build; pnpm run typecheck; pnpm run lint; pnpm run test; pnpm flow-kernel:acceptance; pnpm --filter @skyturn/desktop run acceptance:new-session-ui\nartifact: README.md, Project.canvas, and apps/desktop/scripts/newSessionUiAcceptance.mjs\ndelivery: commit, PR, checks, review, merge, and main sync remain explicit actions"
+      "text": "Evidence: Backend-owned planner turns\nreal oracle: acceptance:new-session-ui ok=true; mockFallback=false; all six executable lanes completed with terminal RunEvidence; reopenedProjectionMatches=true\nshutdown: cleanupConfirmed=true; resourcesKeptAlive=false; isolated project and userData removed\nartifact: screenshot 150922 bytes; sole delivery commit changed only src/App.css and src/App.jsx; verify and capture exit 0\ndeterministic: desktop 550/550; AgentBridge 542 passed, 13 skipped; persistence 225/225\nCI: exact-head PR checks pending\nlevel: Implemented; deterministic Tested; Harness-runnable + Entrypoint-runnable; Experimental, not Supported"
     },
     {
       "id": "1000000000000013",
