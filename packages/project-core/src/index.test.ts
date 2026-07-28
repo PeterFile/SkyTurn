@@ -13,6 +13,8 @@ import {
   normalizeSessionTarget,
   parseExpectedArtifactDeclarations,
   parseExpectedArtifactDeclaration,
+  parseWorkflowLaneCandidateBinding,
+  parseWorkflowLaneCandidateBindingBlock,
   parseRunEvent,
   parseRunEvidence,
   parseRunEvidenceChecks,
@@ -51,6 +53,7 @@ import {
   type SessionTarget,
   type WorkflowVariantAdoption,
   type WorkflowWorktreeIdentity,
+  type WorkflowLaneCandidateBinding,
 } from "./index";
 
 describe("public RunEvidence boundaries", () => {
@@ -1388,5 +1391,41 @@ describe("agent run contracts", () => {
     expect(state.delivery.phase).toBe("checks_stale");
     expect(state.rollback.remoteBlockers[0]?.eventKind).toBe("workflow.pull_request.created");
     expect(state.repair.successorLaneId).toBe("lane-implementation-repair");
+  });
+
+  it("strictly parses durable lane candidate bindings", () => {
+    const binding: WorkflowLaneCandidateBinding = {
+      sessionId: "session-1", laneId: "lane-variant", worktreeId: "worktree-variant",
+      lineageId: "lineage-variant", reason: "variant", predecessorLaneIds: ["lane-a", "lane-b"],
+      sourceCheckpointId: "checkpoint-before-lane-implementation",
+      sourceHeadCommit: "a".repeat(40),
+    };
+    expect(parseWorkflowLaneCandidateBinding(binding)).toEqual(binding);
+    for (const [malformed, reason] of [
+      [{ ...binding, unknown: true }, /unknown/i],
+      [{ ...binding, reason: "first_edge" }, /reason/i],
+      [{ ...binding, predecessorLaneIds: ["lane-b", "lane-a"] }, /sorted/i],
+      [{ ...binding, sourceHeadCommit: "b".repeat(64) }, /full commit SHA/i],
+      [{ ...binding, sourceHeadCommit: "g".repeat(40) }, /full commit SHA/i],
+      [{ ...binding, sourceHeadCommit: "short-sha" }, /full commit SHA/i],
+    ] as const) expect(() => parseWorkflowLaneCandidateBinding(malformed)).toThrow(reason);
+  });
+
+  it.each([
+    ["ambiguous", "ambiguous_predecessor_lineage", ["lineage-a", "lineage-b"]],
+    ["conflicting", "conflicting_predecessor_binding", ["lineage-shared"]],
+  ] as const)("accepts canonical %s binding block evidence", (_label, reason, lineageIds) => {
+    const block = { sessionId: "session-1", laneId: "lane-join", reason, predecessorLaneIds: ["lane-a", "lane-b"], lineageIds };
+    expect(parseWorkflowLaneCandidateBindingBlock(block)).toEqual(block);
+  });
+
+  it.each([
+    ["ambiguous lineage with one lineage", "ambiguous_predecessor_lineage", ["lane-a", "lane-b"], ["lineage-a"]],
+    ["conflicting binding with two lineages", "conflicting_predecessor_binding", ["lane-a", "lane-b"], ["lineage-a", "lineage-b"]],
+    ["conflicting binding without two predecessors", "conflicting_predecessor_binding", ["lane-a"], ["lineage-a"]],
+  ] as const)("rejects contradictory binding block evidence: %s", (_label, reason, predecessorLaneIds, lineageIds) => {
+    expect(() => parseWorkflowLaneCandidateBindingBlock({
+      sessionId: "session-1", laneId: "lane-join", reason, predecessorLaneIds, lineageIds,
+    })).toThrow(/predecessor lineage evidence/i);
   });
 });

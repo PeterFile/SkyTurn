@@ -37,10 +37,14 @@ import type {
   WorkflowSuccessorLoopState,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
+  WorkflowLaneCandidateBinding,
+  WorkflowLaneCandidateBindingBlock,
 } from "@skyturn/project-core";
 import {
   isTerminalAgentRunStatus,
   isSuccessfulRunEvidence,
+  parseWorkflowLaneCandidateBinding,
+  parseWorkflowLaneCandidateBindingBlock,
   parseRunEvent,
   parseRunEvidence,
   sanitizePublicEvidenceText,
@@ -263,6 +267,8 @@ export type FlowEventKind =
   | "workflow.lane.reassigned"
   | "workflow.edge.declared"
   | "workflow.lane.inserted_before"
+  | "workflow.lane.candidate_bound"
+  | "workflow.lane.candidate_binding_blocked"
   | "workflow.segment.started"
   | "workflow.segment.output_delta"
   | "workflow.segment.finished"
@@ -336,6 +342,8 @@ export interface FlowProjection {
   checkpointIntents: WorkflowCheckpointIntent[];
   rollbackIntents: WorkflowCheckpointIntent[];
   worktrees: WorkflowWorktreeIdentity[];
+  candidateBindings: WorkflowLaneCandidateBinding[];
+  candidateBindingBlocks: WorkflowLaneCandidateBindingBlock[];
   variantAdoptions: WorkflowVariantAdoption[];
   rejectedIntents: Array<{ intentId: string; reason: string }>;
   acceptedIntentIds: string[];
@@ -838,6 +846,147 @@ export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleRe
     occupied.push({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes });
   }
   return selected;
+}
+
+export type LaneCandidateBindingResolution =
+  | { status: "bound"; binding: WorkflowLaneCandidateBinding }
+  | { status: "blocked"; block: WorkflowLaneCandidateBindingBlock }
+  | { status: "unavailable"; reason: string };
+
+export function resolveLaneCandidateBinding(
+  projection: FlowProjection,
+  laneId: string,
+): LaneCandidateBindingResolution {
+  const existing = projection.candidateBindings.find((item) => item.laneId === laneId);
+  if (existing) return { status: "bound", binding: existing };
+  const lane = projection.lanes.find((item) => item.id === laneId);
+  if (!lane) return { status: "unavailable", reason: "Candidate binding requires a declared lane." };
+  const predecessorLaneIds = [...new Set(projection.edges
+    .filter((edge) => edge.targetLaneId === laneId)
+    .map((edge) => edge.sourceLaneId))]
+    .sort();
+  const intent = [...projection.checkpointIntents].reverse().find((item) =>
+    item.status === "requested" &&
+    (item.kind === "repair" || item.kind === "variant" || item.kind === "fork") &&
+    (item.successorLaneId === laneId || item.successorSemanticKey === lane.semanticKey)
+  );
+  if (intent?.kind === "variant" || intent?.kind === "fork") {
+    const checkpoint = intent.checkpointId
+      ? projection.checkpoints.find((item) => item.id === intent.checkpointId)
+      : undefined;
+    if (!checkpoint || checkpoint.phase !== "before" || checkpoint.worktreeState !== "clean" || !fullCommitSha(checkpoint.headCommit)) {
+      return { status: "unavailable", reason: "Variant binding requires its clean before checkpoint and full head commit." };
+    }
+    return {
+      status: "bound",
+      binding: parseWorkflowLaneCandidateBinding({
+        sessionId: projection.sessionId,
+        laneId,
+        worktreeId: `worktree-variant-${checkpoint.id}`,
+        lineageId: `lineage-variant-${checkpoint.id}`,
+        reason: "variant",
+        predecessorLaneIds,
+        sourceCheckpointId: checkpoint.id,
+        sourceHeadCommit: checkpoint.headCommit,
+      }),
+    };
+  }
+  if (intent?.kind === "repair") {
+    return inheritedCheckpointBinding(projection, laneId, intent.laneId, intent.checkpointId, predecessorLaneIds, "repair");
+  }
+  const predecessorBindings = predecessorLaneIds.map((id) => projection.candidateBindings.find((item) => item.laneId === id));
+  if (predecessorBindings.some((binding, index) => !binding && projection.lanes.find((item) => item.id === predecessorLaneIds[index])?.executable !== false)) {
+    return { status: "unavailable", reason: "Candidate predecessor binding is not durable yet." };
+  }
+  const bound = predecessorBindings.filter((item): item is WorkflowLaneCandidateBinding => Boolean(item));
+  if (lane.laneKind === "regression" && bound.length === 1 && bound[0]?.sourceCheckpointId) {
+    return inheritedBinding(projection.sessionId, laneId, predecessorLaneIds, bound[0], "regression");
+  }
+  if (lane.semanticSubtype === "repair" && bound.length === 1) {
+    const checkpoint = [...projection.checkpoints].reverse().find((item) =>
+      item.laneId === predecessorLaneIds[0] && item.phase === "after"
+    );
+    return inheritedCheckpointBinding(projection, laneId, predecessorLaneIds[0], checkpoint?.id, predecessorLaneIds, "repair");
+  }
+  if (bound.length === 0) {
+    return {
+      status: "bound",
+      binding: parseWorkflowLaneCandidateBinding({
+        sessionId: projection.sessionId,
+        laneId,
+        worktreeId: `worktree-${projection.sessionId}-candidate`,
+        lineageId: `lineage-${projection.sessionId}-candidate`,
+        reason: "default",
+        predecessorLaneIds,
+      }),
+    };
+  }
+  const identities = new Set(bound.map((item) => `${item.lineageId}\0${item.worktreeId}`));
+  if (identities.size !== 1) {
+    const lineageIds = [...new Set(bound.map((item) => item.lineageId))].sort();
+    return {
+      status: "blocked",
+      block: parseWorkflowLaneCandidateBindingBlock({
+        sessionId: projection.sessionId,
+        laneId,
+        reason: lineageIds.length > 1 ? "ambiguous_predecessor_lineage" : "conflicting_predecessor_binding",
+        predecessorLaneIds,
+        lineageIds,
+      }),
+    };
+  }
+  return inheritedBinding(
+    projection.sessionId,
+    laneId,
+    predecessorLaneIds,
+    bound[0]!,
+    predecessorLaneIds.length > 1 ? "explicit_join" : "serial",
+  );
+}
+
+function inheritedCheckpointBinding(
+  projection: FlowProjection,
+  laneId: string,
+  sourceLaneId: string | undefined,
+  checkpointId: string | undefined,
+  predecessorLaneIds: string[],
+  reason: "repair",
+): LaneCandidateBindingResolution {
+  const source = sourceLaneId ? projection.candidateBindings.find((item) => item.laneId === sourceLaneId) : undefined;
+  const checkpoint = checkpointId ? projection.checkpoints.find((item) => item.id === checkpointId) : undefined;
+  if (
+    !source || !checkpoint || checkpoint.phase !== "after" || !fullCommitSha(checkpoint.headCommit) ||
+    checkpoint.worktreeId !== source.worktreeId
+  ) return { status: "unavailable", reason: "Repair binding requires its after-checkpoint candidate identity." };
+  return inheritedBinding(projection.sessionId, laneId, predecessorLaneIds, source, reason, checkpoint);
+}
+
+function inheritedBinding(
+  sessionId: string,
+  laneId: string,
+  predecessorLaneIds: string[],
+  source: WorkflowLaneCandidateBinding,
+  reason: "serial" | "repair" | "regression" | "explicit_join",
+  checkpoint?: WorkflowNodeCheckpoint,
+): LaneCandidateBindingResolution {
+  const sourceCheckpointId = checkpoint?.id ?? (reason === "regression" ? source.sourceCheckpointId : undefined);
+  const sourceHeadCommit = checkpoint?.headCommit ?? (reason === "regression" ? source.sourceHeadCommit : undefined);
+  return {
+    status: "bound",
+    binding: parseWorkflowLaneCandidateBinding({
+      sessionId,
+      laneId,
+      worktreeId: source.worktreeId,
+      lineageId: source.lineageId,
+      reason,
+      predecessorLaneIds,
+      ...(sourceCheckpointId && sourceHeadCommit ? { sourceCheckpointId, sourceHeadCommit } : {}),
+    }),
+  };
+}
+
+function fullCommitSha(value: string | undefined): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40}$/i.test(value);
 }
 
 function completedLaneIdsForScheduling(projection: FlowProjection): Set<string> {
@@ -1451,6 +1600,16 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
       const replacedEdgeIds = new Set(replacedIncomingEdgeIds);
       projection.edges = projection.edges.filter((edge) => !replacedEdgeIds.has(edge.id));
       for (const edge of edges) upsertEdge(projection, edge);
+    }
+    if (event.kind === "workflow.lane.candidate_bound") {
+      const binding = parseWorkflowLaneCandidateBinding(event.payload.binding);
+      if (binding.sessionId !== event.sessionId) throw new Error("Candidate binding session conflict.");
+      upsertCandidateBinding(projection, binding);
+    }
+    if (event.kind === "workflow.lane.candidate_binding_blocked") {
+      const block = parseWorkflowLaneCandidateBindingBlock(event.payload.block);
+      if (block.sessionId !== event.sessionId) throw new Error("Candidate binding block session conflict.");
+      upsertCandidateBindingBlock(projection, block);
     }
     if (event.kind === "workflow.segment.started" && isRecord(event.payload.segment)) {
       const segment = normalizeSegment(event.payload.segment);
@@ -2161,6 +2320,8 @@ function emptyFlowProjection(sessionId: string): FlowProjection {
     checkpointIntents: [],
     rollbackIntents: [],
     worktrees: [],
+    candidateBindings: [],
+    candidateBindingBlocks: [],
     variantAdoptions: [],
     rejectedIntents: [],
     acceptedIntentIds: [],
@@ -2170,15 +2331,31 @@ function emptyFlowProjection(sessionId: string): FlowProjection {
 }
 
 function dedupeEvents(events: FlowEvent[]): FlowEvent[] {
-  const seen = new Set<string>();
+  const seen = new Map<string, FlowEvent>();
   const result: FlowEvent[] = [];
   for (const event of events) {
     const key = event.idempotencyKey ?? event.id;
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const existing = seen.get(key);
+    if (existing) {
+      const existingCandidate = canonicalCandidateEventPayload(existing);
+      const candidate = canonicalCandidateEventPayload(event);
+      if (existingCandidate || candidate) {
+        if (existing.kind !== event.kind || JSON.stringify(existingCandidate) !== JSON.stringify(candidate)) {
+          throw new Error("Candidate binding event conflict for idempotent replay.");
+        }
+      }
+      continue;
+    }
+    seen.set(key, event);
     result.push(event);
   }
   return result.map((event, index) => ({ ...event, seq: index + 1 }));
+}
+
+function canonicalCandidateEventPayload(event: FlowEvent): WorkflowLaneCandidateBinding | WorkflowLaneCandidateBindingBlock | undefined {
+  if (event.kind === "workflow.lane.candidate_bound") return parseWorkflowLaneCandidateBinding(event.payload.binding);
+  if (event.kind === "workflow.lane.candidate_binding_blocked") return parseWorkflowLaneCandidateBindingBlock(event.payload.block);
+  return undefined;
 }
 
 function normalizeProjectProfile(value: Record<string, unknown> | Partial<ProjectProfile>): ProjectProfile {
@@ -2513,6 +2690,20 @@ function upsertWorktree(projection: FlowProjection, worktree: WorkflowWorktreeId
     return;
   }
   projection.worktrees[index] = { ...projection.worktrees[index], ...worktree };
+}
+
+function upsertCandidateBinding(projection: FlowProjection, binding: WorkflowLaneCandidateBinding): void {
+  const existing = projection.candidateBindings.find((item) => item.laneId === binding.laneId);
+  if (existing && JSON.stringify(existing) !== JSON.stringify(binding)) throw new Error("Candidate binding conflict for lane.");
+  if (!existing) projection.candidateBindings.push(binding);
+  projection.candidateBindingBlocks = projection.candidateBindingBlocks.filter((item) => item.laneId !== binding.laneId);
+}
+
+function upsertCandidateBindingBlock(projection: FlowProjection, block: WorkflowLaneCandidateBindingBlock): void {
+  if (projection.candidateBindings.some((item) => item.laneId === block.laneId)) throw new Error("Candidate binding block conflicts with bound lane.");
+  const existing = projection.candidateBindingBlocks.find((item) => item.laneId === block.laneId);
+  if (existing && JSON.stringify(existing) !== JSON.stringify(block)) throw new Error("Candidate binding block conflict for lane.");
+  if (!existing) projection.candidateBindingBlocks.push(block);
 }
 
 function upsertVariantAdoption(projection: FlowProjection, adoption: WorkflowVariantAdoption): void {

@@ -518,6 +518,22 @@ describe("hydrateSelectedNodeActionStateFromEvents", () => {
     });
   });
 
+  it("keeps checkpoint hydration valid when durable candidate binding events are present", () => {
+    const binding = {
+      sessionId, laneId: "lane-implementation", worktreeId: "worktree-candidate",
+      lineageId: "lineage-candidate", reason: "default", predecessorLaneIds: [],
+    };
+    const state = hydrateSelectedNodeActionStateFromEvents({
+      sessionId, selectedNode,
+      events: [
+        ...workflowEvents(checkpoint("checkpoint-before-implementation", "lane-implementation", "before", "base-sha")),
+        event("workflow.lane.candidate_bound", { binding }),
+      ],
+      composerMode: "variant-from-before-checkpoint",
+    });
+    expect(state).toMatchObject({ canCreateVariant: true, composerMode: "variant-from-before-checkpoint" });
+  });
+
   it("hydrates checkpoint actions after a durable insert-before event", () => {
     const beforeInsert = workflowEvents();
     const inserted = compileInsertClarificationBefore(reduceWorkflowEvents(beforeInsert), {

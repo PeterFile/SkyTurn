@@ -84,6 +84,8 @@ const knownFlowEventKinds = new Set<string>([
   "workflow.intent.rejected",
   "workflow.lane.declared",
   "workflow.lane.inserted_before",
+  "workflow.lane.candidate_bound",
+  "workflow.lane.candidate_binding_blocked",
   "workflow.edge.declared",
   "workflow.segment.started",
   "workflow.segment.output_delta",
