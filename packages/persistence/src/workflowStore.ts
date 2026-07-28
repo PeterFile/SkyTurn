@@ -178,6 +178,7 @@ export interface WorkflowStoreOptions {
     beforePlannerIntentDispositionCommit?: () => void;
     afterSchedulePreview?: (projection: FlowProjection) => void;
     afterCandidateBindingBeforeSegment?: () => void;
+    afterCheckpointCandidateEvents?: () => void;
   };
 }
 
@@ -2538,9 +2539,8 @@ export class WorkflowStore {
     kind: "repair" | "variant",
     input: WorkflowCheckpointSuccessorRequest,
   ): WorkflowCheckpointSuccessorResult {
-    this.requireKnownSession(input.sessionId);
-
     const tx = this.db.transaction(() => {
+      const session = this.requireKnownSession(input.sessionId);
       const currentProjection = this.materializeFlowProjection(input.sessionId);
       const currentPrepared = prepareCheckpointSuccessorRequest(kind, input, currentProjection);
       const existing = this.checkpointSuccessorIdempotentResult(
@@ -2555,6 +2555,9 @@ export class WorkflowStore {
         ? this.checkpointRepairFailedEvidenceResult(input.sessionId, currentPrepared.failedEvidence.id)
         : null;
       if (existingForFailedEvidence) return { kind: "existing" as const, existing: existingForFailedEvidence };
+      if (currentPrepared.checkpoint.executionTarget !== session.target.executionTarget) {
+        throw new Error(`${kind} checkpoint execution target conflicts with its workflow session.`);
+      }
       this.assertCheckpointSuccessorIdentityAvailable(kind, currentPrepared);
       const lanePayload = successorLanePayload(
         kind,
@@ -2572,6 +2575,10 @@ export class WorkflowStore {
         ? repairRegressionLanePayload(currentPrepared, input.instruction)
         : null;
       if (regressionPayload) this.assertRepairRegressionIdentityAvailable(currentPrepared, regressionPayload);
+      const candidateBindings = session.target.executionTarget === "new_worktree"
+        ? checkpointSuccessorCandidateBindings(kind, currentPrepared, regressionPayload?.laneId)
+        : [];
+      for (const binding of candidateBindings) this.assertCandidateBindingEventCompatible(binding);
       const laneEvent = this.insertEventInTransaction({
         sessionId: input.sessionId,
         kind: "workflow.lane.declared",
@@ -2627,6 +2634,10 @@ export class WorkflowStore {
           now: input.now,
         }));
       }
+      for (const binding of candidateBindings) {
+        this.persistCandidateEventInTransaction("workflow.lane.candidate_bound", binding, input.now);
+      }
+      if (candidateBindings.length > 0) this.faultInjection?.afterCheckpointCandidateEvents?.();
       const event = this.insertEventInTransaction({
         sessionId: input.sessionId,
         kind: kind === "repair" ? "workflow.node.repair_requested" : "workflow.node.variant_requested",
@@ -2680,6 +2691,18 @@ export class WorkflowStore {
       edgeEvents,
       projection: this.materializeFlowProjection(input.sessionId),
     };
+  }
+
+  private assertCandidateBindingEventCompatible(candidate: WorkflowLaneCandidateBinding): void {
+    const binding = parseWorkflowLaneCandidateBinding(candidate);
+    const existing = this.getEventByIdempotencyKey(binding.sessionId, `candidate-binding:${binding.laneId}:bound`);
+    if (!existing) return;
+    const existingBinding = existing.kind === "workflow.lane.candidate_bound"
+      ? parseWorkflowLaneCandidateBinding(existing.payload.binding)
+      : null;
+    if (!existingBinding || stableJson(existingBinding) !== stableJson(binding)) {
+      throw new Error("Workflow candidate binding conflicts with an existing mutation.");
+    }
   }
 
   private checkpointSuccessorIdempotentResult(
@@ -3839,6 +3862,102 @@ function prepareCheckpointSuccessorRequest(
     ...(failedRunId ? { failedRunId } : {}),
     ...(failedEvidenceFallbackReason ? { failedEvidenceFallbackReason } : {}),
   };
+}
+
+function checkpointSuccessorCandidateBindings(
+  kind: "repair" | "variant",
+  prepared: PreparedCheckpointSuccessorRequest,
+  regressionLaneId?: string,
+): WorkflowLaneCandidateBinding[] {
+  const { checkpoint, projection } = prepared;
+  if (checkpoint.executionTarget !== "new_worktree") {
+    throw new Error(`${kind} candidate binding requires a new-worktree checkpoint.`);
+  }
+  const sourceHeadCommit = checkpoint.headCommit;
+  if (!sourceHeadCommit || !/^[0-9a-f]{40}$/i.test(sourceHeadCommit)) {
+    throw new Error(`${kind} candidate binding requires a full checkpoint commit SHA.`);
+  }
+  const predecessorLaneIds = uniqueStrings(prepared.edgeSources).sort();
+  if (kind === "variant") {
+    const digest = checkpointVariantDigest({
+      sessionId: projection.sessionId,
+      intentId: prepared.intentId,
+      successorLaneId: prepared.successorLaneId,
+      sourceLaneId: prepared.targetLaneId,
+      checkpointId: checkpoint.id,
+    });
+    const variantId = `variant-${digest}`;
+    return [parseWorkflowLaneCandidateBinding({
+      sessionId: projection.sessionId,
+      laneId: prepared.successorLaneId,
+      variantId,
+      worktreeId: `worktree-${projection.sessionId}-${variantId}`,
+      lineageId: `lineage-${digest}`,
+      reason: "variant",
+      predecessorLaneIds,
+      sourceCheckpointId: checkpoint.id,
+      sourceHeadCommit,
+    })];
+  }
+  const source = repairSourceCandidateBinding(prepared);
+  if (!source) return [];
+  const repair = parseWorkflowLaneCandidateBinding({
+    sessionId: projection.sessionId,
+    laneId: prepared.successorLaneId,
+    variantId: source.variantId,
+    worktreeId: source.worktreeId,
+    lineageId: source.lineageId,
+    reason: "repair",
+    predecessorLaneIds,
+    sourceCheckpointId: checkpoint.id,
+    sourceHeadCommit,
+  });
+  const regression = regressionLaneId
+    ? parseWorkflowLaneCandidateBinding({
+        sessionId: projection.sessionId,
+        laneId: regressionLaneId,
+        variantId: repair.variantId,
+        worktreeId: repair.worktreeId,
+        lineageId: repair.lineageId,
+        reason: "regression",
+        predecessorLaneIds: [prepared.successorLaneId],
+        sourceCheckpointId: checkpoint.id,
+        sourceHeadCommit,
+      })
+    : null;
+  return [repair, ...(regression ? [regression] : [])];
+}
+
+function repairSourceCandidateBinding(
+  prepared: PreparedCheckpointSuccessorRequest,
+): WorkflowLaneCandidateBinding | null {
+  const { checkpoint, projection, targetLaneId } = prepared;
+  const persisted = projection.candidateBindings.filter((binding) => binding.laneId === targetLaneId);
+  if (persisted.length > 1) throw new Error("Repair source candidate binding is ambiguous.");
+  const binding = persisted[0];
+  if (!binding) return null;
+  if (!checkpoint.worktreeId || binding.worktreeId !== checkpoint.worktreeId) {
+    throw new Error("Repair source candidate binding conflicts with the selected checkpoint worktree.");
+  }
+  return binding;
+}
+
+function checkpointVariantDigest(
+  identity: Record<"sessionId" | "intentId" | "successorLaneId" | "sourceLaneId" | "checkpointId", string>,
+): string {
+  const hash = createHash("sha256");
+  for (const [field, value] of [
+    ["domain", "skyturn.checkpoint-variant.v1"],
+    ["sessionId", identity.sessionId],
+    ["intentId", identity.intentId],
+    ["successorLaneId", identity.successorLaneId],
+    ["sourceLaneId", identity.sourceLaneId],
+    ["checkpointId", identity.checkpointId],
+  ] as const) {
+    hash.update(`${Buffer.byteLength(field)}:${field}${Buffer.byteLength(value)}:`);
+    hash.update(value);
+  }
+  return hash.digest("hex");
 }
 
 function checkpointPhaseIsExplicit(projection: FlowProjection, checkpoint: WorkflowNodeCheckpoint): boolean {

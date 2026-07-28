@@ -5544,6 +5544,360 @@ describe("SQLite workflow store", () => {
     }
   });
 
+  it("binds a new-worktree repair to the selected after-checkpoint candidate before scheduling", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store, newWorktreeTarget());
+    appendTestLane(store, "lane-source", "completed");
+    appendCandidateBinding(store, "lane-source", "source", "lineage-source");
+    recordNewWorktreeCheckpoint(store, "checkpoint-after-source", "lane-source", "after", "source", "a".repeat(40));
+
+    const eventCountBeforeRequest = store.listEvents("session-1").length;
+    store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-source",
+      checkpointId: "checkpoint-after-source",
+      intentId: "repair-bound-source",
+      successorLaneId: "lane-repair",
+      successorSemanticKey: "repair:lane-source:bound",
+      now: "2026-07-28T03:10:01.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+    expect(projection.candidateBindings.find((binding) => binding.laneId === "lane-repair")).toEqual({
+      sessionId: "session-1",
+      laneId: "lane-repair",
+      variantId: "source",
+      worktreeId: "worktree-session-1-source",
+      lineageId: "lineage-source",
+      reason: "repair",
+      predecessorLaneIds: ["lane-source"],
+      sourceCheckpointId: "checkpoint-after-source",
+      sourceHeadCommit: "a".repeat(40),
+    });
+    expect(store.listEvents("session-1").slice(eventCountBeforeRequest).map((event) => event.kind)).toEqual([
+      "workflow.lane.declared",
+      "workflow.edge.declared",
+      "workflow.lane.candidate_bound",
+      "workflow.node.repair_requested",
+    ]);
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-after-mismatch", "lane-source", "after", "other", "b".repeat(40),
+    );
+    const eventsBeforeMismatch = store.listEvents("session-1");
+    expect(() => store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-source",
+      checkpointId: "checkpoint-after-mismatch",
+      successorLaneId: "lane-repair-mismatch",
+      successorSemanticKey: "repair:lane-source:mismatch",
+      now: "2026-07-28T03:10:02.000Z",
+    })).toThrow(/binding conflicts.*checkpoint worktree/i);
+    expect(store.listEvents("session-1")).toEqual(eventsBeforeMismatch);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1").candidateBindings)
+      .toContainEqual(expect.objectContaining({ laneId: "lane-repair", reason: "repair", lineageId: "lineage-source" }));
+    reopened.close();
+  });
+
+  it("binds failed-evidence repair and regression lanes to one serialized candidate in deterministic order", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store, newWorktreeTarget());
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    store.recordRunResult(runResultInput(store, "lane-implementation", "failed", "2026-07-28T03:20:00.000Z"));
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-after-implementation", "lane-implementation", "after", "candidate", "b".repeat(40),
+    );
+    const eventCountBeforeRequest = store.listEvents("session-1").length;
+
+    store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      intentId: "repair-failed-source",
+      successorLaneId: "lane-repair",
+      successorSemanticKey: "repair:lane-implementation:failed",
+      now: "2026-07-28T03:20:01.000Z",
+    });
+    const projection = store.materializeFlowProjection("session-1");
+    const repair = projection.candidateBindings.find((binding) => binding.laneId === "lane-repair");
+    const regression = projection.candidateBindings.find((binding) => binding.laneId === "lane-repair-regression");
+    expect(repair).toMatchObject({
+      ...candidateBindingFacts("candidate"),
+      reason: "repair",
+      predecessorLaneIds: ["lane-implementation"],
+      sourceCheckpointId: "checkpoint-after-implementation",
+      sourceHeadCommit: "b".repeat(40),
+    });
+    expect(regression).toEqual({
+      ...repair!,
+      laneId: "lane-repair-regression",
+      reason: "regression",
+      predecessorLaneIds: ["lane-repair"],
+    });
+    expect(store.listEvents("session-1").slice(eventCountBeforeRequest)
+      .filter((event) => event.kind === "workflow.lane.candidate_bound")
+      .map((event) => event.laneId)).toEqual(["lane-repair", "lane-repair-regression"]);
+
+    expect(scheduleLaneIds(store, "2026-07-28T03:20:02.000Z", 2)).toEqual(["lane-repair"]);
+    expect(scheduleLaneIds(store, "2026-07-28T03:20:03.000Z", 2)).toEqual([]);
+    store.recordRunResult(runResultInput(store, "lane-repair", "succeeded", "2026-07-28T03:20:04.000Z"));
+    expect(scheduleLaneIds(store, "2026-07-28T03:20:05.000Z", 2)).toEqual(["lane-repair-regression"]);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1").candidateBindings)
+      .toEqual(expect.arrayContaining([repair, regression]));
+    reopened.close();
+  });
+
+
+  it("allocates a full-digest variant candidate that can run beside its occupied source candidate", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store, newWorktreeTarget());
+    appendTestLane(store, "lane-source");
+    appendCandidateBinding(store, "lane-source", "source", "lineage-source");
+    appendTestFlowEvent(store, "workflow.segment.started", {
+      laneId: "lane-source",
+      segment: { id: "segment-source", laneId: "lane-source", runId: "run-source", status: "running" },
+    }, "test-segment:source");
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-before-source", "lane-source", "before", "source", "e".repeat(40),
+    );
+
+    const eventCountBeforeRequest = store.listEvents("session-1").length;
+    store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-source",
+      checkpointId: "checkpoint-before-source",
+      intentId: "variant-intent-a",
+      successorLaneId: "lane-variant-a",
+      successorSemanticKey: "variant:lane-source:a",
+      now: "2026-07-28T03:50:00.000Z",
+    });
+    expect(store.listEvents("session-1").slice(eventCountBeforeRequest).map((event) => event.kind)).toEqual([
+      "workflow.lane.declared",
+      "workflow.lane.candidate_bound",
+      "workflow.node.variant_requested",
+    ]);
+    const binding = store.materializeFlowProjection("session-1").candidateBindings
+      .find((candidate) => candidate.laneId === "lane-variant-a");
+    expect(binding).toEqual({
+      sessionId: "session-1",
+      laneId: "lane-variant-a",
+      variantId: expect.stringMatching(/^variant-[0-9a-f]{64}$/),
+      worktreeId: expect.stringMatching(/^worktree-session-1-variant-[0-9a-f]{64}$/),
+      lineageId: expect.stringMatching(/^lineage-[0-9a-f]{64}$/),
+      reason: "variant",
+      predecessorLaneIds: [],
+      sourceCheckpointId: "checkpoint-before-source",
+      sourceHeadCommit: "e".repeat(40),
+    });
+    expect(binding?.worktreeId).toBe(`worktree-session-1-${binding?.variantId}`);
+    expect(binding?.lineageId).toBe(`lineage-${binding?.variantId.slice("variant-".length)}`);
+    expect(binding?.variantId).not.toBe("source");
+    expect(scheduleLaneIds(store, "2026-07-28T03:50:01.000Z", 2)).toEqual(["lane-variant-a"]);
+    expect(store.materializeFlowProjection("session-1").segments.filter((segment) => segment.status === "running")
+      .map((segment) => segment.laneId).sort()).toEqual(["lane-source", "lane-variant-a"]);
+    expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-variant-a"))
+      .toMatchObject({
+        candidateBinding: binding,
+        worktree: {
+          variantId: binding?.variantId,
+          worktreeId: binding?.worktreeId,
+          lineageId: binding?.lineageId,
+        },
+      });
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1").candidateBindings).toContainEqual(binding);
+    reopened.close();
+  });
+
+  it("allocates distinct deterministic candidates for distinct variant requests and retries with zero writes", async () => {
+    const store = await makeNewWorktreeStore();
+    appendTestLane(store, "lane-source", "completed");
+    appendCandidateBinding(store, "lane-source", "source", "lineage-source");
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-before-source", "lane-source", "before", "source", "f".repeat(40),
+    );
+    const request = (suffix: "a" | "b", now: string) => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-source",
+      checkpointId: "checkpoint-before-source",
+      intentId: `variant-intent-${suffix}`,
+      successorLaneId: `lane-variant-${suffix}`,
+      successorSemanticKey: `variant:lane-source:${suffix}`,
+      now,
+    });
+    const first = request("a", "2026-07-28T04:00:00.000Z");
+    request("b", "2026-07-28T04:00:01.000Z");
+    const eventsBeforeRetry = store.listEvents("session-1");
+    const retry = request("a", "2026-07-28T04:00:02.000Z");
+    const bindings = store.materializeFlowProjection("session-1").candidateBindings
+      .filter((binding) => binding.laneId.startsWith("lane-variant-"));
+
+    expect(retry.event.id).toBe(first.event.id);
+    expect(store.listEvents("session-1")).toEqual(eventsBeforeRetry);
+    expect(bindings).toHaveLength(2);
+    expect(new Set(bindings.map((binding) => binding.variantId))).toHaveLength(2);
+    expect(new Set(bindings.map((binding) => binding.worktreeId))).toHaveLength(2);
+    expect(new Set(bindings.map((binding) => binding.lineageId))).toHaveLength(2);
+    store.close();
+  });
+
+  it("allocates a full-digest variant for the longest accepted session identity", async () => {
+    const sessionId = "s".repeat(200);
+    const store = await makeStore();
+    seedStore(store, newWorktreeTarget(), sessionId);
+    appendTestFlowEvent(store, "workflow.lane.declared", {
+      lane: {
+        id: "lane-source",
+        semanticKey: "lane-source",
+        kind: "implementation",
+        agentKind: "codex",
+        status: "completed",
+      },
+    }, "test-lane:lane-source", sessionId);
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-before-long-session", "lane-source", "before", "source", "f".repeat(40), sessionId,
+    );
+
+    store.requestNodeVariant({
+      sessionId,
+      laneId: "lane-source",
+      checkpointId: "checkpoint-before-long-session",
+      intentId: "variant-long-session",
+      successorLaneId: "lane-variant",
+      successorSemanticKey: "variant:lane-source:long-session",
+      now: "2026-07-28T04:05:00.000Z",
+    });
+    const binding = store.materializeFlowProjection(sessionId).candidateBindings
+      .find((candidate) => candidate.laneId === "lane-variant");
+    expect(binding?.variantId).toMatch(/^variant-[0-9a-f]{64}$/);
+    expect(binding?.worktreeId).toBe(`worktree-${sessionId}-${binding?.variantId}`);
+    expect(binding?.lineageId).toBe(`lineage-${binding?.variantId.slice("variant-".length)}`);
+    store.close();
+  });
+
+  it.each(["repair", "variant"] as const)(
+    "keeps current-branch %s successor event-compatible without candidate events",
+    async (kind) => {
+      const store = await makeSeededStore();
+      appendTestLane(store, "lane-source", "completed");
+      recordCheckpoint(
+        store,
+        `checkpoint-${kind}-source`,
+        "lane-source",
+        kind === "repair" ? "after" : "before",
+        "1".repeat(40),
+      );
+      const eventsBefore = store.listEvents("session-1").length;
+      const request = {
+        sessionId: "session-1",
+        laneId: "lane-source",
+        checkpointId: `checkpoint-${kind}-source`,
+        intentId: `${kind}-current-branch`,
+        successorLaneId: `lane-${kind}`,
+        successorSemanticKey: `${kind}:lane-source:current`,
+        now: "2026-07-28T04:10:00.000Z",
+      };
+      if (kind === "repair") store.requestNodeRepair(request);
+      else store.requestNodeVariant(request);
+
+      expect(store.listEvents("session-1").slice(eventsBefore).map((event) => event.kind)).toEqual(
+        kind === "repair"
+          ? ["workflow.lane.declared", "workflow.edge.declared", "workflow.node.repair_requested"]
+          : ["workflow.lane.declared", "workflow.node.variant_requested"],
+      );
+      expect(store.materializeFlowProjection("session-1").candidateBindings).toEqual([]);
+      store.close();
+    },
+  );
+
+  it("rejects a new-worktree checkpoint in a current-branch session before successor writes", async () => {
+    const store = await makeSeededStore();
+    appendTestLane(store, "lane-source", "completed");
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-variant-mixed-target", "lane-source", "before", "mixed", "1".repeat(40),
+    );
+    const eventsBefore = store.listEvents("session-1");
+
+    expect(() => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-source",
+      checkpointId: "checkpoint-variant-mixed-target",
+      intentId: "variant-mixed-target",
+      successorLaneId: "lane-variant",
+      successorSemanticKey: "variant:lane-source:mixed-target",
+      now: "2026-07-28T04:15:00.000Z",
+    })).toThrow(/execution target conflicts/i);
+    expect(store.listEvents("session-1")).toEqual(eventsBefore);
+    store.close();
+  });
+
+  it.each(["repair", "variant"] as const)(
+    "keeps a preexisting unbound new-worktree %s retry on the legacy zero-write path",
+    async (kind) => {
+      const store = await makeNewWorktreeStore();
+      appendTestLane(store, "lane-source", "completed");
+      const checkpointId = `checkpoint-${kind}-historical`;
+      const successorLaneId = `lane-${kind}-historical`;
+      const successorSemanticKey = `${kind}:lane-source:historical`;
+      const intentId = `${kind}-historical`;
+      recordNewWorktreeCheckpoint(
+        store, checkpointId, "lane-source", kind === "repair" ? "after" : "before", "historical", "2".repeat(40),
+      );
+      appendTestFlowEvent(store, "workflow.lane.declared", {
+        lane: {
+          id: successorLaneId,
+          semanticKey: successorSemanticKey,
+          kind: kind === "repair" ? "fix" : "implementation",
+          agentKind: "codex",
+          status: "pending",
+        },
+      }, `checkpoint-successor:${intentId}:lane`);
+      if (kind === "repair") {
+        appendTestFlowEvent(store, "workflow.edge.declared", {
+          edge: {
+            id: `edge-lane-source-${successorLaneId}`,
+            sourceLaneId: "lane-source",
+            targetLaneId: successorLaneId,
+          },
+        }, `checkpoint-successor:${intentId}:edge:lane-source:${successorLaneId}`);
+      }
+      appendTestFlowEvent(store, `workflow.node.${kind}_requested`, {
+        intentId,
+        laneId: "lane-source",
+        nodeId: "lane-source",
+        checkpointId,
+        successorLaneId,
+        successorSemanticKey,
+      }, `checkpoint-successor:${intentId}:intent`);
+      const eventsBeforeRetry = store.listEvents("session-1");
+      const request = {
+        sessionId: "session-1",
+        laneId: "lane-source",
+        checkpointId,
+        intentId,
+        successorLaneId,
+        successorSemanticKey,
+        now: "2026-07-28T04:20:00.000Z",
+      };
+
+      if (kind === "repair") store.requestNodeRepair(request);
+      else store.requestNodeVariant(request);
+      expect(store.listEvents("session-1")).toEqual(eventsBeforeRetry);
+      expect(store.materializeFlowProjection("session-1").candidateBindings).toEqual([]);
+      store.close();
+    },
+  );
+
   it.each(["variant", "fork"] as const)(
     "keeps an unbound new-worktree %s successor on the legacy scheduling path",
     async (kind) => {
@@ -5567,12 +5921,12 @@ describe("SQLite workflow store", () => {
     },
   );
 
-  it("keeps an unbound new-worktree repair successor on the legacy scheduling path", async () => {
+  it("keeps a newly requested repair from an unbound legacy source unbound", async () => {
     const store = await makeNewWorktreeStore();
-    declareCodeChangeWorkflow(store);
-    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
-    store.recordRunResult(runResultInput(store, "lane-implementation", "failed", "2026-07-28T04:10:00.000Z"));
-    recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
+    appendTestLane(store, "lane-implementation", "completed");
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-after-implementation", "lane-implementation", "after", "historical", "3".repeat(40),
+    );
     store.requestNodeRepair({
       sessionId: "session-1",
       laneId: "lane-implementation",
@@ -5581,9 +5935,95 @@ describe("SQLite workflow store", () => {
       successorSemanticKey: "repair:lane-implementation:pr1b",
       now: "2026-07-28T04:10:01.000Z",
     });
-    expect(scheduleLaneIds(store, "2026-07-28T04:10:02.000Z")).toEqual(["lane-repair"]);
-    expect(store.materializeFlowProjection("session-1").candidateBindings
+    const projection = store.materializeFlowProjection("session-1");
+    expect(projection.lanes.some((lane) => lane.id === "lane-repair")).toBe(true);
+    expect(projection.candidateBindings
       .some((binding) => binding.laneId === "lane-repair")).toBe(false);
+    store.close();
+  });
+
+  it("rolls back the whole new-worktree successor transaction after checkpoint candidate insertion", async () => {
+    let armed = true;
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({
+      projectRoot,
+      faultInjection: {
+        afterCheckpointCandidateEvents: () => {
+          if (armed) throw new Error("injected checkpoint candidate failure");
+        },
+      },
+    });
+    seedStore(store, newWorktreeTarget());
+    appendTestLane(store, "lane-source", "failed");
+    appendCandidateBinding(store, "lane-source", "source", "lineage-source");
+    appendFailedEvidence(
+      store,
+      "lane-source",
+      "segment-session-1-lane-source",
+      "evidence-failed-source",
+      "source failed",
+      "2026-07-28T04:29:59.000Z",
+      "run-session-1-lane-source",
+    );
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-after-source", "lane-source", "after", "source", "4".repeat(40),
+    );
+    const eventsBefore = store.listEvents("session-1");
+    const projectionBefore = store.materializeFlowProjection("session-1");
+    const request = {
+      sessionId: "session-1",
+      laneId: "lane-source",
+      checkpointId: "checkpoint-after-source",
+      intentId: "repair-after-fault",
+      successorLaneId: "lane-repair",
+      successorSemanticKey: "repair:lane-source:fault",
+      now: "2026-07-28T04:30:00.000Z",
+    };
+
+    expect(() => store.requestNodeRepair(request)).toThrow("injected checkpoint candidate failure");
+    expect(store.listEvents("session-1")).toEqual(eventsBefore);
+    expect(store.materializeFlowProjection("session-1")).toEqual(projectionBefore);
+    expect(store.materializeFlowProjection("session-1").lanes
+      .some((lane) => lane.id === "lane-repair" || lane.id === "lane-repair-regression")).toBe(false);
+    armed = false;
+    expect(store.requestNodeRepair(request).status).toBe("requested");
+    expect(store.materializeFlowProjection("session-1").candidateBindings)
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({ laneId: "lane-source", reason: "default" }),
+        expect.objectContaining({ laneId: "lane-repair", reason: "repair" }),
+        expect.objectContaining({ laneId: "lane-repair-regression", reason: "regression" }),
+      ]));
+    store.close();
+  });
+
+  it("rejects checkpoint candidate idempotency conflicts without partial successor writes", async () => {
+    const store = await makeNewWorktreeStore();
+    appendTestLane(store, "lane-source", "completed");
+    recordNewWorktreeCheckpoint(
+      store, "checkpoint-before-source", "lane-source", "before", "source", "5".repeat(40),
+    );
+    appendCandidateBinding(
+      store,
+      "lane-conflict",
+      "conflict",
+      "lineage-conflict",
+      [],
+      "default",
+      "candidate-binding:lane-variant:bound",
+    );
+    const eventsBefore = store.listEvents("session-1");
+
+    expect(() => store.requestNodeVariant({
+      sessionId: "session-1",
+      laneId: "lane-source",
+      checkpointId: "checkpoint-before-source",
+      intentId: "variant-conflict",
+      successorLaneId: "lane-variant",
+      successorSemanticKey: "variant:lane-source:conflict",
+      now: "2026-07-28T04:40:00.000Z",
+    })).toThrow(/candidate binding conflicts/i);
+    expect(store.listEvents("session-1")).toEqual(eventsBefore);
+    expect(store.materializeFlowProjection("session-1").lanes.some((lane) => lane.id === "lane-variant")).toBe(false);
     store.close();
   });
 
@@ -7800,9 +8240,10 @@ function appendTestFlowEvent(
   kind: FlowEventKind,
   payload: Record<string, unknown>,
   idempotencyKey: string,
+  sessionId = "session-1",
 ): void {
   store.appendWorkflowEvent({
-    sessionId: "session-1",
+    sessionId,
     kind,
     source: "test",
     idempotencyKey,
@@ -8111,9 +8552,10 @@ async function makeNullExitFlowEventFixture(legacySchema: boolean): Promise<stri
 function seedStore(
   store: ReturnType<typeof createWorkflowStore>,
   target?: { executionTarget: "new_worktree"; selectedBranch: string; baseRef: string },
+  sessionId = "session-1",
 ): void {
   const session = store.createWorkflowSession({
-    id: "session-1",
+    id: sessionId,
     projectId: "project-1",
     title: "Persisted workflow",
     goal: "Implement event sourced workflow",
@@ -8126,7 +8568,7 @@ function seedStore(
   });
   completeInitialPlannerTurn(store, session);
   store.applyWorkflowCardToolCall(
-    "session-1",
+    sessionId,
     createCard("tool-plan", {
       id: "node-plan",
       taskKey: "planning",
@@ -8547,6 +8989,44 @@ function recordCheckpoint(
       },
     },
     now: "2026-06-14T00:00:08.000Z",
+  });
+}
+
+function recordNewWorktreeCheckpoint(
+  store: ReturnType<typeof createWorkflowStore>,
+  checkpointId: string,
+  laneId: string,
+  phase: "before" | "after",
+  variantId: string,
+  headCommit: string,
+  sessionId = "session-1",
+): void {
+  store.appendWorkflowEvent({
+    sessionId,
+    kind: "workflow.node.checkpoint_recorded",
+    source: "test",
+    laneId,
+    idempotencyKey: `checkpoint:${checkpointId}`,
+    payload: {
+      checkpoint: {
+        id: checkpointId,
+        sessionId,
+        nodeId: laneId,
+        laneId,
+        runId: `run-${sessionId}-${laneId}`,
+        segmentId: `segment-${sessionId}-${laneId}`,
+        phase,
+        executionTarget: "new_worktree",
+        worktreeId: `worktree-${sessionId}-${variantId}`,
+        worktreeState: "clean",
+        baseCommit: "0".repeat(40),
+        headCommit,
+        createdAt: "2026-07-28T00:00:00.000Z",
+        source: "backend",
+        evidenceRefs: [{ kind: "run", id: `run-${sessionId}-${laneId}` }],
+      },
+    },
+    now: "2026-07-28T00:00:00.000Z",
   });
 }
 
