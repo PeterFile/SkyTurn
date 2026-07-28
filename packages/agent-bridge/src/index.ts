@@ -214,6 +214,7 @@ export interface TerminalPersistenceFailure {
 }
 
 interface DeferredAgentRunStartOwner {
+  bridgeCloseRequested: boolean;
   cancellationReason: string | null;
   completion: Promise<void>;
   reject: (error: unknown) => void;
@@ -554,6 +555,7 @@ export class AgentBridge {
   private readonly runs = new Map<string, AgentRun>();
   private readonly handles = new Map<string, AgentRunHandle>();
   private readonly startFlights = new Map<string, { fingerprint: string; promise: Promise<AgentRun> }>();
+  private readonly startTasks = new Set<Promise<AgentRun>>();
   private readonly startOwners = new Map<string, DeferredAgentRunStartOwner>();
   private readonly runStartFingerprints = new Map<string, string>();
   private readonly terminalPersistenceEvidence = new Map<string, RunEvidence>();
@@ -562,6 +564,10 @@ export class AgentBridge {
   private readonly onTerminalPersistenceFailure?: (failure: TerminalPersistenceFailure) => Promise<void>;
   private readonly durableRunClaimStore: DurableRunClaimStore;
   private readonly privateRunEventStore: PrivateRunEventStore;
+  private readonly closeStartOwnerFailures: unknown[] = [];
+  private startAdmissionOpen = true;
+  private closePromise: Promise<void> | null = null;
+  private closeReason: string | null = null;
 
   constructor(options: AgentBridgeOptions = {}) {
     this.adapters = new Map((options.adapters ?? [createMockAgentAdapter()]).map((adapter) => [adapter.kind, adapter]));
@@ -597,6 +603,9 @@ export class AgentBridge {
   }
 
   startRun(input: StartAgentRunInput): Promise<AgentRun> {
+    if (!this.startAdmissionOpen) {
+      return Promise.reject(new Error(this.closeReason ?? "AgentBridge is closed."));
+    }
     let expectedArtifacts: string[];
     try {
       expectedArtifacts = strictExpectedArtifactDeclarations(input.expectedArtifacts);
@@ -604,7 +613,7 @@ export class AgentBridge {
       return Promise.reject(error);
     }
     const safeInput = input.expectedArtifacts === undefined ? input : { ...input, expectedArtifacts };
-    if (!safeInput.runId) return this.startRunOnce(safeInput);
+    if (!safeInput.runId) return this.trackStartTask(this.startRunOnce(safeInput));
     let fingerprint: string;
     try {
       fingerprint = createAgentRunStartFingerprint(safeInput);
@@ -630,13 +639,63 @@ export class AgentBridge {
       return Promise.resolve(existing);
     }
 
-    const flight = this.startRunOnce(safeInput, fingerprint);
+    const flight = this.trackStartTask(this.startRunOnce(safeInput, fingerprint));
     this.startFlights.set(safeInput.runId, { fingerprint, promise: flight });
     void flight.then(
       () => this.clearStartFlight(safeInput.runId!, flight),
       () => this.clearStartFlight(safeInput.runId!, flight),
     );
     return flight;
+  }
+
+  close(reason = "AgentBridge is closing."): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.startAdmissionOpen = false;
+    this.closeReason = sanitizePublicEvidenceText(reason) || "AgentBridge is closing.";
+    for (const owner of this.startOwners.values()) {
+      owner.bridgeCloseRequested = true;
+      if (owner.cancellationReason === null) owner.cancellationReason = this.closeReason;
+    }
+    this.closePromise = this.performClose();
+    return this.closePromise;
+  }
+
+  private async performClose(): Promise<void> {
+    const startResults = await Promise.allSettled([...this.startTasks]);
+    const failures: unknown[] = startResults.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : []
+    );
+    const activeRuns = [...this.runs.values()].filter((run) => !isFinalRunStatus(run.status));
+    const cancellationResults = await Promise.allSettled(
+      activeRuns.map((run) => this.cancelRun(run.id, this.closeReason ?? "AgentBridge is closing.")),
+    );
+    failures.push(
+      ...this.closeStartOwnerFailures,
+      ...cancellationResults.flatMap((result) => result.status === "rejected" ? [result.reason] : []),
+    );
+
+    if (this.startTasks.size > 0) {
+      failures.push(new Error("AgentBridge close left tracked start tasks unsettled."));
+    }
+    if (this.startOwners.size > 0) {
+      failures.push(new Error("AgentBridge close left start owners unsettled."));
+    }
+    const remainingRuns = [...this.runs.values()].filter((run) => !isFinalRunStatus(run.status));
+    if (remainingRuns.length > 0) {
+      failures.push(new Error(`AgentBridge close left nonterminal runs: ${remainingRuns.map((run) => run.id).join(", ")}.`));
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "AgentBridge close failed.");
+    }
+  }
+
+  private trackStartTask(task: Promise<AgentRun>): Promise<AgentRun> {
+    this.startTasks.add(task);
+    void task.then(
+      () => this.startTasks.delete(task),
+      () => this.startTasks.delete(task),
+    );
+    return task;
   }
 
   private async startRunOnce(input: StartAgentRunInput, explicitFingerprint?: string): Promise<AgentRun> {
@@ -729,7 +788,7 @@ export class AgentBridge {
     }
     if (explicitFingerprint) this.runStartFingerprints.set(run.id, explicitFingerprint);
     this.runs.set(run.id, run);
-    const startOwner = createDeferredAgentRunStartOwner();
+    const startOwner = createDeferredAgentRunStartOwner(this.closeReason);
     this.startOwners.set(run.id, startOwner);
 
     const sink: RunEventSink = {
@@ -783,6 +842,7 @@ export class AgentBridge {
       await handle.cancel(cancellationReason);
     } catch (error) {
       if (!isFinalRunStatus(this.runs.get(run.id)?.status ?? run.status)) this.handles.set(run.id, handle);
+      if (startOwner.bridgeCloseRequested) this.closeStartOwnerFailures.push(error);
       this.settleStartOwner(run.id, startOwner, error);
       return;
     }
@@ -791,6 +851,7 @@ export class AgentBridge {
       this.settleStartOwner(run.id, startOwner);
     } catch (error) {
       this.settleStartOwner(run.id, startOwner, error);
+      throw error;
     }
   }
 
@@ -1047,15 +1108,17 @@ export class AgentBridge {
   }
 }
 
-function createDeferredAgentRunStartOwner(): DeferredAgentRunStartOwner {
+function createDeferredAgentRunStartOwner(closeReason: string | null): DeferredAgentRunStartOwner {
   let resolve!: () => void;
   let reject!: (error: unknown) => void;
   const completion = new Promise<void>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
     reject = rejectPromise;
   });
+  void completion.catch(() => undefined);
   return {
-    cancellationReason: null,
+    bridgeCloseRequested: closeReason !== null,
+    cancellationReason: closeReason,
     completion,
     reject,
     resolve,

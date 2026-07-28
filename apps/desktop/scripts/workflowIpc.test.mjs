@@ -9,6 +9,98 @@ import vm from "node:vm";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
 
+test("Electron workflow shutdown awaits bridge reap before closing SQLite and preserves bridge identity", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const start = main.indexOf("function closeWorkflowStores(): Promise<void>");
+  const end = main.indexOf("function closeWorkflowAdvanceAdmission", start);
+  assert.ok(start >= 0 && end > start);
+  const source = `${main.slice(start, end)}\nmodule.exports = { closeWorkflowStores };`;
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const events = [];
+  let releaseBridgeClose;
+  let bridgeCloseEnteredResolve;
+  const bridgeCloseEntered = new Promise((resolve) => {
+    bridgeCloseEnteredResolve = resolve;
+  });
+  const originalBridge = {
+    close(reason) {
+      events.push(`bridge:close:${reason}`);
+      bridgeCloseEnteredResolve();
+      return new Promise((resolve) => {
+        releaseBridgeClose = resolve;
+      });
+    },
+  };
+  const replacementBridge = { close: async () => undefined };
+  const store = { close: () => events.push("store:close") };
+  let drainCount = 0;
+  const module = { exports: {} };
+  const context = {
+    module,
+    exports: module.exports,
+    Promise,
+    agentBridge: originalBridge,
+    agentBridgeAdmissionOpen: true,
+    agentBridgeInitialization: null,
+    appShutdownRequested: true,
+    closeWorkflowAdvanceAdmission: () => events.push("workflow:admission-close"),
+    closeWorkflowTerminalReconciliationAdmission: () => events.push("terminal:admission-close"),
+    drainWorkflowTasks: async () => events.push(`workflow:drain:${++drainCount}`),
+    planRuntime: { close: async () => events.push("plan:close") },
+    reopenWorkflowAdvanceAdmission: () => events.push("workflow:admission-reopen"),
+    reopenWorkflowTerminalReconciliationAdmission: () => events.push("terminal:admission-reopen"),
+    workflowStores: new Map([["/project", store]]),
+    workflowStoresClosePromise: null,
+    workflowTerminalReconciliationFailures: [],
+    workspaceSaveWriter: {
+      closeAdmission: () => events.push("workspace:admission-close"),
+      drain: async () => events.push("workspace:drain"),
+      reopenAdmission: () => events.push("workspace:admission-reopen"),
+    },
+  };
+  vm.runInNewContext(output, context, { filename: "closeWorkflowStores.ts" });
+
+  const closing = module.exports.closeWorkflowStores();
+  assert.equal(module.exports.closeWorkflowStores(), closing);
+  await bridgeCloseEntered;
+  assert.deepEqual(events, [
+    "workflow:admission-close",
+    "workspace:admission-close",
+    "workspace:drain",
+    "workflow:drain:1",
+    "plan:close",
+    "workflow:drain:2",
+    "bridge:close:SkyTurn is shutting down.",
+  ]);
+  assert.equal(events.includes("store:close"), false);
+
+  context.agentBridge = replacementBridge;
+  releaseBridgeClose();
+  await closing;
+
+  assert.deepEqual(events.slice(-3), [
+    "workflow:drain:3",
+    "terminal:admission-close",
+    "store:close",
+  ]);
+  assert.equal(context.agentBridge, replacementBridge);
+  assert.equal(events.some((event) => event.endsWith("admission-reopen")), false);
+
+  const windowCloseHandler = main.slice(
+    main.indexOf('app.on("window-all-closed"'),
+    main.indexOf('app.on("activate"'),
+  );
+  assert.match(windowCloseHandler, /SKYTURN_NEW_SESSION_UI_ACCEPTANCE === "1"/);
+  const shutdownCatch = main.slice(start, end);
+  assert.match(shutdownCatch, /if \(!appShutdownRequested\) \{\s*workspaceSaveWriter\.reopenAdmission\(\);/);
+});
+
 test("Electron main tracks every top-level workflow store operation, not only workflow IPC", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
 

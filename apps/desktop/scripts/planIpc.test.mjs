@@ -1767,6 +1767,7 @@ test("main coordinator launches every durable session once and advances an inact
   let terminalListener;
   let loaded;
   const bridge = {
+    async close() {},
     onRunEvent(listener) {
       terminalListener = listener;
       return () => undefined;
@@ -2593,6 +2594,147 @@ test("workflow shutdown drains a registered initialization and prevents late pub
   }
 });
 
+test("AgentBridge initialization is single-flight and shutdown closes the shared instance", async () => {
+  const initializationGate = deferred();
+  let createCalls = 0;
+  let initializeCalls = 0;
+  let bridgeCreations = 0;
+  let closeCalls = 0;
+  const bridge = {
+    async close() { closeCalls += 1; },
+    onRunEvent() { return () => undefined; },
+    listRuns() { return []; },
+    async loadEvents() { return []; },
+    async getEvidence() { return null; },
+    async discoverAgents() { return []; },
+  };
+  const loaded = await loadMainModule([], {
+    agentBridge: bridge,
+    createDurableRunClaimStore: () => {
+      createCalls += 1;
+      return {
+        async initialize() {
+          initializeCalls += 1;
+          initializationGate.started.resolve();
+          await initializationGate.release.promise;
+        },
+      };
+    },
+    onAgentBridgeCreated() { bridgeCreations += 1; },
+  });
+
+  const first = loaded.exports.getAgentBridge();
+  const second = loaded.exports.getAgentBridge();
+  await initializationGate.started.promise;
+  assert.equal(createCalls, 1);
+  assert.equal(initializeCalls, 1);
+  assert.equal(bridgeCreations, 0);
+
+  let closeSettled = false;
+  const closing = loaded.exports.closeWorkflowStores().then(() => {
+    closeSettled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(closeSettled, false);
+  assert.equal(closeCalls, 0);
+
+  initializationGate.release.resolve();
+  const [firstBridge, secondBridge] = await Promise.all([first, second]);
+  assert.equal(firstBridge, bridge);
+  assert.equal(secondBridge, bridge);
+  assert.equal(bridgeCreations, 1);
+
+  await closing;
+  assert.equal(closeCalls, 1);
+});
+
+test("workflow shutdown fails closed when observed terminal reconciliation rejects", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-terminal-reconciliation-reject-"));
+  let closeCalls = 0;
+  const loaded = await loadMainModule([], {
+    wrapWorkflowStoreModule: (module) => ({
+      ...module,
+      createWorkflowStore: (options) => {
+        const store = module.createWorkflowStore(options);
+        const close = store.close.bind(store);
+        store.close = () => {
+          closeCalls += 1;
+          close();
+        };
+        return store;
+      },
+    }),
+  });
+  try {
+    await loaded.exports.getWorkflowStore(projectRoot);
+    await assert.rejects(
+      loaded.exports.observeWorkflowTerminalReconciliation(async () => {
+        throw new Error("synthetic terminal reconciliation failure");
+      }),
+      /synthetic terminal reconciliation failure/,
+    );
+
+    await assert.rejects(
+      loaded.exports.closeWorkflowStores(),
+      /Workflow terminal reconciliation failed during shutdown/,
+    );
+    assert.equal(closeCalls, 0);
+    assert.equal(loaded.exports.workflowStores.size, 1);
+  } finally {
+    for (const store of loaded.exports.workflowStores.values()) store.close();
+    loaded.exports.workflowStores.clear();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow shutdown propagates AgentBridge terminal compensation rejection before store close", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-terminal-compensation-reject-"));
+  let bridgeConfig;
+  let closeCalls = 0;
+  const bridge = {
+    async close() {
+      await bridgeConfig.onTerminalPersistenceFailure({ reason: "terminal-persistence-failed" });
+    },
+    onRunEvent() { return () => undefined; },
+    listRuns() { return []; },
+    async loadEvents() { return []; },
+    async getEvidence() { return null; },
+    async discoverAgents() { return []; },
+  };
+  const loaded = await loadMainModule([], {
+    agentBridge: bridge,
+    createDurableRunClaimStore: () => ({ async initialize() {} }),
+    onAgentBridgeCreated(config) { bridgeConfig = config; },
+    wrapWorkflowStoreModule: (module) => ({
+      ...module,
+      createWorkflowStore: (options) => {
+        const store = module.createWorkflowStore(options);
+        const close = store.close.bind(store);
+        store.close = () => {
+          closeCalls += 1;
+          close();
+        };
+        return store;
+      },
+    }),
+  });
+  try {
+    await loaded.exports.getWorkflowStore(projectRoot);
+    await loaded.exports.getAgentBridge();
+
+    await assert.rejects(
+      loaded.exports.closeWorkflowStores(),
+      /terminal-persistence-failed/,
+    );
+    assert.equal(closeCalls, 0);
+    assert.equal(loaded.exports.workflowStores.size, 1);
+  } finally {
+    for (const store of loaded.exports.workflowStores.values()) store.close();
+    loaded.exports.workflowStores.clear();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("workflow shutdown drains registered terminal reconciliation before closing stores", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-terminal-shutdown-"));
   const reconciliationGate = deferred();
@@ -2608,6 +2750,7 @@ test("workflow shutdown drains registered terminal reconciliation before closing
   let bridgeConfig;
   let loaded;
   const bridge = {
+    async close() {},
     onRunEvent(listener) {
       terminalListener = listener;
       return () => undefined;
@@ -2896,6 +3039,7 @@ test("planner turn run ids use canonical project identity and terminal reconcili
 
     const completedAt = "2026-07-17T00:00:03.000Z";
     const bridge = {
+      async close() {},
       listRuns() {
         return [...starts].reverse().map((run) => ({
           id: run.runId,
@@ -3751,6 +3895,7 @@ test("terminal planner reconciliation serializes intent scheduling before the ne
     const completedAt = "2026-07-21T02:00:02.000Z";
     const intent = plannerIntent("intent-before-next-turn", "lane-before-next-turn");
     const bridge = {
+      async close() {},
       listRuns() {
         return [{
           id: firstRun.runId,
@@ -3968,6 +4113,7 @@ test("terminal non-planner Hermes reconciliation requests durable danger authori
     assert.ok(segment);
     const completedAt = "2026-07-22T00:00:04.000Z";
     const bridge = {
+      async close() {},
       listRuns() {
         return [{
           id: segment.runId,
@@ -4092,6 +4238,7 @@ test("terminal listener waits for the unpublished workflow-store recovery barrie
       status,
     });
     const bridge = {
+      async close() {},
       onRunEvent(listener) {
         terminalListener = listener;
         return () => undefined;
@@ -4172,6 +4319,7 @@ test("terminal listener does not deadlock after workflow-store initialization fa
       status: "running",
     };
     const bridge = {
+      async close() {},
       onRunEvent() {
         return () => undefined;
       },
@@ -4691,6 +4839,7 @@ test("terminal Finish planner output is applied and scheduled by Electron main w
     let terminal = false;
     const completedAt = "2026-07-18T00:00:02.000Z";
     const bridge = {
+      async close() {},
       onRunEvent() {
         return () => undefined;
       },
@@ -5610,11 +5759,17 @@ test("before-quit keeps a failed workspace drain retryable without detaching the
     const failedCleanup = loaded.exports.closeWorkflowStores();
     await assert.rejects(failedCleanup, /injected workspace write failure/);
     assert.equal(loaded.appState.quitCalls, 0);
-    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), true);
+    assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), false);
     assert.equal(runtimeCloseCalls, 0);
     const recovered = workspaceSnapshot(projectRoot, "recovered-after-failed-drain");
-    await loaded.ipcHandlers.get("workspace:save")({}, recovered);
-    await loaded.ipcHandlers.get("plan:getState")({}, request);
+    await assert.rejects(
+      loaded.ipcHandlers.get("workspace:save")({}, recovered),
+      /Workspace saving is unavailable while SkyTurn is shutting down/,
+    );
+    await assert.rejects(
+      loaded.ipcHandlers.get("plan:getState")({}, request),
+      /Plan runtime is unavailable while SkyTurn is shutting down/,
+    );
     assert.equal(runtimeFactoryCalls, 1);
 
     loaded.appListeners.get("before-quit")({ preventDefault: () => { prevented += 1; } });
@@ -5624,11 +5779,11 @@ test("before-quit keeps a failed workspace drain retryable without detaching the
     assert.equal(loaded.exports.isWorkflowAdvanceAdmissionOpen(), false);
     assert.equal(prevented, 2);
     assert.equal(writeAttempts, 3);
-    assert.equal(runtimeStateCalls, 2);
+    assert.equal(runtimeStateCalls, 1);
     assert.equal(runtimeCloseCalls, 1);
     assert.deepEqual(
       JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")),
-      recovered,
+      latest,
     );
   } finally {
     await rm(userDataPath, { recursive: true, force: true });
@@ -5708,7 +5863,16 @@ test("activate and second-instance share one failed window-close recovery before
   const windows = [];
   let runtimeFactoryCalls = 0;
   let runtimeCloseCalls = 0;
+  let bridgeCreations = 0;
   let writeAttempts = 0;
+  const bridge = {
+    async close() {},
+    onRunEvent() { return () => undefined; },
+    listRuns() { return []; },
+    async loadEvents() { return []; },
+    async getEvidence() { return null; },
+    async discoverAgents() { return []; },
+  };
   const fsPromises = instrumentWorkspaceWrites({
     blockAttempt: 3,
     blockPayload: '"label": "retained-latest"',
@@ -5725,6 +5889,9 @@ test("activate and second-instance share one failed window-close recovery before
       userDataPath,
       fsPromises,
       platform: "linux",
+      agentBridge: bridge,
+      createDurableRunClaimStore: () => ({ async initialize() {} }),
+      onAgentBridgeCreated() { bridgeCreations += 1; },
       createPlanRuntime: () => {
         runtimeFactoryCalls += 1;
         return {
@@ -5761,6 +5928,13 @@ test("activate and second-instance share one failed window-close recovery before
 
     await loaded.ipcHandlers.get("workspace:load")();
     await loaded.ipcHandlers.get("plan:getState")({}, { planSessionId: "plan-1", projectRoot });
+    assert.equal(await loaded.exports.getAgentBridge(), bridge);
+    let terminalReconciliationRan = false;
+    await loaded.exports.observeWorkflowTerminalReconciliation(async () => {
+      terminalReconciliationRan = true;
+    });
+    assert.equal(terminalReconciliationRan, true);
+    assert.equal(bridgeCreations, 1);
     assert.equal(runtimeFactoryCalls, 2);
     loaded.appListeners.get("activate")();
     loaded.appListeners.get("second-instance")();
@@ -5769,6 +5943,49 @@ test("activate and second-instance share one failed window-close recovery before
     assert.equal(runtimeFactoryCalls, 2);
   } finally {
     gate.release.resolve();
+    await rm(userDataPath, { recursive: true, force: true });
+  }
+});
+
+test("macOS window close reopens AgentBridge and terminal reconciliation admission before activate", async () => {
+  const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-workspace-macos-window-reopen-"));
+  const windows = [];
+  let bridgeCreations = 0;
+  let bridgeCloseCalls = 0;
+  const bridge = {
+    async close() { bridgeCloseCalls += 1; },
+    onRunEvent() { return () => undefined; },
+    listRuns() { return []; },
+    async loadEvents() { return []; },
+    async getEvidence() { return null; },
+    async discoverAgents() { return []; },
+  };
+  try {
+    const loaded = await loadMainModule(windows, {
+      userDataPath,
+      platform: "darwin",
+      agentBridge: bridge,
+      createDurableRunClaimStore: () => ({ async initialize() {} }),
+      onAgentBridgeCreated() { bridgeCreations += 1; },
+    });
+    assert.equal(await loaded.exports.getAgentBridge(), bridge);
+
+    loaded.appListeners.get("window-all-closed")();
+    await loaded.exports.closeWorkflowStores();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(loaded.appState.quitCalls, 0);
+    assert.equal(await loaded.exports.getAgentBridge(), bridge);
+    let terminalReconciliationRan = false;
+    await loaded.exports.observeWorkflowTerminalReconciliation(async () => {
+      terminalReconciliationRan = true;
+    });
+    assert.equal(terminalReconciliationRan, true);
+    loaded.appListeners.get("activate")();
+    await waitForCondition(() => windows.length === 1, "macOS activate did not recreate the window");
+    assert.equal(bridgeCreations, 2);
+    assert.equal(bridgeCloseCalls, 1);
+  } finally {
     await rm(userDataPath, { recursive: true, force: true });
   }
 });
@@ -6316,7 +6533,7 @@ async function loadMainModule(windows, options = {}) {
   const orchestrator = await import("@skyturn/orchestrator");
   const uiCanvasWorkflowRuntime = await import("@skyturn/ui-canvas/workflow-runtime");
   const source = `${await readFile(join(root, "electron", "main.ts"), "utf8")}
-export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getAgentBridge, getWorkflowStore, isWorkflowAdvanceAdmissionOpen, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, registerWorkflowTerminalReconciliation, workflowStoreOperationTasks, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowProjectAdvanceTails, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workflowTerminalReconciliationTasks, workspaceSaveWriter };`;
+export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getAgentBridge, getWorkflowStore, isWorkflowAdvanceAdmissionOpen, observeWorkflowTerminalReconciliation, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, registerWorkflowTerminalReconciliation, workflowStoreOperationTasks, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowProjectAdvanceTails, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workflowTerminalReconciliationTasks, workspaceSaveWriter };`;
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -6342,6 +6559,7 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
     async loadEvents() { return []; }
     async getEvidence() { return null; }
     async discoverAgents() { return []; }
+    async close() {}
   }
   const realAgentBridgeModule = await import("@skyturn/agent-bridge");
   const agentBridgeModule = {
@@ -6349,7 +6567,8 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
     AgentBridge,
     createCodexCliAdapter: () => ({}),
     createHermesCliAdapter: () => ({}),
-    createDurableRunClaimStore: () => ({ initialize: async () => undefined }),
+    createDurableRunClaimStore: options.createDurableRunClaimStore
+      ?? (() => ({ initialize: async () => undefined })),
     createPrivateRunEventStore: () => ({}),
     ...(options.assertExpectedArtifactVerifierCapability
       ? { assertExpectedArtifactVerifierCapability: options.assertExpectedArtifactVerifierCapability }

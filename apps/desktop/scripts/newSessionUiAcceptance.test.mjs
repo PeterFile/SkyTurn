@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -124,7 +124,7 @@ test("New Session UI acceptance rejects unbound danger run authorizations", asyn
   }
 });
 
-test("New Session UI acceptance passes live CDP into workflow completion and drives the real decision DOM", async () => {
+test("New Session UI acceptance returns from danger authorization control before the Agent lane settles", async () => {
   const { authorizePendingDangerRunThroughUi } = await import("./newSessionUiAcceptance.mjs");
   const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
   let expression = "";
@@ -143,16 +143,17 @@ test("New Session UI acceptance passes live CDP into workflow completion and dri
 
   assert.match(source, /waitForWorkflowCompletion\(\{\s*\n\s*cdp: liveCdp,/);
   assert.match(source, /async function waitForWorkflowCompletion\(\{ cdp,/);
-  assert.match(source, /authorizePendingDangerRunThroughUi\(cdp, pendingDangerNodes\[0\]\)/);
+  assert.match(source, /reconcileDangerAuthorizationAcknowledgments/);
+  assert.match(source, /authorize: \(pendingControl\) => authorizePendingDangerRunThroughUi\(cdp, pendingControl\)/);
+  assert.match(source, /submittedDangerAuthorizations = new Map\(\)/);
   assert.match(expression, /querySelectorAll\('button\[aria-label\]'\)/);
   assert.match(expression, /More details for/);
   assert.match(expression, /querySelectorAll\('\.react-flow__node\[data-id\]'\)/);
   assert.match(expression, /findExactAriaLabel\('\.node-modal\[aria-label\]', title\)/);
   assert.match(expression, /querySelectorAll\('\.decision-panel\[aria-label\]'\)/);
   assert.match(expression, /Authorize this run/);
-  assert.match(expression, /const authorizationDeadline = 76000/);
+  assert.match(expression, /const authorizationDeadline = 16000/);
   assert.doesNotMatch(expression, /const authorizationDeadline = Date\.now\(\)/);
-  assert.doesNotMatch(expression, /const deadline = Date\.now\(\) \+ 15000/);
   assert.doesNotMatch(expression, /requestAnimationFrame/);
   assert.match(expression, /setTimeout\(callback, 16\)/);
   assert.match(expression, /if \(now\(\) >= deadline\)/);
@@ -163,12 +164,97 @@ test("New Session UI acceptance passes live CDP into workflow completion and dri
   );
   assert.match(expression, /if \(!authorizationButton\.disabled\)/);
   assert.match(expression, /authorizationButton\.disabled/);
+  assert.doesNotMatch(expression, /authoritative-renderer-update|decision-panel-removed/);
   assert.deepEqual(evaluationOptions, {
     awaitPromise: true,
     returnByValue: true,
-    requestTimeoutMs: 90_000,
+    requestTimeoutMs: 20_000,
   });
+  assert.doesNotMatch(source, /dangerAuthorizationCdpTimeoutMs|90_000/);
   assert.doesNotMatch(expression, /workflow:userDecision:answer|answerUserDecision|createWorkflowSession/);
+});
+
+test("danger authorization acknowledgment fails fast without a repeated dangerous click", async () => {
+  const { reconcileDangerAuthorizationAcknowledgments } = await import("./newSessionUiAcceptance.mjs");
+  const decision = pendingDangerAuthorizationNode();
+  const session = { kind: "canvas", nodes: [decision] };
+  const submitted = new Map();
+  let clickCount = 0;
+  const authorize = async () => {
+    clickCount += 1;
+    return { outcome: "submitted" };
+  };
+
+  const first = await reconcileDangerAuthorizationAcknowledgments(session, submitted, {
+    acknowledgmentBudgetMs: 10,
+    authorize,
+    now: () => 1_000,
+  });
+  assert.equal(first.pending, true);
+  assert.equal(first.submittedDecisionId, decision.id);
+  assert.equal(clickCount, 1);
+  assert.equal(submitted.size, 1);
+
+  const stillPending = await reconcileDangerAuthorizationAcknowledgments(session, submitted, {
+    acknowledgmentBudgetMs: 10,
+    authorize,
+    now: () => 1_009,
+  });
+  assert.equal(stillPending.pending, true);
+  assert.equal(stillPending.submittedDecisionId, null);
+  assert.equal(clickCount, 1);
+
+  await assert.rejects(
+    reconcileDangerAuthorizationAcknowledgments(session, submitted, {
+      acknowledgmentBudgetMs: 10,
+      authorize,
+      now: () => 1_010,
+    }),
+    /Danger authorization acknowledgment timeout.*decision-danger-run.*run-danger.*10ms/,
+  );
+  assert.equal(clickCount, 1);
+});
+
+test("danger authorization acknowledgment continues only after SQLite shows answered or disappearance", async () => {
+  const { reconcileDangerAuthorizationAcknowledgments } = await import("./newSessionUiAcceptance.mjs");
+
+  for (const acknowledgedSession of [
+    () => {
+      const answered = pendingDangerAuthorizationNode();
+      answered.status = "completed";
+      answered.userDecision.status = "answered";
+      return { kind: "canvas", nodes: [answered] };
+    },
+    () => ({ kind: "canvas", nodes: [] }),
+  ]) {
+    const pendingSession = { kind: "canvas", nodes: [pendingDangerAuthorizationNode()] };
+    const submitted = new Map();
+    let clickCount = 0;
+    const authorize = async () => {
+      clickCount += 1;
+      return { outcome: "submitted" };
+    };
+
+    await reconcileDangerAuthorizationAcknowledgments(pendingSession, submitted, {
+      acknowledgmentBudgetMs: 10,
+      authorize,
+      now: () => 2_000,
+    });
+    const acknowledged = await reconcileDangerAuthorizationAcknowledgments(
+      acknowledgedSession(),
+      submitted,
+      {
+        acknowledgmentBudgetMs: 10,
+        authorize,
+        now: () => 2_001,
+      },
+    );
+
+    assert.equal(acknowledged.pending, false);
+    assert.deepEqual(acknowledged.acknowledgedDecisionIds, ["decision-danger-run"]);
+    assert.equal(submitted.size, 0);
+    assert.equal(clickCount, 1);
+  }
 });
 
 test("danger authorization wait rejects an expired deadline before probing or scheduling", async () => {
@@ -943,6 +1029,479 @@ test("New Session UI acceptance omits renderer workspace evidence from terminal 
   ]);
 });
 
+test("New Session UI failure collection preserves terminal after-close SQLite, workspace, project, and private facts", async () => {
+  const { collectFailureAcceptanceResult } = await import("./newSessionUiAcceptance.mjs");
+  const runEvidence = successfulOpaqueEvidence("run-implementation", "codex");
+  const session = {
+    id: "session-partial",
+    kind: "canvas",
+    plannerNodeId: "planner",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    nodes: [
+      { id: "planner", runId: "run-planner", agent: "hermes", status: "completed" },
+      {
+        id: "lane-implementation",
+        laneKind: "implementation",
+        runId: runEvidence.runId,
+        agent: "codex",
+        status: "completed",
+        context: { dependencies: [] },
+      },
+      {
+        id: "lane-validation",
+        laneKind: "validation",
+        runId: "run-validation",
+        agent: "codex",
+        status: "cancelled",
+        context: { dependencies: ["lane-implementation"] },
+      },
+    ],
+    edges: [],
+  };
+  const workspace = {
+    activeProjectId: "project-partial",
+    activeSessionId: session.id,
+    sessions: [structuredClone(session)],
+  };
+  const sqliteState = {
+    canvasSession: structuredClone(session),
+    projection: {
+      segments: [
+        { id: "segment-implementation", laneId: "lane-implementation", runId: runEvidence.runId, status: "succeeded" },
+        { id: "segment-validation", laneId: "lane-validation", runId: "run-validation", status: "cancelled" },
+      ],
+      evidence: [{
+        id: "evidence-implementation",
+        laneId: "lane-implementation",
+        segmentId: "segment-implementation",
+        status: "passed",
+        runEvidence,
+      }],
+    },
+    events: [{ kind: "workflow.segment.completed" }, { kind: "workflow.segment.started" }],
+  };
+  const projectFacts = {
+    projectInspected: true,
+    verificationScriptHashUnchanged: true,
+    captureScriptHashUnchanged: true,
+    verificationCommand: { verify: { code: 0 }, captureScreenshot: { code: null, skipped: true } },
+    screenshot: { path: "/tmp/project/.devflow/acceptance/react-app.png", bytes: 2048 },
+    commitCount: 1,
+    deliveryCommitCount: 0,
+    commitSha: baselineHead,
+    baselineCommitSha: baselineHead,
+    headCommitSha: baselineHead,
+    changedFiles: ["src/App.jsx"],
+    allChangedFilesSinceBaseline: ["src/App.jsx"],
+    expectedChangedFiles: ["src/App.css", "src/App.jsx"],
+    unexpectedChangedFiles: [],
+    missingChangedFiles: ["src/App.css"],
+    gitStatus: { clean: false, value: " M src/App.jsx" },
+  };
+
+  const result = await collectFailureAcceptanceResult({
+    baselineCommitSha: baselineHead,
+    demo: {},
+    expectedCaptureScriptHash: "capture-hash",
+    expectedVerifyScriptHash: "verify-hash",
+    projectRoot: "/tmp/project",
+    readiness: { checks: { mockFallback: false } },
+    precloseSnapshot: { workspace, ui: { title: "SkyTurn" } },
+    userData: "/tmp/user-data",
+    readSqliteState: async () => sqliteState,
+    collectPrivateFacts: async ({ runIds }) => ({
+      activeRuns: [],
+      evidence: { [runEvidence.runId]: runEvidence },
+      diagnostic: null,
+      observedRunIds: runIds,
+    }),
+    collectProjectFacts: async () => projectFacts,
+  });
+
+  assert.equal(result.mockFallback, false);
+  assert.equal(result.sessionId, session.id);
+  assert.deepEqual(result.laneStatuses.map((lane) => [lane.id, lane.status]), [
+    ["planner", "completed"],
+    ["lane-implementation", "completed"],
+    ["lane-validation", "cancelled"],
+  ]);
+  assert.equal(result.laneKindEvidence.lanes.implementation.nodeId, "lane-implementation");
+  assert.equal(result.laneKindEvidence.lanes.implementation.failures.includes("missing-lane"), false);
+  assert.equal(result.runEvidence[runEvidence.runId].status, "succeeded");
+  assert.deepEqual(result.changedFiles, ["src/App.jsx"]);
+  assert.equal(result.verificationScriptHashUnchanged, true);
+  assert.equal(result.screenshot.bytes, 2048);
+  assert.deepEqual(result.failureCollection.sourceAvailability, {
+    sqliteProjection: true,
+    workspace: true,
+    project: true,
+    privateRunFacts: true,
+  });
+  assert.deepEqual(result.failureCollection.sqlite.segments.map((segment) => segment.status), [
+    "succeeded",
+    "cancelled",
+  ]);
+  assert.deepEqual(result.failureCollection.privateRuns.activeRuns, []);
+  assert.equal(result.failureCollection.preclose.workspace.sessionId, session.id);
+  assert.equal(result.failureCollection.preclose.ui.title, "SkyTurn");
+});
+
+test("failure collection ignores a pending synthetic run after an upstream terminal failure", async () => {
+  const { collectFailureAcceptanceResult } = await import("./newSessionUiAcceptance.mjs");
+  const reviewRunId = "run-review-failed";
+  const syntheticCommitRunId = "run-commit-synthetic";
+  const reviewEvidence = {
+    runId: reviewRunId,
+    status: "failed",
+    exitCode: 1,
+    changesetId: null,
+    checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "failed", detail: "exit 1" }],
+    artifacts: [],
+    review: null,
+    errorReason: "review failed",
+    cancelReason: null,
+    completedAt: "2026-07-28T00:00:00.000Z",
+  };
+  const session = {
+    id: "session-upstream-failure",
+    kind: "canvas",
+    plannerNodeId: "planner",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    nodes: [
+      { id: "planner", agent: "hermes", status: "completed" },
+      {
+        id: "lane-review",
+        laneKind: "review",
+        runId: reviewRunId,
+        agent: "hermes",
+        status: "failed",
+        context: { dependencies: [] },
+      },
+      {
+        id: "lane-commit",
+        laneKind: "commit",
+        runId: syntheticCommitRunId,
+        agent: "codex",
+        status: "pending",
+        context: { dependencies: ["lane-review"] },
+      },
+    ],
+    edges: [{ id: "edge-review-commit", source: "lane-review", target: "lane-commit" }],
+  };
+  const sqliteState = {
+    canvasSession: structuredClone(session),
+    projection: {
+      lanes: [
+        { id: "lane-review", status: "failed" },
+        { id: "lane-commit", status: "pending" },
+      ],
+      segments: [{
+        id: "segment-review",
+        laneId: "lane-review",
+        runId: reviewRunId,
+        status: "failed",
+        exitCode: 1,
+      }],
+      evidence: [{
+        id: "evidence-review",
+        laneId: "lane-review",
+        segmentId: "segment-review",
+        status: "failed",
+        runEvidence: reviewEvidence,
+      }],
+    },
+    events: [{ kind: "workflow.segment.completed" }],
+  };
+  let queriedRunIds = null;
+
+  const result = await collectFailureAcceptanceResult({
+    baselineCommitSha: baselineHead,
+    demo: {},
+    expectedCaptureScriptHash: "capture-hash",
+    expectedVerifyScriptHash: "verify-hash",
+    projectRoot: "/tmp/project",
+    readiness: { checks: { mockFallback: false } },
+    precloseSnapshot: {
+      workspace: {
+        activeSessionId: session.id,
+        sessions: [structuredClone(session)],
+      },
+      ui: null,
+    },
+    userData: "/tmp/user-data",
+    readSqliteState: async () => sqliteState,
+    collectPrivateFacts: async ({ runIds }) => {
+      queriedRunIds = runIds;
+      return {
+        activeRuns: [],
+        evidence: { [reviewRunId]: reviewEvidence },
+        diagnostic: null,
+      };
+    },
+    collectProjectFacts: async () => ({ projectInspected: true }),
+  });
+
+  assert.deepEqual(queriedRunIds, [reviewRunId]);
+  assert.equal(result.laneStatuses.find((lane) => lane.id === "lane-commit").status, "pending");
+  assert.deepEqual(result.failureCollection.privateRuns.evidence[reviewRunId], reviewEvidence);
+  assert.equal(Object.hasOwn(result.failureCollection.privateRuns.evidence, syntheticCommitRunId), false);
+});
+
+test("failure collection permits legal not-started lanes without segments", async () => {
+  const { assertNoNonterminalFailureFacts } = await import("./newSessionUiAcceptance.mjs");
+
+  for (const status of ["pending", "ready", "waiting_input"]) {
+    assert.doesNotThrow(
+      () => assertNoNonterminalFailureFacts({
+        projection: {
+          lanes: [{ id: `lane-${status}`, status }],
+          segments: [],
+        },
+      }, { activeRuns: [] }),
+      status,
+    );
+  }
+});
+
+test("failure collection queries evidence-only runs only when their evidence is terminal", async () => {
+  const { collectFailureAcceptanceResult } = await import("./newSessionUiAcceptance.mjs");
+  const terminalRunId = "run-terminal-evidence";
+  const nonterminalRunId = "run-nonterminal-evidence";
+  const session = {
+    id: "session-evidence-only",
+    kind: "canvas",
+    plannerNodeId: "planner",
+    nodes: [
+      { id: "planner", agent: "hermes", status: "completed" },
+      { id: "lane-pending", runId: nonterminalRunId, agent: "codex", status: "pending" },
+    ],
+    edges: [],
+  };
+  let queriedRunIds = null;
+
+  await collectFailureAcceptanceResult({
+    baselineCommitSha: baselineHead,
+    demo: {},
+    expectedCaptureScriptHash: "capture-hash",
+    expectedVerifyScriptHash: "verify-hash",
+    projectRoot: "/tmp/project",
+    readiness: { checks: { mockFallback: false } },
+    precloseSnapshot: {
+      workspace: { activeSessionId: session.id, sessions: [structuredClone(session)] },
+      ui: null,
+    },
+    userData: "/tmp/user-data",
+    readSqliteState: async () => ({
+      canvasSession: structuredClone(session),
+      projection: {
+        lanes: [{ id: "lane-pending", status: "pending" }],
+        segments: [],
+        evidence: [
+          {
+            id: "evidence-terminal",
+            laneId: "lane-terminal",
+            segmentId: "segment-missing",
+            status: "failed",
+            runEvidence: {
+              runId: terminalRunId,
+              status: "failed",
+              exitCode: 1,
+              checks: [],
+              artifacts: [],
+            },
+          },
+          {
+            id: "evidence-nonterminal",
+            laneId: "lane-pending",
+            segmentId: "segment-missing",
+            status: "pending",
+            runEvidence: {
+              runId: nonterminalRunId,
+              status: "running",
+              exitCode: null,
+              checks: [],
+              artifacts: [],
+            },
+          },
+        ],
+      },
+      events: [],
+    }),
+    collectPrivateFacts: async ({ runIds }) => {
+      queriedRunIds = runIds;
+      return { activeRuns: [], evidence: {}, diagnostic: null };
+    },
+    collectProjectFacts: async () => ({ projectInspected: true }),
+  });
+
+  assert.deepEqual(queriedRunIds, [terminalRunId]);
+});
+
+for (const [label, sqliteState, privateRunFacts] of [
+  [
+    "lane",
+    { projection: { lanes: [{ id: "lane-running", status: "running" }], segments: [] } },
+    { activeRuns: [] },
+  ],
+  [
+    "segment",
+    { projection: { lanes: [], segments: [{ id: "segment-running", runId: "run-segment", status: "running" }] } },
+    { activeRuns: [] },
+  ],
+  [
+    "private run",
+    { projection: { lanes: [], segments: [] } },
+    { activeRuns: [{ runId: "run-private", status: "running" }] },
+  ],
+]) {
+  test(`failure collection rejects an after-close nonterminal ${label}`, async () => {
+    const { assertNoNonterminalFailureFacts } = await import("./newSessionUiAcceptance.mjs");
+
+    assert.throws(
+      () => assertNoNonterminalFailureFacts(sqliteState, privateRunFacts),
+      /after-close-nonterminal-facts/,
+    );
+  });
+}
+
+test("failure collection keeps divergent workspace state nested when SQLite is unavailable", async () => {
+  const { collectFailureAcceptanceResult } = await import("./newSessionUiAcceptance.mjs");
+  const workspaceSession = {
+    id: "workspace-session-divergent",
+    kind: "canvas",
+    plannerNodeId: "workspace-planner",
+    target: { executionTarget: "new_worktree", selectedBranch: "forged-workspace" },
+    nodes: [
+      { id: "workspace-planner", runId: "workspace-run-planner", agent: "hermes", status: "completed" },
+      { id: "workspace-lane", runId: "workspace-run-lane", agent: "codex", status: "completed" },
+    ],
+    edges: [],
+  };
+  const workspace = {
+    activeProjectId: "workspace-project",
+    activeSessionId: workspaceSession.id,
+    sessions: [workspaceSession],
+  };
+  let privateRunIds = null;
+
+  const result = await collectFailureAcceptanceResult({
+    baselineCommitSha: baselineHead,
+    demo: {},
+    expectedCaptureScriptHash: "capture-hash",
+    expectedVerifyScriptHash: "verify-hash",
+    projectRoot: "/tmp/project",
+    readiness: { checks: { mockFallback: false } },
+    precloseSnapshot: { workspace, ui: null },
+    userData: "/tmp/user-data",
+    readSqliteState: async () => {
+      throw new Error("sqlite unavailable");
+    },
+    collectPrivateFacts: async ({ runIds }) => {
+      privateRunIds = runIds;
+      return {
+        activeRuns: [],
+        evidence: {},
+        diagnostic: null,
+      };
+    },
+    collectProjectFacts: async () => ({ projectInspected: true }),
+  });
+
+  assert.equal(result.sessionId, null);
+  assert.equal(result.sessionTarget, null);
+  assert.deepEqual(result.laneStatuses, []);
+  assert.deepEqual(result.runEvidence, {});
+  assert.deepEqual(result.agentRunEvidence, { hermes: [], codex: [] });
+  assert.equal(Object.values(result.laneKindEvidence.lanes).every((lane) => lane.nodeId === null), true);
+  assert.equal(privateRunIds, null);
+  assert.equal(result.failureCollection.sourceAvailability.sqliteProjection, false);
+  assert.equal(result.failureCollection.sourceAvailability.privateRunFacts, false);
+  assert.equal(result.failureCollection.preclose.workspace.sessionId, workspaceSession.id);
+  assert.deepEqual(
+    result.failureCollection.preclose.workspace.lanes.map((lane) => lane.id),
+    ["workspace-planner", "workspace-lane"],
+  );
+  assert.deepEqual(result.failureCollection.privateRuns.activeRuns, []);
+  assert.equal(
+    result.failureCollection.privateRuns.diagnostic,
+    "not-collected-without-authoritative-run-ids",
+  );
+});
+
+test("authoritative terminal failure result wins over later divergent collector fields", async () => {
+  const { mergeWorkflowTerminalFailureResult } = await import("./newSessionUiAcceptance.mjs");
+  const authoritative = {
+    sessionId: "sqlite-session",
+    laneStatuses: [{ id: "sqlite-lane", status: "failed" }],
+    laneKindEvidence: { source: "sqlite" },
+    agentRunEvidence: { hermes: [], codex: [{ runId: "sqlite-run", exitCode: 1 }] },
+    runEvidence: { "sqlite-run": { status: "failed", exitCode: 1 } },
+    headCommitSha: "c".repeat(40),
+    failure: { code: "WORKFLOW_RUN_FAILED", diagnostic: "authoritative-terminal-failure" },
+  };
+  const collected = {
+    sessionId: "workspace-session-divergent",
+    laneStatuses: [{ id: "workspace-lane", status: "completed" }],
+    laneKindEvidence: { source: "workspace" },
+    agentRunEvidence: { hermes: [{ runId: "workspace-run" }], codex: [] },
+    runEvidence: { "workspace-run": { status: "succeeded", exitCode: 0 } },
+    headCommitSha: "d".repeat(40),
+    failure: { code: "COLLECTOR_FAILURE" },
+    failureCollection: { workspace: { sessionId: "workspace-session-divergent" } },
+  };
+
+  const merged = mergeWorkflowTerminalFailureResult(authoritative, collected);
+
+  assert.equal(merged.sessionId, authoritative.sessionId);
+  assert.deepEqual(merged.laneStatuses, authoritative.laneStatuses);
+  assert.deepEqual(merged.laneKindEvidence, authoritative.laneKindEvidence);
+  assert.deepEqual(merged.agentRunEvidence, authoritative.agentRunEvidence);
+  assert.deepEqual(merged.runEvidence, authoritative.runEvidence);
+  assert.equal(merged.headCommitSha, authoritative.headCommitSha);
+  assert.deepEqual(merged.failure, authoritative.failure);
+  assert.equal(merged.failureCollection.workspace.sessionId, "workspace-session-divergent");
+});
+
+test("failure collector skips verify and capture and only reads existing project facts", async () => {
+  const { collectProjectFailureFacts, fileSha256 } = await import("./newSessionUiAcceptance.mjs");
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-failure-project-facts-"));
+  const scriptsDir = join(projectRoot, "scripts");
+  const verifyPath = join(scriptsDir, "verify.mjs");
+  const capturePath = join(scriptsDir, "capture-screenshot.mjs");
+  const calls = [];
+
+  try {
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(verifyPath, "throw new Error('must not execute verify');\n");
+    await writeFile(capturePath, "throw new Error('must not execute capture');\n");
+    const expectedVerifyScriptHash = await fileSha256(verifyPath);
+    const expectedCaptureScriptHash = await fileSha256(capturePath);
+    const demo = {
+      async runCapture(command, args) {
+        calls.push({ command, args });
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    const result = await collectProjectFailureFacts({
+      baselineCommitSha: baselineHead,
+      demo,
+      expectedCaptureScriptHash,
+      expectedVerifyScriptHash,
+      projectRoot,
+    });
+
+    assert.equal(result.verificationScriptHashUnchanged, true);
+    assert.equal(result.captureScriptHashUnchanged, true);
+    assert.equal(result.verificationCommand.verify.skipped, true);
+    assert.equal(result.verificationCommand.captureScreenshot.skipped, true);
+    assert.equal(calls.every((call) => call.command === "git"), true);
+    assert.equal(calls.some((call) => call.args.some((arg) => /verify|capture-screenshot/.test(arg))), false);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("New Session UI acceptance agent evidence requires matching runId and CLI exit check", async () => {
   const { hasSuccessfulRunEvidenceForAgent } = await import("./newSessionUiAcceptance.mjs");
   const session = {
@@ -1669,9 +2228,37 @@ test("New Session UI acceptance cancels reopened runs before cleanup after a pos
   assert.deepEqual(result.cancelledRunIds, ["run-reopened"]);
   const relaunchIndex = source.indexOf("app = await launchElectronAcceptanceApp", source.indexOf("overwriteWorkspaceSessionWithStaleClone"));
   const liveReconnectIndex = source.indexOf("liveCdp = await connectToReadySkyTurnRenderer", relaunchIndex);
-  const thrownCleanupIndex = source.indexOf("finalizeAcceptanceOutcome({ app, liveCdp, error })", liveReconnectIndex);
+  const failureShutdownIndex = source.indexOf("const failureOutcome = await shutdownAndCollectFailure({", liveReconnectIndex);
+  const failureCollectionIndex = source.indexOf("collect: (precloseSnapshot) => collectFailureAcceptanceResult({", failureShutdownIndex);
   assert.ok(liveReconnectIndex > relaunchIndex);
-  assert.ok(thrownCleanupIndex > liveReconnectIndex);
+  assert.ok(failureShutdownIndex > liveReconnectIndex);
+  assert.ok(failureCollectionIndex > failureShutdownIndex);
+});
+
+test("New Session UI acceptance quiesces active runs before collecting mutable failure facts", async () => {
+  const { finalizeAcceptanceOutcome } = await import("./newSessionUiAcceptance.mjs");
+  const events = [];
+  const liveCdp = acceptanceCleanupCdp(events);
+  const app = { async close() { events.push("electron:close"); } };
+
+  const result = await finalizeAcceptanceOutcome({
+    app,
+    liveCdp,
+    error: new Error("collect after quiescence"),
+    afterRunCleanup: async () => {
+      events.push("collector:read-git-sqlite-fixtures");
+    },
+  });
+
+  assert.deepEqual(events, [
+    "run:list",
+    "run:cancel",
+    "run:relist",
+    "collector:read-git-sqlite-fixtures",
+    "cdp:close",
+    "electron:close",
+  ]);
+  assert.equal(result.cleanupConfirmed, true);
 });
 
 test("New Session UI acceptance cancels active runs before cleanup for a false predicate result", async () => {
@@ -1734,7 +2321,14 @@ test("New Session UI acceptance fails closed after persistent cleanup failure", 
   };
   const app = { async close() { events.push("electron:close"); } };
 
-  const result = await finalizeAcceptanceOutcome({ app, liveCdp, ok: false });
+  const result = await finalizeAcceptanceOutcome({
+    app,
+    liveCdp,
+    ok: false,
+    afterRunCleanup: async () => {
+      events.push("collector:must-not-run");
+    },
+  });
 
   assert.deepEqual(events, ["cleanup:attempt", "cleanup:attempt"]);
   assert.equal(result.ok, false);
@@ -1766,6 +2360,116 @@ test("New Session UI acceptance fails closed when an active run remains after ca
   assert.equal(result.resourcesKeptAlive, true);
   assert.deepEqual(result.cancelledRunIds, ["run-stubborn"]);
   assert.match(result.diagnostic, /run-cleanup-fail-closed:active-agent-runs-remain:run-stubborn/);
+});
+
+test("failure collection requires a successful CDP request and a clean Electron exit", async () => {
+  const {
+    shutdownAndCollectFailure,
+    shutdownElectronForFailureCollection,
+  } = await import("./newSessionUiAcceptance.mjs");
+  const cases = [
+    {
+      name: "CDP close rejection",
+      evaluate: async () => { throw new Error("synthetic CDP rejection"); },
+      closeResult: { code: 0, signal: null },
+      expected: /CDP window\.close\(\) failed/,
+    },
+    {
+      name: "Electron close timeout",
+      evaluate: async () => true,
+      closeResult: null,
+      expected: /Electron did not close after window\.close\(\)/,
+    },
+    {
+      name: "Electron nonzero exit",
+      evaluate: async () => true,
+      closeResult: { code: 1, signal: null },
+      expected: /exit 1/,
+    },
+    {
+      name: "Electron signal exit",
+      evaluate: async () => true,
+      closeResult: { code: null, signal: "SIGKILL" },
+      expected: /signal SIGKILL/,
+    },
+  ];
+
+  for (const scenario of cases) {
+    const events = [];
+    let collectorCalls = 0;
+    const cdp = {
+      evaluate: scenario.evaluate,
+      close() { events.push("cdp:close"); },
+    };
+    const electron = {
+      async waitForClose() { return scenario.closeResult; },
+      async close() { events.push("electron:cleanup"); },
+    };
+    const vite = { async close() { events.push("vite:cleanup"); } };
+    const app = {
+      shutdownForFailureCollection: () => shutdownElectronForFailureCollection({ cdp, electron, vite }),
+    };
+
+    await assert.rejects(
+      shutdownAndCollectFailure({
+        app,
+        liveCdp: cdp,
+        capture: async () => ({ workspace: null, ui: null, diagnostic: scenario.name }),
+        collect: async () => {
+          collectorCalls += 1;
+          return {};
+        },
+      }),
+      scenario.expected,
+    );
+    assert.equal(collectorCalls, 0, scenario.name);
+    assert.deepEqual(events, ["cdp:close", "electron:cleanup", "vite:cleanup"], scenario.name);
+  }
+});
+
+test("failure collection runs only after a clean Electron exit", async () => {
+  const {
+    shutdownAndCollectFailure,
+    shutdownElectronForFailureCollection,
+  } = await import("./newSessionUiAcceptance.mjs");
+  const events = [];
+  const cdp = {
+    async evaluate() { events.push("cdp:window-close"); },
+    close() { events.push("cdp:close"); },
+  };
+  const electron = {
+    async waitForClose() {
+      events.push("electron:closed");
+      return { code: 0, signal: null };
+    },
+    async close() { events.push("electron:forced-cleanup"); },
+  };
+  const vite = { async close() { events.push("vite:close"); } };
+
+  const result = await shutdownAndCollectFailure({
+    app: {
+      shutdownForFailureCollection: () => shutdownElectronForFailureCollection({ cdp, electron, vite }),
+    },
+    liveCdp: cdp,
+    capture: async () => {
+      events.push("snapshot");
+      return { workspace: null, ui: null, diagnostic: null };
+    },
+    collect: async () => {
+      events.push("collector");
+      return { ok: true };
+    },
+  });
+
+  assert.deepEqual(events, [
+    "snapshot",
+    "electron:closed",
+    "cdp:window-close",
+    "cdp:close",
+    "vite:close",
+    "collector",
+  ]);
+  assert.deepEqual(result.collection, { ok: true });
 });
 
 test("New Session UI acceptance selects only the exact renderer target", async () => {
