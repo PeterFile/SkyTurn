@@ -2344,8 +2344,12 @@ export async function collectFailureAcceptanceResult({
   const projection = sqliteState?.projection ?? null;
   const authoritativeEvidence = authoritativeProjectionEvidenceState(projection);
   const runIds = uniqueSortedStrings([
-    ...laneStatuses(session).map((node) => node.runId),
-    ...authoritativeEvidence.records.map((record) => record.runEvidence.runId),
+    ...(Array.isArray(projection?.segments)
+      ? projection.segments.map((segment) => segment?.runId)
+      : []),
+    ...authoritativeEvidence.records
+      .filter((record) => isTerminalCollectedRunStatus(record.runEvidence.status))
+      .map((record) => record.runEvidence.runId),
   ]);
   let privateRunFacts = {
     activeRuns: [],
@@ -2465,7 +2469,7 @@ export function assertNoNonterminalFailureFacts(sqliteState, privateRunFacts) {
     !new Set(["succeeded", "failed", "cancelled", "timed-out"]).has(segment?.status)
   );
   const nonterminalLanes = (projection?.lanes ?? []).filter((lane) =>
-    !new Set(["completed", "failed", "blocked"]).has(lane?.status)
+    !new Set(["pending", "ready", "waiting_input", "completed", "failed", "blocked"]).has(lane?.status)
   );
   const nonterminalRuns = Array.isArray(privateRunFacts?.activeRuns) ? privateRunFacts.activeRuns : [];
   if (nonterminalSegments.length > 0 || nonterminalLanes.length > 0 || nonterminalRuns.length > 0) {

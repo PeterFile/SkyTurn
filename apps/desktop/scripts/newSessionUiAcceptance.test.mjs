@@ -1146,6 +1146,197 @@ test("New Session UI failure collection preserves terminal after-close SQLite, w
   assert.equal(result.failureCollection.preclose.ui.title, "SkyTurn");
 });
 
+test("failure collection ignores a pending synthetic run after an upstream terminal failure", async () => {
+  const { collectFailureAcceptanceResult } = await import("./newSessionUiAcceptance.mjs");
+  const reviewRunId = "run-review-failed";
+  const syntheticCommitRunId = "run-commit-synthetic";
+  const reviewEvidence = {
+    runId: reviewRunId,
+    status: "failed",
+    exitCode: 1,
+    changesetId: null,
+    checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "failed", detail: "exit 1" }],
+    artifacts: [],
+    review: null,
+    errorReason: "review failed",
+    cancelReason: null,
+    completedAt: "2026-07-28T00:00:00.000Z",
+  };
+  const session = {
+    id: "session-upstream-failure",
+    kind: "canvas",
+    plannerNodeId: "planner",
+    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    nodes: [
+      { id: "planner", agent: "hermes", status: "completed" },
+      {
+        id: "lane-review",
+        laneKind: "review",
+        runId: reviewRunId,
+        agent: "hermes",
+        status: "failed",
+        context: { dependencies: [] },
+      },
+      {
+        id: "lane-commit",
+        laneKind: "commit",
+        runId: syntheticCommitRunId,
+        agent: "codex",
+        status: "pending",
+        context: { dependencies: ["lane-review"] },
+      },
+    ],
+    edges: [{ id: "edge-review-commit", source: "lane-review", target: "lane-commit" }],
+  };
+  const sqliteState = {
+    canvasSession: structuredClone(session),
+    projection: {
+      lanes: [
+        { id: "lane-review", status: "failed" },
+        { id: "lane-commit", status: "pending" },
+      ],
+      segments: [{
+        id: "segment-review",
+        laneId: "lane-review",
+        runId: reviewRunId,
+        status: "failed",
+        exitCode: 1,
+      }],
+      evidence: [{
+        id: "evidence-review",
+        laneId: "lane-review",
+        segmentId: "segment-review",
+        status: "failed",
+        runEvidence: reviewEvidence,
+      }],
+    },
+    events: [{ kind: "workflow.segment.completed" }],
+  };
+  let queriedRunIds = null;
+
+  const result = await collectFailureAcceptanceResult({
+    baselineCommitSha: baselineHead,
+    demo: {},
+    expectedCaptureScriptHash: "capture-hash",
+    expectedVerifyScriptHash: "verify-hash",
+    projectRoot: "/tmp/project",
+    readiness: { checks: { mockFallback: false } },
+    precloseSnapshot: {
+      workspace: {
+        activeSessionId: session.id,
+        sessions: [structuredClone(session)],
+      },
+      ui: null,
+    },
+    userData: "/tmp/user-data",
+    readSqliteState: async () => sqliteState,
+    collectPrivateFacts: async ({ runIds }) => {
+      queriedRunIds = runIds;
+      return {
+        activeRuns: [],
+        evidence: { [reviewRunId]: reviewEvidence },
+        diagnostic: null,
+      };
+    },
+    collectProjectFacts: async () => ({ projectInspected: true }),
+  });
+
+  assert.deepEqual(queriedRunIds, [reviewRunId]);
+  assert.equal(result.laneStatuses.find((lane) => lane.id === "lane-commit").status, "pending");
+  assert.deepEqual(result.failureCollection.privateRuns.evidence[reviewRunId], reviewEvidence);
+  assert.equal(Object.hasOwn(result.failureCollection.privateRuns.evidence, syntheticCommitRunId), false);
+});
+
+test("failure collection permits legal not-started lanes without segments", async () => {
+  const { assertNoNonterminalFailureFacts } = await import("./newSessionUiAcceptance.mjs");
+
+  for (const status of ["pending", "ready", "waiting_input"]) {
+    assert.doesNotThrow(
+      () => assertNoNonterminalFailureFacts({
+        projection: {
+          lanes: [{ id: `lane-${status}`, status }],
+          segments: [],
+        },
+      }, { activeRuns: [] }),
+      status,
+    );
+  }
+});
+
+test("failure collection queries evidence-only runs only when their evidence is terminal", async () => {
+  const { collectFailureAcceptanceResult } = await import("./newSessionUiAcceptance.mjs");
+  const terminalRunId = "run-terminal-evidence";
+  const nonterminalRunId = "run-nonterminal-evidence";
+  const session = {
+    id: "session-evidence-only",
+    kind: "canvas",
+    plannerNodeId: "planner",
+    nodes: [
+      { id: "planner", agent: "hermes", status: "completed" },
+      { id: "lane-pending", runId: nonterminalRunId, agent: "codex", status: "pending" },
+    ],
+    edges: [],
+  };
+  let queriedRunIds = null;
+
+  await collectFailureAcceptanceResult({
+    baselineCommitSha: baselineHead,
+    demo: {},
+    expectedCaptureScriptHash: "capture-hash",
+    expectedVerifyScriptHash: "verify-hash",
+    projectRoot: "/tmp/project",
+    readiness: { checks: { mockFallback: false } },
+    precloseSnapshot: {
+      workspace: { activeSessionId: session.id, sessions: [structuredClone(session)] },
+      ui: null,
+    },
+    userData: "/tmp/user-data",
+    readSqliteState: async () => ({
+      canvasSession: structuredClone(session),
+      projection: {
+        lanes: [{ id: "lane-pending", status: "pending" }],
+        segments: [],
+        evidence: [
+          {
+            id: "evidence-terminal",
+            laneId: "lane-terminal",
+            segmentId: "segment-missing",
+            status: "failed",
+            runEvidence: {
+              runId: terminalRunId,
+              status: "failed",
+              exitCode: 1,
+              checks: [],
+              artifacts: [],
+            },
+          },
+          {
+            id: "evidence-nonterminal",
+            laneId: "lane-pending",
+            segmentId: "segment-missing",
+            status: "pending",
+            runEvidence: {
+              runId: nonterminalRunId,
+              status: "running",
+              exitCode: null,
+              checks: [],
+              artifacts: [],
+            },
+          },
+        ],
+      },
+      events: [],
+    }),
+    collectPrivateFacts: async ({ runIds }) => {
+      queriedRunIds = runIds;
+      return { activeRuns: [], evidence: {}, diagnostic: null };
+    },
+    collectProjectFacts: async () => ({ projectInspected: true }),
+  });
+
+  assert.deepEqual(queriedRunIds, [terminalRunId]);
+});
+
 for (const [label, sqliteState, privateRunFacts] of [
   [
     "lane",
