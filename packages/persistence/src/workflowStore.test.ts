@@ -2284,21 +2284,21 @@ describe("SQLite workflow store", () => {
       baseRef: "origin/main",
     });
     declareCodeChangeWorkflow(store);
-    const worktreePath = `${projectRoot}/.devflow/worktrees/lane-implementation`;
+    const worktreePath = `${projectRoot}/.devflow/worktrees/candidate`;
     store.appendWorkflowEvent({
       sessionId: "session-1",
       kind: "workflow.worktree.created",
       source: "git-worktree",
-      idempotencyKey: "worktree:lane-implementation:created",
+      idempotencyKey: "worktree:candidate:created",
       payload: {
         worktree: {
-          worktreeId: "worktree-session-1-lane-implementation",
-          variantId: "lane-implementation",
+          worktreeId: "worktree-session-1-candidate",
+          variantId: "candidate",
           path: worktreePath,
           realPath: worktreePath,
-          gitdir: `${projectRoot}/.git/worktrees/lane-implementation`,
+          gitdir: `${projectRoot}/.git/worktrees/candidate`,
           repoRoot: projectRoot,
-          branchName: "skyturn/session-1/lane-implementation",
+          branchName: "skyturn/session-1/candidate",
           baseCommit: "a".repeat(40),
           headCommit: "a".repeat(40),
           parentLaneId: "lane-implementation",
@@ -2315,9 +2315,9 @@ describe("SQLite workflow store", () => {
       segmentId: "segment-session-1-lane-implementation",
       phase: "before" as const,
       executionTarget: "new_worktree" as const,
-      worktreeId: "worktree-session-1-lane-implementation",
+      worktreeId: "worktree-session-1-candidate",
       worktreePath,
-      branchName: "skyturn/session-1/lane-implementation",
+      branchName: "skyturn/session-1/candidate",
       headCommit: "a".repeat(40),
       worktreeState: "clean" as const,
       evidenceRefs: [{ kind: "run" as const, id: "run-session-1-lane-implementation" }],
@@ -2326,9 +2326,35 @@ describe("SQLite workflow store", () => {
 
     expect(store.recordRunCheckpoint(input)).toMatchObject({ worktreeId: input.worktreeId, worktreePath, branchName: input.branchName });
     expect(() => store.recordRunCheckpoint({ ...input, worktreeId: undefined })).toThrow(/new worktree.*worktree id/i);
-    expect(() => store.recordRunCheckpoint({ ...input, worktreeId: "wrong" })).toThrow(/managed worktree identity/i);
+    expect(() => store.recordRunCheckpoint({ ...input, worktreeId: "wrong" })).toThrow(/candidate binding/i);
     expect(() => store.recordRunCheckpoint({ ...input, worktreePath: `${worktreePath}-wrong` })).toThrow(/managed worktree identity/i);
     expect(() => store.recordRunCheckpoint({ ...input, branchName: "wrong" })).toThrow(/managed worktree identity/i);
+
+    appendTestLane(store, "lane-legacy");
+    const legacyWorktree = candidateWorktree(projectRoot, "legacy", "lane-legacy");
+    appendWorktreeCreated(store, legacyWorktree);
+    appendTestFlowEvent(store, "workflow.segment.started", {
+      laneId: "lane-legacy",
+      segment: {
+        id: "segment-legacy",
+        laneId: "lane-legacy",
+        runId: "run-legacy",
+        status: "running",
+      },
+    }, "test-segment:legacy");
+    expect(store.recordRunCheckpoint({
+      ...input,
+      nodeId: "lane-legacy",
+      laneId: "lane-legacy",
+      runId: "run-legacy",
+      segmentId: "segment-legacy",
+      worktreeId: legacyWorktree.worktreeId,
+      worktreePath: legacyWorktree.realPath,
+      branchName: legacyWorktree.branchName,
+      headCommit: legacyWorktree.headCommit,
+      evidenceRefs: [{ kind: "run", id: "run-legacy" }],
+      now: "2026-06-14T00:00:04.000Z",
+    })).toMatchObject({ worktreeId: legacyWorktree.worktreeId });
     store.close();
   });
 
@@ -5074,6 +5100,7 @@ describe("SQLite workflow store", () => {
     expect(scheduled.readyLanes[0]?.runId).toBe("run-session-1-lane-implementation");
     expect(duplicateSchedule.readyLanes).toEqual([]);
     expect(store.listEvents("session-1").filter((event) => event.kind === "workflow.segment.started")).toHaveLength(1);
+    expect(store.listEvents("session-1").filter((event) => event.kind.startsWith("workflow.lane.candidate_"))).toEqual([]);
 
     const evidence = {
       runId: "run-session-1-lane-implementation",
@@ -5116,6 +5143,472 @@ describe("SQLite workflow store", () => {
       changesetId: "changeset-implementation-1",
       output: [],
     });
+  });
+
+  it("binds a normal new-worktree serial chain before segment start and reuses its physical candidate", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store, newWorktreeTarget());
+    declareCodeChangeWorkflow(store);
+
+    expect(scheduleLaneIds(store, "2026-07-28T00:00:00.000Z")).toEqual(["lane-implementation"]);
+    const firstEvents = store.listEvents("session-1");
+    const boundIndex = firstEvents.findIndex((event) =>
+      event.kind === "workflow.lane.candidate_bound" && event.laneId === "lane-implementation");
+    const startedIndex = firstEvents.findIndex((event) =>
+      event.kind === "workflow.segment.started" && event.laneId === "lane-implementation");
+    expect(boundIndex).toBeGreaterThan(-1);
+    expect(startedIndex).toBeGreaterThan(boundIndex);
+    const placeholder = store.materializeCanvasSession("session-1")?.nodes
+      .find((node) => node.id === "lane-implementation");
+    expect(placeholder?.candidateBinding).toMatchObject(candidateBindingFacts("candidate"));
+    expect(placeholder?.worktree).toMatchObject(candidateBindingFacts("candidate"));
+
+    const worktree = candidateWorktree(projectRoot, "candidate", "lane-implementation");
+    appendWorktreeCreated(store, worktree);
+    store.recordRunResult(runResultInput(store, "lane-implementation", "succeeded", "2026-07-28T00:00:01.000Z"));
+    expect(scheduleLaneIds(store, "2026-07-28T00:00:02.000Z")).toEqual(["lane-validation"]);
+
+    const projection = store.materializeFlowProjection("session-1");
+    const serial = projection.candidateBindings.find((binding) => binding.laneId === "lane-validation");
+    expect(serial).toMatchObject({ ...candidateBindingFacts("candidate"), reason: "serial" });
+    for (const laneId of ["lane-implementation", "lane-validation"]) {
+      expect(store.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === laneId)?.worktree)
+        .toMatchObject(worktreeMetadataFacts(worktree));
+    }
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeFlowProjection("session-1").candidateBindings).toEqual(projection.candidateBindings);
+    expect(reopened.materializeFlowProjection("session-1").segments).toEqual(projection.segments);
+    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-validation")?.worktree)
+      .toMatchObject(worktreeMetadataFacts(worktree));
+    reopened.close();
+  });
+
+  it("serializes parallel roots on the same candidate until its running segment is terminal", async () => {
+    const store = await makeNewWorktreeStore();
+    appendTestLane(store, "lane-root-a");
+    appendTestLane(store, "lane-root-b");
+
+    expect(scheduleLaneIds(store, "2026-07-28T01:00:00.000Z", 2)).toEqual(["lane-root-a"]);
+    expect(store.materializeFlowProjection("session-1").candidateBindings.map((binding) => binding.laneId))
+      .toEqual(["lane-root-a", "lane-root-b"]);
+    expect(store.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-root-b")?.status)
+      .toBe("pending");
+
+    store.recordRunResult(runResultInput(store, "lane-root-a", "succeeded", "2026-07-28T01:00:01.000Z"));
+    expect(scheduleLaneIds(store, "2026-07-28T01:00:02.000Z", 2)).toEqual(["lane-root-b"]);
+    store.close();
+
+    const distinct = await makeNewWorktreeStore();
+    for (const laneId of ["lane-root-a", "lane-root-b"]) appendTestLane(distinct, laneId);
+    appendCandidateBinding(distinct, "lane-root-a", "a", "lineage-a");
+    appendCandidateBinding(distinct, "lane-root-b", "b", "lineage-b");
+    expect(scheduleLaneIds(distinct, "2026-07-28T01:00:03.000Z", 2)).toEqual(["lane-root-a", "lane-root-b"]);
+    distinct.close();
+  });
+
+  it("holds scheduling authority while previewing and serializes a shared candidate across stores", async () => {
+    const projectRoot = await makeTempRoot();
+    const seed = createWorkflowStore({ projectRoot });
+    try {
+      seedStore(seed, newWorktreeTarget());
+      appendTestLane(seed, "lane-root-a", "pending", "implementation", {
+        fileScopes: ["packages/root-a/**"],
+        packageScopes: ["@skyturn/root-a"],
+      });
+      appendTestLane(seed, "lane-root-b", "pending", "implementation", {
+        fileScopes: ["packages/root-b/**"],
+        packageScopes: ["@skyturn/root-b"],
+      });
+    } finally {
+      seed.close();
+    }
+
+    const contender = createWorkflowStore({
+      projectRoot,
+      faultInjection: { sqliteBusyTimeoutMs: 1 },
+    });
+    let contentionError: unknown;
+    const owner = createWorkflowStore({
+      projectRoot,
+      faultInjection: {
+        afterSchedulePreview: () => {
+          try {
+            contender.scheduleReadyLanes("session-1", {
+              allowedParallelism: 2,
+              authorizedLaneIds: ["lane-root-b"],
+              now: "2026-07-28T01:01:00.001Z",
+            });
+          } catch (error) {
+            contentionError = error;
+          }
+        },
+      },
+    });
+    try {
+      expect(owner.materializeFlowProjection("session-1").segments).toEqual([]);
+      expect(contender.materializeFlowProjection("session-1").segments).toEqual([]);
+      expect(owner.scheduleReadyLanes("session-1", {
+        allowedParallelism: 2,
+        authorizedLaneIds: ["lane-root-a"],
+        now: "2026-07-28T01:01:00.000Z",
+      }).readyLanes.map((lane) => lane.id)).toEqual(["lane-root-a"]);
+      expect(contentionError).toMatchObject({ code: "SQLITE_BUSY" });
+
+      const beforeTerminal = contender.materializeFlowProjection("session-1");
+      const runningSegments = beforeTerminal.segments.filter((segment) => segment.status === "running");
+      expect(runningSegments.map((segment) => segment.laneId)).toEqual(["lane-root-a"]);
+      expect(beforeTerminal.candidateBindings).toEqual([
+        expect.objectContaining({ laneId: "lane-root-a", ...candidateBindingFacts("candidate") }),
+      ]);
+      expect(contender.scheduleReadyLanes("session-1", {
+        allowedParallelism: 2,
+        authorizedLaneIds: ["lane-root-b"],
+        now: "2026-07-28T01:01:00.002Z",
+      }).readyLanes).toEqual([]);
+
+      owner.recordRunResult(
+        runResultInput(owner, "lane-root-a", "succeeded", "2026-07-28T01:01:01.000Z"),
+      );
+      expect(contender.scheduleReadyLanes("session-1", {
+        allowedParallelism: 2,
+        authorizedLaneIds: ["lane-root-b"],
+        now: "2026-07-28T01:01:02.000Z",
+      }).readyLanes.map((lane) => lane.id)).toEqual(["lane-root-b"]);
+    } finally {
+      try {
+        owner.close();
+      } finally {
+        contender.close();
+      }
+    }
+
+    const reopened = createWorkflowStore({ projectRoot });
+    try {
+      const projection = reopened.materializeFlowProjection("session-1");
+      const rootSegments = projection.segments.filter((segment) =>
+        segment.laneId === "lane-root-a" || segment.laneId === "lane-root-b"
+      );
+      const rootBindings = projection.candidateBindings.filter((binding) =>
+        binding.laneId === "lane-root-a" || binding.laneId === "lane-root-b"
+      );
+      expect(rootSegments).toHaveLength(2);
+      expect(new Set(rootSegments.map((segment) => segment.id))).toHaveLength(2);
+      expect(rootBindings).toHaveLength(2);
+      expect(new Set(rootBindings.map((binding) => binding.laneId))).toHaveLength(2);
+      expect(new Set(rootBindings.map((binding) => binding.worktreeId))).toEqual(
+        new Set(["worktree-session-1-candidate"]),
+      );
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("starts distinct persisted candidates through independently opened scheduling stores", async () => {
+    const projectRoot = await makeTempRoot();
+    const seed = createWorkflowStore({ projectRoot });
+    try {
+      seedStore(seed, newWorktreeTarget());
+      appendTestLane(seed, "lane-root-a", "pending", "implementation", {
+        fileScopes: ["packages/root-a/**"],
+        packageScopes: ["@skyturn/root-a"],
+      });
+      appendTestLane(seed, "lane-root-b", "pending", "implementation", {
+        fileScopes: ["packages/root-b/**"],
+        packageScopes: ["@skyturn/root-b"],
+      });
+      appendCandidateBinding(seed, "lane-root-a", "candidate-a", "lineage-candidate-a");
+      appendCandidateBinding(seed, "lane-root-b", "candidate-b", "lineage-candidate-b");
+    } finally {
+      seed.close();
+    }
+
+    const stores = [
+      createWorkflowStore({ projectRoot }),
+      createWorkflowStore({ projectRoot }),
+    ];
+    try {
+      expect(stores.map((store) => store.materializeFlowProjection("session-1").segments)).toEqual([[], []]);
+      // Both handles materialize the empty projection before either queued call, so the second transaction must
+      // rematerialize the first handle's committed SQLite state before deciding that the distinct candidate can run.
+      const scheduled = await Promise.all([
+        Promise.resolve().then(() => stores[0]!.scheduleReadyLanes("session-1", {
+          allowedParallelism: 2,
+          authorizedLaneIds: ["lane-root-a"],
+          now: "2026-07-28T01:02:00.000Z",
+        })),
+        Promise.resolve().then(() => stores[1]!.scheduleReadyLanes("session-1", {
+          allowedParallelism: 2,
+          authorizedLaneIds: ["lane-root-b"],
+          now: "2026-07-28T01:02:00.001Z",
+        })),
+      ]);
+
+      expect(scheduled.map((result) => result.readyLanes.map((lane) => lane.id))).toEqual([
+        ["lane-root-a"],
+        ["lane-root-b"],
+      ]);
+      const projection = stores[0]!.materializeFlowProjection("session-1");
+      const runningSegments = projection.segments.filter((segment) => segment.status === "running");
+      const identities = projection.candidateBindings.map((binding) =>
+        `${binding.lineageId}\0${binding.worktreeId}`
+      );
+      expect(runningSegments.map((segment) => segment.laneId).sort()).toEqual(["lane-root-a", "lane-root-b"]);
+      expect(new Set(identities)).toHaveLength(2);
+    } finally {
+      try {
+        stores[0]!.close();
+      } finally {
+        stores[1]!.close();
+      }
+    }
+
+    const reopened = createWorkflowStore({ projectRoot });
+    try {
+      const projection = reopened.materializeFlowProjection("session-1");
+      const rootSegments = projection.segments.filter((segment) =>
+        segment.laneId === "lane-root-a" || segment.laneId === "lane-root-b"
+      );
+      const rootBindings = projection.candidateBindings.filter((binding) =>
+        binding.laneId === "lane-root-a" || binding.laneId === "lane-root-b"
+      );
+      expect(rootSegments).toHaveLength(2);
+      expect(rootSegments.every((segment) => segment.status === "running")).toBe(true);
+      expect(new Set(rootSegments.map((segment) => segment.id))).toHaveLength(2);
+      expect(rootBindings).toHaveLength(2);
+      expect(new Set(rootBindings.map((binding) => binding.laneId))).toHaveLength(2);
+      expect(new Set(rootBindings.map((binding) => `${binding.lineageId}\0${binding.worktreeId}`))).toHaveLength(2);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("treats exact candidate retries as zero-write and rejects same-key conflicts", async () => {
+    const exact = await makeNewWorktreeStore();
+    appendTestLane(exact, "lane-occupier");
+    appendTestLane(exact, "lane-root");
+    appendCandidateBinding(exact, "lane-occupier", "candidate", "lineage-session-1-candidate");
+    appendCandidateBinding(
+      exact,
+      "lane-root",
+      "candidate",
+      "lineage-session-1-candidate",
+      [],
+      "default",
+      "candidate-binding:lane-root:bound",
+    );
+    appendTestFlowEvent(exact, "workflow.segment.started", {
+      laneId: "lane-occupier",
+      segment: {
+        id: "segment-occupier",
+        laneId: "lane-occupier",
+        runId: "run-occupier",
+        status: "running",
+      },
+    }, "test-segment:occupier");
+    const exactEvents = exact.listEvents("session-1");
+    expect(scheduleLaneIds(exact, "2026-07-28T01:10:00.000Z")).toEqual([]);
+    expect(exact.listEvents("session-1")).toEqual(exactEvents);
+    exact.close();
+
+    const conflict = await makeNewWorktreeStore();
+    appendTestLane(conflict, "lane-root");
+    appendCandidateBinding(
+      conflict,
+      "lane-other",
+      "other",
+      "lineage-other",
+      [],
+      "default",
+      "candidate-binding:lane-root:bound",
+    );
+    const conflictEvents = conflict.listEvents("session-1");
+    expect(() => scheduleLaneIds(conflict, "2026-07-28T01:10:01.000Z")).toThrow(/candidate binding conflicts/i);
+    expect(conflict.listEvents("session-1")).toEqual(conflictEvents);
+    conflict.close();
+  });
+
+  it("persists mixed-lineage fan-in blocks and allows a later exact binding to clear them", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store, newWorktreeTarget());
+    for (const laneId of ["lane-a", "lane-b"]) appendTestLane(store, laneId, "completed");
+    appendTestLane(store, "lane-join", "pending", "integration_join");
+    appendTestEdge(store, "lane-a", "lane-join");
+    appendTestEdge(store, "lane-b", "lane-join");
+    appendCandidateBinding(store, "lane-a", "a", "lineage-a");
+    appendCandidateBinding(store, "lane-b", "b", "lineage-b");
+
+    expect(scheduleLaneIds(store, "2026-07-28T02:00:00.000Z")).toEqual([]);
+    expect(store.materializeFlowProjection("session-1").candidateBindingBlocks[0]).toMatchObject({
+      laneId: "lane-join",
+      reason: "ambiguous_predecessor_lineage",
+      predecessorLaneIds: ["lane-a", "lane-b"],
+      lineageIds: ["lineage-a", "lineage-b"],
+    });
+    expect(store.materializeFlowProjection("session-1").segments).toEqual([]);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(scheduleLaneIds(reopened, "2026-07-28T02:00:01.000Z")).toEqual([]);
+    appendCandidateBinding(reopened, "lane-join", "a", "lineage-a", ["lane-a", "lane-b"], "explicit_join");
+    expect(scheduleLaneIds(reopened, "2026-07-28T02:00:02.000Z")).toEqual(["lane-join"]);
+    reopened.close();
+  });
+
+  it("backfills legacy predecessor worktrees exactly and blocks distinct legacy identities", async () => {
+    const store = await makeNewWorktreeStore();
+    for (const laneId of ["lane-a", "lane-b"]) appendTestLane(store, laneId, "completed");
+    appendTestLane(store, "lane-serial");
+    appendTestLane(store, "lane-join", "pending", "integration_join");
+    appendTestLane(store, "lane-invalid-source", "completed");
+    appendTestLane(store, "lane-invalid");
+    appendTestEdge(store, "lane-a", "lane-serial");
+    appendTestEdge(store, "lane-a", "lane-join");
+    appendTestEdge(store, "lane-b", "lane-join");
+    appendTestEdge(store, "lane-invalid-source", "lane-invalid");
+    const projectRoot = dirname(dirname(store.databasePath));
+    appendWorktreeCreated(store, candidateWorktree(projectRoot, "legacy-a", "lane-a"));
+    appendWorktreeCreated(store, candidateWorktree(projectRoot, "legacy-b", "lane-b"));
+    appendWorktreeCreated(store, {
+      ...candidateWorktree(projectRoot, "legacy-invalid", "lane-invalid-source"),
+      worktreeId: "worktree-session-1-mismatch",
+    });
+
+    expect(scheduleLaneIds(store, "2026-07-28T03:00:00.000Z", 2)).toEqual(["lane-serial"]);
+    const projection = store.materializeFlowProjection("session-1");
+    expect(projection.candidateBindings.find((binding) => binding.laneId === "lane-a"))
+      .toMatchObject(candidateBindingFacts("legacy-a"));
+    expect(projection.candidateBindings.find((binding) => binding.laneId === "lane-serial"))
+      .toMatchObject(candidateBindingFacts("legacy-a"));
+    expect(projection.candidateBindingBlocks.find((block) => block.laneId === "lane-join"))
+      .toMatchObject({ lineageIds: ["lineage-session-1-legacy-a", "lineage-session-1-legacy-b"] });
+    expect(projection.candidateBindings.some((binding) => binding.laneId === "lane-invalid")).toBe(false);
+    expect(projection.segments.some((segment) => segment.laneId === "lane-invalid")).toBe(false);
+    store.close();
+  });
+
+  it("fails closed when one legacy predecessor owns two valid physical worktree identities", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    try {
+      seedStore(store, newWorktreeTarget());
+      appendTestLane(store, "lane-source", "completed");
+      appendTestLane(store, "lane-downstream");
+      appendTestEdge(store, "lane-source", "lane-downstream");
+      appendWorktreeCreated(store, candidateWorktree(projectRoot, "legacy-a", "lane-source"));
+      appendWorktreeCreated(store, candidateWorktree(projectRoot, "legacy-b", "lane-source"));
+
+      expect(store.previewReadyLanes("session-1", { allowedParallelism: 2 }).readyLanes.map((lane) => lane.id))
+        .toEqual(["lane-downstream"]);
+      expect(scheduleLaneIds(store, "2026-07-28T03:01:00.000Z", 2)).toEqual([]);
+      const projection = store.materializeFlowProjection("session-1");
+      const sourceWorktrees = projection.worktrees.filter((worktree) => worktree.parentLaneId === "lane-source");
+      expect(sourceWorktrees.map((worktree) => ({
+        worktreeId: worktree.worktreeId,
+        variantId: worktree.variantId,
+        parentLaneId: worktree.parentLaneId,
+      }))).toEqual([
+        {
+          worktreeId: "worktree-session-1-legacy-a",
+          variantId: "legacy-a",
+          parentLaneId: "lane-source",
+        },
+        {
+          worktreeId: "worktree-session-1-legacy-b",
+          variantId: "legacy-b",
+          parentLaneId: "lane-source",
+        },
+      ]);
+      expect(projection.candidateBindings).toEqual([]);
+      expect(projection.candidateBindingBlocks).toEqual([]);
+      expect(projection.segments).toEqual([]);
+    } finally {
+      store.close();
+    }
+
+    const reopened = createWorkflowStore({ projectRoot });
+    try {
+      expect(reopened.previewReadyLanes("session-1", { allowedParallelism: 2 }).readyLanes.map((lane) => lane.id))
+        .toEqual(["lane-downstream"]);
+      expect(scheduleLaneIds(reopened, "2026-07-28T03:01:01.000Z", 2)).toEqual([]);
+      const projection = reopened.materializeFlowProjection("session-1");
+      expect(projection.worktrees.filter((worktree) => worktree.parentLaneId === "lane-source")).toHaveLength(2);
+      expect(projection.candidateBindings).toEqual([]);
+      expect(projection.candidateBindingBlocks).toEqual([]);
+      expect(projection.segments).toEqual([]);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it.each(["variant", "fork"] as const)(
+    "keeps an unbound new-worktree %s successor on the legacy scheduling path",
+    async (kind) => {
+      const store = await makeNewWorktreeStore();
+      appendTestLane(store, "lane-source", "completed");
+      appendTestLane(store, `lane-${kind}`);
+      const checkpointId = `checkpoint-${kind}`;
+      recordCheckpoint(store, checkpointId, "lane-source", "before", "a".repeat(40));
+      appendTestFlowEvent(store, `workflow.node.${kind}_requested`, {
+        intentId: `intent-${kind}`,
+        laneId: "lane-source",
+        nodeId: "lane-source",
+        checkpointId,
+        successorLaneId: `lane-${kind}`,
+      }, `intent:${kind}`);
+
+      expect(scheduleLaneIds(store, "2026-07-28T04:00:02.000Z")).toEqual([`lane-${kind}`]);
+      expect(store.materializeFlowProjection("session-1").candidateBindings
+        .some((binding) => binding.laneId === `lane-${kind}`)).toBe(false);
+      store.close();
+    },
+  );
+
+  it("keeps an unbound new-worktree repair successor on the legacy scheduling path", async () => {
+    const store = await makeNewWorktreeStore();
+    declareCodeChangeWorkflow(store);
+    advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+    store.recordRunResult(runResultInput(store, "lane-implementation", "failed", "2026-07-28T04:10:00.000Z"));
+    recordCheckpoint(store, "checkpoint-after-implementation", "lane-implementation", "after", "head-sha");
+    store.requestNodeRepair({
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      checkpointId: "checkpoint-after-implementation",
+      successorLaneId: "lane-repair",
+      successorSemanticKey: "repair:lane-implementation:pr1b",
+      now: "2026-07-28T04:10:01.000Z",
+    });
+    expect(scheduleLaneIds(store, "2026-07-28T04:10:02.000Z")).toEqual(["lane-repair"]);
+    expect(store.materializeFlowProjection("session-1").candidateBindings
+      .some((binding) => binding.laneId === "lane-repair")).toBe(false);
+    store.close();
+  });
+
+  it("rolls back both normal candidate binding and segment start when scheduling faults between them", async () => {
+    let armed = false;
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({
+      projectRoot,
+      faultInjection: {
+        afterCandidateBindingBeforeSegment: () => {
+          if (armed) throw new Error("injected candidate scheduling failure");
+        },
+      },
+    });
+    seedStore(store, newWorktreeTarget());
+    appendTestLane(store, "lane-root");
+    armed = true;
+
+    expect(() => store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 1,
+      now: "2026-07-28T05:00:00.000Z",
+    })).toThrow("injected candidate scheduling failure");
+    expect(store.materializeFlowProjection("session-1").candidateBindings).toEqual([]);
+    expect(store.materializeFlowProjection("session-1").segments).toEqual([]);
+    store.close();
   });
 
   it("rejects non-terminal or mismatched run result identity at the store boundary", async () => {
@@ -7273,6 +7766,122 @@ async function makeSeededStore() {
   const store = await makeStore();
   seedStore(store);
   return store;
+}
+
+async function makeNewWorktreeStore() {
+  const store = await makeStore();
+  seedStore(store, newWorktreeTarget());
+  return store;
+}
+
+function newWorktreeTarget() {
+  return {
+    executionTarget: "new_worktree" as const,
+    selectedBranch: "main",
+    baseRef: "origin/main",
+  };
+}
+
+function scheduleLaneIds(store: TestWorkflowStore, now: string, allowedParallelism = 1): string[] {
+  return store.scheduleReadyLanes("session-1", { allowedParallelism, now }).readyLanes.map((lane) => lane.id);
+}
+
+function candidateBindingFacts(variantId: string, lineageId = `lineage-session-1-${variantId}`) {
+  return { variantId, worktreeId: `worktree-session-1-${variantId}`, lineageId };
+}
+
+function worktreeMetadataFacts(worktree: WorkflowWorktreeIdentity) {
+  const { parentLaneId: _parentLaneId, parentSegmentId: _parentSegmentId, ...metadata } = worktree;
+  return metadata;
+}
+
+function appendTestFlowEvent(
+  store: TestWorkflowStore,
+  kind: FlowEventKind,
+  payload: Record<string, unknown>,
+  idempotencyKey: string,
+): void {
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind,
+    source: "test",
+    idempotencyKey,
+    payload,
+    now: "2026-07-28T00:00:00.000Z",
+  });
+}
+
+function appendTestLane(
+  store: TestWorkflowStore,
+  laneId: string,
+  status: "pending" | "completed" | "failed" = "pending",
+  kind = "implementation",
+  scopes?: { fileScopes: string[]; packageScopes: string[] },
+): void {
+  appendTestFlowEvent(store, "workflow.lane.declared", {
+    lane: {
+      id: laneId,
+      semanticKey: laneId,
+      kind,
+      title: laneId,
+      agentKind: "codex",
+      status,
+      ...(scopes ?? {}),
+    },
+  }, `test-lane:${laneId}`);
+}
+
+function appendTestEdge(store: TestWorkflowStore, sourceLaneId: string, targetLaneId: string): void {
+  appendTestFlowEvent(store, "workflow.edge.declared", {
+    edge: { id: `edge-${sourceLaneId}-${targetLaneId}`, sourceLaneId, targetLaneId },
+  }, `test-edge:${sourceLaneId}:${targetLaneId}`);
+}
+
+function appendCandidateBinding(
+  store: TestWorkflowStore,
+  laneId: string,
+  variantId: string,
+  lineageId: string,
+  predecessorLaneIds: string[] = [],
+  reason: "default" | "explicit_join" = "default",
+  idempotencyKey = `test-candidate:${laneId}`,
+): void {
+  appendTestFlowEvent(store, "workflow.lane.candidate_bound", {
+    binding: {
+      sessionId: "session-1", laneId, variantId,
+      worktreeId: `worktree-session-1-${variantId}`,
+      lineageId, reason, predecessorLaneIds,
+    },
+  }, idempotencyKey);
+}
+
+function candidateWorktree(
+  projectRoot: string,
+  variantId: string,
+  parentLaneId: string,
+): WorkflowWorktreeIdentity {
+  const path = join(projectRoot, ".devflow", "worktrees", variantId);
+  return {
+    worktreeId: `worktree-session-1-${variantId}`,
+    variantId,
+    path,
+    realPath: path,
+    gitdir: join(projectRoot, ".git", "worktrees", variantId),
+    repoRoot: projectRoot,
+    branchName: `skyturn/session-1/${variantId}`,
+    baseCommit: "a".repeat(40),
+    headCommit: "a".repeat(40),
+    parentLaneId,
+  };
+}
+
+function appendWorktreeCreated(store: TestWorkflowStore, worktree: WorkflowWorktreeIdentity): void {
+  appendTestFlowEvent(
+    store,
+    "workflow.worktree.created",
+    { worktree },
+    `worktree:${worktree.worktreeId}:created`,
+  );
 }
 
 type TestWorkflowStore = ReturnType<typeof createWorkflowStore>;

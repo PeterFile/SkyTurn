@@ -9,6 +9,8 @@ import {
   normalizeSessionTarget,
   parseRunEvent,
   parseRunEvidence,
+  parseWorkflowLaneCandidateBinding,
+  parseWorkflowLaneCandidateBindingBlock,
   sanitizePublicEvidenceText,
 } from "@skyturn/project-core";
 import type {
@@ -27,6 +29,7 @@ import type {
   WorktreeMetadata,
   WorkflowLedgerSummary,
   WorkflowLedgerSummaryEvent,
+  WorkflowLaneCandidateBinding,
   WorkflowLoopEngineeringProjectionInput,
   WorkflowLoopEngineeringState,
   WorkflowMode,
@@ -45,6 +48,7 @@ import {
   parseWorkflowIntent,
   projectLoopEngineeringState,
   reduceWorkflowEvents,
+  resolveLaneCandidateBinding,
   scheduleReadyLanes as scheduleFlowReadyLanes,
   type CompileWorkflowIntentResult,
   type FlowEvidence,
@@ -160,6 +164,7 @@ export interface WorkflowStoreOptions {
   projectRoot: string;
   databasePath?: string;
   faultInjection?: {
+    sqliteBusyTimeoutMs?: number;
     beforeInsertBeforeAppend?: () => void;
     afterInsertBeforeProjection?: (projection: FlowProjection) => void;
     traceHermesHandleMaintenanceSql?: (sql: string) => void;
@@ -171,6 +176,8 @@ export interface WorkflowStoreOptions {
     ) => WalCheckpointRow[] | undefined;
     beforePlanFinishBinding?: () => void;
     beforePlannerIntentDispositionCommit?: () => void;
+    afterSchedulePreview?: (projection: FlowProjection) => void;
+    afterCandidateBindingBeforeSegment?: () => void;
   };
 }
 
@@ -789,7 +796,9 @@ export class WorkflowStore {
     this.faultInjection = options.faultInjection;
     this.databasePath = options.databasePath ?? join(this.projectRoot, ".devflow", "skyturn-workflow.sqlite");
     mkdirSync(join(this.projectRoot, ".devflow"), { recursive: true });
-    this.db = new Database(this.databasePath);
+    this.db = new Database(this.databasePath, {
+      timeout: this.faultInjection?.sqliteBusyTimeoutMs ?? 5_000,
+    });
     try {
       this.db.pragma("journal_mode = WAL");
       this.db.pragma("secure_delete = ON");
@@ -1223,61 +1232,79 @@ export class WorkflowStore {
     sessionId: string,
     input: ScheduleReadyWorkflowLanesInput,
   ): ScheduleReadyWorkflowLanesResult {
-    const preview = this.previewReadyLanes(sessionId, input);
     const authorizedLaneIds = input.authorizedLaneIds === undefined
       ? null
       : new Set(input.authorizedLaneIds.map((laneId) => requireIdentifier(laneId, "authorizedLaneId")));
-    const scheduled = preview.readyLanes.filter((lane) => authorizedLaneIds
-      ? authorizedLaneIds.has(lane.id)
-      : lane.runtimePolicy.sandbox !== "danger-full-access");
-    if (scheduled.length === 0) return { readyLanes: [], projection: preview.projection };
-
     const owned: ScheduledWorkflowLane[] = [];
     const tx = this.db.transaction(() => {
+      const session = this.requireKnownSession(sessionId);
+      const preview = this.previewReadyLanes(sessionId, input);
+      let projection = preview.projection;
+      this.faultInjection?.afterSchedulePreview?.(projection);
+      const scheduled = preview.readyLanes.filter((lane) => authorizedLaneIds
+        ? authorizedLaneIds.has(lane.id)
+        : lane.runtimePolicy.sandbox !== "danger-full-access");
+      const occupiedCandidates = runningCandidateIdentityKeys(projection);
+
       for (const lane of scheduled) {
-        const idempotencyKey = `schedule:${lane.segmentId}:started`;
-        const existing = this.getEventByIdempotencyKey(sessionId, idempotencyKey);
-        if (existing) {
-          const existingSegment = isRecord(existing.payload.segment) ? existing.payload.segment : null;
-          if (
-            existing.kind !== "workflow.segment.started" ||
-            existing.payload.laneId !== lane.id ||
-            existingSegment?.id !== lane.segmentId ||
-            existingSegment?.laneId !== lane.id ||
-            existingSegment?.runId !== lane.runId ||
-            existingSegment?.status !== "running"
-          ) {
-            throw new Error("Workflow schedule ownership conflicts with an existing mutation.");
+        if (session.target.executionTarget === "current_branch") {
+          if (this.startScheduledLaneInTransaction(sessionId, lane, input.now)) {
+            owned.push(lane);
+            projection = this.materializeFlowProjection(sessionId);
           }
           continue;
         }
-        this.insertFlowEventInTransaction({
-          id: `${sessionId}:flow-schedule:${lane.id}`,
-          sessionId,
-          seq: 0,
-          kind: "workflow.segment.started",
-          source: "workflow-scheduler",
-          payload: {
-            laneId: lane.id,
-            segment: {
-              id: lane.segmentId,
-              laneId: lane.id,
-              runId: lane.runId,
-              status: "running",
-              exitCode: null,
-            },
-          },
-          createdAt: input.now,
-          idempotencyKey,
-        }, input.now);
-        owned.push(lane);
+
+        if (isUnboundCheckpointSuccessor(projection, lane)) {
+          if (this.startScheduledLaneInTransaction(sessionId, lane, input.now)) {
+            owned.push(lane);
+            projection = this.materializeFlowProjection(sessionId);
+          }
+          continue;
+        }
+
+        const legacyBackfills = legacyCandidateBackfills(projection, lane.id);
+        if (legacyBackfills.status === "unavailable") continue;
+        const candidateProjection = legacyBackfills.bindings.length === 0
+          ? projection
+          : {
+              ...projection,
+              candidateBindings: [...projection.candidateBindings, ...legacyBackfills.bindings],
+            };
+        const resolution = resolveLaneCandidateBinding(candidateProjection, lane.id);
+        if (resolution.status === "unavailable") continue;
+
+        for (const binding of legacyBackfills.bindings) {
+          this.persistCandidateEventInTransaction("workflow.lane.candidate_bound", binding, input.now);
+        }
+        if (resolution.status === "blocked") {
+          this.persistCandidateEventInTransaction(
+            "workflow.lane.candidate_binding_blocked",
+            resolution.block,
+            input.now,
+          );
+          projection = this.materializeFlowProjection(sessionId);
+          continue;
+        }
+
+        this.persistCandidateEventInTransaction("workflow.lane.candidate_bound", resolution.binding, input.now);
+        projection = this.materializeFlowProjection(sessionId);
+        const candidateKey = candidateIdentityKey(resolution.binding);
+        if (occupiedCandidates.has(candidateKey)) continue;
+        this.faultInjection?.afterCandidateBindingBeforeSegment?.();
+        if (this.startScheduledLaneInTransaction(sessionId, lane, input.now)) {
+          occupiedCandidates.add(candidateKey);
+          owned.push(lane);
+          projection = this.materializeFlowProjection(sessionId);
+        }
       }
+      return projection;
     });
-    tx.immediate();
+    const projection = tx.immediate();
 
     return {
       readyLanes: owned,
-      projection: this.materializeFlowProjection(sessionId),
+      projection,
     };
   }
 
@@ -1299,6 +1326,83 @@ export class WorkflowStore {
       segmentId: segmentIdForLane(sessionId, lane.id),
     }));
     return { readyLanes: scheduled, projection };
+  }
+
+  private persistCandidateEventInTransaction(
+    kind: "workflow.lane.candidate_bound" | "workflow.lane.candidate_binding_blocked",
+    candidate: WorkflowLaneCandidateBinding | FlowProjection["candidateBindingBlocks"][number],
+    now: string,
+  ): void {
+    const laneId = candidate.laneId;
+    const idempotencyKey = `candidate-binding:${laneId}:${kind === "workflow.lane.candidate_bound" ? "bound" : "blocked"}`;
+    const payload = kind === "workflow.lane.candidate_bound"
+      ? { binding: parseWorkflowLaneCandidateBinding(candidate) }
+      : { block: parseWorkflowLaneCandidateBindingBlock(candidate) };
+    const existing = this.getEventByIdempotencyKey(candidate.sessionId, idempotencyKey);
+    if (existing) {
+      const existingPayload = existing.kind === "workflow.lane.candidate_bound"
+        ? { binding: parseWorkflowLaneCandidateBinding(existing.payload.binding) }
+        : existing.kind === "workflow.lane.candidate_binding_blocked"
+          ? { block: parseWorkflowLaneCandidateBindingBlock(existing.payload.block) }
+          : null;
+      if (existing.kind !== kind || !existingPayload || stableJson(existingPayload) !== stableJson(payload)) {
+        throw new Error("Workflow candidate binding conflicts with an existing mutation.");
+      }
+      return;
+    }
+    this.insertFlowEventInTransaction({
+      id: `${candidate.sessionId}:flow-candidate:${laneId}`,
+      sessionId: candidate.sessionId,
+      seq: 0,
+      kind,
+      source: "workflow-scheduler",
+      payload,
+      createdAt: now,
+      idempotencyKey,
+    }, now);
+  }
+
+  private startScheduledLaneInTransaction(
+    sessionId: string,
+    lane: ScheduledWorkflowLane,
+    now: string,
+  ): boolean {
+    const idempotencyKey = `schedule:${lane.segmentId}:started`;
+    const existing = this.getEventByIdempotencyKey(sessionId, idempotencyKey);
+    if (existing) {
+      const existingSegment = isRecord(existing.payload.segment) ? existing.payload.segment : null;
+      if (
+        existing.kind !== "workflow.segment.started" ||
+        existing.payload.laneId !== lane.id ||
+        existingSegment?.id !== lane.segmentId ||
+        existingSegment?.laneId !== lane.id ||
+        existingSegment?.runId !== lane.runId ||
+        existingSegment?.status !== "running"
+      ) {
+        throw new Error("Workflow schedule ownership conflicts with an existing mutation.");
+      }
+      return false;
+    }
+    this.insertFlowEventInTransaction({
+      id: `${sessionId}:flow-schedule:${lane.id}`,
+      sessionId,
+      seq: 0,
+      kind: "workflow.segment.started",
+      source: "workflow-scheduler",
+      payload: {
+        laneId: lane.id,
+        segment: {
+          id: lane.segmentId,
+          laneId: lane.id,
+          runId: lane.runId,
+          status: "running",
+          exitCode: null,
+        },
+      },
+      createdAt: now,
+      idempotencyKey,
+    }, now);
+    return true;
   }
 
   reassignWorkflowLane(input: WorkflowLaneReassignmentInput): WorkflowLaneReassignmentResult {
@@ -1482,6 +1586,8 @@ export class WorkflowStore {
     if (session.target.executionTarget !== input.executionTarget) {
       throw new Error("Run checkpoint execution target identity mismatch.");
     }
+    const projection = this.materializeFlowProjection(input.sessionId);
+    const candidateBinding = projection.candidateBindings.find((binding) => binding.laneId === input.laneId);
     const canvasSession = this.materializeCanvasSession(input.sessionId);
     const canvasNode = canvasSession?.nodes.find((node) => node.id === input.nodeId);
     const canonicalWorktreePath = canonicalPath(input.worktreePath);
@@ -1495,6 +1601,9 @@ export class WorkflowStore {
       }
     } else {
       if (!input.worktreeId) throw new Error("New worktree checkpoint requires a worktree id.");
+      if (candidateBinding && input.worktreeId !== candidateBinding.worktreeId) {
+        throw new Error("Run checkpoint worktree id must match the durable lane candidate binding.");
+      }
       const managedWorktree = canvasNode?.worktree;
       const managedPath = managedWorktree?.realPath ?? managedWorktree?.path;
       if (
@@ -1506,7 +1615,6 @@ export class WorkflowStore {
         throw new Error("Run checkpoint must match the managed worktree identity.");
       }
     }
-    const projection = this.materializeFlowProjection(input.sessionId);
     const lane = projection.lanes.find((item) => item.id === input.laneId);
     const projectedNode = projection.projectionNodes.find((node) => node.id === input.nodeId && node.laneId === input.laneId);
     if (!lane || !projectedNode?.executable) {
@@ -3371,7 +3479,10 @@ function flowLaneToCanvasNode(
   changesetId: string | undefined,
 ): CanvasNode {
   const latestSegment = [...projection.segments].reverse().find((segment) => segment.laneId === lane.id);
-  const createdWorktree = worktreeForParentLane(projection, lane.id);
+  const candidateBinding = projection.candidateBindings.find((binding) => binding.laneId === lane.id);
+  const createdWorktree = candidateBinding
+    ? projection.worktrees.find((worktree) => worktree.worktreeId === candidateBinding.worktreeId) ?? null
+    : worktreeForParentLane(projection, lane.id);
   const statusProjection = nodeStatusProjectionForFlowLane(lane);
   const status = statusProjection.status;
   return {
@@ -3403,7 +3514,8 @@ function flowLaneToCanvasNode(
     changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
     output: lane.output,
     ...(lane.outputDeltas && lane.outputDeltas.length > 0 ? { outputDeltas: lane.outputDeltas } : {}),
-    worktree: worktreeForSessionTarget(session, lane.id, undefined, createdWorktree),
+    ...(candidateBinding ? { candidateBinding } : {}),
+    worktree: worktreeForSessionTarget(session, lane.id, undefined, createdWorktree, candidateBinding),
     context: {
       brief: lane.brief ?? lane.title,
       sessionGoal: session.goal,
@@ -3478,6 +3590,7 @@ function worktreeForSessionTarget(
   nodeId: string,
   worktreePath?: string,
   createdWorktree?: WorkflowWorktreeIdentity | null,
+  candidateBinding?: WorkflowLaneCandidateBinding,
 ): WorktreeMetadata {
   if (session.target.executionTarget === "new_worktree") {
     if (createdWorktree) {
@@ -3491,6 +3604,7 @@ function worktreeForSessionTarget(
         baselineRef: session.target.baseRef ?? session.target.selectedBranch,
         worktreeId: createdWorktree.worktreeId,
         variantId: createdWorktree.variantId,
+        ...(candidateBinding ? { lineageId: candidateBinding.lineageId } : {}),
         realPath: createdWorktree.realPath,
         gitdir: createdWorktree.gitdir,
         repoRoot: createdWorktree.repoRoot,
@@ -3505,8 +3619,9 @@ function worktreeForSessionTarget(
       selectedBranch: session.target.selectedBranch,
       ...(session.target.baseRef ? { baseRef: session.target.baseRef } : {}),
       baselineRef: session.target.baseRef ?? session.target.selectedBranch,
-      worktreeId: `worktree-${session.id}-${nodeId}`,
-      variantId: nodeId,
+      worktreeId: candidateBinding?.worktreeId ?? `worktree-${session.id}-${nodeId}`,
+      variantId: candidateBinding?.variantId ?? nodeId,
+      ...(candidateBinding ? { lineageId: candidateBinding.lineageId } : {}),
     };
   }
   return {
@@ -3521,6 +3636,60 @@ function worktreeForSessionTarget(
 
 function worktreeForParentLane(projection: FlowProjection, laneId: string): WorkflowWorktreeIdentity | null {
   return projection.worktrees.find((worktree) => worktree.parentLaneId === laneId) ?? null;
+}
+
+function candidateIdentityKey(binding: WorkflowLaneCandidateBinding): string {
+  return `${binding.lineageId}\0${binding.worktreeId}`;
+}
+
+function runningCandidateIdentityKeys(projection: FlowProjection): Set<string> {
+  return new Set(
+    projection.candidateBindings
+      .filter((binding) => projection.segments.some(
+        (segment) => segment.laneId === binding.laneId && segment.status === "running",
+      ))
+      .map(candidateIdentityKey),
+  );
+}
+
+function isUnboundCheckpointSuccessor(projection: FlowProjection, lane: FlowLane): boolean {
+  if (projection.candidateBindings.some((binding) => binding.laneId === lane.id)) return false;
+  return projection.checkpointIntents.some((intent) =>
+    intent.status === "requested" &&
+    (intent.kind === "repair" || intent.kind === "variant" || intent.kind === "fork") &&
+    (intent.successorLaneId === lane.id || intent.successorSemanticKey === lane.semanticKey)
+  );
+}
+
+function legacyCandidateBackfills(
+  projection: FlowProjection,
+  laneId: string,
+): { status: "available"; bindings: WorkflowLaneCandidateBinding[] } | { status: "unavailable" } {
+  const predecessorLaneIds = uniqueStrings(incomingLaneIds(projection, laneId)).sort();
+  const bindings: WorkflowLaneCandidateBinding[] = [];
+  for (const predecessorLaneId of predecessorLaneIds) {
+    const predecessor = projection.lanes.find((lane) => lane.id === predecessorLaneId);
+    if (predecessor?.executable === false) continue;
+    if (projection.candidateBindings.some((binding) => binding.laneId === predecessorLaneId)) continue;
+    const worktrees = projection.worktrees.filter((worktree) => worktree.parentLaneId === predecessorLaneId);
+    if (worktrees.length === 0) continue;
+    if (worktrees.length !== 1) return { status: "unavailable" };
+    const worktree = worktrees[0]!;
+    try {
+      bindings.push(parseWorkflowLaneCandidateBinding({
+        sessionId: projection.sessionId,
+        laneId: predecessorLaneId,
+        variantId: worktree.variantId,
+        worktreeId: worktree.worktreeId,
+        lineageId: `lineage-${projection.sessionId}-${worktree.variantId}`,
+        reason: "default",
+        predecessorLaneIds: uniqueStrings(incomingLaneIds(projection, predecessorLaneId)).sort(),
+      }));
+    } catch {
+      return { status: "unavailable" };
+    }
+  }
+  return { status: "available", bindings };
 }
 
 function rollbackTargetLaneId(
@@ -4181,6 +4350,8 @@ function laneIdFromPayload(payload: Record<string, unknown>): string | null {
   if (typeof payload.laneId === "string") return payload.laneId;
   if (isRecord(payload.segment) && typeof payload.segment.laneId === "string") return payload.segment.laneId;
   if (isRecord(payload.lane) && typeof payload.lane.id === "string") return payload.lane.id;
+  if (isRecord(payload.binding) && typeof payload.binding.laneId === "string") return payload.binding.laneId;
+  if (isRecord(payload.block) && typeof payload.block.laneId === "string") return payload.block.laneId;
   return null;
 }
 
