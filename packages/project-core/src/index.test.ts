@@ -1395,7 +1395,8 @@ describe("agent run contracts", () => {
 
   it("strictly parses durable lane candidate bindings", () => {
     const binding: WorkflowLaneCandidateBinding = {
-      sessionId: "session-1", laneId: "lane-variant", worktreeId: "worktree-variant",
+      sessionId: "session-1", laneId: "lane-variant", variantId: "variant",
+      worktreeId: "worktree-session-1-variant",
       lineageId: "lineage-variant", reason: "variant", predecessorLaneIds: ["lane-a", "lane-b"],
       sourceCheckpointId: "checkpoint-before-lane-implementation",
       sourceHeadCommit: "a".repeat(40),
@@ -1405,6 +1406,10 @@ describe("agent run contracts", () => {
       [{ ...binding, unknown: true }, /unknown/i],
       [{ ...binding, reason: "first_edge" }, /reason/i],
       [{ ...binding, predecessorLaneIds: ["lane-b", "lane-a"] }, /sorted/i],
+      [{ ...binding, variantId: "" }, /variantId/i],
+      [{ ...binding, variantId: "variant:unsafe" }, /variantId/i],
+      [{ ...binding, variantId: "v".repeat(241) }, /variantId/i],
+      [{ ...binding, worktreeId: "worktree-session-1-other" }, /worktreeId.*variantId/i],
       [{ ...binding, sourceHeadCommit: "b".repeat(64) }, /full commit SHA/i],
       [{ ...binding, sourceHeadCommit: "g".repeat(40) }, /full commit SHA/i],
       [{ ...binding, sourceHeadCommit: "short-sha" }, /full commit SHA/i],

@@ -839,6 +839,7 @@ export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleRe
     if (isTerminalRollbackLane(lane)) continue;
     if (lane.status !== "pending" && lane.status !== "ready") continue;
     if (isBlockedByWaitingDecision(projection, lane.id)) continue;
+    if (projection.candidateBindingBlocks.some((block) => block.laneId === lane.id)) continue;
     if (isCheckpointSuccessorWaitingForRollback(projection, lane)) continue;
     if (!(incoming.get(lane.id) ?? []).every((dependency) => dependencyIsSatisfied(projection, lane, dependency, completed))) continue;
     if (hasScopeConflict(lane, occupied)) continue;
@@ -871,25 +872,7 @@ export function resolveLaneCandidateBinding(
     (item.successorLaneId === laneId || item.successorSemanticKey === lane.semanticKey)
   );
   if (intent?.kind === "variant" || intent?.kind === "fork") {
-    const checkpoint = intent.checkpointId
-      ? projection.checkpoints.find((item) => item.id === intent.checkpointId)
-      : undefined;
-    if (!checkpoint || checkpoint.phase !== "before" || checkpoint.worktreeState !== "clean" || !fullCommitSha(checkpoint.headCommit)) {
-      return { status: "unavailable", reason: "Variant binding requires its clean before checkpoint and full head commit." };
-    }
-    return {
-      status: "bound",
-      binding: parseWorkflowLaneCandidateBinding({
-        sessionId: projection.sessionId,
-        laneId,
-        worktreeId: `worktree-variant-${checkpoint.id}`,
-        lineageId: `lineage-variant-${checkpoint.id}`,
-        reason: "variant",
-        predecessorLaneIds,
-        sourceCheckpointId: checkpoint.id,
-        sourceHeadCommit: checkpoint.headCommit,
-      }),
-    };
+    return { status: "unavailable", reason: "Variant candidate identity has not been durably allocated." };
   }
   if (intent?.kind === "repair") {
     return inheritedCheckpointBinding(projection, laneId, intent.laneId, intent.checkpointId, predecessorLaneIds, "repair");
@@ -914,6 +897,7 @@ export function resolveLaneCandidateBinding(
       binding: parseWorkflowLaneCandidateBinding({
         sessionId: projection.sessionId,
         laneId,
+        variantId: "candidate",
         worktreeId: `worktree-${projection.sessionId}-candidate`,
         lineageId: `lineage-${projection.sessionId}-candidate`,
         reason: "default",
@@ -976,6 +960,7 @@ function inheritedBinding(
     binding: parseWorkflowLaneCandidateBinding({
       sessionId,
       laneId,
+      variantId: source.variantId,
       worktreeId: source.worktreeId,
       lineageId: source.lineageId,
       reason,

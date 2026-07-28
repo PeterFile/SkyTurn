@@ -520,7 +520,8 @@ describe("hydrateSelectedNodeActionStateFromEvents", () => {
 
   it("keeps checkpoint hydration valid when durable candidate binding events are present", () => {
     const binding = {
-      sessionId, laneId: "lane-implementation", worktreeId: "worktree-candidate",
+      sessionId, laneId: "lane-implementation", variantId: "candidate",
+      worktreeId: `worktree-${sessionId}-candidate`,
       lineageId: "lineage-candidate", reason: "default", predecessorLaneIds: [],
     };
     const state = hydrateSelectedNodeActionStateFromEvents({

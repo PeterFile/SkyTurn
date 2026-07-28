@@ -1688,6 +1688,7 @@ export interface WorkflowWorktreeIdentity {
 export interface WorkflowLaneCandidateBinding {
   sessionId: string;
   laneId: string;
+  variantId: string;
   worktreeId: string;
   lineageId: string;
   reason: WorkflowLaneCandidateBindingReason;
@@ -2417,7 +2418,7 @@ export function normalizeSessionTarget(value: unknown, fallbackSelectedBranch = 
 export function parseWorkflowLaneCandidateBinding(value: unknown): WorkflowLaneCandidateBinding {
   if (!isRecord(value)) throw new Error("Workflow lane candidate binding must be an object.");
   assertExactKeys(value, [
-    "sessionId", "laneId", "worktreeId", "lineageId", "reason", "predecessorLaneIds",
+    "sessionId", "laneId", "variantId", "worktreeId", "lineageId", "reason", "predecessorLaneIds",
     "sourceCheckpointId", "sourceHeadCommit",
   ], "Workflow lane candidate binding");
   const reason = value.reason;
@@ -2428,11 +2429,15 @@ export function parseWorkflowLaneCandidateBinding(value: unknown): WorkflowLaneC
   const binding: WorkflowLaneCandidateBinding = {
     sessionId: candidateIdentifier(value.sessionId, "sessionId"),
     laneId: candidateIdentifier(value.laneId, "laneId"),
+    variantId: candidateVariantId(value.variantId),
     worktreeId: candidateIdentifier(value.worktreeId, "worktreeId"),
     lineageId: candidateIdentifier(value.lineageId, "lineageId"),
     reason,
     predecessorLaneIds: sortedCandidateIdentifiers(value.predecessorLaneIds, "predecessorLaneIds"),
   };
+  if (binding.worktreeId !== `worktree-${binding.sessionId}-${binding.variantId}`) {
+    throw new Error("Workflow lane candidate binding worktreeId must match its sessionId and variantId.");
+  }
   const checkpointCausal = reason === "repair" || reason === "regression" || reason === "variant";
   if (checkpointCausal) {
     binding.sourceCheckpointId = candidateIdentifier(value.sourceCheckpointId, "sourceCheckpointId");
@@ -2475,6 +2480,13 @@ function assertExactKeys(value: Record<string, unknown>, allowed: string[], labe
 function candidateIdentifier(value: unknown, field: string): string {
   if (typeof value !== "string" || value.length === 0 || value.length > 240 || value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`Workflow lane candidate binding ${field} is invalid.`);
+  }
+  return value;
+}
+
+function candidateVariantId(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 240 || !/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new Error("Workflow lane candidate binding variantId is invalid.");
   }
   return value;
 }
