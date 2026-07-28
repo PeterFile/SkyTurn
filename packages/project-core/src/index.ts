@@ -2415,6 +2415,9 @@ export function normalizeSessionTarget(value: unknown, fallbackSelectedBranch = 
   };
 }
 
+const candidateIdentifierMaxLength = 240;
+const candidateWorktreeIdMaxLength = "worktree-".length + candidateIdentifierMaxLength + 1 + candidateIdentifierMaxLength;
+
 export function parseWorkflowLaneCandidateBinding(value: unknown): WorkflowLaneCandidateBinding {
   if (!isRecord(value)) throw new Error("Workflow lane candidate binding must be an object.");
   assertExactKeys(value, [
@@ -2430,7 +2433,7 @@ export function parseWorkflowLaneCandidateBinding(value: unknown): WorkflowLaneC
     sessionId: candidateIdentifier(value.sessionId, "sessionId"),
     laneId: candidateIdentifier(value.laneId, "laneId"),
     variantId: candidateVariantId(value.variantId),
-    worktreeId: candidateIdentifier(value.worktreeId, "worktreeId"),
+    worktreeId: candidateIdentifier(value.worktreeId, "worktreeId", candidateWorktreeIdMaxLength),
     lineageId: candidateIdentifier(value.lineageId, "lineageId"),
     reason,
     predecessorLaneIds: sortedCandidateIdentifiers(value.predecessorLaneIds, "predecessorLaneIds"),
@@ -2477,15 +2480,15 @@ function assertExactKeys(value: Record<string, unknown>, allowed: string[], labe
   if (Object.keys(value).some((key) => !allowedKeys.has(key))) throw new Error(`${label} contains unknown fields.`);
 }
 
-function candidateIdentifier(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 240 || value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+function candidateIdentifier(value: unknown, field: string, maxLength = candidateIdentifierMaxLength): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > maxLength || value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new Error(`Workflow lane candidate binding ${field} is invalid.`);
   }
   return value;
 }
 
 function candidateVariantId(value: unknown): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > 240 || !/^[A-Za-z0-9._-]+$/.test(value)) {
+  if (typeof value !== "string" || value.length === 0 || value.length > candidateIdentifierMaxLength || !/^[A-Za-z0-9._-]+$/.test(value)) {
     throw new Error("Workflow lane candidate binding variantId is invalid.");
   }
   return value;

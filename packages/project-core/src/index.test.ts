@@ -1414,6 +1414,16 @@ describe("agent run contracts", () => {
       [{ ...binding, sourceHeadCommit: "g".repeat(40) }, /full commit SHA/i],
       [{ ...binding, sourceHeadCommit: "short-sha" }, /full commit SHA/i],
     ] as const) expect(() => parseWorkflowLaneCandidateBinding(malformed)).toThrow(reason);
+
+    const longSessionId = "s".repeat(200);
+    const longVariantId = `variant-${"b".repeat(64)}`;
+    const longBinding: WorkflowLaneCandidateBinding = {
+      ...binding,
+      sessionId: longSessionId,
+      variantId: longVariantId,
+      worktreeId: `worktree-${longSessionId}-${longVariantId}`,
+    };
+    expect(parseWorkflowLaneCandidateBinding(longBinding)).toEqual(longBinding);
   });
 
   it.each([
