@@ -1300,13 +1300,16 @@ ipcMain.handle("workflow:nodePosition:update", workflowHandler(async (projectRoo
 ipcMain.handle("workflow:projection", workflowHandler(async (projectRoot: string, sessionId: string) => {
   assertKnownProjectRoot(projectRoot);
   const workflowSessionId = assertWorkflowSessionId(sessionId);
-  const store = await getWorkflowStore(projectRoot);
-  await advanceWorkflowSession(projectRoot, store, workflowSessionId, false, "projection-query");
-  return {
-    protocolVersion: RUN_PROTOCOL_VERSION,
-    projection: store.materializeFlowProjection(workflowSessionId),
-    canvasSession: materializeRendererCanvasSession(store, workflowSessionId),
-  };
+  const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
+  return await withWorkflowSessionMutationLock(workflowProjectRoot, workflowSessionId, async () => {
+    const store = await getWorkflowStore(projectRoot);
+    await advanceWorkflowSession(projectRoot, store, workflowSessionId, false, "projection-query");
+    return {
+      protocolVersion: RUN_PROTOCOL_VERSION,
+      projection: store.materializeFlowProjection(workflowSessionId),
+      canvasSession: materializeRendererCanvasSession(store, workflowSessionId),
+    };
+  });
 }));
 
 ipcMain.handle("workflow:events", workflowHandler(async (projectRoot: string, sessionId: string) => {

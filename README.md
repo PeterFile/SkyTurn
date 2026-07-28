@@ -81,7 +81,7 @@ Partial and still being hardened:
 
 - Current-branch real loop beyond Phase 1: Current branch is the default main path, runs against the imported project root, and records real `RunEvidence`. Browser/mock fallback remains for development, and failure-repair, artifact, worktree, and delivery product paths still need later-phase hardening.
 - Artifact evidence: `RunEvidence` can carry artifacts and the MVP demo captures a screenshot artifact, but artifact capture/registration is still lane- and script-specific.
-- Failure-to-repair main path: kernel and selected-node foundations exist, but failed node to repair node to regression verification is not yet the default desktop loop.
+- Failure-to-repair main path: Implemented foundations now have deterministic Tested coverage from a seeded failed lane through the real Electron UI Repair entrypoint to automatically created Repair and Regression lanes. Both complete with real Codex CLI `exit 0` `RunEvidence`; `answer.js` is `42`, the seeded test hash and HEAD stay unchanged, and the full `CanvasSession` plus `FlowProjection` reopen exactly from SQLite and after Electron restart. This remains seeded-failure-only and Experimental (`experimental-run`), not Supported (`supported-run`): ordinary New Session does not yet produce this failure-to-repair flow as the default desktop loop, which still needs productization.
 - Worktree product loop: create, compare, adopt, clean, and rollback backend boundaries exist, but New worktree is not the current mainline and the compare/adopt/cleanup experience is not complete.
 - PTY planner transport: contracts, feature gates, IPC, snapshots, and fake-factory tests exist, but the default desktop runtime has no production PTY factory.
 
@@ -103,6 +103,8 @@ Not done or explicit non-goals:
 ## Verification Surfaces
 
 The real New Session product acceptance path is `pnpm --filter @skyturn/desktop run acceptance:new-session-ui`. It initializes a temporary Git project, opens it through the UI, creates a session through real controls, waits for Hermes and downstream execution evidence, submits a second ordinary Canvas input, restarts Electron, and compares the rendered nodes, edges, statuses, and input replay with the reopened SQLite projection. PTY is disabled unless explicitly enabled. The command requires local Hermes/Codex credentials and remains `experimental-run`, not `supported-run`.
+
+`pnpm --filter @skyturn/desktop run acceptance:failure-repair-regression` is both Harness-runnable and UI Entrypoint-runnable for the seeded-failure path. A successful run exits `0` with `ok=true`, drives Repair through the real Electron UI, observes automatically created Repair and Regression lanes complete with real Codex CLI `exit 0` `RunEvidence`, verifies `answer.js = 42` without changing the seeded test hash or HEAD, and requires the complete authoritative `CanvasSession` and `FlowProjection` to match exactly after SQLite reopen and Electron restart. Temporary project, profile, and runtime resources are cleaned. This surface depends on local Codex credentials and the Electron native ABI and remains Experimental (`experimental-run`), not Supported (`supported-run`); it does not make failure-to-repair the default ordinary New Session product loop.
 
 `pnpm --filter @skyturn/desktop run demo:mvp` remains the lower-level Hermes-to-Codex runtime acceptance. Neither command makes the later failure-repair, New worktree, or delivery tracks complete.
 

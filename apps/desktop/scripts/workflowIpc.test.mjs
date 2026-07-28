@@ -996,6 +996,43 @@ test("workflow projection responses keep the Hermes planner terminal binding", a
   );
 });
 
+test("workflow projection query materializes one authoritative snapshot under the session mutation lock", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const projectionHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:projection"'),
+    main.indexOf('ipcMain.handle("workflow:events"'),
+  );
+  const workflowStoreIdentityIndex = projectionHandler.indexOf(
+    "const workflowProjectRoot = await workflowStoreIdentity(projectRoot)",
+  );
+  const lockIndex = projectionHandler.indexOf(
+    "return await withWorkflowSessionMutationLock(workflowProjectRoot, workflowSessionId, async () => {",
+  );
+  const storeIndex = projectionHandler.indexOf("const store = await getWorkflowStore(projectRoot)");
+  const advanceIndex = projectionHandler.indexOf("await advanceWorkflowSession(");
+  const projectionIndex = projectionHandler.indexOf("projection: store.materializeFlowProjection(workflowSessionId)");
+  const canvasIndex = projectionHandler.indexOf(
+    "canvasSession: materializeRendererCanvasSession(store, workflowSessionId)",
+  );
+  const lockCloseIndex = projectionHandler.lastIndexOf("  });");
+
+  assert.ok(workflowStoreIdentityIndex >= 0, "projection query must canonicalize the store identity before locking");
+  assert.ok(lockIndex > workflowStoreIdentityIndex, "projection query must acquire the canonical session mutation lock");
+  assert.ok(storeIndex > lockIndex, "projection query must get the store again inside the lock");
+  assert.ok(advanceIndex > storeIndex, "projection query must advance the session inside the lock");
+  assert.ok(projectionIndex > advanceIndex, "projection query must materialize the projection after advancing");
+  assert.ok(canvasIndex > projectionIndex, "projection query must materialize CanvasSession from the same locked snapshot");
+  assert.ok(lockCloseIndex > canvasIndex, "the session mutation lock must cover the authoritative return boundary");
+  assert.doesNotMatch(
+    projectionHandler.slice(0, lockIndex),
+    /getWorkflowStore|advanceWorkflowSession|materializeFlowProjection|materializeRendererCanvasSession/,
+  );
+  assert.doesNotMatch(
+    projectionHandler.slice(lockCloseIndex + "  });".length),
+    /getWorkflowStore|advanceWorkflowSession|materializeFlowProjection|materializeRendererCanvasSession/,
+  );
+});
+
 test("workflow renderer canvas session responses use the terminal-aware materializer", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const projectionHandler = main.slice(

@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { readFile } from "node:fs/promises";
+import { PassThrough } from "node:stream";
 import test from "node:test";
 
 import {
   assertSeededCheckpointAuthority,
+  authoritativeStateDifference,
   automaticRepairHandoffState,
+  collectProcessOutput,
   createSeedWorkspaceState,
   failureRepairRegressionFixture,
   failureRepairRegressionSummary,
@@ -13,6 +17,22 @@ import {
 } from "./failureRepairRegressionAcceptance.mjs";
 
 const baselineHead = "a".repeat(40);
+
+test("failure repair process output preserves UTF-8 split across stream chunks", async () => {
+  const stream = new PassThrough();
+  let output = "";
+  collectProcessOutput(stream, (chunk) => { output += chunk; });
+  const bytes = Buffer.from("修复，回归", "utf8");
+  const punctuationOffset = Buffer.from("修复", "utf8").length;
+
+  stream.write(bytes.subarray(0, punctuationOffset + 1));
+  stream.write(bytes.subarray(punctuationOffset + 1, punctuationOffset + 2));
+  stream.end(bytes.subarray(punctuationOffset + 2));
+  await once(stream, "end");
+
+  assert.equal(output, "修复，回归");
+  assert.doesNotMatch(output, /\uFFFD/);
+});
 
 test("failure repair acceptance reuses the shared Electron and CDP lifecycle", async () => {
   const source = await readFile(new URL("failureRepairRegressionAcceptance.mjs", import.meta.url), "utf8");
@@ -34,6 +54,49 @@ test("failure repair acceptance reuses the shared Electron and CDP lifecycle", a
   );
   assert.doesNotMatch(waitSource, /getProjection/);
   assert.doesNotMatch(source, /class CdpClient|createConnection\(|WebSocket Protocol/);
+});
+
+test("failure repair acceptance reports the first different event and exact field values", () => {
+  const live = {
+    canvasSession: { id: "session", nodes: [{ id: "repair", status: "completed" }] },
+    projection: {
+      events: [
+        { seq: 1, kind: "workflow.lane.declared", idempotencyKey: "lane:declared", payload: { laneId: "repair" } },
+        { seq: 2, kind: "workflow.segment.finished", idempotencyKey: "segment:finished", payload: { status: "succeeded" } },
+      ],
+    },
+  };
+  const reopened = structuredClone(live);
+  reopened.canvasSession.nodes[0].status = "running";
+  reopened.projection.events[1].payload.status = "failed";
+
+  const difference = authoritativeStateDifference(live, reopened);
+
+  assert.deepEqual(difference.firstDifferentEvent, {
+    index: 1,
+    liveSequence: 2,
+    reopenedSequence: 2,
+    liveKind: "workflow.segment.finished",
+    reopenedKind: "workflow.segment.finished",
+    liveIdempotencyKey: "segment:finished",
+    reopenedIdempotencyKey: "segment:finished",
+    differingFields: [{
+      path: "$.payload.status",
+      liveValue: "succeeded",
+      reopenedValue: "failed",
+    }],
+  });
+  assert.deepEqual(difference.canvasSessionDifferingFields, [{
+    path: "$.nodes[0].status",
+    liveValue: "completed",
+    reopenedValue: "running",
+  }]);
+  assert.deepEqual(difference.projectionDifferingFields, [{
+    path: "$.events[1].payload.status",
+    liveValue: "succeeded",
+    reopenedValue: "failed",
+  }]);
+  assert.equal(authoritativeStateDifference(live, structuredClone(live)), null);
 });
 
 test("failure repair acceptance observes both automatic handoffs from authoritative broadcasts", () => {

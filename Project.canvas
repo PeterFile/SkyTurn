@@ -36,7 +36,7 @@
       "x": 0,
       "y": 900,
       "width": 820,
-      "height": 420,
+      "height": 480,
       "label": "④ Evidence",
       "color": "4"
     },
@@ -146,9 +146,9 @@
       "x": 820,
       "y": 500,
       "width": 360,
-      "height": 210,
-      "color": "6",
-      "text": "Task: Productize failure repair regression\nState: Proposed\nOwner: Hermes/Codex\nDepends: failed-node evidence and checkpoints\nEvidence: README four-track plan\nRisk: repair must not hide failed evidence"
+      "height": 250,
+      "color": "3",
+      "text": "Task: Productize failure repair regression\nState: Verify\nOwner: Hermes/Codex\nDepends: seeded failed-node evidence and checkpoints; same-session mutation lock projection materialization\nEvidence: Seeded failure repair exact-reopen acceptance\nLevel: Implemented foundations + deterministic Tested; seeded Experimental, not Supported\nRisk: ordinary New Session default loop remains unproductized; local Codex and Electron ABI dependencies; failed evidence must remain visible"
     },
     {
       "id": "1000000000000011",
@@ -219,6 +219,16 @@
       "height": 160,
       "color": "4",
       "text": "Decision: Preserve product boundary\nRationale: SkyTurn is desktop workflow, not IDE or terminal dashboard\nImpact: Canvas stays dominant; details stay in Node Modal tabs"
+    },
+    {
+      "id": "d6c6a9445890c0f7",
+      "type": "text",
+      "x": 40,
+      "y": 1200,
+      "width": 750,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Seeded failure repair exact-reopen acceptance\ncommit: none\ntest: pnpm --filter @skyturn/desktop run acceptance:failure-repair-regression -> exit 0, ok=true; seeded failed lane -> real Electron UI Repair -> automatic Repair + Regression; both completed with real Codex CLI exit 0 RunEvidence; answer.js=42; seeded test hash unchanged; HEAD unchanged; complete CanvasSession + FlowProjection exact after SQLite reopen and Electron restart\nbuild: exact-head PR CI pending for pnpm run build; pnpm run test; pnpm run typecheck; pnpm run lint\nmanual: Harness-runnable + UI Entrypoint-runnable only from seeded failure; Experimental, not Supported; ordinary New Session default loop still needs productization; depends on local Codex credentials and Electron native ABI\nartifact: Temporary project, Electron profile, and runtime resources cleaned"
     }
   ],
   "edges": [
@@ -285,7 +295,6 @@
       "toEnd": "arrow",
       "label": "gates"
     },
-
     {
       "id": "2000000000000009",
       "fromNode": "1000000000000009",
@@ -353,6 +362,14 @@
       "id": "4054c54373573560",
       "fromNode": "1000000000000008",
       "toNode": "1000000000000013",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "1f9061250a2b6940",
+      "fromNode": "1000000000000010",
+      "toNode": "d6c6a9445890c0f7",
       "toEnd": "arrow",
       "label": "evidence",
       "color": "4"
