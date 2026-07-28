@@ -130,6 +130,8 @@ export type WorkflowRollbackLocalSafetyStatus =
   | "already_restored";
 export type WorkflowCheckpointIntentKind = "rollback" | "repair" | "variant" | "fork";
 export type WorkflowCheckpointIntentStatus = "requested" | "applied" | "rejected";
+export type WorkflowLaneCandidateBindingReason = "default" | "serial" | "repair" | "regression" | "variant" | "explicit_join";
+export type WorkflowLaneCandidateBindingBlockReason = "ambiguous_predecessor_lineage" | "conflicting_predecessor_binding";
 export type ChangesetEvidenceStatus = "available" | "empty" | "failed" | "unknown";
 export type LiveRunChangeOperation = "add" | "delete" | "update" | "move";
 export type FinalChangesetReconciliationStatus = "available" | "empty" | "failed" | "mismatch";
@@ -1598,6 +1600,7 @@ export interface WorktreeMetadata {
   baselineRef?: string;
   worktreeId?: string;
   variantId?: string;
+  lineageId?: string;
   realPath?: string;
   gitdir?: string;
   repoRoot?: string;
@@ -1680,6 +1683,25 @@ export interface WorkflowWorktreeIdentity {
   headCommit: string;
   parentLaneId: string;
   parentSegmentId?: string;
+}
+
+export interface WorkflowLaneCandidateBinding {
+  sessionId: string;
+  laneId: string;
+  worktreeId: string;
+  lineageId: string;
+  reason: WorkflowLaneCandidateBindingReason;
+  predecessorLaneIds: string[];
+  sourceCheckpointId?: string;
+  sourceHeadCommit?: string;
+}
+
+export interface WorkflowLaneCandidateBindingBlock {
+  sessionId: string;
+  laneId: string;
+  reason: WorkflowLaneCandidateBindingBlockReason;
+  predecessorLaneIds: string[];
+  lineageIds: string[];
 }
 
 export interface WorkflowVariantAdoption {
@@ -2058,6 +2080,7 @@ export interface CanvasNode {
   changesetId: string;
   output: string[];
   outputDeltas?: RunEvent[];
+  candidateBinding?: WorkflowLaneCandidateBinding;
   worktree: WorktreeMetadata;
   context: CanvasNodeContext;
 }
@@ -2389,6 +2412,81 @@ export function normalizeSessionTarget(value: unknown, fallbackSelectedBranch = 
     selectedBranch: selectedBranch || baseRef,
     baseRef,
   };
+}
+
+export function parseWorkflowLaneCandidateBinding(value: unknown): WorkflowLaneCandidateBinding {
+  if (!isRecord(value)) throw new Error("Workflow lane candidate binding must be an object.");
+  assertExactKeys(value, [
+    "sessionId", "laneId", "worktreeId", "lineageId", "reason", "predecessorLaneIds",
+    "sourceCheckpointId", "sourceHeadCommit",
+  ], "Workflow lane candidate binding");
+  const reason = value.reason;
+  if (
+    reason !== "default" && reason !== "serial" && reason !== "repair" &&
+    reason !== "regression" && reason !== "variant" && reason !== "explicit_join"
+  ) throw new Error("Workflow lane candidate binding reason is invalid.");
+  const binding: WorkflowLaneCandidateBinding = {
+    sessionId: candidateIdentifier(value.sessionId, "sessionId"),
+    laneId: candidateIdentifier(value.laneId, "laneId"),
+    worktreeId: candidateIdentifier(value.worktreeId, "worktreeId"),
+    lineageId: candidateIdentifier(value.lineageId, "lineageId"),
+    reason,
+    predecessorLaneIds: sortedCandidateIdentifiers(value.predecessorLaneIds, "predecessorLaneIds"),
+  };
+  const checkpointCausal = reason === "repair" || reason === "regression" || reason === "variant";
+  if (checkpointCausal) {
+    binding.sourceCheckpointId = candidateIdentifier(value.sourceCheckpointId, "sourceCheckpointId");
+    if (typeof value.sourceHeadCommit !== "string" || !/^[0-9a-f]{40}$/i.test(value.sourceHeadCommit)) {
+      throw new Error("Workflow lane candidate binding sourceHeadCommit must be a full commit SHA.");
+    }
+    binding.sourceHeadCommit = value.sourceHeadCommit.toLowerCase();
+  } else if (value.sourceCheckpointId !== undefined || value.sourceHeadCommit !== undefined) {
+    throw new Error("Workflow lane candidate binding source checkpoint is not valid for this reason.");
+  }
+  return binding;
+}
+
+export function parseWorkflowLaneCandidateBindingBlock(value: unknown): WorkflowLaneCandidateBindingBlock {
+  if (!isRecord(value)) throw new Error("Workflow lane candidate binding block must be an object.");
+  assertExactKeys(value, ["sessionId", "laneId", "reason", "predecessorLaneIds", "lineageIds"], "Workflow lane candidate binding block");
+  if (value.reason !== "ambiguous_predecessor_lineage" && value.reason !== "conflicting_predecessor_binding") {
+    throw new Error("Workflow lane candidate binding block reason is invalid.");
+  }
+  const block: WorkflowLaneCandidateBindingBlock = {
+    sessionId: candidateIdentifier(value.sessionId, "sessionId"),
+    laneId: candidateIdentifier(value.laneId, "laneId"),
+    reason: value.reason,
+    predecessorLaneIds: sortedCandidateIdentifiers(value.predecessorLaneIds, "predecessorLaneIds"),
+    lineageIds: sortedCandidateIdentifiers(value.lineageIds, "lineageIds"),
+  };
+  const invalidLineageCardinality = block.reason === "ambiguous_predecessor_lineage"
+    ? block.lineageIds.length < 2 : block.lineageIds.length !== 1;
+  if (block.predecessorLaneIds.length < 2 || invalidLineageCardinality) {
+    throw new Error("Workflow lane candidate binding block requires predecessor lineage evidence.");
+  }
+  return block;
+}
+
+function assertExactKeys(value: Record<string, unknown>, allowed: string[], label: string): void {
+  const allowedKeys = new Set(allowed);
+  if (Object.keys(value).some((key) => !allowedKeys.has(key))) throw new Error(`${label} contains unknown fields.`);
+}
+
+function candidateIdentifier(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 240 || value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`Workflow lane candidate binding ${field} is invalid.`);
+  }
+  return value;
+}
+
+function sortedCandidateIdentifiers(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`Workflow lane candidate binding ${field} must be an array.`);
+  const items = value.map((item) => candidateIdentifier(item, field));
+  if (new Set(items).size !== items.length) throw new Error(`Workflow lane candidate binding ${field} must be unique.`);
+  if (items.some((item, index) => index > 0 && items[index - 1]! > item)) {
+    throw new Error(`Workflow lane candidate binding ${field} must be sorted.`);
+  }
+  return items;
 }
 
 export function deriveNodeStatusFromEvidence(
