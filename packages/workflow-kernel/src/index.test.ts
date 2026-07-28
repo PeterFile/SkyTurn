@@ -5765,13 +5765,13 @@ describe("Flow Kernel gate engine and scheduler", () => {
   });
 
   it("keeps one exact duplicate candidate-bound event for an idempotency key", () => {
-    const binding = candidateBinding("lane-a", "worktree-default", "lineage-default", "variant", [], checkpointSource("before-a", "A"));
+    const binding = candidateBinding("lane-a", "candidate", "lineage-default", "variant", [], checkpointSource("before-a", "A"));
     const recorded = event("workflow.lane.candidate_bound", { binding });
     expect(reduceWorkflowEvents([recorded, { ...recorded, id: `${recorded.id}:retry`, payload: { binding: { ...binding, sourceHeadCommit: "a".repeat(40) } } }]).candidateBindings).toEqual([{ ...binding, sourceHeadCommit: "a".repeat(40) }]);
   });
 
   it("rejects conflicting candidate-bound payloads for an idempotency key", () => {
-    const binding = candidateBinding("lane-a", "worktree-default", "lineage-default", "default", []);
+    const binding = candidateBinding("lane-a", "candidate", "lineage-default", "default", []);
     const recorded = event("workflow.lane.candidate_bound", { binding });
     expect(() => reduceWorkflowEvents([recorded,
       { ...recorded, payload: { binding: { ...binding, lineageId: "lineage-conflict" } } }])).toThrow(/idempotent replay/i);
@@ -5780,7 +5780,13 @@ describe("Flow Kernel gate engine and scheduler", () => {
   it("keeps one exact duplicate candidate-binding-blocked event for an idempotency key", () => {
     const block = candidateBindingBlock("ambiguous_predecessor_lineage", ["lineage-a", "lineage-b"]);
     const recorded = event("workflow.lane.candidate_binding_blocked", { block });
-    expect(reduceWorkflowEvents([recorded, { ...recorded, id: `${recorded.id}:retry` }]).candidateBindingBlocks).toEqual([block]);
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-join", "integration_join") }),
+      recorded,
+      { ...recorded, id: `${recorded.id}:retry` },
+    ]);
+    expect(projection.candidateBindingBlocks).toEqual([block]);
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 1 })).toEqual([]);
   });
 
   it("rejects conflicting candidate-binding-blocked payloads for an idempotency key", () => {
@@ -5791,7 +5797,7 @@ describe("Flow Kernel gate engine and scheduler", () => {
   });
 
   it("rejects bound-blocked idempotency collisions in both event orders", () => {
-    const bindingEvent = event("workflow.lane.candidate_bound", { binding: candidateBinding("lane-join", "worktree-a", "lineage-a", "default", []) });
+    const bindingEvent = event("workflow.lane.candidate_bound", { binding: candidateBinding("lane-join", "a", "lineage-a", "default", []) });
     const blockedEvent = { ...event("workflow.lane.candidate_binding_blocked",
       { block: candidateBindingBlock("ambiguous_predecessor_lineage", ["lineage-a", "lineage-b"]) }), idempotencyKey: bindingEvent.idempotencyKey };
     expect(() => reduceWorkflowEvents([bindingEvent, blockedEvent])).toThrow(/idempotent replay/i);
@@ -5799,49 +5805,50 @@ describe("Flow Kernel gate engine and scheduler", () => {
   });
 
   it("resolves same-identity fan-in and classifies predecessor binding conflicts", () => {
-    const shared = candidateBinding("lane-a", "worktree-default", "lineage-default", "default", []);
+    const shared = candidateBinding("lane-a", "candidate", "lineage-default", "default", []);
     expect(resolveLaneCandidateBinding(boundJoinProjection(
       shared, { ...shared, laneId: "lane-b", reason: "serial", predecessorLaneIds: ["lane-a"] },
     ), "lane-join")).toMatchObject({
       status: "bound",
-      binding: { worktreeId: shared.worktreeId, lineageId: shared.lineageId, reason: "explicit_join" },
+      binding: { variantId: shared.variantId, worktreeId: shared.worktreeId, lineageId: shared.lineageId, reason: "explicit_join" },
     });
     expect(resolveLaneCandidateBinding(boundJoinProjection(
-      candidateBinding("lane-a", "worktree-a", "lineage-a", "default", []),
-      candidateBinding("lane-b", "worktree-b", "lineage-b", "variant", [], checkpointSource("before-b", "b")),
+      candidateBinding("lane-a", "a", "lineage-a", "default", []),
+      candidateBinding("lane-b", "b", "lineage-b", "variant", [], checkpointSource("before-b", "b")),
     ), "lane-join")).toMatchObject({
       status: "blocked",
       block: { reason: "ambiguous_predecessor_lineage", lineageIds: ["lineage-a", "lineage-b"] },
     });
     expect(resolveLaneCandidateBinding(boundJoinProjection(
-      candidateBinding("lane-a", "worktree-a", "lineage-shared", "default", []),
-      candidateBinding("lane-b", "worktree-b", "lineage-shared", "serial", ["lane-a"]),
+      candidateBinding("lane-a", "a", "lineage-shared", "default", []),
+      candidateBinding("lane-b", "b", "lineage-shared", "serial", ["lane-a"]),
     ), "lane-join")).toMatchObject({
       status: "blocked", block: { reason: "conflicting_predecessor_binding", lineageIds: ["lineage-shared"] },
     });
   });
 
   it("derives repair, regression, and variant bindings from checkpoint causality", () => {
-    const { projection, afterCheckpoint, beforeCheckpoint } = checkpointBindingProjection();
+    const { projection, afterCheckpoint } = checkpointBindingProjection();
     const repair = resolveLaneCandidateBinding(projection, "lane-repair");
     expect(repair).toMatchObject({ status: "bound",
-      binding: { reason: "repair", sourceCheckpointId: afterCheckpoint.id } });
+      binding: { variantId: "candidate", reason: "repair", sourceCheckpointId: afterCheckpoint.id } });
     const withRepair = reduceWorkflowEvents([
       ...projection.events, event("workflow.lane.candidate_bound", { binding: repair.status === "bound" ? repair.binding : {} }),
     ]);
     expect(resolveLaneCandidateBinding(withRepair, "lane-regression")).toMatchObject({ status: "bound",
-      binding: { reason: "regression", sourceCheckpointId: afterCheckpoint.id } });
-    expect(resolveLaneCandidateBinding(projection, "lane-variant")).toMatchObject({ status: "bound",
-      binding: { reason: "variant", sourceCheckpointId: beforeCheckpoint.id } });
+      binding: { variantId: "candidate", reason: "regression", sourceCheckpointId: afterCheckpoint.id } });
+    expect(resolveLaneCandidateBinding(projection, "lane-variant")).toMatchObject({
+      status: "unavailable",
+    });
   });
 
   it("requires exactly a 40-character hexadecimal checkpoint commit for candidate resolution", () => {
-    const { projection, beforeCheckpoint } = checkpointBindingProjection();
-    expect(resolveLaneCandidateBinding(projection, "lane-variant").status).toBe("bound");
+    const { projection, afterCheckpoint } = checkpointBindingProjection();
+    expect(resolveLaneCandidateBinding(projection, "lane-repair").status).toBe("bound");
     for (const headCommit of ["b".repeat(64), "g".repeat(40)]) {
       const checkpoints = projection.checkpoints.map((item) =>
-        item.id === beforeCheckpoint.id ? { ...item, headCommit } : item);
-      expect(resolveLaneCandidateBinding({ ...projection, checkpoints }, "lane-variant"))
+        item.id === afterCheckpoint.id ? { ...item, headCommit } : item);
+      expect(resolveLaneCandidateBinding({ ...projection, checkpoints }, "lane-repair"))
         .toMatchObject({ status: "unavailable" });
     }
   });
@@ -6109,7 +6116,7 @@ function checkpoint(
 
 function candidateBinding(
   laneId: string,
-  worktreeId: string,
+  variantId: string,
   lineageId: string,
   reason: "default" | "serial" | "repair" | "regression" | "variant" | "explicit_join",
   predecessorLaneIds: string[],
@@ -6118,7 +6125,8 @@ function candidateBinding(
   return {
     sessionId: "session-1",
     laneId,
-    worktreeId,
+    variantId,
+    worktreeId: `worktree-session-1-${variantId}`,
     lineageId,
     reason,
     predecessorLaneIds,
@@ -6152,7 +6160,7 @@ function boundJoinProjection(first: ReturnType<typeof candidateBinding>, second:
 }
 
 function checkpointBindingProjection() {
-  const source = candidateBinding("lane-source", "worktree-default", "lineage-default", "default", []);
+  const source = candidateBinding("lane-source", "candidate", "lineage-default", "default", []);
   const afterCheckpoint = { ...checkpoint("checkpoint-after-source", "lane-source", "after", "a".repeat(40)), worktreeId: source.worktreeId, worktreeState: "dirty" };
   const beforeCheckpoint = { ...checkpoint("checkpoint-before-source", "lane-source", "before", "b".repeat(40)), worktreeId: source.worktreeId, worktreeState: "clean" };
   const successor = (kind: "repair" | "variant", checkpointId: string) => event(`workflow.node.${kind}_requested`, {
