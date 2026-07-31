@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
+import { execFile, execFileSync } from "node:child_process";
+import fs from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import path, { dirname, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import vm from "node:vm";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -514,6 +518,268 @@ test("public run:start and private planner delivery have separate main-only auth
   );
   assert.match(scheduledInputBuilder, /runtime\.sandboxForNodeRun\(node\)/);
   assert.match(scheduledInputBuilder, /prompt:\s*runtime\.buildPromptForNodeRun\(session, node, ledger\)/);
+});
+
+test("scheduled New-worktree lanes use the real Git service to create, reuse, reopen, and separate durable candidates", async (t) => {
+  const harness = await createRealScheduledWorktreeHarness(t);
+  const firstPath = await harness.resolve(
+    harness.projectRoot,
+    harness.store,
+    scheduledWorktreeSession(),
+    scheduledWorktreeNode("lane-implementation", candidateBinding("lane-implementation")),
+    "segment-implementation",
+  );
+  const created = harness.createdEvents()[0].payload.worktree;
+
+  assert.equal(firstPath, created.realPath);
+  assert.equal(created.path, created.realPath);
+  assert.equal(await fs.realpath(created.path), created.path);
+  assert.equal(git(harness.projectRoot, ["worktree", "list", "--porcelain"]).includes(firstPath), true);
+  assert.deepEqual(harness.createCalls.map((call) => toPlain(call)), [{
+    sessionId: "session-1",
+    variantId: "candidate",
+    repoRoot: harness.projectRoot,
+    baseCommit: harness.baseCommit,
+    branchName: "skyturn/session-1/candidate",
+    parentLaneId: "lane-implementation",
+    parentSegmentId: "segment-implementation",
+  }]);
+
+  const advancedHead = await commitWorktree(firstPath, "serial-head");
+  const serialNode = scheduledWorktreeNode(
+    "lane-validation",
+    candidateBinding("lane-validation", {
+      reason: "serial",
+      predecessorLaneIds: ["lane-implementation"],
+    }),
+  );
+  const serialPath = await harness.resolve(
+    harness.projectRoot,
+    harness.store,
+    scheduledWorktreeSession(),
+    serialNode,
+    "segment-validation",
+  );
+
+  assert.equal(serialPath, firstPath);
+  assert.equal(git(firstPath, ["rev-parse", "HEAD"]), advancedHead);
+  assert.equal(harness.createCalls.length, 1);
+  assert.equal(harness.createdEvents().length, 1);
+  assert.equal(harness.reconcileCalls.length, 1);
+  assert.deepEqual(toPlain(harness.reconcileCalls[0].options), { allowHeadAdvance: true });
+
+  const persistedEvents = structuredClone(harness.events);
+  const reopened = await loadScheduledWorkflowWorktreeRuntime(harness.createService);
+  assert.equal(
+    await reopened.resolveScheduledWorkflowWorktree(
+      harness.projectRoot,
+      storeWithMutableEvents(persistedEvents),
+      scheduledWorktreeSession(),
+      serialNode,
+      "segment-validation-reopened",
+    ),
+    firstPath,
+  );
+  assert.equal(harness.createCalls.length, 1);
+  assert.equal(harness.reconcileCalls.length, 2);
+
+  const variantPath = await reopened.resolveScheduledWorkflowWorktree(
+    harness.projectRoot,
+    storeWithMutableEvents(persistedEvents),
+    scheduledWorktreeSession(),
+    scheduledWorktreeNode("lane-variant", candidateBinding("lane-variant", {
+      variantId: "variant-a",
+      lineageId: "lineage-session-1-variant-a",
+      reason: "variant",
+      sourceCheckpointId: "checkpoint-before-a",
+      sourceHeadCommit: harness.baseCommit,
+    })),
+    "segment-variant",
+  );
+  assert.notEqual(variantPath, firstPath);
+  assert.equal(git(variantPath, ["branch", "--show-current"]), "skyturn/session-1/variant-a");
+  assert.deepEqual(harness.createCalls.map((call) => call.variantId), ["candidate", "variant-a"]);
+  assert.equal(persistedEvents.filter((event) => event.kind === "workflow.worktree.created").length, 2);
+});
+
+test("scheduled New-worktree reuse rejects aliased and tampered durable identities through the real Git resolver", async (t) => {
+  const harness = await createRealScheduledWorktreeHarness(t);
+  const binding = candidateBinding("lane-implementation");
+  const node = scheduledWorktreeNode("lane-implementation", binding);
+  const worktreePath = await harness.resolve(
+    harness.projectRoot,
+    harness.store,
+    scheduledWorktreeSession(),
+    node,
+    "segment-implementation",
+  );
+  const advancedHead = await commitWorktree(worktreePath, "tamper-head");
+  const createdEvent = harness.createdEvents()[0];
+  const created = createdEvent.payload.worktree;
+  const aliasPath = join(harness.tempRoot, "candidate-alias");
+  await fs.symlink(created.realPath, aliasPath, process.platform === "win32" ? "junction" : "dir");
+  const canonicalAliasPath = await fs.realpath(aliasPath);
+  assert.equal(canonicalAliasPath, created.realPath);
+
+  const corruptions = [
+    {
+      label: "symlink alias",
+      events: replaceCreatedWorktree(harness.events, { path: aliasPath, realPath: aliasPath }),
+      reconcile: false,
+    },
+    {
+      label: "alternate path spelling",
+      events: replaceCreatedWorktree(harness.events, { path: `${created.path}${path.sep}.` }),
+      reconcile: false,
+    },
+    {
+      label: "branch",
+      events: replaceCreatedWorktree(harness.events, { branchName: "skyturn/session-1/forged" }),
+      reconcile: false,
+    },
+    {
+      label: "gitdir",
+      events: replaceCreatedWorktree(harness.events, { gitdir: join(harness.projectRoot, ".git") }),
+      reconcile: true,
+    },
+    {
+      label: "path",
+      events: replaceCreatedWorktree(harness.events, { path: aliasPath }),
+      reconcile: false,
+    },
+    {
+      label: "head",
+      events: replaceCreatedWorktree(harness.events, { headCommit: advancedHead }),
+      reconcile: false,
+    },
+    {
+      label: "conflicting",
+      events: [
+        ...structuredClone(harness.events),
+        createdWorktreeEventWith(createdEvent, {
+          baseCommit: advancedHead,
+          headCommit: advancedHead,
+        }),
+      ],
+      reconcile: false,
+    },
+    {
+      label: "cleaned",
+      events: [
+        ...structuredClone(harness.events),
+        {
+          sessionId: "session-1",
+          kind: "workflow.worktree.cleaned",
+          source: "git-worktree",
+          idempotencyKey: `worktree:${created.worktreeId}:cleaned`,
+          createdAt: "2026-07-30T00:00:00.000Z",
+          payload: {
+            worktree: created,
+            result: { ok: true, worktreeId: created.worktreeId },
+          },
+        },
+      ],
+      reconcile: false,
+    },
+  ];
+  const varAlias = created.realPath.replace(/^\/private\/var(?=\/)/, "/var");
+  if (varAlias !== created.realPath) {
+    assert.equal(await fs.realpath(varAlias), created.realPath);
+    corruptions.push({
+      label: "/var alias",
+      events: replaceCreatedWorktree(harness.events, { path: varAlias, realPath: varAlias }),
+      reconcile: false,
+    });
+  }
+
+  for (const corruption of corruptions) {
+    const reconcileCount = harness.reconcileCalls.length;
+    await assert.rejects(
+      harness.resolve(
+        harness.projectRoot,
+        storeWithMutableEvents(corruption.events),
+        scheduledWorktreeSession(),
+        node,
+        `segment-${corruption.label}`,
+      ),
+      /worktree|candidate|branch|gitdir|path|head|identity|cleaned/i,
+      corruption.label,
+    );
+    assert.equal(
+      harness.reconcileCalls.length,
+      reconcileCount + (corruption.reconcile ? 1 : 0),
+      `${corruption.label} reached an unexpected production reconciliation boundary`,
+    );
+  }
+  assert.equal(harness.createCalls.length, 1);
+});
+
+test("scheduled New-worktree lanes reject invalid durable candidate bindings before real Git creation", async (t) => {
+  const harness = await createRealScheduledWorktreeHarness(t);
+  const valid = candidateBinding("lane-implementation");
+  for (const [label, binding] of [
+    ["missing", undefined],
+    ["malformed", { ...valid, unexpected: true }],
+    ["cross-session", { ...valid, sessionId: "session-other" }],
+    ["cross-lane", { ...valid, laneId: "lane-other" }],
+    ["mismatched-worktree", { ...valid, worktreeId: "worktree-session-1-other" }],
+  ]) {
+    await assert.rejects(
+      harness.resolve(
+        harness.projectRoot,
+        harness.store,
+        scheduledWorktreeSession(),
+        scheduledWorktreeNode("lane-implementation", binding),
+        `segment-${label}`,
+      ),
+      /candidate binding/i,
+      label,
+    );
+  }
+  assert.equal(harness.createCalls.length, 0);
+  assert.equal(harness.reconcileCalls.length, 0);
+});
+
+test("scheduled Current-branch lanes still resolve only the canonical project root", async (t) => {
+  const harness = await createRealScheduledWorktreeHarness(t);
+  const session = scheduledWorktreeSession();
+  session.target.executionTarget = "current_branch";
+  const node = scheduledWorktreeNode("lane-current", undefined);
+  node.worktree.executionTarget = "current_branch";
+  node.worktree.path = join(harness.tempRoot, "forged");
+  node.worktree.realPath = join(harness.tempRoot, "forged");
+
+  assert.equal(
+    await harness.resolve(harness.projectRoot, harness.store, session, node, "segment-current"),
+    harness.projectRoot,
+  );
+  assert.equal(harness.createCalls.length, 0);
+  assert.equal(harness.reconcileCalls.length, 0);
+});
+
+test("scheduler compensates the exact durable segment when scheduled worktree resolution rejects", async () => {
+  const segment = {
+    sessionId: "session-1",
+    laneId: "lane-implementation",
+    segmentId: "segment-implementation",
+    runId: "run-implementation",
+    agentKind: "codex",
+  };
+  const result = await runScheduledResolverFailure(segment);
+
+  assert.deepEqual(toPlain(result.resolveCalls), [{
+    projectRoot: "/canonical/project",
+    sessionId: "session-1",
+    laneId: "lane-implementation",
+    segmentId: "segment-implementation",
+  }]);
+  assert.deepEqual(toPlain(result.compensations), [{
+    segment,
+    message: "Scheduled worktree reconciliation rejected.",
+  }]);
+  assert.equal(result.scheduledStartCalls, 0);
+  assert.equal(result.adapterLaunches, 0);
+  assert.equal(result.reopenCalls, 0);
 });
 
 test("MVP demo links the temporary React app to desktop package dependencies", async () => {
@@ -2871,9 +3137,23 @@ async function loadMainDeliveryRendererHelpers() {
 }
 
 function extractFunction(source, name) {
-  const start = source.indexOf(`function ${name}`);
-  assert.ok(start >= 0, `missing function ${name}`);
-  const braceStart = source.indexOf("{", start);
+  const functionStart = source.indexOf(`function ${name}`);
+  assert.ok(functionStart >= 0, `missing function ${name}`);
+  const start = source.slice(Math.max(0, functionStart - 6), functionStart) === "async "
+    ? functionStart - 6
+    : functionStart;
+  const parametersStart = source.indexOf("(", functionStart);
+  let parametersDepth = 0;
+  let parametersEnd = -1;
+  for (let index = parametersStart; index < source.length; index += 1) {
+    if (source[index] === "(") parametersDepth += 1;
+    if (source[index] === ")") parametersDepth -= 1;
+    if (parametersDepth === 0) {
+      parametersEnd = index;
+      break;
+    }
+  }
+  const braceStart = source.indexOf("{", parametersEnd);
   assert.ok(braceStart > start, `missing function body for ${name}`);
   let depth = 0;
   for (let index = braceStart; index < source.length; index += 1) {
@@ -2908,6 +3188,383 @@ function methodResultType(method) {
 
 function toPlain(value) {
   return JSON.parse(JSON.stringify(value));
+}
+
+let productionGitWorktreeModulePromise;
+
+async function createRealScheduledWorktreeHarness(t) {
+  const tempRoot = await fs.mkdtemp(join(tmpdir(), "skyturn-scheduled-worktree-"));
+  t.after(() => fs.rm(tempRoot, { recursive: true, force: true }));
+  const projectPath = join(tempRoot, "project");
+  git(tempRoot, ["init", "project"]);
+  git(projectPath, ["checkout", "-b", "main"]);
+  git(projectPath, ["config", "user.email", "skyturn@example.test"]);
+  git(projectPath, ["config", "user.name", "SkyTurn Test"]);
+  await fs.writeFile(join(projectPath, "base.txt"), "base\n");
+  git(projectPath, ["add", "base.txt"]);
+  git(projectPath, ["commit", "-m", "initial"]);
+  const projectRoot = await fs.realpath(projectPath);
+  const baseCommit = git(projectRoot, ["rev-parse", "HEAD"]);
+  const events = [];
+  const createCalls = [];
+  const reconcileCalls = [];
+  const production = await loadProductionGitWorktreeModule();
+  const createService = (options = {}) => {
+    const service = production.createNodeGitWorktreeService(options);
+    return {
+      createManagedWorktree(input) {
+        createCalls.push(structuredClone(input));
+        return service.createManagedWorktree(input);
+      },
+      reconcileManagedWorktree(worktree, reconcileOptions) {
+        reconcileCalls.push({
+          worktree: structuredClone(worktree),
+          options: structuredClone(reconcileOptions),
+        });
+        return service.reconcileManagedWorktree(worktree, reconcileOptions);
+      },
+    };
+  };
+  const runtime = await loadScheduledWorkflowWorktreeRuntime(createService);
+  const store = storeWithMutableEvents(events);
+
+  return {
+    ...runtime,
+    resolve: runtime.resolveScheduledWorkflowWorktree,
+    tempRoot,
+    projectRoot,
+    baseCommit,
+    events,
+    store,
+    createCalls,
+    reconcileCalls,
+    createService,
+    createdEvents: () => events.filter((event) => event.kind === "workflow.worktree.created"),
+  };
+}
+
+async function loadProductionGitWorktreeModule() {
+  productionGitWorktreeModulePromise ??= (async () => {
+    const ts = require("typescript");
+    const projectCore = transpileCommonJsModule(
+      await readFile(join(root, "..", "..", "packages", "project-core", "src", "index.ts"), "utf8"),
+      "project-core.index.ts",
+      require,
+      ts,
+    );
+    const indexModule = transpileCommonJsModule(
+      await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "index.ts"), "utf8"),
+      "git-worktree.index.ts",
+      (specifier) => specifier === "@skyturn/project-core" ? projectCore : require(specifier),
+      ts,
+    );
+    return transpileCommonJsModule(
+      await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "node.ts"), "utf8"),
+      "git-worktree.node.ts",
+      (specifier) => specifier === "./index.js" ? indexModule : require(specifier),
+      ts,
+      { Buffer, process },
+    );
+  })();
+  return productionGitWorktreeModulePromise;
+}
+
+function transpileCommonJsModule(source, filename, load, ts, globals = {}) {
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, {
+    module,
+    exports: module.exports,
+    require: load,
+    ...globals,
+  }, { filename });
+  return module.exports;
+}
+
+async function loadScheduledWorkflowWorktreeRuntime(createNodeGitWorktreeService) {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const projectCore = await readFile(join(root, "..", "..", "packages", "project-core", "src", "index.ts"), "utf8");
+  const source = [
+    projectCore.slice(
+      projectCore.indexOf("const candidateIdentifierMaxLength"),
+      projectCore.indexOf("export function parseWorkflowLaneCandidateBinding"),
+    ),
+    extractFunction(projectCore, "parseWorkflowLaneCandidateBinding"),
+    extractFunction(projectCore, "assertExactKeys"),
+    extractFunction(projectCore, "candidateIdentifier"),
+    extractFunction(projectCore, "candidateVariantId"),
+    extractFunction(projectCore, "sortedCandidateIdentifiers"),
+    extractFunction(main, "optionalText"),
+    extractFunction(main, "isRecord"),
+    extractFunction(main, "readField"),
+    extractFunction(main, "requireRecord"),
+    extractFunction(main, "requireText"),
+    extractFunction(main, "isInsidePath"),
+    extractFunction(main, "workflowWorktreeIdentityFromRecord"),
+    extractFunction(main, "managedWorktreeEventsFromStore"),
+    extractFunction(main, "isManagedWorktreeEventKind"),
+    extractFunction(main, "findWorktreeCreatedEvent"),
+    extractFunction(main, "findCreatedWorktreeIdentity"),
+    extractFunction(main, "assertAdoptedWorktreeBelongsToProject"),
+    extractFunction(main, "createManagedWorkflowWorktreeForRun"),
+    extractFunction(main, "requireScheduledWorkflowCandidateBinding"),
+    extractFunction(main, "assertScheduledWorkflowNodeCandidateIdentity"),
+    extractFunction(main, "findScheduledWorkflowCreatedIdentity"),
+    extractFunction(main, "sameScheduledWorkflowWorktreeIdentity"),
+    extractFunction(main, "canonicalScheduledWorkflowWorktreePath"),
+    extractFunction(main, "reconcileManagedWorkflowWorktreeForRun"),
+    extractFunction(main, "resolveScheduledWorkflowWorktree"),
+    main.slice(
+      main.indexOf("async function resolveGitCommit"),
+      main.indexOf("function recordWorktreeCreateFailure"),
+    ),
+    "module.exports = { parseWorkflowLaneCandidateBinding, resolveScheduledWorkflowWorktree };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, {
+    module,
+    exports: module.exports,
+    execFileAsync: promisify(execFile),
+    fs,
+    path,
+    recordWorktreeCreateFailure() {
+      throw new Error("Unexpected worktree-create failure path.");
+    },
+    workflowIpcError(code, message) {
+      const error = new Error(message);
+      error.code = code;
+      return error;
+    },
+    require(specifier) {
+      if (specifier === "@skyturn/project-core") {
+        return { parseWorkflowLaneCandidateBinding: module.exports.parseWorkflowLaneCandidateBinding };
+      }
+      if (specifier === "@skyturn/git-worktree/node") return { createNodeGitWorktreeService };
+      return require(specifier);
+    },
+  }, { filename: "main.scheduledWorkflowWorktree.ts" });
+  return module.exports;
+}
+
+async function runScheduledResolverFailure(segment) {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    extractFunction(main, "advanceOneWorkflowSession"),
+    extractFunction(main, "compensateScheduledWorkflowStartBuildFailure"),
+    extractFunction(main, "buildScheduledWorkflowRunStartInput"),
+    "module.exports = { advanceOneWorkflowSession };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  const resolveCalls = [];
+  const compensations = [];
+  let scheduledStartCalls = 0;
+  let adapterLaunches = 0;
+  let reopenCalls = 0;
+  let runningSegments = [];
+  let laneStatus = "pending";
+  const node = {
+    id: segment.laneId,
+    runId: segment.runId,
+    agent: segment.agentKind,
+    status: laneStatus,
+    title: "Implementation",
+    context: { dependencies: [] },
+    worktree: { executionTarget: "new_worktree" },
+  };
+  const session = {
+    id: segment.sessionId,
+    kind: "canvas",
+    plannerNodeId: "planner-root",
+    target: { executionTarget: "new_worktree" },
+    nodes: [node],
+  };
+  const store = {
+    materializeCanvasSession() {
+      node.status = laneStatus;
+      return session;
+    },
+    listRunningSegments() {
+      return runningSegments;
+    },
+    previewReadyLanes() {
+      return laneStatus === "pending"
+        ? { readyLanes: [{ id: segment.laneId, segmentId: segment.segmentId, runId: segment.runId }] }
+        : { readyLanes: [] };
+    },
+    scheduleReadyLanes() {
+      runningSegments = [segment];
+      return { readyLanes: [{ id: segment.laneId, segmentId: segment.segmentId, runId: segment.runId }] };
+    },
+  };
+  vm.runInNewContext(output, {
+    module,
+    exports: module.exports,
+    MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT: 4,
+    isRecord: (value) => value !== null && typeof value === "object" && !Array.isArray(value),
+    hasRunningSharedWorkflowWriter: () => false,
+    hasReadySharedWorkflowWriter: () => false,
+    requireWorkflowCanvasSession: () => session,
+    resolveScheduledWorkflowWorktree: async (projectRoot, _store, resolvedSession, resolvedNode, segmentId) => {
+      resolveCalls.push({
+        projectRoot,
+        sessionId: resolvedSession.id,
+        laneId: resolvedNode.id,
+        segmentId,
+      });
+      throw new Error("Scheduled worktree reconciliation rejected.");
+    },
+    compensateFailedWorkflowRun: (_store, compensatedSegment, error) => {
+      compensations.push({
+        segment: structuredClone(compensatedSegment),
+        message: error instanceof Error ? error.message : String(error),
+      });
+      runningSegments = [];
+      laneStatus = "failed";
+    },
+    reopenWorkflowStore: async () => {
+      reopenCalls += 1;
+      throw new Error("Unexpected workflow-store reopen.");
+    },
+    scheduledWorkflowRunStartHandler: async () => {
+      scheduledStartCalls += 1;
+      adapterLaunches += 1;
+    },
+    trustedRunStartIdentity: async () => {
+      throw new Error("Resolver failure must precede start identity.");
+    },
+    ensureDangerousRunAuthorization: () => "blocked",
+    broadcastWorkflowProjection() {},
+    require(specifier) {
+      if (specifier === "@skyturn/ui-canvas/workflow-runtime") {
+        return {
+          sandboxForNodeRun: () => "read-only",
+          workflowSchedulingPolicyForSession: () => ({ allowedParallelism: 1 }),
+        };
+      }
+      return require(specifier);
+    },
+  }, { filename: "main.scheduledResolverFailure.ts" });
+  await module.exports.advanceOneWorkflowSession("/canonical/project", store, segment.sessionId, "run_terminal");
+  return {
+    resolveCalls,
+    compensations,
+    scheduledStartCalls,
+    adapterLaunches,
+    reopenCalls,
+  };
+}
+
+function scheduledWorktreeSession() {
+  return {
+    id: "session-1",
+    target: {
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "main",
+    },
+  };
+}
+
+function scheduledWorktreeNode(laneId, binding) {
+  const variantId = binding?.variantId ?? laneId;
+  const worktreeId = binding?.worktreeId ?? `worktree-session-1-${laneId}`;
+  return {
+    id: laneId,
+    candidateBinding: binding,
+    worktree: {
+      path: ".",
+      branchName: "main",
+      baseCommit: "main",
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "main",
+      worktreeId,
+      variantId,
+      ...(binding ? { lineageId: binding.lineageId } : {}),
+    },
+  };
+}
+
+function candidateBinding(laneId, overrides = {}) {
+  const variantId = overrides.variantId ?? "candidate";
+  return {
+    sessionId: "session-1",
+    laneId,
+    variantId,
+    worktreeId: `worktree-session-1-${variantId}`,
+    lineageId: overrides.lineageId ?? "lineage-session-1-candidate",
+    reason: overrides.reason ?? "default",
+    predecessorLaneIds: overrides.predecessorLaneIds ?? [],
+    ...(overrides.sourceCheckpointId ? { sourceCheckpointId: overrides.sourceCheckpointId } : {}),
+    ...(overrides.sourceHeadCommit ? { sourceHeadCommit: overrides.sourceHeadCommit } : {}),
+  };
+}
+
+function storeWithMutableEvents(events) {
+  return {
+    listEvents() {
+      return events;
+    },
+    appendWorkflowEvent(event) {
+      const stored = {
+        ...event,
+        createdAt: event.now,
+      };
+      events.push(stored);
+      return stored;
+    },
+  };
+}
+
+function git(cwd, args) {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+async function commitWorktree(worktreePath, label) {
+  await fs.writeFile(join(worktreePath, `${label}.txt`), `${label}\n`);
+  git(worktreePath, ["add", `${label}.txt`]);
+  git(worktreePath, ["commit", "-m", `add ${label}`]);
+  return git(worktreePath, ["rev-parse", "HEAD"]);
+}
+
+function replaceCreatedWorktree(events, worktreeOverrides) {
+  return structuredClone(events).map((event) =>
+    event.kind === "workflow.worktree.created"
+      ? createdWorktreeEventWith(event, worktreeOverrides)
+      : event
+  );
+}
+
+function createdWorktreeEventWith(event, worktreeOverrides) {
+  const clone = structuredClone(event);
+  clone.payload.worktree = {
+    ...clone.payload.worktree,
+    ...worktreeOverrides,
+  };
+  return clone;
 }
 
 function legacyMethodResultType(method) {
