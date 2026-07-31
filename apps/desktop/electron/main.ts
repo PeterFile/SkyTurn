@@ -17,6 +17,7 @@ import type {
   PlanCancelRequest,
   PlanEvent,
   PlanStateSnapshot,
+  WorkflowLaneCandidateBinding,
   WorkflowLedgerSummary,
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core" with { "resolution-mode": "import" };
@@ -3309,20 +3310,226 @@ async function resolveScheduledWorkflowWorktree(
   const realProjectRoot = await fs.realpath(projectRoot);
   const executionTarget = node.worktree.executionTarget ?? session.target.executionTarget;
   if (executionTarget === "current_branch") return realProjectRoot;
-  const existingPath = node.worktree.realPath ?? node.worktree.path;
-  if (path.isAbsolute(existingPath)) return fs.realpath(existingPath);
-  const worktree = await createManagedWorkflowWorktreeForRun(projectRoot, store, {
+  const candidateBinding = await requireScheduledWorkflowCandidateBinding(session.id, node.id, node.candidateBinding);
+  assertScheduledWorkflowNodeCandidateIdentity(node, candidateBinding);
+  const existingEvents = store.listEvents(session.id);
+  const existingWorktree = findScheduledWorkflowCreatedIdentity(existingEvents, session.id, candidateBinding);
+  if (existingWorktree) {
+    await canonicalScheduledWorkflowWorktreePath(
+      realProjectRoot,
+      session.id,
+      candidateBinding,
+      existingWorktree,
+    );
+    const reconciled = await reconcileManagedWorkflowWorktreeForRun(store, session.id, existingWorktree);
+    return canonicalScheduledWorkflowWorktreePath(
+      realProjectRoot,
+      session.id,
+      candidateBinding,
+      reconciled,
+      existingWorktree,
+      true,
+    );
+  }
+  const worktree = await createManagedWorkflowWorktreeForRun(realProjectRoot, store, {
     sessionId: session.id,
-    variantId: node.id,
+    variantId: candidateBinding.variantId,
     baseRef: node.worktree.baseRef ?? session.target.baseRef ?? node.worktree.baseCommit,
     parentLaneId: node.id,
     parentSegmentId: segmentId,
   });
-  const createdPath = optionalText(readField(worktree, "realPath")) ?? optionalText(readField(worktree, "path"));
-  if (!createdPath || !path.isAbsolute(createdPath)) {
-    throw new Error("Managed workflow worktree did not return an absolute path.");
+  const createdWorktree = findScheduledWorkflowCreatedIdentity(
+    store.listEvents(session.id),
+    session.id,
+    candidateBinding,
+  );
+  if (!createdWorktree) {
+    throw new Error("Managed workflow worktree creation did not persist its created identity.");
   }
-  return fs.realpath(createdPath);
+  return canonicalScheduledWorkflowWorktreePath(
+    realProjectRoot,
+    session.id,
+    candidateBinding,
+    worktree,
+    createdWorktree,
+    false,
+    node.id,
+    segmentId,
+  );
+}
+
+async function requireScheduledWorkflowCandidateBinding(
+  sessionId: string,
+  laneId: string,
+  value: unknown,
+): Promise<WorkflowLaneCandidateBinding> {
+  try {
+    const { parseWorkflowLaneCandidateBinding } = await import("@skyturn/project-core");
+    const binding = parseWorkflowLaneCandidateBinding(value);
+    if (binding.sessionId !== sessionId) {
+      throw new Error("Workflow lane candidate binding session does not match the scheduled session.");
+    }
+    if (binding.laneId !== laneId) {
+      throw new Error("Workflow lane candidate binding lane does not match the scheduled node.");
+    }
+    if (binding.worktreeId !== `worktree-${sessionId}-${binding.variantId}`) {
+      throw new Error("Workflow lane candidate binding worktree identity is inconsistent.");
+    }
+    return binding;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw workflowIpcError("INVALID_INPUT", `Scheduled workflow candidate binding is invalid: ${reason}`);
+  }
+}
+
+function assertScheduledWorkflowNodeCandidateIdentity(
+  node: CanvasSession["nodes"][number],
+  binding: WorkflowLaneCandidateBinding,
+): void {
+  const worktree = requireRecord(node.worktree, "scheduled workflow node worktree");
+  if (
+    worktree.worktreeId !== binding.worktreeId ||
+    worktree.variantId !== binding.variantId ||
+    worktree.lineageId !== binding.lineageId
+  ) {
+    throw workflowIpcError(
+      "INVALID_INPUT",
+      "Scheduled workflow node worktree identity does not match its durable candidate binding.",
+    );
+  }
+}
+
+function findScheduledWorkflowCreatedIdentity(
+  events: unknown[],
+  sessionId: string,
+  binding: WorkflowLaneCandidateBinding,
+): WorkflowWorktreeIdentityLike | null {
+  let identity: WorkflowWorktreeIdentityLike | null = null;
+  let cleaned = false;
+  for (const event of events) {
+    if (!isRecord(event) || !isRecord(event.payload)) continue;
+    if (event.kind === "workflow.worktree.created" && isRecord(event.payload.worktree)) {
+      if (event.payload.worktree.worktreeId !== binding.worktreeId) continue;
+      if (event.sessionId !== sessionId) {
+        throw workflowIpcError("INVALID_INPUT", "Scheduled workflow created identity belongs to another session.");
+      }
+      const candidate = workflowWorktreeIdentityFromRecord(event.payload.worktree);
+      if (
+        candidate.worktreeId !== binding.worktreeId ||
+        candidate.variantId !== binding.variantId ||
+        candidate.branchName !== `skyturn/${sessionId}/${binding.variantId}`
+      ) {
+        throw workflowIpcError("INVALID_INPUT", "Scheduled workflow created identity conflicts with its candidate binding.");
+      }
+      if (candidate.headCommit !== candidate.baseCommit) {
+        throw workflowIpcError("INVALID_INPUT", "Scheduled workflow created identity HEAD does not match its base commit.");
+      }
+      if (identity && !sameScheduledWorkflowWorktreeIdentity(identity, candidate, false)) {
+        throw workflowIpcError("INVALID_INPUT", "Scheduled workflow has conflicting created worktree identities.");
+      }
+      identity = candidate;
+      continue;
+    }
+    if (event.kind !== "workflow.worktree.cleaned") continue;
+    const cleanedWorktreeId = isRecord(event.payload.result)
+      ? optionalText(event.payload.result.worktreeId)
+      : isRecord(event.payload.worktree)
+        ? optionalText(event.payload.worktree.worktreeId)
+        : undefined;
+    if (cleanedWorktreeId !== binding.worktreeId) continue;
+    if (event.sessionId !== sessionId) {
+      throw workflowIpcError("INVALID_INPUT", "Scheduled workflow cleaned identity belongs to another session.");
+    }
+    cleaned = true;
+  }
+  if (cleaned) {
+    throw workflowIpcError("INVALID_INPUT", "Scheduled workflow worktree identity has already been cleaned.");
+  }
+  const createdEvent = findWorktreeCreatedEvent(events, binding.worktreeId);
+  if (!createdEvent) return null;
+  const persisted = findCreatedWorktreeIdentity(events, binding.worktreeId);
+  if (!identity || !sameScheduledWorkflowWorktreeIdentity(identity, persisted, false)) {
+    throw workflowIpcError("INVALID_INPUT", "Scheduled workflow created worktree identity is inconsistent.");
+  }
+  return persisted;
+}
+
+function sameScheduledWorkflowWorktreeIdentity(
+  left: WorkflowWorktreeIdentityLike,
+  right: WorkflowWorktreeIdentityLike,
+  allowHeadAdvance: boolean,
+): boolean {
+  return left.worktreeId === right.worktreeId &&
+    left.variantId === right.variantId &&
+    left.path === right.path &&
+    left.realPath === right.realPath &&
+    left.gitdir === right.gitdir &&
+    left.repoRoot === right.repoRoot &&
+    left.branchName === right.branchName &&
+    left.baseCommit === right.baseCommit &&
+    (allowHeadAdvance || left.headCommit === right.headCommit) &&
+    left.parentLaneId === right.parentLaneId &&
+    left.parentSegmentId === right.parentSegmentId;
+}
+
+async function canonicalScheduledWorkflowWorktreePath(
+  projectRoot: string,
+  sessionId: string,
+  binding: WorkflowLaneCandidateBinding,
+  value: unknown,
+  expectedIdentity?: WorkflowWorktreeIdentityLike,
+  allowHeadAdvance = false,
+  creatorLaneId?: string,
+  creatorSegmentId?: string,
+): Promise<string> {
+  const worktree = workflowWorktreeIdentityFromRecord(requireRecord(value, "scheduled workflow worktree identity"));
+  if (
+    worktree.worktreeId !== binding.worktreeId ||
+    worktree.variantId !== binding.variantId ||
+    worktree.branchName !== `skyturn/${sessionId}/${binding.variantId}`
+  ) {
+    throw workflowIpcError("INVALID_INPUT", "Scheduled workflow worktree identity conflicts with its candidate binding.");
+  }
+  if (creatorLaneId && worktree.parentLaneId !== creatorLaneId) {
+    throw workflowIpcError("INVALID_INPUT", "Created workflow worktree does not match its creator lane.");
+  }
+  if (creatorSegmentId && worktree.parentSegmentId !== creatorSegmentId) {
+    throw workflowIpcError("INVALID_INPUT", "Created workflow worktree does not match its creator segment.");
+  }
+  if (
+    expectedIdentity &&
+    !sameScheduledWorkflowWorktreeIdentity(expectedIdentity, worktree, allowHeadAdvance)
+  ) {
+    throw workflowIpcError("INVALID_INPUT", "Reconciled workflow worktree conflicts with its durable created identity.");
+  }
+  await assertAdoptedWorktreeBelongsToProject(projectRoot, worktree);
+  const [realPath, declaredPath] = await Promise.all([
+    fs.realpath(worktree.realPath),
+    fs.realpath(worktree.path),
+  ]);
+  if (
+    worktree.realPath !== realPath ||
+    worktree.path !== declaredPath ||
+    realPath !== declaredPath
+  ) {
+    throw workflowIpcError(
+      "UNSAFE_WORKTREE_PATH",
+      "Workflow worktree path and realPath must be identical canonical paths.",
+    );
+  }
+  return realPath;
+}
+
+async function reconcileManagedWorkflowWorktreeForRun(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  worktree: WorkflowWorktreeIdentityLike,
+): Promise<WorkflowWorktreeIdentity> {
+  const { createNodeGitWorktreeService } = await import("@skyturn/git-worktree/node");
+  const service = createNodeGitWorktreeService({
+    initialEvents: managedWorktreeEventsFromStore(store.listEvents(sessionId)),
+  });
+  return service.reconcileManagedWorktree(worktree, { allowHeadAdvance: true });
 }
 
 async function enrichTerminalWorkflowRun(
