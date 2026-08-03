@@ -295,6 +295,20 @@ test("seeded checkpoint authority requires exact unique empty Git evidence and r
     () => assertSeededCheckpointAuthority(terminalBefore),
     /before checkpoint evidence refs are not exact/,
   );
+
+  const missingAfterProof = structuredClone(projection);
+  delete missingAfterProof.checkpoints[1].ancestryProof;
+  assert.throws(
+    () => assertSeededCheckpointAuthority(missingAfterProof),
+    /after checkpoint must carry a canonical ancestry proof/,
+  );
+
+  const forgedBeforeProof = structuredClone(projection);
+  forgedBeforeProof.checkpoints[0].ancestryProof = "forged-before-proof";
+  assert.throws(
+    () => assertSeededCheckpointAuthority(forgedBeforeProof),
+    /before checkpoint must not carry an ancestry proof/,
+  );
 });
 
 function seededCheckpointProjection() {
@@ -314,6 +328,7 @@ function seededCheckpointProjection() {
     runId,
     segmentId,
     phase,
+    ...(phase === "after" ? { ancestryProof: "canonical-after-proof" } : {}),
     evidenceRefs: [
       { kind: "run", id: runId },
       { kind: "segment", id: segmentId },

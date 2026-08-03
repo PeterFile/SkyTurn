@@ -363,6 +363,7 @@ async function resolveWorkflowGitAncestryFacts(
 
   const repositoryIdentity = hashWorkflowGitIdentity(
     "skyturn.workflow-git-ancestry-proof.repository.v1",
+    directoryIdentityFields("top-level", repositoryTopLevel),
     directoryIdentityFields("common-directory", repositoryCommonDirectory),
     directoryIdentityFields("object-directory", repositoryObjectDirectory),
   );

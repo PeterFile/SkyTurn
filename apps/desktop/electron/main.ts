@@ -44,7 +44,16 @@ import {
   type RunStartDependencies,
   type TrustedRunStartIdentity,
 } from "./runStartHandler";
-import { resolveCurrentBranchRunBaseline } from "./workflowCheckpointRuntime";
+import {
+  WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON,
+  createAfterCheckpointAncestryProof,
+  recordWorkflowCheckpointFailure,
+  requireCheckpointBoundWorktreeBase,
+  resolveCurrentBranchRunBaseline,
+  verifyWorkflowCheckpointActionGate,
+  type WorkflowCheckpointAction,
+  type WorkflowCheckpointPair,
+} from "./workflowCheckpointRuntime";
 import {
   parsePlanBootstrapRequest,
   parsePlanCancelRequest,
@@ -1425,6 +1434,22 @@ ipcMain.handle("workflow:rollback:eligibility", workflowHandler(async (projectRo
   assertKnownWorkflowCanvasSession(store, normalized.sessionId);
   const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
   const eligibility = store.getNodeRollbackEligibility(normalized);
+  const ancestryGate = await verifyLiveWorkflowCheckpointAction(projectRoot, store, {
+    action: "rollback",
+    sessionId: normalized.sessionId,
+    nodeId: normalized.nodeId,
+    laneId: normalized.laneId,
+    checkpointId: optionalText(eligibility.checkpointId) ?? normalized.checkpointId,
+  });
+  if (!ancestryGate.available) {
+    const blockedEligibility = rollbackEligibilityWithInvalidAncestry(eligibility);
+    return {
+      protocolVersion: RUN_PROTOCOL_VERSION,
+      eligibility: blockedEligibility,
+      blockedReason: workflowCheckpointAncestryBlockReason(blockedEligibility),
+      manualRepairRequired: false,
+    };
+  }
   const inFlightBlocks = blockingInFlightRemoteSideEffects(workflowProjectRoot, normalized.sessionId, eligibility);
   if (inFlightBlocks.length > 0) {
     const blockedEligibility = rollbackEligibilityWithInFlightRemoteBlocks(eligibility, inFlightBlocks);
@@ -1455,6 +1480,9 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
   assertKnownWorkflowCanvasSession(store, normalized.sessionId);
   const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
   return await withWorkflowSessionMutationLock(workflowProjectRoot, normalized.sessionId, async () => {
+    const initialEligibility = store.getNodeRollbackEligibility(normalized);
+    const initialAncestryBlock = await workflowRollbackAncestryBlock(projectRoot, store, normalized, initialEligibility);
+    if (initialAncestryBlock) return initialAncestryBlock;
     const initialRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
     if (initialRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, initialRemoteBlock.result);
     const eligibility = initialRemoteBlock.eligibility;
@@ -1469,6 +1497,9 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
       });
     }
     if (localSafety.status === "already_restored" && localSafety.requestId) {
+      const currentEligibility = store.getNodeRollbackEligibility(normalized);
+      const ancestryBlock = await workflowRollbackAncestryBlock(projectRoot, store, normalized, currentEligibility);
+      if (ancestryBlock) return ancestryBlock;
       const recoveryRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
       if (recoveryRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, recoveryRemoteBlock.result);
       const finalEligibility = recoveryRemoteBlock.eligibility;
@@ -1482,6 +1513,8 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
       });
     }
     if (localSafety.status === "manual_repair_required") {
+      const ancestryBlock = await workflowRollbackAncestryBlock(projectRoot, store, normalized, eligibility);
+      if (ancestryBlock) return ancestryBlock;
       const event = appendRollbackRejectedEvent(store, normalized, eligibility, localSafety);
       broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
       return workflowRollbackResponse(store, normalized.sessionId, {
@@ -1499,11 +1532,16 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
       !localSafety.expectedBranchName ||
       !localSafety.expectedHeadCommit
     ) {
+      const ancestryBlock = await workflowRollbackAncestryBlock(projectRoot, store, normalized, eligibility);
+      if (ancestryBlock) return ancestryBlock;
       const result = store.applyNodeRollback(normalized);
       return workflowRollbackResponse(store, normalized.sessionId, result);
     }
 
     const { resetRollbackWorktreeToCommit } = await import("@skyturn/git-worktree/node");
+    const currentEligibility = store.getNodeRollbackEligibility(normalized);
+    const preRequestAncestryBlock = await workflowRollbackAncestryBlock(projectRoot, store, normalized, currentEligibility);
+    if (preRequestAncestryBlock) return preRequestAncestryBlock;
     const finalRemoteBlock = evaluateRollbackRemoteBlocksForRollback(workflowProjectRoot, store, normalized);
     if (finalRemoteBlock.result) return workflowRollbackResponse(store, normalized.sessionId, finalRemoteBlock.result);
     const finalEligibility = finalRemoteBlock.eligibility;
@@ -1534,6 +1572,8 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
         manualRepairRequired: true,
       });
     }
+    const preResetAncestryBlock = await workflowRollbackAncestryBlock(projectRoot, store, normalized, finalEligibility);
+    if (preResetAncestryBlock) return preResetAncestryBlock;
     const resetResult = await resetRollbackWorktreeToCommit({
       projectRoot,
       worktreePath: localSafety.worktreePath,
@@ -1542,6 +1582,8 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
       restoreCommitRef: localSafety.restoreCommitRef,
     });
     if (resetResult.status !== "applied" && resetResult.status !== "already_restored") {
+      const ancestryBlock = await workflowRollbackAncestryBlock(projectRoot, store, normalized, finalEligibility);
+      if (ancestryBlock) return ancestryBlock;
       const message = sanitizeSnippet(resetResult.message) || "Git reset failed; manual repair is required.";
       const rejectedEvent = appendRollbackRejectedEvent(store, normalized, finalEligibility, {
         status: "manual_repair_required",
@@ -1563,6 +1605,8 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
         manualRepairRequired: true,
       });
     }
+    const preAppliedAncestryBlock = await workflowRollbackAncestryBlock(projectRoot, store, normalized, finalEligibility);
+    if (preAppliedAncestryBlock) return preAppliedAncestryBlock;
     const event = appendRollbackAppliedEvent(store, normalized, finalEligibility, requested.requestId);
     broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
     return workflowRollbackResponse(store, normalized.sessionId, {
@@ -1579,6 +1623,13 @@ ipcMain.handle("workflow:repair:create", workflowHandler(async (projectRoot: str
   const normalized = normalizeCheckpointSuccessorInput(input);
   const store = await getWorkflowStore(projectRoot);
   assertKnownWorkflowCanvasSession(store, normalized.sessionId);
+  await requireLiveWorkflowCheckpointAction(projectRoot, store, {
+    action: "repair",
+    sessionId: normalized.sessionId,
+    nodeId: normalized.nodeId,
+    laneId: normalized.laneId,
+    checkpointId: normalized.checkpointId,
+  });
   const result = store.requestNodeRepair(normalized);
   await advanceWorkflowSession(projectRoot, store, normalized.sessionId, true, "repair-request");
   const projection = store.materializeFlowProjection(normalized.sessionId);
@@ -1597,6 +1648,13 @@ ipcMain.handle("workflow:variant:create", workflowHandler(async (projectRoot: st
   const normalized = normalizeCheckpointSuccessorInput(input);
   const store = await getWorkflowStore(projectRoot);
   assertKnownWorkflowCanvasSession(store, normalized.sessionId);
+  await requireLiveWorkflowCheckpointAction(projectRoot, store, {
+    action: "variant",
+    sessionId: normalized.sessionId,
+    nodeId: normalized.nodeId,
+    laneId: normalized.laneId,
+    checkpointId: normalized.checkpointId,
+  });
   const result = store.requestNodeVariant(normalized);
   broadcastWorkflowProjection(projectRoot, normalized.sessionId, store);
   return {
@@ -3331,10 +3389,18 @@ async function resolveScheduledWorkflowWorktree(
       true,
     );
   }
+  const checkpointBaseRef = candidateBinding.sourceCheckpointId && candidateBinding.sourceHeadCommit
+    ? await requireCheckpointBoundWorktreeBase(store, {
+        sessionId: session.id,
+        sourceCheckpointId: candidateBinding.sourceCheckpointId,
+        sourceHeadCommit: candidateBinding.sourceHeadCommit,
+        action: candidateBinding.reason === "variant" ? "variant" : "repair",
+      }, workflowCheckpointGateAuthority(realProjectRoot, store))
+    : undefined;
   const worktree = await createManagedWorkflowWorktreeForRun(realProjectRoot, store, {
     sessionId: session.id,
     variantId: candidateBinding.variantId,
-    baseRef: node.worktree.baseRef ?? session.target.baseRef ?? node.worktree.baseCommit,
+    baseRef: checkpointBaseRef ?? node.worktree.baseRef ?? session.target.baseRef ?? node.worktree.baseCommit,
     parentLaneId: node.id,
     parentSegmentId: segmentId,
   });
@@ -3554,12 +3620,18 @@ async function enrichTerminalWorkflowRun(
   }
   const changeset = await reconcileRunChangeset(projectRoot, identity, events);
   const stableIdentity = await verifyRunGitIdentityAtCheckpoint(identity);
-  const changesetEvidenceId = recordRunChangesetEvidence(store, stableIdentity, "after", changeset);
+  const ancestry = await createAfterCheckpointAncestryProof(store, {
+    ...stableIdentity,
+    repositoryPath: await fs.realpath(projectRoot),
+  }, await workflowGitAncestryProofAuthority());
+  const finalIdentity = await verifyRunGitIdentityAtCheckpoint(stableIdentity);
+  const changesetEvidenceId = recordRunChangesetEvidence(store, finalIdentity, "after", changeset);
   store.recordRunCheckpoint(runCheckpointInput(
-    stableIdentity,
+    finalIdentity,
     "after",
     changesetEvidenceId,
     optionalText(readField(knownEvidence, "completedAt")) ?? new Date().toISOString(),
+    ancestry,
   ));
 }
 
@@ -4831,6 +4903,61 @@ function rollbackEligibilityWithManualRepair(
   };
 }
 
+function rollbackEligibilityWithInvalidAncestry(
+  eligibility: WorkflowRollbackEligibilityLike,
+): WorkflowRollbackEligibilityLike {
+  return {
+    ...eligibility,
+    eligible: false,
+    reason: WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON,
+  };
+}
+
+function workflowRollbackInvalidAncestryResponse(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  eligibility: WorkflowRollbackEligibilityLike,
+): Record<string, unknown> {
+  const blockedEligibility = rollbackEligibilityWithInvalidAncestry(eligibility);
+  return workflowRollbackResponse(store, sessionId, {
+    status: "blocked",
+    eligibility: blockedEligibility,
+    blockedReason: workflowCheckpointAncestryBlockReason(blockedEligibility),
+  });
+}
+
+function workflowCheckpointAncestryBlockReason(
+  eligibility: WorkflowRollbackEligibilityLike,
+): Record<string, unknown> {
+  return {
+    code: "invalid_checkpoint",
+    message: WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON,
+    affectedLaneIds: Array.isArray(eligibility.affectedLaneIds)
+      ? eligibility.affectedLaneIds.filter((id): id is string => typeof id === "string")
+      : [],
+  };
+}
+
+async function workflowRollbackAncestryBlock(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  input: { sessionId: string; nodeId?: string; laneId?: string; checkpointId?: string },
+  eligibility: WorkflowRollbackEligibilityLike,
+): Promise<Record<string, unknown> | null> {
+  try {
+    await requireLiveWorkflowCheckpointAction(projectRoot, store, {
+      action: "rollback",
+      sessionId: input.sessionId,
+      nodeId: input.nodeId,
+      laneId: input.laneId,
+      checkpointId: optionalText(eligibility.checkpointId) ?? input.checkpointId,
+    });
+    return null;
+  } catch {
+    return workflowRollbackInvalidAncestryResponse(store, input.sessionId, eligibility);
+  }
+}
+
 function inFlightRemoteSideEffectBlockReason(
   eligibility: WorkflowRollbackEligibilityLike,
   inFlightBlocks: InFlightRemoteSideEffect[],
@@ -5706,9 +5833,13 @@ async function resolveExecutableRunIdentity(
   if (executionTarget === "new_worktree" && (!recordedWorktreeId || !recordedRealPath)) {
     throw workflowIpcError("INVALID_INPUT", "New worktree workflow requires a created managed worktree identity.");
   }
-  const expectedPath = executionTarget === "current_branch"
-    ? realProjectRoot
-    : await resolveChangesetWorktreePath(realProjectRoot, recordedRealPath!);
+  const managedWorktree = executionTarget === "new_worktree"
+    ? await assertManagedRollbackWorktree(realProjectRoot, projection, {
+        worktreeId: recordedWorktreeId,
+        worktreePath: recordedRealPath,
+      })
+    : null;
+  const expectedPath = managedWorktree?.path ?? realProjectRoot;
   const suppliedPath = optionalText(input.worktreePath);
   if (suppliedPath) {
     const resolvedSuppliedPath = await resolveChangesetWorktreePath(realProjectRoot, suppliedPath);
@@ -5792,6 +5923,100 @@ async function verifyRunGitIdentityAtCheckpoint(identity: ExecutableRunIdentity)
   return { ...identity, branchName, headCommit, worktreeState };
 }
 
+async function workflowGitAncestryProofAuthority() {
+  const {
+    createLiveWorkflowGitAncestryProofContext,
+    createWorkflowGitAncestryProof,
+    verifyWorkflowGitAncestryProof,
+  } = await import("@skyturn/git-worktree/node");
+  return {
+    createProof: createWorkflowGitAncestryProof,
+    createContext: createLiveWorkflowGitAncestryProofContext,
+    verify: verifyWorkflowGitAncestryProof,
+  };
+}
+
+async function resolveWorkflowCheckpointGitPaths(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  pair: WorkflowCheckpointPair,
+): Promise<{ repositoryPath: string; worktreePath: string }> {
+  const repositoryPath = await fs.realpath(projectRoot);
+  const checkpoint = pair.afterCheckpoint;
+  if (checkpoint.executionTarget === "current_branch") {
+    if (checkpoint.worktreeId) {
+      throw workflowIpcError("INVALID_INPUT", WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON);
+    }
+    const checkpointPath = await fs.realpath(checkpoint.worktreePath);
+    if (checkpointPath !== repositoryPath) {
+      throw workflowIpcError("UNSAFE_WORKTREE_PATH", WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON);
+    }
+    return { repositoryPath, worktreePath: repositoryPath };
+  }
+  const projection = store.materializeFlowProjection(checkpoint.sessionId);
+  const managed = await assertManagedRollbackWorktree(
+    repositoryPath,
+    projection,
+    checkpoint as unknown as Record<string, unknown>,
+  );
+  return { repositoryPath, worktreePath: managed.path };
+}
+
+function workflowCheckpointGateAuthority(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+) {
+  return {
+    resolveCanonicalPaths: (pair: WorkflowCheckpointPair) =>
+      resolveWorkflowCheckpointGitPaths(projectRoot, store, pair),
+    verify: async (serializedProof: unknown, input: {
+      repositoryPath: string;
+      worktreePath: string;
+      beforeHeadCommit: string;
+      afterHeadCommit: string;
+    }) => {
+      const { verifyWorkflowGitAncestryProof } = await import("@skyturn/git-worktree/node");
+      return verifyWorkflowGitAncestryProof(serializedProof, input);
+    },
+  };
+}
+
+async function verifyLiveWorkflowCheckpointAction(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  input: {
+    action: WorkflowCheckpointAction;
+    sessionId: string;
+    checkpointId?: string;
+    nodeId?: string;
+    laneId?: string;
+  },
+) {
+  return verifyWorkflowCheckpointActionGate(
+    store,
+    input,
+    workflowCheckpointGateAuthority(projectRoot, store),
+  );
+}
+
+async function requireLiveWorkflowCheckpointAction(
+  projectRoot: string,
+  store: WorkflowStoreHost,
+  input: {
+    action: WorkflowCheckpointAction;
+    sessionId: string;
+    checkpointId?: string;
+    nodeId?: string;
+    laneId?: string;
+  },
+): Promise<WorkflowCheckpointPair> {
+  const gate = await verifyLiveWorkflowCheckpointAction(projectRoot, store, input);
+  if (!gate.available) {
+    throw workflowIpcError("INVALID_INPUT", WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON);
+  }
+  return gate;
+}
+
 async function reconcileRunChangeset(
   projectRoot: string,
   identity: ExecutableRunIdentity,
@@ -5856,6 +6081,15 @@ function runCheckpointInput(
   phase: "before" | "after",
   changesetEvidenceId: string,
   now: string,
+  ancestry?: {
+    ancestryProof: string;
+    ancestryProofContext: {
+      readonly beforeHeadCommit: string;
+      readonly afterHeadCommit: string;
+      readonly repositoryIdentity: string;
+      readonly worktreeIdentity: string;
+    };
+  },
 ): Record<string, unknown> {
   return {
     sessionId: identity.sessionId,
@@ -5876,6 +6110,7 @@ function runCheckpointInput(
       { kind: "changeset", id: changesetEvidenceId },
       ...(phase === "after" ? [{ kind: "evidence", id: `evidence-${identity.segmentId}` }] : []),
     ],
+    ...(ancestry ?? {}),
     now,
   };
 }
@@ -5892,22 +6127,8 @@ function recordRunCheckpointFailure(
     now: string;
   },
 ): void {
-  store.appendWorkflowEvent({
-    sessionId: input.sessionId,
-    kind: "workflow.node.checkpoint_failed",
-    source: "electron-main",
-    laneId: input.laneId,
-    segmentId: input.segmentId,
-    idempotencyKey: `checkpoint:${input.runId}:${input.phase}:failed`,
-    payload: {
-      runId: input.runId,
-      phase: input.phase,
-      status: "failed",
-      terminalRunPreserved: true,
-      reason: sanitizeSnippet(input.error instanceof Error ? input.error.message : String(input.error)),
-    },
-    now: input.now,
-  });
+  void input.error;
+  recordWorkflowCheckpointFailure(store, input);
 }
 
 function workflowHandler<T extends unknown[], R>(

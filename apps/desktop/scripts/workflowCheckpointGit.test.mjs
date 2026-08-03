@@ -1,16 +1,38 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
+  createLiveWorkflowGitAncestryProofContext,
   createGitChangesetService,
+  createWorkflowGitAncestryProof,
   getGitCheckpointSnapshot,
+  verifyWorkflowGitAncestryProof,
 } from "../../../packages/git-worktree/dist/node.js";
 import { createWorkflowStore } from "../../../packages/persistence/dist/workflowStore.js";
-import { resolveCurrentBranchRunBaseline } from "../dist-electron/electron/workflowCheckpointRuntime.js";
+import checkpointRuntime from "../dist-electron/electron/workflowCheckpointRuntime.js";
+
+const {
+  WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON,
+  createAfterCheckpointAncestryProof,
+  recordWorkflowCheckpointFailure,
+  requireCheckpointBoundWorktreeBase,
+  resolveCurrentBranchRunBaseline,
+  verifyWorkflowCheckpointActionGate,
+} = checkpointRuntime;
+
+const requireFromPersistence = createRequire(import.meta.resolve("@skyturn/persistence/workflow-store"));
+const Database = requireFromPersistence("better-sqlite3");
+
+const ancestryAuthority = {
+  createProof: createWorkflowGitAncestryProof,
+  createContext: createLiveWorkflowGitAncestryProofContext,
+  verify: verifyWorkflowGitAncestryProof,
+};
 
 test("current-branch checkpoint evidence excludes volatile runtime and preserves the exact before HEAD after reopen", async () => {
   const root = await mkdtemp(join(tmpdir(), "skyturn-current-branch-checkpoint-"));
@@ -95,6 +117,269 @@ test("current-branch checkpoint evidence excludes volatile runtime and preserves
   }
 });
 
+test("Electron after-proof production survives SQLite reopen and live-gates repair, variant, and rollback", async () => {
+  const root = await createRepository("skyturn-electron-ancestry-linear-");
+  try {
+    let store = createWorkflowStore({ projectRoot: root });
+    const segment = seedExecutableRun(store, root);
+    const before = await recordCheckpoint(store, root, segment, "before");
+
+    await writeFile(join(root, "src.ts"), "export const value = 2;\n", "utf8");
+    git(root, "add", "src.ts");
+    git(root, "commit", "-m", "change source");
+    recordTerminalResult(store, segment);
+    const afterSnapshot = await getGitCheckpointSnapshot(root);
+    const proof = await createAfterCheckpointAncestryProof(store, {
+      ...checkpointIdentity(root, segment, afterSnapshot),
+      repositoryPath: root,
+    }, ancestryAuthority);
+    const after = store.recordRunCheckpoint({
+      ...checkpointInput(root, segment, "after", afterSnapshot),
+      ...proof,
+      now: "2026-08-03T00:00:04.000Z",
+    });
+    store.close();
+
+    store = createWorkflowStore({ projectRoot: root });
+    for (const [action, checkpointId] of [
+      ["repair", after.id],
+      ["variant", before.id],
+      ["rollback", before.id],
+    ]) {
+      const gate = await verifyWorkflowCheckpointActionGate(store, {
+        action,
+        sessionId: segment.sessionId,
+        laneId: segment.laneId,
+        checkpointId,
+      }, liveGateAuthority(root));
+      assert.equal(gate.available, true, `${action} should be live-verifiable`);
+      assert.equal(gate.sourceCheckpoint.id, checkpointId);
+      assert.equal(gate.beforeCheckpoint.headCommit, before.headCommit);
+      assert.equal(gate.afterCheckpoint.headCommit, after.headCommit);
+    }
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Electron refuses an authoritative after checkpoint when Git history diverged", async () => {
+  const root = await createRepository("skyturn-electron-ancestry-diverged-");
+  try {
+    const store = createWorkflowStore({ projectRoot: root });
+    const segment = seedExecutableRun(store, root);
+    await recordCheckpoint(store, root, segment, "before");
+    await rewriteMainWithoutBeforeCommit(root);
+    recordTerminalResult(store, segment);
+    const afterSnapshot = await getGitCheckpointSnapshot(root);
+
+    await assert.rejects(
+      createAfterCheckpointAncestryProof(store, {
+        ...checkpointIdentity(root, segment, afterSnapshot),
+        repositoryPath: root,
+      }, ancestryAuthority),
+      /not an ancestor/i,
+    );
+    assert.equal(store.listNodeCheckpoints({ sessionId: segment.sessionId, phase: "after" }).length, 0);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy no-proof checkpoints stay readable but all Electron action gates are unavailable", async () => {
+  const root = await createRepository("skyturn-electron-ancestry-legacy-");
+  try {
+    let store = createWorkflowStore({ projectRoot: root });
+    const segment = seedExecutableRun(store, root);
+    const before = await recordCheckpoint(store, root, segment, "before");
+    recordTerminalResult(store, segment);
+    const after = await recordCheckpoint(store, root, segment, "after");
+    store.close();
+
+    store = createWorkflowStore({ projectRoot: root });
+    assert.equal(store.listNodeCheckpoints({ sessionId: segment.sessionId }).length, 2);
+    for (const [action, checkpointId] of [
+      ["repair", after.id],
+      ["variant", before.id],
+      ["rollback", before.id],
+    ]) {
+      const gate = await verifyWorkflowCheckpointActionGate(store, {
+        action,
+        sessionId: segment.sessionId,
+        laneId: segment.laneId,
+        checkpointId,
+      }, liveGateAuthority(root));
+      assert.deepEqual(gate, {
+        available: false,
+        reason: WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON,
+      });
+    }
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reopened Electron gates reject changed proof bytes and a mismatched persisted source pair", async () => {
+  for (const tamper of ["proof", "pair"]) {
+    const root = await createRepository(`skyturn-electron-ancestry-${tamper}-`);
+    try {
+      const { segment, before } = await seedProofBearingRun(root);
+      tamperCheckpointDatabase(root, segment, before, tamper);
+      const reopened = createWorkflowStore({ projectRoot: root });
+      const gate = await verifyWorkflowCheckpointActionGate(reopened, {
+        action: "repair",
+        sessionId: segment.sessionId,
+        laneId: segment.laneId,
+        checkpointId: `checkpoint:${segment.runId}:after`,
+      }, liveGateAuthority(root));
+      assert.deepEqual(gate, {
+        available: false,
+        reason: WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON,
+      });
+      reopened.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("same-path Git re-init after SQLite reopen invalidates every live action gate", async () => {
+  const root = await createRepository("skyturn-electron-ancestry-reinit-");
+  try {
+    const { segment, before, after } = await seedProofBearingRun(root);
+    await rm(join(root, ".git"), { recursive: true, force: true });
+    git(root, "init");
+    git(root, "checkout", "-b", "main");
+    git(root, "config", "user.email", "skyturn@example.test");
+    git(root, "config", "user.name", "SkyTurn Test");
+    git(root, "add", "src.ts");
+    git(root, "commit", "-m", "recreated repository");
+
+    const reopened = createWorkflowStore({ projectRoot: root });
+    for (const [action, checkpointId] of [
+      ["repair", after.id],
+      ["variant", before.id],
+      ["rollback", before.id],
+    ]) {
+      const gate = await verifyWorkflowCheckpointActionGate(reopened, {
+        action,
+        sessionId: segment.sessionId,
+        laneId: segment.laneId,
+        checkpointId,
+      }, liveGateAuthority(root));
+      assert.equal(gate.available, false);
+      assert.equal(gate.reason, WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON);
+    }
+    reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("after-proof failure records audit-only failure without changing durable terminal evidence", async () => {
+  const root = await createRepository("skyturn-electron-ancestry-audit-");
+  try {
+    const store = createWorkflowStore({ projectRoot: root });
+    const segment = seedExecutableRun(store, root);
+    await recordCheckpoint(store, root, segment, "before");
+    await rewriteMainWithoutBeforeCommit(root);
+    recordTerminalResult(store, segment);
+    const terminalBefore = store.materializeFlowProjection(segment.sessionId).evidence;
+    const afterSnapshot = await getGitCheckpointSnapshot(root);
+    let failure;
+    try {
+      await createAfterCheckpointAncestryProof(store, {
+        ...checkpointIdentity(root, segment, afterSnapshot),
+        repositoryPath: root,
+      }, ancestryAuthority);
+    } catch (error) {
+      failure = error;
+    }
+    assert.ok(failure);
+    recordWorkflowCheckpointFailure(store, {
+      ...segment,
+      phase: "after",
+      now: "2026-08-03T00:00:05.000Z",
+    });
+
+    const events = store.listEvents(segment.sessionId);
+    const audit = events.find((event) => event.kind === "workflow.node.checkpoint_failed");
+    assert.deepEqual(audit?.payload, {
+      runId: segment.runId,
+      phase: "after",
+      status: "failed",
+      terminalRunPreserved: true,
+      reason: "Workflow after checkpoint could not be recorded.",
+    });
+    const projection = store.materializeFlowProjection(segment.sessionId);
+    assert.deepEqual(projection.evidence, terminalBefore);
+    assert.equal(projection.checkpoints.some((checkpoint) => checkpoint.phase === "after"), false);
+    assert.equal(projection.events.some((event) => event.kind === "workflow.node.checkpoint_failed"), false);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("before-checkpoint failure audit does not claim terminal evidence exists", async () => {
+  const events = [];
+  recordWorkflowCheckpointFailure({
+    appendWorkflowEvent(event) {
+      events.push(event);
+    },
+  }, {
+    sessionId: "session-before-failure",
+    laneId: "lane-before-failure",
+    segmentId: "segment-before-failure",
+    runId: "run-before-failure",
+    phase: "before",
+    now: "2026-08-03T00:00:00.000Z",
+  });
+
+  assert.equal(events.length, 1);
+  assert.equal(events[0].payload.reason, "Workflow before checkpoint could not be recorded.");
+  assert.equal(Object.hasOwn(events[0].payload, "terminalRunPreserved"), false);
+});
+
+test("checkpoint-bound delayed worktree creation re-verifies live context and returns only the immutable source HEAD", async () => {
+  const root = await createRepository("skyturn-electron-ancestry-delayed-");
+  try {
+    const { segment, before } = await seedProofBearingRun(root);
+    let store = createWorkflowStore({ projectRoot: root });
+    assert.equal(await requireCheckpointBoundWorktreeBase(store, {
+      sessionId: segment.sessionId,
+      sourceCheckpointId: before.id,
+      sourceHeadCommit: before.headCommit,
+      action: "variant",
+    }, liveGateAuthority(root)), before.headCommit);
+    store.close();
+
+    await rm(join(root, ".git"), { recursive: true, force: true });
+    git(root, "init");
+    git(root, "checkout", "-b", "main");
+    git(root, "config", "user.email", "skyturn@example.test");
+    git(root, "config", "user.name", "SkyTurn Test");
+    git(root, "add", "src.ts");
+    git(root, "commit", "-m", "changed delayed source context");
+
+    store = createWorkflowStore({ projectRoot: root });
+    await assert.rejects(
+      requireCheckpointBoundWorktreeBase(store, {
+        sessionId: segment.sessionId,
+        sourceCheckpointId: before.id,
+        sourceHeadCommit: before.headCommit,
+        action: "variant",
+      }, liveGateAuthority(root)),
+      new RegExp(WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    );
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function seedExecutableRun(store, projectRoot) {
   const session = store.createWorkflowSession({
     id: "session-1",
@@ -151,10 +436,157 @@ function seedExecutableRun(store, projectRoot) {
     },
     now: "2026-07-13T01:00:00.100Z",
   });
-  store.scheduleReadyLanes("session-1", {
+  const scheduled = store.scheduleReadyLanes("session-1", {
     allowedParallelism: 1,
     now: "2026-07-13T01:00:00.200Z",
   });
+  assert.equal(scheduled.readyLanes.length, 1);
+  return {
+    sessionId: "session-1",
+    laneId: "lane-implementation",
+    nodeId: "lane-implementation",
+    runId: scheduled.readyLanes[0].runId,
+    segmentId: scheduled.readyLanes[0].segmentId,
+    agentKind: "codex",
+  };
+}
+
+async function createRepository(prefix) {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  git(root, "init");
+  git(root, "checkout", "-b", "main");
+  git(root, "config", "user.email", "skyturn@example.test");
+  git(root, "config", "user.name", "SkyTurn Test");
+  await writeFile(join(root, "src.ts"), "export const value = 1;\n", "utf8");
+  git(root, "add", "src.ts");
+  git(root, "commit", "-m", "initial");
+  return realpath(root);
+}
+
+function checkpointInput(root, segment, phase, snapshot) {
+  return {
+    sessionId: segment.sessionId,
+    nodeId: segment.nodeId,
+    laneId: segment.laneId,
+    runId: segment.runId,
+    segmentId: segment.segmentId,
+    phase,
+    executionTarget: "current_branch",
+    worktreePath: root,
+    branchName: "main",
+    headCommit: snapshot.headCommit,
+    worktreeState: snapshot.worktreeState,
+    evidenceRefs: [
+      { kind: "run", id: segment.runId },
+      { kind: "segment", id: segment.segmentId },
+      ...(phase === "after" ? [{ kind: "evidence", id: `evidence-${segment.segmentId}` }] : []),
+    ],
+  };
+}
+
+function checkpointIdentity(root, segment, snapshot) {
+  return {
+    ...checkpointInput(root, segment, "after", snapshot),
+    worktreePath: root,
+  };
+}
+
+async function recordCheckpoint(store, root, segment, phase) {
+  const snapshot = await getGitCheckpointSnapshot(root);
+  return store.recordRunCheckpoint({
+    ...checkpointInput(root, segment, phase, snapshot),
+    now: phase === "before" ? "2026-08-03T00:00:01.000Z" : "2026-08-03T00:00:04.000Z",
+  });
+}
+
+function recordTerminalResult(store, segment) {
+  store.recordRunResult({
+    sessionId: segment.sessionId,
+    laneId: segment.laneId,
+    segmentId: segment.segmentId,
+    runId: segment.runId,
+    agentKind: segment.agentKind,
+    outputSummary: "Completed.",
+    evidence: {
+      runId: segment.runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-08-03T00:00:03.000Z",
+    },
+    now: "2026-08-03T00:00:03.000Z",
+  });
+}
+
+async function seedProofBearingRun(root) {
+  const store = createWorkflowStore({ projectRoot: root });
+  const segment = seedExecutableRun(store, root);
+  const before = await recordCheckpoint(store, root, segment, "before");
+  await writeFile(join(root, "src.ts"), "export const value = 2;\n", "utf8");
+  git(root, "add", "src.ts");
+  git(root, "commit", "-m", "change source");
+  recordTerminalResult(store, segment);
+  const snapshot = await getGitCheckpointSnapshot(root);
+  const proof = await createAfterCheckpointAncestryProof(store, {
+    ...checkpointIdentity(root, segment, snapshot),
+    repositoryPath: root,
+  }, ancestryAuthority);
+  const after = store.recordRunCheckpoint({
+    ...checkpointInput(root, segment, "after", snapshot),
+    ...proof,
+    now: "2026-08-03T00:00:04.000Z",
+  });
+  store.close();
+  return { segment, before, after };
+}
+
+function liveGateAuthority(root) {
+  return {
+    resolveCanonicalPaths: async () => ({ repositoryPath: root, worktreePath: root }),
+    verify: verifyWorkflowGitAncestryProof,
+  };
+}
+
+async function rewriteMainWithoutBeforeCommit(root) {
+  git(root, "checkout", "--orphan", "rewritten-main");
+  execFileSync("git", ["rm", "-rf", "--cached", "."], {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  await rm(join(root, "src.ts"), { force: true });
+  await writeFile(join(root, "rewritten.ts"), "export const rewritten = true;\n", "utf8");
+  git(root, "add", "rewritten.ts");
+  git(root, "commit", "-m", "rewrite history");
+  git(root, "branch", "-f", "main", "HEAD");
+  git(root, "checkout", "main");
+}
+
+function tamperCheckpointDatabase(root, segment, before, tamper) {
+  const database = new Database(join(root, ".devflow", "skyturn-workflow.sqlite"));
+  const idempotencyKey = tamper === "proof"
+    ? `checkpoint:${segment.runId}:after`
+    : `checkpoint:${segment.runId}:before`;
+  const row = database.prepare(
+    "SELECT payload_json FROM workflow_events WHERE session_id = ? AND idempotency_key = ?",
+  ).get(segment.sessionId, idempotencyKey);
+  const payload = JSON.parse(row.payload_json);
+  if (tamper === "proof") {
+    const parsed = JSON.parse(payload.checkpoint.ancestryProof);
+    parsed.repositoryIdentity = `${parsed.repositoryIdentity.slice(0, -1)}${parsed.repositoryIdentity.endsWith("0") ? "1" : "0"}`;
+    payload.checkpoint.ancestryProof = JSON.stringify(parsed);
+  } else {
+    payload.checkpoint.headCommit = before.headCommit.replace(/^./, before.headCommit.startsWith("0") ? "1" : "0");
+  }
+  database.prepare(
+    "UPDATE workflow_events SET payload_json = ? WHERE session_id = ? AND idempotency_key = ?",
+  ).run(JSON.stringify(payload), segment.sessionId, idempotencyKey);
+  database.close();
 }
 
 function git(cwd, ...args) {

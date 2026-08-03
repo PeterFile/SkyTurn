@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink as fsSymlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -367,6 +367,38 @@ describe("workflow Git ancestry proof service", () => {
     expect(directoryIdentity(repo.repoRoot)).not.toEqual(oldRepositoryIdentity);
     await expectAncestryError(
       verifyWorkflowGitAncestryProof(serializedProof, ancestryInput(repo)),
+      "GIT_EXECUTION_FAILED",
+    );
+  });
+
+  it("rejects an old linked-worktree proof after only the repository top-level object is replaced", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-linked-repository-root-replaced-");
+    tempRoots.push(repo.tempRoot);
+    const worktreePath = join(repo.tempRoot, "linked-worktree");
+    git(repo.repoRoot, ["worktree", "add", "-b", "test/root-replacement", worktreePath, repo.baseCommit]);
+    const afterHeadCommit = commitVariant(worktreePath, "linked-root-replacement");
+    const input = ancestryInput(repo, { worktreePath, afterHeadCommit });
+    const serializedProof = await createWorkflowGitAncestryProof(input);
+    const oldRepositoryIdentity = directoryIdentity(repo.repoRoot);
+    const gitDirectory = join(repo.repoRoot, ".git");
+    const objectDirectory = join(gitDirectory, "objects");
+    const oldGitDirectoryIdentity = directoryIdentity(gitDirectory);
+    const oldObjectDirectoryIdentity = directoryIdentity(objectDirectory);
+    const preservedGitDirectory = join(repo.tempRoot, "preserved.git");
+
+    renameSync(gitDirectory, preservedGitDirectory);
+    rmSync(repo.repoRoot, { recursive: true, force: true });
+    await mkdir(repo.repoRoot);
+    renameSync(preservedGitDirectory, gitDirectory);
+
+    expect(directoryIdentity(repo.repoRoot)).not.toEqual(oldRepositoryIdentity);
+    expect(directoryIdentity(gitDirectory)).toEqual(oldGitDirectoryIdentity);
+    expect(directoryIdentity(objectDirectory)).toEqual(oldObjectDirectoryIdentity);
+    expect(git(repo.repoRoot, ["rev-parse", "HEAD"])).toBe(repo.baseCommit);
+    expect(git(worktreePath, ["rev-parse", "HEAD"])).toBe(afterHeadCommit);
+    expect(git(repo.repoRoot, ["worktree", "list", "--porcelain"])).toContain(realpathSync(worktreePath));
+    await expectAncestryError(
+      verifyWorkflowGitAncestryProof(serializedProof, input),
       "GIT_EXECUTION_FAILED",
     );
   });

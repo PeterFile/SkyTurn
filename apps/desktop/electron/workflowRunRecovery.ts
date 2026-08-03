@@ -1,5 +1,7 @@
 import { realpath } from "node:fs/promises";
 
+import { recordWorkflowCheckpointFailure } from "./workflowCheckpointRuntime";
+
 interface RunSegmentIdentity {
   sessionId: string;
   laneId: string;
@@ -168,22 +170,11 @@ export async function recoverTerminalWorkflowRuns(
   for (const segment of store.listPendingRunCheckpointEnrichments()) {
     try {
       await enrichAfterCheckpoint(segment);
-    } catch (error) {
-      store.appendWorkflowEvent({
-        sessionId: segment.sessionId,
-        kind: "workflow.node.checkpoint_failed",
-        source: "electron-main",
-        laneId: segment.laneId,
-        segmentId: segment.segmentId,
-        idempotencyKey: `checkpoint:${segment.runId}:after:failed`,
-        payload: {
-          runId: segment.runId,
-          phase: "after",
-          status: "failed",
-          retryable: true,
-          terminalRunPreserved: true,
-          reason: error instanceof Error ? error.message : String(error),
-        },
+    } catch {
+      recordWorkflowCheckpointFailure(store, {
+        ...segment,
+        phase: "after",
+        retryable: true,
         now: now(),
       });
     }

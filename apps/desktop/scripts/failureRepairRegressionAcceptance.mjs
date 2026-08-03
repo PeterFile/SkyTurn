@@ -253,6 +253,12 @@ export function assertSeededCheckpointAuthority(projection) {
     if (checkpoints.length !== 1 || stableJson(checkpoints[0]?.evidenceRefs) !== stableJson(expectedRefs)) {
       throw new Error(`Seeded ${phase} checkpoint evidence refs are not exact.`);
     }
+    if (phase === "before" && checkpoints[0].ancestryProof !== undefined) {
+      throw new Error("Seeded before checkpoint must not carry an ancestry proof.");
+    }
+    if (phase === "after" && (typeof checkpoints[0].ancestryProof !== "string" || checkpoints[0].ancestryProof.length === 0)) {
+      throw new Error("Seeded after checkpoint must carry a canonical ancestry proof.");
+    }
     if (phase === "before" && checkpoints[0].evidenceRefs.some((ref) => ref?.kind === "evidence")) {
       throw new Error("Seeded before checkpoint must not reference terminal RunEvidence.");
     }
@@ -309,6 +315,11 @@ export function failureRepairRegressionSummary({
 
 export async function seedFailureRepairRegressionStore(config) {
   const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+  const {
+    createLiveWorkflowGitAncestryProofContext,
+    createWorkflowGitAncestryProof,
+    verifyWorkflowGitAncestryProof,
+  } = await import("@skyturn/git-worktree/node");
   const now = "2026-07-23T00:00:00.000Z";
   const store = createWorkflowStore({ projectRoot: config.projectRoot });
   try {
@@ -422,10 +433,21 @@ export async function seedFailureRepairRegressionStore(config) {
       "after",
       "2026-07-23T00:00:06.000Z",
     );
+    const ancestryInput = {
+      repositoryPath: config.projectRoot,
+      worktreePath: config.projectRoot,
+      beforeHeadCommit: config.baselineHead,
+      afterHeadCommit: config.baselineHead,
+    };
+    const ancestryProof = await createWorkflowGitAncestryProof(ancestryInput);
+    const ancestryProofContext = await createLiveWorkflowGitAncestryProofContext(ancestryInput);
+    await verifyWorkflowGitAncestryProof(ancestryProof, ancestryInput);
     appendCheckpointChangesetEvidence(store, checkpointBase, "after", afterChangesetEvidence);
     store.recordRunCheckpoint({
       ...checkpointBase,
       phase: "after",
+      ancestryProof,
+      ancestryProofContext,
       evidenceRefs: [
         { kind: "run", id: failureRepairRegressionFixture.failedRunId },
         { kind: "segment", id: failureRepairRegressionFixture.failedSegmentId },

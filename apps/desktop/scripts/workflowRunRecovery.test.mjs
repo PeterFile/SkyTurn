@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { appendFile, chmod, lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, open, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
@@ -1054,28 +1055,37 @@ test("restart recovery replays after enrichment idempotently and makes a failed 
 });
 
 test("getWorkflowStore completes pending checkpoint enrichment without waiting on its own recovery", { timeout: 10_000 }, async () => {
-  const root = await makeRoot();
+  const root = await makeGitRoot();
   try {
     const store = seedRunningStore(root);
     const segment = store.listRunningSegments()[0];
+    const headCommit = git(root, "rev-parse", "HEAD");
     assert.ok(segment);
-    store.recordRunCheckpoint(checkpointInput(root, segment, "before"));
+    store.recordRunCheckpoint({
+      ...checkpointInput(root, segment, "before"),
+      headCommit,
+    });
     store.recordRunResult(runResult(segment, "succeeded"));
     store.close();
 
-    const harness = await loadMainWorkflowStoreHarness();
+    const harness = await loadMainWorkflowStoreHarness({ checkpointHeadCommit: headCommit });
     const recovered = await withTimeout(
       harness.getWorkflowStore(root),
-      500,
+      3_000,
       "getWorkflowStore pending enrichment timed out",
     );
 
     assert.equal(harness.resolverReceivedKnownStore(), true);
-    assert.equal(recovered.listNodeCheckpoints({
+    const afterCheckpoints = recovered.listNodeCheckpoints({
       sessionId: segment.sessionId,
       runId: segment.runId,
       phase: "after",
-    }).length, 1);
+    });
+    assert.equal(
+      afterCheckpoints.length,
+      1,
+      JSON.stringify(recovered.listEvents(segment.sessionId), null, 2),
+    );
     harness.closeWorkflowStores();
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1796,9 +1806,12 @@ test("AgentBridge start failure commits SQLite terminal state before optional af
     const reopened = createWorkflowStore({ projectRoot: root });
     assert.equal(reopened.listRunningSegments().length, 0);
     assert.equal(segmentStatus(reopened), "failed");
-    assert.equal(reopened.listEvents("session-1").filter((event) =>
+    const checkpointFailures = reopened.listEvents("session-1").filter((event) =>
       event.kind === "workflow.node.checkpoint_failed" && event.payload.terminalRunPreserved === true
-    ).length, 1);
+    );
+    assert.equal(checkpointFailures.length, 1);
+    assert.equal(checkpointFailures[0].payload.reason, "Workflow after checkpoint could not be recorded.");
+    assert.doesNotMatch(JSON.stringify(checkpointFailures[0].payload), /git enrichment failed|\.git|\/tmp\//);
     reopened.close();
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -2090,6 +2103,21 @@ async function makeRoot() {
   return mkdtemp(join(tmpdir(), "skyturn-recovery-"));
 }
 
+async function makeGitRoot() {
+  const root = await makeRoot();
+  git(root, "init", "--initial-branch=main");
+  git(root, "config", "user.name", "SkyTurn Test");
+  git(root, "config", "user.email", "skyturn@example.invalid");
+  await writeFile(join(root, "fixture.txt"), "fixture\n");
+  git(root, "add", "fixture.txt");
+  git(root, "commit", "-m", "test: seed recovery repository");
+  return root;
+}
+
+function git(root, ...args) {
+  return execFileSync("git", ["-C", root, ...args], { encoding: "utf8" }).trim();
+}
+
 async function waitUntil(predicate) {
   const started = Date.now();
   for (;;) {
@@ -2143,9 +2171,9 @@ async function loadMainWorkflowStoreHarness(options = {}) {
         runId: input.runId,
         agentKind: input.agentKind,
         executionTarget: 'current_branch',
-        worktreePath: input.projectRoot,
+        worktreePath: await fs.realpath(input.projectRoot),
         branchName: 'HEAD',
-        headCommit: '${"d".repeat(40)}',
+        headCommit: '${options.checkpointHeadCommit ?? "d".repeat(40)}',
         worktreeState: 'clean',
         node: {},
         target: {},
@@ -2154,7 +2182,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     "async function reconcileRunChangeset() { return { evidence: { status: 'available' }, collectedAt: '2026-06-14T00:00:05.000Z' }; }",
     "async function verifyRunGitIdentityAtCheckpoint(identity) { return identity; }",
     "function recordRunChangesetEvidence(_store, identity, phase) { return `changeset-evidence:${identity.runId}:${phase}`; }",
-    `function runCheckpointInput(identity, phase, changesetEvidenceId, now) {
+    `function runCheckpointInput(identity, phase, changesetEvidenceId, now, ancestry) {
       return {
         sessionId: identity.sessionId,
         nodeId: identity.nodeId,
@@ -2173,6 +2201,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
           { kind: 'changeset', id: changesetEvidenceId },
           { kind: 'evidence', id: 'evidence-' + identity.segmentId },
         ],
+        ...(ancestry ?? {}),
         now,
       };
     }`,
@@ -2205,6 +2234,8 @@ async function loadMainWorkflowStoreHarness(options = {}) {
   const orchestratorModule = await import("@skyturn/orchestrator");
   const projectCoreModule = await import("@skyturn/project-core");
   const workflowRuntimeModule = await import("@skyturn/ui-canvas/workflow-runtime");
+  const checkpointRuntimeModule = await import("../dist-electron/electron/workflowCheckpointRuntime.js");
+  const gitWorktreeNodeModule = await import("@skyturn/git-worktree/node");
   vm.runInNewContext(output, {
     bridge,
     bridgeProvider,
@@ -2213,10 +2244,16 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     Map,
     Promise,
     path: { isAbsolute: (value) => typeof value === "string" && value.startsWith("/") },
-    fs: { realpath: async (value) => value },
+    fs: { realpath },
     module,
     exports: module.exports,
     persistenceModule,
+    createAfterCheckpointAncestryProof: checkpointRuntimeModule.createAfterCheckpointAncestryProof,
+    workflowGitAncestryProofAuthority: async () => ({
+      createProof: gitWorktreeNodeModule.createWorkflowGitAncestryProof,
+      createContext: gitWorktreeNodeModule.createLiveWorkflowGitAncestryProofContext,
+      verify: gitWorktreeNodeModule.verifyWorkflowGitAncestryProof,
+    }),
     recoverPendingPlannerIntentReconciliations,
     recoverTerminalWorkflowRuns,
     require(specifier) {
