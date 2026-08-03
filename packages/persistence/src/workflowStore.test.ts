@@ -10,7 +10,13 @@ import {
   type WorkflowCardCreateInput,
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
-import type { RunEvent, RunEvidence, WorkflowWorktreeIdentity } from "@skyturn/project-core";
+import {
+  createWorkflowGitAncestryProofContext,
+  type RunEvent,
+  type RunEvidence,
+  type WorkflowGitAncestryProofContext,
+  type WorkflowWorktreeIdentity,
+} from "@skyturn/project-core";
 import {
   compileInsertClarificationBefore,
   scheduleReadyLanes,
@@ -2204,6 +2210,418 @@ describe("SQLite workflow store", () => {
     expect(reopened.listNodeCheckpoints({ sessionId: "session-1", runId: input.runId, phase: "after" })).toEqual([
       expect.objectContaining({ id: `checkpoint:${input.runId}:after`, headCommit: input.headCommit }),
     ]);
+    reopened.close();
+  });
+
+  it("preserves exact canonical ancestry proof bytes through replay and reopen with zero writes", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    const { afterInput, beforeHeadCommit } = prepareProofCheckpointRun(store, projectRoot);
+    const proof = workflowGitAncestryProof(beforeHeadCommit, afterInput.headCommit);
+    const input = { ...afterInput, ...proof, now: "2026-08-01T00:00:05.000Z" };
+
+    const first = store.recordRunCheckpoint(input);
+    const events = store.listEvents(input.sessionId);
+    const proofEvent = events.find((event) => event.idempotencyKey === `checkpoint:${input.runId}:after`);
+    expect(first.ancestryProof).toBe(proof.ancestryProof);
+    expect(proofEvent?.payload.checkpoint).toMatchObject({ ancestryProof: proof.ancestryProof });
+    expect(store.materializeFlowProjection(input.sessionId).checkpoints.at(-1)?.ancestryProof)
+      .toBe(proof.ancestryProof);
+    expect(store.listNodeCheckpoints({ sessionId: input.sessionId, runId: input.runId, phase: "after" })[0]?.ancestryProof)
+      .toBe(proof.ancestryProof);
+
+    const wrongContext = workflowGitAncestryProof(
+      beforeHeadCommit,
+      afterInput.headCommit,
+      "3".repeat(64),
+    ).ancestryProofContext;
+    expect(() => store.recordRunCheckpoint({ ...input, ancestryProofContext: wrongContext }))
+      .toThrow(/context mismatch/i);
+    expect(() => store.recordRunCheckpoint({ ...input, ancestryProof: `${proof.ancestryProof} ` }))
+      .toThrow(/canonical/i);
+    expect(() => store.recordRunCheckpoint({ ...input, authority: "forged" } as typeof input))
+      .toThrow(/authority|restricted/i);
+    expect(store.listEvents(input.sessionId)).toEqual(events);
+    expect(store.recordRunCheckpoint({ ...input, now: "2026-08-01T00:00:06.000Z" })).toEqual(first);
+    expect(store.listEvents(input.sessionId)).toEqual(events);
+    store.close();
+
+    store = createWorkflowStore({ projectRoot });
+    expect(store.listEvents(input.sessionId).find((event) => event.idempotencyKey === proofEvent?.idempotencyKey)
+      ?.payload.checkpoint).toMatchObject({ ancestryProof: proof.ancestryProof });
+    expect(store.materializeFlowProjection(input.sessionId).checkpoints.at(-1)?.ancestryProof)
+      .toBe(proof.ancestryProof);
+    expect(store.listNodeCheckpoints({ sessionId: input.sessionId, runId: input.runId, phase: "after" })[0]?.ancestryProof)
+      .toBe(proof.ancestryProof);
+    expect(store.recordRunCheckpoint({ ...input, now: "2026-08-01T00:00:07.000Z" })).toEqual(first);
+    expect(store.listEvents(input.sessionId)).toEqual(events);
+    store.close();
+  });
+
+  it("rejects proof or context on before checkpoints and incomplete after proof inputs before mutation", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const { afterInput, beforeHeadCommit } = prepareProofCheckpointRun(store, projectRoot);
+    const proof = workflowGitAncestryProof(beforeHeadCommit, afterInput.headCommit);
+    const beforeInput = {
+      ...afterInput,
+      phase: "before" as const,
+      headCommit: beforeHeadCommit,
+      now: "2026-08-01T00:00:03.000Z",
+    };
+    const events = store.listEvents(afterInput.sessionId);
+
+    expect(() => store.recordRunCheckpoint({ ...beforeInput, ...proof })).toThrow(/before.*proof|proof.*before/i);
+    expect(() => store.recordRunCheckpoint({ ...beforeInput, ancestryProof: proof.ancestryProof })).toThrow(/before.*proof|proof.*before/i);
+    expect(() => store.recordRunCheckpoint({ ...beforeInput, ancestryProofContext: proof.ancestryProofContext })).toThrow(/before.*context|context.*before/i);
+    expect(() => store.recordRunCheckpoint({ ...afterInput, ancestryProof: proof.ancestryProof })).toThrow(/both.*proof.*context|proof.*context/i);
+    expect(() => store.recordRunCheckpoint({ ...afterInput, ancestryProofContext: proof.ancestryProofContext })).toThrow(/both.*proof.*context|proof.*context/i);
+    expect(store.listEvents(afterInput.sessionId)).toEqual(events);
+    store.close();
+  });
+
+  it.each([
+    "object proof",
+    "malformed proof",
+    "noncanonical proof",
+    "tampered proof",
+    "wrong branded repository context",
+    "wrong branded worktree context",
+    "before commit mismatch",
+    "after commit mismatch",
+  ] as const)("rejects %s before checkpoint mutation", async (failure) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const { afterInput, beforeHeadCommit } = prepareProofCheckpointRun(store, projectRoot);
+    const valid = workflowGitAncestryProof(beforeHeadCommit, afterInput.headCommit);
+    let ancestryProof: unknown = valid.ancestryProof;
+    let ancestryProofContext: WorkflowGitAncestryProofContext = valid.ancestryProofContext;
+
+    if (failure === "object proof") ancestryProof = JSON.parse(valid.ancestryProof);
+    if (failure === "malformed proof") ancestryProof = "{";
+    if (failure === "noncanonical proof") ancestryProof = valid.ancestryProof.replace("{", "{ ");
+    if (failure === "tampered proof") ancestryProof = valid.ancestryProof.replace(beforeHeadCommit, "c".repeat(40));
+    if (failure === "wrong branded repository context") {
+      ancestryProofContext = workflowGitAncestryProof(
+        beforeHeadCommit,
+        afterInput.headCommit,
+        "3".repeat(64),
+      ).ancestryProofContext;
+    }
+    if (failure === "wrong branded worktree context") {
+      ancestryProofContext = workflowGitAncestryProof(
+        beforeHeadCommit,
+        afterInput.headCommit,
+        "1".repeat(64),
+        "4".repeat(64),
+      ).ancestryProofContext;
+    }
+    if (failure === "before commit mismatch") {
+      ({ ancestryProof, ancestryProofContext } = workflowGitAncestryProof("c".repeat(40), afterInput.headCommit));
+    }
+    if (failure === "after commit mismatch") {
+      ({ ancestryProof, ancestryProofContext } = workflowGitAncestryProof(beforeHeadCommit, "c".repeat(40)));
+    }
+    const events = store.listEvents(afterInput.sessionId);
+
+    expect(() => store.recordRunCheckpoint({
+      ...afterInput,
+      ancestryProof: ancestryProof as string,
+      ancestryProofContext,
+    })).toThrow(/proof|commit|context|serialized|string/i);
+    expect(store.listEvents(afterInput.sessionId)).toEqual(events);
+    store.close();
+  });
+
+  it("rejects proof, context, and authority spellings from generic checkpoint append before idempotency", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const checkpoint = rawCheckpoint({
+      id: "checkpoint-generic-legacy",
+      runId: "run-generic-legacy",
+      segmentId: "segment-generic-legacy",
+      phase: "before",
+      headCommit: "a".repeat(40),
+      worktreePath: projectRoot,
+    });
+    const input = {
+      sessionId: "session-1",
+      kind: "workflow.node.checkpoint_recorded" as const,
+      source: "test" as const,
+      idempotencyKey: "checkpoint:generic-legacy",
+      payload: { checkpoint },
+      now: "2026-08-01T00:00:01.000Z",
+    };
+    const legacy = store.appendWorkflowEvent(input);
+    const events = store.listEvents(input.sessionId);
+    const projection = store.materializeFlowProjection(input.sessionId);
+    const canonicalProof = workflowGitAncestryProof("a".repeat(40), "b".repeat(40)).ancestryProof;
+    const reservedFields = [
+      "ancestryProof",
+      "ancestry_proof",
+      "Ancestry-Proof",
+      "ancestryProofContext",
+      "workflow_git_ancestry_proof_context",
+      "proofContext",
+      "authority",
+      "AUTHORITY",
+      "_authority",
+      "checkpointAuthority",
+      "checkpoint_authority",
+      "proofAuthority",
+      "proof-authority",
+    ];
+
+    for (const field of reservedFields) {
+      const value = field.toLowerCase().includes("ancestry") && !field.toLowerCase().includes("context")
+        ? canonicalProof
+        : "forged";
+      expect(() => store.appendWorkflowEvent({
+        ...input,
+        payload: { ...input.payload, [field]: value },
+      }), `payload.${field}`).toThrow(/checkpoint.*restricted|proof|context|authority/i);
+      expect(() => store.appendWorkflowEvent({
+        ...input,
+        payload: { checkpoint: { ...checkpoint, [field]: value } },
+      }), `payload.checkpoint.${field}`).toThrow(/checkpoint.*restricted|proof|context|authority/i);
+    }
+    expect(store.listEvents(input.sessionId)).toEqual(events);
+    expect(store.materializeFlowProjection(input.sessionId)).toEqual(projection);
+    expect(store.listNodeCheckpoints({ sessionId: input.sessionId })).toContainEqual(
+      expect.objectContaining({ id: checkpoint.id }),
+    );
+    store.close();
+
+    store = createWorkflowStore({ projectRoot });
+    expect(store.listEvents(input.sessionId)).toContainEqual(legacy);
+    expect(store.listNodeCheckpoints({ sessionId: input.sessionId })[0]).not.toHaveProperty("ancestryProof");
+    store.close();
+  });
+
+  it("fails every checkpoint read path before returning directly tampered proof bytes", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    const { afterInput, beforeHeadCommit } = prepareProofCheckpointRun(store, projectRoot);
+    const proof = workflowGitAncestryProof(beforeHeadCommit, afterInput.headCommit);
+    store.recordRunCheckpoint({ ...afterInput, ...proof });
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    const row = db.prepare("SELECT payload_json FROM workflow_events WHERE session_id = ? AND idempotency_key = ?")
+      .get(afterInput.sessionId, `checkpoint:${afterInput.runId}:after`) as { payload_json: string };
+    const payload = JSON.parse(row.payload_json) as { checkpoint: Record<string, unknown> };
+    payload.checkpoint.ancestryProof = `${proof.ancestryProof} `;
+    db.prepare("UPDATE workflow_events SET payload_json = ? WHERE session_id = ? AND idempotency_key = ?")
+      .run(JSON.stringify(payload), afterInput.sessionId, `checkpoint:${afterInput.runId}:after`);
+    db.close();
+
+    store = createWorkflowStore({ projectRoot });
+    expect(() => store.listEvents(afterInput.sessionId)).toThrow(/ancestry proof|canonical/i);
+    expect(() => store.materializeFlowProjection(afterInput.sessionId)).toThrow(/ancestry proof|canonical/i);
+    expect(() => store.listNodeCheckpoints({ sessionId: afterInput.sessionId })).toThrow(/ancestry proof|canonical/i);
+    store.close();
+  });
+
+  it.each([
+    ["node", { nodeId: "node-other" }],
+    ["execution target", { executionTarget: "new_worktree", worktreeId: "worktree-other" }],
+    ["worktree id presence", { worktreeId: "worktree-other" }],
+    ["worktree path", { worktreePath: "/different/repository/worktree" }],
+    ["branch", { branchName: "other-branch" }],
+  ] as const)("rejects persisted proof whose unique before checkpoint has mismatched %s authority", async (_label, beforeOverride) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.close();
+    const runId = `run-authority-${_label.replaceAll(" ", "-")}`;
+    const beforeHeadCommit = "a".repeat(40);
+    const afterHeadCommit = "b".repeat(40);
+    const common = {
+      sessionId: "session-1",
+      nodeId: "node-authority",
+      laneId: "lane-authority",
+      runId,
+      segmentId: "segment-authority",
+      executionTarget: "current_branch",
+      worktreePath: projectRoot,
+      branchName: "HEAD",
+    };
+    const proof = workflowGitAncestryProof(beforeHeadCommit, afterHeadCommit);
+    insertRawCheckpointEvents(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), [
+      rawCheckpoint({
+        ...common,
+        ...beforeOverride,
+        id: `checkpoint:${runId}:before`,
+        phase: "before",
+        headCommit: beforeHeadCommit,
+      }),
+      rawCheckpoint({
+        ...common,
+        id: `checkpoint:${runId}:after`,
+        phase: "after",
+        headCommit: afterHeadCommit,
+        ancestryProof: proof.ancestryProof,
+      }),
+    ]);
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(() => reopened.listEvents("session-1")).toThrow(/authority|worktree identity|checkpoint/i);
+    expect(() => reopened.materializeFlowProjection("session-1")).toThrow(/authority|worktree identity|checkpoint/i);
+    expect(() => reopened.listNodeCheckpoints({ sessionId: "session-1" })).toThrow(/authority|worktree identity|checkpoint/i);
+    reopened.close();
+  });
+
+  it.each([
+    ["different authority", {
+      id: "checkpoint-duplicate-before-other-authority",
+      nodeId: "node-other",
+      executionTarget: "new_worktree",
+      worktreeId: "worktree-other",
+      worktreePath: "/different/repository/worktree",
+      branchName: "other-branch",
+    }],
+    ["only checkpoint id differs", { id: "checkpoint-duplicate-before-id-only" }],
+  ] as const)("rejects proof-bearing after checkpoint with same-head ambiguous before candidates: %s", async (_label, duplicateOverride) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.close();
+    const runId = `run-ambiguous-${_label.replaceAll(" ", "-")}`;
+    const beforeHeadCommit = "a".repeat(40);
+    const afterHeadCommit = "b".repeat(40);
+    const common = {
+      sessionId: "session-1",
+      nodeId: "node-ambiguous",
+      laneId: "lane-ambiguous",
+      runId,
+      segmentId: "segment-ambiguous",
+      executionTarget: "current_branch",
+      worktreePath: projectRoot,
+      branchName: "HEAD",
+    };
+    const before = rawCheckpoint({
+      ...common,
+      id: `checkpoint:${runId}:before`,
+      phase: "before",
+      headCommit: beforeHeadCommit,
+    });
+    const proof = workflowGitAncestryProof(beforeHeadCommit, afterHeadCommit);
+    insertRawCheckpointEvents(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), [
+      before,
+      { ...before, ...duplicateOverride },
+      rawCheckpoint({
+        ...common,
+        id: `checkpoint:${runId}:after`,
+        phase: "after",
+        headCommit: afterHeadCommit,
+        ancestryProof: proof.ancestryProof,
+      }),
+    ]);
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(() => reopened.listEvents("session-1")).toThrow(/exactly one|ambiguous/i);
+    expect(() => reopened.materializeFlowProjection("session-1")).toThrow(/exactly one|ambiguous/i);
+    expect(() => reopened.listNodeCheckpoints({ sessionId: "session-1" })).toThrow(/exactly one|ambiguous/i);
+    reopened.close();
+  });
+
+  it("keeps duplicate same-run legacy checkpoints readable when no after checkpoint has proof", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.close();
+    const runId = "run-ambiguous-legacy";
+    const common = {
+      sessionId: "session-1",
+      nodeId: "node-ambiguous-legacy",
+      laneId: "lane-ambiguous-legacy",
+      runId,
+      segmentId: "segment-ambiguous-legacy",
+      executionTarget: "current_branch",
+      worktreePath: projectRoot,
+      branchName: "HEAD",
+    };
+    const before = rawCheckpoint({
+      ...common,
+      id: `checkpoint:${runId}:before`,
+      phase: "before",
+      headCommit: "a".repeat(40),
+      authority: { laneIdExplicit: true, nodeIdExplicit: true },
+    });
+    insertRawCheckpointEvents(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), [
+      before,
+      {
+        ...before,
+        id: "checkpoint-ambiguous-legacy-duplicate",
+        nodeId: "node-other",
+        executionTarget: "new_worktree",
+        worktreeId: "worktree-other",
+        worktreePath: "/different/repository/worktree",
+        branchName: "other-branch",
+      },
+      rawCheckpoint({
+        ...common,
+        id: `checkpoint:${runId}:after`,
+        phase: "after",
+        headCommit: "b".repeat(40),
+      }),
+    ]);
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.node.checkpoint_recorded"))
+      .toHaveLength(3);
+    expect(reopened.materializeFlowProjection("session-1").checkpoints).toHaveLength(3);
+    expect(reopened.listNodeCheckpoints({ sessionId: "session-1" })).toHaveLength(3);
+    expect(reopened.listNodeCheckpoints({ sessionId: "session-1" }).some((checkpoint) => "ancestryProof" in checkpoint))
+      .toBe(false);
+    reopened.close();
+  });
+
+  it("validates many distinct persisted proof pairs through the indexed read path", async () => {
+    const projectRoot = await makeTempRoot();
+    const canonicalProjectRoot = await realpath(projectRoot);
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    store.close();
+    const checkpoints: Record<string, unknown>[] = [];
+    for (let index = 0; index < 128; index += 1) {
+      const runId = `run-linear-${index}`;
+      const beforeHeadCommit = index.toString(16).padStart(40, "0");
+      const afterHeadCommit = (index + 1_000).toString(16).padStart(40, "0");
+      const common = {
+        sessionId: "session-1",
+        nodeId: `node-linear-${index}`,
+        laneId: `lane-linear-${index}`,
+        runId,
+        segmentId: `segment-linear-${index}`,
+        executionTarget: "current_branch",
+        worktreePath: canonicalProjectRoot,
+        branchName: "HEAD",
+      };
+      checkpoints.push(
+        rawCheckpoint({
+          ...common,
+          id: `checkpoint:${runId}:before`,
+          phase: "before",
+          headCommit: beforeHeadCommit,
+        }),
+        rawCheckpoint({
+          ...common,
+          id: `checkpoint:${runId}:after`,
+          phase: "after",
+          headCommit: afterHeadCommit,
+          ancestryProof: workflowGitAncestryProof(beforeHeadCommit, afterHeadCommit).ancestryProof,
+        }),
+      );
+    }
+    insertRawCheckpointEvents(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), checkpoints);
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listEvents("session-1").filter((event) => event.kind === "workflow.node.checkpoint_recorded"))
+      .toHaveLength(256);
+    expect(reopened.materializeFlowProjection("session-1").checkpoints).toHaveLength(256);
+    expect(reopened.listNodeCheckpoints({ sessionId: "session-1", phase: "after" })).toHaveLength(128);
     reopened.close();
   });
 
@@ -8327,6 +8745,136 @@ function appendWorktreeCreated(store: TestWorkflowStore, worktree: WorkflowWorkt
 
 type TestWorkflowStore = ReturnType<typeof createWorkflowStore>;
 type TestSegmentEvidenceInput = Parameters<TestWorkflowStore["recordSegmentEvidence"]>[0];
+
+function workflowGitAncestryProof(
+  beforeHeadCommit: string,
+  afterHeadCommit: string,
+  repositoryIdentity = "1".repeat(64),
+  worktreeIdentity = "2".repeat(64),
+): { ancestryProof: string; ancestryProofContext: WorkflowGitAncestryProofContext } {
+  const ancestryProofContext = createWorkflowGitAncestryProofContext(
+    beforeHeadCommit,
+    afterHeadCommit,
+    repositoryIdentity,
+    worktreeIdentity,
+  );
+  return {
+    ancestryProof: JSON.stringify({
+      protocolVersion: 1,
+      method: "git-merge-base-is-ancestor",
+      beforeHeadCommit,
+      afterHeadCommit,
+      repositoryIdentity,
+      worktreeIdentity,
+    }),
+    ancestryProofContext,
+  };
+}
+
+function prepareProofCheckpointRun(store: TestWorkflowStore, projectRoot: string) {
+  seedStore(store);
+  declareCodeChangeWorkflow(store);
+  advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+  const beforeHeadCommit = "a".repeat(40);
+  const common = {
+    sessionId: "session-1",
+    nodeId: "lane-implementation",
+    laneId: "lane-implementation",
+    runId: "run-session-1-lane-implementation",
+    segmentId: "segment-session-1-lane-implementation",
+    executionTarget: "current_branch" as const,
+    worktreePath: projectRoot,
+    branchName: "HEAD",
+    worktreeState: "clean" as const,
+    evidenceRefs: [{ kind: "run" as const, id: "run-session-1-lane-implementation" }],
+  };
+  store.recordRunCheckpoint({
+    ...common,
+    phase: "before",
+    headCommit: beforeHeadCommit,
+    now: "2026-08-01T00:00:03.000Z",
+  });
+  store.recordRunResult(runResultInput(
+    store,
+    common.laneId,
+    "succeeded",
+    "2026-08-01T00:00:04.000Z",
+  ));
+  return {
+    beforeHeadCommit,
+    afterInput: {
+      ...common,
+      phase: "after" as const,
+      headCommit: "b".repeat(40),
+      now: "2026-08-01T00:00:05.000Z",
+    },
+  };
+}
+
+function rawCheckpoint(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const runId = typeof overrides.runId === "string" ? overrides.runId : "run-raw";
+  const segmentId = typeof overrides.segmentId === "string" ? overrides.segmentId : "segment-raw";
+  const laneId = typeof overrides.laneId === "string" ? overrides.laneId : "lane-raw";
+  return {
+    id: `checkpoint:${runId}:before`,
+    sessionId: "session-1",
+    nodeId: laneId,
+    laneId,
+    runId,
+    segmentId,
+    phase: "before",
+    executionTarget: "current_branch",
+    worktreePath: "/repo",
+    branchName: "HEAD",
+    worktreeState: "clean",
+    headCommit: "a".repeat(40),
+    createdAt: "2026-08-01T00:00:00.000Z",
+    source: "backend",
+    evidenceRefs: [{ kind: "run", id: runId }],
+    ...overrides,
+  };
+}
+
+function insertRawCheckpointEvents(databasePath: string, checkpoints: Record<string, unknown>[]): void {
+  const db = new Database(databasePath);
+  let seq = Number((db.prepare("SELECT MAX(seq) AS seq FROM workflow_events WHERE session_id = ?")
+    .get("session-1") as { seq: number | null }).seq ?? 0);
+  const usedIdempotencyKeys = new Set(
+    (db.prepare("SELECT idempotency_key FROM workflow_events WHERE session_id = ? AND idempotency_key IS NOT NULL")
+      .all("session-1") as Array<{ idempotency_key: string }>).map((row) => row.idempotency_key),
+  );
+  const insert = db.prepare([
+    "INSERT INTO workflow_events(",
+    "id, session_id, seq, kind, source, lane_id, segment_id, causation_id, correlation_id,",
+    "idempotency_key, payload_json, created_at",
+    ") VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
+  ].join(" "));
+  for (const checkpoint of checkpoints) {
+    seq += 1;
+    const sessionId = String(checkpoint.sessionId ?? "session-1");
+    const checkpointId = String(checkpoint.id ?? `checkpoint-raw-${seq}`);
+    const runId = typeof checkpoint.runId === "string" ? checkpoint.runId : `raw-${seq}`;
+    const phase = checkpoint.phase === "after" ? "after" : "before";
+    const expectedIdempotencyKey = `checkpoint:${runId}:${phase}`;
+    const idempotencyKey = usedIdempotencyKeys.has(expectedIdempotencyKey)
+      ? `${expectedIdempotencyKey}:duplicate:${seq}`
+      : expectedIdempotencyKey;
+    usedIdempotencyKeys.add(idempotencyKey);
+    insert.run(
+      `${sessionId}:raw-checkpoint-event:${seq}`,
+      sessionId,
+      seq,
+      "workflow.node.checkpoint_recorded",
+      "backend",
+      typeof checkpoint.laneId === "string" ? checkpoint.laneId : null,
+      typeof checkpoint.segmentId === "string" ? checkpoint.segmentId : null,
+      idempotencyKey,
+      JSON.stringify({ checkpoint }),
+      typeof checkpoint.createdAt === "string" ? checkpoint.createdAt : "2026-08-01T00:00:00.000Z",
+    );
+  }
+  db.close();
+}
 
 function terminalRunEvidence(
   runId: string,
