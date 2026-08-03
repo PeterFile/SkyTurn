@@ -4,11 +4,13 @@ import { mkdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import {
+  createWorkflowGitAncestryProofContext,
   expectedArtifactContractForRequiredEvidence,
   isSuccessfulRunEvidence,
   normalizeSessionTarget,
   parseRunEvent,
   parseRunEvidence,
+  parseWorkflowGitAncestryProof,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
   sanitizePublicEvidenceText,
@@ -33,6 +35,7 @@ import type {
   WorkflowLoopEngineeringProjectionInput,
   WorkflowLoopEngineeringState,
   WorkflowMode,
+  WorkflowGitAncestryProofContext,
   WorkflowNodeCheckpoint,
   WorkflowRollbackEligibility,
   WorkflowWorktreeIdentity,
@@ -478,6 +481,8 @@ export interface RecordRunCheckpointInput {
   headCommit: string;
   worktreeState: NonNullable<WorkflowNodeCheckpoint["worktreeState"]>;
   evidenceRefs: WorkflowNodeCheckpoint["evidenceRefs"];
+  ancestryProof?: string;
+  ancestryProofContext?: WorkflowGitAncestryProofContext;
   now: string;
 }
 
@@ -705,6 +710,11 @@ interface EventRow {
   payload_json: string;
   created_at: string;
   legacy_evidence_compatibility: 0 | 1;
+}
+
+interface ValidatedEventRow {
+  row: EventRow;
+  event: WorkflowEventRecord;
 }
 
 interface LaneRow {
@@ -948,6 +958,7 @@ export class WorkflowStore {
   }
 
   appendWorkflowEvent(input: AppendWorkflowEventInput): WorkflowEventRecord {
+    assertGenericCheckpointEventHasNoRestrictedFields(input);
     const laneId = laneIdFromPayload(input.payload);
     const projection = this.materializeFlowProjection(input.sessionId);
     const lane = laneId ? projection.lanes.find((item) => item.id === laneId) : undefined;
@@ -1583,6 +1594,18 @@ export class WorkflowStore {
   }
 
   recordRunCheckpoint(input: RecordRunCheckpointInput): WorkflowNodeCheckpoint {
+    assertRecordRunCheckpointHasNoUnexpectedProofFields(input);
+    const proofProvided = input.ancestryProof !== undefined;
+    const contextProvided = input.ancestryProofContext !== undefined;
+    if (input.phase === "before" && (proofProvided || contextProvided)) {
+      throw new Error("Before run checkpoint must not include ancestry proof or context.");
+    }
+    if (input.phase === "after" && proofProvided !== contextProvided) {
+      throw new Error("After run checkpoint requires both ancestry proof and context or neither.");
+    }
+    const parsedAncestryProof = proofProvided && contextProvided
+      ? parseWorkflowGitAncestryProof(input.ancestryProof, input.ancestryProofContext!)
+      : null;
     const session = this.requireKnownSession(input.sessionId);
     if (session.target.executionTarget !== input.executionTarget) {
       throw new Error("Run checkpoint execution target identity mismatch.");
@@ -1632,15 +1655,20 @@ export class WorkflowStore {
       throw new Error("After run checkpoint requires terminal RunEvidence.");
     }
     if (input.phase === "after") {
-      const before = projection.checkpoints.find((item) =>
+      const beforeCandidates = projection.checkpoints.filter((item) =>
         item.phase === "before" &&
         item.sessionId === input.sessionId &&
         item.laneId === input.laneId &&
         item.segmentId === input.segmentId &&
         item.runId === input.runId
       );
+      if (parsedAncestryProof && beforeCandidates.length !== 1) {
+        throw new Error("Proof-bearing after checkpoint requires exactly one matching before checkpoint.");
+      }
+      const before = beforeCandidates[0];
       if (!before) throw new Error("After run checkpoint requires the matching before checkpoint.");
       if (
+        before.nodeId !== input.nodeId ||
         before.executionTarget !== input.executionTarget ||
         before.worktreeId !== input.worktreeId ||
         !before.worktreePath ||
@@ -1648,6 +1676,17 @@ export class WorkflowStore {
         before.branchName !== input.branchName
       ) {
         throw new Error("After run checkpoint must match before checkpoint worktree identity.");
+      }
+      if (parsedAncestryProof) {
+        if (before.id !== `checkpoint:${input.runId}:before`) {
+          throw new Error("Proof-bearing before checkpoint authority is invalid.");
+        }
+        if (
+          parsedAncestryProof.beforeHeadCommit !== before.headCommit ||
+          parsedAncestryProof.afterHeadCommit !== input.headCommit.toLowerCase()
+        ) {
+          throw new Error("Workflow Git ancestry proof commit binding mismatch.");
+        }
       }
     }
     if (!/^[0-9a-f]{40}$/i.test(input.headCommit)) throw new Error("Run checkpoint requires a full commit SHA.");
@@ -1676,20 +1715,10 @@ export class WorkflowStore {
       createdAt: input.now,
       source: "backend",
       evidenceRefs: input.evidenceRefs,
+      ...(input.ancestryProof !== undefined ? { ancestryProof: input.ancestryProof } : {}),
     };
     const idempotencyKey = `checkpoint:${input.runId}:${input.phase}`;
-    const existing = this.getEventByIdempotencyKey(input.sessionId, idempotencyKey);
-    if (existing) {
-      const existingCheckpoint = isRecord(existing.payload.checkpoint) ? existing.payload.checkpoint : null;
-      const comparableCheckpoint = existingCheckpoint && typeof existingCheckpoint.createdAt === "string"
-        ? { ...checkpoint, createdAt: existingCheckpoint.createdAt }
-        : checkpoint;
-      if (stableJson(existingCheckpoint) !== stableJson(comparableCheckpoint)) {
-        throw new Error("Run checkpoint identity mismatch for existing run phase.");
-      }
-      return existingCheckpoint as unknown as WorkflowNodeCheckpoint;
-    }
-    this.appendWorkflowEvent({
+    const event = this.appendValidatedRunCheckpointEvent({
       sessionId: input.sessionId,
       kind: "workflow.node.checkpoint_recorded",
       source: "backend",
@@ -1698,8 +1727,27 @@ export class WorkflowStore {
       idempotencyKey,
       payload: { checkpoint },
       now: input.now,
+    }, checkpoint);
+    return event.payload.checkpoint as unknown as WorkflowNodeCheckpoint;
+  }
+
+  private appendValidatedRunCheckpointEvent(
+    input: AppendWorkflowEventInput,
+    checkpoint: WorkflowNodeCheckpoint,
+  ): WorkflowEventRecord {
+    const tx = this.db.transaction(() => {
+      const existing = input.idempotencyKey
+        ? this.getEventByIdempotencyKey(input.sessionId, input.idempotencyKey)
+        : null;
+      if (existing) {
+        assertMatchingRunCheckpointEvent(existing, input, checkpoint);
+        return existing;
+      }
+      const event = this.insertEventInTransaction(input);
+      this.projectEventInTransaction(event);
+      return event;
     });
-    return checkpoint;
+    return tx.immediate();
   }
 
   private recordPlannerRunResult(
@@ -1875,9 +1923,9 @@ export class WorkflowStore {
   }
 
   materializeFlowProjection(sessionId: string): FlowProjection {
-    const flowEvents = (this.statements.listEvents.all(sessionId) as EventRow[])
-      .filter((event) => isFlowEventKind(event.kind))
-      .map(mapEventRowToFlowEvent);
+    const flowEvents = this.readValidatedEventRows(sessionId)
+      .filter(({ row }) => isFlowEventKind(row.kind))
+      .map(({ row, event }) => mapEventRowToFlowEvent(row, event));
     return reduceWorkflowEvents([seedFlowUserInputEvent(sessionId), ...flowEvents]);
   }
 
@@ -1890,7 +1938,16 @@ export class WorkflowStore {
   }
 
   listEvents(sessionId: string): WorkflowEventRecord[] {
-    return (this.statements.listEvents.all(sessionId) as EventRow[]).map(mapEvent);
+    return this.readValidatedEventRows(sessionId).map(({ event }) => event);
+  }
+
+  private readValidatedEventRows(sessionId: string): ValidatedEventRow[] {
+    const events = (this.statements.listEvents.all(sessionId) as EventRow[]).map((row) => ({
+      row,
+      event: mapEvent(row),
+    }));
+    validatePersistedCheckpointAncestryProofs(events);
+    return events;
   }
 
   listNodeCheckpoints(input: WorkflowNodeCheckpointQuery): WorkflowNodeCheckpoint[] {
@@ -3385,6 +3442,69 @@ function assertNoConflictingTerminalRunEvidence(
   if (first && stableJson(first) !== stableJson(incoming)) {
     throw new Error("Workflow terminal evidence conflict for existing run.");
   }
+}
+
+function assertGenericCheckpointEventHasNoRestrictedFields(input: AppendWorkflowEventInput): void {
+  if (input.kind !== "workflow.node.checkpoint_recorded") return;
+  assertNoRestrictedCheckpointFields(input.payload);
+  if (isRecord(input.payload.checkpoint)) {
+    assertNoRestrictedCheckpointFields(input.payload.checkpoint);
+  }
+}
+
+function assertMatchingRunCheckpointEvent(
+  existing: WorkflowEventRecord,
+  input: AppendWorkflowEventInput,
+  checkpoint: WorkflowNodeCheckpoint,
+): void {
+  const existingCheckpoint = isRecord(existing.payload.checkpoint) ? existing.payload.checkpoint : null;
+  const comparableCheckpoint = existingCheckpoint && typeof existingCheckpoint.createdAt === "string"
+    ? { ...checkpoint, createdAt: existingCheckpoint.createdAt }
+    : checkpoint;
+  if (
+    existing.kind !== "workflow.node.checkpoint_recorded"
+    || existing.source !== "backend"
+    || existing.sessionId !== input.sessionId
+    || existing.laneId !== input.laneId
+    || existing.segmentId !== input.segmentId
+    || existing.idempotencyKey !== input.idempotencyKey
+    || stableJson(existing.payload) !== stableJson({ checkpoint: comparableCheckpoint })
+  ) {
+    throw new Error("Run checkpoint identity mismatch for existing run phase.");
+  }
+}
+
+function assertRecordRunCheckpointHasNoUnexpectedProofFields(input: RecordRunCheckpointInput): void {
+  for (const key of Object.keys(input)) {
+    if (
+      key !== "ancestryProof"
+      && key !== "ancestryProofContext"
+      && isRestrictedCheckpointFieldName(key)
+    ) {
+      throw new Error(`Run checkpoint contains restricted proof, context, or authority field: ${key}.`);
+    }
+  }
+}
+
+function assertNoRestrictedCheckpointFields(value: Record<string, unknown>): void {
+  for (const key of Object.keys(value)) {
+    if (isRestrictedCheckpointFieldName(key)) {
+      throw new Error(`Generic checkpoint append contains restricted proof, context, or authority field: ${key}.`);
+    }
+  }
+}
+
+function isRestrictedCheckpointFieldName(key: string): boolean {
+  const folded = key.normalize("NFKC").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return folded.includes("proof")
+    || folded.includes("context")
+    || folded.includes("authority")
+    || folded === "beforeheadcommit"
+    || folded === "afterheadcommit"
+    || folded === "repositoryidentity"
+    || folded === "worktreeidentity"
+    || folded === "protocolversion"
+    || folded === "method";
 }
 
 class LedgerSanitizer {
@@ -5316,14 +5436,211 @@ function mapEvent(row: EventRow): WorkflowEventRecord {
   };
 }
 
+interface PersistedCheckpointEntry {
+  event: WorkflowEventRecord;
+  checkpoint: Record<string, unknown>;
+}
+
+interface PersistedCheckpointAuthority {
+  id: string;
+  nodeId: string;
+  executionTarget: WorkflowNodeCheckpoint["executionTarget"];
+  worktreeId: { present: false } | { present: true; value: string };
+  worktreePath: string;
+  branchName: string;
+  headCommit: string;
+}
+
+function validatePersistedCheckpointAncestryProofs(events: ValidatedEventRow[]): void {
+  const beforeByRunKey = new Map<string, PersistedCheckpointEntry[]>();
+  const checkpointIdCounts = new Map<string, number>();
+  const proofBearingAfter: PersistedCheckpointEntry[] = [];
+
+  for (const { event } of events) {
+    if (event.kind !== "workflow.node.checkpoint_recorded") continue;
+    if (!isRecord(event.payload.checkpoint)) {
+      assertPersistedCheckpointEventFields(event.payload, false);
+      continue;
+    }
+    const checkpoint = event.payload.checkpoint;
+    const hasAncestryProof = Object.prototype.hasOwnProperty.call(checkpoint, "ancestryProof");
+    assertPersistedCheckpointEventFields(event.payload, hasAncestryProof);
+    const entry = { event, checkpoint };
+    if (typeof checkpoint.id === "string") {
+      checkpointIdCounts.set(checkpoint.id, (checkpointIdCounts.get(checkpoint.id) ?? 0) + 1);
+    }
+    const runKey = persistedCheckpointRunKey(checkpoint);
+    if (checkpoint.phase === "before" && runKey) {
+      const candidates = beforeByRunKey.get(runKey);
+      if (candidates) candidates.push(entry);
+      else beforeByRunKey.set(runKey, [entry]);
+    }
+    if (!hasAncestryProof) continue;
+    if (typeof checkpoint.ancestryProof !== "string") {
+      throw new Error("Persisted checkpoint ancestry proof must be an exact string.");
+    }
+    if (checkpoint.phase !== "after") {
+      throw new Error("Only persisted after checkpoints may contain ancestry proof bytes.");
+    }
+    proofBearingAfter.push(entry);
+  }
+
+  for (const afterEntry of proofBearingAfter) {
+    const runKey = persistedCheckpointRunKey(afterEntry.checkpoint);
+    if (!runKey) throw new Error("Proof-bearing after checkpoint primary run identity is invalid.");
+    const beforeCandidates = beforeByRunKey.get(runKey) ?? [];
+    if (beforeCandidates.length !== 1) {
+      throw new Error("Proof-bearing after checkpoint requires exactly one unambiguous before checkpoint.");
+    }
+    const beforeEntry = beforeCandidates[0]!;
+    const before = persistedCheckpointAuthority(beforeEntry, "before");
+    const after = persistedCheckpointAuthority(afterEntry, "after");
+    if (
+      checkpointIdCounts.get(before.id) !== 1
+      || checkpointIdCounts.get(after.id) !== 1
+    ) {
+      throw new Error("Proof-bearing checkpoint authority is ambiguous.");
+    }
+    if (
+      before.nodeId !== after.nodeId
+      || before.executionTarget !== after.executionTarget
+      || before.worktreeId.present !== after.worktreeId.present
+      || (
+        before.worktreeId.present
+        && after.worktreeId.present
+        && before.worktreeId.value !== after.worktreeId.value
+      )
+      || before.worktreePath !== after.worktreePath
+      || before.branchName !== after.branchName
+    ) {
+      throw new Error("Proof-bearing before and after checkpoint authority mismatch.");
+    }
+    const proof = parsePersistedWorkflowGitAncestryProof(afterEntry.checkpoint.ancestryProof as string);
+    if (
+      proof.beforeHeadCommit !== before.headCommit
+      || proof.afterHeadCommit !== after.headCommit
+    ) {
+      throw new Error("Persisted Workflow Git ancestry proof commit binding mismatch.");
+    }
+  }
+}
+
+function persistedCheckpointRunKey(checkpoint: Record<string, unknown>): string | null {
+  const fields = [checkpoint.sessionId, checkpoint.laneId, checkpoint.segmentId, checkpoint.runId];
+  if (fields.some((field) => typeof field !== "string" || field.length === 0)) return null;
+  return JSON.stringify(fields);
+}
+
+function persistedCheckpointAuthority(
+  entry: PersistedCheckpointEntry,
+  phase: "before" | "after",
+): PersistedCheckpointAuthority {
+  const { checkpoint, event } = entry;
+  const sessionId = persistedCheckpointText(checkpoint.sessionId, "sessionId");
+  const laneId = persistedCheckpointText(checkpoint.laneId, "laneId");
+  const segmentId = persistedCheckpointText(checkpoint.segmentId, "segmentId");
+  const runId = persistedCheckpointText(checkpoint.runId, "runId");
+  const id = persistedCheckpointText(checkpoint.id, "id");
+  const nodeId = persistedCheckpointText(checkpoint.nodeId, "nodeId");
+  const worktreePath = persistedCheckpointText(checkpoint.worktreePath, "worktreePath");
+  const branchName = persistedCheckpointText(checkpoint.branchName, "branchName");
+  const headCommit = persistedCheckpointText(checkpoint.headCommit, "headCommit");
+  const executionTarget = checkpoint.executionTarget;
+  const hasWorktreeId = Object.prototype.hasOwnProperty.call(checkpoint, "worktreeId");
+  const worktreeId = hasWorktreeId
+    ? { present: true as const, value: persistedCheckpointText(checkpoint.worktreeId, "worktreeId") }
+    : { present: false as const };
+  if (
+    checkpoint.phase !== phase
+    || event.sessionId !== sessionId
+    || event.laneId !== laneId
+    || event.segmentId !== segmentId
+    || event.source !== "backend"
+    || checkpoint.source !== "backend"
+    || event.idempotencyKey !== `checkpoint:${runId}:${phase}`
+    || id !== `checkpoint:${runId}:${phase}`
+  ) {
+    throw new Error("Persisted proof-bearing checkpoint authority is invalid.");
+  }
+  if (executionTarget !== "current_branch" && executionTarget !== "new_worktree") {
+    throw new Error("Persisted proof-bearing checkpoint execution target authority is invalid.");
+  }
+  if (
+    (executionTarget === "current_branch" && worktreeId.present)
+    || (executionTarget === "new_worktree" && !worktreeId.present)
+  ) {
+    throw new Error("Persisted proof-bearing checkpoint worktree identity authority is invalid.");
+  }
+  if (canonicalPath(worktreePath) !== worktreePath) {
+    throw new Error("Persisted proof-bearing checkpoint worktree path is not canonical.");
+  }
+  if (!/^[0-9a-f]{40}$/.test(headCommit)) {
+    throw new Error("Persisted proof-bearing checkpoint commit is not canonical.");
+  }
+  return { id, nodeId, executionTarget, worktreeId, worktreePath, branchName, headCommit };
+}
+
+function persistedCheckpointText(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.trim() !== value) {
+    throw new Error(`Persisted proof-bearing checkpoint ${field} authority is invalid.`);
+  }
+  return value;
+}
+
+function parsePersistedWorkflowGitAncestryProof(serialized: string) {
+  if (serialized.length > 512) {
+    throw new Error("Persisted Workflow Git ancestry proof must not exceed 512 code units.");
+  }
+  let candidate: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(serialized) as unknown;
+    if (!isRecord(parsed)) throw new Error("not an object");
+    candidate = parsed;
+  } catch {
+    throw new Error("Persisted Workflow Git ancestry proof must be valid object JSON.");
+  }
+  // This context comes only from untrusted persisted bytes. It proves canonical syntax, not live Git trust.
+  const untrustedContext = createWorkflowGitAncestryProofContext(
+    candidate.beforeHeadCommit as string,
+    candidate.afterHeadCommit as string,
+    candidate.repositoryIdentity as string,
+    candidate.worktreeIdentity as string,
+  );
+  return parseWorkflowGitAncestryProof(serialized, untrustedContext);
+}
+
+function assertPersistedCheckpointEventFields(
+  payload: Record<string, unknown>,
+  hasAncestryProof: boolean,
+): void {
+  for (const key of Object.keys(payload)) {
+    if (
+      key !== "checkpoint"
+      && !(key === "authority" && !hasAncestryProof)
+      && isRestrictedCheckpointFieldName(key)
+    ) {
+      throw new Error(`Persisted checkpoint event contains restricted proof, context, or authority field: ${key}.`);
+    }
+  }
+  if (!isRecord(payload.checkpoint)) return;
+  for (const key of Object.keys(payload.checkpoint)) {
+    if (
+      key !== "ancestryProof"
+      && !(key === "authority" && !hasAncestryProof)
+      && isRestrictedCheckpointFieldName(key)
+    ) {
+      throw new Error(`Persisted checkpoint contains restricted proof, context, or authority field: ${key}.`);
+    }
+  }
+}
+
 function stripEvidenceCompatibilitySource(payload: Record<string, unknown>): Record<string, unknown> {
   if (!isRecord(payload.evidence)) return payload;
   const { compatibilitySource: _compatibilitySource, ...evidence } = payload.evidence;
   return { ...payload, evidence };
 }
 
-function mapEventRowToFlowEvent(row: EventRow): FlowEvent {
-  const event = mapEvent(row);
+function mapEventRowToFlowEvent(row: EventRow, event = mapEvent(row)): FlowEvent {
   return {
     id: event.id,
     sessionId: event.sessionId,

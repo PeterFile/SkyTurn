@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -8,9 +9,15 @@ import type {
   Changeset,
   ChangesetEvidence,
   FinalChangesetReconciliation,
+  WorkflowGitAncestryProof,
+  WorkflowGitAncestryProofContext,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
   WorktreeMetadata,
+} from "@skyturn/project-core";
+import {
+  createWorkflowGitAncestryProofContext,
+  parseWorkflowGitAncestryProof,
 } from "@skyturn/project-core";
 
 import {
@@ -131,6 +138,7 @@ interface GitResult {
 interface GitRunOptions {
   allowFailure?: boolean;
   maxBuffer?: number;
+  unknownFailureExitCode?: number;
 }
 
 interface ReconcileOptions {
@@ -187,6 +195,322 @@ export class DeliveryRemoteActionError extends Error {
     this.name = "DeliveryRemoteActionError";
     this.code = code;
   }
+}
+
+export interface WorkflowGitAncestryProofInput {
+  repositoryPath: string;
+  worktreePath: string;
+  beforeHeadCommit: string;
+  afterHeadCommit: string;
+}
+
+export type WorkflowGitAncestryProofErrorCode =
+  | "INVALID_INPUT"
+  | "NOT_ANCESTOR"
+  | "GIT_EXECUTION_FAILED";
+
+const workflowGitAncestryProofErrorMessages: Record<WorkflowGitAncestryProofErrorCode, string> = {
+  INVALID_INPUT: "Workflow Git ancestry proof input is invalid.",
+  NOT_ANCESTOR: "The before commit is not an ancestor of the after commit.",
+  GIT_EXECUTION_FAILED: "Workflow Git ancestry proof Git verification failed.",
+};
+
+export class WorkflowGitAncestryProofError extends Error {
+  readonly code: WorkflowGitAncestryProofErrorCode;
+
+  constructor(code: WorkflowGitAncestryProofErrorCode) {
+    super(workflowGitAncestryProofErrorMessages[code]);
+    this.name = "WorkflowGitAncestryProofError";
+    this.code = code;
+  }
+}
+
+type ValidatedWorkflowGitAncestryProofInput = Readonly<WorkflowGitAncestryProofInput>;
+
+interface GitFilesystemObjectFacts {
+  canonicalPath: string;
+  device: string;
+  inode: string;
+  birthtimeNs: string | null;
+}
+
+interface LiveWorkflowGitAncestryFacts {
+  context: WorkflowGitAncestryProofContext;
+  snapshot: string;
+  worktreePath: string;
+}
+
+export async function createLiveWorkflowGitAncestryProofContext(
+  input: WorkflowGitAncestryProofInput,
+): Promise<WorkflowGitAncestryProofContext> {
+  const validatedInput = validateWorkflowGitAncestryProofInput(input);
+  return (await resolveLiveWorkflowGitAncestryFacts(validatedInput)).context;
+}
+
+export async function createWorkflowGitAncestryProof(
+  input: WorkflowGitAncestryProofInput,
+): Promise<string> {
+  const validatedInput = validateWorkflowGitAncestryProofInput(input);
+  const before = await resolveLiveWorkflowGitAncestryFacts(validatedInput);
+  const ancestry = await executeWorkflowGitAncestryCheck(before, validatedInput);
+  const after = await resolveLiveWorkflowGitAncestryFacts(validatedInput);
+  assertWorkflowGitAncestryFactsUnchanged(before, after);
+  assertWorkflowGitAncestryResult(ancestry);
+  return JSON.stringify({
+    protocolVersion: 1,
+    method: "git-merge-base-is-ancestor",
+    ...after.context,
+  });
+}
+
+export async function verifyWorkflowGitAncestryProof(
+  serializedProof: unknown,
+  input: WorkflowGitAncestryProofInput,
+): Promise<WorkflowGitAncestryProof> {
+  const validatedInput = validateWorkflowGitAncestryProofInput(input);
+  const before = await resolveLiveWorkflowGitAncestryFacts(validatedInput);
+  parseSerializedWorkflowGitAncestryProof(serializedProof, before.context, "INVALID_INPUT");
+  const ancestry = await executeWorkflowGitAncestryCheck(before, validatedInput);
+  const after = await resolveLiveWorkflowGitAncestryFacts(validatedInput);
+  assertWorkflowGitAncestryFactsUnchanged(before, after);
+  const confirmedProof = parseSerializedWorkflowGitAncestryProof(
+    serializedProof,
+    after.context,
+    "GIT_EXECUTION_FAILED",
+  );
+  assertWorkflowGitAncestryResult(ancestry);
+  return confirmedProof;
+}
+
+function validateWorkflowGitAncestryProofInput(
+  input: WorkflowGitAncestryProofInput,
+): ValidatedWorkflowGitAncestryProofInput {
+  try {
+    if (typeof input !== "object" || input === null || Array.isArray(input)) {
+      throw new Error("invalid input");
+    }
+    const repositoryPath = input.repositoryPath;
+    const worktreePath = input.worktreePath;
+    const beforeHeadCommit = input.beforeHeadCommit;
+    const afterHeadCommit = input.afterHeadCommit;
+    if (
+      typeof repositoryPath !== "string"
+      || repositoryPath.length === 0
+      || repositoryPath.includes("\0")
+      || typeof worktreePath !== "string"
+      || worktreePath.length === 0
+      || worktreePath.includes("\0")
+      || typeof beforeHeadCommit !== "string"
+      || !/^[0-9a-f]{40}$/.test(beforeHeadCommit)
+      || typeof afterHeadCommit !== "string"
+      || !/^[0-9a-f]{40}$/.test(afterHeadCommit)
+    ) {
+      throw new Error("invalid input");
+    }
+    return Object.freeze({ repositoryPath, worktreePath, beforeHeadCommit, afterHeadCommit });
+  } catch {
+    throwWorkflowGitAncestryProofError("INVALID_INPUT");
+  }
+}
+
+async function resolveLiveWorkflowGitAncestryFacts(
+  input: ValidatedWorkflowGitAncestryProofInput,
+): Promise<LiveWorkflowGitAncestryFacts> {
+  try {
+    return await resolveWorkflowGitAncestryFacts(input);
+  } catch {
+    throwWorkflowGitAncestryProofError("GIT_EXECUTION_FAILED");
+  }
+}
+
+async function resolveWorkflowGitAncestryFacts(
+  input: ValidatedWorkflowGitAncestryProofInput,
+): Promise<LiveWorkflowGitAncestryFacts> {
+  const repositoryTopLevel = await resolveConcreteGitTopLevel(input.repositoryPath);
+  const worktreeTopLevel = await resolveConcreteGitTopLevel(input.worktreePath);
+  const repositoryCommonDirectory = await resolveGitFilesystemObject(
+    repositoryTopLevel.canonicalPath,
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+  );
+  const worktreeCommonDirectory = await resolveGitFilesystemObject(
+    worktreeTopLevel.canonicalPath,
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+  );
+  if (!sameGitFilesystemObject(repositoryCommonDirectory, worktreeCommonDirectory)) {
+    throw new Error("Git common directory identity mismatch");
+  }
+
+  const repositoryObjectDirectory = await resolveGitFilesystemObject(
+    repositoryTopLevel.canonicalPath,
+    ["rev-parse", "--path-format=absolute", "--git-path", "objects"],
+  );
+  const worktreeObjectDirectory = await resolveGitFilesystemObject(
+    worktreeTopLevel.canonicalPath,
+    ["rev-parse", "--path-format=absolute", "--git-path", "objects"],
+  );
+  if (!sameGitFilesystemObject(repositoryObjectDirectory, worktreeObjectDirectory)) {
+    throw new Error("Git object directory identity mismatch");
+  }
+
+  const worktreeGitDirectory = await resolveGitFilesystemObject(
+    worktreeTopLevel.canonicalPath,
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+  );
+  await verifyWorkflowGitCommit(repositoryTopLevel.canonicalPath, input.beforeHeadCommit);
+  await verifyWorkflowGitCommit(repositoryTopLevel.canonicalPath, input.afterHeadCommit);
+  await verifyWorkflowGitCommit(worktreeTopLevel.canonicalPath, input.beforeHeadCommit);
+  await verifyWorkflowGitCommit(worktreeTopLevel.canonicalPath, input.afterHeadCommit);
+
+  const repositoryIdentity = hashWorkflowGitIdentity(
+    "skyturn.workflow-git-ancestry-proof.repository.v1",
+    directoryIdentityFields("top-level", repositoryTopLevel),
+    directoryIdentityFields("common-directory", repositoryCommonDirectory),
+    directoryIdentityFields("object-directory", repositoryObjectDirectory),
+  );
+  const worktreeIdentity = hashWorkflowGitIdentity(
+    "skyturn.workflow-git-ancestry-proof.worktree.v1",
+    directoryIdentityFields("top-level", worktreeTopLevel),
+    directoryIdentityFields("git-directory", worktreeGitDirectory),
+  );
+  const context = createWorkflowGitAncestryProofContext(
+    input.beforeHeadCommit,
+    input.afterHeadCommit,
+    repositoryIdentity,
+    worktreeIdentity,
+  );
+  const snapshot = JSON.stringify({
+    repositoryTopLevel,
+    worktreeTopLevel,
+    repositoryCommonDirectory,
+    worktreeCommonDirectory,
+    repositoryObjectDirectory,
+    worktreeObjectDirectory,
+    worktreeGitDirectory,
+    beforeHeadCommit: input.beforeHeadCommit,
+    afterHeadCommit: input.afterHeadCommit,
+  });
+  return { context, snapshot, worktreePath: worktreeTopLevel.canonicalPath };
+}
+
+async function resolveConcreteGitTopLevel(candidatePath: string): Promise<GitFilesystemObjectFacts> {
+  const candidate = await realpath(candidatePath);
+  const reportedTopLevel = await realpath((await runGit(candidate, [
+    "rev-parse",
+    "--path-format=absolute",
+    "--show-toplevel",
+  ])).stdout);
+  if (candidate !== reportedTopLevel) throw new Error("Git top-level mismatch");
+  return resolveGitFilesystemObjectAtPath(reportedTopLevel);
+}
+
+async function resolveGitFilesystemObject(cwd: string, args: string[]): Promise<GitFilesystemObjectFacts> {
+  const result = await runGit(cwd, args);
+  return resolveGitFilesystemObjectAtPath(result.stdout);
+}
+
+async function resolveGitFilesystemObjectAtPath(path: string): Promise<GitFilesystemObjectFacts> {
+  const canonicalPath = await realpath(path);
+  const facts = await stat(canonicalPath, { bigint: true });
+  if (!facts.isDirectory()) throw new Error("Git identity object is not a directory");
+  const birthtimeNs = facts.birthtimeNs > 0n ? facts.birthtimeNs.toString() : null;
+  if (facts.ino === 0n && birthtimeNs === null) {
+    throw new Error("Git identity object has no replacement-sensitive filesystem identity");
+  }
+  return {
+    canonicalPath,
+    device: facts.dev.toString(),
+    inode: facts.ino.toString(),
+    birthtimeNs,
+  };
+}
+
+async function verifyWorkflowGitCommit(cwd: string, commit: string): Promise<void> {
+  await runGit(cwd, ["cat-file", "-e", `${commit}^{commit}`]);
+}
+
+function sameGitFilesystemObject(
+  left: GitFilesystemObjectFacts,
+  right: GitFilesystemObjectFacts,
+): boolean {
+  return left.canonicalPath === right.canonicalPath
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.birthtimeNs === right.birthtimeNs;
+}
+
+function directoryIdentityFields(label: string, facts: GitFilesystemObjectFacts): string[] {
+  return [
+    label,
+    "canonical-path",
+    facts.canonicalPath,
+    "device",
+    facts.device,
+    "inode",
+    facts.inode,
+    "birthtime-ns",
+    facts.birthtimeNs ?? "unavailable",
+  ];
+}
+
+function hashWorkflowGitIdentity(domain: string, ...fieldGroups: string[][]): string {
+  const hash = createHash("sha256");
+  for (const value of [domain, ...fieldGroups.flat()]) {
+    const bytes = Buffer.from(value, "utf8");
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64BE(BigInt(bytes.byteLength));
+    hash.update(length);
+    hash.update(bytes);
+  }
+  return hash.digest("hex");
+}
+
+async function executeWorkflowGitAncestryCheck(
+  facts: LiveWorkflowGitAncestryFacts,
+  input: ValidatedWorkflowGitAncestryProofInput,
+): Promise<GitResult> {
+  try {
+    return await runGit(facts.worktreePath, [
+      "merge-base",
+      "--is-ancestor",
+      input.beforeHeadCommit,
+      input.afterHeadCommit,
+    ], { allowFailure: true, unknownFailureExitCode: -1 });
+  } catch {
+    throwWorkflowGitAncestryProofError("GIT_EXECUTION_FAILED");
+  }
+}
+
+function assertWorkflowGitAncestryFactsUnchanged(
+  before: LiveWorkflowGitAncestryFacts,
+  after: LiveWorkflowGitAncestryFacts,
+): void {
+  if (before.snapshot !== after.snapshot) {
+    throwWorkflowGitAncestryProofError("GIT_EXECUTION_FAILED");
+  }
+}
+
+function assertWorkflowGitAncestryResult(result: GitResult): void {
+  if (result.exitCode === 0) return;
+  if (result.exitCode === 1) throwWorkflowGitAncestryProofError("NOT_ANCESTOR");
+  throwWorkflowGitAncestryProofError("GIT_EXECUTION_FAILED");
+}
+
+function parseSerializedWorkflowGitAncestryProof(
+  serializedProof: unknown,
+  context: WorkflowGitAncestryProofContext,
+  failureCode: "INVALID_INPUT" | "GIT_EXECUTION_FAILED",
+): WorkflowGitAncestryProof {
+  try {
+    return parseWorkflowGitAncestryProof(serializedProof, context);
+  } catch (error) {
+    const contextMismatch = error instanceof Error
+      && error.message === "Workflow Git ancestry proof context mismatch.";
+    throwWorkflowGitAncestryProofError(contextMismatch ? "GIT_EXECUTION_FAILED" : failureCode);
+  }
+}
+
+function throwWorkflowGitAncestryProofError(code: WorkflowGitAncestryProofErrorCode): never {
+  throw new WorkflowGitAncestryProofError(code);
 }
 
 class AdoptionTargetBaseMismatchError extends Error {
@@ -2111,7 +2435,7 @@ async function runGit(cwd: string, args: string[], options: GitRunOptions = {}):
       return {
         stdout: String(failure.stdout ?? "").trim(),
         stderr: String(failure.stderr ?? "").trim(),
-        exitCode: typeof failure.code === "number" ? failure.code : 1,
+        exitCode: typeof failure.code === "number" ? failure.code : (options.unknownFailureExitCode ?? 1),
       };
     }
     throw new GitCommandError(`git ${args.join(" ")} failed in ${cwd}.`, String(failure.stderr || failure.message || "").trim());

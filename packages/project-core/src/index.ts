@@ -1892,7 +1892,7 @@ export interface WorkflowNodeCheckpoint {
   createdAt: string;
   source: WorkflowNodeCheckpointSource;
   evidenceRefs: WorkflowCheckpointEvidenceRef[];
-  ancestryProof?: WorkflowGitAncestryProof;
+  ancestryProof?: string;
   authority?: WorkflowNodeCheckpointAuthority;
 }
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   AGENT_TRANSPORT_KINDS,
@@ -274,7 +274,7 @@ describe("Git ancestry proof contract", () => {
     expect(getterCalls).toBe(0);
   });
 
-  it("carries an optional canonical proof on a workflow checkpoint", () => {
+  it("models a checkpoint proof as optional raw canonical bytes", () => {
     const checkpoint: WorkflowNodeCheckpoint = {
       id: "checkpoint-after-lane",
       sessionId: "session-1",
@@ -285,10 +285,11 @@ describe("Git ancestry proof contract", () => {
       createdAt: "2026-07-31T00:00:00.000Z",
       source: "backend",
       evidenceRefs: [],
-      ancestryProof: proof,
+      ancestryProof: serializedProof,
     };
 
-    expect(checkpoint.ancestryProof).toBe(proof);
+    expect(checkpoint.ancestryProof).toBe(serializedProof);
+    expectTypeOf(checkpoint.ancestryProof).toEqualTypeOf<string | undefined>();
   });
 });
 

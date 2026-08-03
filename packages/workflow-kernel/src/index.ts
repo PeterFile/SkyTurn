@@ -2831,6 +2831,15 @@ function normalizeNodeCheckpoint(
   const worktreeState = existing?.worktreeState ?? normalizeCheckpointWorktreeState(value.worktreeState);
   const baseCommit = existing?.baseCommit ?? stringValue(value.baseCommit);
   const headCommit = existing?.headCommit ?? stringValue(value.headCommit);
+  const incomingAncestryProof = checkpointAncestryProof(value);
+  if (
+    incomingAncestryProof !== undefined
+    && existing
+    && existing.ancestryProof !== incomingAncestryProof
+  ) {
+    throw new Error("Checkpoint ancestry proof conflicts with the existing checkpoint.");
+  }
+  const ancestryProof = existing?.ancestryProof ?? incomingAncestryProof;
   const evidenceRefs = Array.isArray(value.evidenceRefs) ? normalizeCheckpointEvidenceRefs(value.evidenceRefs) : [];
   return {
     id,
@@ -2847,10 +2856,19 @@ function normalizeNodeCheckpoint(
     ...(worktreeState ? { worktreeState } : {}),
     ...(baseCommit ? { baseCommit } : {}),
     ...(headCommit ? { headCommit } : {}),
+    ...(ancestryProof !== undefined ? { ancestryProof } : {}),
     createdAt: existing?.createdAt ?? stringValue(value.createdAt) ?? event.createdAt,
     source: existing?.source ?? (isCheckpointSource(value.source) ? value.source : "workflow_kernel"),
     evidenceRefs: mergeCheckpointEvidenceRefs(existing?.evidenceRefs ?? [], evidenceRefs),
   };
+}
+
+function checkpointAncestryProof(value: Record<string, unknown>): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(value, "ancestryProof")) return undefined;
+  if (typeof value.ancestryProof !== "string") {
+    throw new Error("Checkpoint ancestry proof must be an exact string.");
+  }
+  return value.ancestryProof;
 }
 
 function normalizeCheckpointWorktreeState(value: unknown): WorkflowNodeCheckpoint["worktreeState"] | undefined {

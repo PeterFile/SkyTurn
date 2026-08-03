@@ -470,6 +470,99 @@ test("Electron main tracks every top-level workflow store operation, not only wo
   assert.doesNotMatch(deliverySyncMainHandler, /deleteBranch/);
 });
 
+test("Electron main owns trusted checkpoint proof production and re-verifies every live action mutation", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  assert.doesNotMatch(main, /from\s+["']@skyturn\/git-worktree\/node["']/);
+
+  const enrichment = main.slice(
+    main.indexOf("async function enrichTerminalWorkflowRun"),
+    main.indexOf("async function workflowStoreIdentity"),
+  );
+  assert.match(enrichment, /createAfterCheckpointAncestryProof/);
+  assert.ok(
+    enrichment.indexOf("createAfterCheckpointAncestryProof") < enrichment.indexOf("recordRunChangesetEvidence"),
+    "proof production must precede authoritative after changeset evidence",
+  );
+  assert.match(enrichment, /const ancestry = await createAfterCheckpointAncestryProof/);
+  assert.match(enrichment, /runCheckpointInput\([\s\S]*ancestry,/);
+
+  const ancestryAuthority = main.slice(
+    main.indexOf("async function workflowGitAncestryProofAuthority"),
+    main.indexOf("async function resolveWorkflowCheckpointGitPaths"),
+  );
+  for (const name of [
+    "createWorkflowGitAncestryProof",
+    "createLiveWorkflowGitAncestryProofContext",
+    "verifyWorkflowGitAncestryProof",
+  ]) {
+    assert.match(ancestryAuthority, new RegExp(name));
+  }
+  assert.match(ancestryAuthority, /await import\("@skyturn\/git-worktree\/node"\)/);
+
+  const executableIdentity = main.slice(
+    main.indexOf("async function resolveExecutableRunIdentity"),
+    main.indexOf("function isExecutableCheckpointLane"),
+  );
+  assert.match(
+    executableIdentity,
+    /executionTarget === "new_worktree"[\s\S]*assertManagedRollbackWorktree/,
+    "new-worktree checkpoint production must reuse persisted managed-worktree ownership checks",
+  );
+
+  const rollbackEligibility = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:eligibility"'),
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+  );
+  assert.match(rollbackEligibility, /verifyLiveWorkflowCheckpointAction/);
+  assert.match(rollbackEligibility, /rollbackEligibilityWithInvalidAncestry/);
+  assert.match(rollbackEligibility, /workflowCheckpointAncestryBlockReason/);
+  assert.ok(
+    rollbackEligibility.indexOf("verifyLiveWorkflowCheckpointAction") <
+      rollbackEligibility.indexOf("blockingInFlightRemoteSideEffects"),
+    "rollback eligibility must report invalid ancestry even when another rollback block also exists",
+  );
+
+  const rollbackApply = main.slice(
+    main.indexOf('ipcMain.handle("workflow:rollback:apply"'),
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+  );
+  assert.match(rollbackApply, /workflowRollbackAncestryBlock/);
+  assert.ok(
+    rollbackApply.indexOf("workflowRollbackAncestryBlock") <
+      rollbackApply.indexOf("evaluateRollbackRemoteBlocksForRollback"),
+    "rollback apply must verify before a remote-block path can record a rejected mutation",
+  );
+  const resetIndex = rollbackApply.indexOf("const resetResult = await resetRollbackWorktreeToCommit");
+  const verifyBeforeReset = rollbackApply.lastIndexOf("workflowRollbackAncestryBlock", resetIndex);
+  assert.ok(resetIndex > 0);
+  assert.ok(
+    verifyBeforeReset > 0 && verifyBeforeReset < resetIndex,
+    "rollback apply must re-verify before Git reset",
+  );
+
+  const repair = main.slice(
+    main.indexOf('ipcMain.handle("workflow:repair:create"'),
+    main.indexOf('ipcMain.handle("workflow:variant:create"'),
+  );
+  assert.ok(repair.indexOf("requireLiveWorkflowCheckpointAction") < repair.indexOf("requestNodeRepair"));
+  const variant = main.slice(
+    main.indexOf('ipcMain.handle("workflow:variant:create"'),
+    main.indexOf('ipcMain.handle("workflow:userDecision:answer"'),
+  );
+  assert.ok(variant.indexOf("requireLiveWorkflowCheckpointAction") < variant.indexOf("requestNodeVariant"));
+
+  const delayedWorktree = main.slice(
+    main.indexOf("async function resolveScheduledWorkflowWorktree"),
+    main.indexOf("async function requireScheduledWorkflowCandidateBinding"),
+  );
+  assert.match(delayedWorktree, /requireCheckpointBoundWorktreeBase/);
+  assert.match(delayedWorktree, /baseRef:\s*checkpointBaseRef\s*\?\?/);
+  assert.ok(
+    delayedWorktree.indexOf("requireCheckpointBoundWorktreeBase") < delayedWorktree.indexOf("createManagedWorkflowWorktreeForRun"),
+    "delayed worktree source verification must precede Git worktree mutation",
+  );
+});
+
 test("public run:start and private planner delivery have separate main-only authority", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const privatePlanner = main.slice(
@@ -3342,6 +3435,8 @@ async function loadScheduledWorkflowWorktreeRuntime(createNodeGitWorktreeService
     recordWorktreeCreateFailure() {
       throw new Error("Unexpected worktree-create failure path.");
     },
+    requireCheckpointBoundWorktreeBase: async (_store, input) => input.sourceHeadCommit,
+    workflowCheckpointGateAuthority: () => ({}),
     workflowIpcError(code, message) {
       const error = new Error(message);
       error.code = code;

@@ -2100,6 +2100,31 @@ describe("Flow Kernel gate engine and scheduler", () => {
     });
   });
 
+  it("carries checkpoint ancestry proof bytes without normalization", () => {
+    const ancestryProof = "{\"protocolVersion\":1,\"method\":\"git-merge-base-is-ancestor\",\"beforeHeadCommit\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"afterHeadCommit\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"repositoryIdentity\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"worktreeIdentity\":\"2222222222222222222222222222222222222222222222222222222222222222\"}";
+    const projection = reduceWorkflowEvents([
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: {
+          ...checkpoint("checkpoint-after-lane-b", "lane-b", "after", "b".repeat(40)),
+          ancestryProof,
+        },
+      }),
+    ]);
+
+    expect(projection.checkpoints[0]?.ancestryProof).toBe(ancestryProof);
+  });
+
+  it.each([null, 1, {}, []])("rejects a non-string checkpoint ancestry proof: %j", (ancestryProof) => {
+    expect(() => reduceWorkflowEvents([
+      event("workflow.node.checkpoint_recorded", {
+        checkpoint: {
+          ...checkpoint("checkpoint-after-lane-b", "lane-b", "after", "b".repeat(40)),
+          ancestryProof,
+        },
+      }),
+    ])).toThrow(/ancestry proof.*string/i);
+  });
+
   it("projects selected rollback impact without upstream or sibling lanes", () => {
     const projection = reduceWorkflowEvents([
       event("workflow.lane.declared", { lane: { ...lane("lane-a", "design"), status: "completed" } }),

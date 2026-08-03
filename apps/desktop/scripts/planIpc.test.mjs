@@ -6524,6 +6524,7 @@ function plannerStartIdentity(input) {
 async function loadMainModule(windows, options = {}) {
   const contracts = await loadContracts();
   const workflowContracts = await loadWorkflowContracts();
+  const workflowCheckpointRuntime = await loadWorkflowCheckpointRuntime();
   const persistence = await import("@skyturn/persistence");
   const workflowStore = await import("@skyturn/persistence/workflow-store");
   const selectedWorkflowStore = options.wrapWorkflowStoreModule
@@ -6644,6 +6645,7 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
         if (specifier.startsWith("node:")) return require(specifier);
         if (specifier === "./planIpcContracts") return contracts;
         if (specifier === "./workflowIpcContracts") return workflowContracts;
+        if (specifier === "./workflowCheckpointRuntime") return workflowCheckpointRuntime;
         if (specifier === "./workflowRunRecovery" && options.workflowRunRecoveryModule) {
           return options.workflowRunRecoveryModule;
         }
@@ -6686,6 +6688,21 @@ async function loadWorkflowContracts() {
     exports: module.exports,
     require,
   }, { filename: "workflowIpcContracts.ts" });
+  return module.exports;
+}
+
+async function loadWorkflowCheckpointRuntime() {
+  const source = await readFile(join(root, "electron", "workflowCheckpointRuntime.ts"), "utf8");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, {
+    module,
+    exports: module.exports,
+    require,
+  }, { filename: "workflowCheckpointRuntime.ts" });
   return module.exports;
 }
 
