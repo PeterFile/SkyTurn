@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink as fsSymlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -13,7 +13,9 @@ import {
   createDeliveryCommit,
   createDeliveryPullRequest,
   createGitChangesetService,
+  createLiveWorkflowGitAncestryProofContext,
   createNodeGitWorktreeService,
+  createWorkflowGitAncestryProof,
   evaluateRollbackWorktreeState,
   mergeDeliveryPullRequest,
   pushDeliveryBranch,
@@ -21,6 +23,9 @@ import {
   SKYTURN_VOLATILE_GIT_PATHS,
   resetRollbackWorktreeToCommit,
   syncDeliveryMain,
+  verifyWorkflowGitAncestryProof,
+  WorkflowGitAncestryProofError,
+  type WorkflowGitAncestryProofInput,
   type ManagedWorktreeWorkflowEvent,
   worktreeMetadataForVariant,
 } from "./node.js";
@@ -128,6 +133,363 @@ async function createRollbackWorktreeFixture(tempRoots: string[]): Promise<{
   const headCommit = commitVariant(worktree.realPath, "rollback-head");
   return { repo, worktree, headCommit };
 }
+
+function ancestryInput(
+  repo: TestRepo,
+  overrides: Partial<WorkflowGitAncestryProofInput> = {},
+): WorkflowGitAncestryProofInput {
+  return {
+    repositoryPath: repo.repoRoot,
+    worktreePath: repo.repoRoot,
+    beforeHeadCommit: repo.baseCommit,
+    afterHeadCommit: repo.baseCommit,
+    ...overrides,
+  };
+}
+
+function directoryIdentity(path: string): {
+  dev: string;
+  ino: string;
+  birthtimeNs: string;
+} {
+  const facts = statSync(path, { bigint: true });
+  return {
+    dev: facts.dev.toString(),
+    ino: facts.ino.toString(),
+    birthtimeNs: facts.birthtimeNs.toString(),
+  };
+}
+
+function reinitializeRepositoryContents(repoRoot: string): string {
+  const gitDirectory = join(repoRoot, ".git");
+  for (const entry of readdirSync(gitDirectory)) {
+    rmSync(join(gitDirectory, entry), { recursive: true, force: true });
+  }
+  git(repoRoot, ["init"]);
+  git(repoRoot, ["config", "user.email", "skyturn@example.test"]);
+  git(repoRoot, ["config", "user.name", "SkyTurn Test"]);
+  writeFileSync(join(repoRoot, "replacement.txt"), "replacement\n");
+  git(repoRoot, ["add", "replacement.txt"]);
+  git(repoRoot, ["commit", "-m", "replacement"]);
+  return git(repoRoot, ["rev-parse", "HEAD"]);
+}
+
+async function expectAncestryError(
+  operation: Promise<unknown>,
+  code: WorkflowGitAncestryProofError["code"],
+  forbiddenPaths: string[] = [],
+): Promise<WorkflowGitAncestryProofError> {
+  let caught: unknown;
+  try {
+    await operation;
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(WorkflowGitAncestryProofError);
+  const ancestryError = caught as WorkflowGitAncestryProofError;
+  expect(ancestryError.code).toBe(code);
+  for (const path of forbiddenPaths) {
+    expect(ancestryError.message).not.toContain(path);
+    expect(JSON.stringify(ancestryError)).not.toContain(path);
+  }
+  return ancestryError;
+}
+
+describe("workflow Git ancestry proof service", () => {
+  const tempRoots: string[] = [];
+
+  afterEach(() => {
+    for (const root of tempRoots.splice(0)) {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("creates exact canonical bytes for an equal commit with stable alias-safe identities", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-equal-");
+    tempRoots.push(repo.tempRoot);
+    const repositoryAlias = join(repo.tempRoot, "repository-alias");
+    const worktreeAlias = join(repo.tempRoot, "worktree-alias");
+    await fsSymlink(repo.repoRoot, repositoryAlias, "dir");
+    await fsSymlink(repo.repoRoot, worktreeAlias, "dir");
+
+    const directContext = await createLiveWorkflowGitAncestryProofContext(ancestryInput(repo));
+    const aliasContext = await createLiveWorkflowGitAncestryProofContext(ancestryInput(repo, {
+      repositoryPath: repositoryAlias,
+      worktreePath: worktreeAlias,
+    }));
+    const repeatedContext = await createLiveWorkflowGitAncestryProofContext(ancestryInput(repo));
+    commitVariant(repo.repoRoot, "identity-update");
+    const postCommitContext = await createLiveWorkflowGitAncestryProofContext(ancestryInput(repo));
+    const serializedProof = await createWorkflowGitAncestryProof(ancestryInput(repo));
+    const expectedBytes = JSON.stringify({
+      protocolVersion: 1,
+      method: "git-merge-base-is-ancestor",
+      ...directContext,
+    });
+
+    expect(aliasContext).toEqual(directContext);
+    expect(repeatedContext).toEqual(directContext);
+    expect(postCommitContext).toEqual(directContext);
+    expect(serializedProof).toBe(expectedBytes);
+    expect(serializedProof).toHaveLength(356);
+    expect(serializedProof).not.toContain(repo.tempRoot);
+    await expect(verifyWorkflowGitAncestryProof(serializedProof, ancestryInput(repo))).resolves.toEqual(
+      JSON.parse(serializedProof),
+    );
+  });
+
+  it("proves linear ancestry through a real linked worktree", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-linear-");
+    tempRoots.push(repo.tempRoot);
+    const worktreePath = join(repo.tempRoot, "linked-worktree");
+    git(repo.repoRoot, ["worktree", "add", "-b", "test/linear", worktreePath, repo.baseCommit]);
+    const afterHeadCommit = commitVariant(worktreePath, "linear");
+    const input = ancestryInput(repo, { worktreePath, afterHeadCommit });
+
+    const serializedProof = await createWorkflowGitAncestryProof(input);
+
+    await expect(verifyWorkflowGitAncestryProof(serializedProof, input)).resolves.toMatchObject({
+      beforeHeadCommit: repo.baseCommit,
+      afterHeadCommit,
+      method: "git-merge-base-is-ancestor",
+    });
+  });
+
+  it("returns NOT_ANCESTOR and no proof for divergent real commits", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-divergent-");
+    tempRoots.push(repo.tempRoot);
+    const leftPath = join(repo.tempRoot, "left");
+    const rightPath = join(repo.tempRoot, "right");
+    git(repo.repoRoot, ["worktree", "add", "-b", "test/left", leftPath, repo.baseCommit]);
+    git(repo.repoRoot, ["worktree", "add", "-b", "test/right", rightPath, repo.baseCommit]);
+    const leftCommit = commitVariant(leftPath, "left-commit");
+    const rightCommit = commitVariant(rightPath, "right-commit");
+
+    await expectAncestryError(
+      createWorkflowGitAncestryProof(ancestryInput(repo, {
+        worktreePath: rightPath,
+        beforeHeadCommit: leftCommit,
+        afterHeadCommit: rightCommit,
+      })),
+      "NOT_ANCESTOR",
+      [repo.tempRoot],
+    );
+  });
+
+  it("fails closed for invalid input and repository, worktree, commit, and ownership failures", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-failures-");
+    const otherRepo = await createTestRepo("skyturn-ancestry-other-");
+    tempRoots.push(repo.tempRoot, otherRepo.tempRoot);
+    const nestedPath = join(repo.repoRoot, "nested");
+    await mkdir(nestedPath);
+    const cases: Array<{
+      input: WorkflowGitAncestryProofInput;
+      code: WorkflowGitAncestryProofError["code"];
+    }> = [
+      {
+        input: ancestryInput(repo, { beforeHeadCommit: repo.baseCommit.toUpperCase() }),
+        code: "INVALID_INPUT",
+      },
+      {
+        input: ancestryInput(repo, { repositoryPath: join(repo.tempRoot, "missing-repository") }),
+        code: "GIT_EXECUTION_FAILED",
+      },
+      {
+        input: ancestryInput(repo, { repositoryPath: join(repo.repoRoot, "feature.txt") }),
+        code: "GIT_EXECUTION_FAILED",
+      },
+      {
+        input: ancestryInput(repo, { repositoryPath: nestedPath }),
+        code: "GIT_EXECUTION_FAILED",
+      },
+      {
+        input: ancestryInput(repo, { worktreePath: join(repo.tempRoot, "missing-worktree") }),
+        code: "GIT_EXECUTION_FAILED",
+      },
+      {
+        input: ancestryInput(repo, { worktreePath: nestedPath }),
+        code: "GIT_EXECUTION_FAILED",
+      },
+      {
+        input: ancestryInput(repo, { worktreePath: otherRepo.repoRoot }),
+        code: "GIT_EXECUTION_FAILED",
+      },
+      {
+        input: ancestryInput(repo, { afterHeadCommit: "f".repeat(40) }),
+        code: "GIT_EXECUTION_FAILED",
+      },
+    ];
+
+    for (const testCase of cases) {
+      await expectAncestryError(
+        createWorkflowGitAncestryProof(testCase.input),
+        testCase.code,
+        [repo.tempRoot, otherRepo.tempRoot],
+      );
+    }
+  });
+
+  it("rejects replay in another repository or another worktree through live context parsing", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-replay-source-");
+    const otherRepo = await createTestRepo("skyturn-ancestry-replay-target-");
+    tempRoots.push(repo.tempRoot, otherRepo.tempRoot);
+    const serializedProof = await createWorkflowGitAncestryProof(ancestryInput(repo));
+    git(otherRepo.repoRoot, ["fetch", repo.repoRoot, repo.baseCommit]);
+    const otherWorktree = join(repo.tempRoot, "other-worktree");
+    git(repo.repoRoot, ["worktree", "add", "--detach", otherWorktree, repo.baseCommit]);
+
+    await expectAncestryError(
+      verifyWorkflowGitAncestryProof(serializedProof, ancestryInput(otherRepo, {
+        beforeHeadCommit: repo.baseCommit,
+        afterHeadCommit: repo.baseCommit,
+      })),
+      "GIT_EXECUTION_FAILED",
+    );
+    await expectAncestryError(
+      verifyWorkflowGitAncestryProof(serializedProof, ancestryInput(repo, { worktreePath: otherWorktree })),
+      "GIT_EXECUTION_FAILED",
+    );
+  });
+
+  it("rejects an old proof after the repository is destroyed and recreated at the exact path", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-recreated-");
+    tempRoots.push(repo.tempRoot);
+    const serializedProof = await createWorkflowGitAncestryProof(ancestryInput(repo));
+    const oldRepositoryIdentity = directoryIdentity(repo.repoRoot);
+    rmSync(repo.repoRoot, { recursive: true, force: true });
+    git(repo.tempRoot, ["init", "project"]);
+    git(repo.repoRoot, ["config", "user.email", "skyturn@example.test"]);
+    git(repo.repoRoot, ["config", "user.name", "SkyTurn Test"]);
+    writeFileSync(join(repo.repoRoot, "new.txt"), "new\n");
+    git(repo.repoRoot, ["add", "new.txt"]);
+    git(repo.repoRoot, ["commit", "-m", "new repository"]);
+
+    expect(directoryIdentity(repo.repoRoot)).not.toEqual(oldRepositoryIdentity);
+    await expectAncestryError(
+      verifyWorkflowGitAncestryProof(serializedProof, ancestryInput(repo)),
+      "GIT_EXECUTION_FAILED",
+    );
+  });
+
+  it("rejects an old proof after a linked worktree is removed and re-added at the exact path", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-worktree-readded-");
+    tempRoots.push(repo.tempRoot);
+    const worktreePath = join(repo.tempRoot, "reusable-worktree");
+    git(repo.repoRoot, ["worktree", "add", "-b", "test/reusable", worktreePath, repo.baseCommit]);
+    const input = ancestryInput(repo, { worktreePath });
+    const serializedProof = await createWorkflowGitAncestryProof(input);
+    const oldWorktreeIdentity = directoryIdentity(worktreePath);
+    git(repo.repoRoot, ["worktree", "remove", "--force", worktreePath]);
+    git(repo.repoRoot, ["worktree", "add", worktreePath, "test/reusable"]);
+
+    expect(directoryIdentity(worktreePath)).not.toEqual(oldWorktreeIdentity);
+    await expectAncestryError(
+      verifyWorkflowGitAncestryProof(serializedProof, input),
+      "GIT_EXECUTION_FAILED",
+    );
+  });
+
+  it("rejects in-place repository re-init even when root and .git directory objects survive", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-in-place-reinit-");
+    tempRoots.push(repo.tempRoot);
+    const serializedProof = await createWorkflowGitAncestryProof(ancestryInput(repo));
+    const rootIdentity = directoryIdentity(repo.repoRoot);
+    const gitDirectoryIdentity = directoryIdentity(join(repo.repoRoot, ".git"));
+
+    reinitializeRepositoryContents(repo.repoRoot);
+
+    expect(directoryIdentity(repo.repoRoot)).toEqual(rootIdentity);
+    expect(directoryIdentity(join(repo.repoRoot, ".git"))).toEqual(gitDirectoryIdentity);
+    await expectAncestryError(
+      verifyWorkflowGitAncestryProof(serializedProof, ancestryInput(repo)),
+      "GIT_EXECUTION_FAILED",
+    );
+  });
+
+  it("returns no proof when in-place replacement happens after successful merge-base", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-command-race-");
+    tempRoots.push(repo.tempRoot);
+    const rootIdentity = directoryIdentity(repo.repoRoot);
+    const gitDirectoryIdentity = directoryIdentity(join(repo.repoRoot, ".git"));
+    const fakeGit = await installAncestryGitWrapper(repo.tempRoot, {
+      mode: "reinitialize-after-success",
+      repositoryPath: repo.repoRoot,
+    });
+
+    await withFakeGit(fakeGit.binDir, async () => {
+      await expectAncestryError(
+        createWorkflowGitAncestryProof(ancestryInput(repo)),
+        "GIT_EXECUTION_FAILED",
+        [repo.tempRoot],
+      );
+    });
+    expect(directoryIdentity(repo.repoRoot)).toEqual(rootIdentity);
+    expect(directoryIdentity(join(repo.repoRoot, ".git"))).toEqual(gitDirectoryIdentity);
+  });
+
+  it("rejects tampered commit, repository, and worktree proof fields", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-tampered-");
+    tempRoots.push(repo.tempRoot);
+    const input = ancestryInput(repo);
+    const serializedProof = await createWorkflowGitAncestryProof(input);
+    const proof = JSON.parse(serializedProof) as Record<string, unknown>;
+    await expectAncestryError(
+      verifyWorkflowGitAncestryProof("{}", input),
+      "INVALID_INPUT",
+    );
+    const tampered = [
+      { ...proof, beforeHeadCommit: "f".repeat(40) },
+      { ...proof, afterHeadCommit: "e".repeat(40) },
+      { ...proof, repositoryIdentity: "0".repeat(64) },
+      { ...proof, worktreeIdentity: "1".repeat(64) },
+    ];
+
+    for (const value of tampered) {
+      await expectAncestryError(
+        verifyWorkflowGitAncestryProof(JSON.stringify(value), input),
+        "GIT_EXECUTION_FAILED",
+      );
+    }
+  });
+
+  it("distinguishes verifier NOT_ANCESTOR from Git command execution failure", async () => {
+    const repo = await createTestRepo("skyturn-ancestry-verifier-codes-");
+    tempRoots.push(repo.tempRoot);
+    const leftPath = join(repo.tempRoot, "verifier-left");
+    const rightPath = join(repo.tempRoot, "verifier-right");
+    git(repo.repoRoot, ["worktree", "add", "-b", "test/verifier-left", leftPath, repo.baseCommit]);
+    git(repo.repoRoot, ["worktree", "add", "-b", "test/verifier-right", rightPath, repo.baseCommit]);
+    const leftCommit = commitVariant(leftPath, "verifier-left");
+    const rightCommit = commitVariant(rightPath, "verifier-right");
+    const divergentInput = ancestryInput(repo, {
+      worktreePath: rightPath,
+      beforeHeadCommit: leftCommit,
+      afterHeadCommit: rightCommit,
+    });
+    const divergentContext = await createLiveWorkflowGitAncestryProofContext(divergentInput);
+    const canonicalButUnattested = JSON.stringify({
+      protocolVersion: 1,
+      method: "git-merge-base-is-ancestor",
+      ...divergentContext,
+    });
+    await expectAncestryError(
+      verifyWorkflowGitAncestryProof(canonicalButUnattested, divergentInput),
+      "NOT_ANCESTOR",
+    );
+
+    const validProof = await createWorkflowGitAncestryProof(ancestryInput(repo));
+    const fakeGit = await installAncestryGitWrapper(repo.tempRoot, {
+      mode: "fail-after-success",
+      repositoryPath: repo.repoRoot,
+    });
+    await withFakeGit(fakeGit.binDir, async () => {
+      await expectAncestryError(
+        verifyWorkflowGitAncestryProof(validProof, ancestryInput(repo)),
+        "GIT_EXECUTION_FAILED",
+      );
+    });
+  });
+});
 
 describe("node git worktree service", () => {
   const tempRoots: string[] = [];
@@ -2151,6 +2513,42 @@ async function installFakeGit(
     `  exit ${options.resetExitCode}`,
     "fi",
     `exec ${shellSingleQuote(resolveExecutable("git"))} "$@"`,
+    "",
+  ].join("\n");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
+async function installAncestryGitWrapper(
+  tempRoot: string,
+  options: {
+    mode: "fail-after-success" | "reinitialize-after-success";
+    repositoryPath: string;
+  },
+): Promise<{ binDir: string }> {
+  const binDir = join(tempRoot, `ancestry-git-${options.mode}`);
+  await mkdir(binDir, { recursive: true });
+  const gitPath = join(binDir, "git");
+  const realGit = shellSingleQuote(resolveExecutable("git"));
+  const repositoryPath = shellSingleQuote(realpathSync(options.repositoryPath));
+  const afterSuccess = options.mode === "fail-after-success"
+    ? ["  if [ \"$status\" -eq 0 ]; then exit 23; fi"]
+    : [
+      `  if [ "$status" -eq 0 ] && [ "$(pwd -P)" = ${repositoryPath} ]; then`,
+      `    find ${repositoryPath}/.git -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +`,
+      `    ${realGit} -C ${repositoryPath} init -q >/dev/null 2>&1 || exit 24`,
+      "  fi",
+    ];
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"merge-base\" ] && [ \"$2\" = \"--is-ancestor\" ]; then",
+    `  ${realGit} "$@"`,
+    "  status=$?",
+    ...afterSuccess,
+    "  exit \"$status\"",
+    "fi",
+    `exec ${realGit} "$@"`,
     "",
   ].join("\n");
   await writeFile(gitPath, script, "utf8");
