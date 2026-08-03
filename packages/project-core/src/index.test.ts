@@ -9,12 +9,14 @@ import {
   TERMINAL_SESSION_STATUSES,
   canUsePtyInteractiveTransport,
   canonicalExpectedArtifactDeclarationKeys,
+  createWorkflowGitAncestryProofContext,
   expectedArtifactContractForRequiredEvidence,
   normalizeSessionTarget,
   parseExpectedArtifactDeclarations,
   parseExpectedArtifactDeclaration,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
+  parseWorkflowGitAncestryProof,
   parseRunEvent,
   parseRunEvidence,
   parseRunEvidenceChecks,
@@ -44,6 +46,8 @@ import {
   type LiveRunChangesEvidence,
   type WorkflowCheckpointIntent,
   type WorkflowLoopEngineeringState,
+  type WorkflowGitAncestryProof,
+  type WorkflowGitAncestryProofContext,
   type WorkflowNodeCheckpoint,
   type WorkflowRequestedCheckpointSuccessorIntent,
   type NodeRollbackStatus,
@@ -55,6 +59,238 @@ import {
   type WorkflowWorktreeIdentity,
   type WorkflowLaneCandidateBinding,
 } from "./index";
+
+describe("Git ancestry proof contract", () => {
+  const contextValues = {
+    beforeHeadCommit: "a".repeat(40),
+    afterHeadCommit: "b".repeat(40),
+    repositoryIdentity: "1".repeat(64),
+    worktreeIdentity: "2".repeat(64),
+  };
+  const context = createWorkflowGitAncestryProofContext(
+    contextValues.beforeHeadCommit,
+    contextValues.afterHeadCommit,
+    contextValues.repositoryIdentity,
+    contextValues.worktreeIdentity,
+  );
+  const proof: WorkflowGitAncestryProof = {
+    protocolVersion: 1,
+    method: "git-merge-base-is-ancestor",
+    ...contextValues,
+  };
+  const serializedProof = JSON.stringify(proof);
+
+  function createContext(overrides: Partial<typeof contextValues> = {}) {
+    const values = { ...contextValues, ...overrides };
+    return createWorkflowGitAncestryProofContext(
+      values.beforeHeadCommit,
+      values.afterHeadCommit,
+      values.repositoryIdentity,
+      values.worktreeIdentity,
+    );
+  }
+
+  it("accepts a canonical proof only in its expected repository and worktree context", () => {
+    expect(parseWorkflowGitAncestryProof(serializedProof, context)).toEqual(proof);
+    expect(Object.isFrozen(context)).toBe(true);
+  });
+
+  it("accepts equal before and after commits", () => {
+    const equalContext = createContext({ afterHeadCommit: contextValues.beforeHeadCommit });
+    const equalProof = { ...proof, afterHeadCommit: contextValues.beforeHeadCommit };
+
+    expect(parseWorkflowGitAncestryProof(JSON.stringify(equalProof), equalContext)).toEqual(equalProof);
+  });
+
+  it("rejects non-string input without inspecting objects, arrays, proxies, or symbols", () => {
+    let getterCalls = 0;
+    let proxyTrapCalls = 0;
+    const symbolBearing = Object.defineProperties({}, {
+      beforeHeadCommit: {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return contextValues.beforeHeadCommit;
+        },
+      },
+      [Symbol("hidden")]: {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          return "hidden";
+        },
+      },
+    });
+    const trappedProxy = new Proxy({}, {
+      get() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy get trap executed");
+      },
+      getOwnPropertyDescriptor() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy descriptor trap executed");
+      },
+      getPrototypeOf() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy prototype trap executed");
+      },
+      ownKeys() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy ownKeys trap executed");
+      },
+    });
+
+    for (const value of [proof, [], trappedProxy, symbolBearing]) {
+      expect(() => parseWorkflowGitAncestryProof(value, context)).toThrow(/serialized string/i);
+    }
+    expect(getterCalls).toBe(0);
+    expect(proxyTrapCalls).toBe(0);
+  });
+
+  it("rejects oversized input before JSON parsing with a bounded error", () => {
+    let caught: unknown;
+
+    try {
+      parseWorkflowGitAncestryProof("{".repeat(513), context);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toBe(
+      "Workflow Git ancestry proof must not exceed 512 code units.",
+    );
+    expect((caught as Error).message.length).toBeLessThan(80);
+  });
+
+  it.each([
+    ["malformed JSON", "{", /valid JSON/i],
+    ["trailing content", `${serializedProof}x`, /valid JSON/i],
+    ["JSON scalar", "null", /ordinary object/i],
+    ["JSON array", "[]", /ordinary object/i],
+    [
+      "duplicate key",
+      serializedProof.replace('"protocolVersion":1', '"protocolVersion":1,"protocolVersion":1'),
+      /canonical/i,
+    ],
+    ["whitespace", serializedProof.replace("{", "{ "), /canonical/i],
+    [
+      "reordered keys",
+      JSON.stringify({ method: proof.method, protocolVersion: proof.protocolVersion, ...contextValues }),
+      /canonical/i,
+    ],
+    ["extra key", serializedProof.replace(/}$/, ',"extra":true}'), /exactly/i],
+    [
+      "missing key",
+      JSON.stringify({
+        protocolVersion: proof.protocolVersion,
+        method: proof.method,
+        beforeHeadCommit: proof.beforeHeadCommit,
+        afterHeadCommit: proof.afterHeadCommit,
+        repositoryIdentity: proof.repositoryIdentity,
+      }),
+      /exactly/i,
+    ],
+    ["alternate escape", serializedProof.replace("ancestor", "ancest\\u006fr"), /canonical/i],
+  ] as const)("rejects %s", (_label, malformed, expectedError) => {
+    expect(() => parseWorkflowGitAncestryProof(malformed, context)).toThrow(expectedError);
+  });
+
+  it.each([
+    ["protocol version", { ...proof, protocolVersion: 2 }],
+    ["verification method", { ...proof, method: "git-rev-list" }],
+  ])("rejects a wrong %s", (_label, malformed) => {
+    expect(() => parseWorkflowGitAncestryProof(JSON.stringify(malformed), context)).toThrow(
+      /protocol version|method/i,
+    );
+  });
+
+  it.each([
+    ["beforeHeadCommit", "A".repeat(40)],
+    ["beforeHeadCommit", "a".repeat(39)],
+    ["afterHeadCommit", "b".repeat(41)],
+    ["afterHeadCommit", "g".repeat(40)],
+    ["repositoryIdentity", "A".repeat(64)],
+    ["repositoryIdentity", "1".repeat(63)],
+    ["worktreeIdentity", "2".repeat(65)],
+    ["worktreeIdentity", "z".repeat(64)],
+  ] as const)("rejects a non-canonical %s", (field, value) => {
+    expect(() => parseWorkflowGitAncestryProof(
+      JSON.stringify({ ...proof, [field]: value }),
+      context,
+    )).toThrow(/canonical/i);
+  });
+
+  it.each([
+    ["beforeHeadCommit", "c".repeat(40)],
+    ["afterHeadCommit", "d".repeat(40)],
+    ["repositoryIdentity", "3".repeat(64)],
+    ["worktreeIdentity", "4".repeat(64)],
+  ] as const)("rejects an isolated %s context mismatch", (field, value) => {
+    expect(() => parseWorkflowGitAncestryProof(
+      serializedProof,
+      createContext({ [field]: value }),
+    )).toThrow(/context mismatch/i);
+  });
+
+  it.each([
+    ["non-string before commit", 1 as unknown as string, contextValues.afterHeadCommit, contextValues.repositoryIdentity, contextValues.worktreeIdentity],
+    ["uppercase before commit", "A".repeat(40), contextValues.afterHeadCommit, contextValues.repositoryIdentity, contextValues.worktreeIdentity],
+    ["short after commit", contextValues.beforeHeadCommit, "b".repeat(39), contextValues.repositoryIdentity, contextValues.worktreeIdentity],
+    ["nonhex repository", contextValues.beforeHeadCommit, contextValues.afterHeadCommit, "z".repeat(64), contextValues.worktreeIdentity],
+    ["uppercase worktree", contextValues.beforeHeadCommit, contextValues.afterHeadCommit, contextValues.repositoryIdentity, "A".repeat(64)],
+  ] as const)("rejects invalid context creation: %s", (_label, before, after, repository, worktree) => {
+    expect(() => createWorkflowGitAncestryProofContext(
+      before,
+      after,
+      repository,
+      worktree,
+    )).toThrow(/canonical lowercase/i);
+  });
+
+  it("rejects plain, cast, fake, and frozen contexts without reading getters", () => {
+    let getterCalls = 0;
+    const getterContext = Object.create(null);
+    for (const key of Object.keys(contextValues)) {
+      Object.defineProperty(getterContext, key, {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          throw new Error("context getter executed");
+        },
+      });
+    }
+    const invalidContexts = [
+      { ...contextValues },
+      { ...contextValues } as WorkflowGitAncestryProofContext,
+      Object.create(context) as WorkflowGitAncestryProofContext,
+      Object.freeze({ ...contextValues }) as WorkflowGitAncestryProofContext,
+      getterContext as WorkflowGitAncestryProofContext,
+    ];
+
+    for (const invalidContext of invalidContexts) {
+      expect(() => parseWorkflowGitAncestryProof(serializedProof, invalidContext)).toThrow(/branded context/i);
+    }
+    expect(getterCalls).toBe(0);
+  });
+
+  it("carries an optional canonical proof on a workflow checkpoint", () => {
+    const checkpoint: WorkflowNodeCheckpoint = {
+      id: "checkpoint-after-lane",
+      sessionId: "session-1",
+      nodeId: "lane-1",
+      phase: "after",
+      executionTarget: "current_branch",
+      headCommit: proof.afterHeadCommit,
+      createdAt: "2026-07-31T00:00:00.000Z",
+      source: "backend",
+      evidenceRefs: [],
+      ancestryProof: proof,
+    };
+
+    expect(checkpoint.ancestryProof).toBe(proof);
+  });
+});
 
 describe("public RunEvidence boundaries", () => {
   it("preserves lossless RunEvent payload whitespace while compacting metadata", () => {

@@ -1731,6 +1731,149 @@ export interface WorkflowNodeCheckpointAuthority {
   executionTargetExplicit?: boolean;
 }
 
+export interface WorkflowGitAncestryProofContext {
+  readonly beforeHeadCommit: string;
+  readonly afterHeadCommit: string;
+  readonly repositoryIdentity: string;
+  readonly worktreeIdentity: string;
+}
+
+export interface WorkflowGitAncestryProof extends WorkflowGitAncestryProofContext {
+  protocolVersion: 1;
+  method: "git-merge-base-is-ancestor";
+}
+
+const workflowGitAncestryProofContextKeys = [
+  "beforeHeadCommit",
+  "afterHeadCommit",
+  "repositoryIdentity",
+  "worktreeIdentity",
+] as const;
+const workflowGitAncestryProofKeys = [
+  "protocolVersion",
+  "method",
+  ...workflowGitAncestryProofContextKeys,
+] as const;
+const workflowGitAncestryProofContexts = new WeakSet<WorkflowGitAncestryProofContext>();
+// Canonical proofs are exactly 356 ASCII code units; 512 leaves bounded validation headroom.
+const WORKFLOW_GIT_ANCESTRY_PROOF_MAX_CODE_UNITS = 512;
+
+/**
+ * Brands frozen live Git facts for proof parsing. This does not execute or attest to a Git check.
+ */
+export function createWorkflowGitAncestryProofContext(
+  beforeHeadCommit: string,
+  afterHeadCommit: string,
+  repositoryIdentity: string,
+  worktreeIdentity: string,
+): WorkflowGitAncestryProofContext {
+  const context = Object.freeze({
+    beforeHeadCommit: canonicalLowercaseHex(
+      beforeHeadCommit,
+      "Workflow Git ancestry proof context beforeHeadCommit",
+      40,
+    ),
+    afterHeadCommit: canonicalLowercaseHex(
+      afterHeadCommit,
+      "Workflow Git ancestry proof context afterHeadCommit",
+      40,
+    ),
+    repositoryIdentity: canonicalLowercaseHex(
+      repositoryIdentity,
+      "Workflow Git ancestry proof context repositoryIdentity",
+      64,
+    ),
+    worktreeIdentity: canonicalLowercaseHex(
+      worktreeIdentity,
+      "Workflow Git ancestry proof context worktreeIdentity",
+      64,
+    ),
+  });
+  workflowGitAncestryProofContexts.add(context);
+  return context;
+}
+
+/**
+ * Parses canonical serialized attestation bytes against branded live Git facts. The authoritative
+ * backend must execute Git, create the context from those facts, and supply the canonical bytes.
+ */
+export function parseWorkflowGitAncestryProof(
+  value: unknown,
+  expectedContext: WorkflowGitAncestryProofContext,
+): WorkflowGitAncestryProof {
+  if (typeof value !== "string") {
+    throw new Error("Workflow Git ancestry proof must be a serialized string.");
+  }
+  if (value.length > WORKFLOW_GIT_ANCESTRY_PROOF_MAX_CODE_UNITS) {
+    throw new Error("Workflow Git ancestry proof must not exceed 512 code units.");
+  }
+  if (!workflowGitAncestryProofContexts.has(expectedContext)) {
+    throw new Error("Workflow Git ancestry proof requires a branded context.");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("Workflow Git ancestry proof must be valid JSON.");
+  }
+  if (!isRecord(parsed) || Array.isArray(parsed) || Object.getPrototypeOf(parsed) !== Object.prototype) {
+    throw new Error("Workflow Git ancestry proof must be an ordinary object.");
+  }
+  const keys = Object.keys(parsed);
+  if (
+    keys.length !== workflowGitAncestryProofKeys.length
+    || keys.some((key) => !workflowGitAncestryProofKeys.some((expectedKey) => expectedKey === key))
+  ) {
+    throw new Error("Workflow Git ancestry proof must contain exactly the six required keys.");
+  }
+  if (parsed.protocolVersion !== 1) {
+    throw new Error("Workflow Git ancestry proof protocol version must be 1.");
+  }
+  if (parsed.method !== "git-merge-base-is-ancestor") {
+    throw new Error("Workflow Git ancestry proof method is invalid.");
+  }
+  const canonicalProof: WorkflowGitAncestryProof = {
+    protocolVersion: 1,
+    method: "git-merge-base-is-ancestor",
+    beforeHeadCommit: canonicalLowercaseHex(
+      parsed.beforeHeadCommit,
+      "Workflow Git ancestry proof beforeHeadCommit",
+      40,
+    ),
+    afterHeadCommit: canonicalLowercaseHex(
+      parsed.afterHeadCommit,
+      "Workflow Git ancestry proof afterHeadCommit",
+      40,
+    ),
+    repositoryIdentity: canonicalLowercaseHex(
+      parsed.repositoryIdentity,
+      "Workflow Git ancestry proof repositoryIdentity",
+      64,
+    ),
+    worktreeIdentity: canonicalLowercaseHex(
+      parsed.worktreeIdentity,
+      "Workflow Git ancestry proof worktreeIdentity",
+      64,
+    ),
+  };
+  if (JSON.stringify(canonicalProof) !== value) {
+    throw new Error("Workflow Git ancestry proof must use canonical JSON serialization.");
+  }
+  if (workflowGitAncestryProofContextKeys.some((key) => canonicalProof[key] !== expectedContext[key])) {
+    throw new Error("Workflow Git ancestry proof context mismatch.");
+  }
+  return canonicalProof;
+}
+
+function canonicalLowercaseHex(value: unknown, label: string, length: 40 | 64): string {
+  const pattern = length === 40 ? /^[0-9a-f]{40}$/ : /^[0-9a-f]{64}$/;
+  if (typeof value !== "string" || !pattern.test(value)) {
+    throw new Error(`${label} must be a canonical lowercase ${length}-hex value.`);
+  }
+  return value;
+}
+
 export interface WorkflowNodeCheckpoint {
   id: string;
   sessionId: string;
@@ -1749,6 +1892,7 @@ export interface WorkflowNodeCheckpoint {
   createdAt: string;
   source: WorkflowNodeCheckpointSource;
   evidenceRefs: WorkflowCheckpointEvidenceRef[];
+  ancestryProof?: WorkflowGitAncestryProof;
   authority?: WorkflowNodeCheckpointAuthority;
 }
 
