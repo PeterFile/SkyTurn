@@ -410,6 +410,16 @@ export interface ScheduleReadyWorkflowLanesResult {
   projection: FlowProjection;
 }
 
+interface RunningWorkflowScopes {
+  fileScopes: string[];
+  packageScopes: string[];
+}
+
+interface CurrentBranchSchedulingBarrier {
+  writerUnavailable: boolean;
+  runningScopes: RunningWorkflowScopes[];
+}
+
 export interface WorkflowLaneReassignmentInput {
   requestId: string;
   sessionId: string;
@@ -1256,13 +1266,15 @@ export class WorkflowStore {
       let sharedWriterUnavailable = false;
       if (session.target.executionTarget === "current_branch") {
         projection = this.materializeFlowProjection(sessionId);
-        sharedWriterUnavailable = this.hasRunningOrUnresolvedCurrentBranchWriter();
+        const barrier = this.currentBranchSchedulingBarrier();
+        sharedWriterUnavailable = barrier.writerUnavailable;
         scheduled = this.selectCurrentBranchReadyLanes(
           sessionId,
           projection,
           input.allowedParallelism ?? 1,
           authorizedLaneIds,
           sharedWriterUnavailable,
+          barrier.runningScopes,
         );
       } else {
         const preview = this.previewReadyLanes(sessionId, input);
@@ -1368,12 +1380,11 @@ export class WorkflowStore {
     allowedParallelism: number,
     authorizedLaneIds: Set<string> | null,
     sharedWriterUnavailable: boolean,
+    sharedRunningScopes: RunningWorkflowScopes[],
   ): ScheduledWorkflowLane[] {
     const selected: FlowLane[] = [];
     const excludedLaneIds = new Set<string>();
-    const occupied = projection.lanes
-      .filter((lane) => lane.status === "running")
-      .map((lane) => ({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes }));
+    const occupied = [...sharedRunningScopes];
     let writerSelected = sharedWriterUnavailable;
 
     while (true) {
@@ -1412,27 +1423,66 @@ export class WorkflowStore {
     }));
   }
 
-  private hasRunningOrUnresolvedCurrentBranchWriter(): boolean {
+  private currentBranchSchedulingBarrier(): CurrentBranchSchedulingBarrier {
     const sessions = this.statements.listWorkflowSessionIds.all() as Array<{ id: string }>;
     const storedSegments = this.statements.listRunningSegments.all() as SegmentRow[];
+    const runningScopes: RunningWorkflowScopes[] = [];
+    const resolvedRunningLanes = new Set<string>();
+    const runningSegmentFingerprints = new Map<string, string>();
+    let writerUnavailable = false;
     for (const { id: sessionId } of sessions) {
       const session = this.requireKnownSession(sessionId);
       if (session.target.executionTarget !== "current_branch") continue;
       const projection = this.materializeFlowProjection(sessionId);
+      const collectRunningLane = (laneId: string): void => {
+        const identity = `${sessionId}\u0000${laneId}`;
+        if (resolvedRunningLanes.has(identity)) return;
+        resolvedRunningLanes.add(identity);
+
+        const lanes = projection.lanes.filter((lane: FlowLane) => lane.id === laneId);
+        if (lanes.length !== 1) {
+          writerUnavailable = true;
+          return;
+        }
+        const lane = lanes[0]!;
+        runningScopes.push({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes });
+        if (this.runningSegmentBlocksCurrentBranchWriter(projection, laneId)) {
+          writerUnavailable = true;
+        }
+      };
+      const collectRunningSegment = (
+        segmentId: string,
+        laneId: string,
+        runId: string,
+        agentKind: AgentKind | null,
+      ): void => {
+        const identity = `${sessionId}\u0000${segmentId}`;
+        const fingerprint = stableJson({ laneId, runId, agentKind });
+        const resolvedFingerprint = runningSegmentFingerprints.get(identity);
+        if (resolvedFingerprint !== undefined && resolvedFingerprint !== fingerprint) {
+          writerUnavailable = true;
+        } else {
+          runningSegmentFingerprints.set(identity, fingerprint);
+        }
+        collectRunningLane(laneId);
+      };
       for (const segment of storedSegments) {
-        if (
-          segment.session_id === sessionId &&
-          this.runningSegmentBlocksCurrentBranchWriter(projection, segment.lane_id)
-        ) {
-          return true;
+        if (segment.session_id === sessionId) {
+          collectRunningSegment(segment.id, segment.lane_id, segment.run_id, segment.agent_kind);
         }
       }
       for (const segment of projection.segments) {
         if (segment.status !== "running") continue;
-        if (this.runningSegmentBlocksCurrentBranchWriter(projection, segment.laneId)) return true;
+        const lanes = projection.lanes.filter((lane: FlowLane) => lane.id === segment.laneId);
+        collectRunningSegment(
+          segment.id,
+          segment.laneId,
+          segment.runId,
+          lanes.length === 1 ? lanes[0]!.agentKind : null,
+        );
       }
     }
-    return false;
+    return { writerUnavailable, runningScopes };
   }
 
   private isTrustedCurrentBranchWriter(lane: FlowLane): boolean {
