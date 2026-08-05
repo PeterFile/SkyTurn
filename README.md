@@ -36,6 +36,26 @@ packages/
   persistence/          # workspace state and renderer host persistence adapters
 ```
 
+## Documentation Map
+
+Current architecture and operating contracts:
+
+- [`AGENTS.md`](AGENTS.md) and [`.agents/canvas-protocol.md`](.agents/canvas-protocol.md): repository rules and Project Canvas mutation protocol.
+- [`docs/architecture.md`](docs/architecture.md) and [`docs/product-model.md`](docs/product-model.md): process/module boundaries and product objects.
+- [`docs/natural-workflow-design.md`](docs/natural-workflow-design.md): durable workflow design and acceptance targets; use this README and live code/Git evidence for current capability claims.
+- [`docs/agent-adapters.md`](docs/agent-adapters.md), [`docs/agent-bridge.md`](docs/agent-bridge.md), and [`docs/codex-watchdog-design.md`](docs/codex-watchdog-design.md): adapter support levels, authoritative run evidence, and process supervision boundaries.
+- [`docs/git-worktree-design.md`](docs/git-worktree-design.md): Git, worktree, delivery, checkpoint, and rollback safety boundaries.
+
+Current verification entrypoints and scoped acceptance records:
+
+- [Verification Surfaces](#verification-surfaces): current commands, capability levels, and real-runtime prerequisites.
+- [`docs/pty-session-acceptance.md`](docs/pty-session-acceptance.md): bounded PTY transport acceptance record; it does not establish production PTY or agent support.
+
+Historical / Archived records (evidence and original goals, not the current capability map or active backlog):
+
+- [`docs/flow-kernel-v1-acceptance.md`](docs/flow-kernel-v1-acceptance.md), [`docs/flow-kernel-v1-goal.md`](docs/flow-kernel-v1-goal.md), and [`docs/mvp-verification.md`](docs/mvp-verification.md).
+- [`goal-mvp.md`](goal-mvp.md), [`flow-goal.md`](flow-goal.md), and [`new-design-goal.md`](new-design-goal.md).
+
 ## Current Scope
 
 - Desktop shell: Electron + React + TypeScript + Vite.
@@ -48,6 +68,7 @@ packages/
 - Changes: the node modal `Changes` tab can use structured live Codex change events plus git-backed final reconciliation.
 - Node interaction: selecting a node only binds the bottom composer to node-scoped actions. Details open through the node card **More** button, not selection.
 - Node checkpoints: before/after checkpoints are user-visible workflow concepts at the node/run boundary. Node-scoped actions repair from the after checkpoint, create variants from the before checkpoint, or roll back the selected node and downstream nodes.
+- Trusted checkpoint ancestry: ancestry-dependent actions require checkpoint-context proof that Electron/backend validates against live Git before authorizing the action. Legacy checkpoints without proof remain readable as history, but they cannot authorize ancestry-dependent actions and therefore fail closed. Renderer state and persisted claims are not the authority for live Git ancestry.
 - Session target: New Session exposes Current branch by default and New worktree as explicit opt-in.
 - Managed worktrees: desktop IPC calls `NodeGitWorktreeService` for create, adopt, and clean operations, and uses Node-side git evidence for compare.
 - Delivery actions: the node modal **Changes** tab exposes explicit commit, push, create PR, exact-head check, squash merge request, post-merge main sync, and cleanup actions. The preload IPC and Electron main handlers call Node-only git/GitHub helpers. Commit records `workflow.commit.created`; push records `workflow.delivery.pushed`; PR creation records `workflow.pull_request.created`.
@@ -75,11 +96,12 @@ Implemented in the current code:
 - Electron New Session and subsequent ordinary Canvas input keep one planner session/node identity while assigning each turn a distinct durable run identity. The backend owns launch, terminal reconciliation, intent application, scheduling, projection, and broadcast; the planner root remains dependency-free.
 - Electron renderer state is installed only from authoritative `CanvasSession` values returned by workflow IPC or workflow events. Browser/mock mode retains its local development fallback.
 - Completion evidence comes from `RunEvidence`, workflow events, git/worktree reconciliation, checks, artifacts, review evidence, and commit evidence. Agent prose and terminal text are output only.
+- Checkpoint-origin actions carry ancestry proof bound to the persisted checkpoint context; Electron/backend re-checks that proof against live Git and rejects missing, mismatched, or no-longer-valid ancestry.
 - Hermes and Codex real CLI adapters are wired through `agent-bridge` as `experimental-run`. The real path is `experimental-run`, not `supported-run`.
 
 Partial and still being hardened:
 
-- Current-branch real loop beyond Phase 1: Current branch is the default main path, runs against the imported project root, and records real `RunEvidence`. The New Session verification surface is Implemented and Tested, but real execution remains Experimental—not Supported—because it depends on local Hermes/Codex credentials, CLI behavior, and Electron native ABI compatibility. Browser/mock fallback remains for development, and failure-repair, artifact, worktree, and delivery product paths still need later-phase hardening.
+- Current-branch real loop beyond Phase 1: Current branch is the default target selection, not a support-level claim. It runs against the imported project root and records real `RunEvidence`. The New Session verification surface is Implemented and Tested, but real execution remains Experimental—not Supported—because it depends on local Hermes/Codex credentials, CLI behavior, and Electron native ABI compatibility. Browser/mock fallback remains for development, and failure-repair, artifact, worktree, and delivery product paths still need later-phase hardening.
 - Artifact evidence: `RunEvidence` can carry artifacts and the MVP demo captures a screenshot artifact, but artifact capture/registration is still lane- and script-specific.
 - Failure-to-repair main path: Implemented foundations now have deterministic Tested coverage from a seeded failed lane through the real Electron UI Repair entrypoint to automatically created Repair and Regression lanes. Both complete with real Codex CLI `exit 0` `RunEvidence`; `answer.js` is `42`, the seeded test hash and HEAD stay unchanged, and the full `CanvasSession` plus `FlowProjection` reopen exactly from SQLite and after Electron restart. This remains seeded-failure-only and Experimental (`experimental-run`), not Supported (`supported-run`): ordinary New Session does not yet produce this failure-to-repair flow as the default desktop loop, which still needs productization.
 - Worktree product loop: create, compare, adopt, clean, and rollback backend boundaries exist, but New worktree is not the current mainline and the compare/adopt/cleanup experience is not complete.
