@@ -47,6 +47,7 @@ async function runProcessTreeCase(agentKind, terminalPath) {
       canonicalWorkdir: canonicalRoot,
       prompt,
       resumeHandle,
+      ...(agentKind === "codex" ? { sandbox: "danger-full-access" } : {}),
     });
     const fixture = fixtureSource({
       expectedArgs: invocation.expectedFixtureArgv,
@@ -75,6 +76,7 @@ async function runProcessTreeCase(agentKind, terminalPath) {
       timeoutMs: terminalPath === "timeout" ? 1_500 : 20_000,
       killTimeoutMs: 1_000,
       stallTelemetryMs: 0,
+      ...(agentKind === "codex" ? { sandbox: "danger-full-access" } : {}),
     };
     const adapter = agentKind === "codex"
       ? createCodexCliAdapter(options)
@@ -94,6 +96,7 @@ async function runProcessTreeCase(agentKind, terminalPath) {
         projectRoot: root,
         worktreePath: root,
         agentKind,
+        sandbox: "danger-full-access",
         prompt,
         ...(agentKind === "hermes" ? { hermesSessionHandle: resumeHandle } : {}),
       }, {

@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { access, mkdir, open, readFile, realpath, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { constants as fsConstants, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
@@ -81,6 +81,10 @@ import {
   spawnWindowsJobObjectProcess,
   type WindowsJobObjectProcess,
 } from "./internal/windowsJobObjectProcess.js";
+import {
+  hasFdAnchoredCliLaunchCapability,
+  spawnFdAnchoredCli,
+} from "./internal/fdAnchoredCliLaunch.js";
 
 export { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/project-core";
 export {
@@ -130,6 +134,7 @@ type CliFailureCategory =
   | "cli-missing"
   | "auth-missing"
   | "invalid-cwd"
+  | "sandbox-unavailable"
   | "process-timeout"
   | "non-zero-exit"
   | "output-parse-error";
@@ -173,6 +178,7 @@ interface AgentRunTerminalState {
 interface AgentCliProcessBoundary {
   child: ChildProcess;
   closed: Promise<AgentCliProcessCloseResult>;
+  launchFailure: Promise<Error | null>;
   windowsJob: WindowsJobObjectProcess | null;
 }
 
@@ -2190,8 +2196,8 @@ function observeAgentCliProcessBoundary(
   watchdog: AgentRunWatchdog,
   onClose: (result: AgentCliProcessCloseResult) => Promise<AgentRunTerminalKind | void>,
 ): void {
-  const settlement = processBoundary.closed.then(
-    onClose,
+  const settlement = Promise.all([processBoundary.closed, processBoundary.launchFailure]).then(
+    ([result, launchFailure]) => launchFailure ? undefined : onClose(result),
     () => watchdog.completeProcessBoundaryFailure(),
   );
   void settlement.catch(() => undefined);
@@ -2225,9 +2231,22 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
     async startRun(input, sink) {
       const workdir = await resolveRunWorkdir(input, sink, "codex", "Codex CLI");
       if (!workdir) return noopRunHandle();
+      const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : defaultSandbox;
+      if (!(await hasFdAnchoredCliLaunchCapability({ agentKind: "codex", platform: process.platform, sandbox }))) {
+        return failRunPreflight(
+          sink,
+          "codex",
+          "Codex CLI",
+          "sandbox-unavailable",
+          "Codex CLI restricted launch is unavailable on this platform.",
+        );
+      }
       let worktreeHandle: FileHandle | null = null;
       try {
-        if (artifactVerificationPlatform(artifactVerificationHooks) !== "win32") {
+        if (
+          process.platform !== "win32" ||
+          artifactVerificationPlatform(artifactVerificationHooks) !== "win32"
+        ) {
           worktreeHandle = await open(
             workdir,
             fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
@@ -2253,7 +2272,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         });
         return closeRunResourcesPromise;
       };
-      if (!(await hasGitMetadata(workdir))) {
+      if (retainedWorktree === null && !(await hasGitMetadata(workdir))) {
         await closeRunResources();
         return failRunPreflight(sink, "codex", "Codex CLI", "invalid-cwd", "Codex CLI requires a git repository.");
       }
@@ -2279,11 +2298,9 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         throw error;
       }
 
-      const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : defaultSandbox;
       const args = makeCodexExecArgs({
         prompt: input.prompt,
         sandbox,
-        workdir,
         extraArgs: options.extraArgs,
       });
       let processBoundary: AgentCliProcessBoundary;
@@ -2292,6 +2309,9 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           executablePath,
           args,
           workdir,
+          retainedWorktree?.fd ?? null,
+          "codex",
+          sandbox,
           { ...process.env, ...options.env },
           options.killTimeoutMs ?? defaultKillTimeoutMs,
         );
@@ -2355,7 +2375,8 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         });
       }
 
-      if (!processBoundary.windowsJob) child.once("error", (error) => {
+      const completeSpawnFailure = (error: Error) => {
+        if (spawnFailed || watchdog.isFinalized()) return;
         spawnFailed = true;
         const category = errorCategoryFromSpawnError(error);
         const publicMessage = sanitizePublicEvidenceText(error.message) || "Codex CLI spawn failed";
@@ -2387,6 +2408,10 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
             });
           },
         ).catch(() => undefined);
+      };
+      if (!processBoundary.windowsJob) child.once("error", completeSpawnFailure);
+      void processBoundary.launchFailure.then((error) => {
+        if (error) completeSpawnFailure(error);
       });
 
       observeAgentCliProcessBoundary(processBoundary, watchdog, async ({ exitCode: code, signalCode: signal }) => {
@@ -2501,9 +2526,22 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
     async startRun(input, sink) {
       const workdir = await resolveRunWorkdir(input, sink, "hermes", "Hermes CLI");
       if (!workdir) return noopRunHandle();
+      const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : "danger-full-access";
+      if (!(await hasFdAnchoredCliLaunchCapability({ agentKind: "hermes", platform: process.platform, sandbox }))) {
+        return failRunPreflight(
+          sink,
+          "hermes",
+          "Hermes CLI",
+          "sandbox-unavailable",
+          "Hermes CLI restricted launch is unavailable on this platform.",
+        );
+      }
       let worktreeHandle: FileHandle | null = null;
       try {
-        if (artifactVerificationPlatform(artifactVerificationHooks) !== "win32") {
+        if (
+          process.platform !== "win32" ||
+          artifactVerificationPlatform(artifactVerificationHooks) !== "win32"
+        ) {
           worktreeHandle = await open(
             workdir,
             fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
@@ -2563,6 +2601,9 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           executablePath,
           args,
           workdir,
+          retainedWorktree?.fd ?? null,
+          "hermes",
+          sandbox,
           { ...process.env, ...options.env },
           options.killTimeoutMs ?? defaultKillTimeoutMs,
         );
@@ -2618,7 +2659,8 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       child.stdout?.on("data", onStdoutData);
       child.stderr?.on("data", onStderrData);
 
-      if (!processBoundary.windowsJob) child.once("error", (error) => {
+      const completeSpawnFailure = (error: Error) => {
+        if (spawnFailed || watchdog.isFinalized()) return;
         spawnFailed = true;
         artifactVerificationAbort.abort();
         const category = errorCategoryFromSpawnError(error);
@@ -2654,6 +2696,10 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
             });
           },
         ).catch(() => undefined);
+      };
+      if (!processBoundary.windowsJob) child.once("error", completeSpawnFailure);
+      void processBoundary.launchFailure.then((error) => {
+        if (error) completeSpawnFailure(error);
       });
 
       observeAgentCliProcessBoundary(processBoundary, watchdog, async ({ exitCode: code, signalCode: signal }) => {
@@ -2760,29 +2806,43 @@ async function spawnAgentCliProcess(
   executablePath: string,
   args: string[],
   cwd: string,
+  worktreeFd: number | null,
+  agentKind: "codex" | "hermes",
+  sandbox: AgentRunSandbox,
   env: NodeJS.ProcessEnv,
   killTimeoutMs: number,
 ): Promise<AgentCliProcessBoundary> {
   if (process.platform === "win32") {
+    if (sandbox !== "danger-full-access") throw new Error("Restricted Windows CLI launch is unavailable.");
     const windowsJob = await spawnWindowsJobObjectProcess(executablePath, args, {
       cwd,
       env,
       cleanupTimeoutMs: killTimeoutMs,
     });
-    return { child: windowsJob.child, closed: windowsJob.closed, windowsJob };
+    return {
+      child: windowsJob.child,
+      closed: windowsJob.closed,
+      launchFailure: Promise.resolve(null),
+      windowsJob,
+    };
   }
-  const child = spawn(executablePath, args, {
-    cwd,
+  if (worktreeFd === null) throw new Error("CLI worktree descriptor is unavailable.");
+  const launched = spawnFdAnchoredCli({
+    agentKind,
+    args,
     env,
-    detached: true,
-    shell: false,
-    stdio: ["ignore", "pipe", "pipe"],
+    executablePath,
+    platform: process.platform,
+    sandbox,
+    worktreeFd,
   });
+  const child = launched.child;
   return {
     child,
     closed: new Promise((resolve) => {
       child.once("close", (exitCode, signalCode) => resolve({ exitCode, signalCode }));
     }),
+    launchFailure: launched.launchFailure,
     windowsJob: null,
   };
 }
@@ -3233,9 +3293,10 @@ async function resolveCliExecutable(
 ): Promise<string | null> {
   if (!executablePath) return findExecutable(candidates, pathValue);
   if (!isPathLikeCommand(executablePath)) return findExecutable([executablePath], pathValue);
+  const absoluteExecutablePath = resolve(executablePath);
   try {
-    await access(executablePath, fsConstants.X_OK);
-    return executablePath;
+    await access(absoluteExecutablePath, fsConstants.X_OK);
+    return absoluteExecutablePath;
   } catch {
     return null;
   }
@@ -3248,7 +3309,7 @@ function isPathLikeCommand(value: string): boolean {
 async function findExecutable(commands: string[], pathValue: string): Promise<string | null> {
   for (const directory of pathValue.split(delimiter).filter(Boolean)) {
     for (const command of commands) {
-      const candidate = join(directory, command);
+      const candidate = resolve(directory, command);
       try {
         await access(candidate, fsConstants.X_OK);
         return candidate;
@@ -3417,9 +3478,8 @@ async function resolveRunWorkdir(
   source: AgentKind,
   commandLabel: string,
 ): Promise<string | null> {
-  try {
-    return await realpath(input.worktreePath || input.projectRoot);
-  } catch {
+  const workdir = input.worktreePath || input.projectRoot;
+  if (!isAbsolute(workdir)) {
     await failRunPreflight(
       sink,
       source,
@@ -3429,6 +3489,7 @@ async function resolveRunWorkdir(
     );
     return null;
   }
+  return workdir;
 }
 
 async function failRunPreflight(
@@ -3829,7 +3890,6 @@ function isCodexCliSandbox(value: unknown): value is CodexCliSandbox {
 function makeCodexExecArgs(input: {
   prompt: string;
   sandbox: CodexCliSandbox;
-  workdir: string;
   extraArgs?: string[];
 }): string[] {
   return [
@@ -3843,8 +3903,6 @@ function makeCodexExecArgs(input: {
     "-c",
     "approval_policy=never",
     ...(input.extraArgs ?? []),
-    "-C",
-    input.workdir,
     input.prompt,
   ];
 }

@@ -43,11 +43,9 @@ describe("Windows process-tree integration support", () => {
         "-c",
         "approval_policy=never",
         argumentMarker,
-        "-C",
-        canonicalWorkdir,
         prompt,
       ],
-      pathArgumentIndexes: [10],
+      pathArgumentIndexes: [],
     });
   });
 
@@ -91,6 +89,9 @@ describe("Windows process-tree integration support", () => {
           canonicalWorkdir: canonicalRoot,
           prompt,
           resumeHandle,
+          ...(agentKind === "codex" && process.platform === "win32"
+            ? { sandbox: "danger-full-access" }
+            : {}),
         });
         await writeFile(executablePath, [
           "#!/usr/bin/env node",
@@ -103,6 +104,9 @@ describe("Windows process-tree integration support", () => {
           extraArgs: invocation.extraArgs,
           env: { SKYTURN_ARGS_PATH: argsPath },
           stallTelemetryMs: 0,
+          ...(agentKind === "codex" && process.platform === "win32"
+            ? { sandbox: "danger-full-access" as const }
+            : {}),
         };
         const adapter = agentKind === "codex"
           ? createCodexCliAdapter(adapterOptions)
@@ -133,6 +137,7 @@ describe("Windows process-tree integration support", () => {
           projectRoot,
           worktreePath: projectRoot,
           agentKind,
+          ...(process.platform === "win32" ? { sandbox: "danger-full-access" as const } : {}),
           prompt,
           ...(agentKind === "hermes" ? { hermesSessionHandle: resumeHandle } : {}),
         }, sink);
