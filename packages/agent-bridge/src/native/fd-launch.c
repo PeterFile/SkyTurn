@@ -10,7 +10,10 @@
 #define SKYTURN_STATUS_FD 4
 
 static int fail(const char *message, int status) {
-  (void)write(SKYTURN_STATUS_FD, "F", 1);
+  ssize_t written;
+  do {
+    written = write(SKYTURN_STATUS_FD, "F", 1);
+  } while (written < 0 && errno == EINTR);
   (void)fprintf(stderr, "skyturn-fd-launch: %s\n", message);
   return status;
 }
