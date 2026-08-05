@@ -1220,8 +1220,8 @@ describe("workflow runtime event merging", () => {
 
     expect(startAgentRun.mock.calls.map(([input]) => input.sandbox)).toEqual([
       "workspace-write",
-      undefined,
-      "danger-full-access",
+      "read-only",
+      "read-only",
       "danger-full-access",
     ]);
     expect(startAgentRun.mock.calls.map(([input]) => input.expectedArtifacts)).toEqual([
@@ -1864,11 +1864,11 @@ describe("workflow runtime event merging", () => {
     };
 
     expect(sandboxForNodeRun(commitTitledNode)).toBe("workspace-write");
-    expect(sandboxForNodeRun(screenshotNode)).toBe("danger-full-access");
+    expect(sandboxForNodeRun(screenshotNode)).toBe("read-only");
     expect(sandboxForNodeRun(decisionNode)).toBeUndefined();
   });
 
-  it("uses canonical browser screenshot evidence for the Codex sandbox", () => {
+  it("keeps canonical browser screenshot lanes on their trusted final sandbox", () => {
     const node = withRuntimePolicy(makeNode({
       id: "lane-visual-check",
       agent: "codex",
@@ -1879,7 +1879,21 @@ describe("workflow runtime event merging", () => {
       requiredEvidence: ["browser", "screenshot"],
     }), "read-only", []);
 
-    expect(sandboxForNodeRun(node)).toBe("danger-full-access");
+    expect(sandboxForNodeRun(node)).toBe("read-only");
+  });
+
+  it("derives the same trusted final sandbox for every agent kind", () => {
+    for (const agent of ["codex", "hermes", "gemini"] as const) {
+      const node = withRuntimePolicy(makeNode({
+        id: `lane-${agent}-review`,
+        agent,
+        status: "pending",
+        runId: `run-session-1-lane-${agent}-review`,
+        title: "Review current changes before commit",
+        meta: ["review", `lane-${agent}-review`, "flow-kernel"],
+      }), "read-only", ["process"]);
+      expect(sandboxForNodeRun(node)).toBe("read-only");
+    }
   });
 
   it.each(["artifact", "test"])("does not broaden the Codex sandbox for %s evidence", (requiredEvidence) => {
@@ -1933,6 +1947,46 @@ describe("workflow runtime event merging", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it.each(["missing", "untrusted"] as const)(
+    "fails closed before Electron startAgentRun for an executable node with %s runtime policy",
+    async (policyKind) => {
+      const project = makeWorkspace().projects[0] as ImportedProject;
+      const session = makeSession([
+        makeNode({
+          id: `lane-${policyKind}-policy`,
+          agent: "codex",
+          status: "running",
+          runId: `run-session-1-lane-${policyKind}-policy`,
+          meta: ["implementation", `lane-${policyKind}-policy`, "flow-kernel"],
+        }),
+      ]);
+      const node = session.nodes.find((candidate) => candidate.id === `lane-${policyKind}-policy`)!;
+      if (policyKind === "missing") {
+        delete node.runtimePolicy;
+      } else {
+        node.runtimePolicy = {
+          source: "workflow_projection",
+          trusted: false,
+          executable: true,
+          sandbox: "danger-full-access",
+          sideEffects: ["git", "filesystem"],
+          reason: "Untrusted renderer input.",
+        } as unknown as NonNullable<CanvasNode["runtimePolicy"]>;
+      }
+      const startAgentRun = vi.fn();
+      vi.stubGlobal("window", { devflow: { startAgentRun } });
+
+      try {
+        await expect(startBridgeRun(project, session, node)).rejects.toThrow(
+          "Executable workflow node requires a trusted workflow_projection runtime policy.",
+        );
+        expect(startAgentRun).not.toHaveBeenCalled();
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
 
   it("rejects malformed Hermes WorkflowIntent output without crashing the canvas projection", () => {
     const workspace = makeWorkspace();
@@ -2896,6 +2950,17 @@ function makeNode(input: {
   dependencies?: string[];
   output?: string[];
 }): CanvasNode {
+  const laneKind = input.meta?.[0] ?? "planner";
+  const sandbox = laneKind === "commit"
+    ? "danger-full-access"
+    : /implementation|fix/.test(laneKind)
+      ? "workspace-write"
+      : "read-only";
+  const sideEffects: NonNullable<CanvasNode["runtimePolicy"]>["sideEffects"] = sandbox === "danger-full-access"
+    ? ["git", "filesystem", "process"]
+    : sandbox === "workspace-write"
+      ? ["filesystem", "process"]
+      : ["process"];
   return {
     id: input.id,
     title: input.title ?? input.id,
@@ -2908,6 +2973,15 @@ function makeNode(input: {
     output: input.output ?? [],
     ...(input.requiredEvidence ? { requiredEvidence: input.requiredEvidence } : {}),
     display: input.meta ? { agentLabel: input.agent, meta: input.meta } : undefined,
+    executable: true,
+    runtimePolicy: {
+      source: "workflow_projection",
+      trusted: true,
+      executable: true,
+      sandbox,
+      sideEffects,
+      reason: "Trusted test fixture runtime policy.",
+    },
     worktree: {
       path: ".",
       branchName: `skyturn/session-1/${input.id}`,

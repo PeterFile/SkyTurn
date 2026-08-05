@@ -65,6 +65,9 @@ export async function startBridgeRun(
   if (window.devflow && isPlannerRootNode(session, node)) return null;
   if (!canStartNodeRun(node)) return null;
   const sandbox = sandboxForNodeRun(node);
+  if (window.devflow && !sandbox) {
+    throw new Error("Executable workflow node requires a trusted workflow_projection runtime policy.");
+  }
   const ledger = node.agent === "hermes" ? await loadWorkflowLedger(project, session.id) : undefined;
   const worktreePath = await ensureRunWorktreePath(project, session, node);
   if (!worktreePath) return null;
@@ -819,21 +822,15 @@ function promptForNodeRun(
 }
 
 export function sandboxForNodeRun(node: CanvasNode): AgentRunSandbox | undefined {
-  if (node.executable === false || node.runtimePolicy?.executable === false) return undefined;
-  if (node.agent !== "codex") return undefined;
-  if (node.requiredEvidence?.some((kind) => kind === "browser" || kind === "screenshot")) {
-    return "danger-full-access";
-  }
-  const laneKind = node.display?.meta[0] ?? "";
-  const laneText = `${laneKind} ${node.title}`.toLowerCase();
-  if (node.runtimePolicy?.source === "workflow_projection" && node.runtimePolicy.trusted) {
-    if (node.runtimePolicy.sandbox === "read-only" && /browser|screenshot/.test(laneText)) return "danger-full-access";
-    return node.runtimePolicy.sandbox;
-  }
-  if (laneKind === "commit" || /\bcommit\b/.test(laneText)) return "danger-full-access";
-  if (/browser|screenshot/.test(laneText)) return "danger-full-access";
-  if (/implementation|implement|change|update|edit/.test(laneText)) return "workspace-write";
-  return undefined;
+  if (node.executable === false) return undefined;
+  const policy = node.runtimePolicy;
+  if (
+    policy?.source !== "workflow_projection" ||
+    policy.trusted !== true ||
+    policy.executable !== true ||
+    !isAgentRunSandbox(policy.sandbox)
+  ) return undefined;
+  return policy.sandbox;
 }
 
 function canStartNodeRun(node: CanvasNode): boolean {
@@ -842,7 +839,17 @@ function canStartNodeRun(node: CanvasNode): boolean {
 }
 
 function isExecutableNode(node: CanvasNode): boolean {
-  return node.nodeKind !== "user_decision" && node.executable !== false && node.runtimePolicy?.executable !== false;
+  if (node.nodeKind === "user_decision" || node.executable === false) return false;
+  const policy = node.runtimePolicy;
+  return !(
+    policy?.source === "workflow_projection" &&
+    policy.trusted === true &&
+    policy.executable === false
+  );
+}
+
+function isAgentRunSandbox(value: unknown): value is AgentRunSandbox {
+  return value === "read-only" || value === "workspace-write" || value === "danger-full-access";
 }
 
 function hermesGoalForNode(session: CanvasSession, node: CanvasNode): string {

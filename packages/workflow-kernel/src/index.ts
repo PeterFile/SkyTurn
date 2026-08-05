@@ -567,16 +567,25 @@ function parseExternalLaneSuggestion(raw: Record<string, unknown>): LaneSuggesti
   if (!isNonEmptyString(raw.id) || !isNonEmptyString(raw.kind) || !isNonEmptyString(raw.title)) {
     return "Lane suggestions require id, kind, and title.";
   }
+  const declaredKind = raw.kind.trim();
+  const laneKind = laneKindForExternalKind(declaredKind);
+  const kind = laneKind === "implementation" && laneKindForLegacyKind(declaredKind) === "commit"
+    ? "implementation"
+    : declaredKind;
   const lane: LaneSuggestion = {
     id: raw.id.trim(),
-    kind: raw.kind.trim(),
-    laneKind: laneKindForExternalKind(raw.kind.trim()),
+    kind,
+    laneKind,
     title: raw.title.trim(),
   };
   if (isNonEmptyString(raw.semanticKey) && !isReservedRepairSemanticKey(raw.semanticKey.trim())) {
     lane.semanticKey = raw.semanticKey.trim();
   }
-  if (isNonEmptyString(raw.semanticSubtype) && raw.semanticSubtype.trim() !== "repair") {
+  if (
+    isNonEmptyString(raw.semanticSubtype) &&
+    raw.semanticSubtype.trim() !== "repair" &&
+    runtimeLaneKindForSemantic(raw.semanticSubtype) !== "commit"
+  ) {
     lane.semanticSubtype = raw.semanticSubtype.trim();
   }
   if (isAgentKind(raw.agentKind)) lane.agentKind = raw.agentKind;
@@ -725,6 +734,10 @@ export function evaluateGate(projection: FlowProjection, operation: WorkflowInte
     if (incomplete.length > 0) return blocked("Join before upstream lanes complete is rejected.");
   }
   if (operation.type === "Commit") {
+    const commitLane = projection.lanes.find((lane) => lane.id === operation.laneId);
+    if (!isTrustedExecutableCommitLane(commitLane)) {
+      return blocked("Commit requires an existing trusted executable commit lane.");
+    }
     const hasReview = projection.lanes.some((lane) => lane.kind === "review" && isCompletedLane(lane));
     const hasValidation = projection.lanes.some((lane) => /validation|test|regression/.test(lane.kind) && isCompletedLane(lane));
     if (!hasReview || !hasValidation) return blocked("Commit before review and validation is rejected.");
@@ -743,6 +756,24 @@ export function evaluateGate(projection: FlowProjection, operation: WorkflowInte
     if (lane.status !== "failed") return blocked("Replan requires the source lane to remain failed.");
   }
   return { allowed: true, reason: "allowed" };
+}
+
+function isTrustedExecutableCommitLane(lane: FlowProjection["lanes"][number] | undefined): boolean {
+  if (!lane || lane.laneKind !== "commit" || lane.executable !== true) return false;
+  const runtimePolicy = lane.runtimePolicy;
+  if (
+    runtimePolicy.source !== "workflow_projection" ||
+    runtimePolicy.trusted !== true ||
+    runtimePolicy.executable !== true ||
+    runtimePolicy.sandbox !== "danger-full-access"
+  ) {
+    return false;
+  }
+  const sideEffects = new Set(runtimePolicy.sideEffects);
+  return sideEffects.size === 3 &&
+    sideEffects.has("git") &&
+    sideEffects.has("filesystem") &&
+    sideEffects.has("process");
 }
 
 export function compileInsertClarificationBefore(
@@ -2381,7 +2412,16 @@ function normalizeLane(value: Record<string, unknown> | LaneSuggestion | FlowLan
   const laneKind = isWorkflowLaneKind(record.laneKind) ? record.laneKind : laneKindForLegacyKind(kind);
   const semanticSubtype =
     typeof record.semanticSubtype === "string" ? record.semanticSubtype : semanticSubtypeForLegacyKind(kind, laneKind);
-  const executable = typeof record.executable === "boolean" ? record.executable : true;
+  const canonicalExecutable = !isDecisionLaneSemantics(record, laneKind, semanticSubtype);
+  const declaredExecutable = record.executable !== false;
+  const runtimePolicy = normalizeRuntimePolicy(
+    record.runtimePolicy,
+    record,
+    laneKind,
+    semanticSubtype,
+    canonicalExecutable && declaredExecutable,
+  );
+  const executable = runtimePolicy.executable;
   const rollbackStatus = normalizeNodeRollbackStatus(record.rollbackStatus) ?? normalizeNodeRollbackStatus(record.status);
   const status = isTerminalRollbackStatus(rollbackStatus)
     ? "blocked"
@@ -2397,9 +2437,9 @@ function normalizeLane(value: Record<string, unknown> | LaneSuggestion | FlowLan
     title: typeof record.title === "string" ? record.title : id,
     ...(typeof record.brief === "string" && record.brief.trim() ? { brief: record.brief.trim() } : {}),
     agentKind: isAgentKind(record.agentKind) ? record.agentKind : "codex",
-    nodeKind: "agent_task",
+    nodeKind: canonicalExecutable ? "agent_task" : "user_decision",
     executable,
-    runtimePolicy: normalizeRuntimePolicy(record.runtimePolicy, laneKind, executable),
+    runtimePolicy,
     status,
     ...(rollbackStatus ? { rollbackStatus } : {}),
     fileScopes: stringArray(record.fileScopes),
@@ -2463,6 +2503,7 @@ function isBoundedBrowserScreenshotValidationText(value: unknown): boolean {
 function laneKindForLegacyKind(kind: string): WorkflowLaneKind {
   const value = kind.toLowerCase();
   if (isWorkflowLaneKind(value)) return value;
+  if (/decision|user.?gate/.test(value)) return "decision";
   if (/fix|repair/.test(value)) return "fix";
   if (/regression/.test(value)) return "regression";
   if (/validation|test|browser|screenshot|check/.test(value)) return "validation";
@@ -2477,7 +2518,8 @@ function laneKindForLegacyKind(kind: string): WorkflowLaneKind {
 function laneKindForExternalKind(kind: string): WorkflowLaneKind {
   const laneKind = laneKindForLegacyKind(kind);
   // External fix-like lanes are normal implementation; trusted repair lanes come from ReplanFromEvidence.
-  return laneKind === "fix" ? "implementation" : laneKind;
+  // Privileged commit lanes come only from trusted policy packs and explicit backend operations.
+  return laneKind === "fix" || laneKind === "commit" ? "implementation" : laneKind;
 }
 
 function isReservedRepairSemanticKey(value: string): boolean {
@@ -2491,19 +2533,103 @@ function semanticSubtypeForLegacyKind(kind: string, laneKind: WorkflowLaneKind):
 
 function normalizeRuntimePolicy(
   value: unknown,
+  lane: Record<string, unknown>,
   laneKind: WorkflowLaneKind,
+  semanticSubtype: WorkflowLaneSemanticSubtype,
   executable: boolean,
 ): WorkflowRuntimePolicy {
-  const fallback = defaultRuntimePolicyForLane(laneKind, executable);
+  const fallback = defaultRuntimePolicyForLaneSemantics(lane, laneKind, semanticSubtype, executable);
   if (!isRecord(value)) return fallback;
+  const effectiveExecutable = executable && value.executable !== false;
+  if (!effectiveExecutable) return defaultRuntimePolicyForLaneSemantics(lane, laneKind, semanticSubtype, false);
+  const requestedSandbox = isAgentRunSandbox(value.sandbox) ? value.sandbox : fallback.sandbox;
   return {
     source: "workflow_projection",
     trusted: true,
-    executable,
-    sandbox: isAgentRunSandbox(value.sandbox) ? value.sandbox : fallback.sandbox,
+    executable: true,
+    sandbox: tighterSandbox(requestedSandbox, fallback.sandbox),
     sideEffects: normalizeSideEffects(value.sideEffects, fallback.sideEffects),
-    reason: typeof value.reason === "string" && value.reason.trim() ? value.reason : fallback.reason,
+    reason: fallback.reason,
   };
+}
+
+function defaultRuntimePolicyForLaneSemantics(
+  lane: Record<string, unknown>,
+  laneKind: WorkflowLaneKind,
+  semanticSubtype: WorkflowLaneSemanticSubtype,
+  executable: boolean,
+): WorkflowRuntimePolicy {
+  if (!executable) return defaultRuntimePolicyForLane(laneKind, false);
+  const semanticKinds = canonicalRuntimeLaneKinds(lane, laneKind, semanticSubtype);
+  const sandbox = semanticKinds
+    .map(sandboxForRuntimeLaneKind)
+    .reduce(tighterSandbox);
+  const sideEffects = semanticKinds
+    .map(sideEffectsForRuntimeLaneKind)
+    .reduce(intersectSideEffects);
+  const semanticReason = semanticKinds.includes("planner") ? "planner" : laneKind;
+  return {
+    source: "workflow_projection",
+    trusted: true,
+    executable: true,
+    sandbox,
+    sideEffects,
+    reason: `Runtime policy derived from workflow lane kind ${semanticReason}.`,
+  };
+}
+
+type RuntimeLaneKind = WorkflowLaneKind | "planner";
+
+function canonicalRuntimeLaneKinds(
+  lane: Record<string, unknown>,
+  laneKind: WorkflowLaneKind,
+  semanticSubtype: WorkflowLaneSemanticSubtype,
+): RuntimeLaneKind[] {
+  const kinds: RuntimeLaneKind[] = [laneKind];
+  for (const value of [lane.kind, semanticSubtype]) {
+    const semanticKind = runtimeLaneKindForSemantic(value);
+    if (semanticKind && !kinds.includes(semanticKind)) kinds.push(semanticKind);
+  }
+  return kinds;
+}
+
+function runtimeLaneKindForSemantic(value: unknown): RuntimeLaneKind | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  if (/planner|planning/.test(normalized)) return "planner";
+  if (/decision|user.?gate/.test(normalized)) return "decision";
+  if (isWorkflowLaneKind(normalized)) return normalized;
+  if (/fix|repair/.test(normalized)) return "fix";
+  if (/regression/.test(normalized)) return "regression";
+  if (/validation|test|browser|screenshot|check/.test(normalized)) return "validation";
+  if (/review/.test(normalized)) return "review";
+  if (/commit|adopt/.test(normalized)) return "commit";
+  if (/join|integration/.test(normalized)) return "join";
+  if (/design|clarification/.test(normalized)) return "design";
+  if (/discover|profile|understanding|analysis/.test(normalized)) return "discovery";
+  if (/implementation|implement|coding/.test(normalized)) return "implementation";
+  return null;
+}
+
+function isDecisionLaneSemantics(
+  lane: Record<string, unknown>,
+  laneKind: WorkflowLaneKind,
+  semanticSubtype: WorkflowLaneSemanticSubtype,
+): boolean {
+  return laneKind === "decision" ||
+    runtimeLaneKindForSemantic(lane.kind) === "decision" ||
+    runtimeLaneKindForSemantic(semanticSubtype) === "decision" ||
+    lane.nodeKind === "user_decision";
+}
+
+function tighterSandbox(requested: AgentRunSandbox, laneMaximum: AgentRunSandbox): AgentRunSandbox {
+  const privilege: Record<AgentRunSandbox, number> = {
+    "read-only": 0,
+    "workspace-write": 1,
+    "danger-full-access": 2,
+  };
+  return privilege[requested] <= privilege[laneMaximum] ? requested : laneMaximum;
 }
 
 function defaultRuntimePolicyForLane(laneKind: WorkflowLaneKind, executable: boolean): WorkflowRuntimePolicy {
@@ -2534,6 +2660,10 @@ function sandboxForLaneKind(laneKind: WorkflowLaneKind): AgentRunSandbox {
   return "read-only";
 }
 
+function sandboxForRuntimeLaneKind(laneKind: RuntimeLaneKind): AgentRunSandbox {
+  return laneKind === "planner" ? "read-only" : sandboxForLaneKind(laneKind);
+}
+
 function sideEffectsForLaneKind(laneKind: WorkflowLaneKind): WorkflowSideEffectKind[] {
   if (laneKind === "commit") return ["git", "filesystem", "process"];
   if (laneKind === "implementation" || laneKind === "fix") return ["filesystem", "process"];
@@ -2541,9 +2671,22 @@ function sideEffectsForLaneKind(laneKind: WorkflowLaneKind): WorkflowSideEffectK
   return ["process"];
 }
 
+function sideEffectsForRuntimeLaneKind(laneKind: RuntimeLaneKind): WorkflowSideEffectKind[] {
+  return laneKind === "planner" ? ["process"] : sideEffectsForLaneKind(laneKind);
+}
+
+function intersectSideEffects(
+  left: WorkflowSideEffectKind[],
+  right: WorkflowSideEffectKind[],
+): WorkflowSideEffectKind[] {
+  const allowed = new Set(right);
+  return left.filter((effect) => allowed.has(effect));
+}
+
 function normalizeSideEffects(value: unknown, fallback: WorkflowSideEffectKind[]): WorkflowSideEffectKind[] {
+  const allowed = new Set(fallback);
   const values = Array.isArray(value) ? value.filter(isWorkflowSideEffectKind) : fallback;
-  return [...new Set(values)];
+  return [...new Set(values.filter((effect) => allowed.has(effect)))];
 }
 
 function normalizeUserDecisionRequested(
