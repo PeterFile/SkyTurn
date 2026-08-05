@@ -80,6 +80,11 @@ vi.mock("./internal/windowsJobObjectProcess.js", async (importOriginal) => {
 const roots: string[] = [];
 const testDefaultWatchdogTimeoutMs = 250;
 const previousStateHome = process.env.SKYTURN_STATE_HOME;
+const macOsSandboxExecAvailable = process.platform === "darwin" && spawnSync(
+  "/usr/bin/sandbox-exec",
+  ["-p", "(version 1) (allow default)", "/usr/bin/true"],
+  { stdio: "ignore" },
+).status === 0;
 
 beforeEach(async () => {
   process.env.SKYTURN_STATE_HOME = await makeTempRoot();
@@ -2554,8 +2559,6 @@ describe("agent bridge", () => {
       "read-only",
       "-c",
       "approval_policy=never",
-      "-C",
-      await realpath(projectRoot),
       "Implement the task",
     ]);
     expect(events.map((event) => event.seq)).toEqual(events.map((_, index) => index + 1));
@@ -4116,12 +4119,7 @@ describe("agent bridge", () => {
     const codexPath = join(binRoot, "codex");
     await writeFile(
       codexPath,
-      [
-        "#!/usr/bin/env node",
-        "const fs = require('node:fs');",
-        "fs.mkdirSync('.devflow/acceptance', { recursive: true });",
-        "fs.writeFileSync('.devflow/acceptance/replacement.png', 'replacement-bytes');",
-      ].join("\n"),
+      "#!/bin/sh\nexit 0\n",
       { mode: 0o755 },
     );
     let retainedFd = -1;
@@ -4134,6 +4132,11 @@ describe("agent bridge", () => {
               retainedFd = fd;
               await rename(projectRoot, originalRoot);
               await mkdir(join(projectRoot, ".git"), { recursive: true });
+              await mkdir(join(projectRoot, ".devflow/acceptance"), { recursive: true });
+              await writeFile(
+                join(projectRoot, ".devflow/acceptance/replacement.png"),
+                "replacement-bytes",
+              );
             },
           },
         }),
@@ -4298,6 +4301,7 @@ describe("agent bridge", () => {
         const prompt = "Do not expose prompt-secret-123456";
         const input = {
           ...explicitRunInput(projectRoot, `${agentKind}-process-boundary-failure`, agentKind),
+          sandbox: "danger-full-access" as const,
           prompt,
           ...(agentKind === "hermes" ? { hermesSessionHandle: "hermes-resume-secret-123456" } : {}),
         };
@@ -4373,7 +4377,10 @@ describe("agent bridge", () => {
 
         try {
           const run = await bridge.startRun(
-            explicitRunInput(projectRoot, `${agentKind}-cancel-boundary-race`, agentKind),
+            {
+              ...explicitRunInput(projectRoot, `${agentKind}-cancel-boundary-race`, agentKind),
+              sandbox: "danger-full-access",
+            },
           );
           const cancellation = bridge.cancelRun(run.id, "User cancelled first");
           await waitForCondition(
@@ -6406,24 +6413,22 @@ describe("agent bridge", () => {
     ]);
   });
 
-  it("runs Codex from the canonical workdir so sandboxed git writes can reach .git", async () => {
+  it("rejects a final symlink instead of reopening a Codex worktree through its pathname", async () => {
+    if (process.platform === "win32") return;
     const root = await makeTempRoot();
     const projectRoot = join(root, "project");
     const projectLink = join(root, "project-link");
     await mkdir(join(projectRoot, ".git"), { recursive: true });
     await symlink(projectRoot, projectLink);
     const binRoot = await makeTempRoot();
-    const argsPath = join(binRoot, "args.json");
+    const startedPath = join(binRoot, "started");
     const codexPath = join(binRoot, "codex");
     await writeFile(
       codexPath,
       [
         "#!/usr/bin/env node",
         "const fs = require('node:fs');",
-        "fs.writeFileSync(process.env.SKYTURN_CODEX_ARGS_PATH, JSON.stringify({",
-        "  argv: process.argv.slice(2),",
-        "  cwd: process.cwd(),",
-        "}));",
+        "fs.writeFileSync(process.env.SKYTURN_STARTED_PATH, 'started');",
         "process.stdout.write('{\"type\":\"turn.completed\"}\\n');",
       ].join("\n"),
       { mode: 0o755 },
@@ -6432,14 +6437,14 @@ describe("agent bridge", () => {
       adapters: [
         createCodexCliAdapter({
           executablePath: codexPath,
-          env: { SKYTURN_CODEX_ARGS_PATH: argsPath },
+          env: { SKYTURN_STARTED_PATH: startedPath },
           sandbox: "workspace-write",
         }),
       ],
     });
-    const completed = waitForEvent(
+    const terminal = waitForEvent(
       bridge,
-      (event) => event.kind === "status" && event.payload.status === "succeeded",
+      (event) => event.kind === "status" && ["succeeded", "failed"].includes(String(event.payload.status)),
     );
 
     await bridge.startRun({
@@ -6451,14 +6456,273 @@ describe("agent bridge", () => {
       agentKind: "codex",
       prompt: "Commit the task",
     });
+    const event = await terminal;
+
+    expect(event.payload.status).toBe("failed");
+    await expect(stat(startedPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["codex", "hermes"] as const)(
+    "executes %s in the directory retained before its pathname is replaced",
+    async (agentKind) => {
+      if (process.platform === "win32") return;
+      const projectRoot = await makeTempRoot();
+      const worktreePath = join(projectRoot, "worktree");
+      const retainedPath = join(projectRoot, "retained-worktree");
+      await mkdir(worktreePath);
+      if (agentKind === "codex") await mkdir(join(worktreePath, ".git"));
+      const binRoot = await makeTempRoot();
+      const executablePath = join(binRoot, agentKind);
+      await writeFile(
+        executablePath,
+        [
+          "#!/usr/bin/env node",
+          "const fs = require('node:fs');",
+          "fs.writeFileSync('fd-anchored.txt', 'original');",
+          agentKind === "codex"
+            ? "process.stdout.write('{\"type\":\"turn.completed\"}\\n');"
+            : "process.stdout.write('{\"toolCalls\":[]}\\n');",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      let replaced = false;
+      const adapter = agentKind === "codex"
+        ? createCodexCliAdapter({
+            executablePath,
+            artifactVerificationHooks: {
+              async afterWorktreeOpen() {
+                await rename(worktreePath, retainedPath);
+                await mkdir(join(worktreePath, ".git"), { recursive: true });
+                replaced = true;
+              },
+            },
+          })
+        : createHermesCliAdapter({
+            executablePath,
+            artifactVerificationHooks: {
+              async afterWorktreeOpen() {
+                await rename(worktreePath, retainedPath);
+                await mkdir(worktreePath);
+                replaced = true;
+              },
+            },
+          });
+      const bridge = new AgentBridge({ adapters: [adapter] });
+      const succeeded = waitForEvent(
+        bridge,
+        (event) => event.kind === "status" && event.payload.status === "succeeded",
+      );
+
+      await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: `node-${agentKind}-fd-anchor`,
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath,
+        agentKind,
+        prompt: "Use the retained worktree",
+      });
+      await succeeded;
+
+      expect(replaced).toBe(true);
+      await expect(readFile(join(retainedPath, "fd-anchored.txt"), "utf8")).resolves.toBe("original");
+      await expect(stat(join(worktreePath, "fd-anchored.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it.each(["codex", "hermes"] as const)(
+    "fails a restricted %s start before spawning a pathname-only Windows child",
+    async (agentKind) => {
+      const projectRoot = await makeTempRoot();
+      await mkdir(join(projectRoot, ".git"));
+      let spawnAttempts = 0;
+      windowsJobObjectProcessMock.spawn = vi.fn(async () => {
+        spawnAttempts += 1;
+        throw new Error("pathname-only child must not spawn");
+      });
+      const adapter = agentKind === "codex"
+        ? createCodexCliAdapter({ executablePath: "/bin/sh" })
+        : createHermesCliAdapter({ executablePath: "/bin/sh" });
+      const events: RunEventDraft[] = [];
+
+      await withProcessPlatform("win32", async () => {
+        await adapter.startRun({
+          protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+          runId: `run-${agentKind}-unsupported-platform`,
+          nodeId: `node-${agentKind}-unsupported-platform`,
+          sessionId: "session-1",
+          projectRoot,
+          worktreePath: projectRoot,
+          agentKind,
+          sandbox: "read-only",
+          prompt: "Do not spawn",
+        }, {
+          async emit(event) {
+            events.push(event);
+          },
+        });
+      });
+
+      expect(spawnAttempts).toBe(0);
+      expect(events).toContainEqual(expect.objectContaining({
+        kind: "status",
+        payload: expect.objectContaining({ status: "failed", reason: "sandbox-unavailable" }),
+      }));
+    },
+  );
+
+  it.each(["read-only", "workspace-write"] as const)(
+    "fails closed when macOS cannot apply the Hermes %s sandbox",
+    async (sandbox) => {
+      if (process.platform !== "darwin" || macOsSandboxExecAvailable) return;
+      const projectRoot = await makeTempRoot();
+      const startedPath = join(projectRoot, "hermes-started");
+      const binRoot = await makeTempRoot();
+      const hermesPath = join(binRoot, "hermes");
+      await writeFile(
+        hermesPath,
+        [
+          "#!/usr/bin/env node",
+          "const fs = require('node:fs');",
+          "fs.writeFileSync(process.env.SKYTURN_STARTED_PATH, 'started');",
+          "process.stdout.write('{\"toolCalls\":[]}\\n');",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      const bridge = new AgentBridge({
+        adapters: [createHermesCliAdapter({
+          executablePath: hermesPath,
+          env: { SKYTURN_STARTED_PATH: startedPath },
+        })],
+      });
+      const events: RunEvent[] = [];
+      const unsubscribe = bridge.onRunEvent((event) => events.push(event));
+      const terminal = waitForEvent(
+        bridge,
+        (event) => event.kind === "status" && ["succeeded", "failed"].includes(String(event.payload.status)),
+      );
+
+      await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: `node-hermes-${sandbox}-unavailable`,
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "hermes",
+        sandbox,
+        prompt: "Fail closed",
+      });
+      const event = await terminal;
+      unsubscribe();
+
+      expect(event.payload).toMatchObject({ status: "failed", reason: "sandbox-unavailable" });
+      await expect(stat(startedPath)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(JSON.stringify(events)).not.toContain(projectRoot);
+    },
+  );
+
+  it.runIf(macOsSandboxExecAvailable)("denies all Hermes filesystem writes in macOS read-only mode", async () => {
+    const projectRoot = await makeTempRoot();
+    const outsideRoot = await makeTempRoot();
+    const outsidePath = join(outsideRoot, "outside.txt");
+    const binRoot = await makeTempRoot();
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "try { fs.writeFileSync('inside.txt', 'inside'); } catch {}",
+        "try { fs.writeFileSync(process.env.SKYTURN_OUTSIDE_PATH, 'outside'); } catch {}",
+        "process.stdout.write('{\"toolCalls\":[]}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [createHermesCliAdapter({
+        executablePath: hermesPath,
+        env: { SKYTURN_OUTSIDE_PATH: outsidePath },
+      })],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes-read-only-sandbox",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "hermes",
+      sandbox: "read-only",
+      prompt: "Attempt writes",
+    });
     await completed;
 
-    const args = JSON.parse(await readFile(argsPath, "utf8")) as { argv: string[]; cwd: string };
-    const canonicalRoot = await realpath(projectRoot);
+    await expect(stat(join(projectRoot, "inside.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(outsidePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
 
-    expect(args.cwd).toBe(canonicalRoot);
-    expect(args.argv).toContain(canonicalRoot);
-    expect(args.argv).not.toContain(projectLink);
+  it("fails Hermes workspace-write before a replacement pathname can be authorized or executed", async () => {
+    const projectRoot = await makeTempRoot();
+    const worktreePath = join(projectRoot, "worktree");
+    const retainedPath = join(projectRoot, "retained-worktree");
+    const startedPath = join(worktreePath, "hermes-started");
+    const replacementWritePath = join(worktreePath, "replacement-write.txt");
+    await mkdir(worktreePath);
+    const binRoot = await makeTempRoot();
+    const hermesPath = join(binRoot, "hermes");
+    await writeFile(
+      hermesPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.SKYTURN_STARTED_PATH, 'started');",
+        "fs.writeFileSync(process.env.SKYTURN_REPLACEMENT_WRITE_PATH, 'replacement');",
+        "process.stdout.write('{\"toolCalls\":[]}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    let replacementAttempted = false;
+    const bridge = new AgentBridge({
+      adapters: [createHermesCliAdapter({
+        executablePath: hermesPath,
+        env: {
+          SKYTURN_REPLACEMENT_WRITE_PATH: replacementWritePath,
+          SKYTURN_STARTED_PATH: startedPath,
+        },
+        artifactVerificationHooks: {
+          async afterWorktreeOpen() {
+            await rename(worktreePath, retainedPath);
+            await mkdir(worktreePath);
+            replacementAttempted = true;
+          },
+        },
+      })],
+    });
+    const terminal = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && ["succeeded", "failed"].includes(String(event.payload.status)),
+    );
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-hermes-workspace-write-unavailable",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath,
+      agentKind: "hermes",
+      sandbox: "workspace-write",
+      prompt: "Do not spawn",
+    });
+    const event = await terminal;
+
+    expect(event.payload).toMatchObject({ status: "failed", reason: "sandbox-unavailable" });
+    expect(replacementAttempted).toBe(false);
+    await expect(stat(startedPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(replacementWritePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("lets a single Codex run override the adapter sandbox", async () => {
@@ -7397,7 +7661,8 @@ describe("agent bridge", () => {
     });
   });
 
-  it("runs Hermes from the canonical worktree path when provided", async () => {
+  it("rejects a final symlink instead of reopening a Hermes worktree through its pathname", async () => {
+    if (process.platform === "win32") return;
     const root = await makeTempRoot();
     const projectRoot = join(root, "project");
     const worktreeRoot = join(root, "managed-worktree");
@@ -7406,17 +7671,14 @@ describe("agent bridge", () => {
     await mkdir(worktreeRoot);
     await symlink(worktreeRoot, worktreeLink);
     const binRoot = await makeTempRoot();
-    const argsPath = join(binRoot, "args.json");
+    const startedPath = join(binRoot, "started");
     const hermesPath = join(binRoot, "hermes");
     await writeFile(
       hermesPath,
       [
         "#!/usr/bin/env node",
         "const fs = require('node:fs');",
-        "fs.writeFileSync(process.env.SKYTURN_HERMES_ARGS_PATH, JSON.stringify({",
-        "  argv: process.argv.slice(2),",
-        "  cwd: process.cwd(),",
-        "}));",
+        "fs.writeFileSync(process.env.SKYTURN_STARTED_PATH, 'started');",
         "process.stdout.write('{\"toolCalls\":[]}\\n');",
       ].join("\n"),
       { mode: 0o755 },
@@ -7425,13 +7687,13 @@ describe("agent bridge", () => {
       adapters: [
         createHermesCliAdapter({
           executablePath: hermesPath,
-          env: { SKYTURN_HERMES_ARGS_PATH: argsPath },
+          env: { SKYTURN_STARTED_PATH: startedPath },
         }),
       ],
     });
-    const completed = waitForEvent(
+    const terminal = waitForEvent(
       bridge,
-      (event) => event.kind === "status" && event.payload.status === "succeeded",
+      (event) => event.kind === "status" && ["succeeded", "failed"].includes(String(event.payload.status)),
     );
 
     await bridge.startRun({
@@ -7443,13 +7705,10 @@ describe("agent bridge", () => {
       agentKind: "hermes",
       prompt: "Implement in the managed worktree",
     });
-    await completed;
+    const event = await terminal;
 
-    const args = JSON.parse(await readFile(argsPath, "utf8")) as { argv: string[]; cwd: string };
-    const canonicalWorktree = await realpath(worktreeRoot);
-
-    expect(args.cwd).toBe(canonicalWorktree);
-    expect(args.cwd).not.toBe(await realpath(projectRoot));
+    expect(event.payload.status).toBe("failed");
+    await expect(stat(startedPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("classifies Hermes non-zero exits with terminal evidence", async () => {

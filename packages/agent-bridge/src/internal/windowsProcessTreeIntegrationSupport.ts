@@ -15,6 +15,7 @@ interface WindowsFixtureInvocationInput {
   canonicalWorkdir: string;
   prompt: string;
   resumeHandle: string;
+  sandbox?: "read-only" | "workspace-write" | "danger-full-access";
 }
 
 interface WindowsFixtureInvocation {
@@ -53,15 +54,13 @@ export function buildWindowsFixtureInvocation(
         "--color",
         "never",
         "--sandbox",
-        "read-only",
+        input.sandbox ?? "read-only",
         "-c",
         "approval_policy=never",
         input.argumentMarker,
-        "-C",
-        input.canonicalWorkdir,
         input.prompt,
       ],
-      pathArgumentIndexes: [10],
+      pathArgumentIndexes: [],
     };
   }
   return {
