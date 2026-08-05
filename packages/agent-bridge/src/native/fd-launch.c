@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -24,7 +25,13 @@ int main(int argc, char *argv[]) {
     return fail("invalid status descriptor", 65);
   }
 
-  if (argc < 2 || argv[1] == NULL || argv[1][0] != '/') {
+  int executable_index = 1;
+  int require_git_metadata = 0;
+  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "--require-git") == 0) {
+    require_git_metadata = 1;
+    executable_index = 2;
+  }
+  if (argc <= executable_index || argv[executable_index] == NULL || argv[executable_index][0] != '/') {
     return fail("invalid launcher", 64);
   }
 
@@ -38,6 +45,16 @@ int main(int argc, char *argv[]) {
     return fail("worktree descriptor is not a directory", 65);
   }
 
+  if (require_git_metadata) {
+    struct stat git_metadata;
+    if (
+      fstatat(SKYTURN_WORKTREE_FD, ".git", &git_metadata, AT_SYMLINK_NOFOLLOW) != 0 ||
+      (!S_ISDIR(git_metadata.st_mode) && !S_ISREG(git_metadata.st_mode))
+    ) {
+      return fail("worktree descriptor has no git metadata", 66);
+    }
+  }
+
   if (fchdir(SKYTURN_WORKTREE_FD) != 0) {
     return fail("cannot enter worktree descriptor", 66);
   }
@@ -46,6 +63,6 @@ int main(int argc, char *argv[]) {
     return fail("cannot protect worktree descriptor", 66);
   }
 
-  execv(argv[1], &argv[1]);
+  execv(argv[executable_index], &argv[executable_index]);
   return fail("cannot execute launcher", errno == ENOENT ? 127 : 126);
 }

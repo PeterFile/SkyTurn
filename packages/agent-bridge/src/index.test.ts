@@ -6530,6 +6530,61 @@ describe("agent bridge", () => {
     },
   );
 
+  it("rejects Codex when the retained directory loses git metadata before pathname replacement", async () => {
+    if (process.platform === "win32") return;
+    const projectRoot = await makeTempRoot();
+    const worktreePath = join(projectRoot, "worktree");
+    const retainedPath = join(projectRoot, "retained-worktree");
+    await mkdir(join(worktreePath, ".git"), { recursive: true });
+    const binRoot = await makeTempRoot();
+    const startedPath = join(binRoot, "started");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(
+      codexPath,
+      [
+        "#!/usr/bin/env node",
+        "const fs = require('node:fs');",
+        "fs.writeFileSync(process.env.SKYTURN_STARTED_PATH, 'started');",
+        "process.stdout.write('{\"type\":\"turn.completed\"}\\n');",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          env: { SKYTURN_STARTED_PATH: startedPath },
+          artifactVerificationHooks: {
+            async afterWorktreeOpen() {
+              await rename(worktreePath, retainedPath);
+              await rm(join(retainedPath, ".git"), { recursive: true });
+              await mkdir(join(worktreePath, ".git"), { recursive: true });
+            },
+          },
+        }),
+      ],
+    });
+    const failed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "failed",
+    );
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-missing-retained-git",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath,
+      agentKind: "codex",
+      prompt: "Do not execute outside the retained repository",
+    });
+    await failed;
+
+    await expect(stat(startedPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(retainedPath, ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(join(worktreePath, ".git"))).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+  });
+
   it.each(["codex", "hermes"] as const)(
     "fails a restricted %s start before spawning a pathname-only Windows child",
     async (agentKind) => {

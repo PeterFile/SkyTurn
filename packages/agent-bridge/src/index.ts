@@ -2272,7 +2272,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         });
         return closeRunResourcesPromise;
       };
-      if (!(await hasGitMetadata(workdir))) {
+      if (retainedWorktree === null && !(await hasGitMetadata(workdir))) {
         await closeRunResources();
         return failRunPreflight(sink, "codex", "Codex CLI", "invalid-cwd", "Codex CLI requires a git repository.");
       }

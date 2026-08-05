@@ -57,12 +57,15 @@ export function spawnFdAnchoredCli(input: SpawnFdAnchoredCliInput): FdAnchoredCl
     throw new Error("Hermes workspace-write sandbox is unavailable.");
   }
   const helperPath = fdLaunchHelperPath();
-  const helperArgs = [helperPath, input.executablePath, ...input.args];
+  const anchoredArgs = input.agentKind === "codex"
+    ? ["--require-git", input.executablePath, ...input.args]
+    : [input.executablePath, ...input.args];
+  const helperArgs = [helperPath, ...anchoredArgs];
   const sandboxedHermes = input.agentKind === "hermes" && input.sandbox !== "danger-full-access";
   const executablePath = sandboxedHermes ? sandboxExecutablePath : helperPath;
   const args = sandboxedHermes
     ? macOsReadOnlySandboxArgs(helperArgs)
-    : [input.executablePath, ...input.args];
+    : anchoredArgs;
   const child = spawn(executablePath, args, {
     env: input.env,
     detached: true,
