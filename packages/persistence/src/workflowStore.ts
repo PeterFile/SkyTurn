@@ -1404,9 +1404,8 @@ export class WorkflowStore {
       if (!lane) break;
       excludedLaneIds.add(lane.id);
 
-      const authorized = authorizedLaneIds
-        ? authorizedLaneIds.has(lane.id)
-        : lane.runtimePolicy.sandbox !== "danger-full-access";
+      const authorized = lane.runtimePolicy.sandbox !== "danger-full-access" ||
+        authorizedLaneIds?.has(lane.id) === true;
       if (!authorized) continue;
       const isWriter = this.isTrustedCurrentBranchWriter(lane);
       if (isWriter && writerSelected) continue;

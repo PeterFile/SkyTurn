@@ -6151,6 +6151,7 @@ describe("SQLite workflow store", () => {
 
     const scheduled = store.scheduleReadyLanes("session-observer-contender", {
       allowedParallelism: 2,
+      authorizedLaneIds: ["lane-writer"],
       now: "2026-07-28T01:01:20.000Z",
     });
     expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual([

@@ -3033,10 +3033,6 @@ async function advanceOneWorkflowSession(
     if (remainingProjectCapacity === 0) return;
     const runtime = await import("@skyturn/ui-canvas/workflow-runtime");
     const authoritativeSession = canvasSession as unknown as CanvasSession;
-    if (
-      hasRunningSharedWorkflowWriter(store, runtime.sandboxForNodeRun) &&
-      hasReadySharedWorkflowWriter(authoritativeSession, runtime.sandboxForNodeRun)
-    ) return;
     const policy = runtime.workflowSchedulingPolicyForSession(authoritativeSession);
     const allowedParallelism = Math.min(policy.allowedParallelism, remainingProjectCapacity);
     if (allowedParallelism === 0) return;
@@ -3075,10 +3071,8 @@ async function advanceOneWorkflowSession(
       if (authorization === "authorized") authorizedLaneIds.push(lane.id);
       if (authorization === "requested") requestedAuthorization = true;
     }
-    if (authorizedLaneIds.length === 0) {
+    if (authorizedLaneIds.length === 0 && requestedAuthorization) {
       broadcastWorkflowProjection(projectRoot, sessionId, store, cause);
-      if (requestedAuthorization) continue;
-      return;
     }
     const scheduled = store.scheduleReadyLanes(sessionId, {
       allowedParallelism,
@@ -3276,42 +3270,6 @@ async function compensateScheduledWorkflowStartBuildFailure(
       reopened.close();
     }
   }
-}
-
-function hasRunningSharedWorkflowWriter(
-  store: WorkflowStoreHost,
-  sandboxForNodeRun: (node: CanvasSession["nodes"][number]) => string | undefined,
-): boolean {
-  return store.listRunningSegments().some((segment) => {
-    const session = store.materializeCanvasSession(segment.sessionId);
-    if (!isRecord(session) || session.kind !== "canvas") return false;
-    const canvasSession = session as unknown as CanvasSession;
-    const node = canvasSession.nodes.find((candidate) => candidate.id === segment.laneId);
-    return node ? isSharedWorkflowWriter(canvasSession, node, sandboxForNodeRun) : false;
-  });
-}
-
-function hasReadySharedWorkflowWriter(
-  session: CanvasSession,
-  sandboxForNodeRun: (node: CanvasSession["nodes"][number]) => string | undefined,
-): boolean {
-  const nodesById = new Map(session.nodes.map((node) => [node.id, node]));
-  return session.nodes.some((node) =>
-    node.status === "pending" &&
-    node.context.dependencies.every((dependencyId) => nodesById.get(dependencyId)?.status === "completed") &&
-    isSharedWorkflowWriter(session, node, sandboxForNodeRun)
-  );
-}
-
-function isSharedWorkflowWriter(
-  session: CanvasSession,
-  node: CanvasSession["nodes"][number],
-  sandboxForNodeRun: (node: CanvasSession["nodes"][number]) => string | undefined,
-): boolean {
-  const executionTarget = node.worktree.executionTarget ?? session.target.executionTarget;
-  const sandbox = sandboxForNodeRun(node);
-  return executionTarget === "current_branch" &&
-    (sandbox === "workspace-write" || sandbox === "danger-full-access");
 }
 
 async function buildScheduledWorkflowRunStartInput(
