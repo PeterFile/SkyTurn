@@ -410,6 +410,16 @@ export interface ScheduleReadyWorkflowLanesResult {
   projection: FlowProjection;
 }
 
+interface RunningWorkflowScopes {
+  fileScopes: string[];
+  packageScopes: string[];
+}
+
+interface CurrentBranchSchedulingBarrier {
+  writerUnavailable: boolean;
+  runningScopes: RunningWorkflowScopes[];
+}
+
 export interface WorkflowLaneReassignmentInput {
   requestId: string;
   sessionId: string;
@@ -780,6 +790,7 @@ interface WorkflowStoreStatements {
   getSegmentById: Database.Statement;
   getSegmentByRunId: Database.Statement;
   listSegments: Database.Statement;
+  listRunningSegments: Database.Statement;
   getRunningPlannerSegmentForLane: Database.Statement;
   listRunningPlannerSegments: Database.Statement;
   listPendingPlannerIntentReconciliations: Database.Statement;
@@ -1250,18 +1261,41 @@ export class WorkflowStore {
     const owned: ScheduledWorkflowLane[] = [];
     const tx = this.db.transaction(() => {
       const session = this.requireKnownSession(sessionId);
-      const preview = this.previewReadyLanes(sessionId, input);
-      let projection = preview.projection;
+      let projection: FlowProjection;
+      let scheduled: ScheduledWorkflowLane[];
+      let sharedWriterUnavailable = false;
+      if (session.target.executionTarget === "current_branch") {
+        projection = this.materializeFlowProjection(sessionId);
+        const barrier = this.currentBranchSchedulingBarrier();
+        sharedWriterUnavailable = barrier.writerUnavailable;
+        scheduled = this.selectCurrentBranchReadyLanes(
+          sessionId,
+          projection,
+          input.allowedParallelism ?? 1,
+          authorizedLaneIds,
+          sharedWriterUnavailable,
+          barrier.runningScopes,
+        );
+      } else {
+        const preview = this.previewReadyLanes(sessionId, input);
+        projection = preview.projection;
+        scheduled = preview.readyLanes;
+      }
       this.faultInjection?.afterSchedulePreview?.(projection);
-      const scheduled = preview.readyLanes.filter((lane) => authorizedLaneIds
-        ? authorizedLaneIds.has(lane.id)
-        : lane.runtimePolicy.sandbox !== "danger-full-access");
+      if (session.target.executionTarget !== "current_branch") {
+        scheduled = scheduled.filter((lane) => authorizedLaneIds
+          ? authorizedLaneIds.has(lane.id)
+          : lane.runtimePolicy.sandbox !== "danger-full-access");
+      }
       const occupiedCandidates = runningCandidateIdentityKeys(projection);
 
       for (const lane of scheduled) {
         if (session.target.executionTarget === "current_branch") {
+          const isWriter = this.isTrustedCurrentBranchWriter(lane);
+          if (isWriter && sharedWriterUnavailable) continue;
           if (this.startScheduledLaneInTransaction(sessionId, lane, input.now)) {
             owned.push(lane);
+            if (isWriter) sharedWriterUnavailable = true;
             projection = this.materializeFlowProjection(sessionId);
           }
           continue;
@@ -1338,6 +1372,140 @@ export class WorkflowStore {
       segmentId: segmentIdForLane(sessionId, lane.id),
     }));
     return { readyLanes: scheduled, projection };
+  }
+
+  private selectCurrentBranchReadyLanes(
+    sessionId: string,
+    projection: FlowProjection,
+    allowedParallelism: number,
+    authorizedLaneIds: Set<string> | null,
+    sharedWriterUnavailable: boolean,
+    sharedRunningScopes: RunningWorkflowScopes[],
+  ): ScheduledWorkflowLane[] {
+    const selected: FlowLane[] = [];
+    const excludedLaneIds = new Set<string>();
+    const occupied = [...sharedRunningScopes];
+    let writerSelected = sharedWriterUnavailable;
+
+    while (true) {
+      if (selected.length >= allowedParallelism) break;
+      const schedulingProjection = excludedLaneIds.size === 0
+        ? projection
+        : {
+            ...projection,
+            lanes: projection.lanes.map((lane) => excludedLaneIds.has(lane.id)
+              ? { ...lane, executable: false }
+              : lane),
+          };
+      const lane = scheduleFlowReadyLanes(schedulingProjection, {
+        allowedParallelism: 1,
+        runningScopes: occupied,
+      })[0];
+      if (!lane) break;
+      excludedLaneIds.add(lane.id);
+
+      const authorized = lane.runtimePolicy.sandbox !== "danger-full-access" ||
+        authorizedLaneIds?.has(lane.id) === true;
+      if (!authorized) continue;
+      const isWriter = this.isTrustedCurrentBranchWriter(lane);
+      if (isWriter && writerSelected) continue;
+
+      selected.push(lane);
+      occupied.push({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes });
+      if (isWriter) writerSelected = true;
+    }
+
+    return selected.map((lane) => ({
+      ...lane,
+      runId: runIdForLane(sessionId, lane.id),
+      segmentId: segmentIdForLane(sessionId, lane.id),
+    }));
+  }
+
+  private currentBranchSchedulingBarrier(): CurrentBranchSchedulingBarrier {
+    const sessions = this.statements.listWorkflowSessionIds.all() as Array<{ id: string }>;
+    const storedSegments = this.statements.listRunningSegments.all() as SegmentRow[];
+    const runningScopes: RunningWorkflowScopes[] = [];
+    const resolvedRunningLanes = new Set<string>();
+    const runningSegmentFingerprints = new Map<string, string>();
+    let writerUnavailable = false;
+    for (const { id: sessionId } of sessions) {
+      const session = this.requireKnownSession(sessionId);
+      if (session.target.executionTarget !== "current_branch") continue;
+      const projection = this.materializeFlowProjection(sessionId);
+      const collectRunningLane = (laneId: string): void => {
+        const identity = `${sessionId}\u0000${laneId}`;
+        if (resolvedRunningLanes.has(identity)) return;
+        resolvedRunningLanes.add(identity);
+
+        const lanes = projection.lanes.filter((lane: FlowLane) => lane.id === laneId);
+        if (lanes.length !== 1) {
+          writerUnavailable = true;
+          return;
+        }
+        const lane = lanes[0]!;
+        runningScopes.push({ fileScopes: lane.fileScopes, packageScopes: lane.packageScopes });
+        if (this.runningSegmentBlocksCurrentBranchWriter(projection, laneId)) {
+          writerUnavailable = true;
+        }
+      };
+      const collectRunningSegment = (
+        segmentId: string,
+        laneId: string,
+        runId: string,
+        agentKind: AgentKind | null,
+      ): void => {
+        const identity = `${sessionId}\u0000${segmentId}`;
+        const fingerprint = stableJson({ laneId, runId, agentKind });
+        const resolvedFingerprint = runningSegmentFingerprints.get(identity);
+        if (resolvedFingerprint !== undefined && resolvedFingerprint !== fingerprint) {
+          writerUnavailable = true;
+        } else {
+          runningSegmentFingerprints.set(identity, fingerprint);
+        }
+        collectRunningLane(laneId);
+      };
+      for (const segment of storedSegments) {
+        if (segment.session_id === sessionId) {
+          collectRunningSegment(segment.id, segment.lane_id, segment.run_id, segment.agent_kind);
+        }
+      }
+      for (const segment of projection.segments) {
+        if (segment.status !== "running") continue;
+        const lanes = projection.lanes.filter((lane: FlowLane) => lane.id === segment.laneId);
+        collectRunningSegment(
+          segment.id,
+          segment.laneId,
+          segment.runId,
+          lanes.length === 1 ? lanes[0]!.agentKind : null,
+        );
+      }
+    }
+    return { writerUnavailable, runningScopes };
+  }
+
+  private isTrustedCurrentBranchWriter(lane: FlowLane): boolean {
+    const policy = lane.runtimePolicy;
+    return policy.source === "workflow_projection" &&
+      policy.trusted === true &&
+      policy.executable === lane.executable &&
+      (policy.sandbox === "workspace-write" || policy.sandbox === "danger-full-access");
+  }
+
+  private runningSegmentBlocksCurrentBranchWriter(projection: FlowProjection, laneId: string): boolean {
+    const lanes = projection.lanes.filter((lane) => lane.id === laneId);
+    if (lanes.length !== 1) return true;
+    const lane = lanes[0]!;
+    const policy = lane.runtimePolicy;
+    if (
+      policy.source !== "workflow_projection" ||
+      policy.trusted !== true ||
+      policy.executable !== lane.executable
+    ) {
+      return true;
+    }
+    if (policy.sandbox === "workspace-write" || policy.sandbox === "danger-full-access") return true;
+    return policy.sandbox !== "read-only";
   }
 
   private persistCandidateEventInTransaction(
@@ -5152,6 +5320,9 @@ function prepareStatements(db: Database.Database): WorkflowStoreStatements {
     getSegmentById: db.prepare("SELECT * FROM workflow_segments WHERE id = ?"),
     getSegmentByRunId: db.prepare("SELECT * FROM workflow_segments WHERE run_id = ?"),
     listSegments: db.prepare("SELECT * FROM workflow_segments WHERE session_id = ? AND lane_id = ? ORDER BY started_at, id"),
+    listRunningSegments: db.prepare(
+      "SELECT * FROM workflow_segments WHERE status = 'running' ORDER BY started_at, id",
+    ),
     getRunningPlannerSegmentForLane: db.prepare(
       [
         "SELECT workflow_segments.* FROM workflow_segments",

@@ -875,6 +875,20 @@ test("scheduler compensates the exact durable segment when scheduled worktree re
   assert.equal(result.reopenCalls, 0);
 });
 
+test("desktop scheduler backfills a read-only observer when another session owns the current-branch writer", async () => {
+  const result = await runBlockedWriterObserverBackfill();
+
+  assert.deepEqual(toPlain(result.previewCalls), [
+    { allowedParallelism: 1 },
+    { allowedParallelism: 1 },
+  ]);
+  assert.deepEqual(toPlain(result.scheduleCalls), [{
+    allowedParallelism: 1,
+    authorizedLaneIds: ["lane-writer"],
+  }]);
+  assert.deepEqual(result.startedLaneIds, ["lane-observer"]);
+});
+
 test("MVP demo links the temporary React app to desktop package dependencies", async () => {
   const demo = await readFile(join(root, "scripts", "mvpWorkflowDemo.mjs"), "utf8");
   assert.match(demo, /const desktopRoot = dirname\(dirname\(fileURLToPath\(import\.meta\.url\)\)\)/);
@@ -3566,6 +3580,138 @@ async function runScheduledResolverFailure(segment) {
     adapterLaunches,
     reopenCalls,
   };
+}
+
+async function runBlockedWriterObserverBackfill() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    extractFunction(main, "advanceOneWorkflowSession"),
+    "module.exports = { advanceOneWorkflowSession };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  const writer = {
+    id: "lane-writer",
+    runId: "run-writer",
+    agent: "codex",
+    status: "pending",
+    title: "Implementation",
+    context: { dependencies: [] },
+    worktree: { executionTarget: "current_branch" },
+  };
+  const observer = {
+    id: "lane-observer",
+    runId: "run-observer",
+    agent: "codex",
+    status: "pending",
+    title: "Validation",
+    context: { dependencies: [] },
+    worktree: { executionTarget: "current_branch" },
+  };
+  const session = {
+    id: "session-contender",
+    kind: "canvas",
+    plannerNodeId: "planner-root",
+    target: { executionTarget: "current_branch" },
+    nodes: [writer, observer],
+  };
+  const externalWriter = {
+    sessionId: "session-owner",
+    laneId: "lane-owner",
+    segmentId: "segment-owner",
+    runId: "run-owner",
+    agentKind: "codex",
+  };
+  const observerSegment = {
+    sessionId: session.id,
+    laneId: observer.id,
+    segmentId: "segment-observer",
+    runId: observer.runId,
+    agentKind: observer.agent,
+  };
+  let runningSegments = [externalWriter];
+  let scheduled = false;
+  const previewCalls = [];
+  const scheduleCalls = [];
+  const startedLaneIds = [];
+  const store = {
+    materializeCanvasSession() {
+      return session;
+    },
+    listRunningSegments() {
+      return runningSegments;
+    },
+    previewReadyLanes(_sessionId, input) {
+      previewCalls.push(structuredClone(input));
+      return scheduled
+        ? { readyLanes: [] }
+        : {
+            readyLanes: [{
+              id: writer.id,
+              segmentId: "segment-writer",
+              runId: writer.runId,
+            }],
+          };
+    },
+    scheduleReadyLanes(_sessionId, input) {
+      scheduleCalls.push({
+        allowedParallelism: input.allowedParallelism,
+        authorizedLaneIds: [...input.authorizedLaneIds],
+      });
+      if (scheduled) return { readyLanes: [] };
+      scheduled = true;
+      observer.status = "running";
+      runningSegments = [externalWriter, observerSegment];
+      return {
+        readyLanes: [{
+          id: observer.id,
+          segmentId: observerSegment.segmentId,
+          runId: observer.runId,
+        }],
+      };
+    },
+  };
+  vm.runInNewContext(output, {
+    module,
+    exports: module.exports,
+    Date,
+    Error,
+    MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT: 4,
+    isRecord: (value) => value !== null && typeof value === "object" && !Array.isArray(value),
+    hasRunningSharedWorkflowWriter: () => true,
+    hasReadySharedWorkflowWriter: () => true,
+    buildScheduledWorkflowRunStartInput: async (_projectRoot, _store, segment) => ({
+      runId: segment.runId,
+    }),
+    trustedRunStartIdentity: async () => ({}),
+    compensateScheduledWorkflowStartBuildFailure: async () => {
+      throw new Error("Unexpected start-input compensation.");
+    },
+    scheduledWorkflowRunStartHandler: async (_input, context) => {
+      startedLaneIds.push(context.segment.laneId);
+      observer.status = "completed";
+      runningSegments = [externalWriter];
+    },
+    ensureDangerousRunAuthorization: () => "blocked",
+    broadcastWorkflowProjection() {},
+    require(specifier) {
+      if (specifier === "@skyturn/ui-canvas/workflow-runtime") {
+        return {
+          sandboxForNodeRun: (node) => node.id === writer.id ? "workspace-write" : "read-only",
+          workflowSchedulingPolicyForSession: () => ({ allowedParallelism: 1 }),
+        };
+      }
+      return require(specifier);
+    },
+  }, { filename: "main.blockedWriterObserverBackfill.ts" });
+  await module.exports.advanceOneWorkflowSession("/canonical/project", store, session.id, "projection-query");
+  return { previewCalls, scheduleCalls, startedLaneIds };
 }
 
 function scheduledWorktreeSession() {

@@ -1478,17 +1478,27 @@ describe("SQLite workflow store", () => {
     expect(unauthorized.readyLanes.map((lane) => lane.id)).toEqual(["lane-implementation"]);
     expect(store.listRunningSegments().map((segment) => segment.laneId)).toEqual(["lane-implementation"]);
 
-    const authorized = store.scheduleReadyLanes("session-1", {
+    const blockedAuthorized = store.scheduleReadyLanes("session-1", {
       allowedParallelism: 2,
       authorizedLaneIds: ["lane-commit"],
       now: "2026-07-23T00:00:02.000Z",
     });
 
+    expect(blockedAuthorized.readyLanes).toEqual([]);
+    expect(blockedAuthorized.projection.lanes.find((lane) => lane.id === "lane-commit")?.status).toBe("pending");
+    expect(store.listRunningSegments().map((segment) => segment.laneId)).toEqual(["lane-implementation"]);
+
+    store.recordRunResult(
+      runResultInput(store, "lane-implementation", "succeeded", "2026-07-23T00:00:03.000Z"),
+    );
+    const authorized = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      authorizedLaneIds: ["lane-commit"],
+      now: "2026-07-23T00:00:04.000Z",
+    });
+
     expect(authorized.readyLanes.map((lane) => lane.id)).toEqual(["lane-commit"]);
-    expect(store.listRunningSegments().map((segment) => segment.laneId).sort()).toEqual([
-      "lane-commit",
-      "lane-implementation",
-    ]);
+    expect(store.listRunningSegments().map((segment) => segment.laneId)).toEqual(["lane-commit"]);
     store.close();
   });
 
@@ -5719,6 +5729,547 @@ describe("SQLite workflow store", () => {
       expect(new Set(rootBindings.map((binding) => binding.worktreeId))).toEqual(
         new Set(["worktree-session-1-candidate"]),
       );
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("serializes current-branch writers across sessions and stores while allowing observers", async () => {
+    const projectRoot = await makeTempRoot();
+    const contenderLanes = [
+      ["lane-writer-contender-a", "implementation"],
+      ["lane-observer-a", "validation"],
+      ["lane-writer-contender-b", "commit"],
+      ["lane-observer-b", "review"],
+    ] as const;
+    const contenderLaneIds = contenderLanes.map(([laneId]) => laneId);
+    const seed = createWorkflowStore({ projectRoot });
+    try {
+      for (const [sessionId, now] of [
+        ["session-writer-owner", "2026-07-28T01:01:10.000Z"],
+        ["session-writer-contender", "2026-07-28T01:01:11.000Z"],
+      ] as const) {
+        seed.createWorkflowSession({
+          id: sessionId,
+          projectId: "project-1",
+          title: sessionId,
+          goal: "Exercise authoritative current-branch scheduling.",
+          mode: "fast",
+          target: { executionTarget: "current_branch", selectedBranch: "main" },
+          plannerProfile: "default",
+          transport: "hermes_replay_recovery",
+          recoveryReason: "Test setup has no live Hermes session.",
+          now,
+        });
+      }
+      appendTestFlowEvent(seed, "workflow.lane.declared", {
+        lane: {
+          id: "lane-writer-owner",
+          semanticKey: "lane-writer-owner",
+          kind: "implementation",
+          title: "Owner writer",
+          agentKind: "codex",
+          status: "pending",
+        },
+      }, "test-lane:writer-owner", "session-writer-owner");
+      for (const [laneId, kind] of contenderLanes) {
+        appendTestFlowEvent(seed, "workflow.lane.declared", {
+          lane: {
+            id: laneId,
+            semanticKey: laneId,
+            kind,
+            title: laneId,
+            agentKind: "codex",
+            status: "pending",
+          },
+        }, `test-lane:${laneId}`, "session-writer-contender");
+      }
+    } finally {
+      seed.close();
+    }
+
+    const contender = createWorkflowStore({
+      projectRoot,
+      faultInjection: { sqliteBusyTimeoutMs: 1 },
+    });
+    let contentionError: unknown;
+    const owner = createWorkflowStore({
+      projectRoot,
+      faultInjection: {
+        afterSchedulePreview: () => {
+          try {
+            contender.scheduleReadyLanes("session-writer-contender", {
+              allowedParallelism: 4,
+              authorizedLaneIds: contenderLaneIds,
+              now: "2026-07-28T01:01:12.001Z",
+            });
+          } catch (error) {
+            contentionError = error;
+          }
+        },
+      },
+    });
+    let ownerClosed = false;
+    try {
+      expect(owner.materializeFlowProjection("session-writer-owner").segments).toEqual([]);
+      expect(contender.materializeFlowProjection("session-writer-contender").segments).toEqual([]);
+      expect(owner.scheduleReadyLanes("session-writer-owner", {
+        allowedParallelism: 1,
+        now: "2026-07-28T01:01:12.000Z",
+      }).readyLanes.map((lane) => lane.id)).toEqual(["lane-writer-owner"]);
+      expect(contentionError).toMatchObject({ code: "SQLITE_BUSY" });
+
+      const observerSchedule = contender.scheduleReadyLanes("session-writer-contender", {
+        allowedParallelism: 4,
+        authorizedLaneIds: contenderLaneIds,
+        now: "2026-07-28T01:01:12.002Z",
+      });
+      expect(observerSchedule.readyLanes.map((lane) => lane.id)).toEqual([
+        "lane-observer-a",
+        "lane-observer-b",
+      ]);
+      expect(observerSchedule.readyLanes.every((lane) => lane.runtimePolicy.sandbox === "read-only")).toBe(true);
+      expect(observerSchedule.projection.lanes.filter((lane) => lane.id.startsWith("lane-writer-contender")))
+        .toEqual([
+          expect.objectContaining({
+            id: "lane-writer-contender-a",
+            status: "pending",
+            runtimePolicy: expect.objectContaining({ sandbox: "workspace-write" }),
+          }),
+          expect.objectContaining({
+            id: "lane-writer-contender-b",
+            status: "pending",
+            runtimePolicy: expect.objectContaining({ sandbox: "danger-full-access" }),
+          }),
+        ]);
+      expect(contender.scheduleReadyLanes("session-writer-contender", {
+        allowedParallelism: 4,
+        authorizedLaneIds: contenderLaneIds,
+        now: "2026-07-28T01:01:12.003Z",
+      }).readyLanes).toEqual([]);
+
+      owner.recordRunResult({
+        sessionId: "session-writer-owner",
+        laneId: "lane-writer-owner",
+        segmentId: "segment-session-writer-owner-lane-writer-owner",
+        runId: "run-session-writer-owner-lane-writer-owner",
+        agentKind: "codex",
+        outputSummary: "Owner writer completed.",
+        evidence: {
+          runId: "run-session-writer-owner-lane-writer-owner",
+          status: "succeeded",
+          exitCode: 0,
+          changesetId: "changeset-writer-owner",
+          checks: [{ kind: "test", name: "owner writer", status: "passed", detail: "passed" }],
+          artifacts: [],
+          review: null,
+          errorReason: null,
+          cancelReason: null,
+          completedAt: "2026-07-28T01:01:13.000Z",
+        },
+        now: "2026-07-28T01:01:13.000Z",
+      });
+
+      const loserSchedule = contender.scheduleReadyLanes("session-writer-contender", {
+        allowedParallelism: 4,
+        authorizedLaneIds: contenderLaneIds,
+        now: "2026-07-28T01:01:14.000Z",
+      });
+      expect(loserSchedule.readyLanes.map((lane) => lane.id)).toEqual(["lane-writer-contender-a"]);
+      expect(loserSchedule.readyLanes[0]?.runtimePolicy.sandbox).toBe("workspace-write");
+      expect(loserSchedule.projection.lanes.find((lane) => lane.id === "lane-writer-contender-b")?.status)
+        .toBe("pending");
+
+      const ownerEvents = owner.listEvents("session-writer-owner");
+      const contenderEvents = contender.listEvents("session-writer-contender");
+      expect(contender.scheduleReadyLanes("session-writer-contender", {
+        allowedParallelism: 4,
+        authorizedLaneIds: contenderLaneIds,
+        now: "2026-07-28T01:01:15.000Z",
+      }).readyLanes).toEqual([]);
+      expect(contender.listEvents("session-writer-contender")).toEqual(contenderEvents);
+      owner.close();
+      ownerClosed = true;
+
+      const reopened = createWorkflowStore({ projectRoot });
+      try {
+        expect(reopened.listEvents("session-writer-owner")).toEqual(ownerEvents);
+        expect(reopened.listEvents("session-writer-contender")).toEqual(contenderEvents);
+        expect(reopened.scheduleReadyLanes("session-writer-contender", {
+          allowedParallelism: 4,
+          authorizedLaneIds: contenderLaneIds,
+          now: "2026-07-28T01:01:16.000Z",
+        }).readyLanes).toEqual([]);
+        expect(reopened.listEvents("session-writer-contender")).toEqual(contenderEvents);
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      if (!ownerClosed) owner.close();
+      contender.close();
+    }
+  });
+
+  it("preserves cross-session current-branch scopes while backfilling disjoint observers", async () => {
+    const projectRoot = await makeTempRoot();
+    const seed = createWorkflowStore({ projectRoot });
+    try {
+      for (const [sessionId, now] of [
+        ["session-scope-owner", "2026-07-28T01:01:16.000Z"],
+        ["session-scope-contender", "2026-07-28T01:01:16.001Z"],
+      ] as const) {
+        seed.createWorkflowSession({
+          id: sessionId,
+          projectId: "project-1",
+          title: sessionId,
+          goal: "Preserve authoritative scopes across current-branch sessions.",
+          mode: "fast",
+          target: { executionTarget: "current_branch", selectedBranch: "main" },
+          plannerProfile: "default",
+          transport: "hermes_replay_recovery",
+          recoveryReason: "Test setup has no live Hermes session.",
+          now,
+        });
+      }
+      for (const [sessionId, laneId, kind, fileScopes] of [
+        ["session-scope-owner", "lane-scope-owner", "implementation", ["src/shared.ts"]],
+        ["session-scope-owner", "lane-scope-observer", "validation", ["src/observed.ts"]],
+        ["session-scope-contender", "lane-blocked-writer", "implementation", ["src/writer.ts"]],
+        ["session-scope-contender", "lane-shared-observer", "validation", ["src/shared.ts"]],
+        ["session-scope-contender", "lane-observed-observer", "review", ["src/observed.ts"]],
+        ["session-scope-contender", "lane-disjoint-observer", "review", ["src/disjoint.ts"]],
+      ] as const) {
+        appendTestFlowEvent(seed, "workflow.lane.declared", {
+          lane: {
+            id: laneId,
+            semanticKey: laneId,
+            kind,
+            title: laneId,
+            agentKind: "codex",
+            status: "pending",
+            fileScopes,
+            packageScopes: [],
+          },
+        }, `test-lane:${laneId}`, sessionId);
+      }
+    } finally {
+      seed.close();
+    }
+
+    const owner = createWorkflowStore({ projectRoot });
+    const contender = createWorkflowStore({ projectRoot });
+    let contenderClosed = false;
+    try {
+      expect(owner.scheduleReadyLanes("session-scope-owner", {
+        allowedParallelism: 2,
+        now: "2026-07-28T01:01:16.002Z",
+      }).readyLanes.map((lane) => lane.id)).toEqual(["lane-scope-owner", "lane-scope-observer"]);
+
+      const scheduled = contender.scheduleReadyLanes("session-scope-contender", {
+        allowedParallelism: 2,
+        now: "2026-07-28T01:01:16.003Z",
+      });
+      expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual(["lane-disjoint-observer"]);
+      expect(scheduled.projection.lanes.find((lane) => lane.id === "lane-blocked-writer")?.status)
+        .toBe("pending");
+      expect(scheduled.projection.lanes.find((lane) => lane.id === "lane-shared-observer")?.status)
+        .toBe("pending");
+      expect(scheduled.projection.lanes.find((lane) => lane.id === "lane-observed-observer")?.status)
+        .toBe("pending");
+
+      const contenderEvents = contender.listEvents("session-scope-contender");
+      expect(contender.scheduleReadyLanes("session-scope-contender", {
+        allowedParallelism: 2,
+        now: "2026-07-28T01:01:16.004Z",
+      }).readyLanes).toEqual([]);
+      expect(contender.listEvents("session-scope-contender")).toEqual(contenderEvents);
+      contender.close();
+      contenderClosed = true;
+
+      const reopened = createWorkflowStore({ projectRoot });
+      try {
+        expect(reopened.scheduleReadyLanes("session-scope-contender", {
+          allowedParallelism: 2,
+          now: "2026-07-28T01:01:16.005Z",
+        }).readyLanes).toEqual([]);
+        expect(reopened.listEvents("session-scope-contender")).toEqual(contenderEvents);
+        expect(reopened.materializeFlowProjection("session-scope-contender").lanes
+          .find((lane) => lane.id === "lane-shared-observer")?.status).toBe("pending");
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      owner.close();
+      if (!contenderClosed) contender.close();
+    }
+  });
+
+  it("fails closed for a writer when stored and projected running run identities conflict", async () => {
+    const projectRoot = await makeTempRoot();
+    const seed = createWorkflowStore({ projectRoot });
+    try {
+      for (const [sessionId, now] of [
+        ["session-run-owner", "2026-07-28T01:01:16.100Z"],
+        ["session-run-contender", "2026-07-28T01:01:16.101Z"],
+      ] as const) {
+        seed.createWorkflowSession({
+          id: sessionId,
+          projectId: "project-1",
+          title: sessionId,
+          goal: "Fail closed when running run identity is ambiguous.",
+          mode: "fast",
+          target: { executionTarget: "current_branch", selectedBranch: "main" },
+          plannerProfile: "default",
+          transport: "hermes_replay_recovery",
+          recoveryReason: "Test setup has no live Hermes session.",
+          now,
+        });
+      }
+      for (const [sessionId, laneId, kind, fileScopes] of [
+        ["session-run-owner", "lane-run-observer", "validation", ["src/observed.ts"]],
+        ["session-run-contender", "lane-run-writer", "implementation", ["src/writer.ts"]],
+        ["session-run-contender", "lane-run-disjoint", "review", ["src/disjoint.ts"]],
+      ] as const) {
+        appendTestFlowEvent(seed, "workflow.lane.declared", {
+          lane: {
+            id: laneId,
+            semanticKey: laneId,
+            kind,
+            title: laneId,
+            agentKind: "codex",
+            status: "pending",
+            fileScopes,
+            packageScopes: [],
+          },
+        }, `test-lane:${laneId}`, sessionId);
+      }
+    } finally {
+      seed.close();
+    }
+
+    const owner = createWorkflowStore({ projectRoot });
+    const running = owner.scheduleReadyLanes("session-run-owner", {
+      allowedParallelism: 1,
+      now: "2026-07-28T01:01:16.102Z",
+    }).readyLanes[0];
+    expect(running).toEqual(expect.objectContaining({ id: "lane-run-observer" }));
+    owner.close();
+    if (!running) throw new Error("Expected the run-owner observer to be running.");
+
+    const conflictingRunId = `${running.runId}-stored-conflict`;
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    db.pragma("foreign_keys = OFF");
+    db.prepare([
+      "INSERT INTO workflow_segments",
+      "(id, session_id, lane_id, parent_segment_id, run_id, agent_kind, transport, status, worktree_path,",
+      " started_at, ended_at, exit_code, evidence_json, error_reason, legacy_evidence_compatibility)",
+      "VALUES (?, ?, ?, NULL, ?, ?, ?, 'running', ?, ?, NULL, NULL, NULL, NULL, 0)",
+    ].join(" ")).run(
+      running.segmentId,
+      "session-run-owner",
+      running.id,
+      conflictingRunId,
+      running.agentKind,
+      "agent-bridge",
+      projectRoot,
+      "2026-07-28T01:01:16.102Z",
+    );
+    db.close();
+
+    const contender = createWorkflowStore({ projectRoot });
+    const scheduled = contender.scheduleReadyLanes("session-run-contender", {
+      allowedParallelism: 2,
+      now: "2026-07-28T01:01:16.103Z",
+    });
+    expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual(["lane-run-disjoint"]);
+    expect(scheduled.projection.lanes.find((lane) => lane.id === "lane-run-writer")?.status).toBe("pending");
+    expect(contender.materializeFlowProjection("session-run-owner").segments).toEqual([
+      expect.objectContaining({ id: running.segmentId, laneId: running.id, runId: running.runId, status: "running" }),
+    ]);
+    const contenderEvents = contender.listEvents("session-run-contender");
+    contender.close();
+
+    const verifyDb = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), { readonly: true });
+    expect((verifyDb.prepare("SELECT run_id FROM workflow_segments WHERE id = ?")
+      .get(running.segmentId) as { run_id: string }).run_id).toBe(conflictingRunId);
+    verifyDb.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    try {
+      expect(reopened.scheduleReadyLanes("session-run-contender", {
+        allowedParallelism: 2,
+        now: "2026-07-28T01:01:16.104Z",
+      }).readyLanes).toEqual([]);
+      expect(reopened.listEvents("session-run-contender")).toEqual(contenderEvents);
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("backfills current-branch observer capacity when another session owns the writer slot", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    for (const [sessionId, now] of [
+      ["session-writer-owner", "2026-07-28T01:01:17.000Z"],
+      ["session-observer-contender", "2026-07-28T01:01:18.000Z"],
+    ] as const) {
+      store.createWorkflowSession({
+        id: sessionId,
+        projectId: "project-1",
+        title: sessionId,
+        goal: "Fill current-branch scheduling capacity without a second writer.",
+        mode: "fast",
+        target: { executionTarget: "current_branch", selectedBranch: "main" },
+        plannerProfile: "default",
+        transport: "hermes_replay_recovery",
+        recoveryReason: "Test setup has no live Hermes session.",
+        now,
+      });
+    }
+    for (const [sessionId, laneId, kind] of [
+      ["session-writer-owner", "lane-writer-owner", "implementation"],
+      ["session-observer-contender", "lane-writer", "implementation"],
+      ["session-observer-contender", "lane-observer-1", "validation"],
+      ["session-observer-contender", "lane-observer-2", "review"],
+    ] as const) {
+      appendTestFlowEvent(store, "workflow.lane.declared", {
+        lane: {
+          id: laneId,
+          semanticKey: laneId,
+          kind,
+          title: laneId,
+          agentKind: "codex",
+          status: "pending",
+        },
+      }, `test-lane:${laneId}`, sessionId);
+    }
+
+    expect(store.scheduleReadyLanes("session-writer-owner", {
+      allowedParallelism: 1,
+      now: "2026-07-28T01:01:19.000Z",
+    }).readyLanes.map((lane) => lane.id)).toEqual(["lane-writer-owner"]);
+
+    const scheduled = store.scheduleReadyLanes("session-observer-contender", {
+      allowedParallelism: 2,
+      authorizedLaneIds: ["lane-writer"],
+      now: "2026-07-28T01:01:20.000Z",
+    });
+    expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual([
+      "lane-observer-1",
+      "lane-observer-2",
+    ]);
+    expect(scheduled.readyLanes.every((lane) => lane.runtimePolicy.sandbox === "read-only")).toBe(true);
+    expect(scheduled.projection.lanes.find((lane) => lane.id === "lane-writer")?.status).toBe("pending");
+
+    const contenderEvents = store.listEvents("session-observer-contender");
+    expect(store.scheduleReadyLanes("session-observer-contender", {
+      allowedParallelism: 2,
+      now: "2026-07-28T01:01:21.000Z",
+    }).readyLanes).toEqual([]);
+    expect(store.listEvents("session-observer-contender")).toEqual(contenderEvents);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    try {
+      expect(reopened.scheduleReadyLanes("session-observer-contender", {
+        allowedParallelism: 2,
+        now: "2026-07-28T01:01:22.000Z",
+      }).readyLanes).toEqual([]);
+      expect(reopened.listEvents("session-observer-contender")).toEqual(contenderEvents);
+      expect(reopened.materializeFlowProjection("session-observer-contender").lanes
+        .find((lane) => lane.id === "lane-writer")?.status).toBe("pending");
+    } finally {
+      reopened.close();
+    }
+  });
+
+  it("fails closed for a current-branch writer when a running policy is unresolved", async () => {
+    const projectRoot = await makeTempRoot();
+    const seed = createWorkflowStore({ projectRoot });
+    let unresolvedPlannerLaneId = "";
+    try {
+      for (const [sessionId, now] of [
+        ["session-unknown-owner", "2026-07-28T01:01:20.000Z"],
+        ["session-unknown-contender", "2026-07-28T01:01:21.000Z"],
+      ] as const) {
+        const session = seed.createWorkflowSession({
+          id: sessionId,
+          projectId: "project-1",
+          title: sessionId,
+          goal: "Exercise fail-closed current-branch scheduling.",
+          mode: "fast",
+          target: { executionTarget: "current_branch", selectedBranch: "main" },
+          plannerProfile: "default",
+          transport: "hermes_replay_recovery",
+          recoveryReason: "Test setup has no live Hermes session.",
+          now,
+        });
+        if (sessionId === "session-unknown-owner") unresolvedPlannerLaneId = session.plannerLaneId;
+      }
+      seed.claimPlannerRunStart({
+        sessionId: "session-unknown-owner",
+        laneId: unresolvedPlannerLaneId,
+        runId: "run-unresolved-running",
+        agentKind: "hermes",
+        worktreePath: projectRoot,
+        now: "2026-07-28T01:01:21.500Z",
+      });
+      for (const [laneId, kind] of [
+        ["lane-blocked-writer", "implementation"],
+        ["lane-allowed-observer", "validation"],
+      ] as const) {
+        appendTestFlowEvent(seed, "workflow.lane.declared", {
+          lane: {
+            id: laneId,
+            semanticKey: laneId,
+            kind,
+            title: laneId,
+            agentKind: "codex",
+            status: "pending",
+          },
+        }, `test-lane:${laneId}`, "session-unknown-contender");
+      }
+    } finally {
+      seed.close();
+    }
+
+    const owner = createWorkflowStore({ projectRoot });
+    const contender = createWorkflowStore({ projectRoot });
+    try {
+      const unresolvedBefore = owner.listRunningSegments()
+        .filter((segment) => segment.sessionId === "session-unknown-owner");
+      expect(unresolvedBefore).toEqual([expect.objectContaining({
+        laneId: unresolvedPlannerLaneId,
+        runId: "run-unresolved-running",
+        status: "running",
+      })]);
+
+      const scheduled = contender.scheduleReadyLanes("session-unknown-contender", {
+        allowedParallelism: 2,
+        now: "2026-07-28T01:01:22.000Z",
+      });
+      expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual(["lane-allowed-observer"]);
+      expect(scheduled.projection.lanes.find((lane) => lane.id === "lane-blocked-writer")?.status)
+        .toBe("pending");
+      expect(owner.listRunningSegments().filter((segment) => segment.sessionId === "session-unknown-owner"))
+        .toEqual(unresolvedBefore);
+    } finally {
+      owner.close();
+      contender.close();
+    }
+
+    const reopened = createWorkflowStore({ projectRoot });
+    try {
+      expect(reopened.scheduleReadyLanes("session-unknown-contender", {
+        allowedParallelism: 2,
+        now: "2026-07-28T01:01:23.000Z",
+      }).readyLanes).toEqual([]);
+      expect(reopened.listRunningSegments().filter((segment) => segment.sessionId === "session-unknown-owner"))
+        .toEqual([expect.objectContaining({
+          laneId: unresolvedPlannerLaneId,
+          runId: "run-unresolved-running",
+          status: "running",
+        })]);
     } finally {
       reopened.close();
     }
