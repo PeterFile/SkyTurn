@@ -38,9 +38,13 @@ export interface AgentRunHandle {
   cancel(reason: string): Promise<void>;
 }
 
+export interface AgentRunStartContext {
+  signal: AbortSignal;
+}
+
 export interface LocalAgentAdapterContract extends AgentAdapterContract {
   detect(): Promise<AgentDescriptor>;
-  startRun(input: StartAgentRunInput, sink: RunEventSink): Promise<AgentRunHandle>;
+  startRun(input: StartAgentRunInput, sink: RunEventSink, context?: AgentRunStartContext): Promise<AgentRunHandle>;
   send?(runId: string, message: string): Promise<void>;
 }
 

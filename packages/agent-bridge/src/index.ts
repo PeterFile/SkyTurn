@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import type {
   AgentRunHandle,
+  AgentRunStartContext,
   LocalAgentAdapterContract,
   RunEventDraft,
   RunEventSink,
@@ -212,6 +213,7 @@ export interface TerminalPersistenceFailure {
 }
 
 interface DeferredAgentRunStartOwner {
+  abortController: AbortController;
   bridgeCloseRequested: boolean;
   cancellationReason: string | null;
   completion: Promise<void>;
@@ -652,7 +654,7 @@ export class AgentBridge {
     this.closeReason = sanitizePublicEvidenceText(reason) || "AgentBridge is closing.";
     for (const owner of this.startOwners.values()) {
       owner.bridgeCloseRequested = true;
-      if (owner.cancellationReason === null) owner.cancellationReason = this.closeReason;
+      requestStartOwnerCancellation(owner, this.closeReason);
     }
     this.closePromise = this.performClose();
     return this.closePromise;
@@ -797,7 +799,11 @@ export class AgentBridge {
       const fallbackAdapter = input.agentKind === "agy" ? undefined : this.adapters.get("codex");
       const adapter = this.adapters.get(input.agentKind) ?? fallbackAdapter;
       if (!adapter) throw new Error(`No local adapter registered for ${input.agentKind}`);
-      handle = await adapter.startRun({ ...input, runId: run.id }, sink);
+      handle = await adapter.startRun(
+        { ...input, runId: run.id },
+        sink,
+        { signal: startOwner.abortController.signal },
+      );
     } catch (error) {
       const message = sanitizePublicProcessTextWithSensitiveValues(
         errorMessage(error),
@@ -879,7 +885,7 @@ export class AgentBridge {
     let cancelError: unknown = null;
     const startOwner = this.startOwners.get(runId);
     if (startOwner) {
-      if (startOwner.cancellationReason === null) startOwner.cancellationReason = reason;
+      requestStartOwnerCancellation(startOwner, reason);
       try {
         await startOwner.completion;
       } catch (error) {
@@ -1107,6 +1113,7 @@ export class AgentBridge {
 }
 
 function createDeferredAgentRunStartOwner(closeReason: string | null): DeferredAgentRunStartOwner {
+  const abortController = new AbortController();
   let resolve!: () => void;
   let reject!: (error: unknown) => void;
   const completion = new Promise<void>((resolvePromise, rejectPromise) => {
@@ -1114,7 +1121,8 @@ function createDeferredAgentRunStartOwner(closeReason: string | null): DeferredA
     reject = rejectPromise;
   });
   void completion.catch(() => undefined);
-  return {
+  const owner: DeferredAgentRunStartOwner = {
+    abortController,
     bridgeCloseRequested: closeReason !== null,
     cancellationReason: closeReason,
     completion,
@@ -1122,6 +1130,13 @@ function createDeferredAgentRunStartOwner(closeReason: string | null): DeferredA
     resolve,
     settled: false,
   };
+  if (closeReason !== null) abortController.abort(closeReason);
+  return owner;
+}
+
+function requestStartOwnerCancellation(owner: DeferredAgentRunStartOwner, reason: string): void {
+  if (owner.cancellationReason === null) owner.cancellationReason = reason;
+  if (!owner.abortController.signal.aborted) owner.abortController.abort(owner.cancellationReason);
 }
 
 export function createMockAgentAdapter(options: { holdOpen?: boolean } = {}): LocalAgentAdapterContract {
@@ -1971,6 +1986,10 @@ class AgentRunWatchdog {
     await this.completeTerminal({ kind: "start-abort", terminate: true, closeBeforeDrain: true });
   }
 
+  terminatePendingStart(): Promise<void> {
+    return this.terminateAndReap();
+  }
+
   private async expire(): Promise<void> {
     await this.completeTerminal({
       kind: "timeout",
@@ -2169,6 +2188,54 @@ function observeAgentCliProcessBoundary(
   void settlement.catch(() => undefined);
 }
 
+type AgentCliProcessReadiness =
+  | { kind: "ready" }
+  | { kind: "aborted" }
+  | { kind: "failed"; error: unknown };
+
+function waitForAgentCliProcessReady(
+  processBoundary: AgentCliProcessBoundary,
+  context: AgentRunStartContext | undefined,
+  terminateAndReap: () => Promise<void>,
+): Promise<AgentCliProcessReadiness> {
+  const signal = context?.signal;
+  if (!signal) {
+    return processBoundary.ready.then(
+      () => ({ kind: "ready" }),
+      (error: unknown) => ({ kind: "failed", error }),
+    );
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (readiness: AgentCliProcessReadiness): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(readiness);
+    };
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      void terminateAndReap().then(
+        () => resolve({ kind: "aborted" }),
+        () => resolve({ kind: "aborted" }),
+      );
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    void processBoundary.ready.then(
+      () => signal.aborted ? onAbort() : finish({ kind: "ready" }),
+      (error: unknown) => signal.aborted ? onAbort() : finish({ kind: "failed", error }),
+    );
+  });
+}
+
 export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): LocalAgentAdapterContract {
   const defaultSandbox = options.sandbox ?? "read-only";
   const artifactVerificationHooks = artifactVerificationHooksFrom(options);
@@ -2194,7 +2261,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         codexAuthFilePath: options.codexAuthFilePath,
       });
     },
-    async startRun(input, sink) {
+    async startRun(input, sink, context) {
       const workdir = await resolveRunWorkdir(input, sink, "codex", "Codex CLI");
       if (!workdir) return noopRunHandle();
       const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : defaultSandbox;
@@ -2370,14 +2437,22 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         ).catch(() => undefined);
       };
 
-      const ready = await processBoundary.ready.then(
-        () => true,
-        (error: unknown) => {
-          completeSpawnFailure(error instanceof Error ? error : new Error("Codex CLI spawn failed"));
-          return false;
-        },
+      const readiness = await waitForAgentCliProcessReady(
+        processBoundary,
+        context,
+        () => watchdog.terminatePendingStart(),
       );
-      if (!ready) {
+      if (readiness.kind === "aborted") {
+        return {
+          async cancel(reason) {
+            await watchdog.cancel(reason);
+          },
+        };
+      }
+      if (readiness.kind === "failed") {
+        completeSpawnFailure(
+          readiness.error instanceof Error ? readiness.error : new Error("Codex CLI spawn failed"),
+        );
         return {
           async cancel(reason) {
             await watchdog.cancel(reason);
@@ -2493,7 +2568,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         authEnvNames: hermesAuthEnvNames,
       });
     },
-    async startRun(input, sink) {
+    async startRun(input, sink, context) {
       const workdir = await resolveRunWorkdir(input, sink, "hermes", "Hermes CLI");
       if (!workdir) return noopRunHandle();
       const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : "danger-full-access";
@@ -2662,14 +2737,22 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         ).catch(() => undefined);
       };
 
-      const ready = await processBoundary.ready.then(
-        () => true,
-        (error: unknown) => {
-          completeSpawnFailure(error instanceof Error ? error : new Error("Hermes CLI spawn failed"));
-          return false;
-        },
+      const readiness = await waitForAgentCliProcessReady(
+        processBoundary,
+        context,
+        () => watchdog.terminatePendingStart(),
       );
-      if (!ready) {
+      if (readiness.kind === "aborted") {
+        return {
+          async cancel(reason) {
+            await watchdog.cancel(reason);
+          },
+        };
+      }
+      if (readiness.kind === "failed") {
+        completeSpawnFailure(
+          readiness.error instanceof Error ? readiness.error : new Error("Hermes CLI spawn failed"),
+        );
         return {
           async cancel(reason) {
             await watchdog.cancel(reason);
