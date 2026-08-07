@@ -61,10 +61,26 @@ import { assertWindowsExpectedArtifactVerifierCapability } from "./internal/wind
 type SpawnWindowsJobObjectProcess = typeof import(
   "./internal/windowsJobObjectProcess.js"
 )["spawnWindowsJobObjectProcess"];
+type SpawnManagedProcess = typeof import("./internal/managedProcess.js")["spawnManagedProcess"];
+
+const managedProcessMock = vi.hoisted(() => ({
+  spawn: null as SpawnManagedProcess | null,
+}));
 
 const windowsJobObjectProcessMock = vi.hoisted(() => ({
   spawn: null as SpawnWindowsJobObjectProcess | null,
 }));
+
+vi.mock("./internal/managedProcess.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./internal/managedProcess.js")>();
+  return {
+    ...original,
+    spawnManagedProcess: (...args: Parameters<SpawnManagedProcess>) =>
+      managedProcessMock.spawn
+        ? managedProcessMock.spawn(...args)
+        : original.spawnManagedProcess(...args),
+  };
+});
 
 vi.mock("./internal/windowsJobObjectProcess.js", async (importOriginal) => {
   const original = await importOriginal<typeof import("./internal/windowsJobObjectProcess.js")>();
@@ -255,6 +271,7 @@ async function readWorkspaceRunEvents(projectRoot: string, runId: string): Promi
 
 afterEach(async () => {
   vi.useRealTimers();
+  managedProcessMock.spawn = null;
   windowsJobObjectProcessMock.spawn = null;
   await Promise.all(roots.map((root) => rm(root, { force: true, recursive: true })));
   roots.length = 0;
@@ -499,6 +516,87 @@ describe("agent bridge", () => {
     })]);
     await bridge.cancelRun(input.runId, "test cleanup");
   });
+
+  it.each(["cancel", "close"] as const)(
+    "%s before adapter readiness aborts immediately and joins handle cleanup",
+    async (operation) => {
+      const projectRoot = await makeTempRoot();
+      const adapterSignal = deferred<AbortSignal | null>();
+      const cleanupRelease = deferred<void>();
+      const liveEvents: RunEvent[] = [];
+      let abortEvents = 0;
+      let cancelCalls = 0;
+      const bridge = new AgentBridge({
+        privateRunEventStore: inMemoryPrivateRunEventStore(),
+        adapters: [{
+          ...createMockAgentAdapter({ holdOpen: true }),
+          async startRun(_input, sink, context?: { signal: AbortSignal }) {
+            const signal = context?.signal ?? null;
+            signal?.addEventListener("abort", () => {
+              abortEvents += 1;
+            }, { once: true });
+            adapterSignal.resolve(signal);
+            if (signal && !signal.aborted) {
+              await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+            }
+            await cleanupRelease.promise;
+            return {
+              async cancel(reason) {
+                cancelCalls += 1;
+                await sink.emit({
+                  kind: "evidence",
+                  payload: {
+                    exitCode: null,
+                    checks: [{ kind: "run-exit", name: "Pending adapter exit", status: "skipped", detail: reason }],
+                  },
+                });
+                await sink.emit({ kind: "status", payload: { status: "cancelled", reason } });
+              },
+            };
+          },
+        }],
+      });
+      bridge.onRunEvent((event) => liveEvents.push(event));
+      const input = explicitRunInput(projectRoot, `${operation}-before-adapter-readiness`);
+      const reason = operation === "cancel" ? "cancel before readiness" : "close before readiness";
+      const start = bridge.startRun(input);
+      const signal = await adapterSignal.promise;
+      let operationSettled = false;
+      const pendingOperation = operation === "cancel"
+        ? bridge.cancelRun(input.runId, reason)
+        : bridge.close(reason);
+      void pendingOperation.finally(() => {
+        operationSettled = true;
+      });
+
+      try {
+        await flushStartCancellation();
+        expect(signal).not.toBeNull();
+        expect(signal?.aborted).toBe(true);
+        expect(signal?.reason).toBe(reason);
+        expect(abortEvents).toBe(1);
+        expect(operationSettled).toBe(false);
+        expect(cancelCalls).toBe(0);
+      } finally {
+        cleanupRelease.resolve();
+      }
+
+      const [run] = await Promise.all([start, pendingOperation]);
+      const events = await bridge.loadEvents(projectRoot, input.runId);
+
+      expect(run.status).toBe("cancelled");
+      expect(cancelCalls).toBe(1);
+      expect(terminalRunStatuses(events)).toHaveLength(1);
+      expect(terminalRunStatuses(liveEvents)).toHaveLength(1);
+      expect(events.filter((event) => event.kind === "evidence")).toHaveLength(1);
+      expect(events).not.toContainEqual(
+        expect.objectContaining({ kind: "progress", payload: expect.objectContaining({ phase: "started" }) }),
+      );
+      expect(events).not.toContainEqual(
+        expect.objectContaining({ kind: "status", payload: expect.objectContaining({ status: "running" }) }),
+      );
+    },
+  );
 
   it("joins cancellation requested before a delayed adapter publishes its handle", async () => {
     const projectRoot = await makeTempRoot();
@@ -4260,6 +4358,76 @@ describe("agent bridge", () => {
   });
 
   it.each(["codex", "hermes"] as const)(
+    "%s aborts pending managed readiness and waits for reap before returning its handle",
+    async (agentKind) => {
+      const projectRoot = await makeTempRoot();
+      await mkdir(join(projectRoot, ".git"));
+      const boundary = pendingManagedProcessBoundary();
+      managedProcessMock.spawn = boundary.spawn;
+      const adapter = agentKind === "codex"
+        ? createCodexCliAdapter({ executablePath: "/bin/sh", timeoutMs: 0 })
+        : createHermesCliAdapter({ executablePath: "/bin/sh", timeoutMs: 0 });
+      const controller = new AbortController();
+      const drafts: RunEventDraft[] = [];
+      let seq = 0;
+      const sink: RunEventSink = {
+        async emit(draft) {
+          drafts.push(draft);
+          seq += 1;
+          return {
+            protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+            runId: `run-${agentKind}-abort-before-readiness`,
+            seq,
+            timestamp: draft.timestamp ?? new Date().toISOString(),
+            kind: draft.kind,
+            payload: draft.payload,
+          } as RunEvent;
+        },
+      };
+      let startSettled = false;
+      const start = adapter.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        runId: `run-${agentKind}-abort-before-readiness`,
+        nodeId: `node-${agentKind}-abort-before-readiness`,
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind,
+        sandbox: "danger-full-access",
+        prompt: "Cancel before managed readiness",
+      }, sink, { signal: controller.signal }).finally(() => {
+        startSettled = true;
+      });
+      await boundary.spawned.promise;
+
+      controller.abort("cancel before readiness");
+      await flushStartCancellation();
+      const earlyTerminationStarts = boundary.terminationStarts;
+      const earlyStartSettled = startSettled;
+      const earlyDrafts = [...drafts];
+
+      boundary.completeReap();
+      const handle = await start;
+
+      expect(earlyTerminationStarts).toBe(1);
+      expect(earlyStartSettled).toBe(false);
+      expect(earlyDrafts).toEqual([]);
+      expect(drafts).toEqual([]);
+
+      await handle.cancel("cancel before readiness");
+
+      expect(boundary.terminationStarts).toBe(1);
+      expect(drafts.filter((draft) => draft.kind === "evidence")).toHaveLength(1);
+      expect(drafts.filter((draft) => draft.kind === "status")).toEqual([
+        expect.objectContaining({ payload: expect.objectContaining({ status: "cancelled" }) }),
+      ]);
+      expect(drafts).not.toContainEqual(
+        expect.objectContaining({ kind: "progress", payload: expect.objectContaining({ phase: "started" }) }),
+      );
+    },
+  );
+
+  it.each(["codex", "hermes"] as const)(
     "%s fails closed without terminal evidence when the process boundary cannot prove tree-empty cleanup",
     async (agentKind) => {
       const durableRunClaimStore = testDurableRunClaimStore();
@@ -5168,7 +5336,7 @@ describe("agent bridge", () => {
       if (agentKind === "codex") await mkdir(join(projectRoot, ".git"));
       const binRoot = await makeTempRoot();
       const executablePath = join(binRoot, agentKind);
-      await writeFile(executablePath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await writeFile(executablePath, "#!/bin/sh\nwhile true; do sleep 1; done\n", { mode: 0o755 });
       let verifierKills = 0;
       let verifierChild: (ChildProcess & { stdout: PassThrough }) | null = null;
       const verifierKilled = deferred<void>();
@@ -5189,7 +5357,6 @@ describe("agent bridge", () => {
         artifactVerificationHooks: {
           platform: "win32" as const,
           windowsVerifierDependencies,
-          afterParentOpen: async () => rm(executablePath),
         },
       };
       const bridge = new AgentBridge({
@@ -5198,7 +5365,6 @@ describe("agent bridge", () => {
           : createHermesCliAdapter(adapterOptions)],
         appendEvent: async (_root, event) => {
           if (event.kind === "progress" && event.payload.phase === "started") {
-            await verifierKilled.promise;
             throw new Error("started event persistence failed");
           }
         },
@@ -5241,6 +5407,87 @@ describe("agent bridge", () => {
       await waitForCondition(
         () => terminalRunStatuses(liveEvents).length === 1,
         `${agentKind} Review18 terminal settlement`,
+      );
+      expect(terminalRunStatuses(liveEvents)).toHaveLength(1);
+    },
+  );
+
+  it.each(["codex", "hermes"] as const)(
+    "keeps %s spawn-error start and caller compensation pending until a concurrent Windows verifier close",
+    async (agentKind) => {
+      const projectRoot = await makeTempRoot();
+      if (agentKind === "codex") await mkdir(join(projectRoot, ".git"));
+      const binRoot = await makeTempRoot();
+      const executablePath = join(binRoot, agentKind);
+      await writeFile(executablePath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      managedProcessMock.spawn = vi.fn(async () => {
+        throw new Error("synthetic managed spawn error");
+      });
+      let verifierKills = 0;
+      let verifierChild: (ChildProcess & { stdout: PassThrough }) | null = null;
+      const verifierKilled = deferred<void>();
+      const windowsVerifierDependencies = fakeWindowsVerifierDependencies({
+        status: "passed",
+        artifacts: [".devflow/acceptance/review18-spawn-error.png"],
+        counts: { verified: 1, missing: 0, empty: 0, unsafe: 0 },
+      }, {
+        closeOnKill: false,
+        onKill: (child) => {
+          verifierKills += 1;
+          verifierChild = child;
+          verifierKilled.resolve();
+        },
+      });
+      const adapterOptions = {
+        executablePath,
+        artifactVerificationHooks: {
+          platform: "win32" as const,
+          windowsVerifierDependencies,
+        },
+      };
+      const bridge = new AgentBridge({
+        adapters: [agentKind === "codex"
+          ? createCodexCliAdapter(adapterOptions)
+          : createHermesCliAdapter(adapterOptions)],
+      });
+      const liveEvents: RunEvent[] = [];
+      bridge.onRunEvent((event) => liveEvents.push(event));
+      let compensationCalls = 0;
+      const startOutcome = bridge.startRun({
+        ...explicitRunInput(projectRoot, `${agentKind}-review18-spawn-error-close-race`, agentKind),
+        expectedArtifacts: [".devflow/acceptance/review18-spawn-error.png"],
+      }).then(
+        () => ({ status: "fulfilled" as const }),
+        (error: unknown) => {
+          compensationCalls += 1;
+          return { status: "rejected" as const, error };
+        },
+      );
+
+      await verifierKilled.promise;
+      const earlyOutcome = await Promise.race([
+        startOutcome.then(() => "settled" as const),
+        new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 100)),
+      ]);
+
+      expect(verifierKills).toBe(1);
+      expect(earlyOutcome).toBe("pending");
+      expect(compensationCalls).toBe(0);
+      expect(terminalRunStatuses(liveEvents)).toEqual([]);
+
+      verifierChild?.stdout.end();
+      verifierChild?.emit("close", null, "SIGKILL");
+      const outcome = await startOutcome;
+
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status === "rejected") {
+        expect(String(outcome.error)).toMatch(/synthetic managed spawn error/i);
+      }
+      expect(verifierKills).toBe(1);
+      expect(compensationCalls).toBe(1);
+      await waitForCondition(
+        () => terminalRunStatuses(liveEvents).length === 1,
+        `${agentKind} spawn-error close-race terminal settlement`,
       );
       expect(terminalRunStatuses(liveEvents)).toHaveLength(1);
     },
@@ -10352,6 +10599,56 @@ function rejectedWindowsProcessBoundary() {
     },
     spawn,
     terminateAndReap,
+  };
+}
+
+function pendingManagedProcessBoundary() {
+  const child = new EventEmitter() as ChildProcess;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  Object.assign(child, {
+    stdout,
+    stderr,
+    stdin: null,
+    pid: 4343,
+    exitCode: null,
+    signalCode: null,
+    kill: vi.fn(() => true),
+  });
+  const ready = deferred<void>();
+  const closed = deferred<{ exitCode: number | null; signalCode: NodeJS.Signals | null }>();
+  void ready.promise.catch(() => undefined);
+  const spawned = deferred<void>();
+  let termination: Promise<void> | null = null;
+  let terminationStarts = 0;
+  const terminateAndReap = vi.fn(() => {
+    if (termination) return termination;
+    terminationStarts += 1;
+    termination = closed.promise.then(() => undefined);
+    return termination;
+  });
+  const spawn: SpawnManagedProcess = vi.fn(async () => {
+    spawned.resolve();
+    return {
+      child,
+      ready: ready.promise,
+      closed: closed.promise,
+      terminateAndReap,
+    };
+  });
+
+  return {
+    completeReap() {
+      Object.assign(child, { exitCode: null, signalCode: "SIGTERM" });
+      ready.reject(new Error("synthetic readiness failure after termination"));
+      closed.resolve({ exitCode: null, signalCode: "SIGTERM" });
+    },
+    spawn,
+    spawned,
+    terminateAndReap,
+    get terminationStarts() {
+      return terminationStarts;
+    },
   };
 }
 

@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import type {
   AgentRunHandle,
+  AgentRunStartContext,
   LocalAgentAdapterContract,
   RunEventDraft,
   RunEventSink,
@@ -78,13 +79,15 @@ import {
 } from "./internal/streamingSensitiveOutputRedactor.js";
 import {
   assertVerifiedPtyProcessBoundary,
-  spawnWindowsJobObjectProcess,
-  type WindowsJobObjectProcess,
 } from "./internal/windowsJobObjectProcess.js";
 import {
   hasFdAnchoredCliLaunchCapability,
-  spawnFdAnchoredCli,
 } from "./internal/fdAnchoredCliLaunch.js";
+import {
+  spawnManagedProcess,
+  type ManagedProcess,
+  type ManagedProcessCloseResult,
+} from "./internal/managedProcess.js";
 
 export { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/project-core";
 export {
@@ -145,7 +148,6 @@ interface AgentRunWatchdogPolicy {
   timeoutCheckName: string;
   timeoutMs: number;
   stallTelemetryMs: number;
-  killTimeoutMs: number;
 }
 
 type AgentRunTerminalKind =
@@ -175,17 +177,8 @@ interface AgentRunTerminalState {
   resolve: (kind: AgentRunTerminalKind) => void;
 }
 
-interface AgentCliProcessBoundary {
-  child: ChildProcess;
-  closed: Promise<AgentCliProcessCloseResult>;
-  launchFailure: Promise<Error | null>;
-  windowsJob: WindowsJobObjectProcess | null;
-}
-
-interface AgentCliProcessCloseResult {
-  exitCode: number | null;
-  signalCode: NodeJS.Signals | null;
-}
+type AgentCliProcessBoundary = ManagedProcess;
+type AgentCliProcessCloseResult = ManagedProcessCloseResult;
 
 export interface DiscoveryOptions {
   pathValue?: string;
@@ -220,6 +213,7 @@ export interface TerminalPersistenceFailure {
 }
 
 interface DeferredAgentRunStartOwner {
+  abortController: AbortController;
   bridgeCloseRequested: boolean;
   cancellationReason: string | null;
   completion: Promise<void>;
@@ -660,7 +654,7 @@ export class AgentBridge {
     this.closeReason = sanitizePublicEvidenceText(reason) || "AgentBridge is closing.";
     for (const owner of this.startOwners.values()) {
       owner.bridgeCloseRequested = true;
-      if (owner.cancellationReason === null) owner.cancellationReason = this.closeReason;
+      requestStartOwnerCancellation(owner, this.closeReason);
     }
     this.closePromise = this.performClose();
     return this.closePromise;
@@ -805,7 +799,11 @@ export class AgentBridge {
       const fallbackAdapter = input.agentKind === "agy" ? undefined : this.adapters.get("codex");
       const adapter = this.adapters.get(input.agentKind) ?? fallbackAdapter;
       if (!adapter) throw new Error(`No local adapter registered for ${input.agentKind}`);
-      handle = await adapter.startRun({ ...input, runId: run.id }, sink);
+      handle = await adapter.startRun(
+        { ...input, runId: run.id },
+        sink,
+        { signal: startOwner.abortController.signal },
+      );
     } catch (error) {
       const message = sanitizePublicProcessTextWithSensitiveValues(
         errorMessage(error),
@@ -887,7 +885,7 @@ export class AgentBridge {
     let cancelError: unknown = null;
     const startOwner = this.startOwners.get(runId);
     if (startOwner) {
-      if (startOwner.cancellationReason === null) startOwner.cancellationReason = reason;
+      requestStartOwnerCancellation(startOwner, reason);
       try {
         await startOwner.completion;
       } catch (error) {
@@ -1115,6 +1113,7 @@ export class AgentBridge {
 }
 
 function createDeferredAgentRunStartOwner(closeReason: string | null): DeferredAgentRunStartOwner {
+  const abortController = new AbortController();
   let resolve!: () => void;
   let reject!: (error: unknown) => void;
   const completion = new Promise<void>((resolvePromise, rejectPromise) => {
@@ -1122,7 +1121,8 @@ function createDeferredAgentRunStartOwner(closeReason: string | null): DeferredA
     reject = rejectPromise;
   });
   void completion.catch(() => undefined);
-  return {
+  const owner: DeferredAgentRunStartOwner = {
+    abortController,
     bridgeCloseRequested: closeReason !== null,
     cancellationReason: closeReason,
     completion,
@@ -1130,6 +1130,13 @@ function createDeferredAgentRunStartOwner(closeReason: string | null): DeferredA
     resolve,
     settled: false,
   };
+  if (closeReason !== null) abortController.abort(closeReason);
+  return owner;
+}
+
+function requestStartOwnerCancellation(owner: DeferredAgentRunStartOwner, reason: string): void {
+  if (owner.cancellationReason === null) owner.cancellationReason = reason;
+  if (!owner.abortController.signal.aborted) owner.abortController.abort(owner.cancellationReason);
 }
 
 export function createMockAgentAdapter(options: { holdOpen?: boolean } = {}): LocalAgentAdapterContract {
@@ -1856,8 +1863,6 @@ class HermesPlannerPtyTransportImpl implements HermesPlannerPtyTransport {
 class AgentRunWatchdog {
   private readonly childClosed: Promise<void>;
   private finalized = false;
-  private killTimer: NodeJS.Timeout | null = null;
-  private killEscalationPromise: Promise<void> | null = null;
   private terminateAndReapPromise: Promise<void> | null = null;
   private terminalState: AgentRunTerminalState | null = null;
   private timeoutTimer: NodeJS.Timeout | null = null;
@@ -1865,7 +1870,6 @@ class AgentRunWatchdog {
   private lastActivityAt = Date.now();
 
   constructor(
-    private readonly child: ChildProcess,
     private readonly processBoundary: AgentCliProcessBoundary,
     private readonly policy: AgentRunWatchdogPolicy,
     private readonly emit: (draft: RunEventDraft) => Promise<RunEvent>,
@@ -1982,6 +1986,10 @@ class AgentRunWatchdog {
     await this.completeTerminal({ kind: "start-abort", terminate: true, closeBeforeDrain: true });
   }
 
+  terminatePendingStart(): Promise<void> {
+    return this.terminateAndReap();
+  }
+
   private async expire(): Promise<void> {
     await this.completeTerminal({
       kind: "timeout",
@@ -2087,13 +2095,11 @@ class AgentRunWatchdog {
         await this.terminateAndReap();
       } else {
         await this.childClosed;
-        if (isProcessGroupAlive(this.child)) await this.terminateAndReap();
       }
     } catch (error) {
       state.phase = "closing";
       await this.closeRunResources().catch(() => undefined);
-      if (this.processBoundary.windowsJob) throw new Error("process-boundary-failure");
-      throw error;
+      throw new Error("process-boundary-failure", { cause: error });
     }
     if (!this.ownsTerminalExecution(state, generation)) return null;
 
@@ -2158,28 +2164,7 @@ class AgentRunWatchdog {
 
   private terminateAndReap(): Promise<void> {
     if (this.terminateAndReapPromise) return this.terminateAndReapPromise;
-    if (this.processBoundary.windowsJob) {
-      this.terminateAndReapPromise = this.processBoundary.windowsJob.terminateAndReap();
-      return this.terminateAndReapPromise;
-    }
-    this.terminateAndReapPromise = (async () => {
-      terminateProcessTree(this.child, "SIGTERM", { forceProcessGroup: true });
-      this.killEscalationPromise = new Promise((resolve) => {
-        this.killTimer = setTimeout(() => {
-          this.killTimer = null;
-          terminateProcessTree(this.child, "SIGKILL", { forceProcessGroup: true });
-          resolve();
-        }, this.policy.killTimeoutMs);
-      });
-      await this.childClosed;
-      if (!isProcessGroupAlive(this.child)) {
-        if (this.killTimer) clearTimeout(this.killTimer);
-        this.killTimer = null;
-        return;
-      }
-      await this.killEscalationPromise;
-      await waitForProcessGroupExit(this.child, Math.max(1_000, this.policy.killTimeoutMs));
-    })();
+    this.terminateAndReapPromise = this.processBoundary.terminateAndReap();
     return this.terminateAndReapPromise;
   }
 
@@ -2196,11 +2181,59 @@ function observeAgentCliProcessBoundary(
   watchdog: AgentRunWatchdog,
   onClose: (result: AgentCliProcessCloseResult) => Promise<AgentRunTerminalKind | void>,
 ): void {
-  const settlement = Promise.all([processBoundary.closed, processBoundary.launchFailure]).then(
-    ([result, launchFailure]) => launchFailure ? undefined : onClose(result),
+  const settlement = processBoundary.closed.then(
+    (result) => onClose(result),
     () => watchdog.completeProcessBoundaryFailure(),
   );
   void settlement.catch(() => undefined);
+}
+
+type AgentCliProcessReadiness =
+  | { kind: "ready" }
+  | { kind: "aborted" }
+  | { kind: "failed"; error: unknown };
+
+function waitForAgentCliProcessReady(
+  processBoundary: AgentCliProcessBoundary,
+  context: AgentRunStartContext | undefined,
+  terminateAndReap: () => Promise<void>,
+): Promise<AgentCliProcessReadiness> {
+  const signal = context?.signal;
+  if (!signal) {
+    return processBoundary.ready.then(
+      () => ({ kind: "ready" }),
+      (error: unknown) => ({ kind: "failed", error }),
+    );
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (readiness: AgentCliProcessReadiness): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(readiness);
+    };
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      void terminateAndReap().then(
+        () => resolve({ kind: "aborted" }),
+        () => resolve({ kind: "aborted" }),
+      );
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    void processBoundary.ready.then(
+      () => signal.aborted ? onAbort() : finish({ kind: "ready" }),
+      (error: unknown) => signal.aborted ? onAbort() : finish({ kind: "failed", error }),
+    );
+  });
 }
 
 export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): LocalAgentAdapterContract {
@@ -2228,7 +2261,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         codexAuthFilePath: options.codexAuthFilePath,
       });
     },
-    async startRun(input, sink) {
+    async startRun(input, sink, context) {
       const workdir = await resolveRunWorkdir(input, sink, "codex", "Codex CLI");
       if (!workdir) return noopRunHandle();
       const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : defaultSandbox;
@@ -2320,13 +2353,11 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
         throw error;
       }
       const child = processBoundary.child;
-      let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
       const outputReaders: Interface[] = [];
       const stderrLines: string[] = [];
       let stdoutFailureCategory: CliFailureCategory | null = null;
       const watchdog = new AgentRunWatchdog(
-        child,
         processBoundary,
         {
           source: "codex",
@@ -2334,7 +2365,6 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           timeoutCheckName: "Codex CLI watchdog",
           timeoutMs: options.timeoutMs ?? options.defaultWatchdogTimeoutMs ?? defaultRunWatchdogTimeoutMs,
           stallTelemetryMs: options.stallTelemetryMs ?? defaultStallTelemetryMs,
-          killTimeoutMs: options.killTimeoutMs ?? defaultKillTimeoutMs,
         },
         emit,
         drain,
@@ -2376,8 +2406,7 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       }
 
       const completeSpawnFailure = (error: Error) => {
-        if (spawnFailed || watchdog.isFinalized()) return;
-        spawnFailed = true;
+        if (watchdog.isFinalized()) return;
         const category = errorCategoryFromSpawnError(error);
         const publicMessage = sanitizePublicEvidenceText(error.message) || "Codex CLI spawn failed";
         void watchdog.completeSpawnError(
@@ -2390,14 +2419,12 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
               kind: "evidence",
               payload: {
                 exitCode: null,
-                checks: [
-                  {
-                    kind: "run-exit",
-                    name: "Codex CLI spawn",
-                    status: "failed",
-                    detail: `${category}: ${publicMessage}`,
-                  },
-                ],
+                checks: [{
+                  kind: "run-exit",
+                  name: "Codex CLI spawn",
+                  status: "failed",
+                  detail: `${category}: ${publicMessage}`,
+                }],
               },
             });
           },
@@ -2409,13 +2436,31 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
           },
         ).catch(() => undefined);
       };
-      if (!processBoundary.windowsJob) child.once("error", completeSpawnFailure);
-      void processBoundary.launchFailure.then((error) => {
-        if (error) completeSpawnFailure(error);
-      });
+
+      const readiness = await waitForAgentCliProcessReady(
+        processBoundary,
+        context,
+        () => watchdog.terminatePendingStart(),
+      );
+      if (readiness.kind === "aborted") {
+        return {
+          async cancel(reason) {
+            await watchdog.cancel(reason);
+          },
+        };
+      }
+      if (readiness.kind === "failed") {
+        completeSpawnFailure(
+          readiness.error instanceof Error ? readiness.error : new Error("Codex CLI spawn failed"),
+        );
+        return {
+          async cancel(reason) {
+            await watchdog.cancel(reason);
+          },
+        };
+      }
 
       observeAgentCliProcessBoundary(processBoundary, watchdog, async ({ exitCode: code, signalCode: signal }) => {
-        if (spawnFailed) return;
         const exitCode = typeof code === "number" ? code : null;
         const checkStatus = exitCode === 0 ? "passed" : "failed";
         const failureCategory = exitCode === 0 ? null : stdoutFailureCategory ?? processFailureCategory(stderrLines);
@@ -2523,7 +2568,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         authEnvNames: hermesAuthEnvNames,
       });
     },
-    async startRun(input, sink) {
+    async startRun(input, sink, context) {
       const workdir = await resolveRunWorkdir(input, sink, "hermes", "Hermes CLI");
       if (!workdir) return noopRunHandle();
       const sandbox = isCodexCliSandbox(input.sandbox) ? input.sandbox : "danger-full-access";
@@ -2612,7 +2657,6 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         throw error;
       }
       const child = processBoundary.child;
-      let spawnFailed = false;
       const { emit, drain } = createQueuedRunEventEmitter(sink);
       const stderrLines: string[] = [];
       let outputStopped = false;
@@ -2632,7 +2676,6 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         output?.flush();
       };
       watchdog = new AgentRunWatchdog(
-        child,
         processBoundary,
         {
           source: "hermes",
@@ -2640,7 +2683,6 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           timeoutCheckName: "Hermes CLI watchdog",
           timeoutMs: options.timeoutMs ?? options.defaultWatchdogTimeoutMs ?? defaultRunWatchdogTimeoutMs,
           stallTelemetryMs: options.stallTelemetryMs ?? defaultStallTelemetryMs,
-          killTimeoutMs: options.killTimeoutMs ?? defaultKillTimeoutMs,
         },
         emit,
         drain,
@@ -2660,8 +2702,7 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
       child.stderr?.on("data", onStderrData);
 
       const completeSpawnFailure = (error: Error) => {
-        if (spawnFailed || watchdog.isFinalized()) return;
-        spawnFailed = true;
+        if (watchdog.isFinalized()) return;
         artifactVerificationAbort.abort();
         const category = errorCategoryFromSpawnError(error);
         const publicMessage = sanitizePublicProcessTextWithSensitiveValues(
@@ -2678,14 +2719,12 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
               kind: "evidence",
               payload: {
                 exitCode: null,
-                checks: [
-                  {
-                    kind: "run-exit",
-                    name: "Hermes CLI spawn",
-                    status: "failed",
-                    detail: `${category}: ${publicMessage}`,
-                  },
-                ],
+                checks: [{
+                  kind: "run-exit",
+                  name: "Hermes CLI spawn",
+                  status: "failed",
+                  detail: `${category}: ${publicMessage}`,
+                }],
               },
             });
           },
@@ -2697,13 +2736,31 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
           },
         ).catch(() => undefined);
       };
-      if (!processBoundary.windowsJob) child.once("error", completeSpawnFailure);
-      void processBoundary.launchFailure.then((error) => {
-        if (error) completeSpawnFailure(error);
-      });
+
+      const readiness = await waitForAgentCliProcessReady(
+        processBoundary,
+        context,
+        () => watchdog.terminatePendingStart(),
+      );
+      if (readiness.kind === "aborted") {
+        return {
+          async cancel(reason) {
+            await watchdog.cancel(reason);
+          },
+        };
+      }
+      if (readiness.kind === "failed") {
+        completeSpawnFailure(
+          readiness.error instanceof Error ? readiness.error : new Error("Hermes CLI spawn failed"),
+        );
+        return {
+          async cancel(reason) {
+            await watchdog.cancel(reason);
+          },
+        };
+      }
 
       observeAgentCliProcessBoundary(processBoundary, watchdog, async ({ exitCode: code, signalCode: signal }) => {
-        if (spawnFailed) return;
         const exitCode = typeof code === "number" ? code : null;
         const checkStatus = exitCode === 0 ? "passed" : "failed";
         const failureCategory = exitCode === 0 ? null : processFailureCategory(stderrLines);
@@ -2812,39 +2869,17 @@ async function spawnAgentCliProcess(
   env: NodeJS.ProcessEnv,
   killTimeoutMs: number,
 ): Promise<AgentCliProcessBoundary> {
-  if (process.platform === "win32") {
-    if (sandbox !== "danger-full-access") throw new Error("Restricted Windows CLI launch is unavailable.");
-    const windowsJob = await spawnWindowsJobObjectProcess(executablePath, args, {
-      cwd,
-      env,
-      cleanupTimeoutMs: killTimeoutMs,
-    });
-    return {
-      child: windowsJob.child,
-      closed: windowsJob.closed,
-      launchFailure: Promise.resolve(null),
-      windowsJob,
-    };
-  }
-  if (worktreeFd === null) throw new Error("CLI worktree descriptor is unavailable.");
-  const launched = spawnFdAnchoredCli({
+  return spawnManagedProcess({
     agentKind,
     args,
+    cleanupTimeoutMs: killTimeoutMs,
+    cwd,
     env,
     executablePath,
     platform: process.platform,
     sandbox,
     worktreeFd,
   });
-  const child = launched.child;
-  return {
-    child,
-    closed: new Promise((resolve) => {
-      child.once("close", (exitCode, signalCode) => resolve({ exitCode, signalCode }));
-    }),
-    launchFailure: launched.launchFailure,
-    windowsJob: null,
-  };
 }
 
 function terminateProcessTree(
@@ -2865,29 +2900,6 @@ function terminateProcessTree(
   } catch {
     if (child.exitCode === null && child.signalCode === null) child.kill(signal);
   }
-}
-
-function isProcessGroupAlive(child: ChildProcess): boolean {
-  const pid = child.pid;
-  if (!pid || process.platform === "win32") return false;
-  try {
-    process.kill(-pid, 0);
-    return true;
-  } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error) {
-      if (error.code === "ESRCH") return false;
-      if (error.code === "EPERM") return true;
-    }
-    throw new Error("Agent process group state could not be confirmed.");
-  }
-}
-
-async function waitForProcessGroupExit(child: ChildProcess, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (isProcessGroupAlive(child) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  if (isProcessGroupAlive(child)) throw new Error("Agent process group remained alive after SIGKILL.");
 }
 
 function closeReadlineInterfaces(readers: Interface[]): void {
