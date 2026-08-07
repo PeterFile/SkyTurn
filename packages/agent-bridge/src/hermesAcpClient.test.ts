@@ -242,6 +242,9 @@ describe("Hermes ACP client", () => {
 
   it("launches the strict Hermes uv shim through its sibling interpreter without shell forks", async () => {
     const projectRoot = await makeProjectRoot();
+    const hermesHome = await mkdtemp(join(tmpdir(), "skyturn-acp-hermes-home-"));
+    projectRoots.push(hermesHome);
+    const canonicalHermesHome = await realpath(hermesHome);
     const executablePath = join(projectRoot, "hermes");
     const interpreterPath = join(projectRoot, "python3");
     await writeFile(executablePath, [
@@ -267,8 +270,9 @@ describe("Hermes ACP client", () => {
     managedProcessMock.spawn = spawn;
 
     await expect(createHermesAcpClient({
-      env: {},
+      env: { HERMES_HOME: canonicalHermesHome },
       executablePath,
+      platform: "darwin",
       projectRoot,
     })).rejects.toThrow("Hermes ACP initialization failed.");
     const launch = spawn.mock.calls[0]?.[0];
