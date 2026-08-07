@@ -52,6 +52,7 @@ export async function hasFdAnchoredCliLaunchCapability(
   const helperPath = fdLaunchHelperPath();
   try {
     await access(helperPath, fsConstants.X_OK);
+    await access(posixProcessOwnerHelperPath(), fsConstants.X_OK);
   } catch {
     return false;
   }
@@ -101,6 +102,10 @@ export function buildFdAnchoredCliLaunchPlan(
 
 function fdLaunchHelperPath(): string {
   return fileURLToPath(new URL("../native/fd-launch", import.meta.url));
+}
+
+function posixProcessOwnerHelperPath(): string {
+  return fileURLToPath(new URL("../native/posix-process-owner", import.meta.url));
 }
 
 function macOsReadOnlySandboxArgs(helperArgs: string[]): string[] {
