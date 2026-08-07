@@ -1,7 +1,40 @@
+import { spawn as spawnChildProcess } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+type SpawnManagedProcess = typeof import("./internal/managedProcess.js")["spawnManagedProcess"];
+type SpawnManagedProcessInput = Parameters<SpawnManagedProcess>[0];
+type ManagedProcess = Awaited<ReturnType<SpawnManagedProcess>>;
+
+const managedProcessMock = vi.hoisted(() => ({
+  spawn: null as SpawnManagedProcess | null,
+}));
+const fdAnchoredCapabilityMock = vi.hoisted(() => ({
+  available: true,
+}));
+
+vi.mock("./internal/managedProcess.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./internal/managedProcess.js")>();
+  return {
+    ...original,
+    spawnManagedProcess: (...args: Parameters<SpawnManagedProcess>) =>
+      managedProcessMock.spawn
+        ? managedProcessMock.spawn(...args)
+        : spawnManagedProcessFallback(...args),
+  };
+});
+vi.mock("./internal/fdAnchoredCliLaunch.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./internal/fdAnchoredCliLaunch.js")>();
+  return {
+    ...original,
+    hasFdAnchoredCliLaunchCapability: async () => fdAnchoredCapabilityMock.available,
+  };
+});
 
 import {
   createHermesAcpClient,
@@ -11,22 +44,29 @@ import {
 } from "./hermesAcpClient.js";
 
 const clients: HermesAcpClient[] = [];
+const clientProjectRoots = new WeakMap<HermesAcpClient, string>();
+const projectRoots: string[] = [];
+const require = createRequire(import.meta.url);
+const acpSdkModuleUrl = pathToFileURL(require.resolve("@agentclientprotocol/sdk")).href;
 
 afterEach(async () => {
+  managedProcessMock.spawn = null;
+  fdAnchoredCapabilityMock.available = true;
   await Promise.all(clients.splice(0).map((client) => client.close()));
+  await Promise.all(projectRoots.splice(0).map((projectRoot) => rm(projectRoot, { force: true, recursive: true })));
 });
 
 describe("Hermes ACP client", () => {
   it("uses one typed stdio connection for new, load, prompt, and text-only updates", async () => {
     const client = await testClient(agentScript());
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
     const chunks: string[] = [];
 
     const result = await client.prompt(sessionId, "Generate requirements.", {
       timeoutMs: 2_000,
       onText: (text) => chunks.push(text),
     });
-    await client.loadSession("/tmp", sessionId);
+    await client.loadSession(clientProjectRoot(client), sessionId);
 
     expect(sessionId).toBe("opaque-session-do-not-publish");
     expect(result).toEqual({ stopReason: "end_turn", markdown: "# Requirements\n\nComplete." });
@@ -39,7 +79,7 @@ describe("Hermes ACP client", () => {
 
   it("cancels and reports a bounded safe timeout error", async () => {
     const client = await testClient(agentScript({ hangPrompt: true }));
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
 
     await expect(client.prompt(sessionId, "Do not expose this prompt.", { timeoutMs: 20 })).rejects.toThrow(
       "Hermes ACP prompt timed out.",
@@ -50,19 +90,20 @@ describe("Hermes ACP client", () => {
   it("reports a bounded safe session creation timeout", async () => {
     const client = await testClient(agentScript({ hangNew: true }), { sessionRequestTimeoutMs: 20 });
 
-    await expect(client.newSession("/private/project-root")).rejects.toThrow(
+    await expect(client.newSession(clientProjectRoot(client))).rejects.toThrow(
       /^Hermes ACP session creation timed out\.$/,
     );
     expect(client.isClosed()).toBe(true);
   });
 
   it("aborts pending initialization and reaps the child before rejecting", async () => {
+    const projectRoot = await makeProjectRoot();
     const controller = new AbortController();
     const startedAt = Date.now();
     const pending = createHermesAcpClient({
       executablePath: process.execPath,
       args: ["--input-type=module", "--eval", agentScript({ hangInitialize: true })],
-      processCwd: process.cwd(),
+      processCwd: projectRoot,
       initializationTimeoutMs: 1_000,
       terminationGraceMs: 20,
       signal: controller.signal,
@@ -80,21 +121,233 @@ describe("Hermes ACP client", () => {
     expect(Date.now() - startedAt).toBeLessThan(500);
   });
 
+  it("aborts before managed readiness and waits for exactly one reap", async () => {
+    const projectRoot = await makeProjectRoot();
+    let releaseReap!: () => void;
+    const targetInput = new PassThrough();
+    const child = {
+      stderr: new PassThrough(),
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      once: vi.fn(),
+      on: vi.fn(),
+    };
+    const terminateAndReap = vi.fn(() => new Promise<void>((resolve) => {
+      releaseReap = resolve;
+    }));
+    managedProcessMock.spawn = vi.fn(async () => ({
+      child: child as never,
+      ready: new Promise<void>(() => {}),
+      closed: Promise.resolve({ exitCode: 0, signalCode: null }),
+      targetInput,
+      terminateAndReap,
+    }));
+    const controller = new AbortController();
+    const pending = createHermesAcpClient({
+      executablePath: process.execPath,
+      projectRoot,
+      initializationTimeoutMs: 2_000,
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(managedProcessMock.spawn).toHaveBeenCalledOnce());
+    controller.abort();
+
+    let settled = false;
+    const outcome = pending.catch((error: unknown) => {
+      settled = true;
+      return error;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(settled).toBe(false);
+    expect(terminateAndReap).toHaveBeenCalledTimes(1);
+    releaseReap();
+    await expect(outcome).resolves.toEqual(new Error("Hermes ACP initialization failed."));
+  });
+
+  it("bounds managed readiness with the initialization timeout and reaps before rejecting", async () => {
+    const projectRoot = await makeProjectRoot();
+    const terminateAndReap = vi.fn(async () => {});
+    managedProcessMock.spawn = vi.fn(async () => ({
+      child: {
+        stderr: new PassThrough(),
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+      } as never,
+      ready: new Promise<void>(() => {}),
+      closed: Promise.resolve({ exitCode: 0, signalCode: null }),
+      targetInput: new PassThrough(),
+      terminateAndReap,
+    }));
+    const pending = createHermesAcpClient({
+      executablePath: process.execPath,
+      initializationTimeoutMs: 20,
+      projectRoot,
+    });
+
+    const outcome = await Promise.race([
+      pending.catch((error: unknown) => error),
+      new Promise((resolve) => setTimeout(() => resolve(new Error("readiness deadline exceeded")), 200)),
+    ]);
+
+    expect(outcome).toEqual(new Error("Hermes ACP initialization failed."));
+    expect(terminateAndReap).toHaveBeenCalledOnce();
+  });
+
+  it("reports cleanup failure when pre-readiness initialization cannot verify reap", async () => {
+    const projectRoot = await makeProjectRoot();
+    const terminateAndReap = vi.fn(async () => {
+      throw new Error("private managed reap failure");
+    });
+    managedProcessMock.spawn = vi.fn(async () => ({
+      child: {
+        stderr: new PassThrough(),
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+      } as never,
+      ready: Promise.reject(new Error("private readiness failure")),
+      closed: Promise.resolve({ exitCode: 0, signalCode: null }),
+      targetInput: new PassThrough(),
+      terminateAndReap,
+    }));
+
+    await expect(createHermesAcpClient({
+      executablePath: process.execPath,
+      projectRoot,
+    })).rejects.toThrow("Hermes ACP process cleanup could not be verified.");
+    expect(terminateAndReap).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a verified pre-readiness reap distinct from the setup failure", async () => {
+    const projectRoot = await makeProjectRoot();
+    const terminateAndReap = vi.fn(async () => {});
+    managedProcessMock.spawn = vi.fn(async () => ({
+      child: {
+        stderr: new PassThrough(),
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+      } as never,
+      ready: Promise.reject(new Error("private readiness failure")),
+      closed: Promise.reject(new Error("private setup failure")),
+      targetInput: new PassThrough(),
+      terminateAndReap,
+    }));
+
+    await expect(createHermesAcpClient({
+      executablePath: process.execPath,
+      projectRoot,
+    })).rejects.toThrow("Hermes ACP initialization failed.");
+    expect(terminateAndReap).toHaveBeenCalledOnce();
+  });
+
+  it("launches the strict Hermes uv shim through its sibling interpreter without shell forks", async () => {
+    const projectRoot = await makeProjectRoot();
+    const hermesHome = await mkdtemp(join(tmpdir(), "skyturn-acp-hermes-home-"));
+    projectRoots.push(hermesHome);
+    const canonicalHermesHome = await realpath(hermesHome);
+    const executablePath = join(projectRoot, "hermes");
+    const interpreterPath = join(projectRoot, "python3");
+    await writeFile(executablePath, [
+      "#!/bin/sh",
+      `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python3' "$0" "$@"`,
+      "' '''",
+      "from hermes_cli.main import main",
+    ].join("\n"));
+    await writeFile(interpreterPath, "interpreter");
+    await Promise.all([chmod(executablePath, 0o755), chmod(interpreterPath, 0o755)]);
+    const terminateAndReap = vi.fn(async () => {});
+    const spawn = vi.fn(async (_input: SpawnManagedProcessInput) => ({
+      child: {
+        stderr: new PassThrough(),
+        stdin: new PassThrough(),
+        stdout: new PassThrough(),
+      } as never,
+      ready: Promise.reject(new Error("private readiness failure")),
+      closed: Promise.reject(new Error("private setup failure")),
+      targetInput: new PassThrough(),
+      terminateAndReap,
+    }));
+    managedProcessMock.spawn = spawn;
+
+    await expect(createHermesAcpClient({
+      env: { HERMES_HOME: canonicalHermesHome },
+      executablePath,
+      platform: "darwin",
+      projectRoot,
+    })).rejects.toThrow("Hermes ACP initialization failed.");
+    const launch = spawn.mock.calls[0]?.[0];
+    expect(launch?.args).toEqual([await realpath(executablePath), "acp"]);
+    expect(launch?.executablePath).toBe(await realpath(interpreterPath));
+  });
+
+  it("fails closed on Windows capability absence without spawning", async () => {
+    const spawn = vi.fn();
+    fdAnchoredCapabilityMock.available = false;
+    managedProcessMock.spawn = spawn;
+
+    await expect(createHermesAcpClient({
+      executablePath: process.execPath,
+      platform: "win32",
+      projectRoot: "C:\\repo",
+    })).rejects.toThrow("Hermes ACP initialization failed.");
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("reports a distinct bounded safe session loading timeout", async () => {
     const client = await testClient(agentScript({ hangLoad: true }), { sessionRequestTimeoutMs: 500 });
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
 
-    await expect(client.loadSession("/private/project-root", sessionId)).rejects.toThrow(
+    await expect(client.loadSession(clientProjectRoot(client), sessionId)).rejects.toThrow(
       /^Hermes ACP session loading timed out\.$/,
     );
     expect(client.isClosed()).toBe(true);
+  });
+
+  it("binds session creation to /dev/fd/3 and survives path replacement after the retained directory was opened", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-acp-fd3-"));
+    projectRoots.push(projectRoot);
+    const retainedRoot = `${projectRoot}-retained`;
+    await mkdir(join(projectRoot, ".git"), { recursive: true });
+    await writeFile(join(projectRoot, ".git", "anchor.txt"), "retained-anchor");
+    let capturedSpawnInput: SpawnManagedProcessInput | null = null;
+    managedProcessMock.spawn = vi.fn(async (input) => {
+      capturedSpawnInput = input;
+      return spawnManagedProcessFallback(input);
+    });
+    const client = await testClient(agentScript({ reflectFd3SessionNew: true }), {
+      projectRoot,
+      initializationTimeoutMs: 2_000,
+    });
+
+    await rename(projectRoot, retainedRoot);
+    projectRoots.push(retainedRoot);
+    await mkdir(join(projectRoot, ".git"), { recursive: true });
+    await writeFile(join(projectRoot, ".git", "anchor.txt"), "replacement-anchor");
+    const sessionId = await client.newSession(projectRoot);
+
+    expect(capturedSpawnInput).toMatchObject({
+      preserveWorktreeFd: true,
+      targetStdin: "pipe",
+      worktreeFd: expect.any(Number),
+    });
+    expect(sessionId).toContain("param:/dev/fd/3|");
+    expect(sessionId).toContain("|anchor:retained-anchor");
+  });
+
+  it("rejects session requests for a different project before ACP dispatch", async () => {
+    const projectRoot = await makeProjectRoot();
+    const client = await testClient(agentScript(), { projectRoot });
+    const sessionId = await client.newSession(projectRoot);
+
+    await expect(client.newSession("/other-repo")).rejects.toThrow(/project/i);
+    await expect(client.loadSession("/other-repo", sessionId)).rejects.toThrow(/project/i);
   });
 
   it("redacts an echoed opaque session id across arbitrary text chunks", async () => {
     const client = await testClient(agentScript({
       chunks: ["# Requirements\n\nopaque-sess", "ion-do-not-publish\n\nComplete."],
     }));
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
     const chunks: string[] = [];
 
     const result = await client.prompt(sessionId, "Generate requirements.", {
@@ -107,29 +360,29 @@ describe("Hermes ACP client", () => {
   });
 
   it("redacts the complete prompt and caller values before public output accounting", async () => {
-    const projectRoot = "/private/projects/skyturn-plan-secret";
-    const prompt = `Generate Requirements for Project root: ${projectRoot}`;
+    const privateProjectRoot = "/private/projects/skyturn-plan-secret";
+    const prompt = `Generate Requirements for Project root: ${privateProjectRoot}`;
     const ordinaryMarkdown = "# Requirements\n\nKeep **ordinary** Markdown intact.\n\n";
     const rawOutput = [
       ordinaryMarkdown,
       prompt,
-      projectRoot,
+      privateProjectRoot,
       "opaque-session-do-not-publish",
       "Complete.",
     ].join("\n\n");
     const client = await testClient(agentScript({ chunks: Array.from(rawOutput) }));
-    const sessionId = await client.newSession(projectRoot);
+    const sessionId = await client.newSession(clientProjectRoot(client));
     const chunks: string[] = [];
 
     const result = await client.prompt(sessionId, prompt, {
-      redactProjectRoot: projectRoot,
+      redactProjectRoot: privateProjectRoot,
       onText: (text) => chunks.push(text),
     });
 
     expect(chunks.join("")).toBe(result.markdown);
     expect(result.markdown.startsWith(ordinaryMarkdown)).toBe(true);
     expect(JSON.stringify({ chunks, result })).not.toContain(prompt);
-    expect(JSON.stringify({ chunks, result })).not.toContain(projectRoot);
+    expect(JSON.stringify({ chunks, result })).not.toContain(privateProjectRoot);
     expect(JSON.stringify({ chunks, result })).not.toContain(sessionId);
   });
 
@@ -139,7 +392,7 @@ describe("Hermes ACP client", () => {
       sessionId,
       chunks: ["# Requirements\n\nopaque-\ud83d", "\ude00-session-secret\n\nComplete."],
     }));
-    const rawSessionId = await client.newSession("/tmp");
+    const rawSessionId = await client.newSession(clientProjectRoot(client));
 
     const result = await client.prompt(rawSessionId, "Generate requirements.");
 
@@ -149,7 +402,7 @@ describe("Hermes ACP client", () => {
 
   it("fails closed when output ends with an unresolved session id prefix", async () => {
     const client = await testClient(agentScript({ chunks: ["# Requirements\n\nopaque-sess"] }));
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
 
     const result = await client.prompt(sessionId, "Generate requirements.");
 
@@ -175,7 +428,7 @@ describe("Hermes ACP client", () => {
 
     for (const testCase of cases) {
       const client = await testClient(agentScript({ chunks: testCase.chunks }));
-      const sessionId = await client.newSession(testCase.projectRoot);
+      const sessionId = await client.newSession(clientProjectRoot(client));
       const chunks: string[] = [];
 
       const result = await client.prompt(sessionId, testCase.prompt, {
@@ -191,7 +444,7 @@ describe("Hermes ACP client", () => {
 
   it("terminates the client without emitting a UTF-8 output chunk that exceeds the limit", async () => {
     const client = await testClient(agentScript({ chunks: ["ééééé"] }), { maxOutputBytes: 7 });
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
     const chunks: string[] = [];
 
     await expect(client.prompt(sessionId, "Generate requirements.", {
@@ -204,7 +457,7 @@ describe("Hermes ACP client", () => {
 
   it("applies the output byte limit after project-root redaction", async () => {
     const client = await testClient(agentScript({ chunks: ["/r/r/r"] }), { maxOutputBytes: 20 });
-    const sessionId = await client.newSession("/r");
+    const sessionId = await client.newSession(clientProjectRoot(client));
     const chunks: string[] = [];
 
     await expect(client.prompt(sessionId, "Generate requirements.", {
@@ -233,7 +486,7 @@ describe("Hermes ACP client", () => {
         exitMarkerPath,
         sessionId: secrets.sessionId,
       }), { terminationGraceMs: 100 });
-      const sessionId = await client.newSession("/tmp");
+      const sessionId = await client.newSession(clientProjectRoot(client));
 
       const failure = await client.prompt(sessionId, "Generate requirements.", {
         timeoutMs: 500,
@@ -257,7 +510,7 @@ describe("Hermes ACP client", () => {
 
   it("contains an output consumer exception raised while flushing a redacted terminal prefix", async () => {
     const client = await testClient(agentScript({ chunks: ["opaque-sess"] }), { terminationGraceMs: 20 });
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
 
     const failure = await client.prompt(sessionId, "Generate requirements.", {
       onText: () => {
@@ -501,7 +754,7 @@ describe("Hermes ACP client", () => {
       expect(pid).not.toBeNull();
       expect(isProcessAlive(pid!)).toBe(true);
 
-      const failure = await client.newSession("/tmp").catch((error: unknown) => error);
+      const failure = await client.newSession(clientProjectRoot(client)).catch((error: unknown) => error);
       const exposed = `${String(failure)}${JSON.stringify([...consoleError.mock.calls, ...consoleWarn.mock.calls])}`;
 
       expect(failure).toEqual(new Error("Hermes ACP session creation failed."));
@@ -578,7 +831,7 @@ describe("Hermes ACP client", () => {
         responseMarkerPath,
       }));
 
-      await expect(client.newSession("/tmp")).resolves.toBe("chunked-session");
+      await expect(client.newSession(clientProjectRoot(client))).resolves.toBe("chunked-session");
       const recorded = JSON.parse(await readFile(responseMarkerPath, "utf8"));
       expect(recorded).toEqual(response);
       for (const secret of deepStrings(params)) expect(JSON.stringify(recorded)).not.toContain(secret);
@@ -635,7 +888,7 @@ describe("Hermes ACP client", () => {
       expect(pid).not.toBeNull();
       expect(isProcessAlive(pid!)).toBe(true);
 
-      const failure = await client.newSession("/tmp").catch((error: unknown) => error);
+      const failure = await client.newSession(clientProjectRoot(client)).catch((error: unknown) => error);
       const exposed = `${String(failure)}${JSON.stringify([...consoleError.mock.calls, ...consoleWarn.mock.calls])}`;
 
       expect(failure).toEqual(new Error("Hermes ACP session creation failed."));
@@ -659,12 +912,12 @@ describe("Hermes ACP client", () => {
     const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const client = await testClient(rawAgentScript({ sessionNewError: secrets }));
-      const failure = await client.newSession("/tmp").catch((error: unknown) => error);
+      const failure = await client.newSession(clientProjectRoot(client)).catch((error: unknown) => error);
       const exposed = `${String(failure)}${JSON.stringify([...consoleError.mock.calls, ...consoleWarn.mock.calls])}`;
 
       expect(failure).toEqual(new Error("Hermes ACP session creation failed."));
       expect(client.isClosed()).toBe(false);
-      await client.loadSession("/tmp", "chunked-session");
+      await client.loadSession(clientProjectRoot(client), "chunked-session");
       for (const secret of Object.values(secrets)) expect(exposed).not.toContain(secret);
     } finally {
       consoleError.mockRestore();
@@ -677,7 +930,7 @@ describe("Hermes ACP client", () => {
       chunkValidMessages: true,
       validNonTextNotifications: true,
     }));
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
 
     const result = await client.prompt(sessionId, "Generate requirements.");
 
@@ -689,10 +942,11 @@ describe("Hermes ACP client", () => {
     const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     try {
       const client = await testClient(rawAgentScript({ reverseConcurrentResponses: true }));
+      const projectRoot = clientProjectRoot(client);
 
       const [sessionId] = await Promise.all([
-        client.newSession("/tmp"),
-        client.loadSession("/tmp", "chunked-session"),
+        client.newSession(projectRoot),
+        client.loadSession(projectRoot, "chunked-session"),
       ]);
       const diagnostics = JSON.stringify([...consoleError.mock.calls, ...consoleWarn.mock.calls]);
 
@@ -710,7 +964,7 @@ describe("Hermes ACP client", () => {
       cancelTimeoutMs: 20,
       terminationGraceMs: 20,
     } as HermesAcpClientOptions & { maxInboundLineBytes: number; cancelTimeoutMs: number });
-    const sessionId = await client.newSession("/tmp");
+    const sessionId = await client.newSession(clientProjectRoot(client));
     const prompt = client.prompt(sessionId, "p".repeat(256_000), { timeoutMs: 5_000 }).catch(() => undefined);
     await new Promise((resolve) => setTimeout(resolve, 10));
     const testDeadline = new Promise<never>((_resolve, reject) => {
@@ -736,26 +990,108 @@ describe("Hermes ACP client", () => {
     await firstClose;
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(10);
   });
+
+  it("rejects close when managed process cleanup cannot be verified", async () => {
+    managedProcessMock.spawn = vi.fn(async (input) => {
+      const managed = await spawnManagedProcessFallback(input);
+      return {
+        ...managed,
+        closed: managed.closed.then(() => {
+          throw new Error("private managed close failure");
+        }),
+        terminateAndReap: vi.fn(async () => {
+          await managed.terminateAndReap();
+          throw new Error("private managed reap failure");
+        }),
+      };
+    });
+    const client = await testClient(agentScript());
+    clients.splice(clients.indexOf(client), 1);
+
+    const closing = client.close();
+
+    await expect(closing).rejects.toThrow("Hermes ACP process cleanup could not be verified.");
+    expect(client.close()).toBe(closing);
+  });
 });
 
 async function testClient(
   script: string,
   options: HermesAcpClientOptions = {},
 ): Promise<HermesAcpClient> {
+  const projectRoot = options.projectRoot ? options.projectRoot : await makeProjectRoot();
   const client = await createHermesAcpClient({
     executablePath: process.execPath,
     args: ["--input-type=module", "--eval", script],
-    processCwd: process.cwd(),
+    processCwd: projectRoot,
     initializationTimeoutMs: 2_000,
+    projectRoot,
     ...options,
   });
+  clientProjectRoots.set(client, projectRoot);
   clients.push(client);
   return client;
+}
+
+function clientProjectRoot(client: HermesAcpClient): string {
+  const projectRoot = clientProjectRoots.get(client);
+  if (!projectRoot) throw new Error("Missing test project root.");
+  return projectRoot;
+}
+
+async function makeProjectRoot(): Promise<string> {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-acp-project-"));
+  projectRoots.push(projectRoot);
+  await mkdir(join(projectRoot, ".git"), { recursive: true });
+  return projectRoot;
+}
+
+async function spawnManagedProcessFallback(input: SpawnManagedProcessInput): Promise<ManagedProcess> {
+  const child = spawnChildProcess(input.executablePath, input.args, {
+    cwd: input.cwd,
+    env: input.env,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const closed = new Promise<{ exitCode: number | null; signalCode: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (exitCode, signalCode) => resolve({ exitCode, signalCode }));
+  });
+  let termination: Promise<void> | null = null;
+  return {
+    child,
+    ready: Promise.resolve(),
+    closed,
+    targetInput: child.stdin,
+    terminateAndReap() {
+      if (!termination) {
+        termination = (async () => {
+          if (child.exitCode === null && child.signalCode === null) {
+            try {
+              child.kill("SIGTERM");
+            } catch {}
+          }
+          const settled = await Promise.race([
+            closed.then(() => true, () => true),
+            new Promise<false>((resolve) => setTimeout(() => resolve(false), input.cleanupTimeoutMs)),
+          ]);
+          if (!settled && child.exitCode === null && child.signalCode === null) {
+            try {
+              child.kill("SIGKILL");
+            } catch {}
+          }
+          await closed.catch(() => undefined);
+        })();
+      }
+      return termination;
+    },
+  };
 }
 
 function agentScript(options: {
   chunks?: string[];
   exitMarkerPath?: string;
+  reflectFd3SessionNew?: boolean;
   hangLoad?: boolean;
   hangInitialize?: boolean;
   hangNew?: boolean;
@@ -776,7 +1112,7 @@ function agentScript(options: {
   return `
     import { Readable, Writable } from "node:stream";
     import { writeFileSync } from "node:fs";
-    import * as acp from "@agentclientprotocol/sdk";
+    import * as acp from ${JSON.stringify(acpSdkModuleUrl)};
     const sessionId = ${JSON.stringify(options.sessionId ?? "opaque-session-do-not-publish")};
     ${options.pidMarkerPath ? `writeFileSync(${JSON.stringify(options.pidMarkerPath)}, String(process.pid));` : ""}
     ${options.exitMarkerPath ? `
@@ -799,8 +1135,12 @@ function agentScript(options: {
           agentCapabilities: { loadSession: true },
         };
       })
-      .onRequest(acp.methods.agent.session.new, async () => {
-        ${options.hangNew ? "await new Promise(() => {});" : "return { sessionId };"}
+      .onRequest(acp.methods.agent.session.new, async ({ params }) => {
+        ${options.hangNew ? "await new Promise(() => {});" : options.reflectFd3SessionNew ? `
+        const fs = await import("node:fs");
+        return {
+          sessionId: \`param:\${params.cwd}|cwd:\${process.cwd()}|fd3dir:\${fs.fstatSync(3).isDirectory()}|anchor:\${fs.readFileSync(".git/anchor.txt", "utf8")}\`,
+        };` : "return { sessionId };"}
       })
       .onRequest(acp.methods.agent.session.load, async ({ params }) => {
         ${options.hangLoad ? "await new Promise(() => {});" : ""}

@@ -1,6 +1,9 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { constants as osConstants } from "node:os";
-import { type Readable, type Writable } from "node:stream";
+import { fstatSync } from "node:fs";
+import { realpath, stat } from "node:fs/promises";
+import { constants as osConstants, homedir } from "node:os";
+import { isAbsolute, join, relative, sep } from "node:path";
+import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type { AgentRunSandbox } from "@skyturn/project-core";
@@ -19,6 +22,7 @@ export interface PosixManagedProcess {
   child: ChildProcess;
   ready: Promise<void>;
   closed: Promise<PosixManagedProcessCloseResult>;
+  targetInput: Writable | null;
   terminateAndReap(): Promise<void>;
 }
 
@@ -29,7 +33,10 @@ export interface SpawnPosixManagedProcessInput {
   env: NodeJS.ProcessEnv;
   executablePath: string;
   platform: NodeJS.Platform;
+  preserveWorktreeFd: boolean;
+  projectRoot: string;
   sandbox: AgentRunSandbox;
+  targetStdin: "null" | "pipe";
   worktreeFd: number;
 }
 
@@ -38,23 +45,23 @@ export async function spawnPosixManagedProcess(
 ): Promise<PosixManagedProcess> {
   if (input.platform === "win32") throw new Error(capabilityError);
   const ownerPath = fileURLToPath(new URL("../native/posix-process-owner", import.meta.url));
-  const launch = buildFdAnchoredCliLaunchPlan(input);
+  const hermesStateRoot = await resolveHermesStateRoot(input);
+  const launch = buildFdAnchoredCliLaunchPlan({ ...input, hermesStateRoot });
+  const targetArgs = launch.wrapper
+    ? [launch.wrapper.executablePath, ...launch.wrapper.args, launch.fdLaunchPath, ...launch.fdLaunchArgs]
+    : [launch.fdLaunchPath, ...launch.fdLaunchArgs];
   const ownerArgs = [
     String(boundedCleanupTimeout(input.cleanupTimeoutMs)),
-    launch.fdLaunchPath,
-    ...launch.fdLaunchArgs,
+    ...(input.targetStdin === "pipe" ? ["--target-stdin"] : []),
+    ...targetArgs,
   ];
-  const executablePath = launch.wrapper?.executablePath ?? ownerPath;
-  const args = launch.wrapper
-    ? [...launch.wrapper.args, ownerPath, ...ownerArgs]
-    : ownerArgs;
   let child: ChildProcess;
   try {
-    child = spawn(executablePath, args, {
+    child = spawn(ownerPath, ownerArgs, {
       detached: true,
       env: input.env,
       shell: false,
-      stdio: ["pipe", "pipe", "pipe", input.worktreeFd, "pipe"],
+      stdio: ["pipe", "pipe", "pipe", input.worktreeFd, "pipe", input.targetStdin === "pipe" ? "pipe" : "ignore"],
     });
   } catch (error) {
     throw new Error(capabilityError, { cause: error });
@@ -65,12 +72,66 @@ export async function spawnPosixManagedProcess(
   return protocol;
 }
 
+async function resolveHermesStateRoot(
+  input: SpawnPosixManagedProcessInput,
+): Promise<string | undefined> {
+  if (
+    input.agentKind !== "hermes" ||
+    input.platform !== "darwin" ||
+    input.sandbox === "danger-full-access"
+  ) {
+    return undefined;
+  }
+  const configuredRoot = input.env.HERMES_HOME?.trim();
+  const home = input.env.HOME?.trim() || homedir();
+  const requestedRoot = configuredRoot || join(home, ".hermes");
+  if (!isAbsolute(requestedRoot)) throw new Error(capabilityError);
+  try {
+    const [stateRoot, projectRoot] = await Promise.all([
+      realpath(requestedRoot),
+      realpath(input.projectRoot),
+    ]);
+    const [stateRootStat, projectRootStat] = await Promise.all([
+      stat(stateRoot),
+      stat(projectRoot),
+    ]);
+    const retainedRootStat = fstatSync(input.worktreeFd);
+    if (
+      !stateRootStat.isDirectory() ||
+      !projectRootStat.isDirectory() ||
+      projectRootStat.dev !== retainedRootStat.dev ||
+      projectRootStat.ino !== retainedRootStat.ino ||
+      pathsOverlap(stateRoot, projectRoot)
+    ) {
+      throw new Error(capabilityError);
+    }
+    return stateRoot;
+  } catch (error) {
+    if (error instanceof Error && error.message === capabilityError) throw error;
+    throw new Error(capabilityError, { cause: error });
+  }
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return isWithin(left, right) || isWithin(right, left);
+}
+
+function isWithin(parent: string, child: string): boolean {
+  const childRelativePath = relative(parent, child);
+  return childRelativePath === "" ||
+    childRelativePath !== ".." &&
+    !childRelativePath.startsWith(`..${sep}`) &&
+    !isAbsolute(childRelativePath);
+}
+
 function attachPosixManagedProcessProtocol(child: ChildProcess): PosixManagedProcess {
   const ready = deferred<void>();
   const closed = deferred<PosixManagedProcessCloseResult>();
   const reaped = deferred<void>();
   const control = child.stdin as Writable | null;
   const status = child.stdio[4] as Readable | null;
+  const targetStdio = (child.stdio as Array<Readable | Writable | null | undefined>)[5];
+  const targetInput = targetStdio instanceof Writable ? targetStdio : null;
   let buffer = "";
   let closeAcknowledgement: PosixManagedProcessCloseResult | null = null;
   let closedSettled = false;
@@ -95,6 +156,7 @@ function attachPosixManagedProcessProtocol(child: ChildProcess): PosixManagedPro
     child.off("error", onProtocolFailure);
     status?.destroy();
     control?.destroy();
+    targetInput?.destroy();
   }
 
   function rejectReady(error: Error): void {
@@ -247,6 +309,7 @@ function attachPosixManagedProcessProtocol(child: ChildProcess): PosixManagedPro
     child,
     ready: ready.promise,
     closed: closed.promise,
+    targetInput,
     terminateAndReap,
   };
 }

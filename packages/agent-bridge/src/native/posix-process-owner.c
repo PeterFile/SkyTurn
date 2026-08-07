@@ -19,6 +19,7 @@
 
 #define SKYTURN_WORKTREE_FD 3
 #define SKYTURN_OWNER_STATUS_FD 4
+#define SKYTURN_TARGET_STDIN_FD 5
 #define OWNER_FAILURE_STATUS 70
 #define CONTROL_POLL_MS 10
 
@@ -192,17 +193,24 @@ static void fail_root_launch(int launch_status_fd) {
   _exit(126);
 }
 
-static pid_t launch_root(char *const launcher_argv[], int launch_status_pipe[2]) {
+static pid_t launch_root(char *const launcher_argv[], int launch_status_pipe[2], int use_target_stdin) {
   pid_t root_pid = fork();
   if (root_pid != 0) return root_pid;
 
   (void)signal(SIGPIPE, SIG_DFL);
   if (setpgid(0, 0) != 0) fail_root_launch(launch_status_pipe[1]);
-  int null_input = open("/dev/null", O_RDONLY);
-  if (null_input < 0 || dup2(null_input, STDIN_FILENO) < 0) {
-    fail_root_launch(launch_status_pipe[1]);
+  if (use_target_stdin) {
+    if (fcntl(SKYTURN_TARGET_STDIN_FD, F_GETFD) < 0 || dup2(SKYTURN_TARGET_STDIN_FD, STDIN_FILENO) < 0) {
+      fail_root_launch(launch_status_pipe[1]);
+    }
+    if (SKYTURN_TARGET_STDIN_FD != STDIN_FILENO) close(SKYTURN_TARGET_STDIN_FD);
+  } else {
+    int null_input = open("/dev/null", O_RDONLY);
+    if (null_input < 0 || dup2(null_input, STDIN_FILENO) < 0) {
+      fail_root_launch(launch_status_pipe[1]);
+    }
+    if (null_input != STDIN_FILENO) close(null_input);
   }
-  if (null_input != STDIN_FILENO) close(null_input);
   close(launch_status_pipe[0]);
   if (dup2(launch_status_pipe[1], SKYTURN_OWNER_STATUS_FD) < 0) {
     fail_root_launch(launch_status_pipe[1]);
@@ -215,14 +223,25 @@ static pid_t launch_root(char *const launcher_argv[], int launch_status_pipe[2])
 
 int main(int argc, char *argv[]) {
   int cleanup_timeout_ms = 0;
+  int launcher_index = 2;
+  int use_target_stdin = 0;
   struct stat worktree;
+  if (argc > 2 && argv[2] != NULL && strcmp(argv[2], "--target-stdin") == 0) {
+    use_target_stdin = 1;
+    launcher_index = 3;
+  }
   if (
-    argc < 4 ||
+    argc <= launcher_index ||
     !parse_cleanup_timeout(argv[1], &cleanup_timeout_ms) ||
-    argv[2] == NULL || argv[2][0] != '/' ||
+    argv[launcher_index] == NULL || argv[launcher_index][0] != '/' ||
+    (use_target_stdin && fcntl(SKYTURN_TARGET_STDIN_FD, F_GETFD) < 0) ||
     fstat(SKYTURN_WORKTREE_FD, &worktree) != 0 || !S_ISDIR(worktree.st_mode) ||
     !set_close_on_exec(SKYTURN_OWNER_STATUS_FD)
   ) {
+    write_failed();
+    return OWNER_FAILURE_STATUS;
+  }
+  if (!use_target_stdin && close(SKYTURN_TARGET_STDIN_FD) != 0 && errno != EBADF) {
     write_failed();
     return OWNER_FAILURE_STATUS;
   }
@@ -244,11 +263,12 @@ int main(int argc, char *argv[]) {
     return OWNER_FAILURE_STATUS;
   }
 
-  pid_t root_pid = launch_root(&argv[2], launch_status_pipe);
+  pid_t root_pid = launch_root(&argv[launcher_index], launch_status_pipe, use_target_stdin);
   if (root_pid < 0) {
     write_failed();
     return OWNER_FAILURE_STATUS;
   }
+  if (use_target_stdin) close(SKYTURN_TARGET_STDIN_FD);
   close(launch_status_pipe[1]);
   RootStatus root = {0, 0};
   int group_ready = prepare_root_group(root_pid);

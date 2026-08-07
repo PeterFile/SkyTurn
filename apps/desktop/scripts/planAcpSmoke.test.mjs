@@ -40,6 +40,37 @@ test("live ACP seam runs one Requirements prompt without exposing the raw sessio
   ]);
 });
 
+test("live ACP seam binds the default client factory to the project root", async () => {
+  const calls = [];
+  const client = {
+    async newSession(cwd) {
+      calls.push(["new", cwd]);
+      return "opaque-session-secret";
+    },
+    async prompt() {
+      return { stopReason: "end_turn", markdown: "# Requirements" };
+    },
+    close() {
+      calls.push(["close"]);
+    },
+  };
+
+  await runPlanAcpSmoke({
+    projectRoot: "/repo-bound",
+    createClient: async (projectRoot) => {
+      calls.push(["create", projectRoot]);
+      return client;
+    },
+    buildPrompt: () => "safe smoke prompt",
+  });
+
+  assert.deepEqual(calls, [
+    ["create", "/repo-bound"],
+    ["new", "/repo-bound"],
+    ["close"],
+  ]);
+});
+
 test("live ACP seam does not resolve before the client is reaped", async () => {
   let releaseClose;
   const client = {

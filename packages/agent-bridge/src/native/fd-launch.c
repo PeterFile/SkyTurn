@@ -25,13 +25,30 @@ int main(int argc, char *argv[]) {
     return fail("invalid status descriptor", 65);
   }
 
-  int executable_index = 1;
+  int executable_index = 0;
   int require_git_metadata = 0;
-  if (argc > 1 && argv[1] != NULL && strcmp(argv[1], "--require-git") == 0) {
-    require_git_metadata = 1;
-    executable_index = 2;
+  int preserve_worktree_fd = 0;
+  for (int index = 1; index < argc; index += 1) {
+    if (argv[index] == NULL) {
+      return fail("invalid launcher", 64);
+    }
+    if (argv[index][0] != '-') {
+      executable_index = index;
+      break;
+    }
+    if (strcmp(argv[index], "--require-git") == 0) {
+      if (require_git_metadata) return fail("duplicate --require-git", 64);
+      require_git_metadata = 1;
+      continue;
+    }
+    if (strcmp(argv[index], "--preserve-worktree-fd") == 0) {
+      if (preserve_worktree_fd) return fail("duplicate --preserve-worktree-fd", 64);
+      preserve_worktree_fd = 1;
+      continue;
+    }
+    return fail("invalid option", 64);
   }
-  if (argc <= executable_index || argv[executable_index] == NULL || argv[executable_index][0] != '/') {
+  if (executable_index == 0 || argc <= executable_index || argv[executable_index] == NULL || argv[executable_index][0] != '/') {
     return fail("invalid launcher", 64);
   }
 
@@ -59,8 +76,14 @@ int main(int argc, char *argv[]) {
     return fail("cannot enter worktree descriptor", 66);
   }
 
-  if (fcntl(SKYTURN_WORKTREE_FD, F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
-    return fail("cannot protect worktree descriptor", 66);
+  int next_descriptor_flags = preserve_worktree_fd
+    ? (descriptor_flags & ~FD_CLOEXEC)
+    : (descriptor_flags | FD_CLOEXEC);
+  if (fcntl(SKYTURN_WORKTREE_FD, F_SETFD, next_descriptor_flags) != 0) {
+    return fail(
+      preserve_worktree_fd ? "cannot preserve worktree descriptor" : "cannot protect worktree descriptor",
+      66
+    );
   }
 
   execv(argv[executable_index], &argv[executable_index]);

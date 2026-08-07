@@ -1,5 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { isAbsolute } from "node:path";
+import { constants as fsConstants } from "node:fs";
+import { access, open, realpath, type FileHandle } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import {
@@ -15,11 +16,22 @@ import {
   type StopReason,
   type Stream,
 } from "@agentclientprotocol/sdk";
+import {
+  hasFdAnchoredCliLaunchCapability,
+} from "./internal/fdAnchoredCliLaunch.js";
+import {
+  spawnManagedProcess,
+  type ManagedProcess,
+} from "./internal/managedProcess.js";
+import { resolveCliExecutable } from "./internal/resolveCliExecutable.js";
 
 export interface HermesAcpClientOptions {
   executablePath?: string;
   args?: string[];
   env?: NodeJS.ProcessEnv;
+  pathValue?: string;
+  platform?: NodeJS.Platform;
+  projectRoot?: string;
   processCwd?: string;
   initializationTimeoutMs?: number;
   cancelTimeoutMs?: number;
@@ -69,10 +81,12 @@ const maxPublicBytes = 2_000_000;
 const defaultMaxInboundLineBytes = maxPublicBytes;
 const defaultMaxOutputBytes = maxPublicBytes;
 const defaultTerminationGraceMs = 1_000;
+const retainedProjectRootAlias = "/dev/fd/3";
 const outputLimitError = "Hermes ACP output limit exceeded.";
 const outputConsumerError = "Hermes ACP output consumer failed.";
 const inboundTransportError = "Hermes ACP inbound transport failed.";
 const remoteOperationError = "Hermes ACP remote operation failed.";
+const processCleanupError = "Hermes ACP process cleanup could not be verified.";
 
 interface AcpWireSchema {
   safeParse(value: unknown): { success: true; data: unknown } | { success: false };
@@ -122,30 +136,143 @@ export async function createHermesAcpClient(
     maxPublicBytes,
     "Hermes ACP initialization failed.",
   );
-  const child = spawn(options.executablePath ?? "hermes", options.args ?? ["acp"], {
-    cwd: options.processCwd,
-    env: options.env ?? process.env,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  const instance = new HermesAcpClientImpl(
-    child,
-    options.sessionRequestTimeoutMs ?? defaultSessionRequestTimeoutMs,
-    options.cancelTimeoutMs ?? defaultCancelTimeoutMs,
-    maxInboundLineBytes,
-    maxOutputBytes,
-    options.terminationGraceMs ?? defaultTerminationGraceMs,
-  );
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const projectRoot = normalizeProjectRoot(options.projectRoot, options.processCwd);
+  let projectRootHandle: FileHandle | null = null;
+  let managedProcess: ManagedProcess | null = null;
+  let closeManagedProcess: (() => Promise<void>) | null = null;
+  let instance: HermesAcpClientImpl | null = null;
   try {
+    if (!(await hasFdAnchoredCliLaunchCapability({
+      agentKind: "hermes",
+      platform,
+      sandbox: "read-only",
+    }))) {
+      throw new Error("Hermes ACP initialization failed.");
+    }
+    const resolvedExecutablePath = await resolveCliExecutable(
+      options.executablePath,
+      ["hermes"],
+      options.pathValue ?? env.PATH ?? process.env.PATH ?? "",
+    );
+    if (!resolvedExecutablePath) throw new Error("Hermes ACP initialization failed.");
+    const command = await resolveHermesAcpCommand(
+      resolvedExecutablePath,
+      options.args ?? ["acp"],
+      platform,
+    );
+
+    projectRootHandle = await open(
+      projectRoot,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    if (!(await projectRootHandle.stat()).isDirectory()) {
+      throw new Error("Hermes ACP initialization failed.");
+    }
+    managedProcess = await spawnManagedProcess({
+      agentKind: "hermes",
+      args: command.args,
+      cleanupTimeoutMs: options.terminationGraceMs ?? defaultTerminationGraceMs,
+      cwd: projectRoot,
+      env,
+      executablePath: command.executablePath,
+      platform,
+      preserveWorktreeFd: true,
+      sandbox: "read-only",
+      targetStdin: "pipe",
+      worktreeFd: projectRootHandle.fd,
+    });
+
+    const processClosed = managedProcess.closed.then(() => undefined);
+    const closeProjectRootHandle = async (): Promise<void> => {
+      if (!projectRootHandle) return;
+      const handle = projectRootHandle;
+      projectRootHandle = null;
+      await handle.close();
+    };
+    const projectRootHandleClosed = processClosed.then(closeProjectRootHandle, closeProjectRootHandle);
+    closeManagedProcess = onceAsync(async () => {
+      const cleanup = await Promise.allSettled([
+        managedProcess!.terminateAndReap(),
+        projectRootHandleClosed,
+      ]);
+      if (cleanup.some((result) => result.status === "rejected")) {
+        throw new Error(processCleanupError);
+      }
+    });
+    const initializationTimeoutMs = options.initializationTimeoutMs ?? defaultInitializationTimeoutMs;
+    await awaitWithAbortAndTimeout(managedProcess.ready, initializationTimeoutMs, options.signal);
+
+    if (!managedProcess.targetInput || !managedProcess.child.stdout || !managedProcess.child.stderr) {
+      throw new Error("Hermes ACP initialization failed.");
+    }
+    instance = new HermesAcpClientImpl(
+      projectRoot,
+      managedProcess.targetInput,
+      managedProcess.child.stdout,
+      managedProcess.child.stderr,
+      processClosed,
+      closeManagedProcess,
+      options.sessionRequestTimeoutMs ?? defaultSessionRequestTimeoutMs,
+      options.cancelTimeoutMs ?? defaultCancelTimeoutMs,
+      maxInboundLineBytes,
+      maxOutputBytes,
+    );
+
     await initializeWithAbort(
       instance,
-      options.initializationTimeoutMs ?? defaultInitializationTimeoutMs,
+      initializationTimeoutMs,
       options.signal,
     );
     return instance;
   } catch {
-    await instance.close();
+    try {
+      if (instance) await instance.close();
+      else if (closeManagedProcess) await closeManagedProcess();
+      else await projectRootHandle?.close();
+    } catch {
+      throw new Error(processCleanupError);
+    }
     throw new Error("Hermes ACP initialization failed.");
   }
+}
+
+async function resolveHermesAcpCommand(
+  executablePath: string,
+  args: string[],
+  platform: NodeJS.Platform,
+): Promise<{ args: string[]; executablePath: string }> {
+  const canonicalExecutablePath = await realpath(executablePath);
+  if (platform !== "darwin") {
+    return { args, executablePath: canonicalExecutablePath };
+  }
+  const executable = await open(
+    canonicalExecutablePath,
+    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+  );
+  let prefix = "";
+  try {
+    const buffer = Buffer.alloc(512);
+    const { bytesRead } = await executable.read(buffer, 0, buffer.length, 0);
+    prefix = buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await executable.close();
+  }
+  const uvShimPrefix = [
+    "#!/bin/sh",
+    `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python3' "$0" "$@"`,
+    "' '''",
+  ].join("\n");
+  if (!prefix.startsWith(`${uvShimPrefix}\n`)) {
+    return { args, executablePath: canonicalExecutablePath };
+  }
+  const interpreterPath = join(dirname(canonicalExecutablePath), "python3");
+  await access(interpreterPath, fsConstants.X_OK);
+  return {
+    args: [canonicalExecutablePath, ...args],
+    executablePath: interpreterPath,
+  };
 }
 
 async function initializeWithAbort(
@@ -171,36 +298,75 @@ async function initializeWithAbort(
   }
 }
 
+async function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  let rejectAbort = (_error: Error): void => {};
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+  });
+  const abort = (): void => rejectAbort(new Error("Hermes ACP initialization aborted."));
+  signal.addEventListener("abort", abort, { once: true });
+  if (signal.aborted) abort();
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+async function awaitWithAbortAndTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const timedOut = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error("Hermes ACP initialization timed out.")), timeoutMs);
+    });
+    return await awaitWithAbort(Promise.race([promise, timedOut]), signal);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function normalizeProjectRoot(projectRoot: string | undefined, processCwd: string | undefined): string {
+  return resolve(projectRoot ?? processCwd ?? process.cwd());
+}
+
+function onceAsync(operation: () => Promise<void>): () => Promise<void> {
+  let promise: Promise<void> | null = null;
+  return () => {
+    if (!promise) promise = operation();
+    return promise;
+  };
+}
+
 class HermesAcpClientImpl implements HermesAcpClient {
   private readonly activePrompts = new Map<string, ActivePrompt>();
-  private readonly childClosed: Promise<void>;
   private readonly connection: ClientConnection;
-  private childDidClose = false;
   private closed = false;
   private closePromise: Promise<void> | null = null;
   private supportsLoad = false;
 
   constructor(
-    private readonly child: ChildProcessWithoutNullStreams,
+    private readonly boundProjectRoot: string,
+    input: Writable,
+    stdout: Readable,
+    stderr: Readable,
+    private readonly processClosed: Promise<void>,
+    private readonly closeProcess: () => Promise<void>,
     private readonly sessionRequestTimeoutMs: number,
     private readonly cancelTimeoutMs: number,
     maxInboundLineBytes: number,
     private readonly maxOutputBytes: number,
-    private readonly terminationGraceMs: number,
   ) {
-    this.child.stderr.on("data", () => {});
-    this.childClosed = new Promise((resolve) => {
-      child.once("error", () => {});
-      child.once("close", () => {
-        this.childDidClose = true;
-        resolve();
-      });
-    });
+    stderr.on("data", () => {});
     const app = client({ name: "skyturn-plan" })
       .onNotification(methods.client.session.update, ({ params }) => this.handleSessionUpdate(params));
     this.connection = app.connect(safeNdJsonStream(
-      Writable.toWeb(child.stdin),
-      Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>,
+      Writable.toWeb(input),
+      Readable.toWeb(stdout) as unknown as ReadableStream<Uint8Array>,
       maxInboundLineBytes,
     ));
   }
@@ -222,11 +388,11 @@ class HermesAcpClientImpl implements HermesAcpClient {
   }
 
   async newSession(cwd: string): Promise<string> {
-    assertAbsoluteCwd(cwd);
+    assertBoundProjectRoot(this.boundProjectRoot, cwd);
     try {
       const result = await this.raceConnection(
         this.connection.agent.request(methods.agent.session.new, {
-          cwd,
+          cwd: retainedProjectRootAlias,
           mcpServers: [],
         }),
         this.sessionRequestTimeoutMs,
@@ -241,12 +407,12 @@ class HermesAcpClientImpl implements HermesAcpClient {
   }
 
   async loadSession(cwd: string, sessionId: string): Promise<void> {
-    assertAbsoluteCwd(cwd);
+    assertBoundProjectRoot(this.boundProjectRoot, cwd);
     if (!this.supportsLoad) throw new Error("Hermes ACP session loading is unavailable.");
     try {
       await this.raceConnection(
         this.connection.agent.request(methods.agent.session.load, {
-          cwd,
+          cwd: retainedProjectRootAlias,
           sessionId,
           mcpServers: [],
         }),
@@ -333,7 +499,7 @@ class HermesAcpClientImpl implements HermesAcpClient {
     try {
       this.connection.close();
     } catch {}
-    this.closePromise = this.terminateAndReap();
+    this.closePromise = this.closeProcess();
     return this.closePromise;
   }
 
@@ -362,7 +528,7 @@ class HermesAcpClientImpl implements HermesAcpClient {
   }
 
   private async connectionFailure(): Promise<never> {
-    await Promise.race([this.childClosed, this.connection.closed]);
+    await Promise.race([this.processClosed, this.connection.closed]);
     throw new Error("Hermes ACP connection closed.");
   }
 
@@ -422,35 +588,6 @@ class HermesAcpClientImpl implements HermesAcpClient {
       return false;
     }
     return true;
-  }
-
-  private async terminateAndReap(): Promise<void> {
-    if (this.childDidClose) return;
-    try {
-      this.child.kill("SIGTERM");
-    } catch {}
-    if (await this.waitForChildClose(this.terminationGraceMs)) return;
-    if (!this.childDidClose) {
-      try {
-        this.child.kill("SIGKILL");
-      } catch {}
-    }
-    await this.childClosed;
-  }
-
-  private async waitForChildClose(timeoutMs: number): Promise<boolean> {
-    if (this.childDidClose) return true;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      return await Promise.race([
-        this.childClosed.then(() => true),
-        new Promise<false>((resolve) => {
-          timeout = setTimeout(() => resolve(false), timeoutMs);
-        }),
-      ]);
-    } finally {
-      if (timeout) clearTimeout(timeout);
-    }
   }
 }
 
@@ -815,8 +952,11 @@ function prefixTable(pattern: string[]): number[] {
   return prefix;
 }
 
-function assertAbsoluteCwd(cwd: string): void {
+function assertBoundProjectRoot(boundProjectRoot: string, cwd: string): void {
   if (!isAbsolute(cwd)) throw new Error("Hermes ACP working directory must be absolute.");
+  if (resolve(cwd) !== boundProjectRoot) {
+    throw new Error("Hermes ACP session project does not match client project root.");
+  }
 }
 
 function boundedInteger(value: number, minimum: number, maximum: number, error: string): number {

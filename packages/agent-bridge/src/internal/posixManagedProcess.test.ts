@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { spawnPosixManagedProcess } from "./posixManagedProcess.js";
 
 const posixIt = process.platform === "win32" ? it.skip : it;
+const darwinIt = process.platform === "darwin" ? it : it.skip;
 const roots: string[] = [];
 const pids = new Set<number>();
 
@@ -51,6 +52,113 @@ describe("POSIX managed process ownership", () => {
     expect(packed.status, packed.stderr).toBe(0);
     const packedFiles = JSON.parse(packed.stdout).files.map(({ path }: { path: string }) => path);
     expect(packedFiles).toContain("dist/native/posix-process-owner");
+  });
+
+  darwinIt("keeps the owner outside the restricted target sandbox and denies target descendants", async () => {
+    const root = await makeRoot(true);
+    const worktree = await openDirectory(root);
+    let output = "";
+    try {
+      const script = [
+        'const { spawnSync } = require("node:child_process");',
+        'const child = spawnSync("/usr/bin/true");',
+        'process.stdout.write(child.error?.code ?? "none");',
+        'process.exit(child.error?.code === "EPERM" ? 0 : 82);',
+      ].join("");
+      const managed = await spawnPosixManagedProcess({
+        agentKind: "hermes",
+        args: ["-e", script],
+        cleanupTimeoutMs: 200,
+        env: {},
+        executablePath: process.execPath,
+        platform: "darwin",
+        preserveWorktreeFd: true,
+        projectRoot: root,
+        sandbox: "read-only",
+        targetStdin: "null",
+        worktreeFd: worktree.fd,
+      });
+      managed.child.stdout?.on("data", (chunk: Buffer | string) => {
+        output += chunk.toString();
+      });
+
+      await managed.ready;
+      await expect(managed.closed).resolves.toEqual({ exitCode: 0, signalCode: null });
+      expect(output).toBe("EPERM");
+      await expect(managed.terminateAndReap()).resolves.toBeUndefined();
+    } finally {
+      await worktree.close();
+    }
+  }, 15_000);
+
+  darwinIt("allows only bounded Hermes runtime state writes while keeping the project and config read-only", async () => {
+    const root = await makeRoot(true);
+    const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-state-"));
+    roots.push(stateRoot);
+    await Promise.all([
+      mkdir(join(stateRoot, "logs")),
+      mkdir(join(stateRoot, "skills")),
+    ]);
+    const worktree = await openDirectory(root);
+    let output = "";
+    try {
+      const managed = await spawnPosixManagedProcess({
+        agentKind: "hermes",
+        args: ["-e", boundedHermesStateScript()],
+        cleanupTimeoutMs: 200,
+        env: { HERMES_HOME: stateRoot },
+        executablePath: process.execPath,
+        platform: "darwin",
+        preserveWorktreeFd: true,
+        projectRoot: root,
+        sandbox: "read-only",
+        targetStdin: "null",
+        worktreeFd: worktree.fd,
+      });
+      managed.child.stdout?.on("data", (chunk: Buffer | string) => {
+        output += chunk.toString();
+      });
+      managed.child.stderr?.resume();
+
+      await managed.ready;
+      await expect(managed.closed).resolves.toEqual({ exitCode: 0, signalCode: null });
+      expect(output).toBe("bounded");
+      expect(await readFile(join(stateRoot, "state.db-wal"), "utf8")).toBe("state");
+      expect(await readFile(join(stateRoot, "logs", "agent.log"), "utf8")).toBe("log");
+      expect(await readFile(join(stateRoot, "logs", "errors.log"), "utf8")).toBe("errors");
+      await expect(stat(join(root, "project-write"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(join(stateRoot, "config.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(managed.terminateAndReap()).resolves.toBeUndefined();
+    } finally {
+      await worktree.close();
+    }
+  }, 15_000);
+
+  darwinIt("rejects a Hermes runtime state root inside the retained project", async () => {
+    const root = await makeRoot(true);
+    const worktree = await openDirectory(root);
+    try {
+      const outcome = await spawnPosixManagedProcess({
+        agentKind: "hermes",
+        args: ["-e", "setInterval(() => {}, 1000)"],
+        cleanupTimeoutMs: 200,
+        env: { HERMES_HOME: root },
+        executablePath: process.execPath,
+        platform: "darwin",
+        preserveWorktreeFd: true,
+        projectRoot: root,
+        sandbox: "read-only",
+        targetStdin: "null",
+        worktreeFd: worktree.fd,
+      }).then(async (managed) => {
+        await managed.terminateAndReap();
+        return "launched";
+      }, () => "rejected");
+
+      expect(outcome).toBe("rejected");
+    } finally {
+      await worktree.close();
+    }
   });
 
   posixIt("kills a stubborn process tree when a separate Node owner dies", async () => {
@@ -136,6 +244,7 @@ describe("POSIX managed process ownership", () => {
         },
         executablePath: process.execPath,
         platform: process.platform,
+        projectRoot: root,
         sandbox: "danger-full-access",
         worktreeFd: worktree.fd,
       });
@@ -186,6 +295,96 @@ describe("POSIX managed process ownership", () => {
     }
   }, 15_000);
 
+  posixIt("routes target stdin through a dedicated pipe and keeps owner control off the target stream", async () => {
+    const root = await makeRoot(true);
+    const worktree = await openDirectory(root);
+    const stdinCapturePath = join(root, "stdin-capture.txt");
+
+    try {
+      const managed = await spawnPosixManagedProcess({
+        agentKind: "hermes",
+        args: ["-e", interactiveStdinCaptureScript(stdinCapturePath)],
+        cleanupTimeoutMs: 150,
+        env: process.env,
+        executablePath: process.execPath,
+        platform: process.platform,
+        projectRoot: root,
+        sandbox: "danger-full-access",
+        targetStdin: "pipe",
+        worktreeFd: worktree.fd,
+      });
+      await managed.ready;
+
+      expect(managed.targetInput).not.toBeNull();
+      managed.targetInput!.write("hello-from-target-stdin\n");
+      await waitForFile(stdinCapturePath);
+      await managed.terminateAndReap();
+
+      expect(await readFile(stdinCapturePath, "utf8")).toBe("hello-from-target-stdin\n");
+    } finally {
+      await worktree.close();
+    }
+  }, 15_000);
+
+  posixIt("closes the dedicated target stdin pipe to EOF without leaking control traffic", async () => {
+    const root = await makeRoot(true);
+    const worktree = await openDirectory(root);
+    const stdinCapturePath = join(root, "stdin-eof-capture.txt");
+
+    try {
+      const managed = await spawnPosixManagedProcess({
+        agentKind: "hermes",
+        args: ["-e", interactiveStdinEofCaptureScript(stdinCapturePath)],
+        cleanupTimeoutMs: 150,
+        env: process.env,
+        executablePath: process.execPath,
+        platform: process.platform,
+        projectRoot: root,
+        sandbox: "danger-full-access",
+        targetStdin: "pipe",
+        worktreeFd: worktree.fd,
+      });
+      await managed.ready;
+
+      expect(managed.targetInput).not.toBeNull();
+      managed.targetInput!.end("hello-before-eof\n");
+
+      expect(await managed.closed).toEqual({ exitCode: 0, signalCode: null });
+      expect(await readFile(stdinCapturePath, "utf8")).toBe("hello-before-eof\n<<EOF>>");
+    } finally {
+      await worktree.close();
+    }
+  }, 15_000);
+
+  posixIt("keeps existing noninteractive targets on /dev/null stdin", async () => {
+    const root = await makeRoot(true);
+    const worktree = await openDirectory(root);
+    const stdinBytesPath = join(root, "stdin-bytes.txt");
+    const fd5StatePath = join(root, "fd5-state.txt");
+
+    try {
+      const managed = await spawnPosixManagedProcess({
+        agentKind: "codex",
+        args: ["-e", nonInteractiveStdinByteCountScript(stdinBytesPath, fd5StatePath)],
+        cleanupTimeoutMs: 150,
+        env: process.env,
+        executablePath: process.execPath,
+        platform: process.platform,
+        projectRoot: root,
+        sandbox: "danger-full-access",
+        worktreeFd: worktree.fd,
+      });
+      await managed.ready;
+
+      expect(managed.targetInput).toBeNull();
+      expect(await managed.closed).toEqual({ exitCode: 0, signalCode: null });
+      expect(await readFile(stdinBytesPath, "utf8")).toBe("0");
+      expect(await readFile(fd5StatePath, "utf8")).not.toBe("inherited-null");
+    } finally {
+      await worktree.close();
+    }
+  }, 15_000);
+
   posixIt("cleans a stubborn descendant after natural root exit and preserves root evidence", async () => {
     const root = await makeRoot(true);
     const worktree = await openDirectory(root);
@@ -204,6 +403,7 @@ describe("POSIX managed process ownership", () => {
         },
         executablePath: process.execPath,
         platform: process.platform,
+        projectRoot: root,
         sandbox: "danger-full-access",
         worktreeFd: worktree.fd,
       });
@@ -303,6 +503,7 @@ describe("POSIX managed process ownership", () => {
         env: { ...process.env, SKYTURN_TARGET_STARTED_PATH: targetStartedPath },
         executablePath: process.execPath,
         platform: process.platform,
+        projectRoot: worktreePath,
         sandbox: "danger-full-access",
         worktreeFd: worktree.fd,
       });
@@ -391,6 +592,95 @@ function naturalExitWithStubbornChildScript(): string {
     "  clearInterval(timer);",
     "  process.exit(23);",
     "}, 5);",
+  ].join("\n");
+}
+
+function interactiveStdinCaptureScript(stdinCapturePath: string): string {
+  return [
+    "const fs = require('node:fs');",
+    `const outputPath = ${JSON.stringify(stdinCapturePath)};`,
+    "let recorded = '';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', (chunk) => {",
+    "  recorded += chunk;",
+    "  fs.writeFileSync(outputPath, recorded);",
+    "});",
+    "setInterval(() => {}, 1000);",
+  ].join("\n");
+}
+
+function interactiveStdinEofCaptureScript(stdinCapturePath: string): string {
+  return [
+    "const fs = require('node:fs');",
+    `const outputPath = ${JSON.stringify(stdinCapturePath)};`,
+    "let recorded = '';",
+    "process.stdin.setEncoding('utf8');",
+    "process.stdin.on('data', (chunk) => {",
+    "  recorded += chunk;",
+    "});",
+    "process.stdin.on('end', () => {",
+    "  fs.writeFileSync(outputPath, recorded + '<<EOF>>');",
+    "  process.exit(0);",
+    "});",
+    "process.stdin.resume();",
+  ].join("\n");
+}
+
+function boundedHermesStateScript(): string {
+  return [
+    "const fs = require('node:fs');",
+    "const { spawnSync } = require('node:child_process');",
+    "const path = require('node:path');",
+    "const home = process.env.HERMES_HOME;",
+    "let allowed = true;",
+    "for (const [name, value] of [",
+    "  ['state.db-wal', 'state'],",
+    "  ['kanban.db-shm', 'kanban'],",
+    "  ['.mcp-discovery.lock', 'lock'],",
+    "  ['logs/agent.log', 'log'],",
+    "  ['logs/errors.log', 'errors'],",
+    "  ['logs/mcp-stderr.log', 'mcp'],",
+    "  ['skills/.usage.json', 'usage'],",
+    "]) {",
+    "  try { fs.writeFileSync(path.join(home, name), value); } catch { allowed = false; }",
+    "}",
+    "const denied = (target) => {",
+    "  try { fs.writeFileSync(target, 'denied'); return false; } catch { return true; }",
+    "};",
+    "const projectDenied = denied(path.join(process.cwd(), 'project-write'));",
+    "const configDenied = denied(path.join(home, 'config.yaml'));",
+    "const child = spawnSync('/usr/bin/true');",
+    "const forkDenied = child.error?.code === 'EPERM';",
+    "if (allowed && projectDenied && configDenied && forkDenied) {",
+    "  process.stdout.write('bounded');",
+    "  process.exit(0);",
+    "}",
+    "process.exit(82);",
+  ].join("\n");
+}
+
+function nonInteractiveStdinByteCountScript(stdinBytesPath: string, fd5StatePath: string): string {
+  return [
+    "const fs = require('node:fs');",
+    `const outputPath = ${JSON.stringify(stdinBytesPath)};`,
+    `const fd5StatePath = ${JSON.stringify(fd5StatePath)};`,
+    "try {",
+    "  const fd5 = fs.fstatSync(5);",
+    "  const nullDevice = fs.statSync('/dev/null');",
+    "  const inheritedNull = fd5.isCharacterDevice() && fd5.rdev === nullDevice.rdev;",
+    "  fs.writeFileSync(fd5StatePath, inheritedNull ? 'inherited-null' : 'reused');",
+    "} catch (error) {",
+    "  if (error?.code !== 'EBADF') throw error;",
+    "  fs.writeFileSync(fd5StatePath, 'closed');",
+    "}",
+    "let bytes = 0;",
+    "process.stdin.on('data', (chunk) => { bytes += chunk.length; });",
+    "process.stdin.on('end', () => {",
+    "  fs.writeFileSync(outputPath, String(bytes));",
+    "  process.exit(0);",
+    "});",
+    "process.stdin.resume();",
+    "setTimeout(() => process.exit(71), 1000);",
   ].join("\n");
 }
 
