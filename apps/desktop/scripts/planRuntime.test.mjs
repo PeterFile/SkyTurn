@@ -743,6 +743,87 @@ test("Plan cancel closes a prompt that ignores cancellation and returns only aft
   }
 });
 
+test("Plan cancel retains ownership and publishes no terminal when process cleanup is unverified", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
+  const client = new FakeAcpClient({ deferred: true });
+  const closeClient = client.close.bind(client);
+  const events = [];
+  let rejectCleanup = true;
+  client.close = async () => {
+    await closeClient();
+    if (rejectCleanup) {
+      rejectCleanup = false;
+      throw new Error("Hermes ACP process cleanup could not be verified.");
+    }
+  };
+  try {
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, client, events),
+      cancelSettlementGraceMs: 20,
+    });
+    const run = await runtime.generate(generateRequest());
+    await waitFor(() => client.promptCalls.length === 1);
+
+    await assert.rejects(
+      runtime.cancel({ planSessionId: "plan-session-1", projectRoot: "/repo", runId: run.runId }),
+      /Hermes ACP process cleanup could not be verified\./,
+    );
+    const state = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    const duplicate = await runtime.generate(generateRequest());
+
+    assert.equal(state.terminal, null);
+    assert.equal(state.active.runId, run.runId);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.runId, run.runId);
+    assert.equal(events.some((event) => event.runId === run.runId && ["completed", "failed"].includes(event.kind)), false);
+    await runtime.close();
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("Plan cancel retries controlled cleanup before a later cancel may release ownership", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
+  const client = new FakeAcpClient({ deferred: true });
+  const closeClient = client.close.bind(client);
+  const events = [];
+  let cleanupFailures = 2;
+  client.close = async () => {
+    await closeClient();
+    if (cleanupFailures > 0) {
+      cleanupFailures -= 1;
+      throw new Error("Hermes ACP process cleanup could not be verified.");
+    }
+  };
+  try {
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, client, events),
+      cancelSettlementGraceMs: 20,
+    });
+    const run = await runtime.generate(generateRequest());
+    await waitFor(() => client.promptCalls.length === 1);
+    const request = { planSessionId: "plan-session-1", projectRoot: "/repo", runId: run.runId };
+
+    await assert.rejects(runtime.cancel(request), /Hermes ACP process cleanup could not be verified\./);
+    await assert.rejects(runtime.cancel(request), /Hermes ACP process cleanup could not be verified\./);
+    const retained = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(retained.terminal, null);
+    assert.equal(retained.active.runId, run.runId);
+    assert.equal(events.some((event) => event.runId === run.runId && ["completed", "failed"].includes(event.kind)), false);
+
+    assert.deepEqual(toPlain(await runtime.cancel(request)), { protocolVersion: 1, cancelled: true });
+    const released = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(released.active, null);
+    assert.equal(released.terminal.runId, run.runId);
+    assert.equal(released.terminal.error, "Plan generation was cancelled.");
+    await runtime.close();
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
 test("Plan cancel retains ownership until aborted client initialization is reaped", async () => {
   const { createPlanRuntime } = await loadPlanRuntime();
   const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
@@ -756,7 +837,7 @@ test("Plan cancel retains ownership until aborted client initialization is reape
   try {
     runtime = createPlanRuntime({
       ...runtimeOptions(stateRoot, retryClient, events),
-      createClient: async (signal) => {
+      createClient: async (_projectRoot, signal) => {
         factoryCalls += 1;
         if (factoryCalls > 1) return retryClient;
         creationSignal = signal;
@@ -779,11 +860,12 @@ test("Plan cancel retains ownership until aborted client initialization is reape
       () => { cancelSettled = true; },
     );
     await waitFor(() => creationSignal.aborted);
-    await terminalEvent(events, run.runId);
-    await new Promise((resolve) => setImmediate(resolve));
+    const beforeCleanup = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
     const duplicate = await runtime.generate(generateRequest());
 
     assert.equal(cancelSettled, false);
+    assert.equal(beforeCleanup.terminal, null);
+    assert.equal(events.some((event) => event.runId === run.runId && ["completed", "failed"].includes(event.kind)), false);
     assert.equal(duplicate.duplicate, true);
     assert.equal(duplicate.runId, run.runId);
     assert.equal(factoryCalls, 1);
@@ -814,7 +896,7 @@ test("Plan runtime closes a client returned after cancelled initialization", asy
   try {
     const runtime = createPlanRuntime({
       ...runtimeOptions(stateRoot, lateClient, events),
-      createClient: (signal) => {
+      createClient: (_projectRoot, signal) => {
         creationSignal = signal;
         return pendingClient;
       },
@@ -832,10 +914,11 @@ test("Plan runtime closes a client returned after cancelled initialization", asy
       () => { cancelSettled = true; },
       () => { cancelSettled = true; },
     );
-    await terminalEvent(events, run.runId);
-    await new Promise((resolve) => setImmediate(resolve));
+    const beforeCleanup = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
 
     assert.equal(cancelSettled, false);
+    assert.equal(beforeCleanup.terminal, null);
+    assert.equal(events.some((event) => event.runId === run.runId && ["completed", "failed"].includes(event.kind)), false);
     resolveClient(lateClient);
     await cancelling;
     assert.equal(creationSignal.aborted, true);
@@ -928,7 +1011,7 @@ test("Plan runtime closes a client that finishes creation after runtime shutdown
   try {
     const runtime = createPlanRuntime({
       ...runtimeOptions(stateRoot, client, events),
-      createClient: (signal) => {
+      createClient: (_projectRoot, signal) => {
         creationSignal = signal;
         return clientCreation;
       },
@@ -1655,7 +1738,7 @@ test("Plan runtime exposes only the fixed output-limit error", async () => {
   }
 });
 
-test("Plan completion persistence failure emits no terminal and recovers the durable active marker", async () => {
+test("Plan completion persistence failure retains live ownership for an exact retry", async () => {
   const injection = terminalReplacementFailureFs();
   const { createPlanRuntime } = await loadPlanRuntime({ "node:fs/promises": injection.fs });
   const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
@@ -1668,18 +1751,25 @@ test("Plan completion persistence failure emits no terminal and recovers the dur
     await waitForBounded(injection.failureObserved, "Terminal replacement failure deadline exceeded.");
     assert.equal(events.some((event) => event.kind === "completed" || event.kind === "failed"), false);
     injection.recover();
-    const recovered = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
-    assert.equal(recovered.terminal.runId, run.runId);
-    assert.equal(recovered.terminal.kind, "failed");
-    assert.equal(recovered.terminal.error, "Plan generation was interrupted. Retry to continue.");
-    assert.equal(recovered.snapshot.version, 0);
+    const retained = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    const duplicate = await runtime.generate(generateRequest());
+    assert.equal(retained.terminal, null);
+    assert.equal(retained.active.runId, run.runId);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.runId, run.runId);
     await runtime.close();
+    const reopened = createPlanRuntime(runtimeOptions(stateRoot, new FakeAcpClient(), []));
+    const recovered = await reopened.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(recovered.terminal.runId, run.runId);
+    assert.equal(recovered.terminal.kind, "completed");
+    assert.equal(recovered.snapshot.version, 1);
+    await reopened.close();
   } finally {
     await rm(stateRoot, { recursive: true, force: true });
   }
 });
 
-test("Plan failed terminal persistence failure emits no terminal and preserves the prior snapshot", async () => {
+test("Plan failed terminal persistence failure retains live ownership for an exact retry", async () => {
   const injection = terminalReplacementFailureFs();
   const { createPlanRuntime } = await loadPlanRuntime({ "node:fs/promises": injection.fs });
   const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
@@ -1692,17 +1782,25 @@ test("Plan failed terminal persistence failure emits no terminal and preserves t
     await waitForBounded(injection.failureObserved, "Terminal replacement failure deadline exceeded.");
     assert.equal(events.some((event) => event.kind === "completed" || event.kind === "failed"), false);
     injection.recover();
-    const recovered = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
-    assert.equal(recovered.terminal.runId, run.runId);
-    assert.equal(recovered.terminal.error, "Plan generation was interrupted. Retry to continue.");
-    assert.equal(recovered.snapshot.plan.requirements, "");
+    const retained = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    const duplicate = await runtime.generate(generateRequest());
+    assert.equal(retained.terminal, null);
+    assert.equal(retained.active.runId, run.runId);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.runId, run.runId);
     await runtime.close();
+    const reopened = createPlanRuntime(runtimeOptions(stateRoot, new FakeAcpClient(), []));
+    const recovered = await reopened.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(recovered.terminal.runId, run.runId);
+    assert.equal(recovered.terminal.error, "Hermes ACP prompt failed.");
+    assert.equal(recovered.snapshot.plan.requirements, "");
+    await reopened.close();
   } finally {
     await rm(stateRoot, { recursive: true, force: true });
   }
 });
 
-test("Plan cancel reaps the prompt and settles when failed terminal persistence is unavailable", async () => {
+test("Plan cancel persistence failure retains live ownership until the same cancel retries", async () => {
   const injection = terminalReplacementFailureFs();
   const { createPlanRuntime } = await loadPlanRuntime({ "node:fs/promises": injection.fs });
   const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
@@ -1727,10 +1825,154 @@ test("Plan cancel reaps the prompt and settles when failed terminal persistence 
     assert.equal(client.closed, true);
     assert.equal(events.some((event) => event.kind === "completed" || event.kind === "failed"), false);
     injection.recover();
+    const retained = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    const duplicate = await runtime.generate(generateRequest());
+    assert.equal(retained.terminal, null);
+    assert.equal(retained.active.runId, run.runId);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.runId, run.runId);
+    assert.deepEqual(toPlain(await runtime.cancel({
+      planSessionId: "plan-session-1",
+      projectRoot: "/repo",
+      runId: run.runId,
+    })), { protocolVersion: 1, cancelled: true });
     const recovered = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(recovered.active, null);
     assert.equal(recovered.terminal.runId, run.runId);
-    assert.equal(recovered.terminal.error, "Plan generation was interrupted. Retry to continue.");
+    assert.equal(recovered.terminal.error, "Plan generation was cancelled.");
     await runtime.close();
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("Plan runtime close retains ownership and retries the original terminal after persistence recovers", async () => {
+  const injection = terminalReplacementFailureFs();
+  const { createPlanRuntime } = await loadPlanRuntime({ "node:fs/promises": injection.fs });
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
+  const client = new FakeAcpClient({ deferred: true });
+  const events = [];
+  try {
+    const runtime = createPlanRuntime(runtimeOptions(stateRoot, client, events));
+    const run = await runtime.generate(generateRequest());
+    await waitFor(() => client.promptCalls.length === 1);
+
+    const closing = runtime.close();
+    await waitForBounded(injection.failureObserved, "Terminal replacement failure deadline exceeded.");
+    await assert.rejects(closing, /Plan state persistence is unavailable\./);
+    assert.equal(events.some((event) => event.kind === "completed" || event.kind === "failed"), false);
+
+    injection.recover();
+    const state = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(state.terminal, null);
+    assert.equal(state.active.runId, run.runId);
+    await runtime.close();
+    const recovered = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(recovered.active, null);
+    assert.equal(recovered.terminal.runId, run.runId);
+    assert.equal(recovered.terminal.kind, "failed");
+    assert.equal(recovered.terminal.error, "Plan runtime is shut down.");
+    assert.equal(events.filter((event) => event.kind === "failed").length, 1);
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("Plan runtime cannot cancel or close away an unverified initialization cleanup", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
+  const events = [];
+  let factoryCalls = 0;
+  try {
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, new FakeAcpClient(), events),
+      createClient: async () => {
+        factoryCalls += 1;
+        throw new Error("Hermes ACP process cleanup could not be verified.");
+      },
+    });
+    const run = await runtime.generate(generateRequest());
+    await waitFor(() => factoryCalls === 1);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const state = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(state.terminal, null);
+    assert.equal(state.active.runId, run.runId);
+    await assert.rejects(runtime.cancel({
+      planSessionId: "plan-session-1",
+      projectRoot: "/repo",
+      runId: run.runId,
+    }), /Hermes ACP process cleanup could not be verified\./);
+    await assert.rejects(runtime.close(), /Hermes ACP process cleanup could not be verified\./);
+    assert.equal(events.some((event) => event.kind === "completed" || event.kind === "failed"), false);
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("Plan runtime close cannot treat a pending factory as verified cleanup", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
+  let rejectCreation;
+  const created = new Promise((_resolve, reject) => {
+    rejectCreation = reject;
+  });
+  const events = [];
+  let factoryCalls = 0;
+  try {
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, new FakeAcpClient(), events),
+      createClient: async () => {
+        factoryCalls += 1;
+        return created;
+      },
+    });
+    const run = await runtime.generate(generateRequest());
+    await waitFor(() => factoryCalls === 1);
+
+    const closing = runtime.close();
+    rejectCreation(new Error("Hermes ACP process cleanup could not be verified."));
+    await assert.rejects(closing, /Hermes ACP process cleanup could not be verified\./);
+    const state = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(state.terminal, null);
+    assert.equal(state.active.runId, run.runId);
+    assert.equal(events.some((event) => event.kind === "completed" || event.kind === "failed"), false);
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("Plan cancel cannot treat a late pending-factory cleanup failure as success", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-"));
+  let rejectCreation;
+  const created = new Promise((_resolve, reject) => {
+    rejectCreation = reject;
+  });
+  const events = [];
+  let factoryCalls = 0;
+  try {
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, new FakeAcpClient(), events),
+      createClient: async () => {
+        factoryCalls += 1;
+        return created;
+      },
+    });
+    const run = await runtime.generate(generateRequest());
+    await waitFor(() => factoryCalls === 1);
+
+    const cancelling = runtime.cancel({
+      planSessionId: "plan-session-1",
+      projectRoot: "/repo",
+      runId: run.runId,
+    });
+    rejectCreation({ message: "Hermes ACP process cleanup could not be verified." });
+    await assert.rejects(cancelling, /Hermes ACP process cleanup could not be verified\./);
+    const state = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    assert.equal(state.terminal, null);
+    assert.equal(state.active.runId, run.runId);
+    assert.equal(events.some((event) => event.kind === "completed" || event.kind === "failed"), false);
   } finally {
     await rm(stateRoot, { recursive: true, force: true });
   }
@@ -2407,6 +2649,147 @@ test("mapping deletion during active startup never creates a replacement convers
   }
 });
 
+test("Plan runtime reuses one ACP client for the same canonical project root", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-root-reuse-"));
+  const client = new FakeAcpClient();
+  const events = [];
+  const createCalls = [];
+  try {
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, client, events),
+      createClient: async (projectRoot) => {
+        createCalls.push(projectRoot);
+        return client;
+      },
+    });
+    await terminalEvent(events, (await runtime.generate(generateRequest())).runId);
+    client.chunks = ["requirements-v1"];
+    await terminalEvent(events, (await runtime.revise({
+      ...reviseRequirementsRequest("requirements-v0", "Revise same project."),
+      projectRoot: "/repo",
+    })).runId);
+
+    assert.deepEqual(createCalls, ["/repo"]);
+    assert.equal(client.closeCalls, 0);
+    await runtime.close();
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("Plan runtime closes the old project-bound ACP client before creating one for another root", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-root-switch-"));
+  const firstClient = new FakeAcpClient();
+  const secondClient = new FakeAcpClient();
+  const events = [];
+  const createCalls = [];
+  try {
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, firstClient, events),
+      createClient: async (projectRoot) => {
+        createCalls.push([projectRoot, firstClient.closeCalls]);
+        return createCalls.length === 1 ? firstClient : secondClient;
+      },
+    });
+    await terminalEvent(events, (await runtime.generate(generateRequest())).runId);
+    secondClient.chunks = ["# Other requirements"];
+    await terminalEvent(events, (await runtime.generate({
+      ...generateRequest(),
+      planSessionId: "plan-session-2",
+      projectRoot: "/other-repo",
+    })).runId);
+
+    assert.deepEqual(createCalls, [
+      ["/repo", 0],
+      ["/other-repo", 1],
+    ]);
+    assert.equal(firstClient.closeCalls, 1);
+    assert.equal(secondClient.newSessionCalls, 1);
+    assert.deepEqual(secondClient.loadSessionCalls, []);
+    await runtime.close();
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("Plan runtime retains the active run when old-project cleanup cannot be verified", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-root-switch-"));
+  const firstClient = new FakeAcpClient();
+  const secondClient = new FakeAcpClient();
+  const closeFirstClient = firstClient.close.bind(firstClient);
+  const events = [];
+  let rejectCleanup = true;
+  firstClient.close = async () => {
+    await closeFirstClient();
+    if (rejectCleanup) {
+      rejectCleanup = false;
+      throw new Error("Hermes ACP process cleanup could not be verified.");
+    }
+  };
+  try {
+    const clients = [firstClient, secondClient];
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, firstClient, events),
+      createClient: async () => clients.shift(),
+    });
+    await terminalEvent(events, (await runtime.generate(generateRequest())).runId);
+    const secondRequest = {
+      ...generateRequest(),
+      planSessionId: "plan-session-2",
+      projectRoot: "/other-repo",
+    };
+    const run = await runtime.generate(secondRequest);
+    await waitFor(() => firstClient.closeCalls === 1);
+    const state = await runtime.getState({
+      planSessionId: secondRequest.planSessionId,
+      projectRoot: secondRequest.projectRoot,
+    });
+    const duplicate = await runtime.generate(secondRequest);
+
+    assert.equal(state.terminal, null);
+    assert.equal(state.active.runId, run.runId);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.runId, run.runId);
+    assert.equal(secondClient.newSessionCalls, 0);
+    assert.equal(events.some((event) => event.runId === run.runId && ["completed", "failed"].includes(event.kind)), false);
+    await runtime.close();
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("Plan runtime verifies cleanup for a closed client before replacing it", async () => {
+  const { createPlanRuntime } = await loadPlanRuntime();
+  const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-runtime-closed-client-"));
+  const firstClient = new FakeAcpClient();
+  const secondClient = new FakeAcpClient();
+  const events = [];
+  const clients = [firstClient, secondClient];
+  try {
+    const runtime = createPlanRuntime({
+      ...runtimeOptions(stateRoot, firstClient, events),
+      createClient: async () => clients.shift(),
+    });
+    await terminalEvent(events, (await runtime.generate(generateRequest())).runId);
+    firstClient.closed = true;
+
+    const next = await runtime.generate({
+      ...generateRequest(),
+      planSessionId: "plan-session-2",
+    });
+    await terminalEvent(events, next.runId);
+
+    assert.equal(firstClient.closeCalls, 1);
+    assert.equal(secondClient.newSessionCalls, 1);
+    await runtime.close();
+  } finally {
+    await rm(stateRoot, { recursive: true, force: true });
+  }
+});
+
 test("Plan revision derives its current Markdown only from durable state", async () => {
   const { createPlanRuntime } = await loadPlanRuntime();
   const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-plan-durable-revision-"));
@@ -2584,7 +2967,7 @@ test("orphaned active Plan state preserves the exact snapshot and recovers once 
   }
 });
 
-test("terminal replacement failure emits no phantom terminal and later recovers the active marker", async () => {
+test("terminal replacement failure emits no phantom terminal and retains its live owner for retry", async () => {
   const fsPromises = require("node:fs/promises");
   let failTerminalReplacement = true;
   let resolveTerminalReplacementFailure;
@@ -2615,14 +2998,21 @@ test("terminal replacement failure emits no phantom terminal and later recovers 
     assert.equal(events.some((event) => event.kind === "completed" || event.kind === "failed"), false);
 
     failTerminalReplacement = false;
-    const recovered = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    const retained = await runtime.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
+    const duplicate = await runtime.generate({ ...generateRequest(), expectedStateVersion: 0 });
+    assert.equal(retained.terminal, null);
+    assert.equal(retained.active.runId, run.runId);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.runId, run.runId);
+    await runtime.close();
+    const reopened = createPlanRuntime(runtimeOptions(stateRoot, new FakeAcpClient(), []));
+    const recovered = await reopened.getState({ planSessionId: "plan-session-1", projectRoot: "/repo" });
     assert.equal(recovered.active, null);
     assert.equal(recovered.terminal.runId, run.runId);
-    assert.equal(recovered.terminal.kind, "failed");
-    assert.equal(recovered.terminal.error, "Plan generation was interrupted. Retry to continue.");
-    assert.equal(recovered.snapshot.version, 0);
-    assert.equal(recovered.snapshot.plan.requirements, "");
-    await runtime.close();
+    assert.equal(recovered.terminal.kind, "completed");
+    assert.equal(recovered.snapshot.version, 1);
+    assert.equal(recovered.snapshot.plan.requirements, "# Requirements");
+    await reopened.close();
   } finally {
     await rm(stateRoot, { recursive: true, force: true });
   }

@@ -45,7 +45,7 @@ interface PlanPromptInput {
 
 interface PlanRuntimeOptions {
   stateRoot: string;
-  createClient?: (signal: AbortSignal) => Promise<HermesAcpClient>;
+  createClient?: (projectRoot: string, signal: AbortSignal) => Promise<HermesAcpClient>;
   buildPrompt?: (input: PlanPromptInput) => Promise<string>;
   emit: (event: PlanEvent) => void;
   randomUUID?: () => string;
@@ -91,8 +91,10 @@ interface ActivePlanRun {
   acceptance: Promise<void> | null;
   settlement: Promise<void> | null;
   terminal: boolean;
+  terminalResult: PlanTerminalResult | null;
   terminalization: Promise<boolean> | null;
   cancelling: boolean;
+  cleanupUnverified: boolean;
 }
 
 interface PlanMapping {
@@ -105,6 +107,7 @@ interface PlanMapping {
 type MappingRead = { status: "missing" } | { status: "valid"; mapping: PlanMapping };
 type PlanStateRead = { status: "missing" } | { status: "valid"; state: DurablePlanState; legacy: boolean };
 type PlanTerminalEvent = Extract<PlanEvent, { kind: "completed" | "failed" }>;
+type PlanTerminalResult = { kind: "completed" } | { kind: "failed"; error: string };
 
 const protocolVersion = 1 as const;
 const recordVersion = 3 as const;
@@ -119,6 +122,7 @@ const planStatePersistenceError = "Plan state persistence is unavailable.";
 const planStateBootstrapConflictError = "Plan state bootstrap conflict.";
 const planSessionRestartError = "Plan session state is indeterminate. Restart SkyTurn.";
 const orphanedRunError = "Plan generation was interrupted. Retry to continue.";
+const acpCleanupError = "Hermes ACP process cleanup could not be verified.";
 const maxPlanMarkdownLength = 2_000_000;
 const maxPlanCheckpoints = 20;
 const maxAcpSessionIdLength = 4_096;
@@ -131,7 +135,10 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
   let loadedPlanSessionId: string | null = null;
   let client: HermesAcpClient | null = null;
   let clientPromise: Promise<HermesAcpClient> | null = null;
+  let clientProjectRoot: string | null = null;
+  let clientPromiseProjectRoot: string | null = null;
   let clientFactoryCleanup: Promise<void> | null = null;
+  let clientFactoryCleanupFailed = false;
   let clientCreationAbort: AbortController | null = null;
   let stateQueue: Promise<void> = Promise.resolve();
   let closed = false;
@@ -173,12 +180,14 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
     }
   }
 
-  async function getClient(): Promise<HermesAcpClient> {
+  async function getClient(projectRoot: string): Promise<HermesAcpClient> {
     if (closed) throw new Error(runtimeShutdownError);
-    if (client && !client.isClosed()) return client;
-    if (client?.isClosed()) {
-      client = null;
-      loadedPlanSessionId = null;
+    if (client && !client.isClosed() && clientProjectRoot === projectRoot) return client;
+    if (
+      (client && (client.isClosed() || (clientProjectRoot !== null && clientProjectRoot !== projectRoot))) ||
+      (clientPromise && clientPromiseProjectRoot !== null && clientPromiseProjectRoot !== projectRoot)
+    ) {
+      await closePlanClient();
     }
     if (!clientPromise) {
       const controller = new AbortController();
@@ -188,7 +197,9 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
         return createdClose;
       };
       const created = Promise.resolve().then(() => (
-        options.createClient ? options.createClient(controller.signal) : defaultClientFactory(controller.signal)
+        options.createClient
+          ? options.createClient(projectRoot, controller.signal)
+          : defaultClientFactory(projectRoot, controller.signal)
       ));
       let rejectAbort = (_error: Error): void => {};
       const abort = (): void => rejectAbort(
@@ -204,19 +215,30 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
           throw new Error(closed ? runtimeShutdownError : "Plan generation was cancelled.");
         }
         client = createdClient;
+        clientProjectRoot = projectRoot;
         loadedPlanSessionId = null;
         return createdClient;
       });
       clientPromise = pending;
+      clientPromiseProjectRoot = projectRoot;
       void pending.then(
         () => controller.signal.removeEventListener("abort", abort),
         () => controller.signal.removeEventListener("abort", abort),
       );
       clientCreationAbort = controller;
       const cleanup = created.then(async (createdClient) => {
-        if (controller.signal.aborted || closed) await closeCreated(createdClient);
-      }, () => undefined).finally(() => {
+        if (controller.signal.aborted || closed) {
+          try {
+            await closeCreated(createdClient);
+          } catch {
+            clientFactoryCleanupFailed = true;
+          }
+        }
+      }, (error) => {
+        if (isAcpCleanupFailure(error)) clientFactoryCleanupFailed = true;
+      }).finally(() => {
         if (clientPromise === pending) clientPromise = null;
+        if (clientPromiseProjectRoot === projectRoot) clientPromiseProjectRoot = null;
         if (clientFactoryCleanup === cleanup) clientFactoryCleanup = null;
         if (clientCreationAbort === controller) clientCreationAbort = null;
       });
@@ -250,8 +272,10 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
       acceptance: null,
       settlement: null,
       terminal: false,
+      terminalResult: null,
       terminalization: null,
       cancelling: false,
+      cleanupUnverified: false,
     };
     activeRuns.set(request.planSessionId, active);
     active.acceptance = serializeState(() => acceptRun(active));
@@ -291,8 +315,9 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
   }
 
   async function execute(active: ActivePlanRun): Promise<void> {
+    let releaseOwnership = false;
     try {
-      const acp = await getClient();
+      const acp = await getClient(active.request.projectRoot);
       await assertRunMayContinue(active, acp);
       const rawSessionId = await ensureConversation(acp, active);
       active.rawSessionId = rawSessionId;
@@ -306,22 +331,32 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
         timeoutMs: options.promptTimeoutMs ?? defaultPromptTimeoutMs,
         redactProjectRoot: active.request.projectRoot,
         onText: (text) => {
-          if (active.terminal || closed) return;
+          if (active.cancelling || active.terminal || closed) return;
           active.draft += text;
           emitTransient(active, { kind: "delta", text });
         },
       });
-      if (active.terminal || closed) return;
+      if (active.cancelling || active.terminal || closed) return;
       if (!active.draft.trim()) throw new Error("Hermes ACP returned empty Markdown.");
-      await terminalize(active, { kind: "completed" });
+      releaseOwnership = await terminalize(active, { kind: "completed" });
     } catch (error) {
-      if (client?.isClosed()) {
-        client = null;
-        loadedPlanSessionId = null;
+      if (isAcpCleanupFailure(error)) {
+        active.cleanupUnverified = true;
+        return;
       }
-      await terminalize(active, { kind: "failed", error: publicPlanError(error) });
+      if (client?.isClosed()) {
+        try {
+          await closePlanClient();
+        } catch {
+          active.cleanupUnverified = true;
+          return;
+        }
+      }
+      if (!active.cancelling && !closed) {
+        releaseOwnership = await terminalize(active, { kind: "failed", error: publicPlanError(error) });
+      }
     } finally {
-      if (!active.cancelling && activeRuns.get(active.request.planSessionId) === active) {
+      if (releaseOwnership && !closed && !active.cancelling && activeRuns.get(active.request.planSessionId) === active) {
         activeRuns.delete(active.request.planSessionId);
       }
     }
@@ -363,28 +398,33 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
   }
 
   async function assertRunMayContinue(active: ActivePlanRun, acp: HermesAcpClient): Promise<void> {
-    if (!closed && !active.terminal) return;
+    if (!closed && !active.cancelling && !active.terminal) return;
     await acp.close();
-    if (client === acp) client = null;
+    if (client === acp) {
+      client = null;
+      clientProjectRoot = null;
+    }
     loadedPlanSessionId = null;
     throw new Error(closed ? runtimeShutdownError : "Plan generation was cancelled.");
   }
 
   function terminalize(
     active: ActivePlanRun,
-    result: { kind: "completed" } | { kind: "failed"; error: string },
+    result: PlanTerminalResult,
   ): Promise<boolean> {
     if (active.terminalization) return active.terminalization;
     active.terminal = true;
-    const snapshot = result.kind === "completed"
+    active.terminalResult ??= result;
+    const terminalResult = active.terminalResult;
+    const snapshot = terminalResult.kind === "completed"
       ? completedSnapshot(active.snapshot, active.request, active.draft)
       : cloneSnapshot(active.snapshot);
     const terminal: DurablePlanTerminal = {
       runId: active.runId,
       stage: active.request.stage,
       operation: active.request.operation,
-      kind: result.kind,
-      ...(result.kind === "failed" ? { error: result.error } : {}),
+      kind: terminalResult.kind,
+      ...(terminalResult.kind === "failed" ? { error: terminalResult.error } : {}),
     };
     const event = terminalEvent(active.request.planSessionId, terminal, snapshot);
     const terminalization = serializeState(async () => {
@@ -413,6 +453,9 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
       return true;
     });
     active.terminalization = terminalization;
+    void terminalization.then((persisted) => {
+      if (!persisted && active.terminalization === terminalization) active.terminalization = null;
+    });
     return terminalization;
   }
 
@@ -535,10 +578,14 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
       if (active.request.projectRoot !== request.projectRoot) {
         throw new Error("Plan conversation mapping project does not match.");
       }
+      if (active.cleanupUnverified) {
+        if (!await closePlanClient()) throw new Error(acpCleanupError);
+        active.cleanupUnverified = false;
+      }
       active.cancelling = true;
-      const terminalization = terminalize(active, { kind: "failed", error: "Plan generation was cancelled." });
       const factoryCleanup = clientFactoryCleanup;
       abortClientCreation();
+      let cleanupComplete = false;
       try {
         if (active.rawSessionId && client && !client.isClosed()) {
           try {
@@ -551,11 +598,22 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
         if (settlement && !await settlesWithin(settlement, options.cancelSettlementGraceMs ?? defaultCancelSettlementGraceMs)) {
           await closePlanClient();
         }
-        const [, persisted] = await Promise.all([settlement, terminalization, factoryCleanup]);
+        await Promise.all([settlement, factoryCleanup]);
+        if (clientFactoryCleanupFailed || active.cleanupUnverified) {
+          active.cleanupUnverified = true;
+          throw new Error(acpCleanupError);
+        }
+        const persisted = await terminalize(active, { kind: "failed", error: "Plan generation was cancelled." });
         if (!persisted) throw new Error(planStatePersistenceError);
+        cleanupComplete = true;
         return { protocolVersion, cancelled: true };
+      } catch (error) {
+        if (isAcpCleanupFailure(error)) active.cleanupUnverified = true;
+        throw error;
       } finally {
-        if (activeRuns.get(request.planSessionId) === active) activeRuns.delete(request.planSessionId);
+        if (cleanupComplete && activeRuns.get(request.planSessionId) === active) {
+          activeRuns.delete(request.planSessionId);
+        }
       }
     },
     bootstrap(
@@ -640,34 +698,52 @@ export function createPlanRuntime(options: PlanRuntimeOptions) {
       closed = true;
       abortClientCreation();
       const active = [...activeRuns.values()];
-      const terminalizations = active
-        .filter((run) => run.accepted)
-        .map((run) => terminalize(run, { kind: "failed", error: runtimeShutdownError }));
+      const accepted = active.filter((run) => run.accepted);
       const acceptances = active
         .filter((run) => !run.accepted)
         .map((run) => run.acceptance?.catch(() => undefined));
       const settlements = active
         .map((run) => run.settlement)
         .filter((settlement): settlement is Promise<void> => settlement !== null);
-      closePromise = (async () => {
-        await Promise.all([closePlanClient(), ...terminalizations, ...acceptances, ...settlements]);
+      const closing = (async () => {
+        const [clientCleanupVerified] = await Promise.all([closePlanClient(), ...acceptances, ...settlements]);
+        if (clientCleanupVerified) {
+          for (const run of accepted) run.cleanupUnverified = false;
+        }
+        if (accepted.some((run) => run.cleanupUnverified)) throw new Error(acpCleanupError);
+        const persisted = await Promise.all(accepted.map((run) => terminalize(run, {
+          kind: "failed",
+          error: runtimeShutdownError,
+        })));
+        if (persisted.some((result) => !result)) throw new Error(planStatePersistenceError);
         client = null;
         clientPromise = null;
         activeRuns.clear();
         loadedPlanSessionId = null;
       })();
-      return closePromise;
+      closePromise = closing;
+      void closing.catch(() => {
+        if (closePromise === closing) closePromise = null;
+      });
+      return closing;
     },
   };
 
-  async function closePlanClient(): Promise<void> {
+  async function closePlanClient(): Promise<boolean> {
     const current = client;
-    const factoryCleanup = clientFactoryCleanup;
+    const cleanup = clientFactoryCleanup;
+    const closedControlledClient = current !== null;
     abortClientCreation();
     await current?.close();
-    await factoryCleanup;
-    if (client === current || client?.isClosed()) client = null;
+    await cleanup;
+    if (clientFactoryCleanupFailed) throw new Error(acpCleanupError);
+    if (client === current || client?.isClosed()) {
+      client = null;
+      clientProjectRoot = null;
+    }
+    clientPromiseProjectRoot = null;
     loadedPlanSessionId = null;
+    return closedControlledClient;
   }
 
   function abortClientCreation(): void {
@@ -1413,6 +1489,10 @@ function fixedStartError(error: unknown): Error {
 
 class IndeterminatePlanStateError extends Error {}
 
+function isAcpCleanupFailure(error: unknown): boolean {
+  return isRecord(error) && error.message === acpCleanupError;
+}
+
 function publicPlanError(error: unknown): string {
   const message = isRecord(error) && typeof error.message === "string" ? error.message : "";
   const allowed = [
@@ -1439,10 +1519,11 @@ function publicPlanError(error: unknown): string {
   return allowed.includes(message) ? message : "Plan generation failed.";
 }
 
-async function defaultClientFactory(signal: AbortSignal): Promise<HermesAcpClient> {
+async function defaultClientFactory(projectRoot: string, signal: AbortSignal): Promise<HermesAcpClient> {
   const { createHermesAcpClient } = await import("@skyturn/agent-bridge");
   return createHermesAcpClient({
     ...(process.env.SKYTURN_HERMES_PATH ? { executablePath: process.env.SKYTURN_HERMES_PATH } : {}),
+    projectRoot,
     signal,
   });
 }

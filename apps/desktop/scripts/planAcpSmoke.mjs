@@ -5,7 +5,7 @@ export async function runPlanAcpSmoke(options = {}) {
   const projectRoot = resolve(options.projectRoot ?? process.cwd());
   const createClient = options.createClient ?? defaultClientFactory;
   const buildPrompt = options.buildPrompt ?? defaultPromptBuilder;
-  const client = await createClient();
+  const client = await createClient(projectRoot);
   let chunkCount = 0;
   try {
     const sessionId = await client.newSession(projectRoot);
@@ -30,10 +30,11 @@ export async function runPlanAcpSmoke(options = {}) {
   }
 }
 
-async function defaultClientFactory() {
+async function defaultClientFactory(projectRoot) {
   const { createHermesAcpClient } = await import("@skyturn/agent-bridge");
   return createHermesAcpClient({
     ...(process.env.SKYTURN_HERMES_PATH ? { executablePath: process.env.SKYTURN_HERMES_PATH } : {}),
+    projectRoot,
   });
 }
 

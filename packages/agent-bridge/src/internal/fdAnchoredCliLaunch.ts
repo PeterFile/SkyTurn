@@ -10,7 +10,22 @@ import type { AgentRunSandbox } from "@skyturn/project-core";
 
 const sandboxExecutablePath = "/usr/bin/sandbox-exec";
 const sandboxProbeTimeoutMs = 2_000;
-const readOnlyProfile = "(version 1) (allow default) (deny file-write*)";
+const readOnlyProfile = "(version 1) (allow default) (deny file-write*) (deny process-fork)";
+const hermesRuntimeStatePaths = [
+  ".mcp-discovery.lock",
+  "state.db",
+  "state.db-wal",
+  "state.db-shm",
+  "state.db-journal",
+  "kanban.db",
+  "kanban.db-wal",
+  "kanban.db-shm",
+  "kanban.db-journal",
+  "logs/agent.log",
+  "logs/errors.log",
+  "logs/mcp-stderr.log",
+  "skills/.usage.json",
+] as const;
 const supportedCodexRestrictedPlatforms = new Set<NodeJS.Platform>(["darwin", "linux"]);
 const sandboxCapability = new Map<string, Promise<boolean>>();
 
@@ -24,6 +39,8 @@ export interface SpawnFdAnchoredCliInput extends FdAnchoredCliLaunchCapabilityIn
   args: string[];
   env: NodeJS.ProcessEnv;
   executablePath: string;
+  hermesStateRoot?: string;
+  preserveWorktreeFd?: boolean;
   worktreeFd: number;
 }
 
@@ -85,19 +102,28 @@ export function buildFdAnchoredCliLaunchPlan(
   }
   const helperPath = fdLaunchHelperPath();
   const fdLaunchArgs = input.agentKind === "codex"
-    ? ["--require-git", input.executablePath, ...input.args]
-    : [input.executablePath, ...input.args];
+    ? ["--require-git", ...(input.preserveWorktreeFd ? ["--preserve-worktree-fd"] : []), input.executablePath, ...input.args]
+    : [...(input.preserveWorktreeFd ? ["--preserve-worktree-fd"] : []), input.executablePath, ...input.args];
   const sandboxedHermes = input.agentKind === "hermes" && input.sandbox !== "danger-full-access";
   return {
     fdLaunchArgs,
     fdLaunchPath: helperPath,
     wrapper: sandboxedHermes
       ? {
-          args: ["-p", readOnlyProfile],
+          args: ["-p", input.hermesStateRoot
+            ? hermesReadOnlyProfile(input.hermesStateRoot)
+            : readOnlyProfile],
           executablePath: sandboxExecutablePath,
         }
       : null,
   };
+}
+
+function hermesReadOnlyProfile(stateRoot: string): string {
+  const writableFiles = hermesRuntimeStatePaths
+    .map((relativePath) => `(literal ${JSON.stringify(join(stateRoot, relativePath))})`)
+    .join(" ");
+  return `${readOnlyProfile} (allow file-write* ${writableFiles})`;
 }
 
 function fdLaunchHelperPath(): string {
@@ -132,17 +158,24 @@ async function runMacOsReadOnlySandboxProbe(helperPath: string): Promise<boolean
       worktreePath,
       fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
     );
-    const shellScript = "if printf probe > inside 2>/dev/null; then exit 82; fi";
-    const helperArgs = [helperPath, "/bin/sh", "-c", shellScript, "skyturn-sandbox-probe", outsidePath];
-    const args = macOsReadOnlySandboxArgs(helperArgs);
-    const child = spawn(sandboxExecutablePath, args, {
-      detached: false,
+    const probeScript = [
+      'const { spawnSync } = require("node:child_process");',
+      'const { writeFileSync } = require("node:fs");',
+      "let unsafe = false;",
+      'try { writeFileSync("inside", "probe"); unsafe = true; } catch {}',
+      'try { writeFileSync(process.argv[1], "probe"); unsafe = true; } catch {}',
+      'const child = spawnSync("/usr/bin/true");',
+      'if (!child.error || child.error.code !== "EPERM") unsafe = true;',
+      "process.exit(unsafe ? 82 : 0);",
+    ].join("");
+    const helperArgs = [helperPath, process.execPath, "-e", probeScript, outsidePath];
+    const targetArgs = [sandboxExecutablePath, ...macOsReadOnlySandboxArgs(helperArgs)];
+    const child = spawn(posixProcessOwnerHelperPath(), [String(sandboxProbeTimeoutMs), ...targetArgs], {
+      detached: true,
       shell: false,
-      stdio: ["ignore", "ignore", "ignore", worktree.fd, "pipe"],
+      stdio: ["pipe", "ignore", "ignore", worktree.fd, "pipe"],
     });
-    if (child.stdio[4] instanceof Readable) child.stdio[4].resume();
-    const result = await waitForProbeClose(child);
-    if (result !== 0) return false;
+    if (!(await waitForManagedProbeClose(child))) return false;
     const insidePath = join(worktreePath, "inside");
     if (await pathExists(insidePath)) return false;
     return !(await pathExists(outsidePath));
@@ -152,24 +185,53 @@ async function runMacOsReadOnlySandboxProbe(helperPath: string): Promise<boolean
   }
 }
 
-function waitForProbeClose(child: ChildProcess): Promise<number | null> {
+function waitForManagedProbeClose(child: ChildProcess): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (status: number | null) => {
+    let timedOut = false;
+    let protocol = "";
+    let protocolInvalid = false;
+    const status = child.stdio[4];
+    const finish = (exitCode: number | null, signalCode: NodeJS.Signals | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      resolve(status);
+      resolve(
+        !timedOut &&
+        !protocolInvalid &&
+        exitCode === 0 &&
+        signalCode === null &&
+        /^R [1-9][0-9]*\nC 0 0\n$/.test(protocol),
+      );
     };
     const timeout = setTimeout(() => {
+      timedOut = true;
       try {
-        child.kill("SIGKILL");
+        child.stdin?.write("T\n", (error) => {
+          if (error) child.stdin?.destroy();
+        });
       } catch {
-        // A thrown kill does not replace the helper's actual close boundary.
+        child.stdin?.destroy();
       }
     }, sandboxProbeTimeoutMs);
+    if (status instanceof Readable) {
+      status.setEncoding("utf8");
+      status.on("data", (chunk: string) => {
+        if (protocolInvalid) return;
+        protocol += chunk;
+        if (protocol.length > 128) {
+          protocolInvalid = true;
+          protocol = "";
+        }
+      });
+      status.once("error", () => {
+        protocolInvalid = true;
+      });
+    } else {
+      protocolInvalid = true;
+    }
     child.once("error", () => undefined);
-    child.once("close", (code) => finish(code));
+    child.once("close", finish);
   });
 }
 
