@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20,6 +20,39 @@ afterEach(async () => {
 });
 
 describe("POSIX managed process ownership", () => {
+  it("includes dist without a redundant owner-helper package entry", async () => {
+    const packageJson = JSON.parse(await readFile(
+      new URL("../../package.json", import.meta.url),
+      "utf8",
+    ));
+
+    expect(packageJson.files).toContain("dist");
+    expect(packageJson.files).not.toContain("dist/native/posix-process-owner");
+  });
+
+  posixIt("copies the executable owner helper into the published dist package", async () => {
+    const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+    const buildScript = fileURLToPath(new URL("../../scripts/buildArtifactGate.mjs", import.meta.url));
+    const built = spawnSync(process.execPath, [buildScript, "--copy-dist"], {
+      cwd: packageRoot,
+      encoding: "utf8",
+    });
+    expect(built.status, built.stderr).toBe(0);
+
+    const helper = await stat(join(packageRoot, "dist/native/posix-process-owner"));
+    expect(helper.isFile()).toBe(true);
+    expect(helper.size).toBeGreaterThan(0);
+    expect(helper.mode & 0o111).not.toBe(0);
+
+    const packed = spawnSync("pnpm", ["pack", "--dry-run", "--json"], {
+      cwd: packageRoot,
+      encoding: "utf8",
+    });
+    expect(packed.status, packed.stderr).toBe(0);
+    const packedFiles = JSON.parse(packed.stdout).files.map(({ path }: { path: string }) => path);
+    expect(packedFiles).toContain("dist/native/posix-process-owner");
+  });
+
   posixIt("kills a stubborn process tree when a separate Node owner dies", async () => {
     const root = await makeRoot(true);
     const parentPidPath = join(root, "parent.pid");
