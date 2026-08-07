@@ -5168,7 +5168,7 @@ describe("agent bridge", () => {
       if (agentKind === "codex") await mkdir(join(projectRoot, ".git"));
       const binRoot = await makeTempRoot();
       const executablePath = join(binRoot, agentKind);
-      await writeFile(executablePath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await writeFile(executablePath, "#!/bin/sh\nwhile true; do sleep 1; done\n", { mode: 0o755 });
       let verifierKills = 0;
       let verifierChild: (ChildProcess & { stdout: PassThrough }) | null = null;
       const verifierKilled = deferred<void>();
@@ -5189,7 +5189,6 @@ describe("agent bridge", () => {
         artifactVerificationHooks: {
           platform: "win32" as const,
           windowsVerifierDependencies,
-          afterParentOpen: async () => rm(executablePath),
         },
       };
       const bridge = new AgentBridge({
@@ -5198,7 +5197,6 @@ describe("agent bridge", () => {
           : createHermesCliAdapter(adapterOptions)],
         appendEvent: async (_root, event) => {
           if (event.kind === "progress" && event.payload.phase === "started") {
-            await verifierKilled.promise;
             throw new Error("started event persistence failed");
           }
         },

@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const helpers = ["artifact-gate", "fd-launch"];
+const helpers = ["artifact-gate", "fd-launch", "posix-process-owner"];
 const windowsHelpers = ["artifact-gate.ps1", "job-object-host.ps1"];
 for (const legacyPath of [
   join(packageRoot, "src/native/durable-run-claim"),

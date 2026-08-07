@@ -32,6 +32,15 @@ export interface FdAnchoredCliProcess {
   launchFailure: Promise<Error | null>;
 }
 
+export interface FdAnchoredCliLaunchPlan {
+  fdLaunchArgs: string[];
+  fdLaunchPath: string;
+  wrapper: {
+    args: string[];
+    executablePath: string;
+  } | null;
+}
+
 export async function hasFdAnchoredCliLaunchCapability(
   input: FdAnchoredCliLaunchCapabilityInput,
 ): Promise<boolean> {
@@ -53,19 +62,11 @@ export async function hasFdAnchoredCliLaunchCapability(
 }
 
 export function spawnFdAnchoredCli(input: SpawnFdAnchoredCliInput): FdAnchoredCliProcess {
-  if (input.agentKind === "hermes" && input.sandbox === "workspace-write") {
-    throw new Error("Hermes workspace-write sandbox is unavailable.");
-  }
-  const helperPath = fdLaunchHelperPath();
-  const anchoredArgs = input.agentKind === "codex"
-    ? ["--require-git", input.executablePath, ...input.args]
-    : [input.executablePath, ...input.args];
-  const helperArgs = [helperPath, ...anchoredArgs];
-  const sandboxedHermes = input.agentKind === "hermes" && input.sandbox !== "danger-full-access";
-  const executablePath = sandboxedHermes ? sandboxExecutablePath : helperPath;
-  const args = sandboxedHermes
-    ? macOsReadOnlySandboxArgs(helperArgs)
-    : anchoredArgs;
+  const plan = buildFdAnchoredCliLaunchPlan(input);
+  const executablePath = plan.wrapper?.executablePath ?? plan.fdLaunchPath;
+  const args = plan.wrapper
+    ? [...plan.wrapper.args, plan.fdLaunchPath, ...plan.fdLaunchArgs]
+    : plan.fdLaunchArgs;
   const child = spawn(executablePath, args, {
     env: input.env,
     detached: true,
@@ -73,6 +74,29 @@ export function spawnFdAnchoredCli(input: SpawnFdAnchoredCliInput): FdAnchoredCl
     stdio: ["ignore", "pipe", "pipe", input.worktreeFd, "pipe"],
   });
   return { child, launchFailure: readLaunchFailure(child) };
+}
+
+export function buildFdAnchoredCliLaunchPlan(
+  input: SpawnFdAnchoredCliInput,
+): FdAnchoredCliLaunchPlan {
+  if (input.agentKind === "hermes" && input.sandbox === "workspace-write") {
+    throw new Error("Hermes workspace-write sandbox is unavailable.");
+  }
+  const helperPath = fdLaunchHelperPath();
+  const fdLaunchArgs = input.agentKind === "codex"
+    ? ["--require-git", input.executablePath, ...input.args]
+    : [input.executablePath, ...input.args];
+  const sandboxedHermes = input.agentKind === "hermes" && input.sandbox !== "danger-full-access";
+  return {
+    fdLaunchArgs,
+    fdLaunchPath: helperPath,
+    wrapper: sandboxedHermes
+      ? {
+          args: ["-p", readOnlyProfile],
+          executablePath: sandboxExecutablePath,
+        }
+      : null,
+  };
 }
 
 function fdLaunchHelperPath(): string {
