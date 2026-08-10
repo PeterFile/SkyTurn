@@ -1,6 +1,6 @@
 import { constants as fsConstants } from "node:fs";
-import { access, open, realpath, type FileHandle } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { open, type FileHandle } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import {
@@ -24,6 +24,7 @@ import {
   type ManagedProcess,
 } from "./internal/managedProcess.js";
 import { resolveCliExecutable } from "./internal/resolveCliExecutable.js";
+import { resolveHermesCommand } from "./internal/resolveHermesCommand.js";
 
 export interface HermesAcpClientOptions {
   executablePath?: string;
@@ -157,10 +158,10 @@ export async function createHermesAcpClient(
       options.pathValue ?? env.PATH ?? process.env.PATH ?? "",
     );
     if (!resolvedExecutablePath) throw new Error("Hermes ACP initialization failed.");
-    const command = await resolveHermesAcpCommand(
+    const command = await resolveHermesCommand(
       resolvedExecutablePath,
       options.args ?? ["acp"],
-      platform,
+      { canonicalizeNonShimExecutable: true, platform },
     );
 
     projectRootHandle = await open(
@@ -236,43 +237,6 @@ export async function createHermesAcpClient(
     }
     throw new Error("Hermes ACP initialization failed.");
   }
-}
-
-async function resolveHermesAcpCommand(
-  executablePath: string,
-  args: string[],
-  platform: NodeJS.Platform,
-): Promise<{ args: string[]; executablePath: string }> {
-  const canonicalExecutablePath = await realpath(executablePath);
-  if (platform !== "darwin") {
-    return { args, executablePath: canonicalExecutablePath };
-  }
-  const executable = await open(
-    canonicalExecutablePath,
-    fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
-  );
-  let prefix = "";
-  try {
-    const buffer = Buffer.alloc(512);
-    const { bytesRead } = await executable.read(buffer, 0, buffer.length, 0);
-    prefix = buffer.subarray(0, bytesRead).toString("utf8");
-  } finally {
-    await executable.close();
-  }
-  const uvShimPrefix = [
-    "#!/bin/sh",
-    `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python3' "$0" "$@"`,
-    "' '''",
-  ].join("\n");
-  if (!prefix.startsWith(`${uvShimPrefix}\n`)) {
-    return { args, executablePath: canonicalExecutablePath };
-  }
-  const interpreterPath = join(dirname(canonicalExecutablePath), "python3");
-  await access(interpreterPath, fsConstants.X_OK);
-  return {
-    args: [canonicalExecutablePath, ...args],
-    executablePath: interpreterPath,
-  };
 }
 
 async function initializeWithAbort(

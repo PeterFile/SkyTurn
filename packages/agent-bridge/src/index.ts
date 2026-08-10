@@ -89,6 +89,7 @@ import {
   type ManagedProcessCloseResult,
 } from "./internal/managedProcess.js";
 import { resolveCliExecutable } from "./internal/resolveCliExecutable.js";
+import { resolveHermesCommand } from "./internal/resolveHermesCommand.js";
 
 export { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/project-core";
 export {
@@ -2622,6 +2623,21 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         await closeRunResources();
         return failRunPreflight(sink, "hermes", "Hermes CLI", "cli-missing", "Hermes CLI executable was not found.");
       }
+      const args = makeHermesChatArgs({
+        prompt: input.prompt,
+        opaqueHandle: input.hermesSessionHandle,
+        extraArgs: options.extraArgs,
+        source: options.source ?? "skyturn",
+      });
+      let command: Awaited<ReturnType<typeof resolveHermesCommand>>;
+      try {
+        command = await resolveHermesCommand(executablePath, args, {
+          platform: process.platform,
+        });
+      } catch (error) {
+        await closeRunResources();
+        throw error;
+      }
       try {
         if (artifactVerificationPlatform(artifactVerificationHooks) === "win32") {
           windowsVerifier = await openWindowsArtifactVerifierForRun(
@@ -2634,18 +2650,12 @@ export function createHermesCliAdapter(options: HermesCliAdapterOptions = {}): L
         await closeRunResources();
         throw error;
       }
-      const args = makeHermesChatArgs({
-        prompt: input.prompt,
-        opaqueHandle: input.hermesSessionHandle,
-        extraArgs: options.extraArgs,
-        source: options.source ?? "skyturn",
-      });
       const transport = input.hermesSessionHandle ? "hermes_session_resume" : "hermes_replay_recovery";
       let processBoundary: AgentCliProcessBoundary;
       try {
         processBoundary = await spawnAgentCliProcess(
-          executablePath,
-          args,
+          command.executablePath,
+          command.args,
           workdir,
           retainedWorktree?.fd ?? null,
           "hermes",

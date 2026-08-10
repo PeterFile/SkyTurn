@@ -7882,6 +7882,72 @@ describe("agent bridge", () => {
     }
   }, 15_000);
 
+  it("launches a strict Hermes uv shim through sibling Python with unchanged chat arguments", async () => {
+    const projectRoot = await makeTempRoot();
+    const binRoot = await makeTempRoot();
+    const executablePath = join(binRoot, "hermes");
+    const interpreterPath = join(binRoot, "python3");
+    await writeFile(executablePath, [
+      "#!/bin/sh",
+      `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python3' "$0" "$@"`,
+      "' '''",
+      "from hermes_cli.main import main",
+    ].join("\n"), { mode: 0o755 });
+    await writeFile(interpreterPath, "interpreter", { mode: 0o755 });
+    const canonicalExecutablePath = await realpath(executablePath);
+    let launch: Parameters<SpawnManagedProcess>[0] | undefined;
+    managedProcessMock.spawn = async (input: Parameters<SpawnManagedProcess>[0]) => {
+      launch = input;
+      throw new Error("captured Hermes uv shim launch");
+    };
+    const adapter = createHermesCliAdapter({
+      executablePath,
+      extraArgs: ["--model", "test-model"],
+      source: "shim-regression",
+    });
+    const sink: RunEventSink = {
+      async emit() {
+        throw new Error("Hermes uv shim launch unexpectedly emitted an event.");
+      },
+    };
+
+    await withProcessPlatform("darwin", async () => {
+      await expect(adapter.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        runId: "run-hermes-uv-shim",
+        nodeId: "node-hermes-uv-shim",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "hermes",
+        sandbox: "danger-full-access",
+        prompt: "Plan through the shim",
+        hermesSessionHandle: "opaque-resume-handle",
+      }, sink)).rejects.toThrow("captured Hermes uv shim launch");
+    });
+
+    expect(launch).toMatchObject({
+      agentKind: "hermes",
+      args: [
+        canonicalExecutablePath,
+        "chat",
+        "-q",
+        "Plan through the shim",
+        "--quiet",
+        "--source",
+        "shim-regression",
+        "--resume",
+        "opaque-resume-handle",
+        "--model",
+        "test-model",
+      ],
+      executablePath: await realpath(interpreterPath),
+      platform: "darwin",
+      sandbox: "danger-full-access",
+      worktreeFd: expect.any(Number),
+    });
+  });
+
   it("runs Hermes chat planning without oneshot -z and marks replay recovery honestly", async () => {
     const projectRoot = await makeTempRoot();
     const binRoot = await makeTempRoot();
