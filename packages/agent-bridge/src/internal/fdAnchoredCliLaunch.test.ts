@@ -14,6 +14,8 @@ const accessMock = vi.hoisted(() => vi.fn());
 const spawnMock = vi.hoisted(() => vi.fn());
 const posixIt = process.platform === "win32" ? it.skip : it;
 const roots: string[] = [];
+const originalProcessVersions = process.versions;
+const originalElectronRunAsNode = process.env.ELECTRON_RUN_AS_NODE;
 
 vi.mock("node:child_process", async (importOriginal) => {
   const original = await importOriginal<typeof import("node:child_process")>();
@@ -34,6 +36,12 @@ describe("fd-anchored CLI launch", () => {
     vi.resetModules();
     accessMock.mockReset();
     spawnMock.mockReset();
+    Object.defineProperty(process, "versions", { value: originalProcessVersions });
+    if (originalElectronRunAsNode === undefined) {
+      delete process.env.ELECTRON_RUN_AS_NODE;
+    } else {
+      process.env.ELECTRON_RUN_AS_NODE = originalElectronRunAsNode;
+    }
   });
 
   afterEach(async () => {
@@ -119,6 +127,52 @@ describe("fd-anchored CLI launch", () => {
     expect(spawnMock).toHaveBeenCalledOnce();
     expect(spawnMock.mock.calls[0]?.[0]).toMatch(/\/native\/posix-process-owner$/);
   });
+
+  it("runs the Electron sandbox probe with Electron Node CLI semantics", async () => {
+    process.env.ELECTRON_RUN_AS_NODE = "inherited-wrong-value";
+    Object.defineProperty(process, "versions", {
+      value: { ...originalProcessVersions, electron: "41.5.1" },
+    });
+    spawnMock.mockImplementation(successfulManagedProbe);
+    const { hasFdAnchoredCliLaunchCapability } = await import("./fdAnchoredCliLaunch.js");
+
+    await expect(hasFdAnchoredCliLaunchCapability({
+      agentKind: "hermes",
+      platform: "darwin",
+      sandbox: "read-only",
+    })).resolves.toBe(true);
+
+    const spawnOptions = spawnMock.mock.calls[0]?.[2];
+    expect(spawnOptions?.env).not.toBe(process.env);
+    expect(spawnOptions?.env).toMatchObject({ ELECTRON_RUN_AS_NODE: "1" });
+    expect(process.env.ELECTRON_RUN_AS_NODE).toBe("inherited-wrong-value");
+  });
+
+  it.each([undefined, "existing-node-value"])(
+    "preserves the inherited probe environment in a normal Node runtime (%s)",
+    async (electronRunAsNode) => {
+      if (electronRunAsNode === undefined) {
+        delete process.env.ELECTRON_RUN_AS_NODE;
+      } else {
+        process.env.ELECTRON_RUN_AS_NODE = electronRunAsNode;
+      }
+      const inheritedEnv = process.env;
+      spawnMock.mockImplementation(successfulManagedProbe);
+      const { hasFdAnchoredCliLaunchCapability } = await import("./fdAnchoredCliLaunch.js");
+
+      await expect(hasFdAnchoredCliLaunchCapability({
+        agentKind: "hermes",
+        platform: "darwin",
+        sandbox: "read-only",
+      })).resolves.toBe(true);
+
+      const spawnOptions = spawnMock.mock.calls[0]?.[2];
+      expect(spawnOptions?.env === inheritedEnv).toBe(true);
+      expect(spawnOptions?.env?.ELECTRON_RUN_AS_NODE).toBe(electronRunAsNode);
+      expect(process.env === inheritedEnv).toBe(true);
+      expect(process.env.ELECTRON_RUN_AS_NODE).toBe(electronRunAsNode);
+    },
+  );
 
   it("denies descendant creation inside the restricted Hermes sandbox", async () => {
     const { buildFdAnchoredCliLaunchPlan } = await import("./fdAnchoredCliLaunch.js");
@@ -309,4 +363,19 @@ function fd3ProbeScript(outputPath: string): string {
     "const anchor = fs.readFileSync('.git/anchor.txt', 'utf8');",
     `fs.writeFileSync(${JSON.stringify(outputPath)}, cwd + "\\n" + fd3Dir + "\\n" + anchor + "\\n");`,
   ].join("\n");
+}
+
+function successfulManagedProbe(): ChildProcess {
+  const control = new PassThrough();
+  const status = new PassThrough();
+  const child = Object.assign(new EventEmitter(), {
+    kill: vi.fn(() => true),
+    stdin: control,
+    stdio: [control, null, null, null, status],
+  }) as unknown as ChildProcess;
+  queueMicrotask(() => {
+    status.end("R 41\nC 0 0\n");
+    child.emit("close", 0, null);
+  });
+  return child;
 }
