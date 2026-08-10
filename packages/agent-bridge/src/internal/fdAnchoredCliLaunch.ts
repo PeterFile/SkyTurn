@@ -138,6 +138,14 @@ function macOsReadOnlySandboxArgs(helperArgs: string[]): string[] {
   return ["-p", readOnlyProfile, ...helperArgs];
 }
 
+function macOsReadOnlySandboxProbeEnv(
+  env: NodeJS.ProcessEnv,
+  versions: NodeJS.ProcessVersions,
+): NodeJS.ProcessEnv {
+  if (versions.electron === undefined) return env;
+  return { ...env, ELECTRON_RUN_AS_NODE: "1" };
+}
+
 function probeMacOsReadOnlySandbox(helperPath: string): Promise<boolean> {
   const key = `${helperPath}:read-only`;
   const existing = sandboxCapability.get(key);
@@ -172,6 +180,7 @@ async function runMacOsReadOnlySandboxProbe(helperPath: string): Promise<boolean
     const targetArgs = [sandboxExecutablePath, ...macOsReadOnlySandboxArgs(helperArgs)];
     const child = spawn(posixProcessOwnerHelperPath(), [String(sandboxProbeTimeoutMs), ...targetArgs], {
       detached: true,
+      env: macOsReadOnlySandboxProbeEnv(process.env, process.versions),
       shell: false,
       stdio: ["pipe", "ignore", "ignore", worktree.fd, "pipe"],
     });
