@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { chmod, mkdir, mkdtemp, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,7 @@ const posixIt = process.platform === "win32" ? it.skip : it;
 const darwinIt = process.platform === "darwin" ? it : it.skip;
 const roots: string[] = [];
 const pids = new Set<number>();
+const nativeHelperNames = ["artifact-gate", "fd-launch", "posix-process-owner"] as const;
 
 afterEach(async () => {
   for (const pid of pids) killPid(pid);
@@ -52,6 +53,71 @@ describe("POSIX managed process ownership", () => {
     expect(packed.status, packed.stderr).toBe(0);
     const packedFiles = JSON.parse(packed.stdout).files.map(({ path }: { path: string }) => path);
     expect(packedFiles).toContain("dist/native/posix-process-owner");
+  });
+
+  posixIt("keeps published helpers executable until a complete rebuild is atomically published", async () => {
+    const fixture = await makeNativeBuildFixture();
+    const readyPath = join(fixture.root, "compiler.ready");
+    const releasePath = join(fixture.root, "compiler.release");
+    const compilerPath = join(fixture.root, "fake-cc");
+    await writeExecutable(compilerPath, fakeCompilerScript("pause", readyPath, releasePath));
+
+    const build = spawn(process.execPath, [fixture.buildScript, "--copy-dist"], {
+      cwd: fixture.root,
+      env: { ...process.env, CC: compilerPath },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    build.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+    });
+
+    const closed = waitForChildClose(build);
+    await waitForFile(readyPath);
+    try {
+      for (const helper of nativeHelperNames) {
+        const published = join(fixture.nativeRoot, helper);
+        expect(await readFile(published, "utf8")).toBe(nativeHelperScript("old", helper));
+        const executed = spawnSync(published, { encoding: "utf8" });
+        expect(executed.status, executed.stderr).toBe(0);
+        expect(executed.stdout).toBe(`old:${helper}`);
+      }
+    } finally {
+      await writeFile(releasePath, "release");
+      await closed;
+    }
+
+    const result = await closed;
+    expect(result, stderr).toEqual({ code: 0, signal: null });
+    for (const helper of nativeHelperNames) {
+      const source = join(fixture.nativeRoot, helper);
+      const dist = join(fixture.root, "dist/native", helper);
+      expect(await readFile(source, "utf8")).toBe(nativeHelperScript("new", helper));
+      expect(await readFile(dist, "utf8")).toBe(await readFile(source, "utf8"));
+      expect((await stat(source)).mode & 0o111).not.toBe(0);
+      expect((await stat(dist)).mode & 0o111).not.toBe(0);
+    }
+    await expectOnlyFixtureNativeFiles(fixture.nativeRoot);
+  });
+
+  posixIt.each([
+    ["compiler", "fail"],
+    ["chmod", "dangling"],
+  ] as const)("preserves published helpers and cleans temporary output after %s failure", async (_stage, mode) => {
+    const fixture = await makeNativeBuildFixture();
+    const compilerPath = join(fixture.root, "fake-cc");
+    await writeExecutable(compilerPath, fakeCompilerScript(mode));
+
+    const built = spawnSync(process.execPath, [fixture.buildScript, "--copy-dist"], {
+      cwd: fixture.root,
+      encoding: "utf8",
+      env: { ...process.env, CC: compilerPath },
+    });
+    expect(built.status).not.toBe(0);
+    for (const helper of nativeHelperNames) {
+      expect(await readFile(join(fixture.nativeRoot, helper), "utf8")).toBe(nativeHelperScript("old", helper));
+    }
+    await expectOnlyFixtureNativeFiles(fixture.nativeRoot);
   });
 
   darwinIt("keeps the owner outside the restricted target sandbox and denies target descendants", async () => {
@@ -521,6 +587,95 @@ async function makeRoot(git: boolean): Promise<string> {
   roots.push(root);
   if (git) await mkdir(join(root, ".git"));
   return root;
+}
+
+async function makeNativeBuildFixture(): Promise<{
+  buildScript: string;
+  nativeRoot: string;
+  root: string;
+}> {
+  const root = await makeRoot(false);
+  const nativeRoot = join(root, "src/native");
+  const scriptsRoot = join(root, "scripts");
+  const buildScript = join(scriptsRoot, "buildArtifactGate.mjs");
+  await Promise.all([mkdir(nativeRoot, { recursive: true }), mkdir(scriptsRoot, { recursive: true })]);
+  await copyFile(fileURLToPath(new URL("../../scripts/buildArtifactGate.mjs", import.meta.url)), buildScript);
+  await Promise.all([
+    ...nativeHelperNames.flatMap((helper) => [
+      writeFile(join(nativeRoot, `${helper}.c`), "int main(void) { return 0; }\n"),
+      writeExecutable(join(nativeRoot, helper), nativeHelperScript("old", helper)),
+    ]),
+    writeFile(join(nativeRoot, "artifact-gate.ps1"), "# fixture\n"),
+    writeFile(join(nativeRoot, "job-object-host.ps1"), "# fixture\n"),
+  ]);
+  return { buildScript, nativeRoot, root };
+}
+
+function nativeHelperScript(version: "new" | "old", helper: string): string {
+  return `#!/bin/sh\nprintf '${version}:${helper}'\n`;
+}
+
+function fakeCompilerScript(
+  mode: "dangling" | "fail" | "pause",
+  readyPath?: string,
+  releasePath?: string,
+): string {
+  return [
+    "#!/usr/bin/env node",
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    `const mode = ${JSON.stringify(mode)};`,
+    `const readyPath = ${JSON.stringify(readyPath)};`,
+    `const releasePath = ${JSON.stringify(releasePath)};`,
+    "const args = process.argv.slice(2);",
+    'const outputIndex = args.indexOf("-o");',
+    "const output = args[outputIndex + 1];",
+    'const helper = path.basename(args[outputIndex - 1], ".c");',
+    "if (mode === 'dangling') {",
+    "  fs.rmSync(output, { force: true });",
+    "  fs.symlinkSync('missing-native-helper-target', output);",
+    "  process.exit(0);",
+    "}",
+    `const complete = ${JSON.stringify(nativeHelperScript("new", "__HELPER__"))}.replace("__HELPER__", helper);`,
+    "if (mode === 'fail') {",
+    "  fs.writeFileSync(output, complete);",
+    "  process.exit(29);",
+    "}",
+    `fs.writeFileSync(output, ${JSON.stringify("#!/bin/sh\nprintf 'incomplete'\n")});`,
+    "if (helper !== 'artifact-gate') {",
+    "  fs.writeFileSync(output, complete);",
+    "  process.exit(0);",
+    "}",
+    "fs.writeFileSync(readyPath, output);",
+    "const interval = setInterval(() => {",
+    "  if (!fs.existsSync(releasePath)) return;",
+    "  clearInterval(interval);",
+    "  fs.writeFileSync(output, complete);",
+    "  process.exit(0);",
+    "}, 5);",
+  ].join("\n");
+}
+
+async function expectOnlyFixtureNativeFiles(nativeRoot: string): Promise<void> {
+  expect((await readdir(nativeRoot)).sort()).toEqual([
+    "artifact-gate",
+    "artifact-gate.c",
+    "artifact-gate.ps1",
+    "fd-launch",
+    "fd-launch.c",
+    "job-object-host.ps1",
+    "posix-process-owner",
+    "posix-process-owner.c",
+  ]);
+}
+
+function waitForChildClose(child: ReturnType<typeof spawn>): Promise<{
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}> {
+  return new Promise((resolve) => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
 }
 
 async function openDirectory(path: string) {
