@@ -372,15 +372,29 @@ describe("workflow-card tools", () => {
     expect(prompt).toContain("ReplanFromEvidence MUST include laneId and evidenceId; DeclareEdge MUST include sourceLaneId and targetLaneId.");
     expect(prompt).toContain("Allowed operations: AnalyzeRequirement, DiscoverProject, ProposeLanes, SplitLane, JoinLanes, StartImplementation, RequestValidation, RequestReview, RequestUserDecision, ReplanFromEvidence, Commit, DeclareEdge.");
     expect(prompt).toContain("operations MUST include AnalyzeRequirement, DiscoverProject, and ProposeLanes.");
-    expect(prompt).toContain("ProposeLanes MUST include a lanes array");
-    expect(prompt).toContain("Use agentKind codex for implementation, command validation, browser screenshot, and commit lanes");
+    const unprivilegedLaneRule =
+      "For unprivileged planner-owned decomposition, include a lanes array in ProposeLanes; each lane needs id, kind, title, agentKind, and dependsOn when it has dependencies.";
+    const externalPrivilegedLaneRule =
+      'External ProposeLanes and SplitLane lane suggestions MUST NOT use kind "commit" or "adopt"; privileged commit lanes come only from trusted policy packs or explicit backend operations.';
+    const trustedCommitException =
+      "When a workflow requires a privileged git commit lane, ProposeLanes MUST omit its lanes field so the Kernel selects trusted policy-pack lanes based on AnalyzeRequirement and DiscoverProject; this is the only policy-pack exception.";
+    expect(prompt).toContain(unprivilegedLaneRule);
+    expect(prompt).toContain(externalPrivilegedLaneRule);
+    expect(prompt).toContain(trustedCommitException);
+    expect(prompt.indexOf(trustedCommitException)).toBeLessThan(prompt.indexOf("User goal: Update one file and verify it"));
+    expect(prompt).toContain("Use agentKind codex for implementation, command validation, and browser screenshot lanes");
     expect(prompt).toContain("Use agentKind hermes for review lanes");
     expect(prompt).toContain("root planning node already owns planning");
     expect(prompt).toContain("Do not create a separate planning, scope, or intake lane");
     expect(prompt).toContain("Do not output workflow-card tools or UI mutations.");
-    expect(prompt).toContain("Hermes owns lane granularity");
+    expect(prompt).toContain("Hermes owns unprivileged lane granularity");
     expect(prompt).toContain("SkyTurn validates and schedules the DAG");
-    expect(prompt).not.toContain("SkyTurn chooses policy-pack lanes when lanes are omitted.");
+    expect(prompt).toContain("Do not rely on SkyTurn policy-pack fallback for unprivileged decomposition; the privileged commit exception above is required.");
+    expect(prompt).not.toContain("ProposeLanes MUST include a lanes array");
+    expect(prompt).not.toContain('For ProposeLanes, canonical lane kinds are "implementation", "validation", "review", and "commit"');
+    expect(prompt).not.toContain("Hermes owns lane granularity");
+    expect(prompt).not.toContain("command validation, browser screenshot, and commit lanes");
+    expect(prompt).not.toContain("Do not rely on SkyTurn policy-pack fallback for user-request decomposition.");
     expect(prompt).not.toContain("createWorkflowCard");
     expect(prompt).not.toContain("toolCalls");
   });
