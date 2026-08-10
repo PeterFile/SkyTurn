@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,11 +25,8 @@ if (process.platform !== "win32") {
   for (const helper of helpers) {
     const source = join(packageRoot, `src/native/${helper}.c`);
     const sourceBinary = join(packageRoot, `src/native/${helper}`);
-    const result = spawnSync(compiler, ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", source, "-o", sourceBinary], {
-      stdio: "inherit",
-    });
-    if (result.status !== 0) process.exit(result.status ?? 1);
-    chmodSync(sourceBinary, 0o755);
+    const buildStatus = buildNativeHelper(compiler, source, sourceBinary);
+    if (buildStatus !== 0) process.exit(buildStatus);
 
     if (process.argv.includes("--copy-dist")) {
       const distBinary = join(packageRoot, `dist/native/${helper}`);
@@ -36,6 +34,23 @@ if (process.platform !== "win32") {
       copyFileSync(sourceBinary, distBinary);
       chmodSync(distBinary, 0o755);
     }
+  }
+}
+
+function buildNativeHelper(compiler, source, sourceBinary) {
+  const temporaryBinary = `${sourceBinary}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    const result = spawnSync(
+      compiler,
+      ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2", source, "-o", temporaryBinary],
+      { stdio: "inherit" },
+    );
+    if (result.status !== 0) return result.status ?? 1;
+    chmodSync(temporaryBinary, 0o755);
+    renameSync(temporaryBinary, sourceBinary);
+    return 0;
+  } finally {
+    rmSync(temporaryBinary, { force: true });
   }
 }
 
