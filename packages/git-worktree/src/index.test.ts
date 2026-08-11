@@ -140,6 +140,76 @@ describe("git worktree services", () => {
     expect(parsed).not.toBe(evidence);
   });
 
+  it("preserves atomic full patch evidence in variant comparisons", () => {
+    const changeset = {
+      evidenceId: "evidence-left",
+      changesetId: "changeset-left",
+      source: "git",
+      status: "available",
+      files: ["src/index.ts"],
+      diffStat: { added: 1, changed: 0, deleted: 0 },
+      patchPreviewTruncated: false,
+      fullPatchSha256: "a".repeat(64),
+      fullPatchByteLength: 128,
+      fileManifestSha256: "b".repeat(64),
+    };
+    const parsed = parseVariantComparisonEvidence({
+      comparisonId: "comparison-left-right",
+      collectedAt: "2026-07-12T00:00:00.000Z",
+      variants: [{
+        variantId: "variant-left",
+        worktreeId: "worktree-left",
+        changeset,
+        metrics: [],
+      }],
+    });
+
+    expect(parsed.variants[0]?.changeset).toEqual(changeset);
+  });
+
+  it("rejects non-atomic or invalid full patch evidence in variant comparisons", () => {
+    const changeset = {
+      evidenceId: "evidence-left",
+      changesetId: "changeset-left",
+      source: "git",
+      status: "available",
+      files: ["src/index.ts"],
+      diffStat: { added: 1, changed: 0, deleted: 0 },
+      patchPreviewTruncated: false,
+      fullPatchSha256: "a".repeat(64),
+      fullPatchByteLength: 128,
+      fileManifestSha256: "b".repeat(64),
+    };
+    const comparison = {
+      comparisonId: "comparison-left-right",
+      collectedAt: "2026-07-12T00:00:00.000Z",
+      variants: [{
+        variantId: "variant-left",
+        worktreeId: "worktree-left",
+        changeset,
+        metrics: [],
+      }],
+    };
+
+    for (const malformedChangeset of [
+      { ...changeset, fullPatchByteLength: undefined },
+      { ...changeset, fullPatchSha256: "A".repeat(64) },
+      { ...changeset, fileManifestSha256: "b".repeat(63) },
+      { ...changeset, fullPatchByteLength: 0 },
+      { ...changeset, source: "mock" },
+      { ...changeset, status: "empty" },
+      { ...changeset, files: [] },
+    ]) {
+      const malformed = {
+        ...comparison,
+        variants: [{ ...comparison.variants[0], changeset: malformedChangeset }],
+      };
+      expect(() => parseVariantComparisonEvidence(malformed)).toThrow(
+        INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR,
+      );
+    }
+  });
+
   it("versions the root contract ABI", () => {
     expect(GIT_WORKTREE_CONTRACT_VERSION).toBe(1);
   });

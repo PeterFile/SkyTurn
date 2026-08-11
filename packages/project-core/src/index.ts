@@ -2112,7 +2112,7 @@ export type WorkflowCheckpointIntent =
   | WorkflowRequestedCheckpointSuccessorIntent
   | WorkflowRejectedCheckpointSuccessorIntent;
 
-export interface ChangesetEvidence {
+interface ChangesetEvidenceBase {
   evidenceId: string;
   changesetId: string;
   source: Changeset["source"];
@@ -2124,6 +2124,103 @@ export interface ChangesetEvidence {
   collectedAt?: string;
   artifactPaths?: string[];
   errorReason?: string;
+}
+
+export type ChangesetEvidence = ChangesetEvidenceBase & (
+  | {
+    fullPatchSha256?: never;
+    fullPatchByteLength?: never;
+    fileManifestSha256?: never;
+  }
+  | {
+    fullPatchSha256: string;
+    fullPatchByteLength: number;
+    fileManifestSha256: string;
+  }
+);
+
+const changesetEvidenceDigestPattern = /^[0-9a-f]{64}$/;
+
+export function parseChangesetEvidence(value: unknown): ChangesetEvidence | null {
+  if (!isRecord(value)) return null;
+  if (
+    !isNonEmptyString(value.evidenceId) ||
+    !isNonEmptyString(value.changesetId) ||
+    (value.source !== "mock" && value.source !== "git") ||
+    !isChangesetEvidenceStatus(value.status) ||
+    !isStringArray(value.files) ||
+    !isChangesetDiffStat(value.diffStat) ||
+    typeof value.patchPreviewTruncated !== "boolean" ||
+    !isOptionalString(value.worktreeId) ||
+    !isOptionalString(value.collectedAt) ||
+    (value.artifactPaths !== undefined && !isStringArray(value.artifactPaths)) ||
+    !isOptionalString(value.errorReason)
+  ) return null;
+
+  const fullPatchSha256 = value.fullPatchSha256;
+  const fullPatchByteLength = value.fullPatchByteLength;
+  const fileManifestSha256 = value.fileManifestSha256;
+  const fullPatchFields = [fullPatchSha256, fullPatchByteLength, fileManifestSha256];
+  const hasFullPatchEvidence = fullPatchFields.some((field) => field !== undefined);
+  if (hasFullPatchEvidence && (
+    value.source !== "git" ||
+    value.status !== "available" ||
+    value.files.length === 0 ||
+    typeof fullPatchSha256 !== "string" ||
+    !changesetEvidenceDigestPattern.test(fullPatchSha256) ||
+    !Number.isSafeInteger(fullPatchByteLength) ||
+    (fullPatchByteLength as number) <= 0 ||
+    typeof fileManifestSha256 !== "string" ||
+    !changesetEvidenceDigestPattern.test(fileManifestSha256)
+  )) return null;
+
+  const reconstructed: ChangesetEvidenceBase = {
+    evidenceId: value.evidenceId,
+    changesetId: value.changesetId,
+    source: value.source,
+    status: value.status,
+    files: [...value.files],
+    diffStat: {
+      added: value.diffStat.added,
+      changed: value.diffStat.changed,
+      deleted: value.diffStat.deleted,
+    },
+    patchPreviewTruncated: value.patchPreviewTruncated,
+    ...(value.worktreeId !== undefined ? { worktreeId: value.worktreeId } : {}),
+    ...(value.collectedAt !== undefined ? { collectedAt: value.collectedAt } : {}),
+    ...(value.artifactPaths !== undefined ? { artifactPaths: [...value.artifactPaths] } : {}),
+    ...(value.errorReason !== undefined ? { errorReason: value.errorReason } : {}),
+  };
+  if (!hasFullPatchEvidence) return reconstructed;
+  return {
+    ...reconstructed,
+    fullPatchSha256: fullPatchSha256 as string,
+    fullPatchByteLength: fullPatchByteLength as number,
+    fileManifestSha256: fileManifestSha256 as string,
+  };
+}
+
+function isChangesetEvidenceStatus(value: unknown): value is ChangesetEvidenceStatus {
+  return value === "available" || value === "empty" || value === "failed" || value === "unknown";
+}
+
+function isChangesetDiffStat(value: unknown): value is Changeset["diffStat"] {
+  return isRecord(value) &&
+    typeof value.added === "number" && Number.isFinite(value.added) &&
+    typeof value.changed === "number" && Number.isFinite(value.changed) &&
+    typeof value.deleted === "number" && Number.isFinite(value.deleted);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || typeof value === "string";
 }
 
 export interface StructuredRunChange {
