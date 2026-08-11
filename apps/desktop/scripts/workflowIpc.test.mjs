@@ -3372,12 +3372,20 @@ async function loadProductionGitWorktreeModule() {
       ts,
       { Buffer, process },
     );
+    const gitChangesetSnapshotModule = transpileCommonJsModule(
+      await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "internal", "gitChangesetSnapshot.ts"), "utf8"),
+      "git-worktree.gitChangesetSnapshot.ts",
+      (specifier) => specifier === "./gitCommand.js" ? gitCommandModule : require(specifier),
+      ts,
+      { Buffer, process },
+    );
     return transpileCommonJsModule(
       await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "node.ts"), "utf8"),
       "git-worktree.node.ts",
       (specifier) => {
         if (specifier === "./index.js") return indexModule;
         if (specifier === "./internal/gitCommand.js") return gitCommandModule;
+        if (specifier === "./internal/gitChangesetSnapshot.js") return gitChangesetSnapshotModule;
         return require(specifier);
       },
       ts,

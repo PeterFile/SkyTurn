@@ -60,9 +60,18 @@ import {
   type VariantComparisonInput,
   type VariantAdoptionService,
 } from "./index.js";
+import {
+  collectAtomicGitChangesetSnapshot,
+  DEFAULT_MAX_FULL_PATCH_BYTES,
+  SKYTURN_GIT_EVIDENCE_PATHSPECS as skyturnGitEvidencePathspecs,
+  SKYTURN_VOLATILE_GIT_PATHS,
+  type AtomicGitChangesetSnapshot,
+  type GitChangesetBaseline,
+} from "./internal/gitChangesetSnapshot.js";
 import { sanitizedGitEnvironment, spawnBoundedGit } from "./internal/gitCommand.js";
 
 export { parseVariantComparisonEvidence, parseWorktreeComparisonRequest };
+export { SKYTURN_VOLATILE_GIT_PATHS };
 
 export type ManagedWorktreeWorkflowEventKind =
   | "workflow.worktree.create_requested"
@@ -152,21 +161,6 @@ const gitOutputLimit = 8 * 1024 * 1024;
 const patchPreviewLimit = 24 * 1024;
 const defaultMaxPatchPreviewBytes = 64 * 1024;
 const defaultMaxGitOutputBytes = 1024 * 1024;
-
-export const SKYTURN_VOLATILE_GIT_PATHS = [
-  ".devflow/skyturn-workflow.sqlite",
-  ".devflow/skyturn-workflow.sqlite-wal",
-  ".devflow/skyturn-workflow.sqlite-shm",
-  ".devflow/runs/**",
-  ".devflow/tasks/**/output.md",
-] as const;
-
-const skyturnGitEvidencePathspecs = [
-  ".",
-  ...SKYTURN_VOLATILE_GIT_PATHS.map((path) =>
-    path.includes("**") ? `:(top,glob,exclude)${path}` : `:(top,exclude)${path}`
-  ),
-];
 
 export class GitCommandError extends Error {
   readonly stderr: string;
@@ -900,6 +894,7 @@ export function createNodeGitWorktreeService(options: NodeGitWorktreeServiceOpti
 export interface GitChangesetServiceOptions {
   repoRoot?: string;
   maxPatchPreviewBytes?: number;
+  maxFullPatchBytes?: number;
 }
 
 export function createGitChangesetService(
@@ -1839,40 +1834,18 @@ function throwDelivery(code: DeliveryCommitErrorCode, message: string): never {
 }
 
 class GitChangesetService implements ChangesetService, ChangesetEvidenceService, ChangesetReconciliationService {
-  constructor(private readonly options: GitChangesetServiceOptions) {}
+  constructor(private readonly options: GitChangesetServiceOptions) {
+    if (options.maxFullPatchBytes !== undefined) {
+      assertPositiveSafeInteger(options.maxFullPatchBytes, "maxFullPatchBytes");
+    }
+  }
 
   async getChangeset(node: CanvasNode): Promise<Changeset> {
     try {
       const repoRoot = await this.resolveRepoRoot(node);
       await assertGitWorktree(repoRoot);
-      const status = await git(repoRoot, [
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        "--",
-        ...skyturnGitEvidencePathspecs,
-      ]);
-      if (status.truncated) throw new Error("Git status output exceeded the changeset evidence limit.");
-      const statusLines = parseStatusLines(status.stdout);
-      const files = filesFromStatus(statusLines);
-      if (files.length === 0) return this.emptyChangeset(node);
-
-      const untrackedFiles = untrackedFilesFromStatus(statusLines);
-      const diffStat = await diffStatForRepo(repoRoot, files.length, untrackedFiles);
-      const patch = await diffPreviewForRepo(
-        repoRoot,
-        this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes,
-        untrackedFiles,
-      );
-      const evidence = this.evidenceFor(node, "available", files, diffStat, patch.truncated);
-      return {
-        id: node.changesetId,
-        files,
-        diffStat,
-        patchPreview: patch.value,
-        source: "git",
-        evidence,
-      };
+      const snapshot = await this.collect(repoRoot, { kind: "current-head" });
+      return this.changesetFor(node, snapshot);
     } catch (error: unknown) {
       return this.failedChangeset(node, boundedReason(error instanceof Error ? error.message : "Unable to collect git changeset."));
     }
@@ -1891,50 +1864,11 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
     try {
       const repoRoot = await this.resolveRepoRoot(input.node);
       await assertGitWorktree(repoRoot);
-      await verifyGitRef(repoRoot, baselineRef);
-      const status = await git(repoRoot, [
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        "--",
-        ...skyturnGitEvidencePathspecs,
-      ]);
-      if (status.truncated) throw new Error("Git status output exceeded the changeset evidence limit.");
-      const statusLines = parseStatusLines(status.stdout);
-      const untrackedFiles = untrackedFilesFromStatus(statusLines);
-      const files = unionSorted([
-        ...stringLines((await git(repoRoot, [
-          "diff",
-          "--name-only",
-          baselineRef,
-          "--",
-          ...skyturnGitEvidencePathspecs,
-        ])).stdout),
-        ...filesFromStatus(statusLines),
-      ]);
-      const diffStat = files.length === 0
-        ? { added: 0, changed: 0, deleted: 0 }
-        : await diffStatForRepo(repoRoot, files.length, untrackedFiles, baselineRef);
-      const patch = files.length === 0
-        ? { value: "", truncated: false }
-        : await diffPreviewForRepo(
-            repoRoot,
-            this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes,
-            untrackedFiles,
-            baselineRef,
-          );
-      const evidence = this.evidenceFor(input.node, files.length === 0 ? "empty" : "available", files, diffStat, patch.truncated);
-      const changeset: Changeset = {
-        id: input.node.changesetId,
-        files,
-        diffStat,
-        patchPreview: patch.value,
-        source: "git",
-        evidence,
-      };
-      const mismatches = mismatchAgainstLiveChanges(input.liveChanges, files);
+      const snapshot = await this.collect(repoRoot, { kind: "ref", ref: baselineRef });
+      const changeset = this.changesetFor(input.node, snapshot);
+      const mismatches = mismatchAgainstLiveChanges(input.liveChanges, snapshot.files);
       return {
-        status: mismatches.length > 0 ? "mismatch" : evidence.status === "empty" ? "empty" : "available",
+        status: mismatches.length > 0 ? "mismatch" : snapshot.files.length === 0 ? "empty" : "available",
         changeset,
         metadata: {
           source: "git",
@@ -1975,35 +1909,21 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
   ): Promise<ChangesetEvidence> {
     const worktreeNode = nodeWithWorktree(node, worktree);
     try {
-      const diffRange = `${worktree.baseCommit}..${worktree.headCommit}`;
       const repoRoot = await realpath(worktree.realPath);
       await assertGitWorktree(repoRoot);
-      const files = stringLines((await git(repoRoot, [
-        "diff",
-        "--name-only",
-        diffRange,
-        "--",
-        ...skyturnGitEvidencePathspecs,
-      ])).stdout);
-      const numstat = (await git(repoRoot, [
-        "diff",
-        "--numstat",
-        diffRange,
-        "--",
-        ...skyturnGitEvidencePathspecs,
-      ])).stdout;
-      const patch = await git(
-        repoRoot,
-        ["diff", "--no-ext-diff", diffRange, "--", ...skyturnGitEvidencePathspecs],
-        { maxBytes: this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes },
-      );
+      const snapshot = await this.collect(repoRoot, {
+        kind: "committed",
+        baseCommit: worktree.baseCommit,
+        headCommit: worktree.headCommit,
+      });
       return {
         ...this.evidenceFor(
           worktreeNode,
-          files.length === 0 ? "empty" : "available",
-          files,
-          parseNumstat(numstat),
-          patch.truncated,
+          snapshot.files.length === 0 ? "empty" : "available",
+          snapshot.files,
+          snapshot.diffStat,
+          snapshot.previewTruncated,
+          snapshot,
         ),
         worktreeId: worktree.worktreeId,
       };
@@ -2011,7 +1931,7 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
       return {
         ...this.evidenceFor(worktreeNode, "failed", [], { added: 0, changed: 0, deleted: 0 }, false),
         worktreeId: worktree.worktreeId,
-        errorReason: errorMessage(error),
+        errorReason: boundedReason(errorMessage(error)),
       };
     }
   }
@@ -2021,17 +1941,6 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
       ? node.worktree.path
       : this.options.repoRoot ?? resolve(process.cwd(), node.worktree.path);
     return realpath(candidate);
-  }
-
-  private emptyChangeset(node: CanvasNode): Changeset {
-    return {
-      id: node.changesetId,
-      files: [],
-      diffStat: { added: 0, changed: 0, deleted: 0 },
-      patchPreview: "",
-      source: "git",
-      evidence: this.evidenceFor(node, "empty", [], { added: 0, changed: 0, deleted: 0 }, false),
-    };
   }
 
   private failedChangeset(node: CanvasNode, reason: string): Changeset {
@@ -2054,7 +1963,19 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
     files: string[],
     diffStat: Changeset["diffStat"],
     patchPreviewTruncated: boolean,
+    snapshot?: AtomicGitChangesetSnapshot,
   ): ChangesetEvidence {
+    const digest = snapshot?.fullPatchSha256
+      && snapshot.fileManifestSha256
+      && snapshot.fullPatchByteLength > 0
+      && status === "available"
+      && files.length > 0
+      ? {
+          fullPatchSha256: snapshot.fullPatchSha256,
+          fullPatchByteLength: snapshot.fullPatchByteLength,
+          fileManifestSha256: snapshot.fileManifestSha256,
+        }
+      : {};
     return {
       evidenceId: `changeset-evidence-${node.changesetId}`,
       changesetId: node.changesetId,
@@ -2064,6 +1985,38 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
       diffStat,
       patchPreviewTruncated,
       collectedAt: new Date().toISOString(),
+      ...digest,
+    };
+  }
+
+  private async collect(
+    repoRoot: string,
+    baseline: GitChangesetBaseline,
+  ): Promise<AtomicGitChangesetSnapshot> {
+    return collectAtomicGitChangesetSnapshot({
+      repoRoot,
+      baseline,
+      maxPatchPreviewBytes: this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes,
+      maxFullPatchBytes: this.options.maxFullPatchBytes ?? DEFAULT_MAX_FULL_PATCH_BYTES,
+    });
+  }
+
+  private changesetFor(node: CanvasNode, snapshot: AtomicGitChangesetSnapshot): Changeset {
+    const status = snapshot.files.length === 0 ? "empty" : "available";
+    return {
+      id: node.changesetId,
+      files: snapshot.files,
+      diffStat: snapshot.diffStat,
+      patchPreview: snapshot.patchPreview,
+      source: "git",
+      evidence: this.evidenceFor(
+        node,
+        status,
+        snapshot.files,
+        snapshot.diffStat,
+        snapshot.previewTruncated,
+        snapshot,
+      ),
     };
   }
 }
@@ -2224,15 +2177,6 @@ function rollbackManualRepair(
   };
 }
 
-async function verifyGitRef(repoRoot: string, ref: string): Promise<string> {
-  validateGitRef(ref);
-  try {
-    return (await git(repoRoot, ["rev-parse", "--verify", `${ref}^{commit}`])).stdout.trim();
-  } catch (error) {
-    throw new Error(`Baseline ref does not resolve: ${ref}: ${errorMessage(error)}`);
-  }
-}
-
 async function validateSkyTurnBranch(repoRoot: string, branchName: string): Promise<void> {
   validateBranchName(branchName, { requireSkyTurnPrefix: true });
   await runGit(repoRoot, ["check-ref-format", "--branch", branchName]);
@@ -2268,12 +2212,6 @@ function validateBranchName(branchName: string, input: { requireSkyTurnPrefix: b
 function validateCommitHash(commit: string, label: string): void {
   if (!/^[0-9a-fA-F]{7,64}$/.test(commit)) {
     throw new Error(`Invalid ${label}: ${commit}.`);
-  }
-}
-
-function validateGitRef(ref: string): void {
-  if (!ref || ref.startsWith("-") || /[\s\0-\x1f]/.test(ref)) {
-    throw new Error(`Invalid baseline ref: ${ref}.`);
   }
 }
 
@@ -2598,25 +2536,6 @@ function minimalNode(worktree: WorkflowWorktreeIdentity): CanvasNode {
   } as CanvasNode;
 }
 
-function parseNumstat(output: string): ChangesetEvidence["diffStat"] {
-  let added = 0;
-  let deleted = 0;
-  let changed = 0;
-  for (const line of stringLines(output)) {
-    const [rawAdded, rawDeleted] = line.split("\t");
-    added += parseStatValue(rawAdded);
-    deleted += parseStatValue(rawDeleted);
-    changed += 1;
-  }
-  return { added, changed, deleted };
-}
-
-function parseStatValue(value: string | undefined): number {
-  if (!value || value === "-") return 0;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
 function stringLines(output: string): string[] {
   return output.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
@@ -2658,72 +2577,6 @@ async function assertGitWorktree(repoRoot: string): Promise<void> {
   }
 }
 
-async function diffStatForRepo(
-  repoRoot: string,
-  changedFileCount: number,
-  untrackedFiles: string[],
-  baselineRef = "HEAD",
-): Promise<Changeset["diffStat"]> {
-  const output = await diffTextAgainstRef(repoRoot, baselineRef, ["--numstat"]);
-  let added = 0;
-  let deleted = 0;
-  for (const line of `${output}${await untrackedNumstat(repoRoot, untrackedFiles)}`.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const [rawAdded, rawDeleted] = line.split(/\s+/, 3);
-    added += parseStatValue(rawAdded);
-    deleted += parseStatValue(rawDeleted);
-  }
-  return { added, changed: changedFileCount, deleted };
-}
-
-async function diffPreviewForRepo(
-  repoRoot: string,
-  maxPatchPreviewBytes: number,
-  untrackedFiles: string[],
-  baselineRef = "HEAD",
-): Promise<{ value: string; truncated: boolean }> {
-  const result = await diffTextAgainstRefBounded(repoRoot, baselineRef, ["--no-ext-diff"], maxPatchPreviewBytes);
-  if (result.truncated) return { value: `${result.stdout.trimEnd()}\n[diff truncated]\n`, truncated: true };
-
-  let value = result.stdout;
-  for (const file of untrackedFiles) {
-    const remaining = maxPatchPreviewBytes - Buffer.byteLength(value);
-    if (remaining <= 0) return { value: `${value.trimEnd()}\n[diff truncated]\n`, truncated: true };
-    const untracked = await untrackedFileDiff(repoRoot, file, ["--no-ext-diff"], remaining);
-    value += untracked.stdout;
-    if (untracked.truncated) return { value: `${value.trimEnd()}\n[diff truncated]\n`, truncated: true };
-  }
-  return { value, truncated: false };
-}
-
-async function diffTextAgainstRef(repoRoot: string, baselineRef: string, diffArgs: string[]): Promise<string> {
-  validateGitRef(baselineRef);
-  const args = ["diff", ...diffArgs, baselineRef, "--", ...skyturnGitEvidencePathspecs];
-  try {
-    const result = await git(repoRoot, args);
-    return result.stdout;
-  } catch {
-    const unstaged = await git(repoRoot, ["diff", ...diffArgs, "--", ...skyturnGitEvidencePathspecs]);
-    const staged = await git(repoRoot, ["diff", "--cached", ...diffArgs, "--", ...skyturnGitEvidencePathspecs]);
-    return `${staged.stdout}${unstaged.stdout}`;
-  }
-}
-
-async function diffTextAgainstRefBounded(
-  repoRoot: string,
-  baselineRef: string,
-  diffArgs: string[],
-  maxBytes: number,
-): Promise<{ stdout: string; truncated: boolean }> {
-  validateGitRef(baselineRef);
-  const args = ["diff", ...diffArgs, baselineRef, "--", ...skyturnGitEvidencePathspecs];
-  try {
-    return await git(repoRoot, args, { maxBytes });
-  } catch {
-    return git(repoRoot, ["diff", ...diffArgs, "--", ...skyturnGitEvidencePathspecs], { maxBytes });
-  }
-}
-
 function parseStatusLines(output: string): string[] {
   return output.split(/\r?\n/).filter((line) => line.trim().length > 0);
 }
@@ -2738,39 +2591,16 @@ function filesFromStatus(lines: string[]): string[] {
   return [...files].sort();
 }
 
-function untrackedFilesFromStatus(lines: string[]): string[] {
-  return lines
-    .filter((line) => line.startsWith("?? "))
-    .map((line) => line.slice(3).trim())
-    .filter(Boolean)
-    .sort();
-}
-
-async function untrackedNumstat(repoRoot: string, files: string[]): Promise<string> {
-  const chunks: string[] = [];
-  for (const file of files) {
-    const result = await untrackedFileDiff(repoRoot, file, ["--numstat"]);
-    chunks.push(result.stdout);
-  }
-  return chunks.join("");
-}
-
-async function untrackedFileDiff(
-  repoRoot: string,
-  file: string,
-  diffArgs: string[],
-  maxBytes?: number,
-): Promise<{ stdout: string; truncated: boolean }> {
-  return git(repoRoot, ["diff", "--no-index", ...diffArgs, "--", "/dev/null", file], {
-    allowExitCodes: [0, 1],
-    ...(maxBytes ? { maxBytes } : {}),
-  });
-}
-
 function boundedReason(reason: string): string {
   const maxLength = 1000;
   if (reason.length <= maxLength) return reason;
   return `${reason.slice(0, maxLength).trimEnd()}...`;
+}
+
+function assertPositiveSafeInteger(value: number, name: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError(`${name} must be a positive safe integer.`);
+  }
 }
 
 async function git(

@@ -2263,7 +2263,7 @@ describe("GitChangesetService", () => {
     });
   });
 
-  it("fails changeset evidence when bounded Git termination throws before actual close", async () => {
+  it("fails full-patch evidence when bounded Git termination throws before actual close", async () => {
     const target = await createTestRepo("skyturn-git-termination-error-");
     changesetTempRoots.push(target.tempRoot);
     await writeFile(join(target.repoRoot, "feature.txt"), `base\n${"changed\n".repeat(128)}`, "utf8");
@@ -2274,7 +2274,7 @@ describe("GitChangesetService", () => {
     };
 
     try {
-      const changeset = await createGitChangesetService({ maxPatchPreviewBytes: 4 })
+      const changeset = await createGitChangesetService({ maxFullPatchBytes: 4 })
         .getChangeset(nodeForRepo(target.repoRoot));
 
       expect(changeset.evidence?.status).toBe("failed");
@@ -2284,7 +2284,7 @@ describe("GitChangesetService", () => {
     }
   });
 
-  it("keeps truncated changeset evidence when close follows a rejected termination without an error", async () => {
+  it("fails full-patch evidence when close follows a rejected termination", async () => {
     const target = await createTestRepo("skyturn-git-termination-rejected-");
     changesetTempRoots.push(target.tempRoot);
     await writeFile(join(target.repoRoot, "feature.txt"), `base\n${"changed\n".repeat(128)}`, "utf8");
@@ -2298,13 +2298,14 @@ describe("GitChangesetService", () => {
     };
 
     try {
-      const changeset = await createGitChangesetService({ maxPatchPreviewBytes: 4 })
+      const changeset = await createGitChangesetService({ maxFullPatchBytes: 4 })
         .getChangeset(nodeForRepo(target.repoRoot));
 
       expect(changeset.evidence).toMatchObject({
-        status: "available",
-        patchPreviewTruncated: true,
+        status: "failed",
+        patchPreviewTruncated: false,
       });
+      expect(changeset.evidence).not.toHaveProperty("fullPatchSha256");
       expect(terminationCalls).toBe(1);
     } finally {
       ChildProcess.prototype.kill = originalKill;
@@ -2374,6 +2375,11 @@ describe("GitChangesetService", () => {
     expect(changeset.diffStat.changed).toBe(1);
     expect(changeset.diffStat.added).toBeGreaterThan(0);
     expect(changeset.patchPreview).toContain("diff --git a/src.ts b/src.ts");
+    expect(changeset.evidence).toMatchObject({
+      fullPatchSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      fullPatchByteLength: Buffer.byteLength(changeset.patchPreview),
+      fileManifestSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
   });
 
   it("returns empty git evidence instead of mock data for a clean repository", async () => {
@@ -2419,6 +2425,256 @@ describe("GitChangesetService", () => {
     await gitAsync(repoRoot, "diff", "--quiet", "--cached");
   });
 
+  it("collects empty, binary, whitespace, newline, tab, and Unicode untracked paths", async () => {
+    const repoRoot = await createRepo();
+    const files = [
+      "binary.bin",
+      "empty file.txt",
+      "line\nbreak.txt",
+      "tab\tname.txt",
+      "unicodé-雪.txt",
+    ];
+    await writeFile(join(repoRoot, files[0]!), Buffer.from([0, 1, 2, 255, 0, 3]));
+    await writeFile(join(repoRoot, files[1]!), "", "utf8");
+    for (const file of files.slice(2)) await writeFile(join(repoRoot, file), `${file}\n`, "utf8");
+
+    const changeset = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+
+    expect(changeset.evidence?.status).toBe("available");
+    expect(changeset.files).toEqual([...files].sort(compareUtf8));
+    expect(changeset.diffStat).toEqual({ added: 4, changed: 5, deleted: 0 });
+    expect(changeset.patchPreview).toContain("GIT binary patch");
+    expect(changeset.evidence).toHaveProperty("fullPatchSha256");
+  });
+
+  it("accepts the exact full-patch cap and fails cap minus one without digest fields", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "src.ts"), `export const value = 2;\n${"extra line\n".repeat(32)}`, "utf8");
+    await writeFile(join(repoRoot, "cap-untracked.txt"), "untracked cap section\n", "utf8");
+    const initial = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+    const exactLength = initial.evidence?.fullPatchByteLength;
+    expect(exactLength).toBeTypeOf("number");
+    expect(exactLength).toBeGreaterThan(1);
+
+    const exact = await createGitChangesetService({ maxFullPatchBytes: exactLength })
+      .getChangeset(nodeForRepo(repoRoot));
+    const overflow = await createGitChangesetService({ maxFullPatchBytes: exactLength! - 1 })
+      .getChangeset(nodeForRepo(repoRoot));
+
+    expect(exact.evidence).toMatchObject({ status: "available", fullPatchByteLength: exactLength });
+    expect(overflow.evidence).toMatchObject({
+      status: "failed",
+      errorReason: expect.stringMatching(/full patch|byte limit/i),
+    });
+    expect(overflow.evidence).not.toHaveProperty("fullPatchSha256");
+    expect(overflow.evidence).not.toHaveProperty("fullPatchByteLength");
+    expect(overflow.evidence).not.toHaveProperty("fileManifestSha256");
+    for (const invalidLimit of [0, -1, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => createGitChangesetService({ maxFullPatchBytes: invalidLimit })).toThrow(/positive safe integer/i);
+    }
+  });
+
+  it("accepts the exact full-patch cap for a staged-only unborn repository", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "skyturn-git-unborn-staged-cap-"));
+    changesetTempRoots.push(repoRoot);
+    await gitAsync(repoRoot, "init");
+    await writeFile(join(repoRoot, "staged.txt"), `${"staged line\n".repeat(16)}`, "utf8");
+    await gitAsync(repoRoot, "add", "staged.txt");
+    const initial = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+    const exactLength = initial.evidence?.fullPatchByteLength;
+    expect(exactLength).toBeTypeOf("number");
+    expect(exactLength).toBeGreaterThan(1);
+
+    const exact = await createGitChangesetService({ maxFullPatchBytes: exactLength })
+      .getChangeset(nodeForRepo(repoRoot));
+    const overflow = await createGitChangesetService({ maxFullPatchBytes: exactLength! - 1 })
+      .getChangeset(nodeForRepo(repoRoot));
+
+    expect(exact.evidence).toMatchObject({
+      status: "available",
+      fullPatchSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+      fullPatchByteLength: exactLength,
+      fileManifestSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(overflow.evidence).toMatchObject({ status: "failed" });
+    expect(overflow.evidence).not.toHaveProperty("fullPatchSha256");
+    expect(overflow.evidence).not.toHaveProperty("fullPatchByteLength");
+    expect(overflow.evidence).not.toHaveProperty("fileManifestSha256");
+  });
+
+  it("collects ordered staged, unstaged, and untracked evidence in an unborn repository", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "skyturn-git-unborn-"));
+    changesetTempRoots.push(repoRoot);
+    await gitAsync(repoRoot, "init");
+    await writeFile(join(repoRoot, "staged.txt"), "staged\n", "utf8");
+    await gitAsync(repoRoot, "add", "staged.txt");
+    await writeFile(join(repoRoot, "staged.txt"), "staged\nunstaged\n", "utf8");
+    await writeFile(join(repoRoot, "untracked.txt"), "untracked\n", "utf8");
+
+    const changeset = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+
+    expect(changeset.evidence?.status).toBe("available");
+    expect(changeset.files).toEqual(["staged.txt", "untracked.txt"]);
+    expect(changeset.diffStat).toEqual({ added: 3, changed: 2, deleted: 0 });
+    expect(changeset.patchPreview.match(/diff --git a\/staged\.txt b\/staged\.txt/g)).toHaveLength(2);
+    expect(changeset.patchPreview.indexOf("a/untracked.txt")).toBeGreaterThan(
+      changeset.patchPreview.lastIndexOf("a/staged.txt"),
+    );
+    expect(changeset.evidence).toHaveProperty("fullPatchSha256");
+  });
+
+  it("fails closed on unmerged entries without atomic digest fields", async () => {
+    const repoRoot = await createRepo();
+    const mainBranch = git(repoRoot, ["branch", "--show-current"]);
+    await gitAsync(repoRoot, "checkout", "-b", "conflict-side");
+    await writeFile(join(repoRoot, "src.ts"), "side\n", "utf8");
+    await gitAsync(repoRoot, "add", "src.ts");
+    await gitAsync(repoRoot, "commit", "-m", "side");
+    await gitAsync(repoRoot, "checkout", mainBranch);
+    await writeFile(join(repoRoot, "src.ts"), "main\n", "utf8");
+    await gitAsync(repoRoot, "add", "src.ts");
+    await gitAsync(repoRoot, "commit", "-m", "main");
+    await expect(execFileAsync("git", ["merge", "conflict-side"], { cwd: repoRoot })).rejects.toBeDefined();
+
+    const changeset = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+
+    expect(changeset.evidence).toMatchObject({
+      status: "failed",
+      errorReason: expect.stringMatching(/unmerged|conflict/i),
+    });
+    expect(changeset.evidence).not.toHaveProperty("fullPatchSha256");
+  });
+
+  it("fails atomic publication when the worktree mutates between complete snapshots", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    const fakeGit = await installChangesetMutationGitWrapper(repoRoot);
+
+    const changeset = await withFakeGit(fakeGit.binDir, () => (
+      createGitChangesetService().getChangeset(nodeForRepo(repoRoot))
+    ));
+
+    expect(changeset.evidence).toMatchObject({
+      status: "failed",
+      errorReason: expect.stringMatching(/atomic|drift|changed/i),
+    });
+    expect(changeset.evidence).not.toHaveProperty("fullPatchSha256");
+  });
+
+  it.skipIf(process.platform === "win32")("keeps chmod-only evidence visible despite hostile core.fileMode", async () => {
+    const repoRoot = await createRepo();
+    await gitAsync(repoRoot, "config", "core.fileMode", "false");
+    await chmod(join(repoRoot, "src.ts"), 0o755);
+
+    const changeset = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+
+    expect(changeset.evidence?.status).toBe("available");
+    expect(changeset.files).toEqual(["src.ts"]);
+    expect(changeset.diffStat).toEqual({ added: 0, changed: 1, deleted: 0 });
+    expect(changeset.patchPreview).toContain("old mode 100644");
+    expect(changeset.patchPreview).toContain("new mode 100755");
+  });
+
+  it("fails closed on nonempty common info attributes and recovers after removal", async () => {
+    const target = await createTestRepo("skyturn-git-info-attributes-");
+    changesetTempRoots.push(target.tempRoot);
+    const linkedRoot = join(target.tempRoot, "linked");
+    await gitAsync(target.repoRoot, "worktree", "add", "-b", "feature/info-attributes", linkedRoot, target.baseCommit);
+    await writeFile(join(linkedRoot, "feature.txt"), "changed\n", "utf8");
+    const infoAttributes = git(linkedRoot, ["rev-parse", "--path-format=absolute", "--git-path", "info/attributes"]);
+    await writeFile(infoAttributes, "feature.txt -diff\n", "utf8");
+
+    const blocked = await createGitChangesetService().getChangeset(nodeForRepo(linkedRoot));
+
+    expect(blocked.evidence).toMatchObject({
+      status: "failed",
+      errorReason: expect.stringMatching(/attributes|canonical/i),
+    });
+    expect(blocked.evidence?.errorReason).not.toContain(target.repoRoot);
+    expect(blocked.evidence?.errorReason).not.toContain("feature.txt -diff");
+    expect(blocked.evidence).not.toHaveProperty("fullPatchSha256");
+
+    await rm(infoAttributes);
+    const restored = await createGitChangesetService().getChangeset(nodeForRepo(linkedRoot));
+    expect(restored.evidence).toMatchObject({
+      status: "available",
+      fullPatchSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+    expect(restored.files).toEqual(["feature.txt"]);
+    expect(restored.patchPreview).toContain("+changed");
+  });
+
+  it("collects committed variant evidence only for the recorded clean base-to-head range", async () => {
+    const repoRoot = await createRepo();
+    const baseCommit = git(repoRoot, ["rev-parse", "HEAD"]);
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    await gitAsync(repoRoot, "add", "src.ts");
+    await gitAsync(repoRoot, "commit", "-m", "variant");
+    const headCommit = git(repoRoot, ["rev-parse", "HEAD"]);
+    const worktree = worktreeIdentityFor(repoRoot, baseCommit, headCommit);
+    const service = createGitChangesetService();
+
+    const clean = await service.collectChangesetEvidence({ node: nodeForRepo(repoRoot), worktree });
+    expect(clean).toMatchObject({
+      status: "available",
+      files: ["src.ts"],
+      worktreeId: worktree.worktreeId,
+      fullPatchSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
+
+    for (const nonCanonical of [
+      worktreeIdentityFor(repoRoot, "HEAD~1", "HEAD"),
+      worktreeIdentityFor(repoRoot, baseCommit.slice(0, 12), headCommit.slice(0, 12)),
+    ]) {
+      const rejected = await service.collectChangesetEvidence({ node: nodeForRepo(repoRoot), worktree: nonCanonical });
+      expect(rejected).toMatchObject({
+        status: "failed",
+        errorReason: expect.stringMatching(/canonical|object ID|commit/i),
+      });
+      expect(rejected).not.toHaveProperty("fullPatchSha256");
+      expect(rejected).not.toHaveProperty("fullPatchByteLength");
+      expect(rejected).not.toHaveProperty("fileManifestSha256");
+    }
+
+    const dirtySentinel = "DIRTY BYTES MUST NOT ENTER RECORDED EVIDENCE";
+    await writeFile(join(repoRoot, "src.ts"), `${dirtySentinel}\n`, "utf8");
+    const dirty = await service.collectChangesetEvidence({ node: nodeForRepo(repoRoot), worktree });
+    expect(dirty).toMatchObject({ status: "failed", errorReason: expect.stringMatching(/clean|dirty/i) });
+    expect(dirty).not.toHaveProperty("fullPatchSha256");
+    expect(JSON.stringify(dirty)).not.toContain(dirtySentinel);
+
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    const driftedHead = commitVariant(repoRoot, "head-drift");
+    expect(driftedHead).not.toBe(headCommit);
+    const drifted = await service.collectChangesetEvidence({ node: nodeForRepo(repoRoot), worktree });
+    expect(drifted).toMatchObject({ status: "failed", errorReason: expect.stringMatching(/head/i) });
+    expect(drifted).not.toHaveProperty("fullPatchSha256");
+  });
+
+  it("excludes only volatile SkyTurn evidence while retaining legitimate .devflow memory", async () => {
+    const repoRoot = await createRepo();
+    const files = new Map([
+      [".devflow/skyturn-workflow.sqlite", "volatile\n"],
+      [".devflow/skyturn-workflow.sqlite-wal", "volatile\n"],
+      [".devflow/skyturn-workflow.sqlite-shm", "volatile\n"],
+      [".devflow/runs/run-1/events.ndjson", "volatile\n"],
+      [".devflow/tasks/task-1/output.md", "volatile\n"],
+      [".devflow/memory/decisions.md", "keep\n"],
+    ]);
+    for (const [file, contents] of files) {
+      await mkdir(dirname(join(repoRoot, file)), { recursive: true });
+      await writeFile(join(repoRoot, file), contents, "utf8");
+    }
+
+    const changeset = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+
+    expect(changeset.files).toEqual([".devflow/memory/decisions.md"]);
+    expect(changeset.patchPreview).toContain(".devflow/memory/decisions.md");
+    expect(changeset.patchPreview).not.toContain("skyturn-workflow.sqlite");
+    expect(changeset.patchPreview).not.toContain("events.ndjson");
+    expect(changeset.patchPreview).not.toContain("tasks/task-1/output.md");
+  });
+
   it("returns empty final reconciliation for a clean current branch target", async () => {
     const repoRoot = await createRepo();
 
@@ -2458,6 +2714,7 @@ describe("GitChangesetService", () => {
     expect(reconciliation.status).toBe("available");
     expect(reconciliation.changeset.files).toEqual(["src.ts"]);
     expect(reconciliation.changeset.patchPreview).toContain("diff --git a/src.ts b/src.ts");
+    expect(reconciliation.changeset.evidence).toHaveProperty("fullPatchSha256");
   });
 
   it("returns failed final reconciliation when the baseline ref is invalid", async () => {
@@ -2703,6 +2960,34 @@ async function installAncestryGitWrapper(
   return { binDir };
 }
 
+async function installChangesetMutationGitWrapper(repoRoot: string): Promise<{ binDir: string }> {
+  const binDir = join(repoRoot, ".git", "changeset-mutation-git");
+  const countPath = join(binDir, "status-count.txt");
+  const mutatedPath = join(repoRoot, "src.ts");
+  await mkdir(binDir, { recursive: true });
+  const script = [
+    "#!/bin/sh",
+    "command_name=",
+    "for arg in \"$@\"; do",
+    "  if [ \"$arg\" = \"status\" ]; then command_name=status; break; fi",
+    "done",
+    "if [ \"$command_name\" = \"status\" ]; then",
+    `  count="$(cat ${shellSingleQuote(countPath)} 2>/dev/null || echo 0)"`,
+    "  count=$((count + 1))",
+    `  echo "$count" > ${shellSingleQuote(countPath)}`,
+    "  if [ \"$count\" -eq 2 ]; then",
+    `    printf '\\nmutation between snapshots\\n' >> ${shellSingleQuote(mutatedPath)}`,
+    "  fi",
+    "fi",
+    `exec ${shellSingleQuote(resolveExecutable("git"))} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
 async function withFakeGh<T>(binDir: string, argsPath: string, callback: () => Promise<T>): Promise<T> {
   const previousPath = process.env.PATH;
   const previousArgs = process.env.SKYTURN_FAKE_GH_ARGS;
@@ -2740,6 +3025,29 @@ function resolveExecutable(command: string): string {
 
 function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function worktreeIdentityFor(
+  repoRoot: string,
+  baseCommit: string,
+  headCommit: string,
+): WorkflowWorktreeIdentity {
+  return {
+    worktreeId: "worktree-variant-1",
+    variantId: "variant-1",
+    path: repoRoot,
+    realPath: repoRoot,
+    gitdir: realpathSync(join(repoRoot, ".git")),
+    repoRoot,
+    branchName: git(repoRoot, ["branch", "--show-current"]),
+    baseCommit,
+    headCommit,
+    parentLaneId: "lane-parent",
+  };
 }
 
 function nodeForRepo(repoRoot: string): CanvasNode {
