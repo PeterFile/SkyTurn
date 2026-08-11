@@ -35,6 +35,7 @@ import { compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
 import { createTerminalRuntime } from "./terminalRuntime";
 import {
   compensateFailedWorkflowRun,
+  recoverPendingCandidateManifestFreezes,
   recoverPendingPlannerIntentReconciliations,
   recoverTerminalWorkflowRuns,
 } from "./workflowRunRecovery";
@@ -687,6 +688,7 @@ interface WorkflowStoreHost {
   resolveCurrentBranchTarget(input: unknown): unknown;
   recordCanvasNodePosition(input: unknown): unknown;
   recordRunCheckpoint(input: unknown): unknown;
+  freezeCandidateManifest(input: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
@@ -718,6 +720,13 @@ interface WorkflowStoreHost {
     segmentId: string;
     runId: string;
     agentKind: string;
+  }>;
+  listPendingCandidateManifestFreezes(): Array<{
+    sessionId: string;
+    nodeId: string;
+    laneId: string;
+    segmentId: string;
+    runId: string;
   }>;
   listNodeCheckpoints(input: unknown): unknown[];
   findPendingInsertBeforeRequest(sessionId: string, targetLaneId: string): string | null;
@@ -2827,6 +2836,7 @@ async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost>
         store,
         async (segment) => { await reconcilePendingPlannerWorkflowIntent(storeIdentity, store, segment, true); },
       );
+      recoverPendingCandidateManifestFreezes(store);
       if (
         store.listRunningSegments().length > 0 ||
         store.listPendingPlannerIntentReconciliations().length > 0 ||
@@ -3584,13 +3594,22 @@ async function enrichTerminalWorkflowRun(
   }, await workflowGitAncestryProofAuthority());
   const finalIdentity = await verifyRunGitIdentityAtCheckpoint(stableIdentity);
   const changesetEvidenceId = recordRunChangesetEvidence(store, finalIdentity, "after", changeset);
+  const checkpointTime = optionalText(readField(knownEvidence, "completedAt")) ?? new Date().toISOString();
   store.recordRunCheckpoint(runCheckpointInput(
     finalIdentity,
     "after",
     changesetEvidenceId,
-    optionalText(readField(knownEvidence, "completedAt")) ?? new Date().toISOString(),
+    checkpointTime,
     ancestry,
   ));
+  store.freezeCandidateManifest({
+    sessionId: finalIdentity.sessionId,
+    nodeId: finalIdentity.nodeId,
+    laneId: finalIdentity.laneId,
+    segmentId: finalIdentity.segmentId,
+    runId: finalIdentity.runId,
+    now: checkpointTime,
+  });
 }
 
 async function workflowStoreIdentity(projectRoot: string): Promise<string> {

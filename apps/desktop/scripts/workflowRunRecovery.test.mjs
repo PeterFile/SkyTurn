@@ -21,6 +21,7 @@ import { createWorkflowStore } from "@skyturn/persistence/workflow-store";
 
 import {
   compensateFailedWorkflowRun,
+  recoverPendingCandidateManifestFreezes,
   recoverPendingPlannerIntentReconciliations,
   recoverTerminalWorkflowRuns,
 } from "../dist-electron/electron/workflowRunRecovery.js";
@@ -1052,6 +1053,87 @@ test("restart recovery replays after enrichment idempotently and makes a failed 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("restart recovery freezes only the post-checkpoint candidate manifest crash window without bridge reads", async () => {
+  const calls = [];
+  const identity = {
+    sessionId: "session-1",
+    nodeId: "lane-implementation",
+    laneId: "lane-implementation",
+    segmentId: "segment-session-1-lane-implementation",
+    runId: "run-session-1-lane-implementation",
+    agentKind: "codex",
+  };
+  let afterCheckpointExists = false;
+  const store = {
+    listRunningSegments() { return []; },
+    listPendingPlannerIntentReconciliations() { return []; },
+    listPendingRunCheckpointEnrichments() { return [identity]; },
+    listPendingCandidateManifestFreezes() {
+      calls.push("list-manifest-freezes");
+      return afterCheckpointExists ? [{
+        sessionId: identity.sessionId,
+        nodeId: identity.nodeId,
+        laneId: identity.laneId,
+        segmentId: identity.segmentId,
+        runId: identity.runId,
+      }] : [];
+    },
+    freezeCandidateManifest(input) {
+      calls.push(`freeze:${input.runId}`);
+    },
+    appendWorkflowEvent() { assert.fail("manifest recovery must not append generic events"); },
+    recordRunResult() { assert.fail("manifest crash-window recovery must not backfill terminal evidence"); },
+  };
+  const bridge = {
+    async getEvidence() { assert.fail("manifest crash-window recovery must not read bridge evidence"); },
+    async loadEvents() { assert.fail("manifest crash-window recovery must not read bridge events"); },
+  };
+
+  await recoverTerminalWorkflowRuns(
+    "/unused/project",
+    store,
+    bridge,
+    () => "unused",
+    () => "2026-08-11T00:00:06.000Z",
+    async () => {
+      calls.push("changeset-reconciled");
+      calls.push("after-checkpoint-recorded");
+      afterCheckpointExists = true;
+    },
+  );
+
+  assert.deepEqual(calls, [
+    "changeset-reconciled",
+    "after-checkpoint-recorded",
+    "list-manifest-freezes",
+    `freeze:${identity.runId}`,
+  ]);
+});
+
+test("desktop terminal path orders evidence, final changeset, after checkpoint, then manifest freeze", async () => {
+  const main = await readFile(new URL("../electron/main.ts", import.meta.url), "utf8");
+  const liveTerminal = extractSourceRange(
+    main,
+    "async function reconcileTerminalRunEvent",
+    "async function getWorkflowStore",
+  );
+  const terminal = extractSourceRange(
+    main,
+    "async function reconcileTerminalWorkflowRun",
+    "async function reconcilePendingPlannerWorkflowIntent",
+  );
+  const enrichment = extractSourceRange(
+    main,
+    "async function enrichTerminalWorkflowRun",
+    "async function workflowStoreIdentity",
+  );
+
+  assert.ok(liveTerminal.indexOf("reconcileTerminalWorkflowRun") < liveTerminal.indexOf("enrichTerminalWorkflowRun"));
+  assert.match(terminal, /store\.recordRunResult\(/);
+  assert.ok(enrichment.indexOf("recordRunChangesetEvidence") < enrichment.indexOf("store.recordRunCheckpoint"));
+  assert.ok(enrichment.indexOf("store.recordRunCheckpoint") < enrichment.indexOf("store.freezeCandidateManifest"));
 });
 
 test("getWorkflowStore completes pending checkpoint enrichment without waiting on its own recovery", { timeout: 10_000 }, async () => {
@@ -2255,6 +2337,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
       verify: gitWorktreeNodeModule.verifyWorkflowGitAncestryProof,
     }),
     recoverPendingPlannerIntentReconciliations,
+    recoverPendingCandidateManifestFreezes,
     recoverTerminalWorkflowRuns,
     require(specifier) {
       if (specifier === "@skyturn/persistence/workflow-store") return persistenceModule;

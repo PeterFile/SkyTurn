@@ -138,6 +138,7 @@ export type FinalChangesetReconciliationStatus = "available" | "empty" | "failed
 
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
 export const RUN_EVENT_PROTOCOL_VERSION = 1;
+export const WORKFLOW_CANDIDATE_MANIFEST_VERSION = 1;
 export const AGENT_TRANSPORT_KINDS: AgentTransportKind[] = ["exec-json", "pty-interactive"];
 export const TERMINAL_SESSION_STATUSES: TerminalSessionStatus[] = [
   "starting",
@@ -777,6 +778,53 @@ export interface RunEvidence {
   completedAt: string | null;
 }
 
+export interface WorkflowCandidateEvidenceCheckBinding {
+  readonly kind: EvidenceCheckKind;
+  readonly status: EvidenceCheckStatus;
+}
+
+export interface WorkflowCandidateRunEvidenceBinding {
+  readonly runId: string;
+  readonly status: "succeeded";
+  readonly exitCode: 0;
+  readonly changesetId: string | null;
+  readonly checks: readonly WorkflowCandidateEvidenceCheckBinding[];
+  readonly artifactCount: number;
+  readonly review: WorkflowCandidateEvidenceCheckBinding | null;
+  readonly errorReason: null;
+  readonly cancelReason: null;
+  readonly completedAt: string;
+}
+
+export interface WorkflowCandidateManifest {
+  readonly version: typeof WORKFLOW_CANDIDATE_MANIFEST_VERSION;
+  readonly createdAt: string;
+  readonly sessionId: string;
+  readonly nodeId: string;
+  readonly laneId: string;
+  readonly segmentId: string;
+  readonly runId: string;
+  readonly agentKind: AgentKind;
+  readonly executionTarget: SessionExecutionTarget;
+  readonly worktreeId: string | null;
+  readonly repositoryIdentity: string;
+  readonly worktreeIdentity: string;
+  readonly branchName: string;
+  readonly beforeCheckpointId: string;
+  readonly beforeHeadCommit: string;
+  readonly afterCheckpointId: string;
+  readonly afterHeadCommit: string;
+  readonly ancestryProofSha256: string;
+  readonly terminalEvidenceId: string;
+  readonly terminalRunEvidence: WorkflowCandidateRunEvidenceBinding;
+  readonly terminalRunEvidenceSha256: string;
+  readonly changesetEvidenceId: string;
+  readonly changesetId: string;
+  readonly fullPatchSha256: string;
+  readonly fullPatchByteLength: number;
+  readonly fileManifestSha256: string;
+}
+
 export function sanitizeTrustedRunEvidence(evidence: RunEvidence): RunEvidence {
   const checks = uniqueEvidenceChecks(evidence.checks.map(sanitizeTrustedEvidenceCheck));
   const review = evidence.review ? sanitizeTrustedEvidenceCheck(evidence.review) : null;
@@ -863,6 +911,223 @@ export function parseRunEvidence(value: unknown): RunEvidence | null {
     cancelReason: sanitizePublicEvidenceText(value.cancelReason) || null,
     completedAt: value.completedAt,
   });
+}
+
+const workflowCandidateManifestKeys = [
+  "version",
+  "createdAt",
+  "sessionId",
+  "nodeId",
+  "laneId",
+  "segmentId",
+  "runId",
+  "agentKind",
+  "executionTarget",
+  "worktreeId",
+  "repositoryIdentity",
+  "worktreeIdentity",
+  "branchName",
+  "beforeCheckpointId",
+  "beforeHeadCommit",
+  "afterCheckpointId",
+  "afterHeadCommit",
+  "ancestryProofSha256",
+  "terminalEvidenceId",
+  "terminalRunEvidence",
+  "terminalRunEvidenceSha256",
+  "changesetEvidenceId",
+  "changesetId",
+  "fullPatchSha256",
+  "fullPatchByteLength",
+  "fileManifestSha256",
+] as const;
+const workflowCandidateRunEvidenceBindingKeys = [
+  "runId",
+  "status",
+  "exitCode",
+  "changesetId",
+  "checks",
+  "artifactCount",
+  "review",
+  "errorReason",
+  "cancelReason",
+  "completedAt",
+] as const;
+const workflowCandidateEvidenceCheckBindingKeys = ["kind", "status"] as const;
+const manifestSha256Pattern = /^[0-9a-f]{64}$/;
+const manifestCommitPattern = /^[0-9a-f]{40}$/;
+
+export function parseWorkflowCandidateManifest(value: unknown): WorkflowCandidateManifest | null {
+  if (!isRecord(value) || !hasExactlyKeys(value, workflowCandidateManifestKeys)) return null;
+  if (value.version !== WORKFLOW_CANDIDATE_MANIFEST_VERSION) return null;
+  if (!isCanonicalManifestTimestamp(value.createdAt)) return null;
+  if (![
+    value.sessionId,
+    value.nodeId,
+    value.laneId,
+    value.segmentId,
+    value.runId,
+    value.beforeCheckpointId,
+    value.afterCheckpointId,
+    value.terminalEvidenceId,
+    value.changesetEvidenceId,
+    value.changesetId,
+  ].every(isCanonicalManifestIdentity)) return null;
+  if (!isCanonicalManifestBranchName(value.branchName)) return null;
+  if (!isAgentKind(value.agentKind)) return null;
+  if (value.executionTarget !== "current_branch" && value.executionTarget !== "new_worktree") return null;
+  if (
+    (value.executionTarget === "current_branch" && value.worktreeId !== null) ||
+    (value.executionTarget === "new_worktree" && !isCanonicalManifestIdentity(value.worktreeId))
+  ) return null;
+  if (
+    !isManifestSha256(value.repositoryIdentity) ||
+    !isManifestSha256(value.worktreeIdentity) ||
+    !isManifestSha256(value.ancestryProofSha256) ||
+    !isManifestSha256(value.terminalRunEvidenceSha256) ||
+    !isManifestSha256(value.fullPatchSha256) ||
+    !isManifestSha256(value.fileManifestSha256) ||
+    typeof value.beforeHeadCommit !== "string" ||
+    !manifestCommitPattern.test(value.beforeHeadCommit) ||
+    typeof value.afterHeadCommit !== "string" ||
+    !manifestCommitPattern.test(value.afterHeadCommit) ||
+    value.beforeCheckpointId === value.afterCheckpointId ||
+    !Number.isSafeInteger(value.fullPatchByteLength) ||
+    (value.fullPatchByteLength as number) <= 0
+  ) return null;
+  const runEvidence = parseWorkflowCandidateRunEvidenceBinding(value.terminalRunEvidence);
+  if (
+    !runEvidence ||
+    runEvidence.runId !== value.runId ||
+    (runEvidence.changesetId !== null && runEvidence.changesetId !== value.changesetId)
+  ) return null;
+
+  return {
+    version: WORKFLOW_CANDIDATE_MANIFEST_VERSION,
+    createdAt: value.createdAt,
+    sessionId: value.sessionId as string,
+    nodeId: value.nodeId as string,
+    laneId: value.laneId as string,
+    segmentId: value.segmentId as string,
+    runId: value.runId as string,
+    agentKind: value.agentKind,
+    executionTarget: value.executionTarget,
+    worktreeId: value.worktreeId as string | null,
+    repositoryIdentity: value.repositoryIdentity,
+    worktreeIdentity: value.worktreeIdentity,
+    branchName: value.branchName as string,
+    beforeCheckpointId: value.beforeCheckpointId as string,
+    beforeHeadCommit: value.beforeHeadCommit,
+    afterCheckpointId: value.afterCheckpointId as string,
+    afterHeadCommit: value.afterHeadCommit,
+    ancestryProofSha256: value.ancestryProofSha256,
+    terminalEvidenceId: value.terminalEvidenceId as string,
+    terminalRunEvidence: runEvidence,
+    terminalRunEvidenceSha256: value.terminalRunEvidenceSha256,
+    changesetEvidenceId: value.changesetEvidenceId as string,
+    changesetId: value.changesetId as string,
+    fullPatchSha256: value.fullPatchSha256,
+    fullPatchByteLength: value.fullPatchByteLength as number,
+    fileManifestSha256: value.fileManifestSha256,
+  };
+}
+
+function parseWorkflowCandidateRunEvidenceBinding(value: unknown): WorkflowCandidateRunEvidenceBinding | null {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, workflowCandidateRunEvidenceBindingKeys) ||
+    !isCanonicalManifestIdentity(value.runId) ||
+    value.status !== "succeeded" ||
+    value.exitCode !== 0 ||
+    (value.changesetId !== null && !isCanonicalManifestIdentity(value.changesetId)) ||
+    !Array.isArray(value.checks) ||
+    !Number.isSafeInteger(value.artifactCount) ||
+    (value.artifactCount as number) < 0 ||
+    value.errorReason !== null ||
+    value.cancelReason !== null ||
+    !isCanonicalManifestTimestamp(value.completedAt)
+  ) return null;
+  const checks = value.checks.map(parseWorkflowCandidateEvidenceCheckBinding);
+  if (checks.some((check) => check === null)) return null;
+  const review = value.review === null ? null : parseWorkflowCandidateEvidenceCheckBinding(value.review);
+  if (value.review !== null && review === null) return null;
+  return {
+    runId: value.runId,
+    status: "succeeded",
+    exitCode: 0,
+    changesetId: value.changesetId as string | null,
+    checks: checks as WorkflowCandidateEvidenceCheckBinding[],
+    artifactCount: value.artifactCount as number,
+    review,
+    errorReason: null,
+    cancelReason: null,
+    completedAt: value.completedAt,
+  };
+}
+
+function parseWorkflowCandidateEvidenceCheckBinding(value: unknown): WorkflowCandidateEvidenceCheckBinding | null {
+  if (
+    !isRecord(value) ||
+    !hasExactlyKeys(value, workflowCandidateEvidenceCheckBindingKeys) ||
+    !EVIDENCE_CHECK_KINDS.includes(value.kind as EvidenceCheckKind) ||
+    !EVIDENCE_CHECK_STATUSES.includes(value.status as EvidenceCheckStatus)
+  ) return null;
+  return {
+    kind: value.kind as EvidenceCheckKind,
+    status: value.status as EvidenceCheckStatus,
+  };
+}
+
+function hasExactlyKeys(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && keys.every((key) => expected.includes(key));
+}
+
+function isCanonicalManifestIdentity(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    value.trim() === value &&
+    /^[A-Za-z0-9._:-]+$/.test(value);
+}
+
+function isCanonicalManifestBranchName(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 512 ||
+    value.trim() !== value ||
+    value === "@" ||
+    value.startsWith("-") ||
+    value.startsWith("/") ||
+    value.endsWith("/") ||
+    value.endsWith(".") ||
+    value.includes("//") ||
+    value.includes("..") ||
+    value.includes("@{") ||
+    /[\x00-\x20\x7f~^:?*[\]\\]/.test(value)
+  ) return false;
+  return value.split("/").every((component) =>
+    component.length > 0 && !component.startsWith(".") && !component.endsWith(".lock")
+  );
+}
+
+function isCanonicalManifestTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const timestamp = Date.parse(value);
+  return !Number.isNaN(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+function isManifestSha256(value: unknown): value is string {
+  return typeof value === "string" && manifestSha256Pattern.test(value);
+}
+
+function isAgentKind(value: unknown): value is AgentKind {
+  return value === "hermes" || value === "codex" || value === "agy" || value === "gemini" ||
+    value === "claude-code" || value === "openclaw";
 }
 
 export function parseRunEvent(value: unknown): RunEvent | null {

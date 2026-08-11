@@ -18,6 +18,7 @@ import {
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
   parseWorkflowGitAncestryProof,
+  parseWorkflowCandidateManifest,
   parseRunEvent,
   parseRunEvidence,
   parseRunEvidenceChecks,
@@ -25,6 +26,7 @@ import {
   sanitizeRunEvidence,
   sanitizePublicEvidenceText,
   WORKFLOW_LANE_KINDS,
+  WORKFLOW_CANDIDATE_MANIFEST_VERSION,
   deriveNodeStatusFromEvidence,
   hasConcreteRunEvidence,
   summarizeRunEvidence,
@@ -59,7 +61,105 @@ import {
   type WorkflowVariantAdoption,
   type WorkflowWorktreeIdentity,
   type WorkflowLaneCandidateBinding,
+  type WorkflowCandidateManifest,
 } from "./index";
+
+function workflowCandidateManifest(
+  overrides: Partial<WorkflowCandidateManifest> = {},
+): WorkflowCandidateManifest {
+  return {
+    version: 1,
+    createdAt: "2026-08-11T00:00:00.000Z",
+    sessionId: "session-1",
+    nodeId: "lane-implementation",
+    laneId: "lane-implementation",
+    segmentId: "segment-session-1-lane-implementation",
+    runId: "run-session-1-lane-implementation",
+    agentKind: "codex",
+    executionTarget: "current_branch",
+    worktreeId: null,
+    repositoryIdentity: "1".repeat(64),
+    worktreeIdentity: "2".repeat(64),
+    branchName: "main",
+    beforeCheckpointId: "checkpoint:run-session-1-lane-implementation:before",
+    beforeHeadCommit: "a".repeat(40),
+    afterCheckpointId: "checkpoint:run-session-1-lane-implementation:after",
+    afterHeadCommit: "b".repeat(40),
+    ancestryProofSha256: "3".repeat(64),
+    terminalEvidenceId: "evidence-segment-session-1-lane-implementation",
+    terminalRunEvidence: {
+      runId: "run-session-1-lane-implementation",
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: "changeset-run-session-1-lane-implementation",
+      checks: [
+        { kind: "test", status: "passed" },
+        { kind: "review", status: "skipped" },
+      ],
+      artifactCount: 2,
+      review: { kind: "review", status: "passed" },
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-08-11T00:00:00.000Z",
+    },
+    terminalRunEvidenceSha256: "6".repeat(64),
+    changesetEvidenceId: "changeset-evidence:run-session-1-lane-implementation:after",
+    changesetId: "changeset-run-session-1-lane-implementation",
+    fullPatchSha256: "4".repeat(64),
+    fullPatchByteLength: 128,
+    fileManifestSha256: "5".repeat(64),
+    ...overrides,
+  };
+}
+
+describe("WorkflowCandidateManifest contract", () => {
+  it("strictly parses the current immutable manifest shape", () => {
+    const manifest = workflowCandidateManifest();
+
+    expect(WORKFLOW_CANDIDATE_MANIFEST_VERSION).toBe(1);
+    expect(parseWorkflowCandidateManifest(manifest)).toEqual(manifest);
+  });
+
+  it.each([
+    ["missing field", ({ createdAt: _createdAt, ...manifest }) => manifest],
+    ["extra field", (manifest) => ({ ...manifest, worktreePath: "/private/repo" })],
+    ["bad version", (manifest) => ({ ...manifest, version: 2 })],
+    ["malformed identity", (manifest) => ({ ...manifest, sessionId: " session-1" })],
+    ["path-like opaque identity", (manifest: WorkflowCandidateManifest) => ({ ...manifest, changesetId: "src/private.ts" })],
+    ["prose terminal evidence identity", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalEvidenceId: "agent said success" })],
+    ["absolute-path branch", (manifest: WorkflowCandidateManifest) => ({ ...manifest, branchName: "/private/repo" })],
+    ["double-dot branch", (manifest: WorkflowCandidateManifest) => ({ ...manifest, branchName: "main..tampered" })],
+    ["empty branch component", (manifest: WorkflowCandidateManifest) => ({ ...manifest, branchName: "refs//heads/x" })],
+    ["lock-suffixed branch", (manifest: WorkflowCandidateManifest) => ({ ...manifest, branchName: "feature/x.lock" })],
+    ["malformed timestamp", (manifest) => ({ ...manifest, createdAt: "2026-08-11" })],
+    ["non-current evidence", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, exitCode: null } })],
+    ["failed evidence", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, status: "failed" } })],
+    ["extra evidence field", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, compatibilitySource: "legacy-disk" } })],
+    ["evidence check prose", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, checks: [{ kind: "test", status: "passed", name: "pnpm test" }] } })],
+    ["negative artifact count", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, artifactCount: -1 } })],
+    ["non-null failure reason", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, errorReason: "hidden output" } })],
+    ["malformed evidence timestamp", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, completedAt: "2026-08-11" } })],
+    ["mismatched evidence run", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, runId: "run-other" } })],
+    ["mismatched changeset", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, changesetId: "changeset-other" } })],
+    ["path-like evidence changeset", (manifest: WorkflowCandidateManifest) => ({ ...manifest, terminalRunEvidence: { ...manifest.terminalRunEvidence, changesetId: "src/private.ts" }, changesetId: "src/private.ts" })],
+    ["missing evidence digest", ({ terminalRunEvidenceSha256: _digest, ...manifest }) => manifest],
+    ["bad evidence digest", (manifest) => ({ ...manifest, terminalRunEvidenceSha256: "A".repeat(64) })],
+    ["bad patch digest", (manifest) => ({ ...manifest, fullPatchSha256: "A".repeat(64) })],
+    ["bad manifest digest", (manifest) => ({ ...manifest, fileManifestSha256: "5".repeat(63) })],
+    ["zero patch bytes", (manifest) => ({ ...manifest, fullPatchByteLength: 0 })],
+    ["unsafe patch bytes", (manifest) => ({ ...manifest, fullPatchByteLength: Number.MAX_SAFE_INTEGER + 1 })],
+  ])("rejects %s", (_label, mutate) => {
+    expect(parseWorkflowCandidateManifest(mutate(workflowCandidateManifest()) as unknown)).toBeNull();
+  });
+
+  it("allows null RunEvidence changeset identity while retaining authoritative changeset evidence", () => {
+    const manifest = workflowCandidateManifest({
+      terminalRunEvidence: { ...workflowCandidateManifest().terminalRunEvidence, changesetId: null },
+    });
+
+    expect(parseWorkflowCandidateManifest(manifest)).toEqual(manifest);
+  });
+});
 
 describe("Git ancestry proof contract", () => {
   const contextValues = {
