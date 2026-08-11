@@ -10,6 +10,14 @@ interface RunSegmentIdentity {
   agentKind: string;
 }
 
+interface CandidateManifestIdentity {
+  sessionId: string;
+  nodeId: string;
+  laneId: string;
+  segmentId: string;
+  runId: string;
+}
+
 type RunningSegment = RunSegmentIdentity & { status?: "running" };
 
 interface RecoveryBridge {
@@ -22,6 +30,8 @@ interface RecoveryStore {
   listRunningSegments(): RunningSegment[];
   listPendingPlannerIntentReconciliations(): RunSegmentIdentity[];
   listPendingRunCheckpointEnrichments(): RunSegmentIdentity[];
+  listPendingCandidateManifestFreezes?(): CandidateManifestIdentity[];
+  freezeCandidateManifest?(input: CandidateManifestIdentity & { now: string }): unknown;
   recordRunResult(input: {
     sessionId: string;
     laneId: string;
@@ -166,18 +176,33 @@ export async function recoverTerminalWorkflowRuns(
   if (reconcilePendingPlannerIntent) {
     await recoverPendingPlannerIntentReconciliations(store, reconcilePendingPlannerIntent, now);
   }
-  if (!enrichAfterCheckpoint) return;
-  for (const segment of store.listPendingRunCheckpointEnrichments()) {
-    try {
-      await enrichAfterCheckpoint(segment);
-    } catch {
-      recordWorkflowCheckpointFailure(store, {
-        ...segment,
-        phase: "after",
-        retryable: true,
-        now: now(),
-      });
+  if (enrichAfterCheckpoint) {
+    for (const segment of store.listPendingRunCheckpointEnrichments()) {
+      try {
+        await enrichAfterCheckpoint(segment);
+      } catch {
+        recordWorkflowCheckpointFailure(store, {
+          ...segment,
+          phase: "after",
+          retryable: true,
+          now: now(),
+        });
+      }
     }
+  }
+  recoverPendingCandidateManifestFreezes(store, now);
+}
+
+export function recoverPendingCandidateManifestFreezes(
+  store: RecoveryStore,
+  now: () => string = () => new Date().toISOString(),
+): void {
+  const pendingManifestFreezes = store.listPendingCandidateManifestFreezes?.() ?? [];
+  if (pendingManifestFreezes.length > 0 && !store.freezeCandidateManifest) {
+    throw new Error("Workflow candidate manifest freeze API is unavailable.");
+  }
+  for (const identity of pendingManifestFreezes) {
+    store.freezeCandidateManifest!({ ...identity, now: now() });
   }
 }
 

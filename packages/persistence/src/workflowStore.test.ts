@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -2266,6 +2267,389 @@ describe("SQLite workflow store", () => {
     expect(store.recordRunCheckpoint({ ...input, now: "2026-08-01T00:00:07.000Z" })).toEqual(first);
     expect(store.listEvents(input.sessionId)).toEqual(events);
     store.close();
+  });
+
+  it("freezes one immutable backend-only candidate manifest and replays it with zero writes", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot);
+    const projectionBefore = store.materializeFlowProjection(identity.sessionId);
+    expect(store.listPendingCandidateManifestFreezes()).toEqual([identity]);
+
+    const manifest = store.freezeCandidateManifest({
+      ...identity,
+      now: "2026-08-11T00:00:06.000Z",
+    });
+    const eventsAfterFreeze = store.listEvents(identity.sessionId);
+    const replayed = store.freezeCandidateManifest({
+      ...identity,
+      now: "2026-08-11T00:00:07.000Z",
+    });
+
+    expect(replayed).toEqual(manifest);
+    expect(store.getCandidateManifest(identity)).toEqual(manifest);
+    expect(store.listEvents(identity.sessionId)).toEqual(eventsAfterFreeze);
+    expect(store.materializeFlowProjection(identity.sessionId)).toEqual(projectionBefore);
+    expect(store.listPendingCandidateManifestFreezes()).toEqual([]);
+    expect(manifest).toMatchObject({
+      version: 1,
+      createdAt: "2026-08-11T00:00:06.000Z",
+      ...identity,
+      agentKind: "codex",
+      executionTarget: "current_branch",
+      worktreeId: null,
+      repositoryIdentity: "1".repeat(64),
+      worktreeIdentity: "2".repeat(64),
+      beforeHeadCommit: "a".repeat(40),
+      afterHeadCommit: "b".repeat(40),
+      terminalEvidenceId: `evidence-${identity.segmentId}`,
+      changesetEvidenceId: `changeset-evidence:${identity.runId}:after`,
+      changesetId: `changeset-${identity.laneId}`,
+      fullPatchSha256: "4".repeat(64),
+      fullPatchByteLength: 128,
+      fileManifestSha256: "5".repeat(64),
+    });
+
+    const manifestEvent = eventsAfterFreeze.find((event) => event.kind === "workflow.candidate.manifest_recorded");
+    expect(manifestEvent).toMatchObject({
+      source: "workflow_store",
+      laneId: identity.laneId,
+      segmentId: identity.segmentId,
+      payload: { manifest },
+    });
+    const db = new Database(store.databasePath, { readonly: true });
+    const row = db.prepare("SELECT payload_json FROM workflow_events WHERE id = ?")
+      .get(manifestEvent?.id) as { payload_json: string };
+    db.close();
+    expect(row.payload_json).not.toContain(projectRoot);
+    expect(row.payload_json).not.toMatch(/worktreePath|patchPreview|files|prompt|output/);
+    store.close();
+
+    store = createWorkflowStore({ projectRoot });
+    expect(store.getCandidateManifest(identity)).toEqual(manifest);
+    expect(store.freezeCandidateManifest({ ...identity, now: "2026-08-11T00:00:08.000Z" })).toEqual(manifest);
+    expect(store.listEvents(identity.sessionId)).toEqual(eventsAfterFreeze);
+    store.close();
+  });
+
+  it("freezes a pathless terminal evidence binding while hashing exact artifact and prose-bearing evidence", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const checks: RunEvidence["checks"] = [
+      {
+        kind: "test",
+        name: "test worktree/src/private-file.ts prompt transcript",
+        status: "passed",
+        detail: "raw prompt and agent output preview from src/private-file.ts",
+      },
+      { kind: "build", name: "private-file build", status: "skipped" },
+    ];
+    const artifacts = [".devflow/acceptance/private-file-output.png"];
+    const review: NonNullable<RunEvidence["review"]> = {
+      kind: "review",
+      name: "review prompt transcript",
+      status: "passed",
+      detail: "agent prose output for private-file.ts",
+    };
+    const identity = prepareCandidateManifestRun(store, projectRoot, {
+      terminalEvidence: { checks, artifacts, review },
+    });
+    const authoritativeRunEvidence: RunEvidence = {
+      runId: identity.runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: `changeset-${identity.laneId}`,
+      checks,
+      artifacts,
+      review,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-08-11T00:00:04.000Z",
+    };
+
+    const manifest = store.freezeCandidateManifest({
+      ...identity,
+      now: "2026-08-11T00:00:06.000Z",
+    });
+
+    expect(manifest.terminalRunEvidence).toEqual({
+      runId: identity.runId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: `changeset-${identity.laneId}`,
+      checks: [
+        { kind: "test", status: "passed" },
+        { kind: "build", status: "skipped" },
+      ],
+      artifactCount: 1,
+      review: { kind: "review", status: "passed" },
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-08-11T00:00:04.000Z",
+    });
+    expect(manifest.terminalRunEvidenceSha256).toBe(
+      createHash("sha256").update(canonicalJson(authoritativeRunEvidence), "utf8").digest("hex"),
+    );
+
+    const manifestEvent = store.listEvents(identity.sessionId)
+      .find((event) => event.kind === "workflow.candidate.manifest_recorded");
+    const db = new Database(store.databasePath, { readonly: true });
+    const row = db.prepare("SELECT payload_json FROM workflow_events WHERE id = ?")
+      .get(manifestEvent?.id) as { payload_json: string };
+    db.close();
+    expect(JSON.parse(row.payload_json)).toEqual({ manifest });
+    for (const sensitive of [
+      projectRoot,
+      checks[0]!.name,
+      checks[0]!.detail!,
+      checks[1]!.name,
+      artifacts[0]!,
+      review.name,
+      review.detail!,
+      "private-file.ts",
+      "private-file-output.png",
+    ]) {
+      expect(JSON.stringify(manifest)).not.toContain(sensitive);
+      expect(row.payload_json).not.toContain(sensitive);
+    }
+    expect(row.payload_json).toContain('"artifactCount":1');
+    expect(row.payload_json).toContain('"terminalRunEvidenceSha256"');
+    store.close();
+  });
+
+  it("rejects an extra raw terminal RunEvidence field with zero writes", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot);
+    const db = new Database(store.databasePath);
+    const row = db.prepare("SELECT id, payload_json FROM workflow_events WHERE session_id = ? AND idempotency_key = ?")
+      .get(identity.sessionId, `segment:${identity.segmentId}:evidence`) as { id: string; payload_json: string };
+    const payload = JSON.parse(row.payload_json) as {
+      evidence: { runEvidence: Record<string, unknown> };
+    };
+    payload.evidence.runEvidence.compatibilitySource = "legacy-disk";
+    db.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ?").run(JSON.stringify(payload), row.id);
+    db.close();
+    const before = store.listEvents(identity.sessionId);
+
+    expect(() => store.freezeCandidateManifest({
+      ...identity,
+      now: "2026-08-11T00:00:06.000Z",
+    })).toThrow(/candidate manifest.*RunEvidence|current.*RunEvidence/i);
+    expect(store.getCandidateManifest(identity)).toBeNull();
+    expect(store.listEvents(identity.sessionId)).toEqual(before);
+    store.close();
+  });
+
+  it("rejects a path-like changeset identity with zero writes", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot, {
+      changesetId: "src/private.ts",
+    });
+    const before = store.listEvents(identity.sessionId);
+
+    expect(() => store.freezeCandidateManifest({
+      ...identity,
+      now: "2026-08-11T00:00:06.000Z",
+    })).toThrow(/candidate manifest.*RunEvidence|changeset id/i);
+    expect(store.getCandidateManifest(identity)).toBeNull();
+    expect(store.listEvents(identity.sessionId)).toEqual(before);
+    store.close();
+  });
+
+  it("rejects a checkpoint with the same run scope and a conflicting node id with zero writes", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot);
+    insertRawCheckpointEvents(store.databasePath, [rawCheckpoint({
+      id: `checkpoint:${identity.runId}:after-conflicting-node`,
+      sessionId: identity.sessionId,
+      nodeId: "lane-conflicting-node",
+      laneId: identity.laneId,
+      segmentId: identity.segmentId,
+      runId: identity.runId,
+      phase: "after",
+      executionTarget: "current_branch",
+      worktreePath: projectRoot,
+      branchName: "HEAD",
+      headCommit: "b".repeat(40),
+      createdAt: "2026-08-11T00:00:05.750Z",
+      evidenceRefs: [{ kind: "run", id: identity.runId }],
+    })]);
+    const before = store.listEvents(identity.sessionId);
+
+    expect(() => store.freezeCandidateManifest({
+      ...identity,
+      now: "2026-08-11T00:00:06.000Z",
+    })).toThrow(/candidate manifest.*checkpoint/i);
+    expect(store.getCandidateManifest(identity)).toBeNull();
+    expect(store.listEvents(identity.sessionId)).toEqual(before);
+    store.close();
+  });
+
+  it("rejects generic candidate manifest forgery before idempotency", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const input = {
+      sessionId: "session-1",
+      kind: "workflow.candidate.manifest_recorded" as never,
+      source: "backend",
+      idempotencyKey: "candidate-manifest:run-forged",
+      payload: { manifest: { version: 1 } },
+      now: "2026-08-11T00:00:00.000Z",
+    };
+
+    expect(() => store.appendWorkflowEvent(input)).toThrow(/candidate manifest.*internal|forg/i);
+    expect(store.listEvents("session-1").some((event) => event.kind === input.kind)).toBe(false);
+    store.close();
+  });
+
+  it("freezes authoritative changeset evidence when succeeded RunEvidence has a null changeset id", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot, { nullRunChangesetId: true });
+
+    const manifest = store.freezeCandidateManifest({
+      ...identity,
+      now: "2026-08-11T00:00:06.000Z",
+    });
+
+    expect(manifest.terminalRunEvidence.changesetId).toBeNull();
+    expect(manifest.changesetId).toBe(`changeset-${identity.laneId}`);
+    store.close();
+  });
+
+  it.each([
+    "legacy",
+    "digestless",
+    "failed",
+    "missing-proof",
+    "wrong-header-source",
+    "duplicate-changeset",
+  ] as const)(
+    "fails candidate manifest freeze closed for %s authoritative facts",
+    async (failure) => {
+      const projectRoot = await makeTempRoot();
+      const store = createWorkflowStore({ projectRoot });
+      const identity = prepareCandidateManifestRun(store, projectRoot, {
+        status: failure === "failed" ? "failed" : "succeeded",
+        digestless: failure === "digestless",
+        includeProof: failure !== "missing-proof",
+      });
+      if (failure === "legacy") {
+        const db = new Database(store.databasePath);
+        db.prepare("UPDATE workflow_events SET legacy_evidence_compatibility = 1 WHERE session_id = ? AND idempotency_key = ?")
+          .run(identity.sessionId, `segment:${identity.segmentId}:evidence`);
+        db.close();
+      }
+      if (failure === "wrong-header-source") {
+        const db = new Database(store.databasePath);
+        db.prepare("UPDATE workflow_events SET source = 'git' WHERE session_id = ? AND idempotency_key = ?")
+          .run(identity.sessionId, `checkpoint-changeset:${identity.runId}:after`);
+        db.close();
+      }
+      if (failure === "duplicate-changeset") {
+        const db = new Database(store.databasePath);
+        const row = db.prepare([
+          "SELECT kind, source, lane_id, segment_id, payload_json, created_at",
+          "FROM workflow_events WHERE session_id = ? AND idempotency_key = ?",
+        ].join(" ")).get(
+          identity.sessionId,
+          `checkpoint-changeset:${identity.runId}:after`,
+        ) as {
+          kind: string;
+          source: string;
+          lane_id: string;
+          segment_id: string;
+          payload_json: string;
+          created_at: string;
+        };
+        const maxSeq = (db.prepare("SELECT max(seq) AS seq FROM workflow_events WHERE session_id = ?")
+          .get(identity.sessionId) as { seq: number }).seq;
+        db.prepare([
+          "INSERT INTO workflow_events(",
+          "id, session_id, seq, kind, source, lane_id, segment_id, idempotency_key, payload_json, created_at",
+          ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ].join(" ")).run(
+          `${identity.sessionId}:event:duplicate-changeset`,
+          identity.sessionId,
+          maxSeq + 1,
+          row.kind,
+          row.source,
+          row.lane_id,
+          row.segment_id,
+          `duplicate-checkpoint-changeset:${identity.runId}:after`,
+          row.payload_json,
+          row.created_at,
+        );
+        db.close();
+      }
+      const before = store.listEvents(identity.sessionId);
+
+      expect(() => store.freezeCandidateManifest({
+        ...identity,
+        now: "2026-08-11T00:00:06.000Z",
+      })).toThrow(/candidate manifest|current|succeeded|digest|proof/i);
+      expect(store.getCandidateManifest(identity)).toBeNull();
+      expect(store.listEvents(identity.sessionId)).toEqual(before);
+      store.close();
+    },
+  );
+
+  it("conflicts with zero writes when authoritative digest facts change after freeze", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot);
+    store.freezeCandidateManifest({ ...identity, now: "2026-08-11T00:00:06.000Z" });
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    const row = db.prepare("SELECT id, payload_json FROM workflow_events WHERE session_id = ? AND idempotency_key = ?")
+      .get(identity.sessionId, `checkpoint-changeset:${identity.runId}:after`) as { id: string; payload_json: string };
+    const payload = JSON.parse(row.payload_json) as { evidence: { fullPatchSha256: string } };
+    payload.evidence.fullPatchSha256 = "6".repeat(64);
+    db.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ?").run(JSON.stringify(payload), row.id);
+    const countBefore = (db.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
+      .get(identity.sessionId) as { count: number }).count;
+    db.close();
+
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(/candidate manifest.*conflict/i);
+    const reopenedDb = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), { readonly: true });
+    expect((reopenedDb.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
+      .get(identity.sessionId) as { count: number }).count).toBe(countBefore);
+    reopenedDb.close();
+  });
+
+  it("rejects a structurally valid persisted manifest that conflicts with authoritative facts", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot);
+    store.freezeCandidateManifest({ ...identity, now: "2026-08-11T00:00:06.000Z" });
+    const manifestEvent = store.listEvents(identity.sessionId)
+      .find((event) => event.kind === "workflow.candidate.manifest_recorded");
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    const row = db.prepare("SELECT payload_json FROM workflow_events WHERE id = ?")
+      .get(manifestEvent?.id) as { payload_json: string };
+    const payload = JSON.parse(row.payload_json) as { manifest: { agentKind: string } };
+    payload.manifest.agentKind = "gemini";
+    db.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ?")
+      .run(JSON.stringify(payload), manifestEvent?.id);
+    const countBefore = (db.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
+      .get(identity.sessionId) as { count: number }).count;
+    db.close();
+
+    expect(() => store.getCandidateManifest(identity)).toThrow(/candidate manifest.*conflict/i);
+    expect(() => store.listPendingCandidateManifestFreezes()).toThrow(/candidate manifest.*conflict/i);
+    store.close();
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(/candidate manifest.*conflict/i);
+
+    const reopenedDb = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), { readonly: true });
+    expect((reopenedDb.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
+      .get(identity.sessionId) as { count: number }).count).toBe(countBefore);
+    reopenedDb.close();
   });
 
   it("rejects proof or context on before checkpoints and incomplete after proof inputs before mutation", async () => {
@@ -9362,6 +9746,98 @@ function prepareProofCheckpointRun(store: TestWorkflowStore, projectRoot: string
   };
 }
 
+function prepareCandidateManifestRun(
+  store: TestWorkflowStore,
+  projectRoot: string,
+  options: {
+    status?: "succeeded" | "failed";
+    digestless?: boolean;
+    includeProof?: boolean;
+    nullRunChangesetId?: boolean;
+    changesetId?: string;
+    terminalEvidence?: Partial<RunEvidence>;
+  } = {},
+) {
+  seedStore(store);
+  declareCodeChangeWorkflow(store);
+  advanceCodeChangeWorkflowToLane(store, "lane-implementation");
+  const identity = {
+    sessionId: "session-1",
+    nodeId: "lane-implementation",
+    laneId: "lane-implementation",
+    segmentId: "segment-session-1-lane-implementation",
+    runId: "run-session-1-lane-implementation",
+  };
+  const checkpoint = {
+    ...identity,
+    executionTarget: "current_branch" as const,
+    worktreePath: projectRoot,
+    branchName: "HEAD",
+    worktreeState: "clean" as const,
+  };
+  store.recordRunCheckpoint({
+    ...checkpoint,
+    phase: "before",
+    headCommit: "a".repeat(40),
+    evidenceRefs: [{ kind: "run", id: identity.runId }],
+    now: "2026-08-11T00:00:03.000Z",
+  });
+  const changesetId = options.changesetId ?? `changeset-${identity.laneId}`;
+  const terminal = runResultInput(
+    store,
+    identity.laneId,
+    options.status ?? "succeeded",
+    "2026-08-11T00:00:04.000Z",
+  );
+  terminal.evidence.changesetId = options.nullRunChangesetId ? null : changesetId;
+  Object.assign(terminal.evidence, options.terminalEvidence);
+  store.recordRunResult(terminal);
+  const changesetEvidenceId = `changeset-evidence:${identity.runId}:after`;
+  store.appendWorkflowEvent({
+    sessionId: identity.sessionId,
+    kind: "workflow.changeset.evidence_recorded",
+    source: "backend",
+    laneId: identity.laneId,
+    segmentId: identity.segmentId,
+    idempotencyKey: `checkpoint-changeset:${identity.runId}:after`,
+    payload: {
+      laneId: identity.laneId,
+      segmentId: identity.segmentId,
+      evidence: {
+        evidenceId: changesetEvidenceId,
+        changesetId,
+        source: "git",
+        status: "available",
+        files: ["src/index.ts"],
+        diffStat: { added: 4, changed: 1, deleted: 0 },
+        patchPreviewTruncated: false,
+        collectedAt: "2026-08-11T00:00:05.000Z",
+        ...(!options.digestless ? {
+          fullPatchSha256: "4".repeat(64),
+          fullPatchByteLength: 128,
+          fileManifestSha256: "5".repeat(64),
+        } : {}),
+      },
+    },
+    now: "2026-08-11T00:00:05.000Z",
+  });
+  const proof = workflowGitAncestryProof("a".repeat(40), "b".repeat(40));
+  store.recordRunCheckpoint({
+    ...checkpoint,
+    phase: "after",
+    headCommit: "b".repeat(40),
+    evidenceRefs: [
+      { kind: "run", id: identity.runId },
+      { kind: "segment", id: identity.segmentId },
+      { kind: "evidence", id: `evidence-${identity.segmentId}` },
+      { kind: "changeset", id: changesetEvidenceId },
+    ],
+    ...(options.includeProof === false ? {} : proof),
+    now: "2026-08-11T00:00:05.500Z",
+  });
+  return identity;
+}
+
 function rawCheckpoint(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const runId = typeof overrides.runId === "string" ? overrides.runId : "run-raw";
   const segmentId = typeof overrides.segmentId === "string" ? overrides.segmentId : "segment-raw";
@@ -9446,6 +9922,17 @@ function terminalRunEvidence(
     cancelReason: status === "cancelled" ? "Run cancelled." : null,
     completedAt: "2026-06-14T00:00:04.000Z",
   };
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortCanonicalJson(value));
+}
+
+function sortCanonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortCanonicalJson);
+  if (!value || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(Object.keys(record).sort().map((key) => [key, sortCanonicalJson(record[key])]));
 }
 
 function artifactFailureSegmentInput(): TestSegmentEvidenceInput {

@@ -8,17 +8,21 @@ import {
   expectedArtifactContractForRequiredEvidence,
   isSuccessfulRunEvidence,
   normalizeSessionTarget,
+  parseChangesetEvidence,
   parseRunEvent,
   parseRunEvidence,
+  parseWorkflowCandidateManifest,
   parseWorkflowGitAncestryProof,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
   sanitizePublicEvidenceText,
+  WORKFLOW_CANDIDATE_MANIFEST_VERSION,
 } from "@skyturn/project-core";
 import type {
   AgentKind,
   CanvasNode,
   CanvasSession,
+  ChangesetEvidence,
   EvidenceCheck,
   HermesPlannerTransport,
   NodeLifecyclePhase,
@@ -36,6 +40,8 @@ import type {
   WorkflowLoopEngineeringState,
   WorkflowMode,
   WorkflowGitAncestryProofContext,
+  WorkflowCandidateManifest,
+  WorkflowCandidateRunEvidenceBinding,
   WorkflowNodeCheckpoint,
   WorkflowRollbackEligibility,
   WorkflowWorktreeIdentity,
@@ -96,7 +102,8 @@ export type WorkflowInternalEventKind =
   | "workflow.user_input.delivered"
   | "workflow.plan_finish.bound"
   | "workflow.plan_finish.launch_accepted"
-  | "workflow.planner_intent.reconciled";
+  | "workflow.planner_intent.reconciled"
+  | "workflow.candidate.manifest_recorded";
 
 export type WorkflowEventKind =
   | "user_input"
@@ -504,6 +511,18 @@ export interface WorkflowNodeCheckpointQuery {
   phase?: WorkflowNodeCheckpoint["phase"];
 }
 
+export interface WorkflowCandidateManifestIdentity {
+  sessionId: string;
+  nodeId: string;
+  laneId: string;
+  segmentId: string;
+  runId: string;
+}
+
+export interface FreezeWorkflowCandidateManifestInput extends WorkflowCandidateManifestIdentity {
+  now: string;
+}
+
 export interface WorkflowNodeRollbackInput {
   sessionId: string;
   nodeId?: string;
@@ -830,6 +849,7 @@ export class WorkflowStore {
         completeHermesHandlePhysicalCleanup(this.db, this.faultInjection);
       }
       this.statements = prepareStatements(this.db);
+      this.validatePersistedCandidateManifests();
     } catch (error) {
       this.db.close();
       throw error;
@@ -969,6 +989,9 @@ export class WorkflowStore {
   }
 
   appendWorkflowEvent(input: AppendWorkflowEventInput): WorkflowEventRecord {
+    if (input.kind === "workflow.candidate.manifest_recorded") {
+      throw new Error("Workflow candidate manifest is internal and cannot be forged through generic append.");
+    }
     assertGenericCheckpointEventHasNoRestrictedFields(input);
     const laneId = laneIdFromPayload(input.payload);
     const projection = this.materializeFlowProjection(input.sessionId);
@@ -2107,6 +2130,300 @@ export class WorkflowStore {
 
   listEvents(sessionId: string): WorkflowEventRecord[] {
     return this.readValidatedEventRows(sessionId).map(({ event }) => event);
+  }
+
+  freezeCandidateManifest(input: FreezeWorkflowCandidateManifestInput): WorkflowCandidateManifest {
+    const normalized = normalizeCandidateManifestFreezeInput(input);
+    const tx = this.db.transaction(() => {
+      const idempotencyKey = candidateManifestIdempotencyKey(normalized.runId);
+      const existing = this.getEventByIdempotencyKey(normalized.sessionId, idempotencyKey);
+      if (existing) {
+        return this.validateCandidateManifestEvent(existing, normalized);
+      }
+
+      const manifest = this.deriveCandidateManifest(normalized, normalized.now);
+      this.insertEventInTransaction({
+        sessionId: normalized.sessionId,
+        kind: "workflow.candidate.manifest_recorded",
+        source: "workflow_store",
+        laneId: normalized.laneId,
+        segmentId: normalized.segmentId,
+        idempotencyKey,
+        payload: { manifest },
+        now: normalized.now,
+      });
+      return manifest;
+    });
+    return tx.immediate();
+  }
+
+  getCandidateManifest(identity: WorkflowCandidateManifestIdentity): WorkflowCandidateManifest | null {
+    const normalized = normalizeCandidateManifestIdentity(identity);
+    const event = this.getEventByIdempotencyKey(
+      normalized.sessionId,
+      candidateManifestIdempotencyKey(normalized.runId),
+    );
+    return event ? this.validateCandidateManifestEvent(event, normalized) : null;
+  }
+
+  listPendingCandidateManifestFreezes(): WorkflowCandidateManifestIdentity[] {
+    const tx = this.db.transaction(() => {
+      const pending: WorkflowCandidateManifestIdentity[] = [];
+      for (const sessionId of this.listWorkflowSessionIds()) {
+        const events = this.readValidatedEventRows(sessionId);
+        for (const { event } of events) {
+          if (event.kind !== "workflow.node.checkpoint_recorded" || !isRecord(event.payload.checkpoint)) continue;
+          const checkpoint = event.payload.checkpoint;
+          if (checkpoint.phase !== "after" || typeof checkpoint.ancestryProof !== "string") continue;
+          const candidate = candidateIdentityFromCheckpoint(checkpoint);
+          if (!candidate || candidate.sessionId !== sessionId) continue;
+          const existing = this.getEventByIdempotencyKey(
+            sessionId,
+            candidateManifestIdempotencyKey(candidate.runId),
+          );
+          if (existing) {
+            this.validateCandidateManifestEvent(existing, candidate);
+            continue;
+          }
+          try {
+            this.deriveCandidateManifest(candidate, checkpoint.createdAt as string);
+            pending.push(candidate);
+          } catch {
+            // Only strict current-format crash-window candidates are recoverable.
+          }
+        }
+      }
+      return pending;
+    });
+    return tx();
+  }
+
+  private validateCandidateManifestEvent(
+    event: WorkflowEventRecord,
+    identity: WorkflowCandidateManifestIdentity,
+  ): WorkflowCandidateManifest {
+    const manifest = candidateManifestFromEvent(event, identity);
+    const authoritative = this.deriveCandidateManifest(identity, manifest.createdAt);
+    if (stableJson(manifest) !== stableJson(authoritative)) {
+      throw new Error("Workflow candidate manifest conflicts with current authoritative facts.");
+    }
+    return manifest;
+  }
+
+  private validatePersistedCandidateManifests(): void {
+    const tx = this.db.transaction(() => {
+      for (const sessionId of this.listWorkflowSessionIds()) {
+        for (const row of this.statements.listEvents.all(sessionId) as EventRow[]) {
+          if (row.kind !== "workflow.candidate.manifest_recorded") continue;
+          const event = mapEvent(row);
+          if (!isRecord(event.payload.manifest)) {
+            throw new Error("Persisted workflow candidate manifest is invalid.");
+          }
+          const manifest = parseWorkflowCandidateManifest(event.payload.manifest);
+          if (!manifest) throw new Error("Persisted workflow candidate manifest is invalid.");
+          this.validateCandidateManifestEvent(event, manifest);
+        }
+      }
+    });
+    tx();
+  }
+
+  private deriveCandidateManifest(
+    identity: WorkflowCandidateManifestIdentity,
+    createdAt: string,
+  ): WorkflowCandidateManifest {
+    const session = this.requireKnownSession(identity.sessionId);
+    const validatedEvents = this.readValidatedEventRows(identity.sessionId);
+    const checkpoints = validatedEvents.filter(({ event }) =>
+      event.kind === "workflow.node.checkpoint_recorded" &&
+      isRecord(event.payload.checkpoint) &&
+      checkpointMatchesCandidateRunScope(event.payload.checkpoint, identity)
+    );
+    const beforeCandidates = checkpoints.filter(({ event }) =>
+      isRecord(event.payload.checkpoint) && event.payload.checkpoint.phase === "before"
+    );
+    const afterCandidates = checkpoints.filter(({ event }) =>
+      isRecord(event.payload.checkpoint) && event.payload.checkpoint.phase === "after"
+    );
+    if (checkpoints.length !== 2 || beforeCandidates.length !== 1 || afterCandidates.length !== 1) {
+      throw new Error("Workflow candidate manifest requires unique before and after checkpoints.");
+    }
+    const before = requireCandidateManifestCheckpoint(beforeCandidates[0]!, identity, "before", session.target);
+    const after = requireCandidateManifestCheckpoint(afterCandidates[0]!, identity, "after", session.target);
+    const projection = this.materializeFlowProjection(identity.sessionId);
+    const projectedLane = projection.lanes.find((candidate) => candidate.id === identity.laneId);
+    const projectedNode = projection.projectionNodes.find((candidate) =>
+      candidate.id === identity.nodeId && candidate.laneId === identity.laneId
+    );
+    const segment = projection.segments.find((candidate) => candidate.id === identity.segmentId);
+    if (
+      !projectedLane ||
+      !projectedNode ||
+      projectedNode.executable === false ||
+      !segment ||
+      segment.laneId !== identity.laneId ||
+      segment.runId !== identity.runId ||
+      segment.status !== "succeeded"
+    ) {
+      throw new Error("Workflow candidate manifest requires one succeeded executable segment.");
+    }
+    if (
+      before.nodeId !== after.nodeId ||
+      before.executionTarget !== after.executionTarget ||
+      before.worktreeId !== after.worktreeId ||
+      before.worktreePath !== after.worktreePath ||
+      before.branchName !== after.branchName
+    ) {
+      throw new Error("Workflow candidate manifest checkpoint identity mismatch.");
+    }
+    if (!after.ancestryProof) {
+      throw new Error("Workflow candidate manifest requires an ancestry-bearing after checkpoint.");
+    }
+    const ancestryProof = parsePersistedWorkflowGitAncestryProof(after.ancestryProof);
+    if (
+      ancestryProof.beforeHeadCommit !== before.headCommit ||
+      ancestryProof.afterHeadCommit !== after.headCommit
+    ) {
+      throw new Error("Workflow candidate manifest ancestry proof commit mismatch.");
+    }
+
+    const terminalCandidates = validatedEvents.filter(({ event }) =>
+      event.kind === "workflow.evidence.recorded" &&
+      event.payload.segmentId === identity.segmentId
+    );
+    if (terminalCandidates.length !== 1) {
+      throw new Error("Workflow candidate manifest requires unique terminal evidence.");
+    }
+    const terminalEntry = terminalCandidates[0]!;
+    if (
+      terminalEntry.event.idempotencyKey !== `segment:${identity.segmentId}:evidence` ||
+      terminalEntry.row.legacy_evidence_compatibility !== 0 ||
+      terminalEntry.event.kind !== "workflow.evidence.recorded" ||
+      terminalEntry.event.source !== projectedLane.agentKind ||
+      terminalEntry.event.laneId !== identity.laneId ||
+      terminalEntry.event.payload.laneId !== identity.laneId ||
+      terminalEntry.event.payload.segmentId !== identity.segmentId ||
+      !isRecord(terminalEntry.event.payload.evidence)
+    ) {
+      throw new Error("Workflow candidate manifest requires current terminal evidence.");
+    }
+    const outerEvidence = terminalEntry.event.payload.evidence;
+    const terminalEvidenceId = candidateManifestIdentifier(outerEvidence.id, "terminal evidence id");
+    if (outerEvidence.status !== "passed" || outerEvidence.kind !== "run-exit") {
+      throw new Error("Workflow candidate manifest requires strictly succeeded terminal evidence.");
+    }
+    const rawRunEvidence = outerEvidence.runEvidence;
+    const parsedRunEvidence = parseStrictCandidateManifestRunEvidence(rawRunEvidence);
+    if (!parsedRunEvidence) {
+      throw new Error("Workflow candidate manifest current RunEvidence is not exact.");
+    }
+    const { canonicalJson: terminalRunEvidenceCanonicalJson, evidence: runEvidence } = parsedRunEvidence;
+    if (
+      runEvidence.runId !== identity.runId ||
+      runEvidence.status !== "succeeded" ||
+      runEvidence.exitCode !== 0 ||
+      runEvidence.errorReason !== null ||
+      runEvidence.cancelReason !== null ||
+      !isCanonicalCandidateManifestTimestamp(runEvidence.completedAt)
+    ) {
+      throw new Error("Workflow candidate manifest RunEvidence identity is invalid.");
+    }
+    if (outerEvidence.changesetId !== runEvidence.changesetId) {
+      throw new Error("Workflow candidate manifest terminal changeset identity mismatch.");
+    }
+    const finishedEntry = uniqueValidatedEventByIdempotencyKey(
+      validatedEvents,
+      `segment:${identity.segmentId}:finished`,
+      "terminal status",
+    );
+    if (
+      finishedEntry.event.kind !== "workflow.segment.finished" ||
+      finishedEntry.event.source !== projectedLane.agentKind ||
+      finishedEntry.event.laneId !== identity.laneId ||
+      finishedEntry.event.payload.laneId !== identity.laneId ||
+      finishedEntry.event.payload.segmentId !== identity.segmentId ||
+      finishedEntry.event.payload.status !== "succeeded"
+    ) {
+      throw new Error("Workflow candidate manifest terminal status identity is invalid.");
+    }
+
+    const changesetEntry = uniqueValidatedEventByIdempotencyKey(
+      validatedEvents,
+      `checkpoint-changeset:${identity.runId}:after`,
+      "final changeset evidence",
+    );
+    if (
+      changesetEntry.event.kind !== "workflow.changeset.evidence_recorded" ||
+      changesetEntry.event.source !== "backend" ||
+      changesetEntry.event.laneId !== identity.laneId ||
+      changesetEntry.event.segmentId !== identity.segmentId ||
+      changesetEntry.event.payload.laneId !== identity.laneId ||
+      changesetEntry.event.payload.segmentId !== identity.segmentId ||
+      !isRecord(changesetEntry.event.payload.evidence)
+    ) {
+      throw new Error("Workflow candidate manifest final changeset event identity is invalid.");
+    }
+    const changeset = parseChangesetEvidence(changesetEntry.event.payload.evidence);
+    if (!isCompleteCandidateChangeset(changeset, changesetEntry.event.payload.evidence)) {
+      throw new Error("Workflow candidate manifest requires non-empty complete changeset digest evidence.");
+    }
+    candidateManifestIdentifier(changeset.evidenceId, "changeset evidence id");
+    candidateManifestIdentifier(changeset.changesetId, "changeset id");
+    const matchingChangesetEntries = validatedEvents.filter(({ event }) =>
+      event.kind === "workflow.changeset.evidence_recorded" &&
+      isRecord(event.payload.evidence) &&
+      event.payload.evidence.evidenceId === changeset.evidenceId
+    );
+    if (matchingChangesetEntries.length !== 1 || matchingChangesetEntries[0]!.event.id !== changesetEntry.event.id) {
+      throw new Error("Workflow candidate manifest requires unique final changeset evidence identity.");
+    }
+    if (runEvidence.changesetId !== null && runEvidence.changesetId !== changeset.changesetId) {
+      throw new Error("Workflow candidate manifest RunEvidence changeset identity mismatch.");
+    }
+    if (
+      !hasUniqueCheckpointEvidenceRef(after.evidenceRefs, "run", identity.runId) ||
+      !hasUniqueCheckpointEvidenceRef(after.evidenceRefs, "segment", identity.segmentId) ||
+      !hasUniqueCheckpointEvidenceRef(after.evidenceRefs, "evidence", terminalEvidenceId) ||
+      !hasUniqueCheckpointEvidenceRef(after.evidenceRefs, "changeset", changeset.evidenceId)
+    ) {
+      throw new Error("Workflow candidate manifest after checkpoint evidence binding is incomplete.");
+    }
+
+    const candidateManifest = {
+      version: WORKFLOW_CANDIDATE_MANIFEST_VERSION,
+      createdAt,
+      sessionId: identity.sessionId,
+      nodeId: identity.nodeId,
+      laneId: identity.laneId,
+      segmentId: identity.segmentId,
+      runId: identity.runId,
+      agentKind: projectedLane.agentKind,
+      executionTarget: before.executionTarget,
+      worktreeId: before.worktreeId,
+      repositoryIdentity: ancestryProof.repositoryIdentity,
+      worktreeIdentity: ancestryProof.worktreeIdentity,
+      branchName: before.branchName,
+      beforeCheckpointId: before.id,
+      beforeHeadCommit: before.headCommit,
+      afterCheckpointId: after.id,
+      afterHeadCommit: after.headCommit,
+      ancestryProofSha256: createHash("sha256").update(after.ancestryProof, "utf8").digest("hex"),
+      terminalEvidenceId,
+      terminalRunEvidence: candidateManifestRunEvidenceBinding(runEvidence),
+      terminalRunEvidenceSha256: createHash("sha256")
+        .update(terminalRunEvidenceCanonicalJson, "utf8")
+        .digest("hex"),
+      changesetEvidenceId: changeset.evidenceId,
+      changesetId: changeset.changesetId,
+      fullPatchSha256: changeset.fullPatchSha256,
+      fullPatchByteLength: changeset.fullPatchByteLength,
+      fileManifestSha256: changeset.fileManifestSha256,
+    };
+    const manifest = parseWorkflowCandidateManifest(candidateManifest);
+    if (!manifest) {
+      throw new Error("Workflow candidate manifest facts are not strict current-format data.");
+    }
+    return immutableCandidateManifest(manifest);
   }
 
   private readValidatedEventRows(sessionId: string): ValidatedEventRow[] {
@@ -3592,6 +3909,312 @@ export class WorkflowStore {
       updated_at: now,
     });
   }
+}
+
+interface CandidateManifestCheckpoint {
+  id: string;
+  nodeId: string;
+  executionTarget: "current_branch" | "new_worktree";
+  worktreeId: string | null;
+  worktreePath: string;
+  branchName: string;
+  headCommit: string;
+  ancestryProof: string | null;
+  evidenceRefs: WorkflowNodeCheckpoint["evidenceRefs"];
+}
+
+type CompleteCandidateChangeset = ChangesetEvidence & {
+  fullPatchSha256: string;
+  fullPatchByteLength: number;
+  fileManifestSha256: string;
+};
+
+const candidateManifestCheckpointKeys = new Set([
+  "id",
+  "sessionId",
+  "nodeId",
+  "laneId",
+  "runId",
+  "segmentId",
+  "phase",
+  "executionTarget",
+  "worktreeId",
+  "worktreePath",
+  "branchName",
+  "worktreeState",
+  "headCommit",
+  "createdAt",
+  "source",
+  "evidenceRefs",
+  "ancestryProof",
+]);
+const candidateManifestRunEvidenceKeys = [
+  "runId",
+  "status",
+  "exitCode",
+  "changesetId",
+  "checks",
+  "artifacts",
+  "review",
+  "errorReason",
+  "cancelReason",
+  "completedAt",
+] as const;
+
+function normalizeCandidateManifestIdentity(value: unknown): WorkflowCandidateManifestIdentity {
+  if (!isRecord(value) || !hasExactObjectKeys(value, ["sessionId", "nodeId", "laneId", "segmentId", "runId"])) {
+    throw new Error("Workflow candidate manifest identity must contain only session, node, lane, segment, and run ids.");
+  }
+  return {
+    sessionId: candidateManifestIdentifier(value.sessionId, "sessionId"),
+    nodeId: candidateManifestIdentifier(value.nodeId, "nodeId"),
+    laneId: candidateManifestIdentifier(value.laneId, "laneId"),
+    segmentId: candidateManifestIdentifier(value.segmentId, "segmentId"),
+    runId: candidateManifestIdentifier(value.runId, "runId"),
+  };
+}
+
+function normalizeCandidateManifestFreezeInput(value: unknown): FreezeWorkflowCandidateManifestInput {
+  if (!isRecord(value) || !hasExactObjectKeys(value, ["sessionId", "nodeId", "laneId", "segmentId", "runId", "now"])) {
+    throw new Error("Workflow candidate manifest freeze accepts only identity plus time.");
+  }
+  const identity = normalizeCandidateManifestIdentity({
+    sessionId: value.sessionId,
+    nodeId: value.nodeId,
+    laneId: value.laneId,
+    segmentId: value.segmentId,
+    runId: value.runId,
+  });
+  if (!isCanonicalCandidateManifestTimestamp(value.now)) {
+    throw new Error("Workflow candidate manifest freeze time is invalid.");
+  }
+  return { ...identity, now: value.now };
+}
+
+function candidateIdentityFromCheckpoint(value: Record<string, unknown>): WorkflowCandidateManifestIdentity | null {
+  try {
+    return normalizeCandidateManifestIdentity({
+      sessionId: value.sessionId,
+      nodeId: value.nodeId,
+      laneId: value.laneId,
+      segmentId: value.segmentId,
+      runId: value.runId,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function candidateManifestIdempotencyKey(runId: string): string {
+  return `candidate-manifest:${runId}`;
+}
+
+function candidateManifestFromEvent(
+  event: WorkflowEventRecord,
+  identity: WorkflowCandidateManifestIdentity,
+): WorkflowCandidateManifest {
+  if (
+    event.kind !== "workflow.candidate.manifest_recorded" ||
+    event.source !== "workflow_store" ||
+    event.sessionId !== identity.sessionId ||
+    event.laneId !== identity.laneId ||
+    event.segmentId !== identity.segmentId ||
+    event.idempotencyKey !== candidateManifestIdempotencyKey(identity.runId) ||
+    !hasExactObjectKeys(event.payload, ["manifest"])
+  ) {
+    throw new Error("Persisted workflow candidate manifest event identity is invalid.");
+  }
+  const manifest = parseWorkflowCandidateManifest(event.payload.manifest);
+  if (
+    !manifest ||
+    manifest.createdAt !== event.createdAt ||
+    manifest.sessionId !== identity.sessionId ||
+    manifest.nodeId !== identity.nodeId ||
+    manifest.laneId !== identity.laneId ||
+    manifest.segmentId !== identity.segmentId ||
+    manifest.runId !== identity.runId
+  ) {
+    throw new Error("Persisted workflow candidate manifest payload identity is invalid.");
+  }
+  return immutableCandidateManifest(manifest);
+}
+
+function requireCandidateManifestCheckpoint(
+  entry: ValidatedEventRow,
+  identity: WorkflowCandidateManifestIdentity,
+  phase: "before" | "after",
+  target: SessionTarget,
+): CandidateManifestCheckpoint {
+  const { event } = entry;
+  const checkpoint = event.payload.checkpoint;
+  if (!isRecord(checkpoint) || Object.keys(checkpoint).some((key) => !candidateManifestCheckpointKeys.has(key))) {
+    throw new Error("Workflow candidate manifest checkpoint fields are invalid.");
+  }
+  const id = `checkpoint:${identity.runId}:${phase}`;
+  const executionTarget = checkpoint.executionTarget;
+  const worktreeId = Object.prototype.hasOwnProperty.call(checkpoint, "worktreeId")
+    ? candidateManifestIdentifier(checkpoint.worktreeId, "checkpoint worktreeId")
+    : null;
+  if (
+    event.source !== "backend" ||
+    event.laneId !== identity.laneId ||
+    event.segmentId !== identity.segmentId ||
+    event.idempotencyKey !== id ||
+    !hasExactObjectKeys(event.payload, ["checkpoint"]) ||
+    checkpoint.id !== id ||
+    checkpoint.sessionId !== identity.sessionId ||
+    checkpoint.nodeId !== identity.nodeId ||
+    checkpoint.laneId !== identity.laneId ||
+    checkpoint.segmentId !== identity.segmentId ||
+    checkpoint.runId !== identity.runId ||
+    checkpoint.phase !== phase ||
+    checkpoint.source !== "backend" ||
+    (executionTarget !== "current_branch" && executionTarget !== "new_worktree") ||
+    executionTarget !== target.executionTarget ||
+    typeof checkpoint.worktreePath !== "string" ||
+    canonicalPath(checkpoint.worktreePath) !== checkpoint.worktreePath ||
+    typeof checkpoint.branchName !== "string" ||
+    !checkpoint.branchName ||
+    checkpoint.branchName.trim() !== checkpoint.branchName ||
+    (executionTarget === "current_branch" && checkpoint.branchName !== target.selectedBranch) ||
+    typeof checkpoint.headCommit !== "string" ||
+    !/^[0-9a-f]{40}$/.test(checkpoint.headCommit) ||
+    !isCanonicalCandidateManifestTimestamp(checkpoint.createdAt) ||
+    checkpoint.createdAt !== event.createdAt ||
+    !Array.isArray(checkpoint.evidenceRefs) ||
+    (executionTarget === "current_branch" && worktreeId !== null) ||
+    (executionTarget === "new_worktree" && worktreeId === null)
+  ) {
+    throw new Error("Workflow candidate manifest checkpoint authority is invalid.");
+  }
+  const ancestryProof = Object.prototype.hasOwnProperty.call(checkpoint, "ancestryProof")
+    ? typeof checkpoint.ancestryProof === "string" ? checkpoint.ancestryProof : null
+    : null;
+  if (phase === "before" && ancestryProof !== null) {
+    throw new Error("Workflow candidate manifest before checkpoint must not bear ancestry proof.");
+  }
+  return {
+    id,
+    nodeId: identity.nodeId,
+    executionTarget,
+    worktreeId,
+    worktreePath: checkpoint.worktreePath,
+    branchName: checkpoint.branchName,
+    headCommit: checkpoint.headCommit,
+    ancestryProof,
+    evidenceRefs: checkpoint.evidenceRefs as WorkflowNodeCheckpoint["evidenceRefs"],
+  };
+}
+
+function checkpointMatchesCandidateRunScope(
+  checkpoint: Record<string, unknown>,
+  identity: WorkflowCandidateManifestIdentity,
+): boolean {
+  return checkpoint.sessionId === identity.sessionId &&
+    checkpoint.laneId === identity.laneId &&
+    checkpoint.segmentId === identity.segmentId &&
+    checkpoint.runId === identity.runId;
+}
+
+function parseStrictCandidateManifestRunEvidence(
+  value: unknown,
+): { evidence: RunEvidence; canonicalJson: string } | null {
+  if (!isRecord(value) || !hasExactObjectKeys(value, candidateManifestRunEvidenceKeys)) return null;
+  const canonicalJson = stableJson(value);
+  const evidence = parseRunEvidence(value);
+  if (
+    !evidence ||
+    stableJson(evidence) !== canonicalJson ||
+    (evidence.changesetId !== null && !isCandidateManifestIdentifier(evidence.changesetId))
+  ) return null;
+  return { evidence, canonicalJson };
+}
+
+function candidateManifestRunEvidenceBinding(
+  evidence: RunEvidence,
+): WorkflowCandidateRunEvidenceBinding {
+  return {
+    runId: evidence.runId,
+    status: "succeeded",
+    exitCode: 0,
+    changesetId: evidence.changesetId,
+    checks: evidence.checks.map(({ kind, status }) => ({ kind, status })),
+    artifactCount: evidence.artifacts.length,
+    review: evidence.review ? { kind: evidence.review.kind, status: evidence.review.status } : null,
+    errorReason: null,
+    cancelReason: null,
+    completedAt: evidence.completedAt!,
+  };
+}
+
+function uniqueValidatedEventByIdempotencyKey(
+  events: ValidatedEventRow[],
+  idempotencyKey: string,
+  label: string,
+): ValidatedEventRow {
+  const candidates = events.filter(({ event }) => event.idempotencyKey === idempotencyKey);
+  if (candidates.length !== 1) {
+    throw new Error(`Workflow candidate manifest requires unique ${label}.`);
+  }
+  return candidates[0]!;
+}
+
+function isCompleteCandidateChangeset(
+  value: ChangesetEvidence | null,
+  raw: Record<string, unknown>,
+): value is CompleteCandidateChangeset {
+  return Boolean(
+    value &&
+    stableJson(value) === stableJson(raw) &&
+    value.source === "git" &&
+    value.status === "available" &&
+    value.files.length > 0 &&
+    typeof value.fullPatchSha256 === "string" &&
+    typeof value.fullPatchByteLength === "number" &&
+    typeof value.fileManifestSha256 === "string",
+  );
+}
+
+function hasUniqueCheckpointEvidenceRef(
+  refs: WorkflowNodeCheckpoint["evidenceRefs"],
+  kind: WorkflowNodeCheckpoint["evidenceRefs"][number]["kind"],
+  id: string,
+): boolean {
+  return refs.filter((ref) => ref.kind === kind && ref.id === id).length === 1;
+}
+
+function immutableCandidateManifest(manifest: WorkflowCandidateManifest): WorkflowCandidateManifest {
+  for (const check of manifest.terminalRunEvidence.checks) Object.freeze(check);
+  Object.freeze(manifest.terminalRunEvidence.checks);
+  if (manifest.terminalRunEvidence.review) Object.freeze(manifest.terminalRunEvidence.review);
+  Object.freeze(manifest.terminalRunEvidence);
+  return Object.freeze(manifest);
+}
+
+function hasExactObjectKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && keys.every((key) => expected.includes(key));
+}
+
+function candidateManifestIdentifier(value: unknown, field: string): string {
+  if (!isCandidateManifestIdentifier(value)) {
+    throw new Error(`Workflow candidate manifest ${field} is invalid.`);
+  }
+  return value;
+}
+
+function isCandidateManifestIdentifier(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 512 &&
+    value.trim() === value &&
+    /^[A-Za-z0-9._:-]+$/.test(value);
+}
+
+function isCanonicalCandidateManifestTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const timestamp = Date.parse(value);
+  return !Number.isNaN(timestamp) && new Date(timestamp).toISOString() === value;
 }
 
 function assertNoConflictingTerminalRunEvidence(
@@ -6091,7 +6714,8 @@ function isWorkflowInternalEventKind(kind: WorkflowEventKind): kind is WorkflowI
   return kind === "workflow.user_input.delivered" ||
     kind === "workflow.plan_finish.bound" ||
     kind === "workflow.plan_finish.launch_accepted" ||
-    kind === "workflow.planner_intent.reconciled";
+    kind === "workflow.planner_intent.reconciled" ||
+    kind === "workflow.candidate.manifest_recorded";
 }
 
 function userInputDeliveredIdempotencyKey(inputId: string): string {
