@@ -1784,6 +1784,103 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(withEvidence.lanes.find((item) => item.id === "lane-implementation")?.status).toBe("completed");
   });
 
+  it("replays valid legacy changeset evidence without full patch fields", () => {
+    const evidence = {
+      evidenceId: "changeset-evidence-legacy",
+      changesetId: "changeset-legacy",
+      source: "git",
+      status: "available",
+      files: ["src/index.ts"],
+      diffStat: { added: 4, changed: 1, deleted: 0 },
+      patchPreviewTruncated: false,
+      worktreeId: "worktree-legacy",
+      collectedAt: now,
+    };
+    const recorded = event("workflow.changeset.evidence_recorded", { evidence });
+    const projection = reduceWorkflowEvents([recorded]);
+
+    expect(projection.changesetEvidence).toEqual([evidence]);
+    expect(projection.events).toEqual([recorded]);
+  });
+
+  it("replays complete full patch evidence as a cloned strict value", () => {
+    const files = ["src/index.ts"];
+    const diffStat = { added: 4, changed: 1, deleted: 0 };
+    const evidence = {
+      evidenceId: "changeset-evidence-full",
+      changesetId: "changeset-full",
+      source: "git",
+      status: "available",
+      files,
+      diffStat,
+      patchPreviewTruncated: false,
+      worktreeId: "worktree-full",
+      collectedAt: now,
+      artifactPaths: [".devflow/changesets/full.patch"],
+      fullPatchSha256: "a".repeat(64),
+      fullPatchByteLength: 128,
+      fileManifestSha256: "b".repeat(64),
+      ignored: "must not replay",
+    };
+    const recorded = event("workflow.changeset.evidence_recorded", { evidence });
+    const projection = reduceWorkflowEvents([recorded]);
+    const expected = {
+      evidenceId: evidence.evidenceId,
+      changesetId: evidence.changesetId,
+      source: evidence.source,
+      status: evidence.status,
+      files,
+      diffStat,
+      patchPreviewTruncated: evidence.patchPreviewTruncated,
+      worktreeId: evidence.worktreeId,
+      collectedAt: evidence.collectedAt,
+      artifactPaths: evidence.artifactPaths,
+      fullPatchSha256: evidence.fullPatchSha256,
+      fullPatchByteLength: evidence.fullPatchByteLength,
+      fileManifestSha256: evidence.fileManifestSha256,
+    };
+
+    expect(projection.changesetEvidence).toEqual([expected]);
+    expect(projection.changesetEvidence[0]).not.toBe(evidence);
+    expect(projection.changesetEvidence[0]?.files).not.toBe(files);
+    expect(projection.changesetEvidence[0]?.diffStat).not.toBe(diffStat);
+    expect(projection.events[0]?.payload.evidence).toEqual(expected);
+    expect(projection.events[0]?.payload.evidence).not.toBe(evidence);
+  });
+
+  it.each([
+    ["only full patch digest", { fullPatchSha256: "a".repeat(64) }],
+    ["missing file manifest digest", { fullPatchSha256: "a".repeat(64), fullPatchByteLength: 128 }],
+    ["malformed full patch digest", { fullPatchSha256: "A".repeat(64), fullPatchByteLength: 128, fileManifestSha256: "b".repeat(64) }],
+    ["malformed file manifest digest", { fullPatchSha256: "a".repeat(64), fullPatchByteLength: 128, fileManifestSha256: "b".repeat(63) }],
+    ["zero full patch length", { fullPatchSha256: "a".repeat(64), fullPatchByteLength: 0, fileManifestSha256: "b".repeat(64) }],
+    ["fractional full patch length", { fullPatchSha256: "a".repeat(64), fullPatchByteLength: 1.5, fileManifestSha256: "b".repeat(64) }],
+    ["unsafe full patch length", { fullPatchSha256: "a".repeat(64), fullPatchByteLength: Number.MAX_SAFE_INTEGER + 1, fileManifestSha256: "b".repeat(64) }],
+    ["wrong full patch source", { source: "mock", fullPatchSha256: "a".repeat(64), fullPatchByteLength: 128, fileManifestSha256: "b".repeat(64) }],
+    ["wrong full patch status", { status: "empty", fullPatchSha256: "a".repeat(64), fullPatchByteLength: 128, fileManifestSha256: "b".repeat(64) }],
+    ["empty full patch files", { files: [], fullPatchSha256: "a".repeat(64), fullPatchByteLength: 128, fileManifestSha256: "b".repeat(64) }],
+  ] as const)("drops invalid changeset evidence without invalidating unrelated history: %s", (_label, overrides) => {
+    const unrelated = event("workflow.lane.declared", { lane: lane("lane-unrelated", "implementation") });
+    const rejected = event("workflow.changeset.evidence_recorded", {
+      evidence: {
+        evidenceId: "changeset-evidence-invalid",
+        changesetId: "changeset-invalid",
+        source: "git",
+        status: "available",
+        files: ["src/index.ts"],
+        diffStat: { added: 4, changed: 1, deleted: 0 },
+        patchPreviewTruncated: false,
+        collectedAt: now,
+        ...overrides,
+      },
+    });
+    const projection = reduceWorkflowEvents([unrelated, rejected]);
+
+    expect(projection.changesetEvidence).toEqual([]);
+    expect(projection.events).toEqual([unrelated]);
+    expect(projection.lanes.map((item) => item.id)).toEqual(["lane-unrelated"]);
+  });
+
   it("preserves an empty typed output delta without collapsing it", () => {
     const delta = {
       protocolVersion: 1 as const,

@@ -14,6 +14,7 @@ import {
   normalizeSessionTarget,
   parseExpectedArtifactDeclarations,
   parseExpectedArtifactDeclaration,
+  parseChangesetEvidence,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
   parseWorkflowGitAncestryProof,
@@ -1373,12 +1374,57 @@ describe("agent run contracts", () => {
       worktreeId: worktree.worktreeId,
       collectedAt: "2026-06-16T00:00:00.000Z",
     };
+    const fullPatchEvidence: ChangesetEvidence = {
+      ...changesetEvidence,
+      patchPreviewTruncated: false,
+      fullPatchSha256: "a".repeat(64),
+      fullPatchByteLength: 128,
+      fileManifestSha256: "b".repeat(64),
+    };
 
     expect(ledger.recentEvents[0]?.laneId).toBe("lane-implementation");
     expect(answered.action).toBe("parallel_worktree");
     expect(worktree.gitdir).toContain("/.git/worktrees/");
     expect(adoption.status).toBe("requested");
     expect(changesetEvidence.source).toBe("git");
+    expect(fullPatchEvidence.fullPatchSha256).toHaveLength(64);
+    expect(fullPatchEvidence.fullPatchByteLength).toBe(128);
+    expect(fullPatchEvidence.fileManifestSha256).toHaveLength(64);
+  });
+
+  it("strictly reconstructs atomic full patch evidence while preserving legacy rows", () => {
+    const legacy = {
+      evidenceId: "changeset-evidence-a",
+      changesetId: "changeset-a",
+      source: "git",
+      status: "available",
+      files: ["src/index.ts"],
+      diffStat: { added: 4, changed: 1, deleted: 0 },
+      patchPreviewTruncated: false,
+      collectedAt: "2026-06-16T00:00:00.000Z",
+    };
+    const complete = {
+      ...legacy,
+      fullPatchSha256: "a".repeat(64),
+      fullPatchByteLength: 128,
+      fileManifestSha256: "b".repeat(64),
+    };
+
+    expect(parseChangesetEvidence(legacy)).toEqual(legacy);
+    expect(parseChangesetEvidence({ ...complete, ignored: "not reconstructed" })).toEqual(complete);
+
+    for (const malformed of [
+      { ...legacy, fullPatchSha256: "a".repeat(64) },
+      { ...complete, fullPatchSha256: "A".repeat(64) },
+      { ...complete, fileManifestSha256: "b".repeat(63) },
+      { ...complete, fullPatchByteLength: 0 },
+      { ...complete, fullPatchByteLength: Number.MAX_SAFE_INTEGER + 1 },
+      { ...complete, source: "mock" },
+      { ...complete, status: "empty" },
+      { ...complete, files: [] },
+    ]) {
+      expect(parseChangesetEvidence(malformed)).toBeNull();
+    }
   });
 
   it("models node-boundary checkpoints and rollback eligibility without tool-call grain", () => {

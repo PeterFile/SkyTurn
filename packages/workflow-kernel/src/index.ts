@@ -43,6 +43,7 @@ import type {
 import {
   isTerminalAgentRunStatus,
   isSuccessfulRunEvidence,
+  parseChangesetEvidence,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
   parseRunEvent,
@@ -1684,8 +1685,18 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
         setLaneStatus(projection, evidence.laneId, "failed");
       }
     }
-    if (event.kind === "workflow.changeset.evidence_recorded" && isRecord(event.payload.evidence)) {
-      projection.changesetEvidence.push(event.payload.evidence as unknown as ChangesetEvidence);
+    if (event.kind === "workflow.changeset.evidence_recorded") {
+      const evidence = parseChangesetEvidence(event.payload.evidence);
+      if (!evidence) {
+        projection.events = projection.events.filter((recorded) => recorded.id !== event.id);
+        continue;
+      }
+      projection.events = projection.events.map((recorded) =>
+        recorded.id === event.id
+          ? { ...recorded, payload: { ...recorded.payload, evidence } }
+          : recorded
+      );
+      projection.changesetEvidence.push(evidence);
     }
     if (event.kind === "workflow.node.checkpoint_recorded" && isRecord(event.payload.checkpoint)) {
       const checkpointId = stringValue(event.payload.checkpoint.id);

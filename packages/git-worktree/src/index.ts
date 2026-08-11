@@ -12,7 +12,7 @@ import type {
   WorkflowWorktreeIdentity,
   WorktreeMetadata,
 } from "@skyturn/project-core";
-import { parseRunEvidence } from "@skyturn/project-core";
+import { parseChangesetEvidence, parseRunEvidence } from "@skyturn/project-core";
 
 export const GIT_WORKTREE_CONTRACT_VERSION = 1;
 
@@ -317,23 +317,9 @@ function isVariantComparisonEvidence(value: unknown): value is VariantComparison
 }
 
 function reconstructChangesetEvidence(value: ChangesetEvidence): ChangesetEvidence {
-  return {
-    evidenceId: value.evidenceId,
-    changesetId: value.changesetId,
-    source: value.source,
-    status: value.status,
-    files: [...value.files],
-    diffStat: {
-      added: value.diffStat.added,
-      changed: value.diffStat.changed,
-      deleted: value.diffStat.deleted,
-    },
-    patchPreviewTruncated: value.patchPreviewTruncated,
-    ...(value.worktreeId !== undefined ? { worktreeId: value.worktreeId } : {}),
-    ...(value.collectedAt !== undefined ? { collectedAt: value.collectedAt } : {}),
-    ...(value.artifactPaths !== undefined ? { artifactPaths: [...value.artifactPaths] } : {}),
-    ...(value.errorReason !== undefined ? { errorReason: value.errorReason } : {}),
-  };
+  const reconstructed = parseChangesetEvidence(value);
+  if (!reconstructed) throw new Error(INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
+  return reconstructed;
 }
 
 function reconstructAdjudicationMetric(value: AdjudicationMetric): AdjudicationMetric {
@@ -352,24 +338,9 @@ function isVariantComparisonEntry(value: unknown): value is VariantComparisonEvi
   return isRuntimeRecord(value) &&
     isNonEmptyRuntimeString(value.variantId) &&
     isNonEmptyRuntimeString(value.worktreeId) &&
-    isChangesetEvidence(value.changeset) &&
+    parseChangesetEvidence(value.changeset) !== null &&
     Array.isArray(value.metrics) &&
     value.metrics.every(isAdjudicationMetric);
-}
-
-function isChangesetEvidence(value: unknown): value is ChangesetEvidence {
-  if (!isRuntimeRecord(value)) return false;
-  return isNonEmptyRuntimeString(value.evidenceId) &&
-    isNonEmptyRuntimeString(value.changesetId) &&
-    (value.source === "mock" || value.source === "git") &&
-    (value.status === "available" || value.status === "empty" || value.status === "failed" || value.status === "unknown") &&
-    isStringArray(value.files) &&
-    isDiffStat(value.diffStat) &&
-    typeof value.patchPreviewTruncated === "boolean" &&
-    isOptionalRuntimeString(value.worktreeId) &&
-    isOptionalRuntimeString(value.collectedAt) &&
-    (value.artifactPaths === undefined || isStringArray(value.artifactPaths)) &&
-    isOptionalRuntimeString(value.errorReason);
 }
 
 function isAdjudicationMetric(value: unknown): value is AdjudicationMetric {
@@ -383,13 +354,6 @@ function isAdjudicationMetric(value: unknown): value is AdjudicationMetric {
     (value.value === undefined || typeof value.value === "string" || typeof value.value === "number") &&
     isOptionalRuntimeString(value.detail) &&
     (value.artifactPaths === undefined || isStringArray(value.artifactPaths));
-}
-
-function isDiffStat(value: unknown): value is Changeset["diffStat"] {
-  return isRuntimeRecord(value) &&
-    typeof value.added === "number" && Number.isFinite(value.added) &&
-    typeof value.changed === "number" && Number.isFinite(value.changed) &&
-    typeof value.deleted === "number" && Number.isFinite(value.deleted);
 }
 
 function isStringArray(value: unknown): value is string[] {
