@@ -7,7 +7,13 @@ import { promisify } from "node:util";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption, WorkflowWorktreeIdentity } from "@skyturn/project-core";
+import type {
+  CanvasNode,
+  ChangesetEvidence,
+  LiveRunChangesEvidence,
+  WorkflowVariantAdoption,
+  WorkflowWorktreeIdentity,
+} from "@skyturn/project-core";
 import {
   checkDeliveryPullRequest,
   createDeliveryCommit,
@@ -2410,6 +2416,378 @@ describe("GitChangesetService", () => {
     ]);
     expect(reconciliation.liveChanges).toEqual(liveChanges);
   });
+
+  it("publishes atomic full-patch evidence for stable committed, staged, unstaged, and untracked layers", async () => {
+    const repoRoot = await createRepo();
+    const baselineRef = git(repoRoot, ["rev-parse", "HEAD"]);
+    await writeFile(join(repoRoot, "committed.txt"), "committed\n", "utf8");
+    await gitAsync(repoRoot, "add", "committed.txt");
+    await gitAsync(repoRoot, "commit", "-m", "committed layer");
+    await writeFile(join(repoRoot, "staged.txt"), "staged\n", "utf8");
+    await gitAsync(repoRoot, "add", "staged.txt");
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    await writeFile(join(repoRoot, "untracked.txt"), "untracked\n", "utf8");
+
+    const reconciliation = await createGitChangesetService().reconcileFinalChangeset({
+      node: nodeForRepo(repoRoot),
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+      baselineRef,
+    });
+
+    expect(reconciliation.status).toBe("available");
+    expect(reconciliation.changeset.files).toEqual([
+      "committed.txt",
+      "src.ts",
+      "staged.txt",
+      "untracked.txt",
+    ]);
+    expectCompleteFullPatchEvidence(reconciliation.changeset.evidence);
+  });
+
+  it("preserves staged and unstaged layers when their final worktree content cancels out", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    await gitAsync(repoRoot, "add", "src.ts");
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 1;\n", "utf8");
+
+    const changeset = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+
+    expect(changeset.files).toEqual(["src.ts"]);
+    expect(changeset.diffStat.changed).toBe(1);
+    expectCompleteFullPatchEvidence(changeset.evidence);
+  });
+
+  it("frames rename and deletion paths without losing either change", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "delete-me.txt"), "delete me\n", "utf8");
+    await gitAsync(repoRoot, "add", "delete-me.txt");
+    await gitAsync(repoRoot, "commit", "-m", "add rename fixtures");
+    const baselineRef = git(repoRoot, ["rev-parse", "HEAD"]);
+    await gitAsync(repoRoot, "mv", "src.ts", "renamed.ts");
+    await gitAsync(repoRoot, "rm", "delete-me.txt");
+
+    const reconciliation = await createGitChangesetService().reconcileFinalChangeset({
+      node: nodeForRepo(repoRoot),
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+      baselineRef,
+    });
+
+    expect(reconciliation.changeset.files).toEqual(["delete-me.txt", "renamed.ts"]);
+    expect(reconciliation.changeset.patchPreview).toContain("rename from src.ts");
+    expect(reconciliation.changeset.patchPreview).toContain("deleted file mode");
+    expectCompleteFullPatchEvidence(reconciliation.changeset.evidence);
+  });
+
+  it("hashes binary and invalid UTF-8 content as raw patch bytes", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "binary.dat"), Buffer.from([0x00, 0xff, 0x01, 0xfe]));
+    await gitAsync(repoRoot, "add", "binary.dat");
+    await gitAsync(repoRoot, "commit", "-m", "add binary fixture");
+    await writeFile(join(repoRoot, "binary.dat"), Buffer.from([0x00, 0xff, 0x02, 0xfe]));
+
+    const first = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+    expectCompleteFullPatchEvidence(first.evidence);
+
+    await writeFile(join(repoRoot, "binary.dat"), Buffer.from([0x00, 0xff, 0x03, 0xfe]));
+    const second = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+    expectCompleteFullPatchEvidence(second.evidence);
+    expect(second.evidence?.fullPatchSha256).not.toBe(first.evidence?.fullPatchSha256);
+    expect(second.evidence?.fileManifestSha256).toBe(first.evidence?.fileManifestSha256);
+  });
+
+  it("uses NUL-safe discovery for unusual UTF-8 filenames", async () => {
+    const repoRoot = await createRepo();
+    const unusualPath = "space tab\t雪\nname.txt";
+    await writeFile(join(repoRoot, unusualPath), "unusual\n", "utf8");
+
+    const changeset = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+
+    expect(changeset.files).toEqual([unusualPath]);
+    expectCompleteFullPatchEvidence(changeset.evidence);
+  });
+
+  it("fails closed on duplicate framed change records from malformed Git output", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    const wrapper = await installChangesetGitWrapper(repoRoot, { mode: "duplicate-status" });
+
+    const changeset = await withFakeGit(wrapper.binDir, () => (
+      createGitChangesetService().getChangeset(nodeForRepo(repoRoot))
+    ));
+
+    expect(changeset.evidence?.status).toBe("failed");
+    expect(changeset.evidence?.errorReason).toMatch(/duplicate/i);
+    expectNoFullPatchEvidence(changeset.evidence);
+  });
+
+  it("shares volatile path exclusions while retaining project memory", async () => {
+    const repoRoot = await createRepo();
+    await mkdir(join(repoRoot, ".devflow", "runs", "run-1"), { recursive: true });
+    await mkdir(join(repoRoot, ".devflow", "tasks", "task-1"), { recursive: true });
+    await writeFile(join(repoRoot, ".devflow", "skyturn-workflow.sqlite"), "volatile\n", "utf8");
+    await writeFile(join(repoRoot, ".devflow", "skyturn-workflow.sqlite-wal"), "volatile\n", "utf8");
+    await writeFile(join(repoRoot, ".devflow", "skyturn-workflow.sqlite-shm"), "volatile\n", "utf8");
+    await writeFile(join(repoRoot, ".devflow", "runs", "run-1", "events.ndjson"), "volatile\n", "utf8");
+    await writeFile(join(repoRoot, ".devflow", "tasks", "task-1", "output.md"), "volatile\n", "utf8");
+    await writeFile(join(repoRoot, ".devflow", "decisions.md"), "durable\n", "utf8");
+
+    const changeset = await createGitChangesetService().getChangeset(nodeForRepo(repoRoot));
+
+    expect(changeset.files).toEqual([".devflow/decisions.md"]);
+    expectCompleteFullPatchEvidence(changeset.evidence);
+  });
+
+  it("omits all full-patch fields when the canonical patch exceeds the collection limit", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "large.txt"), Buffer.alloc(1024 * 1024 + 64 * 1024, 0x61));
+
+    const changeset = await createGitChangesetService({ maxPatchPreviewBytes: 256 }).getChangeset(
+      nodeForRepo(repoRoot),
+    );
+
+    expect(changeset.evidence?.status).toBe("available");
+    expect(changeset.evidence?.patchPreviewTruncated).toBe(true);
+    expectNoFullPatchEvidence(changeset.evidence);
+  });
+
+  it("uses the canonical empty-tree baseline for unborn untracked and staged snapshots", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "skyturn-git-changeset-unborn-"));
+    changesetTempRoots.push(repoRoot);
+    await gitAsync(repoRoot, "init");
+    await gitAsync(repoRoot, "config", "user.email", "skyturn@example.test");
+    await gitAsync(repoRoot, "config", "user.name", "SkyTurn Test");
+    await writeFile(join(repoRoot, "first.txt"), "first\n", "utf8");
+    const service = createGitChangesetService();
+
+    const untracked = await service.getChangeset(nodeForRepo(repoRoot));
+    expect(untracked.files).toEqual(["first.txt"]);
+    expect(untracked.patchPreview).toContain("diff --git a/first.txt b/first.txt");
+    expect(untracked.diffStat).toEqual({ added: 1, changed: 1, deleted: 0 });
+    expectCompleteFullPatchEvidence(untracked.evidence);
+
+    await gitAsync(repoRoot, "add", "first.txt");
+    const staged = await service.getChangeset(nodeForRepo(repoRoot));
+    expect(staged.files).toEqual(["first.txt"]);
+    expect(staged.patchPreview).toContain("diff --git a/first.txt b/first.txt");
+    expect(staged.patchPreview).toContain("+first");
+    expect(staged.diffStat).toEqual({ added: 1, changed: 1, deleted: 0 });
+    expectCompleteFullPatchEvidence(staged.evidence);
+    expect(staged.evidence?.fullPatchSha256).toBe(untracked.evidence?.fullPatchSha256);
+    expect(staged.evidence?.fileManifestSha256).not.toBe(untracked.evidence?.fileManifestSha256);
+
+    await writeFile(join(repoRoot, "first.txt"), "first\nsecond\n", "utf8");
+    const stagedAndUnstaged = await service.getChangeset(nodeForRepo(repoRoot));
+    expect(stagedAndUnstaged.files).toEqual(["first.txt"]);
+    expect(stagedAndUnstaged.patchPreview).toContain("+second");
+    expect(stagedAndUnstaged.diffStat).toEqual({ added: 2, changed: 1, deleted: 0 });
+    expectCompleteFullPatchEvidence(stagedAndUnstaged.evidence);
+  });
+
+  it("rejects an explicit reconciliation baseline in an unborn repository", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "skyturn-git-changeset-unborn-reconcile-"));
+    changesetTempRoots.push(repoRoot);
+    await gitAsync(repoRoot, "init");
+    await writeFile(join(repoRoot, "first.txt"), "first\n", "utf8");
+
+    const reconciliation = await createGitChangesetService().reconcileFinalChangeset({
+      node: nodeForRepo(repoRoot),
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+      baselineRef: "HEAD",
+    });
+
+    expect(reconciliation.status).toBe("failed");
+    expectNoFullPatchEvidence(reconciliation.changeset.evidence);
+  });
+
+  it("collects committed-only variant evidence without dirty worktree contamination", async () => {
+    const repo = await createTestRepo("skyturn-committed-changeset-");
+    changesetTempRoots.push(repo.tempRoot);
+    const headCommit = commitVariant(repo.repoRoot, "recorded");
+    const worktree = worktreeIdentityForRepo(repo, headCommit);
+    const service = createGitChangesetService();
+
+    const cleanEvidence = await service.collectChangesetEvidence({
+      node: nodeForRepo(repo.repoRoot),
+      worktree,
+    });
+    await writeFile(join(repo.repoRoot, "recorded.txt"), "staged dirty\n", "utf8");
+    await gitAsync(repo.repoRoot, "add", "recorded.txt");
+    await writeFile(join(repo.repoRoot, "recorded.txt"), "unstaged dirty\n", "utf8");
+    await writeFile(join(repo.repoRoot, "extra.txt"), "untracked dirty\n", "utf8");
+    const dirtyEvidence = await service.collectChangesetEvidence({
+      node: nodeForRepo(repo.repoRoot),
+      worktree,
+    });
+
+    expect(dirtyEvidence.status).toBe("available");
+    expect(dirtyEvidence.files).toEqual(["recorded.txt"]);
+    expect(dirtyEvidence.fullPatchSha256).toBe(cleanEvidence.fullPatchSha256);
+    expect(dirtyEvidence.fullPatchByteLength).toBe(cleanEvidence.fullPatchByteLength);
+    expect(dirtyEvidence.fileManifestSha256).toBe(cleanEvidence.fileManifestSha256);
+  });
+
+  it("produces deterministic digests despite hostile repository diff configuration", async () => {
+    const left = await createRepo();
+    const right = await createRepo();
+    const moduleRepo = await createRepo();
+    await gitAsync(left, "-c", "protocol.file.allow=always", "submodule", "add", moduleRepo, "vendor/module");
+    await gitAsync(right, "-c", "protocol.file.allow=always", "submodule", "add", moduleRepo, "vendor/module");
+    const baseLines = Array.from({ length: 16 }, (_, index) => (
+      index === 7 ? "" : `export const line${index + 1} = ${index + 1};`
+    )).join("\n") + "\n";
+    await writeFile(join(left, "src.ts"), baseLines, "utf8");
+    await writeFile(join(right, "src.ts"), baseLines, "utf8");
+    await writeFile(join(left, "z.ts"), "export const z = 1;\n", "utf8");
+    await writeFile(join(right, "z.ts"), "export const z = 1;\n", "utf8");
+    await writeFile(join(left, ".gitattributes"), "*.ts diff=hostile\n", "utf8");
+    await writeFile(join(right, ".gitattributes"), "*.ts diff=hostile\n", "utf8");
+    await gitAsync(left, "add", ".");
+    await gitAsync(right, "add", ".");
+    await gitAsync(left, "commit", "-m", "add canonical diff fixtures");
+    await gitAsync(right, "commit", "-m", "add canonical diff fixtures");
+
+    await writeFile(join(moduleRepo, "src.ts"), "export const value = 2;\n", "utf8");
+    await gitAsync(moduleRepo, "add", "src.ts");
+    await gitAsync(moduleRepo, "commit", "-m", "advance module");
+    const moduleHead = git(moduleRepo, ["rev-parse", "HEAD"]);
+    await gitAsync(join(left, "vendor", "module"), "fetch", "origin");
+    await gitAsync(join(right, "vendor", "module"), "fetch", "origin");
+    await gitAsync(join(left, "vendor", "module"), "checkout", moduleHead);
+    await gitAsync(join(right, "vendor", "module"), "checkout", moduleHead);
+    const changedLines = baseLines.trimEnd().split("\n");
+    changedLines[1] = "export const line2 = 200;";
+    changedLines[12] = "export const line13 = 1300;";
+    const changedSource = `${changedLines.join("\n")}\n`;
+    await writeFile(join(left, "src.ts"), changedSource, "utf8");
+    await writeFile(join(right, "src.ts"), changedSource, "utf8");
+    await writeFile(join(left, "z.ts"), "export const z = 7;\n", "utf8");
+    await writeFile(join(right, "z.ts"), "export const z = 7;\n", "utf8");
+    await writeFile(join(left, "untracked.txt"), "untracked\n", "utf8");
+    await writeFile(join(right, "untracked.txt"), "untracked\n", "utf8");
+    await gitAsync(left, "add", "vendor/module");
+    await gitAsync(right, "add", "vendor/module");
+
+    await writeFile(join(right, ".git", "diff-order"), "z.ts\nsrc.ts\nvendor/module\n", "utf8");
+    const hostileConfig: Array<[string, string]> = [
+      ["diff.orderFile", ".git/diff-order"],
+      ["diff.context", "0"],
+      ["diff.interHunkContext", "99"],
+      ["diff.outputIndicatorNew", ">"],
+      ["diff.outputIndicatorOld", "<"],
+      ["diff.outputIndicatorContext", "."],
+      ["diff.suppressBlankEmpty", "true"],
+      ["diff.mnemonicPrefix", "true"],
+      ["diff.noPrefix", "true"],
+      ["diff.srcPrefix", "hostile-old/"],
+      ["diff.dstPrefix", "hostile-new/"],
+      ["diff.relative", "true"],
+      ["diff.submodule", "log"],
+      ["diff.ignoreSubmodules", "all"],
+      ["diff.renames", "copies"],
+      ["diff.renameLimit", "1"],
+      ["diff.algorithm", "histogram"],
+      ["diff.indentHeuristic", "true"],
+      ["color.ui", "always"],
+      ["color.diff.meta", "red"],
+      ["diff.external", "skyturn-command-must-not-run"],
+      ["diff.hostile.command", "skyturn-command-must-not-run"],
+      ["diff.hostile.textconv", "skyturn-command-must-not-run"],
+    ];
+    for (const [key, value] of hostileConfig) await gitAsync(right, "config", key, value);
+
+    const service = createGitChangesetService();
+    const leftEvidence = (await service.getChangeset(nodeForRepo(left))).evidence;
+    const rightEvidence = (await service.getChangeset(nodeForRepo(right))).evidence;
+
+    expectCompleteFullPatchEvidence(leftEvidence);
+    expect(rightEvidence?.status, rightEvidence?.errorReason).toBe("available");
+    expectCompleteFullPatchEvidence(rightEvidence);
+    expect(rightEvidence?.fullPatchSha256).toBe(leftEvidence?.fullPatchSha256);
+    expect(rightEvidence?.fullPatchByteLength).toBe(leftEvidence?.fullPatchByteLength);
+    expect(rightEvidence?.fileManifestSha256).toBe(leftEvidence?.fileManifestSha256);
+  });
+
+  it("fails closed when a real merge conflict produces unmerged records", async () => {
+    const repoRoot = await createRepo();
+    const primaryBranch = git(repoRoot, ["branch", "--show-current"]);
+    await gitAsync(repoRoot, "checkout", "-b", "conflicting-change");
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    await gitAsync(repoRoot, "add", "src.ts");
+    await gitAsync(repoRoot, "commit", "-m", "change on conflicting branch");
+    await gitAsync(repoRoot, "checkout", primaryBranch);
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 3;\n", "utf8");
+    await gitAsync(repoRoot, "add", "src.ts");
+    await gitAsync(repoRoot, "commit", "-m", "change on main");
+    await expect(execFileAsync("git", ["merge", "conflicting-change"], { cwd: repoRoot })).rejects.toBeDefined();
+
+    const service = createGitChangesetService();
+    const changeset = await service.getChangeset(nodeForRepo(repoRoot));
+    const reconciliation = await service.reconcileFinalChangeset({
+      node: nodeForRepo(repoRoot),
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+      baselineRef: "HEAD",
+    });
+
+    expect(changeset.evidence?.status).toBe("failed");
+    expect(changeset.evidence?.errorReason).toMatch(/unsupported status/i);
+    expect(changeset.files).toEqual([]);
+    expectNoFullPatchEvidence(changeset.evidence);
+    expect(reconciliation.status).toBe("failed");
+    expect(reconciliation.errorReason).toMatch(/unsupported status/i);
+    expect(reconciliation.changeset.evidence?.status).toBe("failed");
+    expectNoFullPatchEvidence(reconciliation.changeset.evidence);
+  });
+
+  it("omits full-patch evidence when content drifts with unchanged path and status between passes", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    const wrapper = await installChangesetGitWrapper(repoRoot, {
+      mode: "content-drift",
+      targetPath: join(repoRoot, "src.ts"),
+    });
+
+    const changeset = await withFakeGit(wrapper.binDir, () => (
+      createGitChangesetService().getChangeset(nodeForRepo(repoRoot))
+    ));
+
+    expect(changeset.evidence?.status).toBe("available");
+    expect(changeset.files).toEqual(["src.ts"]);
+    expectNoFullPatchEvidence(changeset.evidence);
+  });
+
+  it("omits live full-patch evidence when HEAD drifts during collection", async () => {
+    const repoRoot = await createRepo();
+    await writeFile(join(repoRoot, "src.ts"), "export const value = 2;\n", "utf8");
+    const wrapper = await installChangesetGitWrapper(repoRoot, { mode: "head-drift" });
+
+    const changeset = await withFakeGit(wrapper.binDir, () => (
+      createGitChangesetService().getChangeset(nodeForRepo(repoRoot))
+    ));
+
+    expect(changeset.evidence?.status).toBe("available");
+    expectNoFullPatchEvidence(changeset.evidence);
+  });
+
+  it("fails committed-only evidence when live HEAD drifts from the recorded head", async () => {
+    const repo = await createTestRepo("skyturn-committed-head-drift-");
+    changesetTempRoots.push(repo.tempRoot);
+    const headCommit = commitVariant(repo.repoRoot, "recorded");
+    const worktree = worktreeIdentityForRepo(repo, headCommit);
+    const wrapper = await installChangesetGitWrapper(repo.repoRoot, {
+      mode: "head-drift",
+      triggerPatchCall: 1,
+    });
+
+    const evidence = await withFakeGit(wrapper.binDir, () => (
+      createGitChangesetService().collectChangesetEvidence({
+        node: nodeForRepo(repo.repoRoot),
+        worktree,
+      })
+    ));
+
+    expect(evidence.status).toBe("failed");
+    expectNoFullPatchEvidence(evidence);
+  });
 });
 
 async function createRepo(): Promise<string> {
@@ -2552,6 +2930,67 @@ async function installFakeGit(
   return { binDir };
 }
 
+async function installChangesetGitWrapper(
+  tempRoot: string,
+  options: {
+    mode: "content-drift" | "head-drift" | "duplicate-status";
+    targetPath?: string;
+    triggerPatchCall?: number;
+  },
+): Promise<{ binDir: string }> {
+  const binDir = await mkdtemp(join(tmpdir(), `skyturn-changeset-git-${options.mode}-`));
+  changesetTempRoots.push(binDir);
+  const gitPath = join(binDir, "git");
+  const markerPath = join(binDir, "triggered");
+  const countPath = join(binDir, "patch-count");
+  const realGit = shellSingleQuote(resolveExecutable("git"));
+  const triggerPatchCall = options.triggerPatchCall ?? 3;
+  const action = options.mode === "content-drift"
+    ? `printf '%s\\n' 'export const value = 3;' > ${shellSingleQuote(options.targetPath ?? "")}`
+    : options.mode === "head-drift"
+      ? `${realGit} -C ${shellSingleQuote(tempRoot)} commit --allow-empty -qm 'snapshot head drift'`
+      : ":";
+  const script = [
+    "#!/bin/sh",
+    "has_diff=0",
+    "has_binary=0",
+    "has_full_index=0",
+    "has_no_index=0",
+    "has_name_status=0",
+    "for arg in \"$@\"; do",
+    "  if [ \"$arg\" = \"diff\" ]; then has_diff=1; fi",
+    "  if [ \"$arg\" = \"--binary\" ]; then has_binary=1; fi",
+    "  if [ \"$arg\" = \"--full-index\" ]; then has_full_index=1; fi",
+    "  if [ \"$arg\" = \"--no-index\" ]; then has_no_index=1; fi",
+    "  if [ \"$arg\" = \"--name-status\" ]; then has_name_status=1; fi",
+    "done",
+    ...(options.mode === "duplicate-status" ? [
+      "if [ \"$has_diff\" -eq 1 ] && [ \"$has_name_status\" -eq 1 ]; then",
+      "  printf 'M\\000src.ts\\000M\\000src.ts\\000'",
+      "  exit 0",
+      "fi",
+    ] : []),
+    "if [ \"$has_diff\" -eq 1 ] && [ \"$has_binary\" -eq 1 ] && [ \"$has_full_index\" -eq 1 ] && [ \"$has_no_index\" -eq 0 ]; then",
+    `  ${realGit} "$@"`,
+    "  status=$?",
+    "  count=0",
+    `  if [ -r ${shellSingleQuote(countPath)} ]; then read count < ${shellSingleQuote(countPath)}; fi`,
+    "  count=$((count + 1))",
+    `  printf '%s\\n' "$count" > ${shellSingleQuote(countPath)}`,
+    `  if [ "$status" -eq 0 ] && [ "$count" -eq ${triggerPatchCall} ] && [ ! -e ${shellSingleQuote(markerPath)} ]; then`,
+    `    : > ${shellSingleQuote(markerPath)}`,
+    `    ${action} || exit 25`,
+    "  fi",
+    "  exit \"$status\"",
+    "fi",
+    `exec ${realGit} "$@"`,
+    "",
+  ].join("\n");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
 async function installAncestryGitWrapper(
   tempRoot: string,
   options: {
@@ -2637,4 +3076,35 @@ function nodeForRepo(repoRoot: string): CanvasNode {
       baseCommit: "HEAD",
     },
   } as CanvasNode;
+}
+
+function worktreeIdentityForRepo(repo: TestRepo, headCommit: string): WorkflowWorktreeIdentity {
+  return {
+    worktreeId: "worktree-recorded",
+    variantId: "recorded",
+    path: repo.repoRoot,
+    realPath: repo.repoRoot,
+    gitdir: join(repo.repoRoot, ".git"),
+    repoRoot: repo.repoRoot,
+    branchName: "main",
+    baseCommit: repo.baseCommit,
+    headCommit,
+    parentLaneId: "lane-parent",
+  };
+}
+
+function expectCompleteFullPatchEvidence(evidence: ChangesetEvidence | undefined): void {
+  expect(evidence).toMatchObject({
+    status: "available",
+    fullPatchSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+    fullPatchByteLength: expect.any(Number),
+    fileManifestSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
+  });
+  expect(evidence?.fullPatchByteLength).toBeGreaterThan(0);
+}
+
+function expectNoFullPatchEvidence(evidence: ChangesetEvidence | undefined): void {
+  expect(evidence?.fullPatchSha256).toBeUndefined();
+  expect(evidence?.fullPatchByteLength).toBeUndefined();
+  expect(evidence?.fileManifestSha256).toBeUndefined();
 }

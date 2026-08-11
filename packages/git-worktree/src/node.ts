@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { devNull } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -60,6 +61,10 @@ import {
   type VariantComparisonInput,
   type VariantAdoptionService,
 } from "./index.js";
+import {
+  collectStableGitChangesetSnapshot,
+  type FullPatchEvidenceFields,
+} from "./internal/gitChangesetSnapshot.js";
 
 export { parseVariantComparisonEvidence, parseWorktreeComparisonRequest };
 
@@ -1842,26 +1847,37 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
     try {
       const repoRoot = await this.resolveRepoRoot(node);
       await assertGitWorktree(repoRoot);
-      const status = await git(repoRoot, [
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        "--",
-        ...skyturnGitEvidencePathspecs,
-      ]);
-      if (status.truncated) throw new Error("Git status output exceeded the changeset evidence limit.");
-      const statusLines = parseStatusLines(status.stdout);
-      const files = filesFromStatus(statusLines);
+      const snapshot = await collectStableGitChangesetSnapshot({
+        mode: "live",
+        repoRoot,
+        allowUnbornHead: true,
+        pathspecs: skyturnGitEvidencePathspecs,
+        maxFullPatchBytes: defaultMaxGitOutputBytes,
+        maxDiscoveryBytes: defaultMaxGitOutputBytes,
+      });
+      const files = snapshot.files;
       if (files.length === 0) return this.emptyChangeset(node);
 
-      const untrackedFiles = untrackedFilesFromStatus(statusLines);
-      const diffStat = await diffStatForRepo(repoRoot, files.length, untrackedFiles);
+      const diffStat = await diffStatForRepo(
+        repoRoot,
+        files.length,
+        snapshot.untrackedFiles,
+        snapshot.baselineCommit,
+      );
       const patch = await diffPreviewForRepo(
         repoRoot,
         this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes,
-        untrackedFiles,
+        snapshot.untrackedFiles,
+        snapshot.baselineCommit,
       );
-      const evidence = this.evidenceFor(node, "available", files, diffStat, patch.truncated);
+      const evidence = this.evidenceFor(
+        node,
+        "available",
+        files,
+        diffStat,
+        patch.truncated,
+        snapshot.fullPatchEvidence,
+      );
       return {
         id: node.changesetId,
         files,
@@ -1889,38 +1905,40 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
       const repoRoot = await this.resolveRepoRoot(input.node);
       await assertGitWorktree(repoRoot);
       await verifyGitRef(repoRoot, baselineRef);
-      const status = await git(repoRoot, [
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        "--",
-        ...skyturnGitEvidencePathspecs,
-      ]);
-      if (status.truncated) throw new Error("Git status output exceeded the changeset evidence limit.");
-      const statusLines = parseStatusLines(status.stdout);
-      const untrackedFiles = untrackedFilesFromStatus(statusLines);
-      const files = unionSorted([
-        ...stringLines((await git(repoRoot, [
-          "diff",
-          "--name-only",
-          baselineRef,
-          "--",
-          ...skyturnGitEvidencePathspecs,
-        ])).stdout),
-        ...filesFromStatus(statusLines),
-      ]);
+      const snapshot = await collectStableGitChangesetSnapshot({
+        mode: "live",
+        repoRoot,
+        baselineRef,
+        allowUnbornHead: false,
+        pathspecs: skyturnGitEvidencePathspecs,
+        maxFullPatchBytes: defaultMaxGitOutputBytes,
+        maxDiscoveryBytes: defaultMaxGitOutputBytes,
+      });
+      const files = snapshot.files;
       const diffStat = files.length === 0
         ? { added: 0, changed: 0, deleted: 0 }
-        : await diffStatForRepo(repoRoot, files.length, untrackedFiles, baselineRef);
+        : await diffStatForRepo(
+            repoRoot,
+            files.length,
+            snapshot.untrackedFiles,
+            snapshot.baselineCommit,
+          );
       const patch = files.length === 0
         ? { value: "", truncated: false }
         : await diffPreviewForRepo(
             repoRoot,
             this.options.maxPatchPreviewBytes ?? defaultMaxPatchPreviewBytes,
-            untrackedFiles,
-            baselineRef,
+            snapshot.untrackedFiles,
+            snapshot.baselineCommit,
           );
-      const evidence = this.evidenceFor(input.node, files.length === 0 ? "empty" : "available", files, diffStat, patch.truncated);
+      const evidence = this.evidenceFor(
+        input.node,
+        files.length === 0 ? "empty" : "available",
+        files,
+        diffStat,
+        patch.truncated,
+        snapshot.fullPatchEvidence,
+      );
       const changeset: Changeset = {
         id: input.node.changesetId,
         files,
@@ -1975,13 +1993,16 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
       const diffRange = `${worktree.baseCommit}..${worktree.headCommit}`;
       const repoRoot = await realpath(worktree.realPath);
       await assertGitWorktree(repoRoot);
-      const files = stringLines((await git(repoRoot, [
-        "diff",
-        "--name-only",
-        diffRange,
-        "--",
-        ...skyturnGitEvidencePathspecs,
-      ])).stdout);
+      const snapshot = await collectStableGitChangesetSnapshot({
+        mode: "recorded",
+        repoRoot,
+        baseCommit: worktree.baseCommit,
+        headCommit: worktree.headCommit,
+        pathspecs: skyturnGitEvidencePathspecs,
+        maxFullPatchBytes: defaultMaxGitOutputBytes,
+        maxDiscoveryBytes: defaultMaxGitOutputBytes,
+      });
+      const files = snapshot.files;
       const numstat = (await git(repoRoot, [
         "diff",
         "--numstat",
@@ -2001,6 +2022,7 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
           files,
           parseNumstat(numstat),
           patch.truncated,
+          snapshot.fullPatchEvidence,
         ),
         worktreeId: worktree.worktreeId,
       };
@@ -2051,8 +2073,9 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
     files: string[],
     diffStat: Changeset["diffStat"],
     patchPreviewTruncated: boolean,
+    fullPatchEvidence?: FullPatchEvidenceFields,
   ): ChangesetEvidence {
-    return {
+    const evidence: ChangesetEvidence = {
       evidenceId: `changeset-evidence-${node.changesetId}`,
       changesetId: node.changesetId,
       source: "git",
@@ -2062,6 +2085,8 @@ class GitChangesetService implements ChangesetService, ChangesetEvidenceService,
       patchPreviewTruncated,
       collectedAt: new Date().toISOString(),
     };
+    if (status !== "available" || files.length === 0 || !fullPatchEvidence) return evidence;
+    return { ...evidence, ...fullPatchEvidence };
   }
 }
 
@@ -2653,9 +2678,11 @@ async function diffStatForRepo(
   repoRoot: string,
   changedFileCount: number,
   untrackedFiles: string[],
-  baselineRef = "HEAD",
+  baselineRef: string | null = "HEAD",
 ): Promise<Changeset["diffStat"]> {
-  const output = await diffTextAgainstRef(repoRoot, baselineRef, ["--numstat"]);
+  const output = baselineRef === null
+    ? ""
+    : await diffTextAgainstRef(repoRoot, baselineRef, ["--numstat"]);
   let added = 0;
   let deleted = 0;
   for (const line of `${output}${await untrackedNumstat(repoRoot, untrackedFiles)}`.split(/\r?\n/)) {
@@ -2671,16 +2698,23 @@ async function diffPreviewForRepo(
   repoRoot: string,
   maxPatchPreviewBytes: number,
   untrackedFiles: string[],
-  baselineRef = "HEAD",
+  baselineRef: string | null = "HEAD",
 ): Promise<{ value: string; truncated: boolean }> {
-  const result = await diffTextAgainstRefBounded(repoRoot, baselineRef, ["--no-ext-diff"], maxPatchPreviewBytes);
-  if (result.truncated) return { value: `${result.stdout.trimEnd()}\n[diff truncated]\n`, truncated: true };
-
-  let value = result.stdout;
+  let value = "";
+  if (baselineRef !== null) {
+    const result = await diffTextAgainstRefBounded(
+      repoRoot,
+      baselineRef,
+      ["--no-ext-diff", "--no-textconv"],
+      maxPatchPreviewBytes,
+    );
+    if (result.truncated) return { value: `${result.stdout.trimEnd()}\n[diff truncated]\n`, truncated: true };
+    value = result.stdout;
+  }
   for (const file of untrackedFiles) {
     const remaining = maxPatchPreviewBytes - Buffer.byteLength(value);
     if (remaining <= 0) return { value: `${value.trimEnd()}\n[diff truncated]\n`, truncated: true };
-    const untracked = await untrackedFileDiff(repoRoot, file, ["--no-ext-diff"], remaining);
+    const untracked = await untrackedFileDiff(repoRoot, file, ["--no-ext-diff", "--no-textconv"], remaining);
     value += untracked.stdout;
     if (untracked.truncated) return { value: `${value.trimEnd()}\n[diff truncated]\n`, truncated: true };
   }
@@ -2752,7 +2786,7 @@ async function untrackedFileDiff(
   diffArgs: string[],
   maxBytes?: number,
 ): Promise<{ stdout: string; truncated: boolean }> {
-  return git(repoRoot, ["diff", "--no-index", ...diffArgs, "--", "/dev/null", file], {
+  return git(repoRoot, ["diff", "--no-index", ...diffArgs, "--", devNull, file], {
     allowExitCodes: [0, 1],
     ...(maxBytes ? { maxBytes } : {}),
   });
