@@ -1,4 +1,4 @@
-import { execFile, execFileSync } from "node:child_process";
+import { ChildProcess, execFile, execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink as fsSymlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,6 +17,7 @@ import {
   createNodeGitWorktreeService,
   createWorkflowGitAncestryProof,
   evaluateRollbackWorktreeState,
+  getGitCheckpointSnapshot,
   mergeDeliveryPullRequest,
   pushDeliveryBranch,
   getGitBranchFacts,
@@ -2231,6 +2232,101 @@ describe("GitChangesetService", () => {
     expect(facts.branches).toContain("feature/api");
   });
 
+  it("ignores hostile Git redirect environments for checkpoint and changeset evidence", async () => {
+    const target = await createTestRepo("skyturn-git-environment-target-");
+    const hostile = await createTestRepo("skyturn-git-environment-hostile-");
+    changesetTempRoots.push(target.tempRoot, hostile.tempRoot);
+    await writeFile(join(target.repoRoot, "feature.txt"), "target change\n", "utf8");
+    const expectedHead = git(target.repoRoot, ["rev-parse", "HEAD"]);
+
+    await withProcessEnvironment({
+      GIT_DIR: join(hostile.repoRoot, ".git"),
+      GIT_WORK_TREE: hostile.repoRoot,
+      GIT_INDEX_FILE: join(hostile.repoRoot, ".git", "index"),
+      GIT_OBJECT_DIRECTORY: join(hostile.repoRoot, ".git", "objects"),
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "status.showUntrackedFiles",
+      GIT_CONFIG_VALUE_0: "no",
+      Git_Future_Redirect: hostile.repoRoot,
+      git_work_tree: hostile.repoRoot,
+    }, async () => {
+      await expect(getGitCheckpointSnapshot(target.repoRoot)).resolves.toEqual({
+        branchName: "main",
+        headCommit: expectedHead,
+        worktreeState: "dirty",
+      });
+
+      const changeset = await createGitChangesetService().getChangeset(nodeForRepo(target.repoRoot));
+      expect(changeset.evidence?.status).toBe("available");
+      expect(changeset.files).toEqual(["feature.txt"]);
+      expect(changeset.patchPreview).toContain("+target change");
+    });
+  });
+
+  it("fails changeset evidence when bounded Git termination throws before actual close", async () => {
+    const target = await createTestRepo("skyturn-git-termination-error-");
+    changesetTempRoots.push(target.tempRoot);
+    await writeFile(join(target.repoRoot, "feature.txt"), `base\n${"changed\n".repeat(128)}`, "utf8");
+    const originalKill = ChildProcess.prototype.kill;
+    ChildProcess.prototype.kill = function (signal?: NodeJS.Signals | number): boolean {
+      if (signal === "SIGTERM") throw new Error("test termination failure");
+      return originalKill.call(this, signal);
+    };
+
+    try {
+      const changeset = await createGitChangesetService({ maxPatchPreviewBytes: 4 })
+        .getChangeset(nodeForRepo(target.repoRoot));
+
+      expect(changeset.evidence?.status).toBe("failed");
+      expect(changeset.evidence?.errorReason).toContain("test termination failure");
+    } finally {
+      ChildProcess.prototype.kill = originalKill;
+    }
+  });
+
+  it("keeps truncated changeset evidence when close follows a rejected termination without an error", async () => {
+    const target = await createTestRepo("skyturn-git-termination-rejected-");
+    changesetTempRoots.push(target.tempRoot);
+    await writeFile(join(target.repoRoot, "feature.txt"), `base\n${"changed\n".repeat(128)}`, "utf8");
+    const originalKill = ChildProcess.prototype.kill;
+    let terminationCalls = 0;
+    ChildProcess.prototype.kill = function (signal?: NodeJS.Signals | number): boolean {
+      const accepted = originalKill.call(this, signal);
+      if (signal !== "SIGTERM") return accepted;
+      terminationCalls += 1;
+      return false;
+    };
+
+    try {
+      const changeset = await createGitChangesetService({ maxPatchPreviewBytes: 4 })
+        .getChangeset(nodeForRepo(target.repoRoot));
+
+      expect(changeset.evidence).toMatchObject({
+        status: "available",
+        patchPreviewTruncated: true,
+      });
+      expect(terminationCalls).toBe(1);
+    } finally {
+      ChildProcess.prototype.kill = originalKill;
+    }
+  });
+
+  it("rejects a nested checkout path but accepts a linked worktree top level", async () => {
+    const repo = await createTestRepo("skyturn-checkpoint-top-level-");
+    changesetTempRoots.push(repo.tempRoot);
+    const nestedPath = join(repo.repoRoot, "nested");
+    const linkedPath = join(repo.tempRoot, "linked");
+    await mkdir(nestedPath);
+    await gitAsync(repo.repoRoot, "worktree", "add", "-b", "feature/linked", linkedPath, repo.baseCommit);
+
+    await expect(getGitCheckpointSnapshot(nestedPath)).rejects.toThrow(/top-level/i);
+    await expect(getGitCheckpointSnapshot(linkedPath)).resolves.toEqual({
+      branchName: "feature/linked",
+      headCommit: repo.baseCommit,
+      worktreeState: "clean",
+    });
+  });
+
   it("defines only SkyTurn-generated volatile .devflow paths as Git evidence exclusions", () => {
     expect(SKYTURN_VOLATILE_GIT_PATHS).toEqual([
       ".devflow/skyturn-workflow.sqlite",
@@ -2426,6 +2522,25 @@ async function createRepo(): Promise<string> {
 
 async function gitAsync(cwd: string, ...args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
+}
+
+async function withProcessEnvironment<T>(
+  values: Record<string, string>,
+  callback: () => Promise<T>,
+): Promise<T> {
+  const previous = new Map<string, string | undefined>();
+  for (const [name, value] of Object.entries(values)) {
+    previous.set(name, process.env[name]);
+    process.env[name] = value;
+  }
+  try {
+    return await callback();
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 }
 
 async function installFakeGh(

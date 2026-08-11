@@ -3365,10 +3365,21 @@ async function loadProductionGitWorktreeModule() {
       (specifier) => specifier === "@skyturn/project-core" ? projectCore : require(specifier),
       ts,
     );
+    const gitCommandModule = transpileCommonJsModule(
+      await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "internal", "gitCommand.ts"), "utf8"),
+      "git-worktree.gitCommand.ts",
+      require,
+      ts,
+      { Buffer, process },
+    );
     return transpileCommonJsModule(
       await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "node.ts"), "utf8"),
       "git-worktree.node.ts",
-      (specifier) => specifier === "./index.js" ? indexModule : require(specifier),
+      (specifier) => {
+        if (specifier === "./index.js") return indexModule;
+        if (specifier === "./internal/gitCommand.js") return gitCommandModule;
+        return require(specifier);
+      },
       ts,
       { Buffer, process },
     );

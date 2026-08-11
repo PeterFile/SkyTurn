@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -60,6 +60,7 @@ import {
   type VariantComparisonInput,
   type VariantAdoptionService,
 } from "./index.js";
+import { sanitizedGitEnvironment, spawnBoundedGit } from "./internal/gitCommand.js";
 
 export { parseVariantComparisonEvidence, parseWorktreeComparisonRequest };
 
@@ -1647,6 +1648,7 @@ async function runDeliveryCommandWithRawOutput(
       encoding: "utf8",
       maxBuffer: gitOutputLimit,
       shell: false,
+      ...(command === "git" ? { env: sanitizedGitEnvironment() } : {}),
     });
     const rawStdout = String(result.stdout).trim();
     const rawStderr = String(result.stderr).trim();
@@ -1813,6 +1815,7 @@ async function runDeliveryGitCommand(cwd: string, args: string[]): Promise<Deliv
     const result = await execFileAsync("git", args, {
       cwd,
       encoding: "utf8",
+      env: sanitizedGitEnvironment(),
       maxBuffer: gitOutputLimit,
       shell: false,
     });
@@ -2421,6 +2424,7 @@ async function runGit(cwd: string, args: string[], options: GitRunOptions = {}):
     const result = await execFileAsync("git", args, {
       cwd,
       encoding: "utf8",
+      env: sanitizedGitEnvironment(),
       maxBuffer: options.maxBuffer ?? gitOutputLimit,
       shell: false,
     });
@@ -2645,8 +2649,13 @@ function truncate(value: string): string {
 }
 
 async function assertGitWorktree(repoRoot: string): Promise<void> {
-  const result = await git(repoRoot, ["rev-parse", "--is-inside-work-tree"]);
-  if (result.stdout.trim() !== "true") throw new Error("Path is not inside a git worktree.");
+  const requestedRoot = await realpath(repoRoot);
+  const result = await git(requestedRoot, ["rev-parse", "--is-inside-work-tree", "--show-toplevel"]);
+  const [insideWorktree, reportedRoot] = result.stdout.trim().split(/\r?\n/, 2);
+  if (insideWorktree !== "true") throw new Error("Path is not inside a git worktree.");
+  if (!reportedRoot || await realpath(reportedRoot) !== requestedRoot) {
+    throw new Error("Path must be the git worktree top-level directory.");
+  }
 }
 
 async function diffStatForRepo(
@@ -2771,43 +2780,21 @@ async function git(
 ): Promise<{ stdout: string; truncated: boolean }> {
   const maxBytes = options.maxBytes ?? defaultMaxGitOutputBytes;
   const allowExitCodes = new Set([0, ...(options.allowExitCodes ?? [])]);
-  return new Promise((resolve, reject) => {
-    const child = spawn("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let truncated = false;
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      if (stdoutBytes >= maxBytes) return;
-      const remaining = maxBytes - stdoutBytes;
-      const value = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
-      stdoutChunks.push(value);
-      stdoutBytes += value.byteLength;
-      if (chunk.byteLength >= remaining) {
-        truncated = true;
-        child.kill("SIGTERM");
-      }
-    });
-
-    child.stderr.on("data", (chunk: Buffer) => {
-      if (stderrBytes >= defaultMaxGitOutputBytes) return;
-      const remaining = defaultMaxGitOutputBytes - stderrBytes;
-      const value = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
-      stderrChunks.push(value);
-      stderrBytes += value.byteLength;
-    });
-
-    child.on("error", reject);
-    child.on("close", (code) => {
-      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
-      const stderr = Buffer.concat(stderrChunks).toString("utf8");
-      if (!allowExitCodes.has(code ?? -1) && !truncated) {
-        reject(new Error(stderr.trim() || `git ${args[0]} failed with exit code ${code ?? "unknown"}.`));
-        return;
-      }
-      resolve({ stdout, truncated });
+  const result = await spawnBoundedGit(cwd, args, {
+    stdoutMaxBytes: maxBytes,
+    stderrMaxBytes: defaultMaxGitOutputBytes,
   });
-  });
+  if (result.spawnError) {
+    throw new Error(result.spawnError.message || `git ${args[0]} failed to spawn.`);
+  }
+  if (result.terminationError) {
+    throw new Error(result.terminationError.message || `git ${args[0]} failed to terminate after exceeding the output limit.`);
+  }
+  if (result.stderrTruncated) {
+    throw new Error(`git ${args[0]} stderr exceeded the git output limit.`);
+  }
+  if (!allowExitCodes.has(result.exitCode ?? -1) && !result.stdoutTruncated) {
+    throw new Error(result.stderr.trim() || `git ${args[0]} failed with exit code ${result.exitCode ?? "unknown"}.`);
+  }
+  return { stdout: result.stdout, truncated: result.stdoutTruncated };
 }
