@@ -21,7 +21,7 @@ const {
   createAfterCheckpointAncestryProof,
   recordWorkflowCheckpointFailure,
   requireCheckpointBoundWorktreeBase,
-  resolveCurrentBranchRunBaseline,
+  resolveExecutableRunBaseline,
   verifyWorkflowCheckpointActionGate,
 } = checkpointRuntime;
 
@@ -91,12 +91,16 @@ test("current-branch checkpoint evidence excludes volatile runtime and preserves
 
     const reopened = createWorkflowStore({ projectRoot: root });
     const after = await getGitCheckpointSnapshot(root);
-    const baselineRef = resolveCurrentBranchRunBaseline(reopened, {
+    const baselineRef = resolveExecutableRunBaseline(reopened, {
       sessionId: "session-1",
+      nodeId: "lane-implementation",
       laneId: "lane-implementation",
       segmentId: "segment-session-1-lane-implementation",
       runId: "run-session-1-lane-implementation",
       phase: "after",
+      executionTarget: "current_branch",
+      worktreePath: await realpath(root),
+      branchName: "main",
       headCommit: after.headCommit,
     });
     const node = reopened.materializeCanvasSession("session-1").nodes.find((item) => item.id === "lane-implementation");
@@ -114,6 +118,91 @@ test("current-branch checkpoint evidence excludes volatile runtime and preserves
     reopened.close();
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("executable run baseline uses each target's exact matching before checkpoint instead of its static base", () => {
+  const currentBefore = baselineCheckpoint({
+    executionTarget: "current_branch",
+    headCommit: "a".repeat(40),
+  });
+  const worktreeBefore = baselineCheckpoint({
+    executionTarget: "new_worktree",
+    worktreeId: "worktree-candidate",
+    worktreePath: "/repo/.devflow/worktrees/candidate",
+    branchName: "skyturn/session-1/candidate",
+    headCommit: "b".repeat(40),
+  });
+
+  for (const checkpoint of [currentBefore, worktreeBefore]) {
+    const calls = [];
+    const baseline = resolveExecutableRunBaseline({
+      listNodeCheckpoints(input) {
+        calls.push(input);
+        return [checkpoint];
+      },
+    }, {
+      ...checkpoint,
+      phase: "after",
+      headCommit: "c".repeat(40),
+    });
+
+    assert.equal(baseline, checkpoint.headCommit);
+    assert.deepEqual(calls, [{
+      sessionId: checkpoint.sessionId,
+      laneId: checkpoint.laneId,
+      runId: checkpoint.runId,
+      phase: "before",
+    }]);
+  }
+  assert.notEqual(worktreeBefore.headCommit, "9".repeat(40), "per-run B must win over the static worktree base");
+});
+
+test("before run baseline uses the current canonical full HEAD without reading persisted checkpoints", () => {
+  for (const executionTarget of ["current_branch", "new_worktree"]) {
+    const headCommit = "D".repeat(40);
+    const baseline = resolveExecutableRunBaseline({
+      listNodeCheckpoints() {
+        assert.fail("before baseline must not query persisted checkpoints");
+      },
+    }, {
+      ...baselineCheckpoint({
+        executionTarget,
+        ...(executionTarget === "new_worktree" ? { worktreeId: "worktree-candidate" } : {}),
+        headCommit,
+      }),
+      phase: "before",
+    });
+    assert.equal(baseline, headCommit.toLowerCase());
+  }
+});
+
+test("after run baseline fails closed for duplicate, malformed, or mismatched before checkpoint authority", () => {
+  const matching = baselineCheckpoint({
+    executionTarget: "new_worktree",
+    worktreeId: "worktree-later-run",
+    worktreePath: "/repo/.devflow/worktrees/later-run",
+    branchName: "skyturn/session-1/later-run",
+    headCommit: "e".repeat(40),
+  });
+  const after = { ...matching, phase: "after", headCommit: "f".repeat(40) };
+  const cases = [
+    ["missing", []],
+    ["duplicate", [matching, { ...matching }]],
+    ["malformed", [{ ...matching, headCommit: "short" }]],
+    ["cross-node", [{ ...matching, nodeId: "lane-other" }]],
+    ["cross-segment", [{ ...matching, segmentId: "segment-other" }]],
+    ["cross-worktree", [{ ...matching, worktreeId: "worktree-other" }]],
+    ["cross-path", [{ ...matching, worktreePath: "/repo/.devflow/worktrees/other" }]],
+    ["cross-target", [{ ...matching, executionTarget: "current_branch", worktreeId: undefined }]],
+  ];
+
+  for (const [label, checkpoints] of cases) {
+    assert.throws(
+      () => resolveExecutableRunBaseline({ listNodeCheckpoints: () => checkpoints }, after),
+      /matching before checkpoint|identity|baseline|commit/i,
+      label,
+    );
   }
 });
 
@@ -488,6 +577,23 @@ function checkpointIdentity(root, segment, snapshot) {
   return {
     ...checkpointInput(root, segment, "after", snapshot),
     worktreePath: root,
+  };
+}
+
+function baselineCheckpoint(overrides = {}) {
+  return {
+    id: "checkpoint:run-session-1-lane-implementation:before",
+    sessionId: "session-1",
+    nodeId: "lane-implementation",
+    laneId: "lane-implementation",
+    segmentId: "segment-session-1-lane-implementation",
+    runId: "run-session-1-lane-implementation",
+    phase: "before",
+    executionTarget: "current_branch",
+    worktreePath: "/repo",
+    branchName: "main",
+    headCommit: "a".repeat(40),
+    ...overrides,
   };
 }
 

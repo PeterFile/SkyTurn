@@ -2363,6 +2363,14 @@ export class WorkflowStore {
     ) {
       throw new Error("Workflow candidate manifest final changeset event identity is invalid.");
     }
+    const baselineHeadCommit = changesetEntry.event.payload.baselineHeadCommit;
+    if (
+      typeof baselineHeadCommit !== "string" ||
+      !/^[0-9a-f]{40}$/.test(baselineHeadCommit) ||
+      baselineHeadCommit !== before.headCommit
+    ) {
+      throw new Error("Workflow candidate manifest final changeset baseline must match the before checkpoint HEAD.");
+    }
     const changeset = parseChangesetEvidence(changesetEntry.event.payload.evidence);
     if (!isCompleteCandidateChangeset(changeset, changesetEntry.event.payload.evidence)) {
       throw new Error("Workflow candidate manifest requires non-empty complete changeset digest evidence.");

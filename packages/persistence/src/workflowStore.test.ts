@@ -2598,6 +2598,76 @@ describe("SQLite workflow store", () => {
     },
   );
 
+  it.each([
+    ["legacy changeset evidence", undefined],
+    ["wrong baseline", "c".repeat(40)],
+    ["noncanonical baseline", "A".repeat(40)],
+  ] as const)(
+    "rejects %s without writing a candidate manifest and stays fail closed after reopen",
+    async (_failure, baselineHeadCommit) => {
+      const projectRoot = await makeTempRoot();
+      let store = createWorkflowStore({ projectRoot });
+      const identity = prepareCandidateManifestRun(store, projectRoot);
+      rewriteChangesetBaseline(store.databasePath, identity, baselineHeadCommit);
+      const before = store.listEvents(identity.sessionId);
+
+      expect(() => store.freezeCandidateManifest({
+        ...identity,
+        now: "2026-08-11T00:00:06.000Z",
+      })).toThrow(/candidate manifest.*baseline|before.*head/i);
+      expect(store.getCandidateManifest(identity)).toBeNull();
+      expect(store.listPendingCandidateManifestFreezes()).toEqual([]);
+      expect(store.listEvents(identity.sessionId)).toEqual(before);
+      store.close();
+
+      store = createWorkflowStore({ projectRoot });
+      const reopenedBefore = store.listEvents(identity.sessionId);
+      expect(() => store.freezeCandidateManifest({
+        ...identity,
+        now: "2026-08-11T00:00:07.000Z",
+      })).toThrow(/candidate manifest.*baseline|before.*head/i);
+      expect(store.listEvents(identity.sessionId)).toEqual(reopenedBefore);
+      store.close();
+    },
+  );
+
+  it("rejects a duplicate matching before checkpoint before manifest mutation", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot);
+    insertRawCheckpointEvents(store.databasePath, [rawCheckpoint({
+      id: `checkpoint:${identity.runId}:before-duplicate`,
+      sessionId: identity.sessionId,
+      nodeId: identity.nodeId,
+      laneId: identity.laneId,
+      segmentId: identity.segmentId,
+      runId: identity.runId,
+      phase: "before",
+      executionTarget: "current_branch",
+      worktreePath: projectRoot,
+      branchName: "HEAD",
+      headCommit: "a".repeat(40),
+      createdAt: "2026-08-11T00:00:03.250Z",
+      evidenceRefs: [{ kind: "run", id: identity.runId }],
+    })]);
+    const db = new Database(store.databasePath, { readonly: true });
+    const countBefore = (db.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
+      .get(identity.sessionId) as { count: number }).count;
+    db.close();
+
+    expect(() => store.freezeCandidateManifest({
+      ...identity,
+      now: "2026-08-11T00:00:06.000Z",
+    })).toThrow(/candidate manifest.*checkpoint|unique.*before|proof-bearing.*before/i);
+    expect(store.getCandidateManifest(identity)).toBeNull();
+    store.close();
+
+    const reopenedDb = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), { readonly: true });
+    expect((reopenedDb.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
+      .get(identity.sessionId) as { count: number }).count).toBe(countBefore);
+    reopenedDb.close();
+  });
+
   it("conflicts with zero writes when authoritative digest facts change after freeze", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
@@ -2616,6 +2686,29 @@ describe("SQLite workflow store", () => {
     db.close();
 
     expect(() => createWorkflowStore({ projectRoot })).toThrow(/candidate manifest.*conflict/i);
+    const reopenedDb = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), { readonly: true });
+    expect((reopenedDb.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
+      .get(identity.sessionId) as { count: number }).count).toBe(countBefore);
+    reopenedDb.close();
+  });
+
+  it("fails reopen closed when a frozen manifest's changeset baseline binding changes", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot);
+    store.freezeCandidateManifest({ ...identity, now: "2026-08-11T00:00:06.000Z" });
+    store.close();
+    rewriteChangesetBaseline(
+      join(projectRoot, ".devflow", "skyturn-workflow.sqlite"),
+      identity,
+      "c".repeat(40),
+    );
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), { readonly: true });
+    const countBefore = (db.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
+      .get(identity.sessionId) as { count: number }).count;
+    db.close();
+
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(/candidate manifest.*baseline|before.*head/i);
     const reopenedDb = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), { readonly: true });
     expect((reopenedDb.prepare("SELECT count(*) AS count FROM workflow_events WHERE session_id = ?")
       .get(identity.sessionId) as { count: number }).count).toBe(countBefore);
@@ -9803,6 +9896,7 @@ function prepareCandidateManifestRun(
     payload: {
       laneId: identity.laneId,
       segmentId: identity.segmentId,
+      baselineHeadCommit: "a".repeat(40),
       evidence: {
         evidenceId: changesetEvidenceId,
         changesetId,
@@ -9836,6 +9930,21 @@ function prepareCandidateManifestRun(
     now: "2026-08-11T00:00:05.500Z",
   });
   return identity;
+}
+
+function rewriteChangesetBaseline(
+  databasePath: string,
+  identity: { sessionId: string; runId: string },
+  baselineHeadCommit: string | undefined,
+): void {
+  const db = new Database(databasePath);
+  const row = db.prepare("SELECT id, payload_json FROM workflow_events WHERE session_id = ? AND idempotency_key = ?")
+    .get(identity.sessionId, `checkpoint-changeset:${identity.runId}:after`) as { id: string; payload_json: string };
+  const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+  if (baselineHeadCommit === undefined) delete payload.baselineHeadCommit;
+  else payload.baselineHeadCommit = baselineHeadCommit;
+  db.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ?").run(JSON.stringify(payload), row.id);
+  db.close();
 }
 
 function rawCheckpoint(overrides: Record<string, unknown> = {}): Record<string, unknown> {

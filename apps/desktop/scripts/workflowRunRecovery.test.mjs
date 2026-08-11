@@ -1065,14 +1065,14 @@ test("restart recovery freezes only the post-checkpoint candidate manifest crash
     runId: "run-session-1-lane-implementation",
     agentKind: "codex",
   };
-  let afterCheckpointExists = false;
+  let baselineBindingExists = true;
   const store = {
     listRunningSegments() { return []; },
     listPendingPlannerIntentReconciliations() { return []; },
-    listPendingRunCheckpointEnrichments() { return [identity]; },
+    listPendingRunCheckpointEnrichments() { return []; },
     listPendingCandidateManifestFreezes() {
       calls.push("list-manifest-freezes");
-      return afterCheckpointExists ? [{
+      return baselineBindingExists ? [{
         sessionId: identity.sessionId,
         nodeId: identity.nodeId,
         laneId: identity.laneId,
@@ -1097,19 +1097,25 @@ test("restart recovery freezes only the post-checkpoint candidate manifest crash
     bridge,
     () => "unused",
     () => "2026-08-11T00:00:06.000Z",
-    async () => {
-      calls.push("changeset-reconciled");
-      calls.push("after-checkpoint-recorded");
-      afterCheckpointExists = true;
-    },
+    async () => { assert.fail("post-checkpoint manifest recovery must not recollect Git"); },
   );
 
   assert.deepEqual(calls, [
-    "changeset-reconciled",
-    "after-checkpoint-recorded",
     "list-manifest-freezes",
     `freeze:${identity.runId}`,
   ]);
+
+  calls.length = 0;
+  baselineBindingExists = false;
+  await recoverTerminalWorkflowRuns(
+    "/unused/project",
+    store,
+    bridge,
+    () => "unused",
+    () => "2026-08-11T00:00:07.000Z",
+    async () => { assert.fail("unbound manifest recovery must not recollect Git"); },
+  );
+  assert.deepEqual(calls, ["list-manifest-freezes"]);
 });
 
 test("desktop terminal path orders evidence, final changeset, after checkpoint, then manifest freeze", async () => {
@@ -1168,6 +1174,14 @@ test("getWorkflowStore completes pending checkpoint enrichment without waiting o
       1,
       JSON.stringify(recovered.listEvents(segment.sessionId), null, 2),
     );
+    assert.deepEqual(Array.from(harness.reconciledBaselines()), [headCommit]);
+    const changesetEvent = recovered.listEvents(segment.sessionId).find((event) =>
+      event.idempotencyKey === `checkpoint-changeset:${segment.runId}:after`
+    );
+    assert.equal(changesetEvent.payload.baselineHeadCommit, headCommit);
+    const eventsAfterRecovery = recovered.listEvents(segment.sessionId);
+    assert.strictEqual(await harness.getWorkflowStore(root), recovered);
+    assert.deepEqual(recovered.listEvents(segment.sessionId), eventsAfterRecovery);
     harness.closeWorkflowStores();
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1711,6 +1725,7 @@ for (const mode of ["same-process", "concurrent", "reopened"]) {
         laneId: "lane-implementation",
         segmentId: "segment-session-1-lane-implementation",
         runId: "run-session-1-lane-implementation",
+        baselineHeadCommit: "a".repeat(40),
       };
       const first = changesetEvidence("normal-order");
       const duplicate = changesetEvidence("reordered");
@@ -1732,12 +1747,132 @@ for (const mode of ["same-process", "concurrent", "reopened"]) {
       assert.equal(store.listEvents("session-1").filter((event) =>
         event.kind === "workflow.changeset.evidence_recorded"
       ).length, 1);
+      const recorded = store.listEvents("session-1").find((event) =>
+        event.kind === "workflow.changeset.evidence_recorded"
+      );
+      assert.equal(recorded.source, "backend");
+      assert.equal(recorded.payload.baselineHeadCommit, identity.baselineHeadCommit);
+      assert.equal(recorded.payload.evidence.source, "git");
       store.close();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
 }
+
+test("changeset evidence rejects legacy or mismatched baseline replay with zero writes", async () => {
+  const root = await makeRoot();
+  try {
+    const recordRunChangesetEvidence = await loadMainChangesetEvidenceRecorder();
+    const identity = {
+      sessionId: "session-1",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      runId: "run-session-1-lane-implementation",
+      baselineHeadCommit: "a".repeat(40),
+    };
+    const changeset = changesetEvidence("normal-order");
+
+    for (const existingBaseline of [undefined, "b".repeat(40)]) {
+      const store = seedRunningStore(root);
+      store.appendWorkflowEvent({
+        sessionId: identity.sessionId,
+        kind: "workflow.changeset.evidence_recorded",
+        source: "backend",
+        laneId: identity.laneId,
+        segmentId: identity.segmentId,
+        idempotencyKey: `checkpoint-changeset:${identity.runId}:after`,
+        payload: {
+          laneId: identity.laneId,
+          segmentId: identity.segmentId,
+          ...(existingBaseline ? { baselineHeadCommit: existingBaseline } : {}),
+          evidence: {
+            ...changeset.evidence,
+            evidenceId: `changeset-evidence:${identity.runId}:after`,
+            collectedAt: changeset.collectedAt,
+          },
+        },
+        now: changeset.collectedAt,
+      });
+      const before = store.listEvents(identity.sessionId);
+
+      assert.throws(
+        () => recordRunChangesetEvidence(store, identity, "after", changeset),
+        /changeset evidence mismatch|baseline/i,
+      );
+      assert.deepEqual(store.listEvents(identity.sessionId), before);
+      store.close();
+      await rm(join(root, ".devflow"), { recursive: true, force: true });
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("current-branch and new-worktree reconciliation persist each run's explicit checkpoint baseline", async () => {
+  const root = await makeRoot();
+  try {
+    const calls = [];
+    const { reconcileRunChangeset, recordRunChangesetEvidence } = await loadMainChangesetRuntime(calls);
+    const store = seedRunningStore(root);
+    const staticWorktreeBase = "9".repeat(40);
+    const identities = [
+      {
+        sessionId: "session-1",
+        laneId: "lane-current",
+        segmentId: "segment-current",
+        runId: "run-current",
+        executionTarget: "current_branch",
+        baselineHeadCommit: "a".repeat(40),
+        worktreeState: "clean",
+        node: { worktree: { path: root, baseCommit: staticWorktreeBase } },
+        target: { executionTarget: "current_branch", selectedBranch: "main" },
+      },
+      {
+        sessionId: "session-1",
+        laneId: "lane-worktree",
+        segmentId: "segment-worktree",
+        runId: "run-worktree",
+        executionTarget: "new_worktree",
+        baselineHeadCommit: "b".repeat(40),
+        worktreeState: "clean",
+        node: { worktree: { path: root, baseCommit: staticWorktreeBase } },
+        target: { executionTarget: "new_worktree", selectedBranch: "main", baseRef: staticWorktreeBase },
+      },
+      {
+        sessionId: "session-1",
+        laneId: "lane-later-worktree",
+        segmentId: "segment-later-worktree",
+        runId: "run-later-worktree",
+        executionTarget: "new_worktree",
+        baselineHeadCommit: "c".repeat(40),
+        worktreeState: "clean",
+        node: { worktree: { path: root, baseCommit: staticWorktreeBase } },
+        target: { executionTarget: "new_worktree", selectedBranch: "main", baseRef: staticWorktreeBase },
+      },
+    ];
+
+    for (const identity of identities) {
+      const changeset = await reconcileRunChangeset(root, identity, []);
+      recordRunChangesetEvidence(store, identity, "after", changeset);
+    }
+
+    assert.deepEqual(calls.map((input) => input.baselineRef), identities.map((identity) => identity.baselineHeadCommit));
+    assert.notEqual(identities[1].baselineHeadCommit, staticWorktreeBase);
+    assert.notEqual(identities[2].baselineHeadCommit, identities[1].baselineHeadCommit);
+    const events = store.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.changeset.evidence_recorded"
+    );
+    assert.deepEqual(
+      events.map((event) => event.payload.baselineHeadCommit),
+      identities.map((identity) => identity.baselineHeadCommit),
+    );
+    assert.equal(events.every((event) => event.source === "backend" && event.payload.evidence.source === "git"), true);
+    store.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("restart recovery persists retryable after-enrichment failure and retries it after another restart", async () => {
   const root = await makeRoot();
@@ -2220,6 +2355,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     "const workflowStoreInitializations = new Map();",
     "const workflowSessionAdvanceFlights = new Map();",
     "const workflowProjectAdvanceTails = new Map();",
+    "const reconciledBaselines = [];",
     "const workflowAdvanceShutdownError = 'Workflow advancement is unavailable while SkyTurn is shutting down.';",
     "let workflowAdvanceAdmissionOpen = true;",
     "let workflowAdvanceAdmissionEpoch = 0;",
@@ -2245,6 +2381,13 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     `async function resolveExecutableRunIdentity(input, _phase, knownStore) {
       if (!knownStore) await getWorkflowStore(input.projectRoot);
       resolverReceivedKnownStore = knownStore !== undefined;
+      const before = knownStore.listNodeCheckpoints({
+        sessionId: input.sessionId,
+        laneId: input.nodeId,
+        runId: input.runId,
+        phase: 'before',
+      });
+      if (before.length !== 1) throw new Error('missing authoritative before checkpoint');
       return {
         sessionId: input.sessionId,
         nodeId: input.nodeId,
@@ -2257,13 +2400,32 @@ async function loadMainWorkflowStoreHarness(options = {}) {
         branchName: 'HEAD',
         headCommit: '${options.checkpointHeadCommit ?? "d".repeat(40)}',
         worktreeState: 'clean',
+        baselineHeadCommit: before[0].headCommit,
         node: {},
         target: {},
       };
     }`,
-    "async function reconcileRunChangeset() { return { evidence: { status: 'available' }, collectedAt: '2026-06-14T00:00:05.000Z' }; }",
+    `async function reconcileRunChangeset(_projectRoot, identity) {
+      reconciledBaselines.push(identity.baselineHeadCommit);
+      return {
+        evidence: {
+          changesetId: 'changeset-' + identity.laneId,
+          source: 'git',
+          status: 'available',
+          files: ['fixture.txt'],
+          diffStat: { added: 1, changed: 1, deleted: 0 },
+          patchPreviewTruncated: false,
+          fullPatchSha256: '${"4".repeat(64)}',
+          fullPatchByteLength: 1,
+          fileManifestSha256: '${"5".repeat(64)}',
+        },
+        collectedAt: '2026-06-14T00:00:05.000Z',
+      };
+    }`,
     "async function verifyRunGitIdentityAtCheckpoint(identity) { return identity; }",
-    "function recordRunChangesetEvidence(_store, identity, phase) { return `changeset-evidence:${identity.runId}:${phase}`; }",
+    extractFunction(main, "recordRunChangesetEvidence"),
+    extractFunction(main, "stableJson"),
+    extractFunction(main, "sortJson"),
     `function runCheckpointInput(identity, phase, changesetEvidenceId, now, ancestry) {
       return {
         sessionId: identity.sessionId,
@@ -2292,7 +2454,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     getWorkflowStoreSource,
     extractSourceRange(main, "async function enrichTerminalWorkflowRun", "async function workflowStoreIdentity"),
     "function closeWorkflowStores() { for (const store of workflowStores.values()) store.close(); workflowStores.clear(); workflowStoreInitializations.clear(); workflowSessionAdvanceFlights.clear(); workflowProjectAdvanceTails.clear(); }",
-    "module.exports = { getWorkflowStore, closeWorkflowStores, hasPublishedStore: (root) => workflowStores.get(root) ?? false, resolverReceivedKnownStore: () => resolverReceivedKnownStore, launchedRuns: () => launchedRuns };",
+    "module.exports = { getWorkflowStore, closeWorkflowStores, hasPublishedStore: (root) => workflowStores.get(root) ?? false, resolverReceivedKnownStore: () => resolverReceivedKnownStore, reconciledBaselines: () => reconciledBaselines, launchedRuns: () => launchedRuns };",
   ].join("\n");
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
@@ -2465,11 +2627,65 @@ async function loadMainChangesetEvidenceRecorder() {
   return module.exports.recordRunChangesetEvidence;
 }
 
+async function loadMainChangesetRuntime(calls) {
+  const main = await readFile(new URL("../electron/main.ts", import.meta.url), "utf8");
+  const reconcile = extractFunction(main, "reconcileRunChangeset").replace(
+    'const { createGitChangesetService } = await import("@skyturn/git-worktree/node");',
+    "const createGitChangesetService = createGitChangesetServiceForTest;",
+  );
+  const source = [
+    "function workflowIpcError(_code, message) { return new Error(message); }",
+    "function liveChangesFromRunEvents() { return null; }",
+    reconcile,
+    extractFunction(main, "recordRunChangesetEvidence"),
+    extractFunction(main, "stableJson"),
+    extractFunction(main, "sortJson"),
+    extractFunction(main, "isRecord"),
+    "module.exports = { reconcileRunChangeset, recordRunChangesetEvidence };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, {
+    createGitChangesetServiceForTest() {
+      return {
+        async reconcileFinalChangeset(input) {
+          calls.push(input);
+          return {
+            changeset: {
+              evidence: {
+                changesetId: `changeset-${input.baselineRef}`,
+                source: "git",
+                status: "available",
+                files: ["src/a.ts"],
+                collectedAt: "2026-08-12T00:00:00.000Z",
+              },
+            },
+          };
+        },
+      };
+    },
+    fs: { realpath: async (value) => value },
+    Error,
+    JSON,
+    Object,
+    Date,
+    module,
+    exports: module.exports,
+  }, { filename: "main.changesetRuntime.ts" });
+  return module.exports;
+}
+
 function changesetEvidence(order) {
   const nested = order === "normal-order" ? { zeta: 2, alpha: 1 } : { alpha: 1, zeta: 2 };
   const evidence = order === "normal-order"
-    ? { status: "available", summary: nested, files: [{ path: "src/a.ts", status: "modified" }] }
-    : { files: [{ status: "modified", path: "src/a.ts" }], summary: nested, status: "available" };
+    ? { source: "git", status: "available", summary: nested, files: [{ path: "src/a.ts", status: "modified" }] }
+    : { files: [{ status: "modified", path: "src/a.ts" }], summary: nested, status: "available", source: "git" };
   return { evidence, collectedAt: "2026-06-14T00:00:05.000Z" };
 }
 

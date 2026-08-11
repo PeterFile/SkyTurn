@@ -50,7 +50,7 @@ import {
   createAfterCheckpointAncestryProof,
   recordWorkflowCheckpointFailure,
   requireCheckpointBoundWorktreeBase,
-  resolveCurrentBranchRunBaseline,
+  resolveExecutableRunBaseline,
   verifyWorkflowCheckpointActionGate,
   type WorkflowCheckpointAction,
   type WorkflowCheckpointPair,
@@ -312,7 +312,7 @@ interface ExecutableRunIdentity {
   branchName: string;
   headCommit: string;
   worktreeState: "clean" | "dirty";
-  baselineRef?: string;
+  baselineHeadCommit: string;
   node: Record<string, unknown>;
   target: Record<string, unknown>;
 }
@@ -5833,16 +5833,19 @@ async function resolveExecutableRunIdentity(
   }
   const headCommit = snapshot.headCommit;
   if (!isFullCommitSha(headCommit)) throw workflowIpcError("INVALID_INPUT", "Workflow run HEAD is not a full commit SHA.");
-  const baselineRef = executionTarget === "current_branch"
-    ? resolveCurrentBranchRunBaseline(store, {
-        sessionId,
-        laneId: lane.id,
-        segmentId: segment.id,
-        runId,
-        phase,
-        headCommit,
-      })
-    : undefined;
+  const baselineHeadCommit = resolveExecutableRunBaseline(store, {
+    sessionId,
+    nodeId,
+    laneId: lane.id,
+    segmentId: segment.id,
+    runId,
+    phase,
+    executionTarget,
+    ...(recordedWorktreeId ? { worktreeId: recordedWorktreeId } : {}),
+    worktreePath: expectedPath,
+    branchName,
+    headCommit,
+  });
   return {
     sessionId,
     nodeId,
@@ -5856,7 +5859,7 @@ async function resolveExecutableRunIdentity(
     branchName,
     headCommit,
     worktreeState: snapshot.worktreeState,
-    ...(baselineRef ? { baselineRef } : {}),
+    baselineHeadCommit,
     node: {
       ...node,
       worktree: { ...node.worktree, path: expectedPath, realPath: expectedPath, branchName },
@@ -6005,7 +6008,7 @@ async function reconcileRunChangeset(
   const reconciliation = await service.reconcileFinalChangeset({
     node: identity.node as unknown as ReconcileInput["node"],
     target: identity.target as unknown as ReconcileInput["target"],
-    ...(identity.baselineRef ? { baselineRef: identity.baselineRef } : {}),
+    baselineRef: identity.baselineHeadCommit,
     liveChanges: liveChangesFromRunEvents(runEvents) as ReconcileInput["liveChanges"],
   });
   const evidence = reconciliation.changeset.evidence;
@@ -6024,18 +6027,36 @@ function recordRunChangesetEvidence(
   phase: "before" | "after",
   changeset: ReconciledRunChangeset,
 ): string {
+  if (!/^[0-9a-f]{40}$/.test(identity.baselineHeadCommit)) {
+    throw workflowIpcError("INVALID_INPUT", "Run changeset baseline must be a canonical full commit SHA.");
+  }
   const evidenceId = `changeset-evidence:${identity.runId}:${phase}`;
   const evidence = { ...changeset.evidence, evidenceId, collectedAt: changeset.collectedAt };
   const idempotencyKey = `checkpoint-changeset:${identity.runId}:${phase}`;
+  const payload = {
+    laneId: identity.laneId,
+    segmentId: identity.segmentId,
+    baselineHeadCommit: identity.baselineHeadCommit,
+    evidence,
+  };
   const existing = store.listEvents(identity.sessionId).find((event) =>
     isRecord(event) && event.idempotencyKey === idempotencyKey
   );
-  if (isRecord(existing) && isRecord(existing.payload) && isRecord(existing.payload.evidence)) {
+  if (existing !== undefined) {
+    if (!isRecord(existing) || !isRecord(existing.payload) || !isRecord(existing.payload.evidence)) {
+      throw workflowIpcError("INVALID_INPUT", "Run changeset evidence mismatch for existing run phase.");
+    }
     const existingEvidence = existing.payload.evidence;
     const comparableEvidence = typeof existingEvidence.collectedAt === "string"
       ? { ...evidence, collectedAt: existingEvidence.collectedAt }
       : evidence;
-    if (stableJson(existingEvidence) !== stableJson(comparableEvidence)) {
+    if (
+      existing.kind !== "workflow.changeset.evidence_recorded" ||
+      existing.source !== "backend" ||
+      existing.laneId !== identity.laneId ||
+      existing.segmentId !== identity.segmentId ||
+      stableJson(existing.payload) !== stableJson({ ...payload, evidence: comparableEvidence })
+    ) {
       throw workflowIpcError("INVALID_INPUT", "Run changeset evidence mismatch for existing run phase.");
     }
     return evidenceId;
@@ -6047,7 +6068,7 @@ function recordRunChangesetEvidence(
     laneId: identity.laneId,
     segmentId: identity.segmentId,
     idempotencyKey,
-    payload: { laneId: identity.laneId, segmentId: identity.segmentId, evidence },
+    payload,
     now: changeset.collectedAt,
   });
   return evidenceId;
