@@ -80,31 +80,50 @@ export type WorkflowCheckpointAction = "repair" | "variant" | "rollback";
 export const WORKFLOW_CHECKPOINT_ANCESTRY_UNAVAILABLE_REASON =
   "Checkpoint Git ancestry proof is unavailable or no longer valid.";
 
-interface CurrentBranchRunBaselineInput {
+interface ExecutableRunBaselineInput {
   sessionId: string;
+  nodeId: string;
   laneId: string;
   segmentId: string;
   runId: string;
   phase: "before" | "after";
+  executionTarget: "current_branch" | "new_worktree";
+  worktreeId?: string;
+  worktreePath: string;
+  branchName: string;
   headCommit: string;
 }
 
-export function resolveCurrentBranchRunBaseline(
+export function resolveExecutableRunBaseline(
   store: RunCheckpointStore,
-  input: CurrentBranchRunBaselineInput,
+  input: ExecutableRunBaselineInput,
 ): string {
   if (input.phase === "before") return fullCommit(input.headCommit);
-  const before = store.listNodeCheckpoints({
+  const candidates = store.listNodeCheckpoints({
     sessionId: input.sessionId,
     laneId: input.laneId,
     runId: input.runId,
     phase: "before",
-  }).find((checkpoint): checkpoint is RunCheckpointRecord =>
-    isRecord(checkpoint) &&
-    checkpoint.segmentId === input.segmentId &&
-    typeof checkpoint.headCommit === "string"
-  );
-  if (!before) throw new Error("After run changeset requires the matching before checkpoint.");
+  }).map(runCheckpointRecord);
+  if (candidates.length !== 1) {
+    throw new Error("After run changeset requires exactly one matching before checkpoint.");
+  }
+  const before = candidates[0]!;
+  const after: RunCheckpointRecord = {
+    id: `checkpoint:${input.runId}:after`,
+    sessionId: input.sessionId,
+    nodeId: input.nodeId,
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    runId: input.runId,
+    phase: "after",
+    executionTarget: input.executionTarget,
+    ...(input.worktreeId ? { worktreeId: input.worktreeId } : {}),
+    worktreePath: input.worktreePath,
+    branchName: input.branchName,
+    headCommit: fullCommit(input.headCommit),
+  };
+  assertMatchingCheckpointPair(before, after);
   return fullCommit(before.headCommit);
 }
 
