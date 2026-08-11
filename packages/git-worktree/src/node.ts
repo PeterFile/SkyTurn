@@ -2784,6 +2784,8 @@ async function git(
     stdoutMaxBytes: maxBytes,
     stderrMaxBytes: defaultMaxGitOutputBytes,
   });
+  const stdout = result.stdout.toString("utf8");
+  const stderr = result.stderr.toString("utf8");
   if (result.spawnError) {
     throw new Error(result.spawnError.message || `git ${args[0]} failed to spawn.`);
   }
@@ -2794,7 +2796,7 @@ async function git(
     throw new Error(`git ${args[0]} stderr exceeded the git output limit.`);
   }
   if (!allowExitCodes.has(result.exitCode ?? -1) && !result.stdoutTruncated) {
-    throw new Error(result.stderr.trim() || `git ${args[0]} failed with exit code ${result.exitCode ?? "unknown"}.`);
+    throw new Error(stderr.trim() || `git ${args[0]} failed with exit code ${result.exitCode ?? "unknown"}.`);
   }
-  return { stdout: result.stdout, truncated: result.stdoutTruncated };
+  return { stdout, truncated: result.stdoutTruncated };
 }

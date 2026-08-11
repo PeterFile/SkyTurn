@@ -121,8 +121,8 @@ describe("spawnBoundedGit", () => {
     ));
 
     expect(result).toMatchObject({
-      stdout: "oooo",
-      stderr: "eeee",
+      stdout: Buffer.from("oooo"),
+      stderr: Buffer.from("eeee"),
       stdoutTruncated: false,
       stderrTruncated: false,
       exitCode: 0,
@@ -151,8 +151,8 @@ describe("spawnBoundedGit", () => {
     await writeFile(fixture.releasePath, "release\n", "utf8");
 
     const result = await execution;
-    expect(result.stdout).toBe("oooo");
-    expect(Buffer.byteLength(result.stdout)).toBe(4);
+    expect(result.stdout).toEqual(Buffer.from("oooo"));
+    expect(result.stdout.byteLength).toBe(4);
     expect(result.stdoutTruncated).toBe(true);
     expect(result.stderrTruncated).toBe(true);
     expect(result.terminationRequested).toBe(true);
@@ -177,7 +177,7 @@ describe("spawnBoundedGit", () => {
     await writeFile(fixture.releasePath, "release\n", "utf8");
 
     const result = await execution;
-    expect(result.stderr).toBe("eeee");
+    expect(result.stderr).toEqual(Buffer.from("eeee"));
     expect(result.stderrTruncated).toBe(true);
     expect(result.terminationRequested).toBe(true);
     expect(readFileSync(fixture.signalPath, "utf8")).toBe("SIGTERM\n");
@@ -195,12 +195,28 @@ describe("spawnBoundedGit", () => {
       });
       expect(result.spawnError).toMatchObject({ code: "ENOENT" });
       expect(result.exitCode).toBe(-2);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toBe("");
+      expect(result.stdout).toEqual(Buffer.alloc(0));
+      expect(result.stderr).toEqual(Buffer.alloc(0));
     } finally {
       if (previousPath === undefined) delete process.env.PATH;
       else process.env.PATH = previousPath;
     }
+  });
+
+  it("preserves raw NUL and invalid UTF-8 bytes on stdout and stderr", async () => {
+    const fixture = await installGitFixture();
+
+    const result = await withFixturePath(fixture, () => spawnBoundedGit(
+      fixture.tempRoot,
+      ["raw-bytes", "8"],
+      { stdoutMaxBytes: 8, stderrMaxBytes: 8 },
+    ));
+
+    expect(result.stdout).toEqual(Buffer.from([0x00, 0xff, 0xc3, 0x28, 0x41]));
+    expect(result.stderr).toEqual(Buffer.from([0x80, 0x00, 0xfe, 0x42]));
+    expect(result.stdoutTruncated).toBe(false);
+    expect(result.stderrTruncated).toBe(false);
+    expect(result.exitCode).toBe(0);
   });
 });
 
@@ -244,6 +260,9 @@ function holdForTermination(writeOverflow) {
 if (mode === "exact") {
   process.stdout.write(Buffer.alloc(limit, "o"));
   process.stderr.write(Buffer.alloc(limit, "e"));
+} else if (mode === "raw-bytes") {
+  process.stdout.write(Buffer.from([0x00, 0xff, 0xc3, 0x28, 0x41]));
+  process.stderr.write(Buffer.from([0x80, 0x00, 0xfe, 0x42]));
 } else if (mode === "stdout-overflow") {
   holdForTermination(() => process.stderr.write(Buffer.alloc(limit + 1, "e")));
   process.stdout.write(Buffer.alloc(limit, "o"), () => {

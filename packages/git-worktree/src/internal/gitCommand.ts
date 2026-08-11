@@ -86,8 +86,8 @@ export interface BoundedGitSpawnError {
 }
 
 export interface BoundedGitSpawnResult {
-  stdout: string;
-  stderr: string;
+  stdout: Buffer;
+  stderr: Buffer;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
   exitCode: number | null;
@@ -157,8 +157,8 @@ export async function spawnBoundedGit(
   });
 
   return {
-    stdout: Buffer.concat(stdout.chunks, stdout.retainedBytes).toString("utf8"),
-    stderr: Buffer.concat(stderr.chunks, stderr.retainedBytes).toString("utf8"),
+    stdout: Buffer.concat(stdout.chunks, stdout.retainedBytes),
+    stderr: Buffer.concat(stderr.chunks, stderr.retainedBytes),
     stdoutTruncated: stdout.truncated,
     stderrTruncated: stderr.truncated,
     exitCode: closed.exitCode,
@@ -212,8 +212,8 @@ function normalizeSpawnError(error: unknown): BoundedGitSpawnError {
 
 function failedSpawnResult(spawnError: BoundedGitSpawnError): BoundedGitSpawnResult {
   return {
-    stdout: "",
-    stderr: "",
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.alloc(0),
     stdoutTruncated: false,
     stderrTruncated: false,
     exitCode: null,
