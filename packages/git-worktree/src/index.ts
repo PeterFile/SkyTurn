@@ -94,6 +94,33 @@ export interface DeliveryCommitEvidence {
   check: DeliveryCommitCheckResult;
 }
 
+export interface CandidateCommitExpectation {
+  readonly repositoryIdentity: string;
+  readonly worktreeIdentity: string;
+  readonly branchName: string;
+  readonly beforeHeadCommit: string;
+  readonly afterHeadCommit: string;
+  readonly ancestryProofSha256: string;
+  readonly fullPatchSha256: string;
+  readonly fullPatchByteLength: number;
+  readonly fileManifestSha256: string;
+}
+
+export interface CandidateDeliveryCommitInput {
+  projectRoot: string;
+  worktreePath: string;
+  expected: CandidateCommitExpectation;
+  subject: string;
+  body?: string;
+}
+
+export interface CandidateDeliveryCommitEvidence {
+  status: "committed";
+  commitSha: string;
+  branch: string;
+  parentCommit: string;
+}
+
 export interface ManagedWorktreeCreateInput {
   sessionId: string;
   variantId: string;
