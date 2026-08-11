@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
@@ -29,6 +30,9 @@ import {
   type ChangesetReconciliationInput,
   type ChangesetReconciliationService,
   type ChangesetService,
+  type CandidateCommitExpectation,
+  type CandidateDeliveryCommitEvidence,
+  type CandidateDeliveryCommitInput,
   type DeliveryCommandResult,
   type DeliveryCommitErrorCode,
   type DeliveryCommitEvidence,
@@ -68,7 +72,11 @@ import {
   type AtomicGitChangesetSnapshot,
   type GitChangesetBaseline,
 } from "./internal/gitChangesetSnapshot.js";
-import { sanitizedGitEnvironment, spawnBoundedGit } from "./internal/gitCommand.js";
+import {
+  publishPreparedCandidateRef,
+  sanitizedGitEnvironment,
+  spawnBoundedGit,
+} from "./internal/gitCommand.js";
 
 export { parseVariantComparisonEvidence, parseWorktreeComparisonRequest };
 export { SKYTURN_VOLATILE_GIT_PATHS };
@@ -161,6 +169,22 @@ const gitOutputLimit = 8 * 1024 * 1024;
 const patchPreviewLimit = 24 * 1024;
 const defaultMaxPatchPreviewBytes = 64 * 1024;
 const defaultMaxGitOutputBytes = 1024 * 1024;
+const candidateCommitMessageMaxBytes = 1024 * 1024;
+const candidateGitMetadataMaxBytes = DEFAULT_MAX_FULL_PATCH_BYTES;
+const candidateGitStderrMaxBytes = 64 * 1024;
+const candidateExpectationKeys = [
+  "afterHeadCommit",
+  "ancestryProofSha256",
+  "beforeHeadCommit",
+  "branchName",
+  "fileManifestSha256",
+  "fullPatchByteLength",
+  "fullPatchSha256",
+  "repositoryIdentity",
+  "worktreeIdentity",
+] as const;
+const candidateRejectedMessage = "Candidate delivery commit was rejected.";
+const candidateInvalidMessage = "Candidate delivery commit input is invalid.";
 
 export class GitCommandError extends Error {
   readonly stderr: string;
@@ -1081,7 +1105,7 @@ export async function resetRollbackWorktreeToCommit(input: RollbackWorktreeInput
 export async function createDeliveryCommit(input: DeliveryCommitInput): Promise<DeliveryCommitEvidence> {
   assertDeliveryReconciliationStatus(input.reconciliationStatus, input.acceptMismatch === true);
   const subject = normalizeCommitSubject(input.subject);
-  const body = typeof input.body === "string" && input.body.trim().length > 0 ? input.body.trim() : undefined;
+  const body = normalizeCommitBody(input.body);
   const worktreePath = await resolveDeliveryWorktreePath(input.projectRoot, input.worktreePath);
   const files = await normalizeDeliveryFileList(worktreePath, input.files);
   const statusLines = parseStatusLines((await git(
@@ -1132,6 +1156,59 @@ export async function createDeliveryCommit(input: DeliveryCommitInput): Promise<
       files: committedFiles,
     },
   };
+}
+
+export async function createCandidateDeliveryCommit(
+  input: CandidateDeliveryCommitInput,
+): Promise<CandidateDeliveryCommitEvidence> {
+  const parsedInput = parseCandidateDeliveryCommitInput(input);
+
+  try {
+    const projectRoot = await assertGitRepo(parsedInput.projectRoot);
+    const worktreePath = await resolveDeliveryWorktreePath(projectRoot, parsedInput.worktreePath);
+    await assertCandidateBranchName(worktreePath, parsedInput.expected.branchName);
+    await assertCandidateSha1Repository(worktreePath);
+    await assertCandidateLiveCheckout(worktreePath, parsedInput.expected);
+    await assertCandidateAncestryExpectation(projectRoot, worktreePath, parsedInput.expected);
+
+    const snapshot = await collectAtomicGitChangesetSnapshot({
+      repoRoot: worktreePath,
+      baseline: { kind: "ref", ref: parsedInput.expected.beforeHeadCommit },
+      maxPatchPreviewBytes: 1,
+      maxFullPatchBytes: DEFAULT_MAX_FULL_PATCH_BYTES,
+    });
+    assertCandidateSnapshot(snapshot, parsedInput.expected);
+
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "skyturn-candidate-commit-"));
+    let published = false;
+    try {
+      await chmod(temporaryRoot, 0o700);
+      const indexFile = resolve(temporaryRoot, "index");
+      const evidence = await publishCandidateSnapshot(
+        projectRoot,
+        worktreePath,
+        indexFile,
+        snapshot,
+        parsedInput.expected,
+        parsedInput.message,
+      );
+      published = true;
+      return evidence;
+    } finally {
+      try {
+        await rm(temporaryRoot, { recursive: true, force: true });
+      } catch {
+        try {
+          await rm(temporaryRoot, { recursive: true, force: true });
+        } catch (error) {
+          if (!published) throw error;
+        }
+      }
+    }
+  } catch (error) {
+    if (error instanceof DeliveryCommitError && error.message === candidateRejectedMessage) throw error;
+    throwDelivery("DELIVERY_REJECTED", candidateRejectedMessage);
+  }
 }
 
 export async function pushDeliveryBranch(input: DeliveryPushInput): Promise<DeliveryPushEvidence> {
@@ -1734,6 +1811,447 @@ function normalizeCommitSubject(value: string): string {
     throwDelivery("INVALID_INPUT", "Commit subject must use Conventional Commits format.");
   }
   return subject;
+}
+
+function normalizeCommitBody(value: string | undefined): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+interface ParsedCandidateDeliveryCommitInput {
+  readonly projectRoot: string;
+  readonly worktreePath: string;
+  readonly expected: CandidateCommitExpectation;
+  readonly message: Buffer;
+}
+
+function parseCandidateDeliveryCommitInput(value: unknown): ParsedCandidateDeliveryCommitInput {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("Invalid candidate input.");
+    }
+    const record = value as Record<string, unknown>;
+    const projectRoot = record.projectRoot;
+    const worktreePath = record.worktreePath;
+    const expectedValue = record.expected;
+    const subjectValue = record.subject;
+    const bodyValue = record.body;
+    if (
+      typeof projectRoot !== "string"
+      || projectRoot.length === 0
+      || projectRoot.includes("\0")
+      || typeof worktreePath !== "string"
+      || worktreePath.length === 0
+      || worktreePath.includes("\0")
+    ) {
+      throw new Error("Invalid candidate path input.");
+    }
+    return Object.freeze({
+      projectRoot,
+      worktreePath,
+      expected: validateCandidateCommitExpectation(expectedValue),
+      message: candidateCommitMessage(subjectValue, bodyValue),
+    });
+  } catch {
+    throwDelivery("INVALID_INPUT", candidateInvalidMessage);
+  }
+}
+
+function validateCandidateCommitExpectation(value: unknown): CandidateCommitExpectation {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throwDelivery("INVALID_INPUT", candidateInvalidMessage);
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (
+    keys.length !== candidateExpectationKeys.length
+    || keys.some((key, index) => key !== candidateExpectationKeys[index])
+    || !isCanonicalLowercaseHex(record.repositoryIdentity, 64)
+    || !isCanonicalLowercaseHex(record.worktreeIdentity, 64)
+    || !isBoundedCandidateBranch(record.branchName)
+    || !isCanonicalLowercaseHex(record.beforeHeadCommit, 40)
+    || !isCanonicalLowercaseHex(record.afterHeadCommit, 40)
+    || !isCanonicalLowercaseHex(record.ancestryProofSha256, 64)
+    || !isCanonicalLowercaseHex(record.fullPatchSha256, 64)
+    || !Number.isSafeInteger(record.fullPatchByteLength)
+    || (record.fullPatchByteLength as number) <= 0
+    || (record.fullPatchByteLength as number) > DEFAULT_MAX_FULL_PATCH_BYTES
+    || !isCanonicalLowercaseHex(record.fileManifestSha256, 64)
+  ) {
+    throwDelivery("INVALID_INPUT", candidateInvalidMessage);
+  }
+  return Object.freeze({
+    repositoryIdentity: record.repositoryIdentity as string,
+    worktreeIdentity: record.worktreeIdentity as string,
+    branchName: record.branchName as string,
+    beforeHeadCommit: record.beforeHeadCommit as string,
+    afterHeadCommit: record.afterHeadCommit as string,
+    ancestryProofSha256: record.ancestryProofSha256 as string,
+    fullPatchSha256: record.fullPatchSha256 as string,
+    fullPatchByteLength: record.fullPatchByteLength as number,
+    fileManifestSha256: record.fileManifestSha256 as string,
+  });
+}
+
+function isCanonicalLowercaseHex(value: unknown, length: number): value is string {
+  return typeof value === "string" && new RegExp(`^[0-9a-f]{${length}}$`).test(value);
+}
+
+function isBoundedCandidateBranch(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= 1_024
+    && !value.includes("\0")
+    && !value.includes("\r")
+    && !value.includes("\n");
+}
+
+function candidateCommitMessage(subjectValue: unknown, bodyValue: unknown): Buffer {
+  if (
+    typeof subjectValue !== "string"
+    || subjectValue.length > candidateCommitMessageMaxBytes
+    || Buffer.byteLength(subjectValue, "utf8") > candidateCommitMessageMaxBytes
+    || (bodyValue !== undefined && (
+      typeof bodyValue !== "string"
+      || bodyValue.length > candidateCommitMessageMaxBytes
+      || Buffer.byteLength(bodyValue, "utf8") > candidateCommitMessageMaxBytes
+    ))
+  ) {
+    throwDelivery("INVALID_INPUT", candidateInvalidMessage);
+  }
+  const subject = normalizeCommitSubject(subjectValue);
+  const normalizedBody = bodyValue === undefined ? undefined : bodyValue.trim();
+  const body = normalizedBody && normalizedBody.length > 0 ? normalizedBody : undefined;
+  const messageByteLength = Buffer.byteLength(subject, "utf8")
+    + 1
+    + (body === undefined ? 0 : Buffer.byteLength(body, "utf8") + 2);
+  if (messageByteLength > candidateCommitMessageMaxBytes) {
+    throwDelivery("INVALID_INPUT", candidateInvalidMessage);
+  }
+  return Buffer.from(body === undefined ? `${subject}\n` : `${subject}\n\n${body}\n`, "utf8");
+}
+
+async function assertCandidateBranchName(cwd: string, branchName: string): Promise<void> {
+  await runCandidateGit(cwd, ["check-ref-format", "--branch", branchName]);
+}
+
+async function assertCandidateSha1Repository(cwd: string): Promise<void> {
+  const objectFormat = await candidateGitLine(cwd, ["rev-parse", "--show-object-format"]);
+  if (objectFormat !== "sha1") throw new Error("Unsupported Git object format.");
+}
+
+async function assertCandidateLiveCheckout(
+  cwd: string,
+  expected: CandidateCommitExpectation,
+): Promise<void> {
+  const branch = await candidateGitLine(cwd, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  const headCommit = await candidateGitCommit(cwd, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    "HEAD^{commit}",
+  ]);
+  const branchCommit = await candidateGitCommit(cwd, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${candidateBranchRef(expected.branchName)}^{commit}`,
+  ]);
+  if (
+    branch !== expected.branchName
+    || headCommit !== expected.afterHeadCommit
+    || branchCommit !== expected.afterHeadCommit
+  ) {
+    throw new Error("Candidate checkout facts differ from the expectation.");
+  }
+}
+
+async function assertCandidateAncestryExpectation(
+  projectRoot: string,
+  worktreePath: string,
+  expected: CandidateCommitExpectation,
+): Promise<void> {
+  const serializedProof = await createWorkflowGitAncestryProof({
+    repositoryPath: projectRoot,
+    worktreePath,
+    beforeHeadCommit: expected.beforeHeadCommit,
+    afterHeadCommit: expected.afterHeadCommit,
+  });
+  const expectedContext = createWorkflowGitAncestryProofContext(
+    expected.beforeHeadCommit,
+    expected.afterHeadCommit,
+    expected.repositoryIdentity,
+    expected.worktreeIdentity,
+  );
+  parseWorkflowGitAncestryProof(serializedProof, expectedContext);
+  if (sha256CandidateBytes(Buffer.from(serializedProof, "utf8")) !== expected.ancestryProofSha256) {
+    throw new Error("Candidate ancestry proof digest differs from the expectation.");
+  }
+}
+
+function assertCandidateSnapshot(
+  snapshot: AtomicGitChangesetSnapshot,
+  expected: CandidateCommitExpectation,
+): void {
+  if (
+    snapshot.baselineCommit !== expected.beforeHeadCommit
+    || snapshot.headCommit !== expected.afterHeadCommit
+    || snapshot.files.length === 0
+    || snapshot.fullPatch.byteLength === 0
+    || snapshot.fullPatchSha256 !== expected.fullPatchSha256
+    || snapshot.fullPatchByteLength !== expected.fullPatchByteLength
+    || snapshot.fileManifestSha256 !== expected.fileManifestSha256
+  ) {
+    throw new Error("Candidate changeset differs from the expectation.");
+  }
+}
+
+async function publishCandidateSnapshot(
+  projectRoot: string,
+  worktreePath: string,
+  indexFile: string,
+  snapshot: AtomicGitChangesetSnapshot,
+  expected: CandidateCommitExpectation,
+  message: Buffer,
+): Promise<CandidateDeliveryCommitEvidence> {
+  const indexOptions = { internalGitIndexFile: indexFile } as const;
+  await runCandidateGit(worktreePath, ["read-tree", expected.beforeHeadCommit], indexOptions);
+  await runCandidateGit(worktreePath, [
+    "apply",
+    "--cached",
+    "--binary",
+    "--whitespace=nowarn",
+    "-",
+  ], {
+    ...indexOptions,
+    stdin: snapshot.fullPatch,
+    stdinMaxBytes: DEFAULT_MAX_FULL_PATCH_BYTES,
+  });
+  if (expected.beforeHeadCommit !== expected.afterHeadCommit) {
+    await runCandidateGit(worktreePath, [
+      "reset",
+      "--quiet",
+      "--no-refresh",
+      expected.afterHeadCommit,
+      "--",
+      ...candidateVolatilePathspecs(),
+    ], indexOptions);
+  }
+
+  const manifestOutput = await runCandidateGit(worktreePath, [
+    "diff",
+    "--cached",
+    "--name-only",
+    "-z",
+    "--no-renames",
+    "--no-ext-diff",
+    "--no-textconv",
+    expected.beforeHeadCommit,
+    "--",
+    ...skyturnGitEvidencePathspecs,
+  ], indexOptions);
+  const files = parseCandidateFileManifest(manifestOutput);
+  if (
+    !sameOrderedStrings(files, snapshot.files)
+    || hashCandidateFileManifest(files) !== expected.fileManifestSha256
+  ) {
+    throw new Error("Candidate isolated index manifest differs from the expectation.");
+  }
+
+  const tree = await candidateGitCommit(worktreePath, ["write-tree"], indexOptions);
+  const parentTree = await candidateGitCommit(worktreePath, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${expected.afterHeadCommit}^{tree}`,
+  ]);
+  if (tree === parentTree) throw new Error("Candidate tree is empty relative to its parent.");
+
+  const commitSha = await candidateGitCommit(worktreePath, [
+    "commit-tree",
+    tree,
+    "-p",
+    expected.afterHeadCommit,
+    "-F",
+    "-",
+  ], {
+    stdin: message,
+    stdinMaxBytes: candidateCommitMessageMaxBytes,
+  });
+
+  await assertCandidateIdentityStillMatches(projectRoot, worktreePath, expected);
+  const branchRef = candidateBranchRef(expected.branchName);
+  const branchHead = await candidateGitCommit(worktreePath, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${branchRef}^{commit}`,
+  ]);
+  if (branchHead !== expected.afterHeadCommit) throw new Error("Candidate branch advanced.");
+  await publishPreparedCandidateRef(worktreePath, {
+    branchRef,
+    candidateCommit: commitSha,
+    expectedHeadCommit: expected.afterHeadCommit,
+  });
+
+  const publishedCommit = await candidateGitCommit(worktreePath, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${branchRef}^{commit}`,
+  ]);
+  const publishedParent = await candidateGitCommit(worktreePath, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${commitSha}^1`,
+  ]);
+  const publishedTree = await candidateGitCommit(worktreePath, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${commitSha}^{tree}`,
+  ]);
+  if (
+    publishedCommit !== commitSha
+    || publishedParent !== expected.afterHeadCommit
+    || publishedTree !== tree
+  ) {
+    throw new Error("Candidate publication verification failed.");
+  }
+  return {
+    status: "committed",
+    commitSha,
+    branch: expected.branchName,
+    parentCommit: expected.afterHeadCommit,
+  };
+}
+
+async function assertCandidateIdentityStillMatches(
+  projectRoot: string,
+  worktreePath: string,
+  expected: CandidateCommitExpectation,
+): Promise<void> {
+  const live = await createLiveWorkflowGitAncestryProofContext({
+    repositoryPath: projectRoot,
+    worktreePath,
+    beforeHeadCommit: expected.beforeHeadCommit,
+    afterHeadCommit: expected.afterHeadCommit,
+  });
+  if (
+    live.repositoryIdentity !== expected.repositoryIdentity
+    || live.worktreeIdentity !== expected.worktreeIdentity
+  ) {
+    throw new Error("Candidate Git identity changed.");
+  }
+}
+
+function candidateBranchRef(branchName: string): string {
+  return `refs/heads/${branchName}`;
+}
+
+function candidateVolatilePathspecs(): string[] {
+  return SKYTURN_VOLATILE_GIT_PATHS.map((path) => (
+    path.includes("**") ? `:(top,glob)${path}` : `:(top,literal)${path}`
+  ));
+}
+
+function parseCandidateFileManifest(raw: Buffer): string[] {
+  if (raw.byteLength === 0 || raw[raw.byteLength - 1] !== 0) {
+    throw new Error("Candidate file manifest is malformed.");
+  }
+  const files: string[] = [];
+  let start = 0;
+  for (let index = 0; index < raw.byteLength; index += 1) {
+    if (raw[index] !== 0) continue;
+    const bytes = raw.subarray(start, index);
+    const file = bytes.toString("utf8");
+    if (
+      bytes.byteLength === 0
+      || !Buffer.from(file, "utf8").equals(bytes)
+      || isAbsolute(file)
+      || /^[A-Za-z]:[\\/]/.test(file)
+      || file.split("/").some((part) => part === "" || part === "." || part === "..")
+    ) {
+      throw new Error("Candidate file manifest is malformed.");
+    }
+    files.push(file);
+    start = index + 1;
+  }
+  const canonical = [...new Set(files)].sort(compareCandidateUtf8);
+  if (canonical.length !== files.length) throw new Error("Candidate file manifest contains duplicates.");
+  return canonical;
+}
+
+function hashCandidateFileManifest(files: string[]): string {
+  return hashWorkflowGitIdentity("skyturn-git-file-manifest-v1", files);
+}
+
+function sha256CandidateBytes(value: Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function compareCandidateUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function sameOrderedStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+interface CandidateGitOptions {
+  readonly stdin?: Buffer;
+  readonly stdinMaxBytes?: number;
+  readonly internalGitIndexFile?: string;
+}
+
+async function runCandidateGit(
+  cwd: string,
+  args: readonly string[],
+  options: CandidateGitOptions = {},
+): Promise<Buffer> {
+  const result = await spawnBoundedGit(cwd, args, {
+    stdoutMaxBytes: candidateGitMetadataMaxBytes,
+    stderrMaxBytes: candidateGitStderrMaxBytes,
+    ...options,
+  });
+  if (
+    result.spawnError
+    || result.terminationError
+    || result.stdoutTruncated
+    || result.stderrTruncated
+    || result.exitCode !== 0
+  ) {
+    throwDelivery("DELIVERY_REJECTED", candidateRejectedMessage);
+  }
+  return result.stdout;
+}
+
+async function candidateGitLine(
+  cwd: string,
+  args: readonly string[],
+  options: CandidateGitOptions = {},
+): Promise<string> {
+  const raw = await runCandidateGit(cwd, args, options);
+  const value = raw.toString("utf8");
+  if (
+    !Buffer.from(value, "utf8").equals(raw)
+    || !value.endsWith("\n")
+    || value.includes("\r")
+    || value.slice(0, -1).includes("\n")
+  ) {
+    throw new Error("Candidate Git output is malformed.");
+  }
+  return value.slice(0, -1);
+}
+
+async function candidateGitCommit(
+  cwd: string,
+  args: readonly string[],
+  options: CandidateGitOptions = {},
+): Promise<string> {
+  const commit = await candidateGitLine(cwd, args, options);
+  if (!isCanonicalLowercaseHex(commit, 40)) throw new Error("Candidate Git object ID is malformed.");
+  return commit;
 }
 
 async function resolveDeliveryWorktreePath(projectRoot: string, worktreePath: string): Promise<string> {

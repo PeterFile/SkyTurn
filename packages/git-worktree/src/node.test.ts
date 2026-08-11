@@ -1,4 +1,5 @@
 import { ChildProcess, execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink as fsSymlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,12 +11,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption, WorkflowWorktreeIdentity } from "@skyturn/project-core";
 import {
   checkDeliveryPullRequest,
+  createCandidateDeliveryCommit,
   createDeliveryCommit,
   createDeliveryPullRequest,
   createGitChangesetService,
   createLiveWorkflowGitAncestryProofContext,
   createNodeGitWorktreeService,
   createWorkflowGitAncestryProof,
+  DeliveryCommitError,
   evaluateRollbackWorktreeState,
   getGitCheckpointSnapshot,
   mergeDeliveryPullRequest,
@@ -30,6 +33,7 @@ import {
   type ManagedWorktreeWorkflowEvent,
   worktreeMetadataForVariant,
 } from "./node.js";
+import type { CandidateCommitExpectation } from "./index.js";
 
 const execFileAsync = promisify(execFile);
 const changesetTempRoots: string[] = [];
@@ -46,6 +50,15 @@ function git(cwd: string, args: string[]): string {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
+}
+
+function gitBuffer(cwd: string, args: string[]): Buffer {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "buffer",
+    maxBuffer: 2 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
 async function createTestRepo(prefix: string): Promise<TestRepo> {
@@ -1575,6 +1588,675 @@ describe("delivery commits", () => {
   });
 });
 
+describe("candidate delivery commits", () => {
+  const tempRoots: string[] = [];
+  const candidateMessageMaxBytes = 1024 * 1024;
+
+  afterEach(() => {
+    for (const root of tempRoots.splice(0)) {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes the reviewed tree with minimal evidence without changing the real index", async () => {
+    const repo = await createTestRepo("skyturn-candidate-commit-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const indexPath = git(repo.repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const indexBefore = readFileSync(indexPath);
+
+    const evidence = await createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): publish reviewed candidate",
+      body: "Build the commit from reviewed patch bytes.",
+    });
+
+    expect(evidence).toEqual({
+      status: "committed",
+      commitSha: expect.stringMatching(/^[0-9a-f]{40}$/),
+      branch: "main",
+      parentCommit: headCommit,
+    });
+    expect(git(repo.repoRoot, ["show", `${evidence.commitSha}:feature.txt`])).toBe("reviewed");
+    expect(readFileSync(indexPath)).toEqual(indexBefore);
+  });
+
+  it("sanitizes candidate input proxy traps and throwing getters", async () => {
+    const sensitive = "/private/review/SENSITIVE_FILE.txt: SENSITIVE_REVIEWED_CONTENT";
+    const trap = () => {
+      throw new Error(sensitive);
+    };
+    const expected = {
+      repositoryIdentity: "0".repeat(64),
+      worktreeIdentity: "1".repeat(64),
+      branchName: "main",
+      beforeHeadCommit: "2".repeat(40),
+      afterHeadCommit: "3".repeat(40),
+      ancestryProofSha256: "4".repeat(64),
+      fullPatchSha256: "5".repeat(64),
+      fullPatchByteLength: 1,
+      fileManifestSha256: "6".repeat(64),
+    };
+    const expectedWithGetter = { ...expected };
+    Object.defineProperty(expectedWithGetter, "repositoryIdentity", { enumerable: true, get: trap });
+    const cases: unknown[] = [
+      new Proxy({}, { get: trap }),
+      { get expected() { return trap(); } },
+      {
+        projectRoot: "/unused",
+        worktreePath: "/unused",
+        expected: new Proxy(expected, { getPrototypeOf: trap }),
+        subject: "feat(delivery): reject trapped expectation",
+      },
+      {
+        projectRoot: "/unused",
+        worktreePath: "/unused",
+        expected: expectedWithGetter,
+        subject: "feat(delivery): reject trapped expectation field",
+      },
+      {
+        projectRoot: "/unused",
+        worktreePath: "/unused",
+        expected,
+        get subject() { return trap(); },
+      },
+      {
+        projectRoot: "/unused",
+        worktreePath: "/unused",
+        expected,
+        subject: "feat(delivery): reject trapped body",
+        get body() { return trap(); },
+      },
+    ];
+
+    for (const candidateInput of cases) {
+      let caught: unknown;
+      try {
+        await createCandidateDeliveryCommit(
+          candidateInput as Parameters<typeof createCandidateDeliveryCommit>[0],
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(DeliveryCommitError);
+      expect((caught as DeliveryCommitError).code).toBe("INVALID_INPUT");
+      expect((caught as DeliveryCommitError).message).toBe("Candidate delivery commit input is invalid.");
+      expect(String(caught)).toBe("DeliveryCommitError: Candidate delivery commit input is invalid.");
+      expect(JSON.stringify(caught)).not.toContain(sensitive);
+    }
+  });
+
+  it("rejects malformed or oversized raw message fields before normalization or Git side effects", async () => {
+    const repo = await createTestRepo("skyturn-candidate-raw-message-limit-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed raw limit\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const indexBefore = gitBuffer(repo.repoRoot, ["ls-files", "--stage", "-z"]);
+    const objectsBefore = git(repo.repoRoot, ["count-objects", "-v"]);
+    const statusBefore = git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
+
+    const validInput = {
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): reject oversized raw body",
+    };
+    const invalidInputs: unknown[] = [
+      { ...validInput, subject: 42 },
+      { ...validInput, body: null },
+      {
+        ...validInput,
+        subject: `${" ".repeat(candidateMessageMaxBytes)}feat(delivery): reject oversized raw subject`,
+      },
+      { ...validInput, body: " ".repeat(candidateMessageMaxBytes + 1) },
+    ];
+
+    for (const invalidInput of invalidInputs) {
+      await expect(createCandidateDeliveryCommit(
+        invalidInput as Parameters<typeof createCandidateDeliveryCommit>[0],
+      )).rejects.toMatchObject({
+        code: "INVALID_INPUT",
+        message: "Candidate delivery commit input is invalid.",
+      });
+    }
+
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+    expect(gitBuffer(repo.repoRoot, ["ls-files", "--stage", "-z"])).toEqual(indexBefore);
+    expect(git(repo.repoRoot, ["count-objects", "-v"])).toBe(objectsBefore);
+    expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe(statusBefore);
+  });
+
+  it("enforces the exact final candidate message byte limit before Git side effects", async () => {
+    const repo = await createTestRepo("skyturn-candidate-final-message-limit-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed exact limit\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const subject = "feat(delivery): enforce exact candidate message limit";
+    const exactBody = "b".repeat(candidateMessageMaxBytes - Buffer.byteLength(subject, "utf8") - 3);
+    const rejectedBodies = [
+      "b".repeat(candidateMessageMaxBytes + 1),
+      `${exactBody}b`,
+    ];
+    const indexBefore = gitBuffer(repo.repoRoot, ["ls-files", "--stage", "-z"]);
+    const objectsBefore = git(repo.repoRoot, ["count-objects", "-v"]);
+    const statusBefore = git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
+
+    for (const body of rejectedBodies) {
+      await expect(createCandidateDeliveryCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        expected,
+        subject,
+        body,
+      })).rejects.toMatchObject({
+        code: "INVALID_INPUT",
+        message: "Candidate delivery commit input is invalid.",
+      });
+      expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+      expect(gitBuffer(repo.repoRoot, ["ls-files", "--stage", "-z"])).toEqual(indexBefore);
+      expect(git(repo.repoRoot, ["count-objects", "-v"])).toBe(objectsBefore);
+      expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe(statusBefore);
+    }
+
+    const evidence = await createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject,
+      body: exactBody,
+    });
+    const commitBytes = gitBuffer(repo.repoRoot, ["cat-file", "commit", evidence.commitSha]);
+    const messageOffset = commitBytes.indexOf("\n\n") + 2;
+    expect(messageOffset).toBeGreaterThan(1);
+    expect(commitBytes.subarray(messageOffset)).toHaveLength(candidateMessageMaxBytes);
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a delivery branch converted to symbolic when prepared publication begins", async () => {
+    const repo = await createTestRepo("skyturn-candidate-symbolic-branch-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed symbolic candidate\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    git(repo.repoRoot, ["branch", "victim", headCommit]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const wrapper = await installCandidateSymbolicBranchWrapper(repo.repoRoot, "refs/heads/main", "refs/heads/victim");
+
+    await expect(withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): reject symbolic delivery branch",
+    }))).rejects.toThrow("Candidate delivery commit was rejected.");
+
+    expect(git(repo.repoRoot, ["symbolic-ref", "refs/heads/main"])).toBe("refs/heads/victim");
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/victim"])).toBe(headCommit);
+    expect(readFileSync(wrapper.protocolPath, "utf8").trim().split("\n")).toEqual([
+      "start",
+      "option no-deref",
+      expect.stringMatching(new RegExp(`^update refs/heads/main [0-9a-f]{40} ${headCommit}$`)),
+      "prepare",
+      "abort",
+    ]);
+    const unreachableCommits = git(repo.repoRoot, [
+      "fsck",
+      "--unreachable",
+      "--no-reflogs",
+      "--no-progress",
+    ]).split("\n").flatMap((line) => {
+      const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
+      return match ? [match[1]] : [];
+    });
+    expect(unreachableCommits).toHaveLength(1);
+    const candidateCommit = unreachableCommits[0];
+    expect(git(repo.repoRoot, ["show", `${candidateCommit}:feature.txt`])).toBe("reviewed symbolic candidate");
+    const branchCommits = git(repo.repoRoot, [
+      "for-each-ref",
+      "--format=%(objectname)",
+      "refs/heads",
+    ]).split("\n");
+    expect(branchCommits).not.toContain(candidateCommit);
+  });
+
+  it.skipIf(process.platform === "win32")("aborts a malformed prepared-transaction protocol without changing the branch", async () => {
+    const repo = await createTestRepo("skyturn-candidate-protocol-failure-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed protocol failure\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const wrapper = await installCandidateProtocolFailureWrapper(repo.repoRoot);
+
+    let exposed = "";
+    try {
+      await withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        expected,
+        subject: "feat(delivery): reject malformed publication protocol",
+      }));
+    } catch (error) {
+      exposed = String(error);
+    }
+
+    expect(exposed).toBe("DeliveryCommitError: Candidate delivery commit was rejected.");
+    expect(exposed.length).toBeLessThan(128);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+    expect(readFileSync(wrapper.protocolPath, "utf8").trim().split("\n")).toEqual([
+      "start",
+      "abort",
+    ]);
+  });
+
+  it.skipIf(process.platform === "win32")("terminates a silent prepared transaction and releases its lock", async () => {
+    const repo = await createTestRepo("skyturn-candidate-silent-prepare-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed silent candidate\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const wrapper = await installCandidateSilentPrepareWrapper(repo.repoRoot);
+
+    const startedAt = Date.now();
+    let exposed = "";
+    try {
+      await withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        expected,
+        subject: "feat(delivery): reject silent prepared publication",
+      }));
+    } catch (error) {
+      exposed = String(error);
+    }
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(exposed).toBe("DeliveryCommitError: Candidate delivery commit was rejected.");
+    expect(elapsedMs).toBeLessThan(12_000);
+    expect(readFileSync(wrapper.protocolPath, "utf8").trim().split("\n")).toEqual([
+      "start",
+      "option no-deref",
+      expect.stringMatching(new RegExp(`^update refs/heads/main [0-9a-f]{40} ${headCommit}$`)),
+      "prepare",
+    ]);
+    expect(existsSync(wrapper.terminationPath)).toBe(true);
+    expect(existsSync(wrapper.lockMarkerPath)).toBe(false);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+    const unreachableCommits = git(repo.repoRoot, [
+      "fsck",
+      "--unreachable",
+      "--no-reflogs",
+      "--no-progress",
+    ]).split("\n").flatMap((line) => {
+      const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
+      return match ? [match[1]] : [];
+    });
+    expect(unreachableCommits).toHaveLength(1);
+    const branchCommits = git(repo.repoRoot, [
+      "for-each-ref",
+      "--format=%(objectname)",
+      "refs/heads",
+    ]).split("\n");
+    expect(branchCommits).not.toContain(unreachableCommits[0]);
+  }, 25_000);
+
+  it.skipIf(process.platform === "win32")("terminates and reaps silent prepared-ref validation before aborting publication", async () => {
+    const repo = await createTestRepo("skyturn-candidate-silent-validation-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed silent validation\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const wrapper = await installCandidateSilentValidationWrapper(repo.repoRoot);
+
+    const startedAt = Date.now();
+    await expect(withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): reject silent prepared-ref validation",
+    }))).rejects.toThrow("Candidate delivery commit was rejected.");
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(elapsedMs).toBeLessThan(10_000);
+    expect(readFileSync(wrapper.protocolPath, "utf8").trim().split("\n")).toEqual([
+      "start",
+      "option no-deref",
+      expect.stringMatching(new RegExp(`^update refs/heads/main [0-9a-f]{40} ${headCommit}$`)),
+      "prepare",
+      "abort",
+    ]);
+    expect(existsSync(wrapper.validationTerminationPath)).toBe(true);
+    expect(existsSync(wrapper.validationLivePath)).toBe(false);
+    expect(existsSync(wrapper.validationClosedPath)).toBe(true);
+    expect(existsSync(wrapper.abortAfterValidationClosePath)).toBe(true);
+    expect(existsSync(wrapper.updateRefClosedPath)).toBe(true);
+    expect(existsSync(wrapper.lockMarkerPath)).toBe(false);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+    const unreachableCommits = git(repo.repoRoot, [
+      "fsck",
+      "--unreachable",
+      "--no-reflogs",
+      "--no-progress",
+    ]).split("\n").flatMap((line) => {
+      const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
+      return match ? [match[1]] : [];
+    });
+    expect(unreachableCommits).toHaveLength(1);
+    const branchCommits = git(repo.repoRoot, [
+      "for-each-ref",
+      "--format=%(objectname)",
+      "refs/heads",
+    ]).split("\n");
+    expect(branchCommits).not.toContain(unreachableCommits[0]);
+  }, 20_000);
+
+  it.skipIf(process.platform === "win32")("bounds prepared-transaction output and leaves the branch unchanged", async () => {
+    const repo = await createTestRepo("skyturn-candidate-protocol-overflow-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed protocol overflow\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const wrapper = await installCandidateProtocolOverflowWrapper(repo.repoRoot);
+
+    let exposed = "";
+    try {
+      await withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        expected,
+        subject: "feat(delivery): reject oversized publication output",
+      }));
+    } catch (error) {
+      exposed = String(error);
+    }
+
+    expect(exposed).toBe("DeliveryCommitError: Candidate delivery commit was rejected.");
+    expect(exposed.length).toBeLessThan(128);
+    expect(exposed).not.toContain("SENSITIVE_PROTOCOL_OUTPUT");
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+  });
+
+  it.skipIf(process.platform === "win32")("rebuilds a mixed B-to-H candidate tree and inherits volatile paths from H", async () => {
+    const repo = await createTestRepo("skyturn-candidate-mixed-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "text.txt"), "base text\n");
+    await writeFile(join(repo.repoRoot, "binary.bin"), Buffer.from([0, 1, 2, 0, 3]));
+    await writeFile(join(repo.repoRoot, "delete.txt"), "delete me\n");
+    await writeFile(join(repo.repoRoot, "mode.sh"), "#!/bin/sh\nexit 0\n");
+    await fsSymlink("old-target", join(repo.repoRoot, "link"));
+    const volatileBaseFiles = new Map([
+      [".devflow/skyturn-workflow.sqlite", "base sqlite\n"],
+      [".devflow/skyturn-workflow.sqlite-wal", "base wal\n"],
+      [".devflow/skyturn-workflow.sqlite-shm", "base shm\n"],
+      [".devflow/tasks/task-1/output.md", "base output\n"],
+    ]);
+    for (const [file, contents] of volatileBaseFiles) {
+      await mkdir(dirname(join(repo.repoRoot, file)), { recursive: true });
+      await writeFile(join(repo.repoRoot, file), contents);
+    }
+    git(repo.repoRoot, ["add", "-A"]);
+    git(repo.repoRoot, ["commit", "-m", "candidate base"]);
+    const beforeHeadCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+
+    await writeFile(join(repo.repoRoot, "head-only.txt"), "from H\n");
+    const volatileHeadFiles = new Map([
+      [".devflow/skyturn-workflow.sqlite", "from H: sqlite\n"],
+      [".devflow/skyturn-workflow.sqlite-wal", "from H: wal\n"],
+      [".devflow/runs/run-1/events.ndjson", "from H: events\n"],
+      [".devflow/tasks/task-1/output.md", "from H: output\n"],
+    ]);
+    await rm(join(repo.repoRoot, ".devflow/skyturn-workflow.sqlite-shm"));
+    for (const [file, contents] of volatileHeadFiles) {
+      await mkdir(dirname(join(repo.repoRoot, file)), { recursive: true });
+      await writeFile(join(repo.repoRoot, file), contents);
+    }
+    git(repo.repoRoot, ["add", "-A"]);
+    git(repo.repoRoot, ["commit", "-m", "advance parent"]);
+    const afterHeadCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+
+    await writeFile(join(repo.repoRoot, "text.txt"), "reviewed text\n");
+    await writeFile(join(repo.repoRoot, "binary.bin"), Buffer.from([255, 0, 9, 8, 0, 7]));
+    await rm(join(repo.repoRoot, "delete.txt"));
+    await writeFile(join(repo.repoRoot, "untracked.txt"), "reviewed untracked\n");
+    await chmod(join(repo.repoRoot, "mode.sh"), 0o755);
+    await rm(join(repo.repoRoot, "link"));
+    await fsSymlink("reviewed-target", join(repo.repoRoot, "link"));
+
+    const expected = await candidateExpectationFor(repo.repoRoot, beforeHeadCommit, afterHeadCommit);
+    const indexPath = git(repo.repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const indexBefore = readFileSync(indexPath);
+    const evidence = await createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): publish mixed reviewed candidate",
+    });
+
+    expect(evidence.parentCommit).toBe(afterHeadCommit);
+    expect(git(repo.repoRoot, ["show", `${evidence.commitSha}:text.txt`])).toBe("reviewed text");
+    expect(gitBuffer(repo.repoRoot, ["show", `${evidence.commitSha}:binary.bin`])).toEqual(
+      Buffer.from([255, 0, 9, 8, 0, 7]),
+    );
+    expect(() => git(repo.repoRoot, ["cat-file", "-e", `${evidence.commitSha}:delete.txt`])).toThrow();
+    expect(git(repo.repoRoot, ["show", `${evidence.commitSha}:untracked.txt`])).toBe("reviewed untracked");
+    expect(git(repo.repoRoot, ["ls-tree", evidence.commitSha, "mode.sh"]).split(" ")[0]).toBe("100755");
+    expect(git(repo.repoRoot, ["ls-tree", evidence.commitSha, "link"]).split(" ")[0]).toBe("120000");
+    expect(git(repo.repoRoot, ["show", `${evidence.commitSha}:link`])).toBe("reviewed-target");
+    expect(git(repo.repoRoot, ["show", `${evidence.commitSha}:head-only.txt`])).toBe("from H");
+    for (const [file, contents] of volatileHeadFiles) {
+      expect(git(repo.repoRoot, ["show", `${evidence.commitSha}:${file}`])).toBe(contents.trim());
+    }
+    expect(() => git(repo.repoRoot, [
+      "cat-file",
+      "-e",
+      `${evidence.commitSha}:.devflow/skyturn-workflow.sqlite-shm`,
+    ])).toThrow();
+    expect(readFileSync(indexPath)).toEqual(indexBefore);
+  });
+
+  it.skipIf(process.platform === "win32")("ignores live file and real-index mutations after capture", async () => {
+    const repo = await createTestRepo("skyturn-candidate-post-capture-");
+    tempRoots.push(repo.tempRoot);
+    const reviewedBytes = "reviewed bytes\n";
+    const externalBytes = "EXTERNAL MUTATION AFTER CAPTURE\n";
+    await writeFile(join(repo.repoRoot, "feature.txt"), reviewedBytes);
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const wrapper = await installCandidatePostCaptureMutationWrapper(repo.repoRoot, externalBytes);
+
+    const evidence = await withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): isolate reviewed bytes",
+    }));
+
+    expect(git(repo.repoRoot, ["show", `${evidence.commitSha}:feature.txt`])).toBe(reviewedBytes.trim());
+    expect(readFileSync(join(repo.repoRoot, "feature.txt"), "utf8")).toBe(externalBytes);
+    expect(git(repo.repoRoot, ["show", ":feature.txt"])).toBe(externalBytes.trim());
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a stale CAS and leaves the competing branch update authoritative", async () => {
+    const repo = await createTestRepo("skyturn-candidate-cas-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed candidate\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const parentTree = git(repo.repoRoot, ["rev-parse", `${headCommit}^{tree}`]);
+    const competingCommit = git(repo.repoRoot, ["commit-tree", parentTree, "-p", headCommit, "-m", "competing update"]);
+    const wrapper = await installCandidateCasWrapper(repo.repoRoot, "refs/heads/main", headCommit, competingCommit);
+
+    await expect(withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): lose stale candidate race",
+    }))).rejects.toThrow("Candidate delivery commit was rejected.");
+
+    const candidateCommit = git(repo.repoRoot, [
+      "fsck",
+      "--unreachable",
+      "--no-reflogs",
+      "--no-progress",
+    ]).split("\n").flatMap((line) => {
+      const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
+      return match ? [match[1]] : [];
+    })[0];
+    expect(candidateCommit).toMatch(/^[0-9a-f]{40}$/);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(competingCommit);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).not.toBe(candidateCommit);
+    expect(git(repo.repoRoot, ["cat-file", "-t", candidateCommit])).toBe("commit");
+  });
+
+  it.skipIf(process.platform === "win32")("allows at most one concurrent secure publication", async () => {
+    const repo = await createTestRepo("skyturn-candidate-concurrent-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "concurrent reviewed bytes\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const wrapper = await installCandidateConcurrentCasWrapper(repo.repoRoot);
+    const publish = () => createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): publish one concurrent candidate",
+    });
+
+    const results = await withFakeGit(wrapper.binDir, () => Promise.allSettled([publish(), publish()]));
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const winner = results.find((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof publish>>> => (
+      result.status === "fulfilled"
+    ));
+    expect(winner?.value.commitSha).toBe(git(repo.repoRoot, ["rev-parse", "refs/heads/main"]));
+  });
+
+  it.skipIf(process.platform === "win32")("publishes only to R when HEAD switches to another branch at H before CAS", async () => {
+    const repo = await createTestRepo("skyturn-candidate-head-switch-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed for named branch\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    git(repo.repoRoot, ["branch", "other", headCommit]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const wrapper = await installCandidateHeadSwitchWrapper(repo.repoRoot, "other");
+
+    const evidence = await withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): target manifest branch",
+    }));
+
+    expect(evidence.branch).toBe("main");
+    expect(git(repo.repoRoot, ["branch", "--show-current"])).toBe("other");
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(evidence.commitSha);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/other"])).toBe(headCommit);
+  });
+
+  it("rejects malformed expectations and all bound fact mismatches without mutating refs, index, or worktree", async () => {
+    const repo = await createTestRepo("skyturn-candidate-rejections-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "anchor.txt"), "second commit\n");
+    git(repo.repoRoot, ["add", "anchor.txt"]);
+    git(repo.repoRoot, ["commit", "-m", "add rejection anchor"]);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed rejection fixture\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const ancestorCommit = git(repo.repoRoot, ["rev-parse", "HEAD^"]);
+    git(repo.repoRoot, ["branch", "alternate", headCommit]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const { fullPatchSha256: _removedDigest, ...missingDigest } = expected;
+    const variants: unknown[] = [
+      missingDigest,
+      { ...expected, unexpected: true },
+      { ...expected, beforeHeadCommit: "A".repeat(40) },
+      { ...expected, fullPatchSha256: "A".repeat(64) },
+      { ...expected, fullPatchByteLength: 0 },
+      { ...expected, fullPatchByteLength: Number.MAX_SAFE_INTEGER },
+      { ...expected, branchName: "-unsafe" },
+      { ...expected, branchName: "x".repeat(1_025) },
+      { ...expected, repositoryIdentity: "0".repeat(64) },
+      { ...expected, worktreeIdentity: "1".repeat(64) },
+      { ...expected, ancestryProofSha256: "2".repeat(64) },
+      { ...expected, fullPatchSha256: "3".repeat(64) },
+      { ...expected, fullPatchByteLength: expected.fullPatchByteLength + 1 },
+      { ...expected, fileManifestSha256: "4".repeat(64) },
+      { ...expected, beforeHeadCommit: ancestorCommit },
+      { ...expected, afterHeadCommit: ancestorCommit },
+      { ...expected, branchName: "alternate" },
+    ];
+    const indexPath = git(repo.repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const indexBefore = readFileSync(indexPath);
+    const statusBefore = git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
+
+    for (const variant of variants) {
+      await expect(createCandidateDeliveryCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        expected: variant as CandidateCommitExpectation,
+        subject: "feat(delivery): reject mismatched candidate",
+      })).rejects.toThrow(/Candidate delivery commit (?:input is invalid|was rejected)\./);
+      expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+      expect(git(repo.repoRoot, ["rev-parse", "refs/heads/alternate"])).toBe(headCommit);
+      expect(readFileSync(indexPath)).toEqual(indexBefore);
+      expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe(statusBefore);
+    }
+  });
+
+  it("returns bounded evidence and errors without paths, filenames, or reviewed bytes", async () => {
+    const repo = await createTestRepo("skyturn-candidate-sensitive-path-");
+    tempRoots.push(repo.tempRoot);
+    const sensitiveFile = "SENSITIVE_FILE_SENTINEL.txt";
+    const sensitiveBytes = "SENSITIVE_REVIEWED_BYTES_SENTINEL\n";
+    await writeFile(join(repo.repoRoot, sensitiveFile), sensitiveBytes);
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+
+    let exposed = "";
+    try {
+      await createCandidateDeliveryCommit({
+        projectRoot: repo.repoRoot,
+        worktreePath: repo.repoRoot,
+        expected: { ...expected, fullPatchSha256: "0".repeat(64) },
+        subject: "feat(delivery): reject sensitive candidate",
+      });
+    } catch (error) {
+      exposed = String(error);
+    }
+
+    expect(exposed).toBe("DeliveryCommitError: Candidate delivery commit was rejected.");
+    expect(exposed.length).toBeLessThan(128);
+    expect(exposed).not.toContain(repo.repoRoot);
+    expect(exposed).not.toContain(sensitiveFile);
+    expect(exposed).not.toContain(sensitiveBytes.trim());
+  });
+
+  it("rejects an empty live snapshot before creating candidate objects", async () => {
+    const repo = await createTestRepo("skyturn-candidate-empty-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "temporarily reviewed\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "base\n");
+    const indexBefore = gitBuffer(repo.repoRoot, ["ls-files", "--stage", "-z"]);
+    const objectsBefore = git(repo.repoRoot, ["count-objects", "-v"]);
+
+    await expect(createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): reject empty candidate",
+    })).rejects.toThrow("Candidate delivery commit was rejected.");
+
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+    expect(gitBuffer(repo.repoRoot, ["ls-files", "--stage", "-z"])).toEqual(indexBefore);
+    expect(git(repo.repoRoot, ["count-objects", "-v"])).toBe(objectsBefore);
+    expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe("");
+  });
+});
+
 describe("delivery remote actions", () => {
   const tempRoots: string[] = [];
 
@@ -2988,6 +3670,295 @@ async function installChangesetMutationGitWrapper(repoRoot: string): Promise<{ b
   return { binDir };
 }
 
+async function installCandidatePostCaptureMutationWrapper(
+  repoRoot: string,
+  externalBytes: string,
+): Promise<{ binDir: string }> {
+  const binDir = join(repoRoot, ".git", "candidate-post-capture-git");
+  const markerPath = join(binDir, "mutated");
+  const liveFile = join(repoRoot, "feature.txt");
+  await mkdir(binDir, { recursive: true });
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"read-tree\" ] && [ ! -e " + shellSingleQuote(markerPath) + " ]; then",
+    `  : > ${shellSingleQuote(markerPath)}`,
+    "  candidate_index=$GIT_INDEX_FILE",
+    "  unset GIT_INDEX_FILE",
+    `  printf %s ${shellSingleQuote(externalBytes)} > ${shellSingleQuote(liveFile)}`,
+    `  ${shellSingleQuote(resolveExecutable("git"))} -C ${shellSingleQuote(repoRoot)} add -- feature.txt`,
+    "  GIT_INDEX_FILE=$candidate_index",
+    "  export GIT_INDEX_FILE",
+    "fi",
+    `exec ${shellSingleQuote(resolveExecutable("git"))} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
+async function installCandidateCasWrapper(
+  repoRoot: string,
+  branchRef: string,
+  expectedOldCommit: string,
+  competingCommit: string,
+): Promise<{ binDir: string }> {
+  const binDir = join(repoRoot, ".git", "candidate-cas-git");
+  const markerPath = join(binDir, "competed");
+  await mkdir(binDir, { recursive: true });
+  const realGit = resolveExecutable("git");
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ] && [ ! -e " + shellSingleQuote(markerPath) + " ]; then",
+    `  : > ${shellSingleQuote(markerPath)}`,
+    `  ${shellSingleQuote(realGit)} -C ${shellSingleQuote(repoRoot)} update-ref ${shellSingleQuote(branchRef)} ${shellSingleQuote(competingCommit)} ${shellSingleQuote(expectedOldCommit)}`,
+    "fi",
+    `exec ${shellSingleQuote(realGit)} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
+async function installCandidateSymbolicBranchWrapper(
+  repoRoot: string,
+  branchRef: string,
+  targetRef: string,
+): Promise<{ binDir: string; protocolPath: string }> {
+  const binDir = join(repoRoot, ".git", "candidate-symbolic-branch-git");
+  const markerPath = join(binDir, "converted");
+  const protocolPath = join(binDir, "protocol.txt");
+  await mkdir(binDir, { recursive: true });
+  const realGit = resolveExecutable("git");
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ] && [ ! -e " + shellSingleQuote(markerPath) + " ]; then",
+    `  : > ${shellSingleQuote(markerPath)}`,
+    `  ${shellSingleQuote(realGit)} -C ${shellSingleQuote(repoRoot)} symbolic-ref ${shellSingleQuote(branchRef)} ${shellSingleQuote(targetRef)}`,
+    `  tee ${shellSingleQuote(protocolPath)} | ${shellSingleQuote(realGit)} "$@"`,
+    "  exit $?",
+    "fi",
+    `exec ${shellSingleQuote(realGit)} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir, protocolPath };
+}
+
+async function installCandidateProtocolFailureWrapper(
+  repoRoot: string,
+): Promise<{ binDir: string; protocolPath: string }> {
+  const binDir = join(repoRoot, ".git", "candidate-protocol-failure-git");
+  const protocolPath = join(binDir, "protocol.txt");
+  await mkdir(binDir, { recursive: true });
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ]; then",
+    "  IFS= read -r command || exit 1",
+    `  printf '%s\\n' "$command" > ${shellSingleQuote(protocolPath)}`,
+    "  printf 'start: malformed\\n'",
+    `  while IFS= read -r command; do printf '%s\\n' "$command" >> ${shellSingleQuote(protocolPath)}; done`,
+    "  exit 1",
+    "fi",
+    `exec ${shellSingleQuote(resolveExecutable("git"))} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir, protocolPath };
+}
+
+async function installCandidateProtocolOverflowWrapper(repoRoot: string): Promise<{ binDir: string }> {
+  const binDir = join(repoRoot, ".git", "candidate-protocol-overflow-git");
+  await mkdir(binDir, { recursive: true });
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ]; then",
+    "  IFS= read -r command || exit 1",
+    "  i=0",
+    "  while [ \"$i\" -lt 1024 ]; do printf 'SENSITIVE_PROTOCOL_OUTPUT'; i=$((i + 1)); done",
+    "  printf '\\n'",
+    "  while IFS= read -r command; do :; done",
+    "  exit 1",
+    "fi",
+    `exec ${shellSingleQuote(resolveExecutable("git"))} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
+async function installCandidateSilentPrepareWrapper(repoRoot: string): Promise<{
+  binDir: string;
+  lockMarkerPath: string;
+  protocolPath: string;
+  terminationPath: string;
+}> {
+  const binDir = join(repoRoot, ".git", "candidate-silent-prepare-git");
+  const lockMarkerPath = join(binDir, "prepared.lock");
+  const protocolPath = join(binDir, "protocol.txt");
+  const terminationPath = join(binDir, "terminated");
+  await mkdir(binDir, { recursive: true });
+  const script = [
+    "#!/bin/sh",
+    `lock_marker=${shellSingleQuote(lockMarkerPath)}`,
+    `termination_marker=${shellSingleQuote(terminationPath)}`,
+    "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ]; then",
+    "  trap 'rm -f \"$lock_marker\"' EXIT",
+    "  trap 'printf terminated > \"$termination_marker\"; exit 143' TERM",
+    "  IFS= read -r command || exit 1",
+    `  printf '%s\\n' \"$command\" > ${shellSingleQuote(protocolPath)}`,
+    "  [ \"$command\" = \"start\" ] || exit 1",
+    "  printf 'start: ok\\n'",
+    "  while IFS= read -r command; do",
+    `    printf '%s\\n' \"$command\" >> ${shellSingleQuote(protocolPath)}`,
+    "    if [ \"$command\" = \"prepare\" ]; then",
+    `      : > ${shellSingleQuote(lockMarkerPath)}`,
+    "      i=0",
+    "      while [ \"$i\" -lt 15 ]; do sleep 1; i=$((i + 1)); done",
+    "      exit 1",
+    "    fi",
+    "  done",
+    "  exit 1",
+    "fi",
+    `exec ${shellSingleQuote(resolveExecutable("git"))} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir, lockMarkerPath, protocolPath, terminationPath };
+}
+
+async function installCandidateSilentValidationWrapper(repoRoot: string): Promise<{
+  binDir: string;
+  lockMarkerPath: string;
+  protocolPath: string;
+  validationLivePath: string;
+  validationTerminationPath: string;
+  validationClosedPath: string;
+  abortAfterValidationClosePath: string;
+  updateRefClosedPath: string;
+}> {
+  const binDir = join(repoRoot, ".git", "candidate-silent-validation-git");
+  const lockMarkerPath = join(binDir, "prepared.lock");
+  const protocolPath = join(binDir, "protocol.txt");
+  const validationLivePath = join(binDir, "validation.live");
+  const validationTerminationPath = join(binDir, "validation.terminated");
+  const validationClosedPath = join(binDir, "validation.closed");
+  const abortAfterValidationClosePath = join(binDir, "abort-after-validation-close");
+  const updateRefClosedPath = join(binDir, "update-ref.closed");
+  await mkdir(binDir, { recursive: true });
+  const script = [
+    "#!/bin/sh",
+    `lock_marker=${shellSingleQuote(lockMarkerPath)}`,
+    `validation_live=${shellSingleQuote(validationLivePath)}`,
+    `validation_terminated=${shellSingleQuote(validationTerminationPath)}`,
+    `validation_closed=${shellSingleQuote(validationClosedPath)}`,
+    `abort_after_validation_close=${shellSingleQuote(abortAfterValidationClosePath)}`,
+    `update_ref_closed=${shellSingleQuote(updateRefClosedPath)}`,
+    "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ]; then",
+    "  trap 'rm -f \"$lock_marker\"; : > \"$update_ref_closed\"' EXIT",
+    "  IFS= read -r command || exit 1",
+    `  printf '%s\\n' "$command" > ${shellSingleQuote(protocolPath)}`,
+    "  [ \"$command\" = \"start\" ] || exit 1",
+    "  printf 'start: ok\\n'",
+    "  while IFS= read -r command; do",
+    `    printf '%s\\n' "$command" >> ${shellSingleQuote(protocolPath)}`,
+    "    if [ \"$command\" = \"prepare\" ]; then",
+    "      : > \"$lock_marker\"",
+    "      printf 'prepare: ok\\n'",
+    "    elif [ \"$command\" = \"abort\" ]; then",
+    "      [ -e \"$validation_closed\" ] && : > \"$abort_after_validation_close\"",
+    "      printf 'abort: ok\\n'",
+    "      exit 0",
+    "    else",
+    "      :",
+    "    fi",
+    "  done",
+    "  exit 1",
+    "fi",
+    "if [ \"$1\" = \"for-each-ref\" ] && [ -e \"$lock_marker\" ]; then",
+    "  : > \"$validation_live\"",
+    "  trap ': > \"$validation_terminated\"; exit 0' TERM",
+    "  trap 'rm -f \"$validation_live\"; : > \"$validation_closed\"' EXIT",
+    "  i=0",
+    "  while [ \"$i\" -lt 120 ]; do sleep 0.1; i=$((i + 1)); done",
+    "  exit 0",
+    "fi",
+    `exec ${shellSingleQuote(resolveExecutable("git"))} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return {
+    binDir,
+    lockMarkerPath,
+    protocolPath,
+    validationLivePath,
+    validationTerminationPath,
+    validationClosedPath,
+    abortAfterValidationClosePath,
+    updateRefClosedPath,
+  };
+}
+
+async function installCandidateConcurrentCasWrapper(repoRoot: string): Promise<{ binDir: string }> {
+  const binDir = join(repoRoot, ".git", "candidate-concurrent-git");
+  const firstPath = join(binDir, "first");
+  const secondPath = join(binDir, "second");
+  await mkdir(binDir, { recursive: true });
+  const realGit = resolveExecutable("git");
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ]; then",
+    `  if mkdir ${shellSingleQuote(firstPath)} 2>/dev/null; then`,
+    `    while [ ! -e ${shellSingleQuote(secondPath)} ]; do sleep 0.01; done`,
+    "  else",
+    `    : > ${shellSingleQuote(secondPath)}`,
+    "  fi",
+    "fi",
+    `exec ${shellSingleQuote(realGit)} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
+async function installCandidateHeadSwitchWrapper(
+  repoRoot: string,
+  branchName: string,
+): Promise<{ binDir: string }> {
+  const binDir = join(repoRoot, ".git", "candidate-head-switch-git");
+  const markerPath = join(binDir, "switched");
+  await mkdir(binDir, { recursive: true });
+  const realGit = resolveExecutable("git");
+  const script = [
+    "#!/bin/sh",
+    "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ] && [ ! -e " + shellSingleQuote(markerPath) + " ]; then",
+    `  : > ${shellSingleQuote(markerPath)}`,
+    `  ${shellSingleQuote(realGit)} -C ${shellSingleQuote(repoRoot)} switch ${shellSingleQuote(branchName)} >/dev/null`,
+    "fi",
+    `exec ${shellSingleQuote(realGit)} "$@"`,
+    "",
+  ].join("\n");
+  const gitPath = join(binDir, "git");
+  await writeFile(gitPath, script, "utf8");
+  await chmod(gitPath, 0o755);
+  return { binDir };
+}
+
 async function withFakeGh<T>(binDir: string, argsPath: string, callback: () => Promise<T>): Promise<T> {
   const previousPath = process.env.PATH;
   const previousArgs = process.env.SKYTURN_FAKE_GH_ARGS;
@@ -3029,6 +4000,51 @@ function shellSingleQuote(value: string): string {
 
 function compareUtf8(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+async function candidateExpectationFor(
+  repoRoot: string,
+  beforeHeadCommit: string,
+  afterHeadCommit: string,
+): Promise<CandidateCommitExpectation> {
+  const serializedProof = await createWorkflowGitAncestryProof({
+    repositoryPath: repoRoot,
+    worktreePath: repoRoot,
+    beforeHeadCommit,
+    afterHeadCommit,
+  });
+  const proof = JSON.parse(serializedProof) as {
+    repositoryIdentity: string;
+    worktreeIdentity: string;
+  };
+  const reconciliation = await createGitChangesetService().reconcileFinalChangeset({
+    node: nodeForRepo(repoRoot),
+    target: {
+      executionTarget: "current_branch",
+      selectedBranch: git(repoRoot, ["branch", "--show-current"]),
+    },
+    baselineRef: beforeHeadCommit,
+  });
+  const evidence = reconciliation.changeset.evidence;
+  if (
+    reconciliation.status !== "available"
+    || !evidence?.fullPatchSha256
+    || !evidence.fullPatchByteLength
+    || !evidence.fileManifestSha256
+  ) {
+    throw new Error("Candidate test fixture did not produce complete changeset evidence.");
+  }
+  return {
+    repositoryIdentity: proof.repositoryIdentity,
+    worktreeIdentity: proof.worktreeIdentity,
+    branchName: git(repoRoot, ["branch", "--show-current"]),
+    beforeHeadCommit,
+    afterHeadCommit,
+    ancestryProofSha256: createHash("sha256").update(serializedProof, "utf8").digest("hex"),
+    fullPatchSha256: evidence.fullPatchSha256,
+    fullPatchByteLength: evidence.fullPatchByteLength,
+    fileManifestSha256: evidence.fileManifestSha256,
+  };
 }
 
 function worktreeIdentityFor(
