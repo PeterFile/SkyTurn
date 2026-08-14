@@ -403,12 +403,11 @@ test("Electron main tracks every top-level workflow store operation, not only wo
   );
   assert.match(deliveryCommitHandler, /captureCandidateDeliveryReviewSnapshot/);
   assert.match(deliveryCommitHandler, /reviewCandidateWithHermes/);
-  assert.match(deliveryCommitHandler, /createCandidateDeliveryCommit/);
+  assert.match(deliveryCommitHandler, /prepareCandidateDeliveryCommit/);
+  assert.match(deliveryCommitHandler, /publishPreparedCandidateDeliveryCommit/);
+  assert.match(deliveryCommitHandler, /publishCandidateDeliveryCommitWithRecovery/);
   assert.doesNotMatch(deliveryCommitHandler, /createDeliveryCommit\s*\(/);
   assert.doesNotMatch(deliveryCommitHandler, /normalizeDeliveryCommitIpcError|deliveryReconciliationStatus/);
-  assert.match(deliveryCommitHandler, /workflow\.commit\.created/);
-  assert.match(deliveryCommitHandler, /appendWorkflowEvent/);
-  assert.match(deliveryCommitHandler, /status:\s*"committed"/);
   assert.doesNotMatch(deliveryCommitHandler, /status:\s*"requested"/);
 
   const deliveryPushHandler = main.slice(
@@ -913,7 +912,7 @@ test("workflow delivery commit validates known sessions before creating git comm
   const storeIndex = deliveryCommitHandler.indexOf("const store = await getWorkflowStore");
   const canvasIndex = deliveryCommitHandler.indexOf("assertKnownWorkflowCanvasSession");
   const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
-  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
+  const commitIndex = deliveryCommitHandler.indexOf("context.prepareCandidateDeliveryCommit({");
 
   assert.ok(sessionIndex >= 0, "delivery commit IPC must require a workflow sessionId");
   assert.ok(storeIndex > sessionIndex, "delivery commit IPC must open the workflow store after resolving sessionId");
@@ -930,6 +929,10 @@ test("workflow delivery commit takes the session mutation lock before local git 
     main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
     main.indexOf('ipcMain.handle("workflow:delivery:push"'),
   );
+  const publicationHelper = main.slice(
+    main.indexOf("async function publishCandidateDeliveryCommitWithRecovery"),
+    main.indexOf("function requireWorkflowDeliveryCandidateManifest"),
+  );
 
   const workflowProjectRootIndex = deliveryCommitHandler.indexOf("const workflowProjectRoot = await workflowStoreIdentity(projectRoot)");
   const lockIndex = deliveryCommitHandler.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, sessionId");
@@ -938,9 +941,11 @@ test("workflow delivery commit takes the session mutation lock before local git 
   const laneGuardIndex = deliveryCommitHandler.indexOf("resolveWorkflowDeliveryCandidateIdentity");
   const worktreeIndex = deliveryCommitHandler.indexOf("resolveCandidateDeliveryWorktreePath");
   const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
-  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
-  const eventIndex = deliveryCommitHandler.indexOf('kind: "workflow.commit.created"');
-  const broadcastIndex = deliveryCommitHandler.indexOf("broadcastWorkflowProjection");
+  const commitIndex = deliveryCommitHandler.indexOf("context.prepareCandidateDeliveryCommit({");
+  const preparedEventIndex = publicationHelper.indexOf("appendCandidateCommitPreparedIntent");
+  const publishIndex = publicationHelper.indexOf("input.publish(preparation)");
+  const eventIndex = publicationHelper.indexOf("appendCandidateCommitCreatedEvent");
+  const broadcastIndex = publicationHelper.indexOf("input.broadcast()");
 
   assert.ok(workflowProjectRootIndex >= 0, "delivery commit must use the workflow store identity as the lock key root");
   assert.ok(lockIndex > workflowProjectRootIndex, "delivery commit must enter the session mutation lock");
@@ -950,7 +955,9 @@ test("workflow delivery commit takes the session mutation lock before local git 
   assert.ok(worktreeIndex > laneGuardIndex, "delivery commit must resolve the worktree only after locked lane validation");
   assert.ok(importIndex > worktreeIndex, "delivery commit must import the git helper inside the lock");
   assert.ok(commitIndex > importIndex, "delivery commit must call the local git mutation after the lock is held");
-  assert.ok(eventIndex > commitIndex, "workflow.commit.created must be written only after the locked git commit succeeds");
+  assert.ok(preparedEventIndex >= 0, "publication must persist the prepared intent");
+  assert.ok(publishIndex > preparedEventIndex, "branch CAS must happen after durable intent persistence");
+  assert.ok(eventIndex > publishIndex, "workflow.commit.created must be written only after branch publication succeeds");
   assert.ok(broadcastIndex > eventIndex, "delivery commit broadcast must happen after locked event materialization");
 });
 
@@ -967,9 +974,8 @@ test("workflow delivery commit reviews one store manifest before exact candidate
   const manifestIndex = deliveryCommitHandler.indexOf("store.getCandidateManifest({");
   const recaptureIndex = deliveryCommitHandler.indexOf("captureCandidateDeliveryReviewSnapshot({");
   const reviewIndex = deliveryCommitHandler.indexOf("reviewCandidateWithHermes({");
-  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
-  const eventIndex = deliveryCommitHandler.indexOf('kind: "workflow.commit.created"');
-  const broadcastIndex = deliveryCommitHandler.indexOf("broadcastWorkflowProjection");
+  const commitIndex = deliveryCommitHandler.indexOf("context.prepareCandidateDeliveryCommit({");
+  const recoveryIndex = deliveryCommitHandler.indexOf("publishCandidateDeliveryCommitWithRecovery({");
 
   assert.ok(lockIndex >= 0);
   assert.ok(storeIndex > lockIndex);
@@ -978,14 +984,13 @@ test("workflow delivery commit reviews one store manifest before exact candidate
   assert.ok(recaptureIndex > manifestIndex);
   assert.ok(reviewIndex > recaptureIndex);
   assert.ok(commitIndex > reviewIndex);
-  assert.ok(eventIndex > commitIndex);
-  assert.ok(broadcastIndex > eventIndex);
+  assert.ok(recoveryIndex > manifestIndex);
   assert.match(deliveryCommitHandler, /store\.getCandidateManifest\(\{\s*sessionId:\s*candidateIdentity\.sessionId,\s*nodeId:\s*candidateIdentity\.nodeId,\s*laneId:\s*candidateIdentity\.laneId,\s*segmentId:\s*candidateIdentity\.segmentId,\s*runId:\s*candidateIdentity\.runId,?\s*\}\)/);
   const manifestLookup = deliveryCommitHandler.slice(manifestIndex, deliveryCommitHandler.indexOf(");", manifestIndex) + 2);
   assert.doesNotMatch(manifestLookup, /agentKind/);
-  assert.match(deliveryCommitHandler, /expected:\s*candidateCommitExpectationFromManifest\(manifest\)/);
+  assert.match(deliveryCommitHandler, /expected:\s*candidateCommitExpectationFromManifest\(context\.manifest\)/);
   assert.match(deliveryCommitHandler, /reviewCandidateWithHermes\(\{ request: reviewRequest \}\)/);
-  assert.match(deliveryCommitHandler, /segmentId:\s*manifest\.segmentId/);
+  assert.match(deliveryCommitHandler, /segmentId:\s*context\.manifest\.segmentId/);
   assert.doesNotMatch(deliveryCommitHandler, /createDeliveryCommit\s*\(/);
   assert.doesNotMatch(deliveryCommitHandler, /deliveryFilesFromInput|deliveryReconciliationStatus|acceptMismatch/);
   assert.doesNotMatch(deliveryCommitHandler, /readField\(input,\s*"(?:manifest|runId|digest|files|reconciliationStatus|acceptMismatch)"\)/);
@@ -997,14 +1002,115 @@ test("candidate review material remains ephemeral and candidate commit evidence 
     main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
     main.indexOf('ipcMain.handle("workflow:delivery:push"'),
   );
-  const eventBlock = deliveryCommitHandler.slice(
-    deliveryCommitHandler.indexOf("const event = store.appendWorkflowEvent"),
-    deliveryCommitHandler.indexOf("broadcastWorkflowProjection"),
+  const publicationHelpers = main.slice(
+    main.indexOf("function candidateCommitPreparedIntentPayload"),
+    main.indexOf("function requireWorkflowDeliveryCandidateManifest"),
   );
 
-  assert.doesNotMatch(eventBlock, /reviewRequest|decision|fullPatch|fileManifest|files/);
-  assert.match(eventBlock, /payload:\s*\{[\s\S]*laneId,[\s\S]*segmentId:\s*manifest\.segmentId,[\s\S]*evidence,[\s\S]*\}/);
+  assert.doesNotMatch(publicationHelpers, /reviewRequest|decision|fullPatch|fileManifest|files/);
+  assert.match(publicationHelpers, /const payload = \{[\s\S]*laneId:\s*input\.laneId,[\s\S]*segmentId:\s*input\.segmentId,[\s\S]*evidence,[\s\S]*\}/);
   assert.doesNotMatch(deliveryCommitHandler, /stagedFiles|worktreePath:\s*evidence\.worktreePath/);
+});
+
+test("candidate commit publication never runs CAS when durable prepared-intent persistence fails", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness({ failPreparedAppends: 1 });
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(harness.input),
+    /publication.*retry|retry.*publication/i,
+  );
+
+  assert.equal(harness.state.branchHead, harness.preparation.parentCommit);
+  assert.equal(harness.calls.prepare, 1);
+  assert.equal(harness.calls.publish, 0);
+  assert.equal(harness.events.length, 0);
+});
+
+test("candidate commit publication recovers CAS success followed by terminal append failure without another review", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness({ failTerminalAppends: 1 });
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(harness.input),
+    /publication.*retry|retry.*publication/i,
+  );
+  assert.equal(harness.state.branchHead, harness.preparation.commitSha);
+  assert.equal(harness.calls.prepare, 1);
+  assert.equal(harness.calls.cas, 1);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.created").length, 0);
+
+  const recovered = await runtime.publishCandidateDeliveryCommitWithRecovery(harness.input);
+  assert.equal(recovered.status, "committed");
+  assert.equal(recovered.evidence.commitSha, harness.preparation.commitSha);
+  assert.equal(harness.calls.prepare, 1);
+  assert.equal(harness.calls.cas, 1);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.created").length, 1);
+});
+
+test("candidate commit publication tolerates broadcast failure after durable terminal evidence", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness({ failBroadcasts: 1 });
+
+  const result = await runtime.publishCandidateDeliveryCommitWithRecovery(harness.input);
+
+  assert.equal(result.status, "committed");
+  assert.equal(harness.state.branchHead, harness.preparation.commitSha);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.created").length, 1);
+  assert.equal(harness.calls.cas, 1);
+});
+
+test("duplicate candidate commit IPC publication replays one prepared intent and one terminal event", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness();
+
+  const first = await runtime.publishCandidateDeliveryCommitWithRecovery(harness.input);
+  const retry = await runtime.publishCandidateDeliveryCommitWithRecovery(harness.input);
+
+  assert.deepEqual(toPlain(retry), toPlain(first));
+  assert.equal(harness.calls.prepare, 1);
+  assert.equal(harness.calls.cas, 1);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.publication_prepared").length, 1);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.created").length, 1);
+});
+
+test("candidate commit publication recovers the same prepared identity after store reopen", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const firstProcess = candidateCommitPublicationHarness({ failTerminalAppends: 1 });
+  await assert.rejects(runtime.publishCandidateDeliveryCommitWithRecovery(firstProcess.input));
+
+  const reopened = candidateCommitPublicationHarness({
+    events: structuredClone(firstProcess.events),
+    state: firstProcess.state,
+  });
+  const result = await runtime.publishCandidateDeliveryCommitWithRecovery(reopened.input);
+
+  assert.equal(result.status, "committed");
+  assert.equal(reopened.calls.prepare, 0);
+  assert.equal(reopened.calls.cas, 0);
+  assert.equal(reopened.events.filter((event) => event.kind === "workflow.commit.created").length, 1);
+});
+
+test("candidate commit publication fails closed on conflicting durable request or branch facts", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness({ branchHead: "f".repeat(40) });
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(harness.input),
+    /manual repair/i,
+  );
+  assert.equal(harness.calls.cas, 0);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.publication_prepared").length, 1);
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery({
+      ...harness.input,
+      requestSha256: "c".repeat(64),
+    }),
+    /manual repair/i,
+  );
+  assert.equal(harness.calls.prepare, 1);
+  assert.equal(harness.calls.publish, 1);
 });
 
 test("downstream delivery uses the backend-resolved path with pathless candidate commit evidence", async () => {
@@ -1407,7 +1513,7 @@ test("workflow delivery commit derives the commit lane candidate before creating
   const laneIdIndex = deliveryCommitHandler.indexOf('const laneId = requireText(readField(input, "laneId"), "workflow commit laneId")');
   const laneGuardIndex = deliveryCommitHandler.indexOf("resolveWorkflowDeliveryCandidateIdentity(projection, sessionId, laneId)");
   const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
-  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
+  const commitIndex = deliveryCommitHandler.indexOf("context.prepareCandidateDeliveryCommit({");
 
   assert.ok(laneIdIndex > canvasIndex, "delivery commit IPC must require laneId after validating the session");
   assert.ok(laneGuardIndex > laneIdIndex, "delivery commit IPC must resolve laneId through the Flow projection");
@@ -1431,7 +1537,7 @@ test("workflow delivery commit resolves the candidate worktree from backend stat
   const laneGuardIndex = deliveryCommitHandler.indexOf("resolveWorkflowDeliveryCandidateIdentity(projection, sessionId, laneId)");
   const resolveIndex = deliveryCommitHandler.indexOf("resolveCandidateDeliveryWorktreePath(");
   const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
-  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
+  const commitIndex = deliveryCommitHandler.indexOf("context.prepareCandidateDeliveryCommit({");
 
   assert.ok(resolveIndex > laneGuardIndex, "delivery commit IPC must resolve the worktree after commit-lane validation");
   assert.ok(resolveIndex < importIndex, "renderer worktreePath must be validated before importing git commit implementation");
@@ -1454,7 +1560,7 @@ test("workflow delivery commit ignores obsolete renderer reconciliation authorit
 
   assert.doesNotMatch(deliveryCommitHandler, /deliveryFilesFromInput|deliveryReconciliationStatus/);
   assert.doesNotMatch(deliveryCommitHandler, /readField\(input,\s*"(?:files|reconciliationStatus|acceptMismatch)"\)/);
-  assert.match(deliveryCommitHandler, /candidateCommitExpectationFromManifest\(manifest\)/);
+  assert.match(deliveryCommitHandler, /candidateCommitExpectationFromManifest\(context\.manifest\)/);
 });
 
 test("workflow createSession resolves and persists the authoritative current branch target", async () => {
@@ -3403,6 +3509,138 @@ async function loadMainDeliveryCommitEvidenceHelper() {
     path,
   }, { filename: "main.deliveryCommitEvidence.ts" });
   return module.exports;
+}
+
+async function loadCandidateCommitPublicationRuntime() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    "const RUN_PROTOCOL_VERSION = 1;",
+    'function workflowIpcError(code, message) { const error = new Error(message); error.code = code; return error; }',
+    extractFunction(main, "isRecord"),
+    extractFunction(main, "optionalText"),
+    extractFunction(main, "stableJson"),
+    extractFunction(main, "sortJson"),
+    extractFunction(main, "candidateCommitPublicationError"),
+    extractFunction(main, "candidateCommitPreparedIntentPayload"),
+    extractFunction(main, "findCandidateCommitPreparedIntent"),
+    extractFunction(main, "appendCandidateCommitPreparedIntent"),
+    extractFunction(main, "appendCandidateCommitCreatedEvent"),
+    extractFunction(main, "publishCandidateDeliveryCommitWithRecovery"),
+    "module.exports = { publishCandidateDeliveryCommitWithRecovery };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, {
+    module,
+    exports: module.exports,
+    Date,
+    Error,
+    JSON,
+    Object,
+  }, { filename: "main.candidateCommitPublication.ts" });
+  return module.exports;
+}
+
+function candidateCommitPublicationHarness(options = {}) {
+  const preparation = {
+    status: "prepared",
+    commitSha: "2".repeat(40),
+    treeSha: "3".repeat(40),
+    branch: "main",
+    parentCommit: "1".repeat(40),
+    expected: {
+      repositoryIdentity: "4".repeat(64),
+      worktreeIdentity: "5".repeat(64),
+      branchName: "main",
+      beforeHeadCommit: "1".repeat(40),
+      afterHeadCommit: "1".repeat(40),
+      ancestryProofSha256: "6".repeat(64),
+      fullPatchSha256: "7".repeat(64),
+      fullPatchByteLength: 42,
+      fileManifestSha256: "8".repeat(64),
+    },
+  };
+  const events = options.events ?? [];
+  const state = options.state ?? {
+    branchHead: options.branchHead ?? preparation.parentCommit,
+  };
+  const calls = { prepare: 0, publish: 0, cas: 0, broadcast: 0 };
+  let failPreparedAppends = options.failPreparedAppends ?? 0;
+  let failTerminalAppends = options.failTerminalAppends ?? 0;
+  let failBroadcasts = options.failBroadcasts ?? 0;
+  const store = {
+    listEvents() {
+      return events;
+    },
+    appendWorkflowEvent(input) {
+      if (input.kind === "workflow.commit.publication_prepared" && failPreparedAppends > 0) {
+        failPreparedAppends -= 1;
+        throw new Error("prepared intent persistence failed");
+      }
+      if (input.kind === "workflow.commit.created" && failTerminalAppends > 0) {
+        failTerminalAppends -= 1;
+        throw new Error("terminal persistence failed");
+      }
+      const existing = events.find((event) => event.idempotencyKey === input.idempotencyKey);
+      if (existing) return existing;
+      const event = {
+        ...structuredClone(input),
+        id: `event-${events.length + 1}`,
+        seq: events.length + 1,
+        createdAt: input.now,
+      };
+      events.push(event);
+      return event;
+    },
+  };
+  const input = {
+    store,
+    sessionId: "session-1",
+    laneId: "lane-commit",
+    segmentId: "segment-candidate",
+    manifestSha256: "a".repeat(64),
+    requestSha256: "b".repeat(64),
+    async prepare() {
+      calls.prepare += 1;
+      return structuredClone(preparation);
+    },
+    async publish(candidate) {
+      calls.publish += 1;
+      assert.deepEqual(candidate, preparation);
+      if (state.branchHead === preparation.commitSha) {
+        return {
+          status: "committed",
+          commitSha: preparation.commitSha,
+          branch: preparation.branch,
+          parentCommit: preparation.parentCommit,
+        };
+      }
+      if (state.branchHead !== preparation.parentCommit) throw new Error("conflicting branch facts");
+      calls.cas += 1;
+      state.branchHead = preparation.commitSha;
+      return {
+        status: "committed",
+        commitSha: preparation.commitSha,
+        branch: preparation.branch,
+        parentCommit: preparation.parentCommit,
+      };
+    },
+    broadcast() {
+      calls.broadcast += 1;
+      if (failBroadcasts > 0) {
+        failBroadcasts -= 1;
+        throw new Error("broadcast failed");
+      }
+    },
+    now: () => "2026-08-14T00:00:00.000Z",
+  };
+  return { calls, events, input, preparation, state, store };
 }
 
 function extractFunction(source, name) {

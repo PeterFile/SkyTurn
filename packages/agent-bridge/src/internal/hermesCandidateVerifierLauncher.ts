@@ -25,7 +25,10 @@ import {
   type PosixManagedProcessCloseResult,
 } from "./posixManagedProcess.js";
 import { resolveCliExecutable } from "./resolveCliExecutable.js";
-import { resolveHermesCommand } from "./resolveHermesCommand.js";
+import {
+  resolveHermesCommand,
+  revalidateHermesCommandExecutable,
+} from "./resolveHermesCommand.js";
 
 const failureMessage = "Hermes candidate verifier failed.";
 const maximumPromptBytes = 24 * 1024 * 1024;
@@ -200,11 +203,12 @@ export async function launchHermesCandidateVerifierProcess(input: {
     if (
       command.args.length !== 1 ||
       command.args[0] !== canonicalHermes ||
-      dirname(interpreter) !== dirname(canonicalHermes)
+      dirname(interpreter) !== dirname(canonicalHermes) ||
+      !command.executableIdentity
     ) {
       throw new Error(failureMessage);
     }
-    await access(interpreter, fsConstants.X_OK);
+    await revalidateHermesCommandExecutable(command.executableIdentity);
     assertNotAborted(input.signal);
 
     const canonicalStateRoot = await resolveHermesStateRoot(environment);
@@ -251,6 +255,7 @@ export async function launchHermesCandidateVerifierProcess(input: {
       isolatedStateDirectories,
     );
     const childEnvironment = verifierEnvironment(environment, isolatedStateRoot, scratchRoot);
+    const launchInterpreter = await revalidateHermesCommandExecutable(command.executableIdentity);
     const child = (dependencies.spawnProcess ?? spawn)(ownerPath, [
       String(cleanupTimeoutMs),
       "--target-stdin",
@@ -258,7 +263,7 @@ export async function launchHermesCandidateVerifierProcess(input: {
       "/usr/bin/sandbox-exec",
       "-p",
       sandboxProfile,
-      interpreter,
+      launchInterpreter,
       "-I",
       runnerPath,
     ], {

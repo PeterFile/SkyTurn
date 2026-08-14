@@ -103,7 +103,8 @@ export type WorkflowInternalEventKind =
   | "workflow.plan_finish.bound"
   | "workflow.plan_finish.launch_accepted"
   | "workflow.planner_intent.reconciled"
-  | "workflow.candidate.manifest_recorded";
+  | "workflow.candidate.manifest_recorded"
+  | "workflow.commit.publication_prepared";
 
 export type WorkflowEventKind =
   | "user_input"
@@ -6723,7 +6724,8 @@ function isWorkflowInternalEventKind(kind: WorkflowEventKind): kind is WorkflowI
     kind === "workflow.plan_finish.bound" ||
     kind === "workflow.plan_finish.launch_accepted" ||
     kind === "workflow.planner_intent.reconciled" ||
-    kind === "workflow.candidate.manifest_recorded";
+    kind === "workflow.candidate.manifest_recorded" ||
+    kind === "workflow.commit.publication_prepared";
 }
 
 function userInputDeliveredIdempotencyKey(inputId: string): string {

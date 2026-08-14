@@ -260,6 +260,50 @@ describe("managed Hermes candidate verifier launcher", () => {
     expect(spawnProcess).toHaveBeenCalledOnce();
   });
 
+  it("rejects interpreter identity replacement between resolution and launch", async () => {
+    const binaryRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-bin-"));
+    const canonicalStateRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-state-"));
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-launch-"));
+    roots.push(binaryRoot, canonicalStateRoot, temporaryRoot);
+    const hermesPath = join(binaryRoot, "hermes");
+    const interpreterPath = join(binaryRoot, "python");
+    await writeFile(hermesPath, [
+      "#!/bin/sh",
+      `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python' "$0" "$@"`,
+      "' '''",
+      "",
+    ].join("\n"), { mode: 0o755 });
+    await writeFile(interpreterPath, "original interpreter", { mode: 0o755 });
+    await writeFile(join(canonicalStateRoot, "config.yaml"), "model: isolated-test\n", { mode: 0o400 });
+    const originalPath = process.env.PATH;
+    const originalHermesHome = process.env.HERMES_HOME;
+    process.env.PATH = binaryRoot;
+    process.env.HERMES_HOME = canonicalStateRoot;
+    const spawnProcess = vi.fn() as unknown as typeof spawn;
+
+    try {
+      await expect(launchHermesCandidateVerifierProcess(
+        { signal: new AbortController().signal },
+        {
+          platform: "darwin",
+          async createTemporaryRoot() {
+            await rm(interpreterPath);
+            await writeFile(interpreterPath, "replacement interpreter", { mode: 0o755 });
+            return temporaryRoot;
+          },
+          spawnProcess,
+        },
+      )).rejects.toThrow("Hermes candidate verifier failed.");
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+      else process.env.HERMES_HOME = originalHermesHome;
+    }
+
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
+
   it("allows only scratch writes and exact isolated-state directory metadata", () => {
     const profile = buildHermesCandidateVerifierSandboxProfile(
       "/private/tmp/review/scratch",

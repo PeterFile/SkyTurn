@@ -121,6 +121,21 @@ export interface CandidateDeliveryCommitEvidence {
   parentCommit: string;
 }
 
+export interface CandidateDeliveryCommitPreparation {
+  status: "prepared";
+  commitSha: string;
+  treeSha: string;
+  branch: string;
+  parentCommit: string;
+  expected: CandidateCommitExpectation;
+}
+
+export interface PublishPreparedCandidateDeliveryCommitInput {
+  projectRoot: string;
+  worktreePath: string;
+  preparation: CandidateDeliveryCommitPreparation;
+}
+
 export interface ManagedWorktreeCreateInput {
   sessionId: string;
   variantId: string;

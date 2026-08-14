@@ -100,6 +100,61 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("persists commit publication preparation across reopen without projecting it", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const projectionBefore = store.materializeFlowProjection("session-1");
+    const ledgerBefore = store.buildLedgerSummary("session-1");
+    const payload = {
+      laneId: "lane-commit",
+      segmentId: "segment-candidate",
+      manifestSha256: "a".repeat(64),
+      requestSha256: "b".repeat(64),
+      preparation: {
+        status: "prepared",
+        commitSha: "2".repeat(40),
+        treeSha: "3".repeat(40),
+        branch: "main",
+        parentCommit: "1".repeat(40),
+        expected: {
+          repositoryIdentity: "4".repeat(64),
+          worktreeIdentity: "5".repeat(64),
+          branchName: "main",
+          beforeHeadCommit: "1".repeat(40),
+          afterHeadCommit: "1".repeat(40),
+          ancestryProofSha256: "6".repeat(64),
+          fullPatchSha256: "7".repeat(64),
+          fullPatchByteLength: 42,
+          fileManifestSha256: "8".repeat(64),
+        },
+      },
+    };
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.commit.publication_prepared",
+      source: "electron-main",
+      laneId: "lane-commit",
+      segmentId: "segment-candidate",
+      idempotencyKey: "delivery-commit-prepared:lane-commit:segment-candidate",
+      payload,
+      now: "2026-08-14T00:00:00.000Z",
+    });
+    expect(store.materializeFlowProjection("session-1")).toEqual(projectionBefore);
+    expect(store.buildLedgerSummary("session-1")).toEqual(ledgerBefore);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listEvents("session-1").at(-1)).toMatchObject({
+      kind: "workflow.commit.publication_prepared",
+      idempotencyKey: "delivery-commit-prepared:lane-commit:segment-candidate",
+      payload,
+    });
+    expect(reopened.materializeFlowProjection("session-1")).toEqual(projectionBefore);
+    expect(reopened.buildLedgerSummary("session-1")).toEqual(ledgerBefore);
+    reopened.close();
+  });
+
   it("never persists or returns a raw Hermes resume handle", async () => {
     const projectRoot = await makeTempRoot();
     const rawHandle = "Bearer resume-secret path=/Users/alice/private password=hunter2";

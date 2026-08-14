@@ -23,6 +23,8 @@ import {
   evaluateRollbackWorktreeState,
   getGitCheckpointSnapshot,
   mergeDeliveryPullRequest,
+  prepareCandidateDeliveryCommit,
+  publishPreparedCandidateDeliveryCommit,
   pushDeliveryBranch,
   getGitBranchFacts,
   SKYTURN_VOLATILE_GIT_PATHS,
@@ -1672,6 +1674,71 @@ describe("candidate delivery commits", () => {
     });
     expect(git(repo.repoRoot, ["show", `${evidence.commitSha}:feature.txt`])).toBe("reviewed");
     expect(readFileSync(indexPath)).toEqual(indexBefore);
+  });
+
+  it("prepares exact candidate bytes without moving the branch and publishes the same identity idempotently", async () => {
+    const repo = await createTestRepo("skyturn-candidate-prepare-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed prepared bytes\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+
+    const preparation = await prepareCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): prepare reviewed candidate",
+    });
+
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+    expect(git(repo.repoRoot, ["cat-file", "-t", preparation.commitSha])).toBe("commit");
+    expect(git(repo.repoRoot, ["rev-parse", `${preparation.commitSha}^{tree}`])).toBe(preparation.treeSha);
+
+    const first = await publishPreparedCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      preparation,
+    });
+    const retry = await publishPreparedCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      preparation,
+    });
+
+    expect(first).toEqual(retry);
+    expect(first.commitSha).toBe(preparation.commitSha);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(preparation.commitSha);
+  });
+
+  it("fails closed when prepared branch or commit facts conflict", async () => {
+    const repo = await createTestRepo("skyturn-candidate-prepare-conflict-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed conflict bytes\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    const preparation = await prepareCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+      subject: "feat(delivery): reject prepared conflict",
+    });
+    const parentTree = git(repo.repoRoot, ["rev-parse", `${headCommit}^{tree}`]);
+
+    await expect(publishPreparedCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      preparation: { ...preparation, treeSha: parentTree },
+    })).rejects.toThrow();
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+
+    const competingCommit = git(repo.repoRoot, ["commit-tree", parentTree, "-p", headCommit, "-m", "competing update"]);
+    git(repo.repoRoot, ["update-ref", "refs/heads/main", competingCommit, headCommit]);
+    await expect(publishPreparedCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      preparation,
+    })).rejects.toThrow();
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(competingCommit);
   });
 
   it("sanitizes candidate input proxy traps and throwing getters", async () => {
