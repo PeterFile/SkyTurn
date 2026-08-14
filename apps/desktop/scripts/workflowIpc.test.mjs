@@ -245,6 +245,7 @@ test("Electron main tracks every top-level workflow store operation, not only wo
     main.indexOf('ipcMain.handle("workflow:checkpoints"'),
   );
   assert.match(workflowEventsHandler, /redactWorkflowEventForRenderer/);
+  assert.match(workflowEventsHandler, /event\.kind\s*!==\s*"workflow\.commit\.publication_prepared"/);
   assert.doesNotMatch(workflowEventsHandler, /events:\s*store\.listEvents\(sessionId\)\.filter/);
 
   const projectionHandler = main.slice(
@@ -1008,6 +1009,11 @@ test("candidate review material remains ephemeral and candidate commit evidence 
   );
 
   assert.doesNotMatch(publicationHelpers, /reviewRequest|decision|fullPatch|fileManifest|files/);
+  assert.match(publicationHelpers, /store\.getPreparedCandidatePublication\(/);
+  assert.match(publicationHelpers, /store\.appendPreparedCandidatePublication\(/);
+  assert.match(publicationHelpers, /input\.parsePreparation\(/);
+  assert.match(publicationHelpers, /stableJson\(preparation\.expected\)\s*!==\s*stableJson\(input\.expected\)/);
+  assert.doesNotMatch(publicationHelpers, /as unknown as CandidateDeliveryCommitPreparation/);
   assert.match(publicationHelpers, /const payload = \{[\s\S]*laneId:\s*input\.laneId,[\s\S]*segmentId:\s*input\.segmentId,[\s\S]*evidence,[\s\S]*\}/);
   assert.doesNotMatch(deliveryCommitHandler, /stagedFiles|worktreePath:\s*evidence\.worktreePath/);
 });
@@ -1111,6 +1117,39 @@ test("candidate commit publication fails closed on conflicting durable request o
   );
   assert.equal(harness.calls.prepare, 1);
   assert.equal(harness.calls.publish, 1);
+});
+
+test("candidate commit recovery rejects a structurally valid prepared expectation that differs from the current manifest", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const firstProcess = candidateCommitPublicationHarness({ failTerminalAppends: 1 });
+  await assert.rejects(runtime.publishCandidateDeliveryCommitWithRecovery(firstProcess.input));
+  const prepared = firstProcess.events.find((event) => event.kind === "workflow.commit.publication_prepared");
+  prepared.payload.preparation.expected.fileManifestSha256 = "9".repeat(64);
+  const publishCalls = firstProcess.calls.publish;
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(firstProcess.input),
+    /manual repair/i,
+  );
+
+  assert.equal(firstProcess.calls.prepare, 1);
+  assert.equal(firstProcess.calls.publish, publishCalls);
+});
+
+test("candidate commit recovery rejects malformed prepared publication before publish", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const firstProcess = candidateCommitPublicationHarness({ failTerminalAppends: 1 });
+  await assert.rejects(runtime.publishCandidateDeliveryCommitWithRecovery(firstProcess.input));
+  const prepared = firstProcess.events.find((event) => event.kind === "workflow.commit.publication_prepared");
+  prepared.payload.preparation.rawPath = "/private/source";
+  const publishCalls = firstProcess.calls.publish;
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(firstProcess.input),
+    /manual repair/i,
+  );
+
+  assert.equal(firstProcess.calls.publish, publishCalls);
 });
 
 test("downstream delivery uses the backend-resolved path with pathless candidate commit evidence", async () => {
@@ -3578,11 +3617,45 @@ function candidateCommitPublicationHarness(options = {}) {
     listEvents() {
       return events;
     },
-    appendWorkflowEvent(input) {
-      if (input.kind === "workflow.commit.publication_prepared" && failPreparedAppends > 0) {
+    getPreparedCandidatePublication(input) {
+      const event = events.find((candidate) =>
+        candidate.kind === "workflow.commit.publication_prepared" &&
+        candidate.idempotencyKey === `delivery-commit-prepared:${input.laneId}:${input.segmentId}`
+      );
+      if (!event) return null;
+      if (
+        event.payload.manifestSha256 !== input.manifestSha256 ||
+        event.payload.requestSha256 !== input.requestSha256
+      ) throw new Error("prepared publication identity conflict");
+      return structuredClone(event.payload.preparation);
+    },
+    appendPreparedCandidatePublication(input) {
+      if (failPreparedAppends > 0) {
         failPreparedAppends -= 1;
         throw new Error("prepared intent persistence failed");
       }
+      const idempotencyKey = `delivery-commit-prepared:${input.laneId}:${input.segmentId}`;
+      const existing = events.find((event) => event.idempotencyKey === idempotencyKey);
+      if (existing) return existing;
+      const event = {
+        ...structuredClone(input),
+        id: `event-${events.length + 1}`,
+        kind: "workflow.commit.publication_prepared",
+        source: "workflow_store",
+        idempotencyKey,
+        payload: {
+          laneId: input.laneId,
+          segmentId: input.segmentId,
+          manifestSha256: input.manifestSha256,
+          requestSha256: input.requestSha256,
+          preparation: structuredClone(input.preparation),
+        },
+        createdAt: input.now,
+      };
+      events.push(event);
+      return event;
+    },
+    appendWorkflowEvent(input) {
       if (input.kind === "workflow.commit.created" && failTerminalAppends > 0) {
         failTerminalAppends -= 1;
         throw new Error("terminal persistence failed");
@@ -3602,10 +3675,14 @@ function candidateCommitPublicationHarness(options = {}) {
   const input = {
     store,
     sessionId: "session-1",
+    nodeId: "node-candidate",
     laneId: "lane-commit",
     segmentId: "segment-candidate",
+    runId: "run-candidate",
     manifestSha256: "a".repeat(64),
     requestSha256: "b".repeat(64),
+    expected: structuredClone(preparation.expected),
+    parsePreparation: parseCandidateCommitPreparation,
     async prepare() {
       calls.prepare += 1;
       return structuredClone(preparation);
@@ -3641,6 +3718,32 @@ function candidateCommitPublicationHarness(options = {}) {
     now: () => "2026-08-14T00:00:00.000Z",
   };
   return { calls, events, input, preparation, state, store };
+}
+
+function parseCandidateCommitPreparation(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (Object.keys(value).sort().join(",") !== "branch,commitSha,expected,parentCommit,status,treeSha") return null;
+  const expected = value.expected;
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)) return null;
+  if (Object.keys(expected).sort().join(",") !== [
+    "afterHeadCommit",
+    "ancestryProofSha256",
+    "beforeHeadCommit",
+    "branchName",
+    "fileManifestSha256",
+    "fullPatchByteLength",
+    "fullPatchSha256",
+    "repositoryIdentity",
+    "worktreeIdentity",
+  ].join(",")) return null;
+  if (
+    value.status !== "prepared" ||
+    !/^[0-9a-f]{40}$/.test(value.commitSha) ||
+    !/^[0-9a-f]{40}$/.test(value.treeSha) ||
+    value.branch !== expected.branchName ||
+    value.parentCommit !== expected.afterHeadCommit
+  ) return null;
+  return structuredClone(value);
 }
 
 function extractFunction(source, name) {

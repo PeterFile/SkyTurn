@@ -1,11 +1,13 @@
 import { spawn } from "node:child_process";
-import { lstatSync, readFileSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import {
   chmod,
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
+  realpath,
   rm,
   stat,
   symlink,
@@ -258,6 +260,125 @@ describe("managed Hermes candidate verifier launcher", () => {
     }
 
     expect(spawnProcess).toHaveBeenCalledOnce();
+  });
+
+  it("executes a sealed owned interpreter copy whose bytes survive source replacement before spawn", async () => {
+    const binaryRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-bin-"));
+    const canonicalStateRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-state-"));
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-launch-"));
+    roots.push(binaryRoot, canonicalStateRoot, temporaryRoot);
+    const canonicalTemporaryRoot = await realpath(temporaryRoot);
+    const hermesPath = join(binaryRoot, "hermes");
+    const interpreterPath = join(binaryRoot, "python");
+    const originalInterpreter = "#!/bin/sh\n# original-interpreter\nexit 0\n";
+    await writeFile(hermesPath, [
+      "#!/bin/sh",
+      `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python' "$0" "$@"`,
+      "' '''",
+      "",
+    ].join("\n"), { mode: 0o755 });
+    await writeFile(interpreterPath, originalInterpreter, { mode: 0o755 });
+    const canonicalInterpreterPath = await realpath(interpreterPath);
+    await writeFile(join(canonicalStateRoot, "config.yaml"), "model: isolated-test\n", { mode: 0o400 });
+    const originalPath = process.env.PATH;
+    const originalHermesHome = process.env.HERMES_HOME;
+    process.env.PATH = binaryRoot;
+    process.env.HERMES_HOME = canonicalStateRoot;
+    let managed: HermesCandidateVerifierManagedProcess | null = null;
+    const spawnProcess = vi.fn(((
+      _ownerPath: string,
+      args: readonly string[],
+      options: { readonly env?: NodeJS.ProcessEnv },
+    ) => {
+      const launchInterpreter = args[6];
+      expect(launchInterpreter).toBe(join(canonicalTemporaryRoot, "python"));
+      expect(launchInterpreter).not.toBe(canonicalInterpreterPath);
+      expect(statSync(canonicalTemporaryRoot).mode & 0o777).toBe(0o500);
+      expect(statSync(launchInterpreter).mode & 0o777).toBe(0o500);
+      expect(readFileSync(launchInterpreter, "utf8")).toBe(originalInterpreter);
+      expect(options.env?.__PYVENV_LAUNCHER__).toBe(canonicalInterpreterPath);
+
+      writeFileSync(interpreterPath, "#!/bin/sh\n# replacement-interpreter\nexit 82\n", { mode: 0o755 });
+      expect(readFileSync(launchInterpreter, "utf8")).toBe(originalInterpreter);
+      return spawnProtocolFixture();
+    }) as unknown as typeof spawn);
+
+    try {
+      managed = await launchHermesCandidateVerifierProcess(
+        { signal: new AbortController().signal },
+        { platform: "darwin", createTemporaryRoot: async () => temporaryRoot, spawnProcess },
+      );
+      await managed.ready;
+      await managed.terminateAndReap();
+      await managed.cleanup();
+    } finally {
+      if (managed) await managed.terminateAndReap().catch(() => undefined);
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+      else process.env.HERMES_HOME = originalHermesHome;
+    }
+
+    expect(spawnProcess).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    {
+      name: "empty",
+      async create(path: string) {
+        await writeFile(path, "", { mode: 0o755 });
+      },
+    },
+    {
+      name: "oversized",
+      async create(path: string) {
+        const handle = await open(path, "wx", 0o755);
+        try {
+          await handle.truncate(256 * 1024 * 1024);
+        } finally {
+          await handle.close();
+        }
+      },
+    },
+    {
+      name: "non-regular",
+      async create(path: string) {
+        await mkdir(path, { mode: 0o755 });
+      },
+    },
+  ])("fails closed before spawn for a $name interpreter source", async ({ create }) => {
+    const binaryRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-invalid-bin-"));
+    const canonicalStateRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-invalid-state-"));
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-review-invalid-launch-"));
+    roots.push(binaryRoot, canonicalStateRoot, temporaryRoot);
+    const hermesPath = join(binaryRoot, "hermes");
+    await writeFile(hermesPath, [
+      "#!/bin/sh",
+      `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python' "$0" "$@"`,
+      "' '''",
+      "",
+    ].join("\n"), { mode: 0o755 });
+    await create(join(binaryRoot, "python"));
+    await writeFile(join(canonicalStateRoot, "config.yaml"), "model: isolated-test\n", { mode: 0o400 });
+    const originalPath = process.env.PATH;
+    const originalHermesHome = process.env.HERMES_HOME;
+    process.env.PATH = binaryRoot;
+    process.env.HERMES_HOME = canonicalStateRoot;
+    const spawnProcess = vi.fn() as unknown as typeof spawn;
+
+    try {
+      await expect(launchHermesCandidateVerifierProcess(
+        { signal: new AbortController().signal },
+        { platform: "darwin", createTemporaryRoot: async () => temporaryRoot, spawnProcess },
+      )).rejects.toThrow("Hermes candidate verifier failed.");
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalHermesHome === undefined) delete process.env.HERMES_HOME;
+      else process.env.HERMES_HOME = originalHermesHome;
+    }
+
+    expect(spawnProcess).not.toHaveBeenCalled();
   });
 
   it("rejects interpreter identity replacement between resolution and launch", async () => {

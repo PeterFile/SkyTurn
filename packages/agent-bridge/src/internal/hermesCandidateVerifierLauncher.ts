@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { constants as fsConstants } from "node:fs";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
 import {
   access,
   chmod,
@@ -27,7 +27,7 @@ import {
 import { resolveCliExecutable } from "./resolveCliExecutable.js";
 import {
   resolveHermesCommand,
-  revalidateHermesCommandExecutable,
+  type HermesCommandExecutableIdentity,
 } from "./resolveHermesCommand.js";
 
 const failureMessage = "Hermes candidate verifier failed.";
@@ -35,6 +35,7 @@ const maximumPromptBytes = 24 * 1024 * 1024;
 const maximumResponseBytes = 1_024;
 const maximumFrameBytes = 8_192;
 const maximumTimeoutMs = 5 * 60_000;
+const maximumInterpreterBytes = 64 * 1024 * 1024;
 const cleanupTimeoutMs = 5_000;
 const stateFileNames = ["config.yaml", ".env", "auth.json", ".anthropic_oauth.json"] as const;
 const isolatedStateDirectoryNames = [
@@ -208,9 +209,6 @@ export async function launchHermesCandidateVerifierProcess(input: {
     ) {
       throw new Error(failureMessage);
     }
-    await revalidateHermesCommandExecutable(command.executableIdentity);
-    assertNotAborted(input.signal);
-
     const canonicalStateRoot = await resolveHermesStateRoot(environment);
     const createdRoot = await (
       dependencies.createTemporaryRoot ?? (() => mkdtemp(join(tmpdir(), "skyturn-hermes-review-")))
@@ -224,6 +222,11 @@ export async function launchHermesCandidateVerifierProcess(input: {
     temporaryRoot = await realpath(temporaryRoot);
     ownedDirectories[0] = temporaryRoot;
     if (pathsOverlap(temporaryRoot, canonicalStateRoot)) throw new Error(failureMessage);
+    const launchInterpreter = await copyAttestedHermesInterpreter(
+      command.executableIdentity,
+      join(temporaryRoot, "python"),
+    );
+    assertNotAborted(input.signal);
     const isolatedStateRoot = join(temporaryRoot, "state");
     const scratchRoot = join(temporaryRoot, "scratch");
     await mkdir(isolatedStateRoot, { mode: 0o700 });
@@ -248,14 +251,23 @@ export async function launchHermesCandidateVerifierProcess(input: {
       temporaryRoot,
       fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
     );
+    await rootHandle.chmod(0o500);
+    const sealedRootMetadata = await rootHandle.stat();
+    if (!sealedRootMetadata.isDirectory() || (sealedRootMetadata.mode & 0o777) !== 0o500) {
+      throw new Error(failureMessage);
+    }
     assertNotAborted(input.signal);
 
     const sandboxProfile = buildHermesCandidateVerifierSandboxProfile(
       scratchRoot,
       isolatedStateDirectories,
     );
-    const childEnvironment = verifierEnvironment(environment, isolatedStateRoot, scratchRoot);
-    const launchInterpreter = await revalidateHermesCommandExecutable(command.executableIdentity);
+    const childEnvironment = verifierEnvironment(
+      environment,
+      isolatedStateRoot,
+      scratchRoot,
+      command.executableIdentity.launchPath,
+    );
     const child = (dependencies.spawnProcess ?? spawn)(ownerPath, [
       String(cleanupTimeoutMs),
       "--target-stdin",
@@ -420,10 +432,122 @@ async function readVerifierRunnerSource(): Promise<Buffer> {
   throw new Error(failureMessage);
 }
 
+async function copyAttestedHermesInterpreter(
+  expected: HermesCommandExecutableIdentity,
+  destinationPath: string,
+): Promise<string> {
+  let source: FileHandle | null = null;
+  let destination: FileHandle | null = null;
+  try {
+    // macOS has no fexecve entry point usable here. Copying exact bytes from the
+    // attested descriptor into an O_EXCL launcher-owned file removes mutable PATH
+    // and source replacement from the execution capability. This is not isolation
+    // from a hostile same-UID host process, which is outside the adapter-sandbox boundary.
+    source = await open(
+      expected.canonicalPath,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+    );
+    const sourceMetadata = await source.stat({ bigint: true });
+    assertPinnedInterpreterSource(sourceMetadata, expected);
+    const sourceSize = Number(sourceMetadata.size);
+
+    destination = await open(
+      destinationPath,
+      fsConstants.O_WRONLY |
+        fsConstants.O_CREAT |
+        fsConstants.O_EXCL |
+        fsConstants.O_NOFOLLOW,
+      0o500,
+    );
+    const createdMetadata = await destination.stat({ bigint: true });
+    if (!createdMetadata.isFile() || createdMetadata.size !== 0n || createdMetadata.nlink !== 1n) {
+      throw new Error(failureMessage);
+    }
+
+    const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, sourceSize));
+    let position = 0;
+    while (position < sourceSize) {
+      const length = Math.min(buffer.byteLength, sourceSize - position);
+      let filled = 0;
+      while (filled < length) {
+        const { bytesRead } = await source.read(buffer, filled, length - filled, position + filled);
+        if (bytesRead === 0) throw new Error(failureMessage);
+        filled += bytesRead;
+      }
+      let written = 0;
+      while (written < length) {
+        const result = await destination.write(buffer, written, length - written, position + written);
+        if (result.bytesWritten === 0) throw new Error(failureMessage);
+        written += result.bytesWritten;
+      }
+      position += length;
+    }
+    const trailing = Buffer.allocUnsafe(1);
+    if ((await source.read(trailing, 0, 1, sourceSize)).bytesRead !== 0) {
+      throw new Error(failureMessage);
+    }
+    const finalSourceMetadata = await source.stat({ bigint: true });
+    assertPinnedInterpreterSource(finalSourceMetadata, expected);
+    if (finalSourceMetadata.size !== sourceMetadata.size) throw new Error(failureMessage);
+
+    await destination.chmod(0o500);
+    await destination.sync();
+    const syncedMetadata = await destination.stat({ bigint: true });
+    assertOwnedInterpreterCopy(syncedMetadata, createdMetadata, sourceMetadata.size);
+    await destination.close();
+    destination = null;
+    await source.close();
+    source = null;
+
+    const closedMetadata = await lstat(destinationPath, { bigint: true });
+    assertOwnedInterpreterCopy(closedMetadata, createdMetadata, sourceMetadata.size);
+    return destinationPath;
+  } finally {
+    await destination?.close().catch(() => undefined);
+    await source?.close().catch(() => undefined);
+  }
+}
+
+function assertPinnedInterpreterSource(
+  metadata: BigIntStats,
+  expected: HermesCommandExecutableIdentity,
+): void {
+  const birthtimeNs = metadata.birthtimeNs > 0n ? metadata.birthtimeNs.toString() : null;
+  if (
+    !metadata.isFile() ||
+    metadata.size <= 0n ||
+    metadata.size > BigInt(maximumInterpreterBytes) ||
+    metadata.dev.toString() !== expected.device ||
+    metadata.ino.toString() !== expected.inode ||
+    birthtimeNs !== expected.birthtimeNs
+  ) {
+    throw new Error(failureMessage);
+  }
+}
+
+function assertOwnedInterpreterCopy(
+  metadata: BigIntStats,
+  created: BigIntStats,
+  expectedSize: bigint,
+): void {
+  if (
+    !metadata.isFile() ||
+    metadata.size !== expectedSize ||
+    metadata.nlink !== 1n ||
+    metadata.dev !== created.dev ||
+    metadata.ino !== created.ino ||
+    metadata.birthtimeNs !== created.birthtimeNs ||
+    Number(metadata.mode & 0o777n) !== 0o500
+  ) {
+    throw new Error(failureMessage);
+  }
+}
+
 function verifierEnvironment(
   inherited: NodeJS.ProcessEnv,
   stateRoot: string,
   scratchRoot: string,
+  venvLaunchPath: string,
 ): NodeJS.ProcessEnv {
   const inheritedNames = [
     "HOME",
@@ -491,6 +615,7 @@ function verifierEnvironment(
   result.PYTHONDONTWRITEBYTECODE = "1";
   result.PYTHONNOUSERSITE = "1";
   result.PYTHONPYCACHEPREFIX = join(scratchRoot, "pycache");
+  result.__PYVENV_LAUNCHER__ = venvLaunchPath;
   result.PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
   return result;
 }

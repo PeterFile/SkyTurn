@@ -370,10 +370,14 @@ interface CandidateDeliveryReviewSnapshotLike {
 interface CandidateDeliveryCommitPublicationInput {
   store: WorkflowStoreHost;
   sessionId: string;
+  nodeId: string;
   laneId: string;
   segmentId: string;
+  runId: string;
   manifestSha256: string;
   requestSha256: string;
+  expected: CandidateDeliveryCommitPreparation["expected"];
+  parsePreparation(value: unknown): CandidateDeliveryCommitPreparation | null;
   prepare(): Promise<CandidateDeliveryCommitPreparation>;
   publish(preparation: CandidateDeliveryCommitPreparation): Promise<CandidateDeliveryCommitEvidence>;
   broadcast(): void;
@@ -744,6 +748,8 @@ interface WorkflowStoreHost {
   recordRunCheckpoint(input: unknown): unknown;
   freezeCandidateManifest(input: unknown): unknown;
   getCandidateManifest(identity: unknown): unknown;
+  appendPreparedCandidatePublication(input: unknown): unknown;
+  getPreparedCandidatePublication(identity: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
@@ -1395,7 +1401,9 @@ ipcMain.handle("workflow:events", workflowHandler(async (projectRoot: string, se
   assertKnownProjectRoot(projectRoot);
   const workflowSessionId = assertWorkflowSessionId(sessionId);
   const store = await getWorkflowStore(projectRoot);
-  const events = store.listEvents(workflowSessionId).filter(isWorkflowEventRecord);
+  const events = store.listEvents(workflowSessionId)
+    .filter(isWorkflowEventRecord)
+    .filter((event) => event.kind !== "workflow.commit.publication_prepared");
   const plannerLaneId = reconciledPlannerLaneIdForRenderer(events);
   const plannerSegments = plannerLaneId ? store.listSegments(workflowSessionId, plannerLaneId) : [];
   const plannerSegmentsById = new Map(plannerSegments.map((segment) => [segment.segmentId, segment]));
@@ -2022,6 +2030,7 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
         );
         const {
           captureCandidateDeliveryReviewSnapshot,
+          parseCandidateDeliveryCommitPreparation,
           prepareCandidateDeliveryCommit,
           publishPreparedCandidateDeliveryCommit,
         } = await import("@skyturn/git-worktree/node");
@@ -2030,6 +2039,7 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
           manifest,
           manifestSha256,
           parseCandidateReviewRequest,
+          parseCandidateDeliveryCommitPreparation,
           prepareCandidateDeliveryCommit,
           publishPreparedCandidateDeliveryCommit,
           realProjectRoot,
@@ -2047,10 +2057,14 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
     return publishCandidateDeliveryCommitWithRecovery({
       store,
       sessionId,
+      nodeId: context.manifest.nodeId,
       laneId,
       segmentId: context.manifest.segmentId,
+      runId: context.manifest.runId,
       manifestSha256: context.manifestSha256,
       requestSha256,
+      expected: candidateCommitExpectationFromManifest(context.manifest),
+      parsePreparation: context.parseCandidateDeliveryCommitPreparation,
       async prepare() {
         try {
           const snapshot = await context.captureCandidateDeliveryReviewSnapshot({
@@ -6780,36 +6794,26 @@ function candidateCommitPreparedIntentPayload(input: CandidateDeliveryCommitPubl
 function findCandidateCommitPreparedIntent(
   input: CandidateDeliveryCommitPublicationInput,
 ): CandidateDeliveryCommitPreparation | null {
-  const matches: Record<string, unknown>[] = [];
-  for (const event of input.store.listEvents(input.sessionId)) {
-    if (!isRecord(event) || event.kind !== "workflow.commit.publication_prepared") continue;
-    const payload = isRecord(event.payload) ? event.payload : {};
-    if (
-      (optionalText(event.laneId) ?? optionalText(payload.laneId)) === input.laneId &&
-      (optionalText(event.segmentId) ?? optionalText(payload.segmentId)) === input.segmentId
-    ) matches.push(event);
-  }
-  if (matches.length === 0) return null;
-  if (matches.length !== 1) throw candidateCommitPublicationError(true);
-  const event = matches[0]!;
-  const payload = isRecord(event.payload) ? event.payload : {};
-  const preparation = isRecord(payload.preparation) ? payload.preparation : null;
-  const expectedIdempotencyKey = `delivery-commit-prepared:${input.laneId}:${input.segmentId}`;
-  if (
-    event.sessionId !== input.sessionId ||
-    event.source !== "electron-main" ||
-    event.laneId !== input.laneId ||
-    event.segmentId !== input.segmentId ||
-    event.idempotencyKey !== expectedIdempotencyKey ||
-    payload.laneId !== input.laneId ||
-    payload.segmentId !== input.segmentId ||
-    payload.manifestSha256 !== input.manifestSha256 ||
-    payload.requestSha256 !== input.requestSha256 ||
-    !preparation
-  ) {
+  let persisted: unknown;
+  try {
+    persisted = input.store.getPreparedCandidatePublication({
+      sessionId: input.sessionId,
+      nodeId: input.nodeId,
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      runId: input.runId,
+      manifestSha256: input.manifestSha256,
+      requestSha256: input.requestSha256,
+    });
+  } catch {
     throw candidateCommitPublicationError(true);
   }
-  return preparation as unknown as CandidateDeliveryCommitPreparation;
+  if (persisted === null) return null;
+  const preparation = input.parsePreparation(persisted);
+  if (!preparation || stableJson(preparation.expected) !== stableJson(input.expected)) {
+    throw candidateCommitPublicationError(true);
+  }
+  return preparation;
 }
 
 function appendCandidateCommitPreparedIntent(
@@ -6818,21 +6822,22 @@ function appendCandidateCommitPreparedIntent(
 ): void {
   const idempotencyKey = `delivery-commit-prepared:${input.laneId}:${input.segmentId}`;
   const payload = candidateCommitPreparedIntentPayload(input, preparation);
-  const event = input.store.appendWorkflowEvent({
+  const event = input.store.appendPreparedCandidatePublication({
     sessionId: input.sessionId,
-    kind: "workflow.commit.publication_prepared",
-    source: "electron-main",
+    nodeId: input.nodeId,
     laneId: input.laneId,
     segmentId: input.segmentId,
-    idempotencyKey,
-    payload,
+    runId: input.runId,
+    manifestSha256: input.manifestSha256,
+    requestSha256: input.requestSha256,
+    preparation,
     now: input.now(),
   });
   if (
     !isRecord(event) ||
     event.sessionId !== input.sessionId ||
     event.kind !== "workflow.commit.publication_prepared" ||
-    event.source !== "electron-main" ||
+    event.source !== "workflow_store" ||
     event.laneId !== input.laneId ||
     event.segmentId !== input.segmentId ||
     event.idempotencyKey !== idempotencyKey ||

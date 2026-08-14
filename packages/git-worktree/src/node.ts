@@ -23,6 +23,7 @@ import {
 
 import {
   buildAdjudicationMetrics,
+  parseCandidateDeliveryCommitPreparation,
   parseVariantComparisonEvidence,
   parseWorktreeComparisonRequest,
   type ChangesetEvidenceInput,
@@ -80,7 +81,11 @@ import {
   spawnBoundedGit,
 } from "./internal/gitCommand.js";
 
-export { parseVariantComparisonEvidence, parseWorktreeComparisonRequest };
+export {
+  parseCandidateDeliveryCommitPreparation,
+  parseVariantComparisonEvidence,
+  parseWorktreeComparisonRequest,
+};
 export { SKYTURN_VOLATILE_GIT_PATHS };
 
 export type ManagedWorktreeWorkflowEventKind =
@@ -2036,34 +2041,9 @@ function parsePublishPreparedCandidateDeliveryCommitInput(
 }
 
 function validateCandidateDeliveryCommitPreparation(value: unknown): CandidateDeliveryCommitPreparation {
-  if (!isOrdinaryCandidateRecord(value, [
-    "branch",
-    "commitSha",
-    "expected",
-    "parentCommit",
-    "status",
-    "treeSha",
-  ])) {
-    throw new Error("Invalid candidate commit preparation.");
-  }
-  const expected = validateCandidateCommitExpectation(value.expected);
-  if (
-    value.status !== "prepared" ||
-    !isCanonicalLowercaseHex(value.commitSha, 40) ||
-    !isCanonicalLowercaseHex(value.treeSha, 40) ||
-    value.branch !== expected.branchName ||
-    value.parentCommit !== expected.afterHeadCommit
-  ) {
-    throw new Error("Invalid candidate commit preparation facts.");
-  }
-  return Object.freeze({
-    status: "prepared",
-    commitSha: value.commitSha,
-    treeSha: value.treeSha,
-    branch: value.branch,
-    parentCommit: value.parentCommit,
-    expected,
-  });
+  const parsed = parseCandidateDeliveryCommitPreparation(value);
+  if (!parsed) throw new Error("Invalid candidate commit preparation.");
+  return parsed;
 }
 
 function isOrdinaryCandidateRecord(
