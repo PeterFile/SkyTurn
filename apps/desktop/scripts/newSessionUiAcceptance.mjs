@@ -21,6 +21,10 @@ const waitTimeoutMs = Number(process.env.SKYTURN_NEW_SESSION_UI_WAIT_TIMEOUT_MS 
 const agentWatchdogTimeoutMs = Math.max(1_000, Math.min(12 * 60 * 1_000, waitTimeoutMs - 60_000));
 const pollIntervalMs = Number(process.env.SKYTURN_NEW_SESSION_UI_POLL_MS ?? 2_000);
 const commandOutputLimitBytes = Number(process.env.SKYTURN_NEW_SESSION_UI_OUTPUT_LIMIT_BYTES ?? 4_000);
+const managedStreamOutputLimitBytes = 1024 * 1024;
+const managedCombinedOutputLimitBytes = 2 * 1024 * 1024;
+const capturedStreamOutputLimitBytes = 8 * 1024 * 1024;
+const capturedCombinedOutputLimitBytes = 8 * 1024 * 1024;
 const defaultCdpRequestTimeoutMs = 30_000;
 const controlPlaneUiTimeoutMs = 15_000;
 const controlPlaneCdpRequestTimeoutMs = 20_000;
@@ -28,6 +32,8 @@ const failureShutdownTimeoutMs = 30_000;
 const dangerAuthorizationAcknowledgmentBudgetMs = 10_000;
 const dangerAuthorizationOption = "Authorize this run";
 const expectedChangedFiles = ["src/App.css", "src/App.jsx"];
+
+export const MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC = "Acceptance child output exceeded the fixed byte limit.";
 
 export function waitForBrowserProbe(probe, label, {
   deadline,
@@ -593,6 +599,11 @@ function errorText(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+function hasManagedOutputOverflow(error) {
+  if (error instanceof Error && error.message === MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC) return true;
+  return error instanceof AggregateError && error.errors.some(hasManagedOutputOverflow);
+}
+
 export async function fileSha256(filePath) {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
 }
@@ -617,7 +628,7 @@ export async function launchElectronAcceptanceApp({ userData, projectRoot }) {
   });
   let electron = null;
   try {
-    await waitForHttpOk(devServerUrl, "renderer dev server");
+    await waitForHttpOk(devServerUrl, "renderer dev server", vite);
 
     const electronBinary = require("electron");
     const electronArgs = [
@@ -644,6 +655,9 @@ export async function launchElectronAcceptanceApp({ userData, projectRoot }) {
   } catch (error) {
     const cleanupResults = await Promise.allSettled(electron ? [electron.close(), vite.close()] : [vite.close()]);
     const cleanupFailures = cleanupResults.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    if ([error, ...cleanupFailures].some(hasManagedOutputOverflow)) {
+      throw new Error(MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC);
+    }
     if (cleanupFailures.length > 0) {
       throw new AggregateError([error, ...cleanupFailures], "Electron acceptance launch and cleanup failed.");
     }
@@ -654,7 +668,10 @@ export async function launchElectronAcceptanceApp({ userData, projectRoot }) {
     cdpPort,
     devServerUrl,
     diagnostics() {
-      return [vite.diagnosticOutput(), electron.diagnosticOutput()].filter(Boolean).join("\n");
+      const diagnostics = [vite.diagnosticOutput(), electron.diagnosticOutput()].filter(Boolean);
+      return diagnostics.includes(MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC)
+        ? MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC
+        : diagnostics.join("\n");
     },
     async close() {
       await Promise.all([electron.close(), vite.close()]);
@@ -685,11 +702,19 @@ export async function shutdownElectronForFailureCollection({ cdp, electron, vite
     ));
   }
   try {
+    electron.assertOutputWithinLimit?.();
+  } catch (error) {
+    gracefulFailures.push(error);
+  }
+  try {
     cdp.close();
   } catch {}
   if (gracefulFailures.length > 0) {
     const cleanupResults = await Promise.allSettled([electron.close(), vite.close()]);
     const cleanupFailures = cleanupResults.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
+    if ([...gracefulFailures, ...cleanupFailures].some(hasManagedOutputOverflow)) {
+      throw new Error(MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC);
+    }
     throw new AggregateError(
       [...gracefulFailures, ...cleanupFailures],
       `Electron failure shutdown was not graceful: ${gracefulFailures.map(errorText).join("; ")}`,
@@ -3174,22 +3199,27 @@ function summarizeWorkspace(workspace) {
   });
 }
 
-function spawnManaged(command, args, { cwd, env, label }) {
+export function spawnManaged(command, args, {
+  cwd,
+  env,
+  label,
+  outputLimitBytes = managedStreamOutputLimitBytes,
+  combinedOutputLimitBytes = managedCombinedOutputLimitBytes,
+}) {
+  const output = createBoundedProcessOutput({ outputLimitBytes, combinedOutputLimitBytes });
   const child = spawn(command, args, {
     cwd,
     env,
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   });
-  let stdout = "";
-  let stderr = "";
   let closed = false;
   let closeResult = null;
   child.stdout.on("data", (chunk) => {
-    stdout += chunk.toString();
+    output.append("stdout", chunk);
   });
   child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString();
+    output.append("stderr", chunk);
   });
   child.once("close", (code, signal) => {
     closed = true;
@@ -3200,24 +3230,107 @@ function spawnManaged(command, args, { cwd, env, label }) {
     child,
     label,
     output() {
-      return `${stderr}${stdout}`.trim();
+      const state = output.state();
+      return `${state.stderr}${state.stdout}`.trim();
+    },
+    outputState() {
+      return output.state();
     },
     diagnosticOutput() {
-      return boundedText(`${label}:\n${stderr}${stdout}`.trim(), commandOutputLimitBytes).value;
+      if (output.state().truncated) return MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC;
+      return boundedText(`${label}:\n${this.output()}`.trim(), commandOutputLimitBytes).value;
+    },
+    assertOutputWithinLimit() {
+      if (output.state().truncated) throw new Error(MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC);
     },
     assertAlive() {
+      this.assertOutputWithinLimit();
       if (!closed) return;
       const reason = closeResult?.signal ? `signal ${closeResult.signal}` : `exit ${closeResult?.code}`;
       throw new Error(`${label} exited before readiness (${reason}): ${this.output()}`);
     },
-    close() {
-      return terminateChild(child, () => closed);
+    async close() {
+      await terminateChild(child, () => closed);
+      this.assertOutputWithinLimit();
     },
     async waitForClose(timeoutMs) {
       if (!closed && !await waitForChildClose(child, timeoutMs, () => closed)) return null;
       return closeResult;
     },
   };
+}
+
+function createBoundedProcessOutput({ outputLimitBytes, combinedOutputLimitBytes }) {
+  assertPositiveOutputLimit(outputLimitBytes);
+  assertPositiveOutputLimit(combinedOutputLimitBytes);
+  const streams = {
+    stdout: createOutputStreamState(outputLimitBytes),
+    stderr: createOutputStreamState(outputLimitBytes),
+  };
+  let combinedBytes = 0;
+  let combinedRetainedBytes = 0;
+  let combinedTruncated = false;
+
+  return {
+    append(name, chunk) {
+      const stream = streams[name];
+      if (!stream) throw new Error("Unknown acceptance output stream.");
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      stream.bytes = saturatingByteCount(stream.bytes, bytes.byteLength);
+      combinedBytes = saturatingByteCount(combinedBytes, bytes.byteLength);
+      const retainedBytes = Math.min(
+        bytes.byteLength,
+        outputLimitBytes - stream.retainedBytes,
+        combinedOutputLimitBytes - combinedRetainedBytes,
+      );
+      if (retainedBytes > 0) {
+        bytes.copy(stream.buffer, stream.retainedBytes, 0, retainedBytes);
+        stream.retainedBytes += retainedBytes;
+        combinedRetainedBytes += retainedBytes;
+      }
+      if (stream.bytes > outputLimitBytes) stream.truncated = true;
+      if (combinedBytes > combinedOutputLimitBytes) combinedTruncated = true;
+    },
+    state() {
+      return {
+        stdout: retainedOutputText(streams.stdout),
+        stderr: retainedOutputText(streams.stderr),
+        stdoutBytes: streams.stdout.bytes,
+        stderrBytes: streams.stderr.bytes,
+        combinedBytes,
+        stdoutRetainedBytes: streams.stdout.retainedBytes,
+        stderrRetainedBytes: streams.stderr.retainedBytes,
+        combinedRetainedBytes,
+        stdoutTruncated: streams.stdout.truncated,
+        stderrTruncated: streams.stderr.truncated,
+        combinedTruncated,
+        truncated: streams.stdout.truncated || streams.stderr.truncated || combinedTruncated,
+      };
+    },
+  };
+}
+
+function createOutputStreamState(limitBytes) {
+  return {
+    buffer: Buffer.allocUnsafe(limitBytes),
+    bytes: 0,
+    retainedBytes: 0,
+    truncated: false,
+  };
+}
+
+function retainedOutputText(stream) {
+  return stream.buffer.subarray(0, stream.retainedBytes).toString("utf8").replace(/\uFFFD+$/, "");
+}
+
+function assertPositiveOutputLimit(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("Acceptance output limit must be a positive safe integer.");
+  }
+}
+
+function saturatingByteCount(current, added) {
+  return Math.min(Number.MAX_SAFE_INTEGER, current + added);
 }
 
 export async function terminateChild(child, closeObserved = () => false) {
@@ -3258,13 +3371,26 @@ function waitForChildClose(child, timeoutMs, closeObserved = () => false) {
   });
 }
 
-function runCapturedProcess(command, args, { cwd, env, timeoutMs }) {
+export function runCapturedProcess(command, args, {
+  cwd,
+  env,
+  timeoutMs,
+  outputLimitBytes = capturedStreamOutputLimitBytes,
+  combinedOutputLimitBytes = capturedCombinedOutputLimitBytes,
+}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
+    const output = createBoundedProcessOutput({ outputLimitBytes, combinedOutputLimitBytes });
+    const child = spawn(command, args, {
+      cwd,
+      env,
+      detached: process.platform !== "win32",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let settled = false;
+    let closed = false;
     let timer = null;
+    let terminalError = null;
+    let termination = null;
     const finish = (error, result) => {
       if (settled) return;
       settled = true;
@@ -3272,36 +3398,64 @@ function runCapturedProcess(command, args, { cwd, env, timeoutMs }) {
       if (error) reject(error);
       else resolve(result);
     };
+    const terminateFor = (error) => {
+      terminalError ??= error;
+      if (!termination) {
+        termination = terminateChild(child, () => closed).catch(() => {
+          terminalError = new Error("Failure collector subprocess cleanup failed.");
+          finish(terminalError);
+        });
+      }
+    };
     child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      output.append("stdout", chunk);
+      if (output.state().truncated) terminateFor(new Error(MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC));
     });
     child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      output.append("stderr", chunk);
+      if (output.state().truncated) terminateFor(new Error(MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC));
     });
-    child.once("error", (error) => finish(error));
-    child.once("close", (code, signal) => {
-      if (code === 0) {
-        finish(null, { stdout, stderr, code, signal });
+    child.once("error", (error) => {
+      terminalError ??= error;
+      if (!child.pid) finish(terminalError);
+    });
+    child.once("close", async (code, signal) => {
+      closed = true;
+      if (termination) await termination;
+      const state = output.state();
+      if (state.truncated) {
+        finish(new Error(MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC));
         return;
       }
-      finish(new Error(`Failure collector subprocess exited with ${signal ?? code}: ${boundedText(stderr, commandOutputLimitBytes).value}`));
+      if (terminalError) {
+        finish(terminalError);
+        return;
+      }
+      if (code === 0) {
+        finish(null, { stdout: state.stdout, stderr: state.stderr, code, signal });
+        return;
+      }
+      finish(new Error(
+        `Failure collector subprocess exited with ${signal ?? code}: ${boundedText(state.stderr, commandOutputLimitBytes).value}`,
+      ));
     });
     timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish(new Error(`Failure collector subprocess timed out after ${timeoutMs}ms.`));
+      terminateFor(new Error(`Failure collector subprocess timed out after ${timeoutMs}ms.`));
     }, timeoutMs);
   });
 }
 
-async function waitForHttpOk(url, label) {
+async function waitForHttpOk(url, label, managedProcess = null) {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
+    managedProcess?.assertAlive();
     try {
       const response = await fetch(url);
       if (response.ok) return;
     } catch {}
     await delay(250);
   }
+  managedProcess?.assertAlive();
   throw new Error(`Timed out waiting for ${label} at ${url}.`);
 }
 

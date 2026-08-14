@@ -6,6 +6,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const root = new URL("..", import.meta.url);
 const strictNodeIds = {
@@ -903,6 +904,110 @@ test("New Session UI acceptance bounds verification command output", async () =>
   assert.equal(summary.stderrBytes, 5201);
   assert.equal(summary.stdoutTruncated, true);
   assert.equal(summary.stderrTruncated, true);
+});
+
+test("shared Electron launcher bounds child output and reaps an overflowing managed process", async () => {
+  const {
+    MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC,
+    spawnManaged,
+  } = await import("./newSessionUiAcceptance.mjs");
+  const rawTail = "RAW-MANAGED-TAIL-MUST-NOT-SURVIVE";
+  const managed = spawnManaged(process.execPath, [
+    "-e",
+    `process.stdout.write("x".repeat(512) + ${JSON.stringify(rawTail)}); setInterval(() => {}, 1000);`,
+  ], {
+    cwd: fileURLToPath(root),
+    env: process.env,
+    label: "bounded-child",
+    outputLimitBytes: 128,
+    combinedOutputLimitBytes: 192,
+  });
+  const pid = managed.child.pid;
+
+  await waitForCondition(() => managed.outputState().truncated === true);
+  const state = managed.outputState();
+  assert.ok(state.stdoutRetainedBytes <= 128);
+  assert.ok(state.stderrRetainedBytes <= 128);
+  assert.ok(state.combinedRetainedBytes <= 192);
+  assert.equal(managed.diagnosticOutput(), MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC);
+  assert.doesNotMatch(managed.output(), new RegExp(rawTail));
+  await assert.rejects(managed.close(), {
+    message: MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC,
+  });
+  assert.equal(await processExists(pid), false);
+});
+
+test("failure collector fails with one fixed overflow diagnostic after cleanup and reap", async () => {
+  const {
+    MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC,
+    runCapturedProcess,
+  } = await import("./newSessionUiAcceptance.mjs");
+  const tempRoot = await mkdtemp(join(tmpdir(), "skyturn-bounded-collector-"));
+  const pidPath = join(tempRoot, "pid");
+  const rawTail = "RAW-COLLECTOR-TAIL-MUST-NOT-SURVIVE";
+  try {
+    await assert.rejects(
+      runCapturedProcess(process.execPath, [
+        "-e",
+        [
+          `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
+          `process.stderr.write("y".repeat(512) + ${JSON.stringify(rawTail)});`,
+          "setInterval(() => {}, 1000);",
+        ].join(" "),
+      ], {
+        cwd: fileURLToPath(root),
+        env: process.env,
+        timeoutMs: 5_000,
+        outputLimitBytes: 128,
+        combinedOutputLimitBytes: 192,
+      }),
+      (error) => {
+        assert.equal(error.message, MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC);
+        assert.doesNotMatch(error.message, new RegExp(rawTail));
+        return true;
+      },
+    );
+    const pid = Number(await readFile(pidPath, "utf8"));
+    assert.equal(await processExists(pid), false);
+  } finally {
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("failure shutdown preserves the fixed overflow diagnostic after closing every child", async () => {
+  const {
+    MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC,
+    shutdownElectronForFailureCollection,
+  } = await import("./newSessionUiAcceptance.mjs");
+  const closed = [];
+  const electron = {
+    async waitForClose() {
+      return { code: 0, signal: null };
+    },
+    assertOutputWithinLimit() {
+      throw new Error(MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC);
+    },
+    async close() {
+      closed.push("electron");
+    },
+  };
+  const vite = {
+    async close() {
+      closed.push("vite");
+    },
+  };
+  const cdp = {
+    async evaluate() {},
+    close() {
+      closed.push("cdp");
+    },
+  };
+
+  await assert.rejects(
+    shutdownElectronForFailureCollection({ cdp, electron, vite }),
+    { message: MANAGED_OUTPUT_OVERFLOW_DIAGNOSTIC },
+  );
+  assert.deepEqual(closed.sort(), ["cdp", "electron", "vite"]);
 });
 
 test("New Session UI acceptance rejects unexpected files from any delivery commit since baseline", async () => {
@@ -3484,4 +3589,23 @@ function plannerTurnEvents(seq, laneId, { runId, segmentId }) {
       },
     },
   }];
+}
+
+async function waitForCondition(predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Timed out waiting for deterministic child state.");
+}
+
+async function processExists(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error && typeof error === "object" && error.code === "EPERM";
+  }
 }
