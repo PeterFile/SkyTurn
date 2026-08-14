@@ -124,7 +124,7 @@ function isWithin(parent: string, child: string): boolean {
     !isAbsolute(childRelativePath);
 }
 
-function attachPosixManagedProcessProtocol(child: ChildProcess): PosixManagedProcess {
+export function attachPosixManagedProcessProtocol(child: ChildProcess): PosixManagedProcess {
   const ready = deferred<void>();
   const closed = deferred<PosixManagedProcessCloseResult>();
   const reaped = deferred<void>();

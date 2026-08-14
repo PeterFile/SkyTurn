@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { CanvasNode, LiveRunChangesEvidence, WorkflowVariantAdoption, WorkflowWorktreeIdentity } from "@skyturn/project-core";
 import {
   checkDeliveryPullRequest,
+  captureCandidateDeliveryReviewSnapshot,
   createCandidateDeliveryCommit,
   createDeliveryCommit,
   createDeliveryPullRequest,
@@ -1596,6 +1597,54 @@ describe("candidate delivery commits", () => {
     for (const root of tempRoots.splice(0)) {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it.skipIf(process.platform === "win32")("captures the exact reviewed binary, symlink, and executable patch without exposing files", async () => {
+    const repo = await createTestRepo("skyturn-candidate-review-snapshot-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "binary.dat"), Buffer.from([0, 1, 2, 0xff, 0, 3]));
+    await writeFile(join(repo.repoRoot, "run.sh"), "#!/bin/sh\necho reviewed\n");
+    await chmod(join(repo.repoRoot, "run.sh"), 0o755);
+    await fsSymlink("run.sh", join(repo.repoRoot, "run-link"));
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+
+    const snapshot = await captureCandidateDeliveryReviewSnapshot({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+    });
+    const patch = Buffer.from(snapshot.fullPatchBase64, "base64");
+
+    expect(snapshot).toEqual({
+      baselineCommit: headCommit,
+      headCommit,
+      fullPatchBase64: expect.any(String),
+      fullPatchSha256: expected.fullPatchSha256,
+      fullPatchByteLength: expected.fullPatchByteLength,
+      fileManifestSha256: expected.fileManifestSha256,
+    });
+    expect(snapshot).not.toHaveProperty("files");
+    expect(patch.byteLength).toBe(expected.fullPatchByteLength);
+    expect(createHash("sha256").update(patch).digest("hex")).toBe(expected.fullPatchSha256);
+    expect(patch.toString("utf8")).toContain("GIT binary patch");
+    expect(patch.toString("utf8")).toContain("new file mode 120000");
+    expect(patch.toString("utf8")).toContain("new file mode 100755");
+  });
+
+  it("rejects a stale review snapshot expectation with the bounded candidate error", async () => {
+    const repo = await createTestRepo("skyturn-candidate-review-stale-");
+    tempRoots.push(repo.tempRoot);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "reviewed once\n");
+    const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
+    const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
+    await writeFile(join(repo.repoRoot, "feature.txt"), "changed after manifest\n");
+
+    await expect(captureCandidateDeliveryReviewSnapshot({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected,
+    })).rejects.toThrow("Candidate delivery commit was rejected.");
   });
 
   it("publishes the reviewed tree with minimal evidence without changing the real index", async () => {

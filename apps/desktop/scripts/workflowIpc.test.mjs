@@ -401,9 +401,11 @@ test("Electron main tracks every top-level workflow store operation, not only wo
     main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
     main.indexOf('ipcMain.handle("workflow:changeset"'),
   );
-  assert.match(deliveryCommitHandler, /createDeliveryCommit/);
-  assert.match(deliveryCommitHandler, /normalizeDeliveryCommitIpcError/);
-  assert.match(deliveryCommitHandler, /deliveryReconciliationStatus/);
+  assert.match(deliveryCommitHandler, /captureCandidateDeliveryReviewSnapshot/);
+  assert.match(deliveryCommitHandler, /reviewCandidateWithHermes/);
+  assert.match(deliveryCommitHandler, /createCandidateDeliveryCommit/);
+  assert.doesNotMatch(deliveryCommitHandler, /createDeliveryCommit\s*\(/);
+  assert.doesNotMatch(deliveryCommitHandler, /normalizeDeliveryCommitIpcError|deliveryReconciliationStatus/);
   assert.match(deliveryCommitHandler, /workflow\.commit\.created/);
   assert.match(deliveryCommitHandler, /appendWorkflowEvent/);
   assert.match(deliveryCommitHandler, /status:\s*"committed"/);
@@ -911,7 +913,7 @@ test("workflow delivery commit validates known sessions before creating git comm
   const storeIndex = deliveryCommitHandler.indexOf("const store = await getWorkflowStore");
   const canvasIndex = deliveryCommitHandler.indexOf("assertKnownWorkflowCanvasSession");
   const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
-  const commitIndex = deliveryCommitHandler.indexOf("createDeliveryCommit({");
+  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
 
   assert.ok(sessionIndex >= 0, "delivery commit IPC must require a workflow sessionId");
   assert.ok(storeIndex > sessionIndex, "delivery commit IPC must open the workflow store after resolving sessionId");
@@ -933,10 +935,10 @@ test("workflow delivery commit takes the session mutation lock before local git 
   const lockIndex = deliveryCommitHandler.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, sessionId");
   const storeIndex = deliveryCommitHandler.indexOf("const store = await getWorkflowStore");
   const canvasIndex = deliveryCommitHandler.indexOf("assertKnownWorkflowCanvasSession");
-  const laneGuardIndex = deliveryCommitHandler.indexOf("assertWorkflowDeliveryCommitLane");
-  const worktreeIndex = deliveryCommitHandler.indexOf("resolveDeliveryCommitWorktreePath");
+  const laneGuardIndex = deliveryCommitHandler.indexOf("resolveWorkflowDeliveryCandidateIdentity");
+  const worktreeIndex = deliveryCommitHandler.indexOf("resolveCandidateDeliveryWorktreePath");
   const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
-  const commitIndex = deliveryCommitHandler.indexOf("createDeliveryCommit({");
+  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
   const eventIndex = deliveryCommitHandler.indexOf('kind: "workflow.commit.created"');
   const broadcastIndex = deliveryCommitHandler.indexOf("broadcastWorkflowProjection");
 
@@ -950,6 +952,120 @@ test("workflow delivery commit takes the session mutation lock before local git 
   assert.ok(commitIndex > importIndex, "delivery commit must call the local git mutation after the lock is held");
   assert.ok(eventIndex > commitIndex, "workflow.commit.created must be written only after the locked git commit succeeds");
   assert.ok(broadcastIndex > eventIndex, "delivery commit broadcast must happen after locked event materialization");
+});
+
+test("workflow delivery commit reviews one store manifest before exact candidate ref publication", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const deliveryCommitHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
+    main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+  );
+
+  const lockIndex = deliveryCommitHandler.indexOf("withWorkflowSessionMutationLock(workflowProjectRoot, sessionId");
+  const storeIndex = deliveryCommitHandler.indexOf("const store = await getWorkflowStore");
+  const lineageIndex = deliveryCommitHandler.indexOf("resolveWorkflowDeliveryCandidateIdentity");
+  const manifestIndex = deliveryCommitHandler.indexOf("store.getCandidateManifest({");
+  const recaptureIndex = deliveryCommitHandler.indexOf("captureCandidateDeliveryReviewSnapshot({");
+  const reviewIndex = deliveryCommitHandler.indexOf("reviewCandidateWithHermes({");
+  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
+  const eventIndex = deliveryCommitHandler.indexOf('kind: "workflow.commit.created"');
+  const broadcastIndex = deliveryCommitHandler.indexOf("broadcastWorkflowProjection");
+
+  assert.ok(lockIndex >= 0);
+  assert.ok(storeIndex > lockIndex);
+  assert.ok(lineageIndex > storeIndex);
+  assert.ok(manifestIndex > lineageIndex);
+  assert.ok(recaptureIndex > manifestIndex);
+  assert.ok(reviewIndex > recaptureIndex);
+  assert.ok(commitIndex > reviewIndex);
+  assert.ok(eventIndex > commitIndex);
+  assert.ok(broadcastIndex > eventIndex);
+  assert.match(deliveryCommitHandler, /store\.getCandidateManifest\(\{\s*sessionId:\s*candidateIdentity\.sessionId,\s*nodeId:\s*candidateIdentity\.nodeId,\s*laneId:\s*candidateIdentity\.laneId,\s*segmentId:\s*candidateIdentity\.segmentId,\s*runId:\s*candidateIdentity\.runId,?\s*\}\)/);
+  const manifestLookup = deliveryCommitHandler.slice(manifestIndex, deliveryCommitHandler.indexOf(");", manifestIndex) + 2);
+  assert.doesNotMatch(manifestLookup, /agentKind/);
+  assert.match(deliveryCommitHandler, /expected:\s*candidateCommitExpectationFromManifest\(manifest\)/);
+  assert.match(deliveryCommitHandler, /reviewCandidateWithHermes\(\{ request: reviewRequest \}\)/);
+  assert.match(deliveryCommitHandler, /segmentId:\s*manifest\.segmentId/);
+  assert.doesNotMatch(deliveryCommitHandler, /createDeliveryCommit\s*\(/);
+  assert.doesNotMatch(deliveryCommitHandler, /deliveryFilesFromInput|deliveryReconciliationStatus|acceptMismatch/);
+  assert.doesNotMatch(deliveryCommitHandler, /readField\(input,\s*"(?:manifest|runId|digest|files|reconciliationStatus|acceptMismatch)"\)/);
+});
+
+test("candidate review material remains ephemeral and candidate commit evidence stays honest", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const deliveryCommitHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
+    main.indexOf('ipcMain.handle("workflow:delivery:push"'),
+  );
+  const eventBlock = deliveryCommitHandler.slice(
+    deliveryCommitHandler.indexOf("const event = store.appendWorkflowEvent"),
+    deliveryCommitHandler.indexOf("broadcastWorkflowProjection"),
+  );
+
+  assert.doesNotMatch(eventBlock, /reviewRequest|decision|fullPatch|fileManifest|files/);
+  assert.match(eventBlock, /payload:\s*\{[\s\S]*laneId,[\s\S]*segmentId:\s*manifest\.segmentId,[\s\S]*evidence,[\s\S]*\}/);
+  assert.doesNotMatch(deliveryCommitHandler, /stagedFiles|worktreePath:\s*evidence\.worktreePath/);
+});
+
+test("downstream delivery uses the backend-resolved path with pathless candidate commit evidence", async () => {
+  const { findDeliveryCommitEvidence } = await loadMainDeliveryCommitEvidenceHelper();
+  const store = {
+    listEvents() {
+      return [{
+        kind: "workflow.commit.created",
+        laneId: "lane-commit",
+        segmentId: "segment-implementation",
+        payload: {
+          laneId: "lane-commit",
+          segmentId: "segment-implementation",
+          evidence: {
+            status: "committed",
+            commitSha: "c".repeat(40),
+            branch: "feature/review",
+            parentCommit: "b".repeat(40),
+          },
+        },
+      }];
+    },
+  };
+
+  assert.deepEqual(
+    structuredClone(await findDeliveryCommitEvidence(
+      store,
+      "session-1",
+      "lane-commit",
+      "segment-implementation",
+      "/repo",
+    )),
+    {
+      commitSha: "c".repeat(40),
+      branch: "feature/review",
+      worktreePath: "/repo",
+    },
+  );
+});
+
+test("candidate manifest binding rejects a renderer/session worktree mismatch", async () => {
+  const helpers = await loadMainCandidateDeliveryHelpers();
+  const manifest = {
+    executionTarget: "new_worktree",
+    worktreeId: "worktree-authoritative",
+    branchName: "feature/review",
+  };
+  const session = {
+    target: { executionTarget: "new_worktree", selectedBranch: "feature/review" },
+  };
+
+  assert.throws(
+    () => helpers.assertCandidateManifestCanvasBinding(manifest, session, {
+      worktree: {
+        worktreeId: "worktree-renderer",
+        branchName: "feature/review",
+        realPath: "/repo.worktrees/renderer",
+      },
+    }),
+    (error) => error?.code === "DELIVERY_REJECTED" && error.message === "Candidate delivery was rejected.",
+  );
 });
 
 test("workflow events expose renderer-safe delivery lifecycle facts without raw payloads", async () => {
@@ -1281,70 +1397,64 @@ test("workflow delivery sync main uses an explicit ff-only IPC and records main_
   assert.doesNotMatch(syncHandler, /deleteBranch/);
 });
 
-test("workflow delivery commit validates a commit lane before creating git commits", async () => {
+test("workflow delivery commit derives the commit lane candidate before creating git commits", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const deliveryCommitHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
     main.indexOf('ipcMain.handle("workflow:changeset"'),
   );
-  const helperSource = main.slice(
-    main.indexOf("function assertWorkflowDeliveryCommitLane"),
-    main.indexOf("async function assertComparedWorktreeBelongsToProject"),
-  );
-
   const canvasIndex = deliveryCommitHandler.indexOf("assertKnownWorkflowCanvasSession");
   const laneIdIndex = deliveryCommitHandler.indexOf('const laneId = requireText(readField(input, "laneId"), "workflow commit laneId")');
-  const laneGuardIndex = deliveryCommitHandler.indexOf("assertWorkflowDeliveryCommitLane(store, sessionId, laneId)");
+  const laneGuardIndex = deliveryCommitHandler.indexOf("resolveWorkflowDeliveryCandidateIdentity(projection, sessionId, laneId)");
   const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
-  const commitIndex = deliveryCommitHandler.indexOf("createDeliveryCommit({");
+  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
 
   assert.ok(laneIdIndex > canvasIndex, "delivery commit IPC must require laneId after validating the session");
   assert.ok(laneGuardIndex > laneIdIndex, "delivery commit IPC must resolve laneId through the Flow projection");
   assert.ok(laneGuardIndex < importIndex, "unknown or non-commit laneIds must reject before importing commit implementation");
   assert.ok(commitIndex > laneGuardIndex, "git commit creation must stay after commit-lane validation");
-  assert.match(helperSource, /store\.materializeFlowProjection\(sessionId\)/);
-  assert.match(helperSource, /\.id === laneId/);
-  assert.match(helperSource, /lane\.laneKind !== "commit"/);
+  assert.match(deliveryCommitHandler, /store\.materializeFlowProjection\(sessionId\)/);
+  assert.match(deliveryCommitHandler, /resolveWorkflowDeliveryCandidateIdentity,/);
 });
 
-test("workflow delivery commit resolves commit worktree from CanvasSession before creating git commits", async () => {
+test("workflow delivery commit resolves the candidate worktree from backend state before creating git commits", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const deliveryCommitHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
     main.indexOf('ipcMain.handle("workflow:changeset"'),
   );
   const helperSource = main.slice(
-    main.indexOf("async function resolveDeliveryCommitWorktreePath"),
-    main.indexOf("async function assertComparedWorktreeBelongsToProject"),
+    main.indexOf("async function resolveCandidateDeliveryWorktreePath"),
+    main.indexOf("async function findDeliveryCommitEvidence"),
   );
 
-  const laneGuardIndex = deliveryCommitHandler.indexOf("assertWorkflowDeliveryCommitLane(store, sessionId, laneId)");
-  const resolveIndex = deliveryCommitHandler.indexOf("resolveDeliveryCommitWorktreePath(");
+  const laneGuardIndex = deliveryCommitHandler.indexOf("resolveWorkflowDeliveryCandidateIdentity(projection, sessionId, laneId)");
+  const resolveIndex = deliveryCommitHandler.indexOf("resolveCandidateDeliveryWorktreePath(");
   const importIndex = deliveryCommitHandler.indexOf('await import("@skyturn/git-worktree/node")');
-  const commitIndex = deliveryCommitHandler.indexOf("createDeliveryCommit({");
+  const commitIndex = deliveryCommitHandler.indexOf("createCandidateDeliveryCommit({");
 
   assert.ok(resolveIndex > laneGuardIndex, "delivery commit IPC must resolve the worktree after commit-lane validation");
   assert.ok(resolveIndex < importIndex, "renderer worktreePath must be validated before importing git commit implementation");
   assert.ok(commitIndex > resolveIndex, "git commit creation must use the server-resolved worktree path");
-  assert.match(deliveryCommitHandler, /const worktreePath = await resolveDeliveryCommitWorktreePath\(store,\s*sessionId,\s*laneId,\s*rawWorktreePath,\s*realProjectRoot\)/);
+  assert.match(deliveryCommitHandler, /const worktreePath = await resolveCandidateDeliveryWorktreePath\(/);
   assert.match(helperSource, /store\.materializeCanvasSession\(sessionId\)/);
-  assert.match(helperSource, /node\.id === laneId/);
-  assert.match(helperSource, /node\.worktree/);
-  assert.match(helperSource, /await fs\.realpath\(expectedWorktreePath\)/);
-  assert.match(helperSource, /await fs\.realpath\(suppliedWorktreePath\)/);
-  assert.match(helperSource, /realSuppliedWorktreePath !== realExpectedWorktreePath/);
-  assert.match(helperSource, /UNSAFE_WORKTREE_PATH/);
+  assert.match(helperSource, /node\.id === manifest\.nodeId/);
+  assert.match(helperSource, /assertCandidateManifestCanvasBinding/);
+  assert.match(helperSource, /assertManagedRollbackWorktree/);
+  assert.match(helperSource, /realSupplied !== expectedWorktreePath/);
+  assert.match(helperSource, /rejectCandidateDelivery/);
 });
 
-test("workflow delivery commit passes explicit mismatch acceptance to git service", async () => {
+test("workflow delivery commit ignores obsolete renderer reconciliation authority", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const deliveryCommitHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
     main.indexOf('ipcMain.handle("workflow:changeset"'),
   );
 
-  assert.match(deliveryCommitHandler, /const acceptMismatch = readField\(input,\s*"acceptMismatch"\) === true/);
-  assert.match(deliveryCommitHandler, /\.\.\.\(acceptMismatch \? \{ acceptMismatch \} : \{\}\)/);
+  assert.doesNotMatch(deliveryCommitHandler, /deliveryFilesFromInput|deliveryReconciliationStatus/);
+  assert.doesNotMatch(deliveryCommitHandler, /readField\(input,\s*"(?:files|reconciliationStatus|acceptMismatch)"\)/);
+  assert.match(deliveryCommitHandler, /candidateCommitExpectationFromManifest\(manifest\)/);
 });
 
 test("workflow createSession resolves and persists the authoritative current branch target", async () => {
@@ -3240,6 +3350,58 @@ async function loadMainDeliveryRendererHelpers() {
   }).outputText;
   const module = { exports: {} };
   vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.deliveryRenderer.ts" });
+  return module.exports;
+}
+
+async function loadMainCandidateDeliveryHelpers() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    'const CANDIDATE_DELIVERY_REJECTED_MESSAGE = "Candidate delivery was rejected.";',
+    'const candidateDeliveryAgentKinds = new Set(["codex", "agy", "gemini", "claude-code", "openclaw"]);',
+    'function isRecord(value) { return !!value && typeof value === "object" && !Array.isArray(value); }',
+    'function optionalText(value) { return typeof value === "string" && value.trim() ? value.trim() : null; }',
+    'function workflowIpcError(code, message) { const error = new Error(message); error.code = code; return error; }',
+    extractFunction(main, "rejectCandidateDelivery"),
+    extractFunction(main, "assertCandidateManifestCanvasBinding"),
+    "module.exports = { assertCandidateManifestCanvasBinding };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, { module, exports: module.exports, Error, Set }, { filename: "main.candidateDelivery.ts" });
+  return module.exports;
+}
+
+async function loadMainDeliveryCommitEvidenceHelper() {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    'function isRecord(value) { return !!value && typeof value === "object" && !Array.isArray(value); }',
+    'function optionalText(value) { return typeof value === "string" && value.trim() ? value.trim() : null; }',
+    'function requireText(value, field) { const text = optionalText(value); if (!text) throw workflowIpcError("INVALID_INPUT", `${field} is required.`); return text; }',
+    'function workflowIpcError(code, message) { const error = new Error(message); error.code = code; return error; }',
+    extractFunction(main, "findDeliveryCommitEvidence"),
+    "module.exports = { findDeliveryCommitEvidence };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, {
+    module,
+    exports: module.exports,
+    Error,
+    fs: { realpath: async (value) => value },
+    path,
+  }, { filename: "main.deliveryCommitEvidence.ts" });
   return module.exports;
 }
 

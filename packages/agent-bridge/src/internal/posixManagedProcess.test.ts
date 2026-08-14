@@ -596,9 +596,14 @@ async function makeNativeBuildFixture(): Promise<{
 }> {
   const root = await makeRoot(false);
   const nativeRoot = join(root, "src/native");
+  const internalRoot = join(root, "src/internal");
   const scriptsRoot = join(root, "scripts");
   const buildScript = join(scriptsRoot, "buildArtifactGate.mjs");
-  await Promise.all([mkdir(nativeRoot, { recursive: true }), mkdir(scriptsRoot, { recursive: true })]);
+  await Promise.all([
+    mkdir(nativeRoot, { recursive: true }),
+    mkdir(internalRoot, { recursive: true }),
+    mkdir(scriptsRoot, { recursive: true }),
+  ]);
   await copyFile(fileURLToPath(new URL("../../scripts/buildArtifactGate.mjs", import.meta.url)), buildScript);
   await Promise.all([
     ...nativeHelperNames.flatMap((helper) => [
@@ -607,6 +612,7 @@ async function makeNativeBuildFixture(): Promise<{
     ]),
     writeFile(join(nativeRoot, "artifact-gate.ps1"), "# fixture\n"),
     writeFile(join(nativeRoot, "job-object-host.ps1"), "# fixture\n"),
+    writeFile(join(internalRoot, "hermesCandidateVerifier.py"), "# fixture\n"),
   ]);
   return { buildScript, nativeRoot, root };
 }

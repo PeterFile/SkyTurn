@@ -223,6 +223,21 @@ export interface WorkflowGitAncestryProofInput {
   afterHeadCommit: string;
 }
 
+export interface CandidateDeliveryReviewSnapshotInput {
+  readonly projectRoot: string;
+  readonly worktreePath: string;
+  readonly expected: CandidateCommitExpectation;
+}
+
+export interface CandidateDeliveryReviewSnapshot {
+  readonly baselineCommit: string;
+  readonly headCommit: string;
+  readonly fullPatchBase64: string;
+  readonly fullPatchSha256: string;
+  readonly fullPatchByteLength: number;
+  readonly fileManifestSha256: string;
+}
+
 export type WorkflowGitAncestryProofErrorCode =
   | "INVALID_INPUT"
   | "NOT_ANCESTOR"
@@ -1164,20 +1179,7 @@ export async function createCandidateDeliveryCommit(
   const parsedInput = parseCandidateDeliveryCommitInput(input);
 
   try {
-    const projectRoot = await assertGitRepo(parsedInput.projectRoot);
-    const worktreePath = await resolveDeliveryWorktreePath(projectRoot, parsedInput.worktreePath);
-    await assertCandidateBranchName(worktreePath, parsedInput.expected.branchName);
-    await assertCandidateSha1Repository(worktreePath);
-    await assertCandidateLiveCheckout(worktreePath, parsedInput.expected);
-    await assertCandidateAncestryExpectation(projectRoot, worktreePath, parsedInput.expected);
-
-    const snapshot = await collectAtomicGitChangesetSnapshot({
-      repoRoot: worktreePath,
-      baseline: { kind: "ref", ref: parsedInput.expected.beforeHeadCommit },
-      maxPatchPreviewBytes: 1,
-      maxFullPatchBytes: DEFAULT_MAX_FULL_PATCH_BYTES,
-    });
-    assertCandidateSnapshot(snapshot, parsedInput.expected);
+    const { projectRoot, worktreePath, snapshot } = await collectVerifiedCandidateSnapshot(parsedInput);
 
     const temporaryRoot = await mkdtemp(join(tmpdir(), "skyturn-candidate-commit-"));
     let published = false;
@@ -1205,6 +1207,26 @@ export async function createCandidateDeliveryCommit(
         }
       }
     }
+  } catch (error) {
+    if (error instanceof DeliveryCommitError && error.message === candidateRejectedMessage) throw error;
+    throwDelivery("DELIVERY_REJECTED", candidateRejectedMessage);
+  }
+}
+
+export async function captureCandidateDeliveryReviewSnapshot(
+  input: CandidateDeliveryReviewSnapshotInput,
+): Promise<CandidateDeliveryReviewSnapshot> {
+  try {
+    const parsedInput = parseCandidateDeliveryReviewSnapshotInput(input);
+    const { snapshot } = await collectVerifiedCandidateSnapshot(parsedInput);
+    return Object.freeze({
+      baselineCommit: snapshot.baselineCommit,
+      headCommit: snapshot.headCommit!,
+      fullPatchBase64: snapshot.fullPatch.toString("base64"),
+      fullPatchSha256: snapshot.fullPatchSha256!,
+      fullPatchByteLength: snapshot.fullPatchByteLength,
+      fileManifestSha256: snapshot.fileManifestSha256!,
+    });
   } catch (error) {
     if (error instanceof DeliveryCommitError && error.message === candidateRejectedMessage) throw error;
     throwDelivery("DELIVERY_REJECTED", candidateRejectedMessage);
@@ -1822,6 +1844,57 @@ interface ParsedCandidateDeliveryCommitInput {
   readonly worktreePath: string;
   readonly expected: CandidateCommitExpectation;
   readonly message: Buffer;
+}
+
+interface ParsedCandidateDeliveryReviewSnapshotInput {
+  readonly projectRoot: string;
+  readonly worktreePath: string;
+  readonly expected: CandidateCommitExpectation;
+}
+
+function parseCandidateDeliveryReviewSnapshotInput(value: unknown): ParsedCandidateDeliveryReviewSnapshotInput {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("Invalid candidate review snapshot input.");
+    }
+    const record = value as Record<string, unknown>;
+    if (
+      typeof record.projectRoot !== "string" ||
+      record.projectRoot.length === 0 ||
+      record.projectRoot.includes("\0") ||
+      typeof record.worktreePath !== "string" ||
+      record.worktreePath.length === 0 ||
+      record.worktreePath.includes("\0")
+    ) {
+      throw new Error("Invalid candidate review snapshot path input.");
+    }
+    return Object.freeze({
+      projectRoot: record.projectRoot,
+      worktreePath: record.worktreePath,
+      expected: validateCandidateCommitExpectation(record.expected),
+    });
+  } catch {
+    throwDelivery("INVALID_INPUT", candidateInvalidMessage);
+  }
+}
+
+async function collectVerifiedCandidateSnapshot(
+  input: ParsedCandidateDeliveryReviewSnapshotInput,
+): Promise<{ projectRoot: string; worktreePath: string; snapshot: AtomicGitChangesetSnapshot }> {
+  const projectRoot = await assertGitRepo(input.projectRoot);
+  const worktreePath = await resolveDeliveryWorktreePath(projectRoot, input.worktreePath);
+  await assertCandidateBranchName(worktreePath, input.expected.branchName);
+  await assertCandidateSha1Repository(worktreePath);
+  await assertCandidateLiveCheckout(worktreePath, input.expected);
+  await assertCandidateAncestryExpectation(projectRoot, worktreePath, input.expected);
+  const snapshot = await collectAtomicGitChangesetSnapshot({
+    repoRoot: worktreePath,
+    baseline: { kind: "ref", ref: input.expected.beforeHeadCommit },
+    maxPatchPreviewBytes: 1,
+    maxFullPatchBytes: DEFAULT_MAX_FULL_PATCH_BYTES,
+  });
+  assertCandidateSnapshot(snapshot, input.expected);
+  return { projectRoot, worktreePath, snapshot };
 }
 
 function parseCandidateDeliveryCommitInput(value: unknown): ParsedCandidateDeliveryCommitInput {

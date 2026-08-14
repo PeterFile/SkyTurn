@@ -17,6 +17,10 @@ import type {
   PlanCancelRequest,
   PlanEvent,
   PlanStateSnapshot,
+  CandidateReviewAgentKind,
+  CandidateReviewRequest,
+  WorkflowDeliveryCandidateIdentity,
+  WorkflowCandidateManifest,
   WorkflowLaneCandidateBinding,
   WorkflowLedgerSummary,
   WorkflowWorktreeIdentity,
@@ -326,13 +330,37 @@ interface WorkflowDeliveryFlowProjectionLike {
   lanes: Array<{
     id: string;
     laneKind?: string;
+    status?: string;
+    executable?: boolean;
+    agentKind?: string;
     rollbackStatus?: string;
+  }>;
+  projectionNodes?: Array<{
+    id?: string;
+    laneId?: string;
+    executable?: boolean;
   }>;
   edges?: Array<{
     sourceLaneId?: string;
     targetLaneId?: string;
   }>;
+  segments?: Array<{
+    id?: string;
+    laneId?: string;
+    runId?: string;
+    status?: string;
+  }>;
   laneRollbackStatuses?: Record<string, unknown>;
+  worktrees?: unknown[];
+}
+
+interface CandidateDeliveryReviewSnapshotLike {
+  baselineCommit: string;
+  headCommit: string;
+  fullPatchBase64: string;
+  fullPatchSha256: string;
+  fullPatchByteLength: number;
+  fileManifestSha256: string;
 }
 
 interface DeliveryCommitEvidenceLike {
@@ -579,6 +607,8 @@ interface ValidatedWorkspaceCollections {
 }
 
 const RUN_PROTOCOL_VERSION = 1;
+const CANDIDATE_DELIVERY_REJECTED_MESSAGE = "Candidate delivery was rejected.";
+const candidateDeliveryAgentKinds = new Set(["codex", "agy", "gemini", "claude-code", "openclaw"]);
 const planRuntimeShutdownError = "Plan runtime is unavailable while SkyTurn is shutting down.";
 const workspaceLoadError = "Workspace could not be loaded.";
 const workspaceSaveError = "Workspace could not be saved.";
@@ -689,6 +719,7 @@ interface WorkflowStoreHost {
   recordCanvasNodePosition(input: unknown): unknown;
   recordRunCheckpoint(input: unknown): unknown;
   freezeCandidateManifest(input: unknown): unknown;
+  getCandidateManifest(identity: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
@@ -1929,49 +1960,85 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
     const store = await getWorkflowStore(projectRoot);
     assertKnownWorkflowCanvasSession(store, sessionId);
     const laneId = requireText(readField(input, "laneId"), "workflow commit laneId");
-    assertWorkflowDeliveryCommitLane(store, sessionId, laneId);
-    const realProjectRoot = await fs.realpath(projectRoot);
-    const rawWorktreePath = optionalText(readField(input, "worktreePath"));
-    const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, laneId, rawWorktreePath, realProjectRoot);
-    const files = deliveryFilesFromInput(readField(input, "files"));
     const subject = requireText(readField(input, "subject"), "commit subject");
     const body = optionalText(readField(input, "body")) ?? undefined;
-    const reconciliationStatus = deliveryReconciliationStatus(input);
-    const acceptMismatch = readField(input, "acceptMismatch") === true;
-    const { createDeliveryCommit } = await import("@skyturn/git-worktree/node");
-    let evidence: Awaited<ReturnType<typeof createDeliveryCommit>>;
     try {
-      evidence = await createDeliveryCommit({
+      const projection = store.materializeFlowProjection(sessionId) as WorkflowDeliveryFlowProjectionLike;
+      const {
+        canonicalWorkflowCandidateManifestJson,
+        parseCandidateReviewRequest,
+        parseWorkflowCandidateManifest,
+        resolveWorkflowDeliveryCandidateIdentity,
+      } = await import("@skyturn/project-core");
+      const candidateIdentity = resolveWorkflowDeliveryCandidateIdentity(projection, sessionId, laneId);
+      const storedManifest = store.getCandidateManifest({
+        sessionId: candidateIdentity.sessionId,
+        nodeId: candidateIdentity.nodeId,
+        laneId: candidateIdentity.laneId,
+        segmentId: candidateIdentity.segmentId,
+        runId: candidateIdentity.runId,
+      });
+      const manifest = requireWorkflowDeliveryCandidateManifest(
+        parseWorkflowCandidateManifest(storedManifest),
+        candidateIdentity,
+      );
+      const manifestSha256 = createHash("sha256")
+        .update(canonicalWorkflowCandidateManifestJson(manifest), "utf8")
+        .digest("hex");
+      const realProjectRoot = await fs.realpath(projectRoot);
+      const rawWorktreePath = optionalText(readField(input, "worktreePath"));
+      const worktreePath = await resolveCandidateDeliveryWorktreePath(
+        store,
+        sessionId,
+        manifest,
+        projection,
+        rawWorktreePath,
+        realProjectRoot,
+      );
+      const {
+        captureCandidateDeliveryReviewSnapshot,
+        createCandidateDeliveryCommit,
+      } = await import("@skyturn/git-worktree/node");
+      const snapshot = await captureCandidateDeliveryReviewSnapshot({
         projectRoot: realProjectRoot,
         worktreePath,
-        files,
+        expected: candidateCommitExpectationFromManifest(manifest),
+      });
+      assertCandidateDeliveryReviewSnapshot(manifest, snapshot);
+      const reviewRequest = parseCandidateReviewRequest(
+        candidateReviewRequestFromManifest(manifest, manifestSha256, snapshot),
+      );
+      if (!reviewRequest) rejectCandidateDelivery();
+      const { reviewCandidateWithHermes } = await import("@skyturn/agent-bridge");
+      await reviewCandidateWithHermes({ request: reviewRequest });
+      const evidence = await createCandidateDeliveryCommit({
+        projectRoot: realProjectRoot,
+        worktreePath,
+        expected: candidateCommitExpectationFromManifest(manifest),
         subject,
         ...(body ? { body } : {}),
-        ...(reconciliationStatus ? { reconciliationStatus } : {}),
-        ...(acceptMismatch ? { acceptMismatch } : {}),
       });
-    } catch (error) {
-      throw normalizeDeliveryCommitIpcError(error);
-    }
 
-    const segmentId = optionalText(readField(input, "segmentId"));
-    const event = store.appendWorkflowEvent({
-      sessionId,
-      kind: "workflow.commit.created",
-      source: "electron-main",
-      laneId,
-      segmentId,
-      idempotencyKey: `delivery-commit:${evidence.commitSha}`,
-      payload: {
+      const event = store.appendWorkflowEvent({
+        sessionId,
+        kind: "workflow.commit.created",
+        source: "electron-main",
         laneId,
-        ...(segmentId ? { segmentId } : {}),
-        evidence,
-      },
-      now: new Date().toISOString(),
-    });
-    broadcastWorkflowProjection(projectRoot, sessionId, store);
+        segmentId: manifest.segmentId,
+        idempotencyKey: `delivery-commit:${evidence.commitSha}`,
+        payload: {
+          laneId,
+          segmentId: manifest.segmentId,
+          evidence,
+        },
+        now: new Date().toISOString(),
+      });
+      broadcastWorkflowProjection(projectRoot, sessionId, store);
 
-    return { protocolVersion: RUN_PROTOCOL_VERSION, status: "committed", event, evidence };
+      return { protocolVersion: RUN_PROTOCOL_VERSION, status: "committed", event, evidence };
+    } catch {
+      rejectCandidateDelivery();
+    }
   });
 }));
 
@@ -6627,6 +6694,119 @@ function assertKnownWorkflowCanvasSession(store: WorkflowStoreHost, sessionId: s
   }
 }
 
+function rejectCandidateDelivery(): never {
+  throw workflowIpcError("DELIVERY_REJECTED", CANDIDATE_DELIVERY_REJECTED_MESSAGE);
+}
+
+function requireWorkflowDeliveryCandidateManifest(
+  value: WorkflowCandidateManifest | null,
+  identity: WorkflowDeliveryCandidateIdentity,
+): WorkflowCandidateManifest {
+  if (
+    !value ||
+    value.sessionId !== identity.sessionId ||
+    value.nodeId !== identity.nodeId ||
+    value.laneId !== identity.laneId ||
+    value.segmentId !== identity.segmentId ||
+    value.runId !== identity.runId ||
+    value.agentKind !== identity.agentKind ||
+    !isCandidateDeliveryAgentKind(value.agentKind) ||
+    value.terminalRunEvidence.status !== "succeeded" ||
+    value.terminalRunEvidence.runId !== identity.runId
+  ) rejectCandidateDelivery();
+  return value;
+}
+
+function assertCandidateManifestCanvasBinding(
+  manifest: Pick<WorkflowCandidateManifest, "executionTarget" | "worktreeId" | "branchName">,
+  canvasSession: Record<string, unknown>,
+  node: Record<string, unknown>,
+): void {
+  if (!isRecord(canvasSession.target) || !isRecord(node.worktree)) rejectCandidateDelivery();
+  if (canvasSession.target.executionTarget !== manifest.executionTarget) rejectCandidateDelivery();
+  const worktreeExecutionTarget = optionalText(node.worktree.executionTarget);
+  if (worktreeExecutionTarget && worktreeExecutionTarget !== manifest.executionTarget) rejectCandidateDelivery();
+  if (optionalText(node.worktree.branchName) !== manifest.branchName) rejectCandidateDelivery();
+  const nodeWorktreeId = optionalText(node.worktree.worktreeId);
+  if (manifest.executionTarget === "current_branch") {
+    if (manifest.worktreeId !== null || nodeWorktreeId) rejectCandidateDelivery();
+    if (optionalText(canvasSession.target.selectedBranch) !== manifest.branchName) rejectCandidateDelivery();
+    return;
+  }
+  if (!manifest.worktreeId || nodeWorktreeId !== manifest.worktreeId || !optionalText(node.worktree.realPath)) {
+    rejectCandidateDelivery();
+  }
+}
+
+function candidateCommitExpectationFromManifest(manifest: WorkflowCandidateManifest) {
+  return {
+    repositoryIdentity: manifest.repositoryIdentity,
+    worktreeIdentity: manifest.worktreeIdentity,
+    branchName: manifest.branchName,
+    beforeHeadCommit: manifest.beforeHeadCommit,
+    afterHeadCommit: manifest.afterHeadCommit,
+    ancestryProofSha256: manifest.ancestryProofSha256,
+    fullPatchSha256: manifest.fullPatchSha256,
+    fullPatchByteLength: manifest.fullPatchByteLength,
+    fileManifestSha256: manifest.fileManifestSha256,
+  };
+}
+
+function assertCandidateDeliveryReviewSnapshot(
+  manifest: WorkflowCandidateManifest,
+  snapshot: CandidateDeliveryReviewSnapshotLike,
+): void {
+  if (
+    snapshot.baselineCommit !== manifest.beforeHeadCommit ||
+    snapshot.headCommit !== manifest.afterHeadCommit ||
+    snapshot.fullPatchSha256 !== manifest.fullPatchSha256 ||
+    snapshot.fullPatchByteLength !== manifest.fullPatchByteLength ||
+    snapshot.fileManifestSha256 !== manifest.fileManifestSha256 ||
+    typeof snapshot.fullPatchBase64 !== "string" ||
+    snapshot.fullPatchBase64.length === 0
+  ) rejectCandidateDelivery();
+}
+
+function candidateReviewRequestFromManifest(
+  manifest: WorkflowCandidateManifest,
+  manifestSha256: string,
+  snapshot: CandidateDeliveryReviewSnapshotLike,
+): CandidateReviewRequest {
+  if (!isCandidateDeliveryAgentKind(manifest.agentKind)) rejectCandidateDelivery();
+  return {
+    version: 1,
+    manifestSha256,
+    identity: {
+      sessionId: manifest.sessionId,
+      nodeId: manifest.nodeId,
+      laneId: manifest.laneId,
+      segmentId: manifest.segmentId,
+      runId: manifest.runId,
+    },
+    candidate: {
+      repositoryIdentity: manifest.repositoryIdentity,
+      worktreeIdentity: manifest.worktreeIdentity,
+      branchName: manifest.branchName,
+      beforeHeadCommit: manifest.beforeHeadCommit,
+      afterHeadCommit: manifest.afterHeadCommit,
+      ancestryProofSha256: manifest.ancestryProofSha256,
+      fileManifestSha256: manifest.fileManifestSha256,
+    },
+    patch: {
+      encoding: "base64",
+      sha256: manifest.fullPatchSha256,
+      byteLength: manifest.fullPatchByteLength,
+      base64: snapshot.fullPatchBase64,
+    },
+  };
+}
+
+function isCandidateDeliveryAgentKind(
+  value: unknown,
+): value is CandidateReviewAgentKind {
+  return typeof value === "string" && candidateDeliveryAgentKinds.has(value);
+}
+
 function assertWorkflowDeliveryCommitLane(store: WorkflowStoreHost, sessionId: string, laneId: string): void {
   const projection = store.materializeFlowProjection(sessionId) as WorkflowDeliveryFlowProjectionLike;
   if (!isRecord(projection) || !Array.isArray(projection.lanes)) {
@@ -6722,6 +6902,44 @@ async function resolveDeliveryCommitWorktreePath(
   return realExpectedWorktreePath;
 }
 
+async function resolveCandidateDeliveryWorktreePath(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  manifest: WorkflowCandidateManifest,
+  projection: WorkflowDeliveryFlowProjectionLike,
+  rawWorktreePath: string | null,
+  realProjectRoot: string,
+): Promise<string> {
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  if (!isRecord(canvasSession) || !Array.isArray(canvasSession.nodes)) rejectCandidateDelivery();
+  const nodes = canvasSession.nodes.filter((node) => isRecord(node) && node.id === manifest.nodeId);
+  if (nodes.length !== 1) rejectCandidateDelivery();
+  const node = nodes[0] as Record<string, unknown>;
+  assertCandidateManifestCanvasBinding(manifest, canvasSession, node);
+
+  let expectedWorktreePath = realProjectRoot;
+  if (manifest.executionTarget === "new_worktree") {
+    const nodeWorktree = node.worktree as Record<string, unknown>;
+    const recordedPath = optionalText(nodeWorktree.realPath);
+    if (!recordedPath) rejectCandidateDelivery();
+    const managed = await assertManagedRollbackWorktree(realProjectRoot, projection, {
+      worktreeId: manifest.worktreeId,
+      worktreePath: recordedPath,
+    });
+    if (managed.branchName !== manifest.branchName) rejectCandidateDelivery();
+    expectedWorktreePath = managed.path;
+  }
+
+  if (rawWorktreePath) {
+    const supplied = path.isAbsolute(rawWorktreePath)
+      ? rawWorktreePath
+      : path.resolve(realProjectRoot, rawWorktreePath);
+    const realSupplied = await fs.realpath(supplied);
+    if (realSupplied !== expectedWorktreePath) rejectCandidateDelivery();
+  }
+  return expectedWorktreePath;
+}
+
 async function findDeliveryCommitEvidence(
   store: WorkflowStoreHost,
   sessionId: string,
@@ -6739,15 +6957,18 @@ async function findDeliveryCommitEvidence(
     const eventSegmentId = optionalText(event.segmentId) ?? optionalText(payload.segmentId);
     if (segmentId && eventSegmentId !== segmentId) continue;
     if (!isRecord(payload.evidence)) continue;
+    const recordedWorktreePath = optionalText(payload.evidence.worktreePath);
     const evidence = {
       commitSha: requireText(payload.evidence.commitSha, "delivery commit sha"),
       branch: requireText(payload.evidence.branch, "delivery branch"),
-      worktreePath: requireText(payload.evidence.worktreePath, "delivery worktree path"),
+      worktreePath,
     };
-    const realEvidenceWorktree = await fs.realpath(evidence.worktreePath).catch(() => path.resolve(evidence.worktreePath));
-    const realWorktreePath = await fs.realpath(worktreePath).catch(() => path.resolve(worktreePath));
-    if (realEvidenceWorktree !== realWorktreePath) {
-      throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Recorded delivery commit worktree does not match the lane worktree.");
+    if (recordedWorktreePath) {
+      const realEvidenceWorktree = await fs.realpath(recordedWorktreePath).catch(() => path.resolve(recordedWorktreePath));
+      const realWorktreePath = await fs.realpath(worktreePath).catch(() => path.resolve(worktreePath));
+      if (realEvidenceWorktree !== realWorktreePath) {
+        throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Recorded delivery commit worktree does not match the lane worktree.");
+      }
     }
     return evidence;
   }
@@ -7127,22 +7348,6 @@ function requireRecord(value: unknown, field: string): Record<string, unknown> {
   return value;
 }
 
-function deliveryFilesFromInput(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    throw workflowIpcError("INVALID_INPUT", "Delivery file list must be non-empty.");
-  }
-  return value.map((file) => requireText(file, "delivery file path"));
-}
-
-function deliveryReconciliationStatus(input: Record<string, unknown>): "available" | "empty" | "failed" | "mismatch" | null {
-  const reconciliation = readField(input, "reconciliation");
-  const status = optionalText(readField(input, "reconciliationStatus")) ??
-    (isRecord(reconciliation) ? optionalText(readField(reconciliation, "status")) : null);
-  if (!status) return null;
-  if (status === "available" || status === "empty" || status === "failed" || status === "mismatch") return status;
-  throw workflowIpcError("INVALID_INPUT", "Delivery reconciliation status is invalid.");
-}
-
 function requireText(value: unknown, field: string): string {
   const text = optionalText(value);
   if (!text) throw workflowIpcError("INVALID_INPUT", `${field} is required.`);
@@ -7161,15 +7366,6 @@ function optionalText(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-function normalizeDeliveryCommitIpcError(error: unknown): Error {
-  const message = error instanceof Error ? error.message : String(error);
-  if (isRecord(error)) {
-    const code = deliveryCommitIpcErrorCode(error.code);
-    if (code) return workflowIpcError(code, message);
-  }
-  return normalizeWorkflowIpcError(error);
-}
-
 function normalizeDeliveryRemoteIpcError(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
   if (isRecord(error)) {
@@ -7177,11 +7373,6 @@ function normalizeDeliveryRemoteIpcError(error: unknown): Error {
     if (code) return workflowIpcError(code, message);
   }
   return normalizeWorkflowIpcError(error);
-}
-
-function deliveryCommitIpcErrorCode(value: unknown): WorkflowIpcErrorCode | null {
-  if (value === "INVALID_INPUT" || value === "UNSAFE_WORKTREE_PATH" || value === "DELIVERY_REJECTED") return value;
-  return null;
 }
 
 function isKnownPreMutationDeliveryRemoteError(error: unknown): boolean {

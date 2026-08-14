@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
@@ -8,6 +10,8 @@ import {
   RUN_EVENT_PROTOCOL_VERSION,
   TERMINAL_SESSION_STATUSES,
   canUsePtyInteractiveTransport,
+  canonicalCandidateReviewRequestJson,
+  canonicalWorkflowCandidateManifestJson,
   canonicalExpectedArtifactDeclarationKeys,
   createWorkflowGitAncestryProofContext,
   expectedArtifactContractForRequiredEvidence,
@@ -15,6 +19,10 @@ import {
   parseExpectedArtifactDeclarations,
   parseExpectedArtifactDeclaration,
   parseChangesetEvidence,
+  parseCandidateReviewDecision,
+  parseCandidateReviewDecisionJson,
+  parseCandidateReviewRequest,
+  resolveWorkflowDeliveryCandidateIdentity,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
   parseWorkflowGitAncestryProof,
@@ -38,6 +46,7 @@ import {
   type AgentTransportCapabilities,
   type CanvasNode,
   type ChangesetEvidence,
+  type CandidateReviewRequest,
   type EvidenceCheck,
   type RunEvent,
   type RunEvidence,
@@ -63,6 +72,241 @@ import {
   type WorkflowLaneCandidateBinding,
   type WorkflowCandidateManifest,
 } from "./index";
+
+function candidateReviewRequest(
+  overrides: Partial<CandidateReviewRequest> = {},
+): CandidateReviewRequest {
+  return {
+    version: 1,
+    manifestSha256: "7".repeat(64),
+    identity: {
+      sessionId: "session-1",
+      nodeId: "lane-implementation",
+      laneId: "lane-implementation",
+      segmentId: "segment-session-1-lane-implementation",
+      runId: "run-session-1-lane-implementation",
+    },
+    candidate: {
+      repositoryIdentity: "1".repeat(64),
+      worktreeIdentity: "2".repeat(64),
+      branchName: "feature/candidate-review",
+      beforeHeadCommit: "a".repeat(40),
+      afterHeadCommit: "b".repeat(40),
+      ancestryProofSha256: "3".repeat(64),
+      fileManifestSha256: "5".repeat(64),
+    },
+    patch: {
+      encoding: "base64",
+      sha256: "4".repeat(64),
+      byteLength: 4,
+      base64: Buffer.from([0, 0xff, 0x41, 0x0a]).toString("base64"),
+    },
+    ...overrides,
+  };
+}
+
+describe("CandidateReview v1 contracts", () => {
+  it("strictly parses allow and block decisions with exact canonical digests", () => {
+    const allow = {
+      version: 1,
+      requestSha256: "8".repeat(64),
+      manifestSha256: "7".repeat(64),
+      disposition: "allow",
+    } as const;
+    const block = { ...allow, disposition: "block" } as const;
+
+    expect(parseCandidateReviewDecision(allow)).toEqual(allow);
+    expect(parseCandidateReviewDecision(block)).toEqual(block);
+    expect(parseCandidateReviewDecisionJson(JSON.stringify(allow))).toEqual(allow);
+    expect(parseCandidateReviewDecisionJson(JSON.stringify(block))).toEqual(block);
+  });
+
+  it.each([
+    ["missing key", ({ manifestSha256: _digest, ...decision }) => decision],
+    ["extra key", (decision) => ({ ...decision, reason: "looks safe" })],
+    ["wrong version", (decision) => ({ ...decision, version: 2 })],
+    ["uppercase request digest", (decision) => ({ ...decision, requestSha256: "A".repeat(64) })],
+    ["malformed manifest digest", (decision) => ({ ...decision, manifestSha256: "7".repeat(63) })],
+    ["unknown disposition", (decision) => ({ ...decision, disposition: "approve" })],
+  ])("rejects a decision with %s", (_label, mutate) => {
+    const decision = {
+      version: 1,
+      requestSha256: "8".repeat(64),
+      manifestSha256: "7".repeat(64),
+      disposition: "allow",
+    };
+    expect(parseCandidateReviewDecision(mutate(decision))).toBeNull();
+  });
+
+  it.each([
+    ["leading prose", "allow: "],
+    ["markdown fence", "```json\n"],
+    ["trailing whitespace", ""],
+  ])("rejects non-exact decision JSON with %s", (_label, prefix) => {
+    const decision = JSON.stringify({
+      version: 1,
+      requestSha256: "8".repeat(64),
+      manifestSha256: "7".repeat(64),
+      disposition: "allow",
+    });
+    const raw = prefix === "" ? `${decision}\n` : `${prefix}${decision}${prefix.startsWith("```") ? "\n```" : ""}`;
+    expect(parseCandidateReviewDecisionJson(raw)).toBeNull();
+  });
+
+  it("rejects duplicate and non-canonical decision identity serialization", () => {
+    const duplicate = `{"version":1,"requestSha256":"${"8".repeat(64)}","requestSha256":"${"8".repeat(64)}","manifestSha256":"${"7".repeat(64)}","disposition":"allow"}`;
+    const unsorted = JSON.stringify({
+      disposition: "allow",
+      manifestSha256: "7".repeat(64),
+      requestSha256: "8".repeat(64),
+      version: 1,
+    });
+
+    expect(parseCandidateReviewDecisionJson(duplicate)).toBeNull();
+    expect(parseCandidateReviewDecisionJson(unsorted)).toBeNull();
+  });
+
+  it("strictly parses a bounded base64 request and canonicalizes key order", () => {
+    const request = candidateReviewRequest();
+    const reordered = {
+      patch: { ...request.patch },
+      candidate: { ...request.candidate },
+      identity: { ...request.identity },
+      manifestSha256: request.manifestSha256,
+      version: request.version,
+    };
+
+    expect(parseCandidateReviewRequest(request)).toEqual(request);
+    expect(parseCandidateReviewRequest(reordered)).toEqual(request);
+    expect(canonicalCandidateReviewRequestJson(reordered)).toBe(JSON.stringify(request));
+    expect(
+      createHash("sha256").update(canonicalCandidateReviewRequestJson(reordered), "utf8").digest("hex"),
+    ).toBe(createHash("sha256").update(JSON.stringify(request), "utf8").digest("hex"));
+  });
+
+  it.each([
+    ["missing request key", ({ patch: _patch, ...request }) => request],
+    ["extra request key", (request) => ({ ...request, prompt: "trust me" })],
+    ["wrong request version", (request) => ({ ...request, version: 2 })],
+    ["uppercase manifest digest", (request) => ({ ...request, manifestSha256: "A".repeat(64) })],
+    ["extra identity key", (request: CandidateReviewRequest) => ({ ...request, identity: { ...request.identity, path: "/private/repo" } })],
+    ["malformed identity", (request: CandidateReviewRequest) => ({ ...request, identity: { ...request.identity, runId: " run-1" } })],
+    ["extra candidate digest", (request: CandidateReviewRequest) => ({ ...request, candidate: { ...request.candidate, terminalRunEvidenceSha256: "6".repeat(64) } })],
+    ["uppercase candidate digest", (request: CandidateReviewRequest) => ({ ...request, candidate: { ...request.candidate, ancestryProofSha256: "A".repeat(64) } })],
+    ["unsafe branch", (request: CandidateReviewRequest) => ({ ...request, candidate: { ...request.candidate, branchName: "main..other" } })],
+    ["invalid base64", (request: CandidateReviewRequest) => ({ ...request, patch: { ...request.patch, base64: "not base64" } })],
+    ["wrong decoded length", (request: CandidateReviewRequest) => ({ ...request, patch: { ...request.patch, byteLength: 5 } })],
+    ["uppercase patch digest", (request: CandidateReviewRequest) => ({ ...request, patch: { ...request.patch, sha256: "A".repeat(64) } })],
+    ["wire policy claim", (request: CandidateReviewRequest) => ({ ...request, policy: { toolAccess: "none" } })],
+  ])("rejects a candidate request with %s", (_label, mutate) => {
+    expect(parseCandidateReviewRequest(mutate(candidateReviewRequest()) as unknown)).toBeNull();
+  });
+
+  it("serializes manifests canonically before the host hashes them", () => {
+    const manifest = workflowCandidateManifest();
+    const reordered = Object.fromEntries(Object.entries(manifest).reverse());
+
+    expect(canonicalWorkflowCandidateManifestJson(reordered)).toBe(JSON.stringify(manifest));
+    expect(
+      createHash("sha256").update(canonicalWorkflowCandidateManifestJson(reordered), "utf8").digest("hex"),
+    ).toBe(createHash("sha256").update(JSON.stringify(manifest), "utf8").digest("hex"));
+  });
+});
+
+describe("Workflow delivery candidate lineage", () => {
+  it("requires one completed validation gate followed by one completed workflow review gate", () => {
+    expect(resolveWorkflowDeliveryCandidateIdentity(
+      candidateDeliveryProjection(),
+      "session-1",
+      "lane-commit",
+    )).toEqual({
+      sessionId: "session-1",
+      nodeId: "lane-implementation",
+      laneId: "lane-implementation",
+      segmentId: "segment-implementation",
+      runId: "run-implementation",
+      agentKind: "codex",
+    });
+  });
+
+  it.each([
+    ["implementation directly to commit", (projection: CandidateDeliveryProjection) => {
+      projection.lanes = projection.lanes.filter((lane) => lane.id === "lane-implementation" || lane.id === "lane-commit");
+      projection.projectionNodes = projection.projectionNodes.filter((node) => node.id === "lane-implementation" || node.id === "lane-commit");
+      projection.segments = projection.segments.filter((segment) => segment.laneId === "lane-implementation");
+      projection.edges = [{ sourceLaneId: "lane-implementation", targetLaneId: "lane-commit" }];
+    }],
+    ["missing validation", (projection: CandidateDeliveryProjection) => {
+      projection.lanes = projection.lanes.filter((lane) => lane.id !== "lane-validation");
+      projection.projectionNodes = projection.projectionNodes.filter((node) => node.id !== "lane-validation");
+      projection.segments = projection.segments.filter((segment) => segment.laneId !== "lane-validation");
+      projection.edges = [
+        { sourceLaneId: "lane-implementation", targetLaneId: "lane-review" },
+        { sourceLaneId: "lane-review", targetLaneId: "lane-commit" },
+      ];
+    }],
+    ["missing review", (projection: CandidateDeliveryProjection) => {
+      projection.lanes = projection.lanes.filter((lane) => lane.id !== "lane-review");
+      projection.projectionNodes = projection.projectionNodes.filter((node) => node.id !== "lane-review");
+      projection.segments = projection.segments.filter((segment) => segment.laneId !== "lane-review");
+      projection.edges = [
+        { sourceLaneId: "lane-implementation", targetLaneId: "lane-validation" },
+        { sourceLaneId: "lane-validation", targetLaneId: "lane-commit" },
+      ];
+    }],
+    ["ambiguous graph", (projection: CandidateDeliveryProjection) => {
+      projection.edges.push({ sourceLaneId: "lane-implementation", targetLaneId: "lane-review" });
+    }],
+    ["failed gate", (projection: CandidateDeliveryProjection) => {
+      projection.segments.find((segment) => segment.laneId === "lane-validation")!.status = "failed";
+    }],
+  ])("rejects %s", (_label, mutate) => {
+    const projection = candidateDeliveryProjection();
+    mutate(projection);
+
+    expect(() => resolveWorkflowDeliveryCandidateIdentity(
+      projection,
+      "session-1",
+      "lane-commit",
+    )).toThrow("Workflow delivery candidate lineage is invalid.");
+  });
+});
+
+interface CandidateDeliveryProjection {
+  lanes: Array<Record<string, unknown> & { id: string; status: string }>;
+  projectionNodes: Array<Record<string, unknown> & { id: string }>;
+  segments: Array<Record<string, unknown> & { laneId: string; status: string }>;
+  edges: Array<{ sourceLaneId: string; targetLaneId: string }>;
+  laneRollbackStatuses: Record<string, unknown>;
+}
+
+function candidateDeliveryProjection(): CandidateDeliveryProjection {
+  return {
+    lanes: [
+      { id: "lane-implementation", kind: "implementation", laneKind: "implementation", status: "completed", executable: true, agentKind: "codex" },
+      { id: "lane-validation", kind: "validation", laneKind: "validation", status: "completed", executable: true, agentKind: "codex" },
+      { id: "lane-review", kind: "review", laneKind: "review", status: "completed", executable: true, agentKind: "hermes" },
+      { id: "lane-commit", kind: "commit", laneKind: "commit", status: "pending", executable: true, agentKind: "codex" },
+    ],
+    projectionNodes: [
+      { id: "lane-implementation", laneId: "lane-implementation", executable: true },
+      { id: "lane-validation", laneId: "lane-validation", executable: true },
+      { id: "lane-review", laneId: "lane-review", executable: true },
+      { id: "lane-commit", laneId: "lane-commit", executable: true },
+    ],
+    segments: [
+      { id: "segment-implementation", laneId: "lane-implementation", runId: "run-implementation", status: "succeeded" },
+      { id: "segment-validation", laneId: "lane-validation", runId: "run-validation", status: "succeeded" },
+      { id: "segment-review", laneId: "lane-review", runId: "run-review", status: "succeeded" },
+    ],
+    edges: [
+      { sourceLaneId: "lane-implementation", targetLaneId: "lane-validation" },
+      { sourceLaneId: "lane-validation", targetLaneId: "lane-review" },
+      { sourceLaneId: "lane-review", targetLaneId: "lane-commit" },
+    ],
+    laneRollbackStatuses: {},
+  };
+}
 
 function workflowCandidateManifest(
   overrides: Partial<WorkflowCandidateManifest> = {},

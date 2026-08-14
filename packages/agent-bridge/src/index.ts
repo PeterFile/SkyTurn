@@ -101,6 +101,11 @@ export {
   type HermesAcpPromptResult,
 } from "./hermesAcpClient.js";
 export {
+  CANDIDATE_REVIEW_REJECTED_MESSAGE,
+  reviewCandidateWithHermes,
+  type CandidateReviewInput,
+} from "./candidateReview.js";
+export {
   createDurableRunClaimStore,
   defaultDurableRunClaimRoot,
   type DurableRunClaimStore,

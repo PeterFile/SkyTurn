@@ -40,12 +40,15 @@ export async function resolveHermesCommand(
   } finally {
     await executable.close();
   }
-  const uvShimPrefix = [
-    "#!/bin/sh",
-    `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'python3' "$0" "$@"`,
-    "' '''",
-  ].join("\n");
-  if (!prefix.startsWith(`${uvShimPrefix}\n`)) {
+  const interpreterName = (["python", "python3"] as const).find((candidate) => {
+    const uvShimPrefix = [
+      "#!/bin/sh",
+      `'''exec' "$(dirname -- "$(realpath -- "$0")")"/'${candidate}' "$0" "$@"`,
+      "' '''",
+    ].join("\n");
+    return prefix.startsWith(`${uvShimPrefix}\n`);
+  });
+  if (!interpreterName) {
     return {
       args,
       executablePath: options.canonicalizeNonShimExecutable
@@ -54,7 +57,7 @@ export async function resolveHermesCommand(
     };
   }
 
-  const interpreterPath = join(dirname(canonicalExecutablePath), "python3");
+  const interpreterPath = join(dirname(canonicalExecutablePath), interpreterName);
   await access(interpreterPath, fsConstants.X_OK);
   return {
     args: [canonicalExecutablePath, ...args],

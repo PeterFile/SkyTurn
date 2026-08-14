@@ -1,6 +1,14 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -60,5 +68,13 @@ if (process.argv.includes("--copy-dist")) {
     const destination = join(packageRoot, "dist/native", helper);
     mkdirSync(dirname(destination), { recursive: true });
     copyFileSync(source, destination);
+  }
+
+  const verifierSource = join(packageRoot, "src/internal/hermesCandidateVerifier.py");
+  const verifierDestination = join(packageRoot, "dist/internal/hermesCandidateVerifier.py");
+  mkdirSync(dirname(verifierDestination), { recursive: true });
+  copyFileSync(verifierSource, verifierDestination);
+  if (!readFileSync(verifierDestination).equals(readFileSync(verifierSource))) {
+    throw new Error("Hermes candidate verifier runner copy does not match its source.");
   }
 }
