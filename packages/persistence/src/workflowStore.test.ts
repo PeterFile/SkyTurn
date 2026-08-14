@@ -126,18 +126,24 @@ describe("SQLite workflow store", () => {
       source: string;
       payload: Record<string, unknown>;
     };
+    const eventBytes = JSON.stringify(event);
     const eventsAfterAppend = store.listEvents(fixture.identity.sessionId);
     expect(api.appendPreparedCandidatePublication({
       ...fixture.input,
       now: "2026-08-14T00:00:01.000Z",
     })).toEqual(event);
+    expect(JSON.stringify(api.appendPreparedCandidatePublication({
+      ...fixture.input,
+      now: "2026-08-14T00:00:02.000Z",
+    }))).toBe(eventBytes);
     expect(store.listEvents(fixture.identity.sessionId)).toEqual(eventsAfterAppend);
     expect(api.getPreparedCandidatePublication(fixture.lookup)).toEqual(fixture.preparation);
     expect(event).toMatchObject({
       kind: "workflow.commit.publication_prepared",
       source: "workflow_store",
       payload: {
-        laneId: fixture.identity.laneId,
+        laneId: fixture.publicationLaneId,
+        candidateLaneId: fixture.identity.laneId,
         segmentId: fixture.identity.segmentId,
         manifestSha256: fixture.manifestSha256,
         requestSha256: fixture.input.requestSha256,
@@ -158,6 +164,167 @@ describe("SQLite workflow store", () => {
     expect(reopened.buildLedgerSummary(fixture.identity.sessionId)).toEqual(ledgerBefore);
     reopened.close();
   });
+
+  it("quarantines exact v8 prepared publications before strict validation and permits a fresh strict preparation", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const projectionBefore = store.materializeFlowProjection(fixture.identity.sessionId);
+    const databasePath = store.databasePath;
+    store.close();
+
+    const legacy = insertBaselinePreparedPublicationRow(databasePath, fixture);
+    const legacyLogicalValues = [
+      fixture.manifestSha256,
+      fixture.input.requestSha256,
+      fixture.preparation.commitSha,
+      fixture.preparation.treeSha,
+    ];
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    const events = reopened.listEvents(fixture.identity.sessionId);
+    const audit = events.find((event) => event.id === legacy.id);
+    expect(audit).toEqual({
+      id: legacy.id,
+      sessionId: fixture.identity.sessionId,
+      seq: legacy.seq,
+      kind: "workflow.run.recovery_failed",
+      source: "workflow_store",
+      laneId: null,
+      segmentId: null,
+      causationId: null,
+      correlationId: null,
+      idempotencyKey: null,
+      payload: {
+        reason: "legacy-prepared-publication-requires-fresh-review",
+        status: "failed",
+      },
+      createdAt: legacy.createdAt,
+    });
+    const logicalAudit = JSON.stringify(audit);
+    for (const value of legacyLogicalValues) expect(logicalAudit).not.toContain(value);
+    expect(reopened.getPreparedCandidatePublication(fixture.lookup)).toBeNull();
+    expect(reopened.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
+
+    const quarantinedRow = readRawWorkflowEvent(databasePath, legacy.id);
+    expect(quarantinedRow.kind).toBe("workflow.run.recovery_failed");
+    expect(quarantinedRow.idempotency_key).toBeNull();
+    expect(quarantinedRow.payload_json).toBe(JSON.stringify({
+      reason: "legacy-prepared-publication-requires-fresh-review",
+      status: "failed",
+    }));
+    for (const value of legacyLogicalValues) expect(JSON.stringify(quarantinedRow)).not.toContain(value);
+
+    const fresh = reopened.appendPreparedCandidatePublication(fixture.input);
+    expect(fresh.idempotencyKey).toBe(
+      `delivery-commit-prepared:${fixture.publicationLaneId}:${fixture.identity.segmentId}`,
+    );
+    expect(reopened.getPreparedCandidatePublication(fixture.lookup)).toEqual(fixture.preparation);
+    const quarantineBytes = JSON.stringify(readRawWorkflowEvent(databasePath, legacy.id));
+    reopened.close();
+
+    const reopenedAgain = createWorkflowStore({ projectRoot });
+    expect(reopenedAgain.listAppliedMigrations().filter((version) => version === 9)).toHaveLength(1);
+    expect(JSON.stringify(readRawWorkflowEvent(databasePath, legacy.id))).toBe(quarantineBytes);
+    expect(reopenedAgain.getPreparedCandidatePublication(fixture.lookup)).toEqual(fixture.preparation);
+    expect(reopenedAgain.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
+    reopenedAgain.close();
+  });
+
+  it("rolls back legacy publication quarantine when the v9 marker cannot be committed", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const databasePath = store.databasePath;
+    store.close();
+    const legacy = insertBaselinePreparedPublicationRow(databasePath, fixture);
+
+    const db = new Database(databasePath);
+    db.exec(`
+      CREATE TRIGGER reject_publication_quarantine_migration
+      BEFORE INSERT ON schema_migrations
+      WHEN NEW.version = 9
+      BEGIN
+        SELECT RAISE(ABORT, 'injected publication quarantine marker failure');
+      END;
+    `);
+    db.close();
+
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(/injected publication quarantine marker failure/);
+    const failedRow = readRawWorkflowEvent(databasePath, legacy.id);
+    expect(failedRow.kind).toBe("workflow.commit.publication_prepared");
+    expect(failedRow.idempotency_key).toBe(legacy.idempotencyKey);
+    expect(failedRow.payload_json).toBe(legacy.payloadJson);
+    const afterFailure = new Database(databasePath);
+    expect(afterFailure.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 9").get())
+      .toEqual({ count: 0 });
+    afterFailure.exec("DROP TRIGGER reject_publication_quarantine_migration");
+    afterFailure.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listAppliedMigrations()).toContain(9);
+    reopened.close();
+  });
+
+  it("leaves a non-legacy prepared publication missing candidate identity to fail store open", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const databasePath = store.databasePath;
+    store.close();
+    const malformed = insertBaselinePreparedPublicationRow(databasePath, fixture, (payload) => {
+      payload.nodeId = fixture.identity.nodeId;
+      payload.runId = fixture.identity.runId;
+    });
+
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(/prepared candidate publication.*identity/i);
+    const row = readRawWorkflowEvent(databasePath, malformed.id);
+    expect(row.kind).toBe("workflow.commit.publication_prepared");
+    expect(row.idempotency_key).toBe(malformed.idempotencyKey);
+    expect(row.payload_json).toBe(malformed.payloadJson);
+    const db = new Database(databasePath, { readonly: true });
+    expect(db.prepare("SELECT COUNT(*) AS count FROM schema_migrations WHERE version = 9").get())
+      .toEqual({ count: 1 });
+    db.close();
+  });
+
+  it.each(["forged event id", "manifest ordered after publication"])(
+    "leaves a legacy-shaped publication with %s to fail store open",
+    async (tampering) => {
+      const projectRoot = await makeTempRoot();
+      const store = createWorkflowStore({ projectRoot });
+      const fixture = preparedPublicationFixture(store, projectRoot);
+      const databasePath = store.databasePath;
+      store.close();
+      const legacy = insertBaselinePreparedPublicationRow(databasePath, fixture);
+
+      const db = new Database(databasePath);
+      if (tampering === "forged event id") {
+        db.prepare("UPDATE workflow_events SET id = ? WHERE id = ?")
+          .run("event-forged-legacy-prepared-publication", legacy.id);
+      } else {
+        const manifest = db.prepare([
+          "SELECT id FROM workflow_events",
+          "WHERE session_id = ? AND kind = 'workflow.candidate.manifest_recorded'",
+        ].join(" ")).get(fixture.identity.sessionId) as { id: string };
+        db.prepare("UPDATE workflow_events SET seq = ? WHERE id = ?")
+          .run(legacy.seq + 1, manifest.id);
+      }
+      db.close();
+
+      expect(() => createWorkflowStore({ projectRoot })).toThrow(/prepared candidate publication.*identity/i);
+      const reopened = new Database(databasePath, { readonly: true });
+      expect(reopened.prepare([
+        "SELECT kind, idempotency_key FROM workflow_events",
+        "WHERE session_id = ? AND kind = 'workflow.commit.publication_prepared'",
+      ].join(" ")).get(fixture.identity.sessionId)).toEqual({
+        kind: "workflow.commit.publication_prepared",
+        idempotency_key: legacy.idempotencyKey,
+      });
+      reopened.close();
+    },
+  );
 
   it("never persists or returns a raw Hermes resume handle", async () => {
     const projectRoot = await makeTempRoot();
@@ -241,7 +408,7 @@ describe("SQLite workflow store", () => {
     seedLegacyHermesHandle(projectRoot, "session-legacy-old", rawHandle, true);
 
     const reopened = createWorkflowStore({ projectRoot });
-    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(reopened.listHermesSessions("session-legacy-old")[0]?.opaqueHandle).toBe("[redacted]");
     reopened.close();
     await expectRawHandleAbsent(projectRoot, rawHandle);
@@ -261,7 +428,7 @@ describe("SQLite workflow store", () => {
       projectRoot,
       faultInjection: maintenanceFaultInjection({ trace: firstTrace }),
     });
-    expect(first.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(first.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(first.listHermesSessions("session-maintenance")[0]?.opaqueHandle).toBe("[redacted]");
     first.close();
 
@@ -767,8 +934,8 @@ describe("SQLite workflow store", () => {
     expect(first.databasePath).toBe(join(await realpath(projectRoot), ".devflow", "skyturn-workflow.sqlite"));
     expect(pragmas.journalMode).toBe("wal");
     expect(pragmas.foreignKeys).toBe(1);
-    expect(firstMigrations).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
-    expect(second.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(firstMigrations).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(second.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     second.close();
   });
 
@@ -2558,6 +2725,7 @@ describe("SQLite workflow store", () => {
       idempotencyKey: "delivery-commit-prepared:lane-forged:segment-forged",
       payload: {
         laneId: "lane-forged",
+        candidateLaneId: "lane-candidate-forged",
         segmentId: "segment-forged",
         manifestSha256: "a".repeat(64),
         requestSha256: "b".repeat(64),
@@ -2598,6 +2766,8 @@ describe("SQLite workflow store", () => {
 
     for (const invalid of [
       { ...fixture.input, requestSha256: "c".repeat(64) },
+      { ...fixture.input, candidateLaneId: fixture.publicationLaneId },
+      { ...fixture.input, candidateLaneId: " lane-implementation" },
       { ...fixture.input, manifestSha256: "A".repeat(64) },
       { ...fixture.input, preparation: { ...fixture.preparation, commitSha: "2".repeat(39) } },
       { ...fixture.input, preparation: { ...fixture.preparation, branch: "forged" } },
@@ -2617,6 +2787,15 @@ describe("SQLite workflow store", () => {
   });
 
   it.each([
+    ["a missing candidate lane identity", (payload: Record<string, unknown>) => {
+      delete payload.candidateLaneId;
+    }],
+    ["a candidate lane identity matching the publication lane", (payload: Record<string, unknown>) => {
+      payload.candidateLaneId = payload.laneId;
+    }],
+    ["a forged candidate lane identity", (payload: Record<string, unknown>) => {
+      payload.candidateLaneId = "lane-forged-candidate";
+    }],
     ["an extra sensitive field", (payload: Record<string, unknown>) => {
       payload.worktreePath = "/private/source";
     }],
@@ -2653,7 +2832,9 @@ describe("SQLite workflow store", () => {
       .run(JSON.stringify(payload), event.id);
     db.close();
 
-    expect(() => createWorkflowStore({ projectRoot })).toThrow(/prepared publication|candidate publication/i);
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(
+      /prepared publication|candidate publication|candidate manifest/i,
+    );
   });
 
   it("freezes authoritative changeset evidence when succeeded RunEvidence has a null changeset id", async () => {
@@ -8931,7 +9112,7 @@ describe("SQLite workflow store", () => {
       "historical-token",
     ];
     assertOuterOnlyArtifactPayloadRemoved(reopened, rawValues);
-    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(reopened.listAppliedMigrations()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     reopened.close();
 
     const migrated = new Database(databasePath);
@@ -10084,6 +10265,7 @@ function prepareCandidateManifestRun(
 
 function preparedPublicationFixture(store: TestWorkflowStore, projectRoot: string) {
   const identity = prepareCandidateManifestRun(store, projectRoot);
+  const publicationLaneId = "lane-candidate-review-commit";
   const manifest = store.freezeCandidateManifest({
     ...identity,
     now: "2026-08-11T00:00:06.000Z",
@@ -10112,11 +10294,14 @@ function preparedPublicationFixture(store: TestWorkflowStore, projectRoot: strin
   };
   const lookup = {
     ...identity,
+    laneId: publicationLaneId,
+    candidateLaneId: identity.laneId,
     manifestSha256,
     requestSha256: "b".repeat(64),
   };
   return {
     identity,
+    publicationLaneId,
     manifest,
     manifestSha256,
     preparation,
@@ -10127,6 +10312,74 @@ function preparedPublicationFixture(store: TestWorkflowStore, projectRoot: strin
       now: "2026-08-14T00:00:00.000Z",
     },
   };
+}
+
+function insertBaselinePreparedPublicationRow(
+  databasePath: string,
+  fixture: ReturnType<typeof preparedPublicationFixture>,
+  mutatePayload?: (payload: Record<string, unknown>) => void,
+) {
+  const db = new Database(databasePath);
+  db.prepare("DELETE FROM schema_migrations WHERE version = 9").run();
+  const seq = Number((db.prepare("SELECT MAX(seq) AS seq FROM workflow_events WHERE session_id = ?")
+    .get(fixture.identity.sessionId) as { seq: number | null }).seq ?? 0) + 1;
+  const id = `${fixture.identity.sessionId}:event:${String(seq).padStart(8, "0")}`;
+  const idempotencyKey = `delivery-commit-prepared:${fixture.identity.laneId}:${fixture.identity.segmentId}`;
+  const createdAt = "2026-08-13T00:00:00.000Z";
+  const payload: Record<string, unknown> = {
+    laneId: fixture.identity.laneId,
+    manifestSha256: fixture.manifestSha256,
+    preparation: fixture.preparation,
+    requestSha256: fixture.input.requestSha256,
+    segmentId: fixture.identity.segmentId,
+  };
+  mutatePayload?.(payload);
+  const payloadJson = stableTestJson(payload);
+  db.prepare([
+    "INSERT INTO workflow_events(",
+    "id, session_id, seq, kind, source, lane_id, segment_id, causation_id, correlation_id,",
+    "idempotency_key, payload_json, created_at, legacy_evidence_compatibility",
+    ") VALUES (?, ?, ?, 'workflow.commit.publication_prepared', 'workflow_store', ?, ?, NULL, NULL, ?, ?, ?, 0)",
+  ].join(" ")).run(
+    id,
+    fixture.identity.sessionId,
+    seq,
+    fixture.identity.laneId,
+    fixture.identity.segmentId,
+    idempotencyKey,
+    payloadJson,
+    createdAt,
+  );
+  db.close();
+  return { id, seq, idempotencyKey, payloadJson, createdAt };
+}
+
+function readRawWorkflowEvent(databasePath: string, eventId: string): {
+  kind: string;
+  idempotency_key: string | null;
+  payload_json: string;
+} {
+  const db = new Database(databasePath, { readonly: true });
+  const row = db.prepare([
+    "SELECT kind, idempotency_key, payload_json FROM workflow_events WHERE id = ?",
+  ].join(" ")).get(eventId) as {
+    kind: string;
+    idempotency_key: string | null;
+    payload_json: string;
+  };
+  db.close();
+  return row;
+}
+
+function stableTestJson(value: unknown): string {
+  return JSON.stringify(sortTestJson(value));
+}
+
+function sortTestJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortTestJson);
+  if (!value || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(Object.keys(record).sort().map((key) => [key, sortTestJson(record[key])]));
 }
 
 function rewriteChangesetBaseline(

@@ -1011,11 +1011,13 @@ test("candidate review material remains ephemeral and candidate commit evidence 
   assert.doesNotMatch(publicationHelpers, /reviewRequest|decision|fullPatch|fileManifest|files/);
   assert.match(publicationHelpers, /store\.getPreparedCandidatePublication\(/);
   assert.match(publicationHelpers, /store\.appendPreparedCandidatePublication\(/);
+  assert.match(publicationHelpers, /candidateLaneId:\s*input\.candidateLaneId/);
   assert.match(publicationHelpers, /input\.parsePreparation\(/);
   assert.match(publicationHelpers, /stableJson\(preparation\.expected\)\s*!==\s*stableJson\(input\.expected\)/);
   assert.doesNotMatch(publicationHelpers, /as unknown as CandidateDeliveryCommitPreparation/);
   assert.match(publicationHelpers, /const payload = \{[\s\S]*laneId:\s*input\.laneId,[\s\S]*segmentId:\s*input\.segmentId,[\s\S]*evidence,[\s\S]*\}/);
   assert.doesNotMatch(deliveryCommitHandler, /stagedFiles|worktreePath:\s*evidence\.worktreePath/);
+  assert.match(deliveryCommitHandler, /candidateLaneId:\s*context\.manifest\.laneId/);
 });
 
 test("candidate commit publication never runs CAS when durable prepared-intent persistence fails", async () => {
@@ -1248,6 +1250,34 @@ test("workflow events expose renderer-safe delivery lifecycle facts without raw 
   assert.match(deliveryFactsHelper, /kind:\s*"merge"/);
   assert.match(deliveryFactsHelper, /kind:\s*"main_synced"/);
   assert.doesNotMatch(deliveryFactsHelper, /worktreePath|command|commands|stdout|stderr|rawStdout/);
+});
+
+test("legacy publication quarantine audit exposes no renderer authority", async () => {
+  const { redactWorkflowEventForRenderer } = await loadMainDeliveryRendererHelpers();
+  const projected = toPlain(redactWorkflowEventForRenderer({
+    id: "event-legacy-prepared-publication",
+    sessionId: "session-1",
+    seq: 7,
+    kind: "workflow.run.recovery_failed",
+    source: "workflow_store",
+    laneId: null,
+    segmentId: null,
+    causationId: null,
+    correlationId: null,
+    createdAt: "2026-08-13T00:00:00.000Z",
+    payload: {
+      reason: "legacy-prepared-publication-requires-fresh-review",
+      status: "failed",
+    },
+  }));
+
+  assert.deepEqual(projected.payload, {
+    redacted: true,
+    summary: "Workflow event recorded.",
+  });
+  assert.equal("delivery" in projected.payload, false);
+  assert.equal("plannerTurn" in projected.payload, false);
+  assert.doesNotMatch(JSON.stringify(projected.payload), /prepared-publication|manifest|request|preparation/);
 });
 
 test("workflow checks projection preserves only renderer-safe review and mergeability facts", async () => {
@@ -3618,18 +3648,25 @@ function candidateCommitPublicationHarness(options = {}) {
       return events;
     },
     getPreparedCandidatePublication(input) {
+      if (input.laneId !== "lane-commit" || input.candidateLaneId !== "lane-candidate-implementation") {
+        throw new Error("prepared publication lane identity conflict");
+      }
       const event = events.find((candidate) =>
         candidate.kind === "workflow.commit.publication_prepared" &&
         candidate.idempotencyKey === `delivery-commit-prepared:${input.laneId}:${input.segmentId}`
       );
       if (!event) return null;
       if (
+        event.payload.candidateLaneId !== input.candidateLaneId ||
         event.payload.manifestSha256 !== input.manifestSha256 ||
         event.payload.requestSha256 !== input.requestSha256
       ) throw new Error("prepared publication identity conflict");
       return structuredClone(event.payload.preparation);
     },
     appendPreparedCandidatePublication(input) {
+      if (input.laneId !== "lane-commit" || input.candidateLaneId !== "lane-candidate-implementation") {
+        throw new Error("prepared publication lane identity conflict");
+      }
       if (failPreparedAppends > 0) {
         failPreparedAppends -= 1;
         throw new Error("prepared intent persistence failed");
@@ -3645,7 +3682,10 @@ function candidateCommitPublicationHarness(options = {}) {
         idempotencyKey,
         payload: {
           laneId: input.laneId,
+          candidateLaneId: input.candidateLaneId,
+          nodeId: input.nodeId,
           segmentId: input.segmentId,
+          runId: input.runId,
           manifestSha256: input.manifestSha256,
           requestSha256: input.requestSha256,
           preparation: structuredClone(input.preparation),
@@ -3677,6 +3717,7 @@ function candidateCommitPublicationHarness(options = {}) {
     sessionId: "session-1",
     nodeId: "node-candidate",
     laneId: "lane-commit",
+    candidateLaneId: "lane-candidate-implementation",
     segmentId: "segment-candidate",
     runId: "run-candidate",
     manifestSha256: "a".repeat(64),
