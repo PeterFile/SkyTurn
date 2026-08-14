@@ -139,6 +139,15 @@ export type FinalChangesetReconciliationStatus = "available" | "empty" | "failed
 export const NODE_MODAL_TABS: NodeModalTab[] = ["Output", "Changes", "Context"];
 export const RUN_EVENT_PROTOCOL_VERSION = 1;
 export const WORKFLOW_CANDIDATE_MANIFEST_VERSION = 1;
+export const CANDIDATE_REVIEW_REQUEST_VERSION = 1;
+export const CANDIDATE_REVIEW_MAX_PATCH_BYTES = 16 * 1024 * 1024;
+export const CANDIDATE_REVIEW_AGENT_KINDS = [
+  "codex",
+  "agy",
+  "gemini",
+  "claude-code",
+  "openclaw",
+] as const;
 export const AGENT_TRANSPORT_KINDS: AgentTransportKind[] = ["exec-json", "pty-interactive"];
 export const TERMINAL_SESSION_STATUSES: TerminalSessionStatus[] = [
   "starting",
@@ -825,6 +834,58 @@ export interface WorkflowCandidateManifest {
   readonly fileManifestSha256: string;
 }
 
+export type CandidateReviewAgentKind = typeof CANDIDATE_REVIEW_AGENT_KINDS[number];
+export type CandidateReviewDisposition = "allow" | "block";
+
+export interface CandidateReviewRequestIdentity {
+  readonly sessionId: string;
+  readonly nodeId: string;
+  readonly laneId: string;
+  readonly segmentId: string;
+  readonly runId: string;
+}
+
+export interface CandidateReviewRequestCandidate {
+  readonly repositoryIdentity: string;
+  readonly worktreeIdentity: string;
+  readonly branchName: string;
+  readonly beforeHeadCommit: string;
+  readonly afterHeadCommit: string;
+  readonly ancestryProofSha256: string;
+  readonly fileManifestSha256: string;
+}
+
+export interface CandidateReviewRequestPatch {
+  readonly encoding: "base64";
+  readonly sha256: string;
+  readonly byteLength: number;
+  readonly base64: string;
+}
+
+export interface CandidateReviewRequest {
+  readonly version: typeof CANDIDATE_REVIEW_REQUEST_VERSION;
+  readonly manifestSha256: string;
+  readonly identity: CandidateReviewRequestIdentity;
+  readonly candidate: CandidateReviewRequestCandidate;
+  readonly patch: CandidateReviewRequestPatch;
+}
+
+export interface CandidateReviewDecision {
+  readonly version: typeof CANDIDATE_REVIEW_REQUEST_VERSION;
+  readonly requestSha256: string;
+  readonly manifestSha256: string;
+  readonly disposition: CandidateReviewDisposition;
+}
+
+export interface WorkflowDeliveryCandidateIdentity {
+  readonly sessionId: string;
+  readonly nodeId: string;
+  readonly laneId: string;
+  readonly segmentId: string;
+  readonly runId: string;
+  readonly agentKind: CandidateReviewAgentKind;
+}
+
 export function sanitizeTrustedRunEvidence(evidence: RunEvidence): RunEvidence {
   const checks = uniqueEvidenceChecks(evidence.checks.map(sanitizeTrustedEvidenceCheck));
   const review = evidence.review ? sanitizeTrustedEvidenceCheck(evidence.review) : null;
@@ -1030,6 +1091,316 @@ export function parseWorkflowCandidateManifest(value: unknown): WorkflowCandidat
     fullPatchByteLength: value.fullPatchByteLength as number,
     fileManifestSha256: value.fileManifestSha256,
   };
+}
+
+const candidateReviewRequestKeys = [
+  "version",
+  "manifestSha256",
+  "identity",
+  "candidate",
+  "patch",
+] as const;
+const candidateReviewIdentityKeys = ["sessionId", "nodeId", "laneId", "segmentId", "runId"] as const;
+const candidateReviewCandidateKeys = [
+  "repositoryIdentity",
+  "worktreeIdentity",
+  "branchName",
+  "beforeHeadCommit",
+  "afterHeadCommit",
+  "ancestryProofSha256",
+  "fileManifestSha256",
+] as const;
+const candidateReviewPatchKeys = ["encoding", "sha256", "byteLength", "base64"] as const;
+const candidateReviewDecisionKeys = [
+  "version",
+  "requestSha256",
+  "manifestSha256",
+  "disposition",
+] as const;
+const candidateReviewDecisionMaxBytes = 1_024;
+const candidateReviewMaxBase64Bytes = Math.ceil(CANDIDATE_REVIEW_MAX_PATCH_BYTES / 3) * 4;
+const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+export function parseCandidateReviewRequest(value: unknown): CandidateReviewRequest | null {
+  if (!isOrdinaryRecord(value) || !hasExactlyKeys(value, candidateReviewRequestKeys)) return null;
+  if (value.version !== CANDIDATE_REVIEW_REQUEST_VERSION || !isManifestSha256(value.manifestSha256)) return null;
+  const identity = parseCandidateReviewRequestIdentity(value.identity);
+  const candidate = parseCandidateReviewRequestCandidate(value.candidate);
+  const patch = parseCandidateReviewRequestPatch(value.patch);
+  if (!identity || !candidate || !patch) return null;
+  return {
+    version: CANDIDATE_REVIEW_REQUEST_VERSION,
+    manifestSha256: value.manifestSha256,
+    identity,
+    candidate,
+    patch,
+  };
+}
+
+export function canonicalCandidateReviewRequestJson(value: unknown): string {
+  const request = parseCandidateReviewRequest(value);
+  if (!request) throw new Error("Candidate review request is invalid.");
+  return JSON.stringify(request);
+}
+
+export function canonicalWorkflowCandidateManifestJson(value: unknown): string {
+  const manifest = parseWorkflowCandidateManifest(value);
+  if (!manifest) throw new Error("Workflow candidate manifest is invalid.");
+  return JSON.stringify(manifest);
+}
+
+export function parseCandidateReviewDecision(value: unknown): CandidateReviewDecision | null {
+  if (!isOrdinaryRecord(value) || !hasExactlyKeys(value, candidateReviewDecisionKeys)) return null;
+  if (
+    value.version !== CANDIDATE_REVIEW_REQUEST_VERSION ||
+    !isManifestSha256(value.requestSha256) ||
+    !isManifestSha256(value.manifestSha256) ||
+    (value.disposition !== "allow" && value.disposition !== "block")
+  ) return null;
+  return {
+    version: CANDIDATE_REVIEW_REQUEST_VERSION,
+    requestSha256: value.requestSha256,
+    manifestSha256: value.manifestSha256,
+    disposition: value.disposition,
+  };
+}
+
+export function parseCandidateReviewDecisionJson(value: unknown): CandidateReviewDecision | null {
+  if (typeof value !== "string" || value.length === 0 || value.length > candidateReviewDecisionMaxBytes) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  const decision = parseCandidateReviewDecision(parsed);
+  return decision && JSON.stringify(decision) === value ? decision : null;
+}
+
+export function resolveWorkflowDeliveryCandidateIdentity(
+  value: unknown,
+  sessionId: string,
+  commitLaneId: string,
+): WorkflowDeliveryCandidateIdentity {
+  const reject = (): never => {
+    throw new Error("Workflow delivery candidate lineage is invalid.");
+  };
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.lanes) ||
+    !Array.isArray(value.edges) ||
+    !Array.isArray(value.segments) ||
+    !Array.isArray(value.projectionNodes) ||
+    !isCanonicalManifestIdentity(sessionId) ||
+    !isCanonicalManifestIdentity(commitLaneId)
+  ) reject();
+
+  const projection = value as Record<string, unknown> & {
+    lanes: unknown[];
+    edges: unknown[];
+    segments: unknown[];
+    projectionNodes: unknown[];
+  };
+  const lanes = projection.lanes;
+  const edges = projection.edges;
+  const segments = projection.segments;
+  const projectionNodes = projection.projectionNodes;
+  if (
+    lanes.some((lane) => !isRecord(lane) || !isCanonicalManifestIdentity(lane.id)) ||
+    edges.some((edge) =>
+      !isRecord(edge) ||
+      !isCanonicalManifestIdentity(edge.sourceLaneId) ||
+      !isCanonicalManifestIdentity(edge.targetLaneId)
+    ) ||
+    segments.some((segment) =>
+      !isRecord(segment) ||
+      !isCanonicalManifestIdentity(segment.id) ||
+      !isCanonicalManifestIdentity(segment.laneId) ||
+      !isCanonicalManifestIdentity(segment.runId) ||
+      !["running", "succeeded", "failed", "cancelled", "timed-out"].includes(String(segment.status))
+    ) ||
+    projectionNodes.some((node) =>
+      !isRecord(node) ||
+      !isCanonicalManifestIdentity(node.id) ||
+      !isCanonicalManifestIdentity(node.laneId) ||
+      typeof node.executable !== "boolean"
+    )
+  ) reject();
+
+  const requireLane = (laneId: string): Record<string, unknown> => {
+    const matches = lanes.filter((lane) => (lane as Record<string, unknown>).id === laneId);
+    if (matches.length !== 1) reject();
+    const lane = matches[0] as Record<string, unknown>;
+    const directRollbackStatus = deliveryLineageText(lane.rollbackStatus);
+    const projectedRollbackStatus = isRecord(projection.laneRollbackStatuses)
+      ? deliveryLineageText(projection.laneRollbackStatuses[laneId])
+      : null;
+    if (
+      directRollbackStatus &&
+      projectedRollbackStatus &&
+      directRollbackStatus !== projectedRollbackStatus
+    ) reject();
+    if ([directRollbackStatus, projectedRollbackStatus].some((status) =>
+      status === "rolled_back" || status === "inactive"
+    )) reject();
+    const nodes = projectionNodes.filter((node) =>
+      (node as Record<string, unknown>).id === laneId &&
+      (node as Record<string, unknown>).laneId === laneId
+    );
+    if (nodes.length !== 1 || (nodes[0] as Record<string, unknown>).executable !== (lane.executable === true)) {
+      reject();
+    }
+    return lane;
+  };
+
+  const requireSucceededSegment = (laneId: string): Record<string, unknown> => {
+    const matches = segments.filter((segment) => (segment as Record<string, unknown>).laneId === laneId);
+    const segmentIds = matches.map((segment) => (segment as Record<string, unknown>).id);
+    if (matches.length === 0 || new Set(segmentIds).size !== segmentIds.length) reject();
+    const succeeded = matches.filter((segment) => (segment as Record<string, unknown>).status === "succeeded");
+    if (succeeded.length !== 1) reject();
+    return succeeded[0] as Record<string, unknown>;
+  };
+
+  const commitLane = requireLane(commitLaneId);
+  if (commitLane.laneKind !== "commit") reject();
+  const visited = new Set<string>([commitLaneId]);
+  let successorLaneId = commitLaneId;
+  let sawReview = false;
+  let sawValidation = false;
+
+  while (visited.size <= lanes.length) {
+    const incoming = edges.filter((edge) =>
+      (edge as Record<string, unknown>).targetLaneId === successorLaneId
+    );
+    if (incoming.length !== 1) reject();
+    const predecessorLaneId = (incoming[0] as Record<string, unknown>).sourceLaneId as string;
+    const outgoing = edges.filter((edge) =>
+      (edge as Record<string, unknown>).sourceLaneId === predecessorLaneId
+    );
+    if (
+      outgoing.length !== 1 ||
+      (outgoing[0] as Record<string, unknown>).targetLaneId !== successorLaneId ||
+      visited.has(predecessorLaneId)
+    ) reject();
+    visited.add(predecessorLaneId);
+
+    const lane = requireLane(predecessorLaneId);
+    const laneKind = deliveryLineageText(lane.laneKind);
+    const executable = lane.executable === true;
+    if ((laneKind === "implementation" || laneKind === "fix") && executable) {
+      if (lane.status !== "completed" || !sawReview || !sawValidation) reject();
+      const agentKind = deliveryLineageText(lane.agentKind);
+      if (!CANDIDATE_REVIEW_AGENT_KINDS.includes(agentKind as CandidateReviewAgentKind)) reject();
+      const segment = requireSucceededSegment(predecessorLaneId);
+      return {
+        sessionId,
+        nodeId: predecessorLaneId,
+        laneId: predecessorLaneId,
+        segmentId: segment.id as string,
+        runId: segment.runId as string,
+        agentKind: agentKind as CandidateReviewAgentKind,
+      };
+    }
+
+    if (lane.status !== "completed") reject();
+    if (laneKind === "review") {
+      if (sawValidation) reject();
+      sawReview = true;
+    } else if (laneKind === "validation" || laneKind === "regression") {
+      if (!sawReview) reject();
+      sawValidation = true;
+    } else {
+      reject();
+    }
+    if (executable) {
+      requireSucceededSegment(predecessorLaneId);
+    } else if (segments.some((segment) => (segment as Record<string, unknown>).laneId === predecessorLaneId)) {
+      reject();
+    }
+    successorLaneId = predecessorLaneId;
+  }
+  return reject();
+}
+
+function deliveryLineageText(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 && value.trim() === value ? value : null;
+}
+
+function parseCandidateReviewRequestIdentity(value: unknown): CandidateReviewRequestIdentity | null {
+  if (!isOrdinaryRecord(value) || !hasExactlyKeys(value, candidateReviewIdentityKeys)) return null;
+  if (!candidateReviewIdentityKeys.every((key) => isCanonicalManifestIdentity(value[key]))) return null;
+  return {
+    sessionId: value.sessionId as string,
+    nodeId: value.nodeId as string,
+    laneId: value.laneId as string,
+    segmentId: value.segmentId as string,
+    runId: value.runId as string,
+  };
+}
+
+function parseCandidateReviewRequestCandidate(value: unknown): CandidateReviewRequestCandidate | null {
+  if (!isOrdinaryRecord(value) || !hasExactlyKeys(value, candidateReviewCandidateKeys)) return null;
+  if (
+    !isManifestSha256(value.repositoryIdentity) ||
+    !isManifestSha256(value.worktreeIdentity) ||
+    !isCanonicalManifestBranchName(value.branchName) ||
+    typeof value.beforeHeadCommit !== "string" ||
+    !manifestCommitPattern.test(value.beforeHeadCommit) ||
+    typeof value.afterHeadCommit !== "string" ||
+    !manifestCommitPattern.test(value.afterHeadCommit) ||
+    !isManifestSha256(value.ancestryProofSha256) ||
+    !isManifestSha256(value.fileManifestSha256)
+  ) return null;
+  return {
+    repositoryIdentity: value.repositoryIdentity,
+    worktreeIdentity: value.worktreeIdentity,
+    branchName: value.branchName,
+    beforeHeadCommit: value.beforeHeadCommit,
+    afterHeadCommit: value.afterHeadCommit,
+    ancestryProofSha256: value.ancestryProofSha256,
+    fileManifestSha256: value.fileManifestSha256,
+  };
+}
+
+function parseCandidateReviewRequestPatch(value: unknown): CandidateReviewRequestPatch | null {
+  if (!isOrdinaryRecord(value) || !hasExactlyKeys(value, candidateReviewPatchKeys)) return null;
+  if (
+    value.encoding !== "base64" ||
+    !isManifestSha256(value.sha256) ||
+    !Number.isSafeInteger(value.byteLength) ||
+    (value.byteLength as number) <= 0 ||
+    (value.byteLength as number) > CANDIDATE_REVIEW_MAX_PATCH_BYTES ||
+    typeof value.base64 !== "string" ||
+    value.base64.length > candidateReviewMaxBase64Bytes ||
+    canonicalBase64ByteLength(value.base64) !== value.byteLength
+  ) return null;
+  return {
+    encoding: "base64",
+    sha256: value.sha256,
+    byteLength: value.byteLength as number,
+    base64: value.base64,
+  };
+}
+
+function canonicalBase64ByteLength(value: string): number | null {
+  if (value.length === 0 || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return null;
+  const firstPadding = value.indexOf("=");
+  if (firstPadding !== -1 && firstPadding < value.length - 2) return null;
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  if (padding === 2 && (base64Alphabet.indexOf(value[value.length - 3]!) & 0x0f) !== 0) return null;
+  if (padding === 1 && (base64Alphabet.indexOf(value[value.length - 2]!) & 0x03) !== 0) return null;
+  return (value.length / 4) * 3 - padding;
+}
+
+function isOrdinaryRecord(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (!prototype) return false;
+  const constructor = Object.getOwnPropertyDescriptor(prototype, "constructor");
+  if (!constructor || !("value" in constructor) || typeof constructor.value !== "function") return false;
+  return Function.prototype.toString.call(constructor.value) ===
+    Function.prototype.toString.call(Object);
 }
 
 function parseWorkflowCandidateRunEvidenceBinding(value: unknown): WorkflowCandidateRunEvidenceBinding | null {

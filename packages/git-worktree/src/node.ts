@@ -23,6 +23,7 @@ import {
 
 import {
   buildAdjudicationMetrics,
+  parseCandidateDeliveryCommitPreparation,
   parseVariantComparisonEvidence,
   parseWorktreeComparisonRequest,
   type ChangesetEvidenceInput,
@@ -33,6 +34,7 @@ import {
   type CandidateCommitExpectation,
   type CandidateDeliveryCommitEvidence,
   type CandidateDeliveryCommitInput,
+  type CandidateDeliveryCommitPreparation,
   type DeliveryCommandResult,
   type DeliveryCommitErrorCode,
   type DeliveryCommitEvidence,
@@ -55,6 +57,7 @@ import {
   type ManagedWorktreeCleanupResult,
   type ManagedWorktreeCreateInput,
   type ManagedWorktreeService,
+  type PublishPreparedCandidateDeliveryCommitInput,
   type RollbackWorktreeInput,
   type RollbackWorktreeManualRepairState,
   type RollbackWorktreeManualRepairReasonCode,
@@ -78,7 +81,11 @@ import {
   spawnBoundedGit,
 } from "./internal/gitCommand.js";
 
-export { parseVariantComparisonEvidence, parseWorktreeComparisonRequest };
+export {
+  parseCandidateDeliveryCommitPreparation,
+  parseVariantComparisonEvidence,
+  parseWorktreeComparisonRequest,
+};
 export { SKYTURN_VOLATILE_GIT_PATHS };
 
 export type ManagedWorktreeWorkflowEventKind =
@@ -221,6 +228,21 @@ export interface WorkflowGitAncestryProofInput {
   worktreePath: string;
   beforeHeadCommit: string;
   afterHeadCommit: string;
+}
+
+export interface CandidateDeliveryReviewSnapshotInput {
+  readonly projectRoot: string;
+  readonly worktreePath: string;
+  readonly expected: CandidateCommitExpectation;
+}
+
+export interface CandidateDeliveryReviewSnapshot {
+  readonly baselineCommit: string;
+  readonly headCommit: string;
+  readonly fullPatchBase64: string;
+  readonly fullPatchSha256: string;
+  readonly fullPatchByteLength: number;
+  readonly fileManifestSha256: string;
 }
 
 export type WorkflowGitAncestryProofErrorCode =
@@ -1162,29 +1184,32 @@ export async function createCandidateDeliveryCommit(
   input: CandidateDeliveryCommitInput,
 ): Promise<CandidateDeliveryCommitEvidence> {
   const parsedInput = parseCandidateDeliveryCommitInput(input);
+  const preparation = await prepareParsedCandidateDeliveryCommit(parsedInput);
+  return publishParsedCandidateDeliveryCommit({
+    projectRoot: parsedInput.projectRoot,
+    worktreePath: parsedInput.worktreePath,
+    preparation,
+  }, false);
+}
 
+export async function prepareCandidateDeliveryCommit(
+  input: CandidateDeliveryCommitInput,
+): Promise<CandidateDeliveryCommitPreparation> {
+  const parsedInput = parseCandidateDeliveryCommitInput(input);
+  return prepareParsedCandidateDeliveryCommit(parsedInput);
+}
+
+async function prepareParsedCandidateDeliveryCommit(
+  parsedInput: ParsedCandidateDeliveryCommitInput,
+): Promise<CandidateDeliveryCommitPreparation> {
   try {
-    const projectRoot = await assertGitRepo(parsedInput.projectRoot);
-    const worktreePath = await resolveDeliveryWorktreePath(projectRoot, parsedInput.worktreePath);
-    await assertCandidateBranchName(worktreePath, parsedInput.expected.branchName);
-    await assertCandidateSha1Repository(worktreePath);
-    await assertCandidateLiveCheckout(worktreePath, parsedInput.expected);
-    await assertCandidateAncestryExpectation(projectRoot, worktreePath, parsedInput.expected);
-
-    const snapshot = await collectAtomicGitChangesetSnapshot({
-      repoRoot: worktreePath,
-      baseline: { kind: "ref", ref: parsedInput.expected.beforeHeadCommit },
-      maxPatchPreviewBytes: 1,
-      maxFullPatchBytes: DEFAULT_MAX_FULL_PATCH_BYTES,
-    });
-    assertCandidateSnapshot(snapshot, parsedInput.expected);
+    const { projectRoot, worktreePath, snapshot } = await collectVerifiedCandidateSnapshot(parsedInput);
 
     const temporaryRoot = await mkdtemp(join(tmpdir(), "skyturn-candidate-commit-"));
-    let published = false;
     try {
       await chmod(temporaryRoot, 0o700);
       const indexFile = resolve(temporaryRoot, "index");
-      const evidence = await publishCandidateSnapshot(
+      return await prepareCandidateSnapshot(
         projectRoot,
         worktreePath,
         indexFile,
@@ -1192,19 +1217,94 @@ export async function createCandidateDeliveryCommit(
         parsedInput.expected,
         parsedInput.message,
       );
-      published = true;
-      return evidence;
     } finally {
       try {
         await rm(temporaryRoot, { recursive: true, force: true });
       } catch {
-        try {
-          await rm(temporaryRoot, { recursive: true, force: true });
-        } catch (error) {
-          if (!published) throw error;
-        }
+        await rm(temporaryRoot, { recursive: true, force: true });
       }
     }
+  } catch (error) {
+    if (error instanceof DeliveryCommitError && error.message === candidateRejectedMessage) throw error;
+    throwDelivery("DELIVERY_REJECTED", candidateRejectedMessage);
+  }
+}
+
+export async function publishPreparedCandidateDeliveryCommit(
+  input: PublishPreparedCandidateDeliveryCommitInput,
+): Promise<CandidateDeliveryCommitEvidence> {
+  const parsedInput = parsePublishPreparedCandidateDeliveryCommitInput(input);
+  return publishParsedCandidateDeliveryCommit(parsedInput, true);
+}
+
+async function publishParsedCandidateDeliveryCommit(
+  parsedInput: ParsedPublishPreparedCandidateDeliveryCommitInput,
+  allowAlreadyPublished: boolean,
+): Promise<CandidateDeliveryCommitEvidence> {
+  try {
+    const projectRoot = await assertGitRepo(parsedInput.projectRoot);
+    const worktreePath = await resolveDeliveryWorktreePath(projectRoot, parsedInput.worktreePath);
+    const preparation = parsedInput.preparation;
+    await assertCandidateBranchName(worktreePath, preparation.branch);
+    await assertCandidateSha1Repository(worktreePath);
+    await assertCandidateIdentityStillMatches(projectRoot, worktreePath, preparation.expected);
+    await assertPreparedCandidateCommitFacts(worktreePath, preparation);
+
+    const branchRef = candidateBranchRef(preparation.branch);
+    await assertCandidateBranchRefIsDirect(worktreePath, branchRef);
+    const branchHead = await candidateGitCommit(worktreePath, [
+      "rev-parse",
+      "--verify",
+      "--end-of-options",
+      `${branchRef}^{commit}`,
+    ]);
+    if (branchHead === preparation.parentCommit) {
+      try {
+        await publishPreparedCandidateRef(worktreePath, {
+          branchRef,
+          candidateCommit: preparation.commitSha,
+          expectedHeadCommit: preparation.parentCommit,
+        });
+      } catch (error) {
+        const recoveredHead = await candidateGitCommit(worktreePath, [
+          "rev-parse",
+          "--verify",
+          "--end-of-options",
+          `${branchRef}^{commit}`,
+        ]);
+        if (!allowAlreadyPublished || recoveredHead !== preparation.commitSha) throw error;
+      }
+    } else if (branchHead !== preparation.commitSha || !allowAlreadyPublished) {
+      throw new Error("Candidate branch conflicts with prepared publication.");
+    }
+
+    await assertPublishedCandidateCommitFacts(worktreePath, preparation);
+    return Object.freeze({
+      status: "committed",
+      commitSha: preparation.commitSha,
+      branch: preparation.branch,
+      parentCommit: preparation.parentCommit,
+    });
+  } catch (error) {
+    if (error instanceof DeliveryCommitError && error.message === candidateRejectedMessage) throw error;
+    throwDelivery("DELIVERY_REJECTED", candidateRejectedMessage);
+  }
+}
+
+export async function captureCandidateDeliveryReviewSnapshot(
+  input: CandidateDeliveryReviewSnapshotInput,
+): Promise<CandidateDeliveryReviewSnapshot> {
+  try {
+    const parsedInput = parseCandidateDeliveryReviewSnapshotInput(input);
+    const { snapshot } = await collectVerifiedCandidateSnapshot(parsedInput);
+    return Object.freeze({
+      baselineCommit: snapshot.baselineCommit,
+      headCommit: snapshot.headCommit!,
+      fullPatchBase64: snapshot.fullPatch.toString("base64"),
+      fullPatchSha256: snapshot.fullPatchSha256!,
+      fullPatchByteLength: snapshot.fullPatchByteLength,
+      fileManifestSha256: snapshot.fileManifestSha256!,
+    });
   } catch (error) {
     if (error instanceof DeliveryCommitError && error.message === candidateRejectedMessage) throw error;
     throwDelivery("DELIVERY_REJECTED", candidateRejectedMessage);
@@ -1824,6 +1924,63 @@ interface ParsedCandidateDeliveryCommitInput {
   readonly message: Buffer;
 }
 
+interface ParsedPublishPreparedCandidateDeliveryCommitInput {
+  readonly projectRoot: string;
+  readonly worktreePath: string;
+  readonly preparation: CandidateDeliveryCommitPreparation;
+}
+
+interface ParsedCandidateDeliveryReviewSnapshotInput {
+  readonly projectRoot: string;
+  readonly worktreePath: string;
+  readonly expected: CandidateCommitExpectation;
+}
+
+function parseCandidateDeliveryReviewSnapshotInput(value: unknown): ParsedCandidateDeliveryReviewSnapshotInput {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error("Invalid candidate review snapshot input.");
+    }
+    const record = value as Record<string, unknown>;
+    if (
+      typeof record.projectRoot !== "string" ||
+      record.projectRoot.length === 0 ||
+      record.projectRoot.includes("\0") ||
+      typeof record.worktreePath !== "string" ||
+      record.worktreePath.length === 0 ||
+      record.worktreePath.includes("\0")
+    ) {
+      throw new Error("Invalid candidate review snapshot path input.");
+    }
+    return Object.freeze({
+      projectRoot: record.projectRoot,
+      worktreePath: record.worktreePath,
+      expected: validateCandidateCommitExpectation(record.expected),
+    });
+  } catch {
+    throwDelivery("INVALID_INPUT", candidateInvalidMessage);
+  }
+}
+
+async function collectVerifiedCandidateSnapshot(
+  input: ParsedCandidateDeliveryReviewSnapshotInput,
+): Promise<{ projectRoot: string; worktreePath: string; snapshot: AtomicGitChangesetSnapshot }> {
+  const projectRoot = await assertGitRepo(input.projectRoot);
+  const worktreePath = await resolveDeliveryWorktreePath(projectRoot, input.worktreePath);
+  await assertCandidateBranchName(worktreePath, input.expected.branchName);
+  await assertCandidateSha1Repository(worktreePath);
+  await assertCandidateLiveCheckout(worktreePath, input.expected);
+  await assertCandidateAncestryExpectation(projectRoot, worktreePath, input.expected);
+  const snapshot = await collectAtomicGitChangesetSnapshot({
+    repoRoot: worktreePath,
+    baseline: { kind: "ref", ref: input.expected.beforeHeadCommit },
+    maxPatchPreviewBytes: 1,
+    maxFullPatchBytes: DEFAULT_MAX_FULL_PATCH_BYTES,
+  });
+  assertCandidateSnapshot(snapshot, input.expected);
+  return { projectRoot, worktreePath, snapshot };
+}
+
 function parseCandidateDeliveryCommitInput(value: unknown): ParsedCandidateDeliveryCommitInput {
   try {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -1854,6 +2011,50 @@ function parseCandidateDeliveryCommitInput(value: unknown): ParsedCandidateDeliv
   } catch {
     throwDelivery("INVALID_INPUT", candidateInvalidMessage);
   }
+}
+
+function parsePublishPreparedCandidateDeliveryCommitInput(
+  value: unknown,
+): ParsedPublishPreparedCandidateDeliveryCommitInput {
+  try {
+    if (!isOrdinaryCandidateRecord(value, ["preparation", "projectRoot", "worktreePath"])) {
+      throw new Error("Invalid prepared candidate publication input.");
+    }
+    if (
+      typeof value.projectRoot !== "string" ||
+      value.projectRoot.length === 0 ||
+      value.projectRoot.includes("\0") ||
+      typeof value.worktreePath !== "string" ||
+      value.worktreePath.length === 0 ||
+      value.worktreePath.includes("\0")
+    ) {
+      throw new Error("Invalid prepared candidate publication path.");
+    }
+    return Object.freeze({
+      projectRoot: value.projectRoot,
+      worktreePath: value.worktreePath,
+      preparation: validateCandidateDeliveryCommitPreparation(value.preparation),
+    });
+  } catch {
+    throwDelivery("INVALID_INPUT", candidateInvalidMessage);
+  }
+}
+
+function validateCandidateDeliveryCommitPreparation(value: unknown): CandidateDeliveryCommitPreparation {
+  const parsed = parseCandidateDeliveryCommitPreparation(value);
+  if (!parsed) throw new Error("Invalid candidate commit preparation.");
+  return parsed;
+}
+
+function isOrdinaryCandidateRecord(
+  value: unknown,
+  expectedKeys: readonly string[],
+): value is Record<string, unknown> {
+  return !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype &&
+    sameOrderedStrings(Object.keys(value).sort(), expectedKeys);
 }
 
 function validateCandidateCommitExpectation(value: unknown): CandidateCommitExpectation {
@@ -2005,14 +2206,14 @@ function assertCandidateSnapshot(
   }
 }
 
-async function publishCandidateSnapshot(
+async function prepareCandidateSnapshot(
   projectRoot: string,
   worktreePath: string,
   indexFile: string,
   snapshot: AtomicGitChangesetSnapshot,
   expected: CandidateCommitExpectation,
   message: Buffer,
-): Promise<CandidateDeliveryCommitEvidence> {
+): Promise<CandidateDeliveryCommitPreparation> {
   const indexOptions = { internalGitIndexFile: indexFile } as const;
   await runCandidateGit(worktreePath, ["read-tree", expected.beforeHeadCommit], indexOptions);
   await runCandidateGit(worktreePath, [
@@ -2079,51 +2280,85 @@ async function publishCandidateSnapshot(
   });
 
   await assertCandidateIdentityStillMatches(projectRoot, worktreePath, expected);
-  const branchRef = candidateBranchRef(expected.branchName);
   const branchHead = await candidateGitCommit(worktreePath, [
     "rev-parse",
     "--verify",
     "--end-of-options",
-    `${branchRef}^{commit}`,
+    `${candidateBranchRef(expected.branchName)}^{commit}`,
   ]);
   if (branchHead !== expected.afterHeadCommit) throw new Error("Candidate branch advanced.");
-  await publishPreparedCandidateRef(worktreePath, {
-    branchRef,
-    candidateCommit: commitSha,
-    expectedHeadCommit: expected.afterHeadCommit,
+  return Object.freeze({
+    status: "prepared",
+    commitSha,
+    treeSha: tree,
+    branch: expected.branchName,
+    parentCommit: expected.afterHeadCommit,
+    expected,
   });
+}
 
+async function assertPreparedCandidateCommitFacts(
+  worktreePath: string,
+  preparation: CandidateDeliveryCommitPreparation,
+): Promise<void> {
+  const commitType = await candidateGitLine(worktreePath, [
+    "cat-file",
+    "-t",
+    preparation.commitSha,
+  ]);
+  const parentLine = await candidateGitLine(worktreePath, [
+    "rev-list",
+    "--parents",
+    "-n",
+    "1",
+    preparation.commitSha,
+  ]);
+  const tree = await candidateGitCommit(worktreePath, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${preparation.commitSha}^{tree}`,
+  ]);
+  const parentTree = await candidateGitCommit(worktreePath, [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${preparation.parentCommit}^{tree}`,
+  ]);
+  if (
+    commitType !== "commit" ||
+    parentLine !== `${preparation.commitSha} ${preparation.parentCommit}` ||
+    tree !== preparation.treeSha ||
+    tree === parentTree
+  ) {
+    throw new Error("Prepared candidate commit facts conflict.");
+  }
+}
+
+async function assertPublishedCandidateCommitFacts(
+  worktreePath: string,
+  preparation: CandidateDeliveryCommitPreparation,
+): Promise<void> {
   const publishedCommit = await candidateGitCommit(worktreePath, [
     "rev-parse",
     "--verify",
     "--end-of-options",
-    `${branchRef}^{commit}`,
+    `${candidateBranchRef(preparation.branch)}^{commit}`,
   ]);
-  const publishedParent = await candidateGitCommit(worktreePath, [
-    "rev-parse",
-    "--verify",
-    "--end-of-options",
-    `${commitSha}^1`,
-  ]);
-  const publishedTree = await candidateGitCommit(worktreePath, [
-    "rev-parse",
-    "--verify",
-    "--end-of-options",
-    `${commitSha}^{tree}`,
-  ]);
-  if (
-    publishedCommit !== commitSha
-    || publishedParent !== expected.afterHeadCommit
-    || publishedTree !== tree
-  ) {
+  if (publishedCommit !== preparation.commitSha) {
     throw new Error("Candidate publication verification failed.");
   }
-  return {
-    status: "committed",
-    commitSha,
-    branch: expected.branchName,
-    parentCommit: expected.afterHeadCommit,
-  };
+  await assertPreparedCandidateCommitFacts(worktreePath, preparation);
+}
+
+async function assertCandidateBranchRefIsDirect(cwd: string, branchRef: string): Promise<void> {
+  const symref = await candidateGitLine(cwd, [
+    "for-each-ref",
+    "--format=%(symref)",
+    "--count=1",
+    branchRef,
+  ]);
+  if (symref !== "") throw new Error("Candidate branch ref is symbolic.");
 }
 
 async function assertCandidateIdentityStillMatches(

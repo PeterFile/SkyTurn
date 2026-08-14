@@ -12,6 +12,7 @@ import {
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
 import {
+  canonicalWorkflowCandidateManifestJson,
   createWorkflowGitAncestryProofContext,
   type RunEvent,
   type RunEvidence,
@@ -97,6 +98,64 @@ describe("SQLite workflow store", () => {
     expect(reopened.listWorkflowSessionIds()).toEqual(["session-later-id", "session-earlier-id"]);
     expect(reopened.getWorkflowSession("session-later-id")?.plannerLaneId).toBe(first?.plannerLaneId);
     expect(reopened.getWorkflowSession("session-earlier-id")?.plannerLaneId).toBe(second?.plannerLaneId);
+    reopened.close();
+  });
+
+  it("persists only manifest-bound prepared publication input across reopen without projecting it", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const projectionBefore = store.materializeFlowProjection(fixture.identity.sessionId);
+    const ledgerBefore = store.buildLedgerSummary(fixture.identity.sessionId);
+    const api = store as unknown as {
+      appendPreparedCandidatePublication(input: typeof fixture.input): unknown;
+      getPreparedCandidatePublication(input: Omit<typeof fixture.input, "now" | "preparation">): unknown;
+    };
+    expect(typeof api.appendPreparedCandidatePublication).toBe("function");
+    expect(typeof api.getPreparedCandidatePublication).toBe("function");
+    if (
+      typeof api.appendPreparedCandidatePublication !== "function" ||
+      typeof api.getPreparedCandidatePublication !== "function"
+    ) {
+      store.close();
+      return;
+    }
+
+    const event = api.appendPreparedCandidatePublication(fixture.input) as {
+      kind: string;
+      source: string;
+      payload: Record<string, unknown>;
+    };
+    const eventsAfterAppend = store.listEvents(fixture.identity.sessionId);
+    expect(api.appendPreparedCandidatePublication({
+      ...fixture.input,
+      now: "2026-08-14T00:00:01.000Z",
+    })).toEqual(event);
+    expect(store.listEvents(fixture.identity.sessionId)).toEqual(eventsAfterAppend);
+    expect(api.getPreparedCandidatePublication(fixture.lookup)).toEqual(fixture.preparation);
+    expect(event).toMatchObject({
+      kind: "workflow.commit.publication_prepared",
+      source: "workflow_store",
+      payload: {
+        laneId: fixture.identity.laneId,
+        segmentId: fixture.identity.segmentId,
+        manifestSha256: fixture.manifestSha256,
+        requestSha256: fixture.input.requestSha256,
+        preparation: fixture.preparation,
+      },
+    });
+    expect(store.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
+    expect(store.buildLedgerSummary(fixture.identity.sessionId)).toEqual(ledgerBefore);
+    expect(JSON.stringify(event)).not.toMatch(/worktreePath|patchPreview|reviewRequest|credential|subject|body/);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const reopenedApi = reopened as unknown as {
+      getPreparedCandidatePublication(input: typeof fixture.lookup): unknown;
+    };
+    expect(reopenedApi.getPreparedCandidatePublication(fixture.lookup)).toEqual(fixture.preparation);
+    expect(reopened.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
+    expect(reopened.buildLedgerSummary(fixture.identity.sessionId)).toEqual(ledgerBefore);
     reopened.close();
   });
 
@@ -2488,22 +2547,113 @@ describe("SQLite workflow store", () => {
     store.close();
   });
 
-  it("rejects generic candidate manifest forgery before idempotency", async () => {
+  it.each([
+    {
+      kind: "workflow.candidate.manifest_recorded",
+      idempotencyKey: "candidate-manifest:run-forged",
+      payload: { manifest: { version: 1 } },
+    },
+    {
+      kind: "workflow.commit.publication_prepared",
+      idempotencyKey: "delivery-commit-prepared:lane-forged:segment-forged",
+      payload: {
+        laneId: "lane-forged",
+        segmentId: "segment-forged",
+        manifestSha256: "a".repeat(64),
+        requestSha256: "b".repeat(64),
+        preparation: {},
+      },
+    },
+  ])("rejects generic $kind forgery before idempotency", async ({ kind, idempotencyKey, payload }) => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
     seedStore(store);
     const input = {
       sessionId: "session-1",
-      kind: "workflow.candidate.manifest_recorded" as never,
+      kind: kind as never,
       source: "backend",
-      idempotencyKey: "candidate-manifest:run-forged",
-      payload: { manifest: { version: 1 } },
+      idempotencyKey,
+      payload,
       now: "2026-08-11T00:00:00.000Z",
     };
 
-    expect(() => store.appendWorkflowEvent(input)).toThrow(/candidate manifest.*internal|forg/i);
+    expect(() => store.appendWorkflowEvent(input)).toThrow(/internal|forg/i);
     expect(store.listEvents("session-1").some((event) => event.kind === input.kind)).toBe(false);
     store.close();
+  });
+
+  it("rejects conflicting or noncanonical prepared publication input before writing", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const api = store as unknown as {
+      appendPreparedCandidatePublication(input: unknown): unknown;
+    };
+    if (typeof api.appendPreparedCandidatePublication !== "function") {
+      store.close();
+      return;
+    }
+    api.appendPreparedCandidatePublication(fixture.input);
+    const events = store.listEvents(fixture.identity.sessionId);
+
+    for (const invalid of [
+      { ...fixture.input, requestSha256: "c".repeat(64) },
+      { ...fixture.input, manifestSha256: "A".repeat(64) },
+      { ...fixture.input, preparation: { ...fixture.preparation, commitSha: "2".repeat(39) } },
+      { ...fixture.input, preparation: { ...fixture.preparation, branch: "forged" } },
+      {
+        ...fixture.input,
+        preparation: {
+          ...fixture.preparation,
+          expected: { ...fixture.preparation.expected, fullPatchSha256: "9".repeat(64) },
+        },
+      },
+      { ...fixture.input, worktreePath: "/private/source" },
+    ]) {
+      expect(() => api.appendPreparedCandidatePublication(invalid)).toThrow();
+      expect(store.listEvents(fixture.identity.sessionId)).toEqual(events);
+    }
+    store.close();
+  });
+
+  it.each([
+    ["an extra sensitive field", (payload: Record<string, unknown>) => {
+      payload.worktreePath = "/private/source";
+    }],
+    ["a forged manifest digest", (payload: Record<string, unknown>) => {
+      payload.manifestSha256 = "9".repeat(64);
+    }],
+    ["a malformed preparation SHA", (payload: Record<string, unknown>) => {
+      (payload.preparation as Record<string, unknown>).commitSha = "A".repeat(40);
+    }],
+    ["an expectation mismatch", (payload: Record<string, unknown>) => {
+      const preparation = payload.preparation as { expected: Record<string, unknown> };
+      preparation.expected.fileManifestSha256 = "9".repeat(64);
+    }],
+  ])("fails store reopen closed for prepared publication with %s", async (_label, mutate) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const api = store as unknown as {
+      appendPreparedCandidatePublication(input: unknown): unknown;
+    };
+    if (typeof api.appendPreparedCandidatePublication !== "function") {
+      store.close();
+      return;
+    }
+    const event = api.appendPreparedCandidatePublication(fixture.input) as { id: string };
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    const row = db.prepare("SELECT payload_json FROM workflow_events WHERE id = ?")
+      .get(event.id) as { payload_json: string };
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    mutate(payload);
+    db.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ?")
+      .run(JSON.stringify(payload), event.id);
+    db.close();
+
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(/prepared publication|candidate publication/i);
   });
 
   it("freezes authoritative changeset evidence when succeeded RunEvidence has a null changeset id", async () => {
@@ -9930,6 +10080,53 @@ function prepareCandidateManifestRun(
     now: "2026-08-11T00:00:05.500Z",
   });
   return identity;
+}
+
+function preparedPublicationFixture(store: TestWorkflowStore, projectRoot: string) {
+  const identity = prepareCandidateManifestRun(store, projectRoot);
+  const manifest = store.freezeCandidateManifest({
+    ...identity,
+    now: "2026-08-11T00:00:06.000Z",
+  });
+  const manifestSha256 = createHash("sha256")
+    .update(canonicalWorkflowCandidateManifestJson(manifest), "utf8")
+    .digest("hex");
+  const expected = {
+    repositoryIdentity: manifest.repositoryIdentity,
+    worktreeIdentity: manifest.worktreeIdentity,
+    branchName: manifest.branchName,
+    beforeHeadCommit: manifest.beforeHeadCommit,
+    afterHeadCommit: manifest.afterHeadCommit,
+    ancestryProofSha256: manifest.ancestryProofSha256,
+    fullPatchSha256: manifest.fullPatchSha256,
+    fullPatchByteLength: manifest.fullPatchByteLength,
+    fileManifestSha256: manifest.fileManifestSha256,
+  };
+  const preparation = {
+    status: "prepared" as const,
+    commitSha: "2".repeat(40),
+    treeSha: "3".repeat(40),
+    branch: expected.branchName,
+    parentCommit: expected.afterHeadCommit,
+    expected,
+  };
+  const lookup = {
+    ...identity,
+    manifestSha256,
+    requestSha256: "b".repeat(64),
+  };
+  return {
+    identity,
+    manifest,
+    manifestSha256,
+    preparation,
+    lookup,
+    input: {
+      ...lookup,
+      preparation,
+      now: "2026-08-14T00:00:00.000Z",
+    },
+  };
 }
 
 function rewriteChangesetBaseline(

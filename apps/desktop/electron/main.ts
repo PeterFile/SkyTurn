@@ -11,12 +11,20 @@ import {
   defaultDevflowFileContent,
 } from "@skyturn/project-memory";
 import type {
+  CandidateDeliveryCommitEvidence,
+  CandidateDeliveryCommitPreparation,
+} from "@skyturn/git-worktree" with { "resolution-mode": "import" };
+import type {
   AgentDescriptor,
   CanvasSession,
   PlanBootstrapRequest,
   PlanCancelRequest,
   PlanEvent,
   PlanStateSnapshot,
+  CandidateReviewAgentKind,
+  CandidateReviewRequest,
+  WorkflowDeliveryCandidateIdentity,
+  WorkflowCandidateManifest,
   WorkflowLaneCandidateBinding,
   WorkflowLedgerSummary,
   WorkflowWorktreeIdentity,
@@ -326,13 +334,61 @@ interface WorkflowDeliveryFlowProjectionLike {
   lanes: Array<{
     id: string;
     laneKind?: string;
+    status?: string;
+    executable?: boolean;
+    agentKind?: string;
     rollbackStatus?: string;
+  }>;
+  projectionNodes?: Array<{
+    id?: string;
+    laneId?: string;
+    executable?: boolean;
   }>;
   edges?: Array<{
     sourceLaneId?: string;
     targetLaneId?: string;
   }>;
+  segments?: Array<{
+    id?: string;
+    laneId?: string;
+    runId?: string;
+    status?: string;
+  }>;
   laneRollbackStatuses?: Record<string, unknown>;
+  worktrees?: unknown[];
+}
+
+interface CandidateDeliveryReviewSnapshotLike {
+  baselineCommit: string;
+  headCommit: string;
+  fullPatchBase64: string;
+  fullPatchSha256: string;
+  fullPatchByteLength: number;
+  fileManifestSha256: string;
+}
+
+interface CandidateDeliveryCommitPublicationInput {
+  store: WorkflowStoreHost;
+  sessionId: string;
+  nodeId: string;
+  laneId: string;
+  segmentId: string;
+  runId: string;
+  manifestSha256: string;
+  requestSha256: string;
+  expected: CandidateDeliveryCommitPreparation["expected"];
+  parsePreparation(value: unknown): CandidateDeliveryCommitPreparation | null;
+  prepare(): Promise<CandidateDeliveryCommitPreparation>;
+  publish(preparation: CandidateDeliveryCommitPreparation): Promise<CandidateDeliveryCommitEvidence>;
+  broadcast(): void;
+  now(): string;
+}
+
+interface CandidateDeliveryCommitPublicationResult {
+  protocolVersion: number;
+  status: "committed";
+  event: unknown;
+  evidence: CandidateDeliveryCommitEvidence;
 }
 
 interface DeliveryCommitEvidenceLike {
@@ -579,6 +635,8 @@ interface ValidatedWorkspaceCollections {
 }
 
 const RUN_PROTOCOL_VERSION = 1;
+const CANDIDATE_DELIVERY_REJECTED_MESSAGE = "Candidate delivery was rejected.";
+const candidateDeliveryAgentKinds = new Set(["codex", "agy", "gemini", "claude-code", "openclaw"]);
 const planRuntimeShutdownError = "Plan runtime is unavailable while SkyTurn is shutting down.";
 const workspaceLoadError = "Workspace could not be loaded.";
 const workspaceSaveError = "Workspace could not be saved.";
@@ -689,6 +747,9 @@ interface WorkflowStoreHost {
   recordCanvasNodePosition(input: unknown): unknown;
   recordRunCheckpoint(input: unknown): unknown;
   freezeCandidateManifest(input: unknown): unknown;
+  getCandidateManifest(identity: unknown): unknown;
+  appendPreparedCandidatePublication(input: unknown): unknown;
+  getPreparedCandidatePublication(identity: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
@@ -1340,7 +1401,9 @@ ipcMain.handle("workflow:events", workflowHandler(async (projectRoot: string, se
   assertKnownProjectRoot(projectRoot);
   const workflowSessionId = assertWorkflowSessionId(sessionId);
   const store = await getWorkflowStore(projectRoot);
-  const events = store.listEvents(workflowSessionId).filter(isWorkflowEventRecord);
+  const events = store.listEvents(workflowSessionId)
+    .filter(isWorkflowEventRecord)
+    .filter((event) => event.kind !== "workflow.commit.publication_prepared");
   const plannerLaneId = reconciledPlannerLaneIdForRenderer(events);
   const plannerSegments = plannerLaneId ? store.listSegments(workflowSessionId, plannerLaneId) : [];
   const plannerSegmentsById = new Map(plannerSegments.map((segment) => [segment.segmentId, segment]));
@@ -1929,49 +1992,112 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
     const store = await getWorkflowStore(projectRoot);
     assertKnownWorkflowCanvasSession(store, sessionId);
     const laneId = requireText(readField(input, "laneId"), "workflow commit laneId");
-    assertWorkflowDeliveryCommitLane(store, sessionId, laneId);
-    const realProjectRoot = await fs.realpath(projectRoot);
-    const rawWorktreePath = optionalText(readField(input, "worktreePath"));
-    const worktreePath = await resolveDeliveryCommitWorktreePath(store, sessionId, laneId, rawWorktreePath, realProjectRoot);
-    const files = deliveryFilesFromInput(readField(input, "files"));
     const subject = requireText(readField(input, "subject"), "commit subject");
     const body = optionalText(readField(input, "body")) ?? undefined;
-    const reconciliationStatus = deliveryReconciliationStatus(input);
-    const acceptMismatch = readField(input, "acceptMismatch") === true;
-    const { createDeliveryCommit } = await import("@skyturn/git-worktree/node");
-    let evidence: Awaited<ReturnType<typeof createDeliveryCommit>>;
-    try {
-      evidence = await createDeliveryCommit({
-        projectRoot: realProjectRoot,
-        worktreePath,
-        files,
-        subject,
-        ...(body ? { body } : {}),
-        ...(reconciliationStatus ? { reconciliationStatus } : {}),
-        ...(acceptMismatch ? { acceptMismatch } : {}),
-      });
-    } catch (error) {
-      throw normalizeDeliveryCommitIpcError(error);
-    }
-
-    const segmentId = optionalText(readField(input, "segmentId"));
-    const event = store.appendWorkflowEvent({
+    const context = await (async () => {
+      try {
+        const projection = store.materializeFlowProjection(sessionId) as WorkflowDeliveryFlowProjectionLike;
+        const {
+          canonicalWorkflowCandidateManifestJson,
+          parseCandidateReviewRequest,
+          parseWorkflowCandidateManifest,
+          resolveWorkflowDeliveryCandidateIdentity,
+        } = await import("@skyturn/project-core");
+        const candidateIdentity = resolveWorkflowDeliveryCandidateIdentity(projection, sessionId, laneId);
+        const storedManifest = store.getCandidateManifest({
+          sessionId: candidateIdentity.sessionId,
+          nodeId: candidateIdentity.nodeId,
+          laneId: candidateIdentity.laneId,
+          segmentId: candidateIdentity.segmentId,
+          runId: candidateIdentity.runId,
+        });
+        const manifest = requireWorkflowDeliveryCandidateManifest(
+          parseWorkflowCandidateManifest(storedManifest),
+          candidateIdentity,
+        );
+        const manifestSha256 = createHash("sha256")
+          .update(canonicalWorkflowCandidateManifestJson(manifest), "utf8")
+          .digest("hex");
+        const realProjectRoot = await fs.realpath(projectRoot);
+        const rawWorktreePath = optionalText(readField(input, "worktreePath"));
+        const worktreePath = await resolveCandidateDeliveryWorktreePath(
+          store,
+          sessionId,
+          manifest,
+          projection,
+          rawWorktreePath,
+          realProjectRoot,
+        );
+        const {
+          captureCandidateDeliveryReviewSnapshot,
+          parseCandidateDeliveryCommitPreparation,
+          prepareCandidateDeliveryCommit,
+          publishPreparedCandidateDeliveryCommit,
+        } = await import("@skyturn/git-worktree/node");
+        return {
+          captureCandidateDeliveryReviewSnapshot,
+          manifest,
+          manifestSha256,
+          parseCandidateReviewRequest,
+          parseCandidateDeliveryCommitPreparation,
+          prepareCandidateDeliveryCommit,
+          publishPreparedCandidateDeliveryCommit,
+          realProjectRoot,
+          worktreePath,
+        };
+      } catch {
+        rejectCandidateDelivery();
+      }
+    })();
+    const requestSha256 = candidateDeliveryCommitRequestSha256(
+      context.manifestSha256,
+      subject,
+      body,
+    );
+    return publishCandidateDeliveryCommitWithRecovery({
+      store,
       sessionId,
-      kind: "workflow.commit.created",
-      source: "electron-main",
+      nodeId: context.manifest.nodeId,
       laneId,
-      segmentId,
-      idempotencyKey: `delivery-commit:${evidence.commitSha}`,
-      payload: {
-        laneId,
-        ...(segmentId ? { segmentId } : {}),
-        evidence,
+      segmentId: context.manifest.segmentId,
+      runId: context.manifest.runId,
+      manifestSha256: context.manifestSha256,
+      requestSha256,
+      expected: candidateCommitExpectationFromManifest(context.manifest),
+      parsePreparation: context.parseCandidateDeliveryCommitPreparation,
+      async prepare() {
+        try {
+          const snapshot = await context.captureCandidateDeliveryReviewSnapshot({
+            projectRoot: context.realProjectRoot,
+            worktreePath: context.worktreePath,
+            expected: candidateCommitExpectationFromManifest(context.manifest),
+          });
+          assertCandidateDeliveryReviewSnapshot(context.manifest, snapshot);
+          const reviewRequest = context.parseCandidateReviewRequest(
+            candidateReviewRequestFromManifest(context.manifest, context.manifestSha256, snapshot),
+          );
+          if (!reviewRequest) rejectCandidateDelivery();
+          const { reviewCandidateWithHermes } = await import("@skyturn/agent-bridge");
+          await reviewCandidateWithHermes({ request: reviewRequest });
+          return await context.prepareCandidateDeliveryCommit({
+            projectRoot: context.realProjectRoot,
+            worktreePath: context.worktreePath,
+            expected: candidateCommitExpectationFromManifest(context.manifest),
+            subject,
+            ...(body ? { body } : {}),
+          });
+        } catch {
+          rejectCandidateDelivery();
+        }
       },
-      now: new Date().toISOString(),
+      publish: (preparation) => context.publishPreparedCandidateDeliveryCommit({
+        projectRoot: context.realProjectRoot,
+        worktreePath: context.worktreePath,
+        preparation,
+      }),
+      broadcast: () => broadcastWorkflowProjection(projectRoot, sessionId, store),
+      now: () => new Date().toISOString(),
     });
-    broadcastWorkflowProjection(projectRoot, sessionId, store);
-
-    return { protocolVersion: RUN_PROTOCOL_VERSION, status: "committed", event, evidence };
   });
 }));
 
@@ -6627,6 +6753,287 @@ function assertKnownWorkflowCanvasSession(store: WorkflowStoreHost, sessionId: s
   }
 }
 
+function rejectCandidateDelivery(): never {
+  throw workflowIpcError("DELIVERY_REJECTED", CANDIDATE_DELIVERY_REJECTED_MESSAGE);
+}
+
+function candidateCommitPublicationError(manualRepairRequired = false): Error {
+  const error = workflowIpcError(
+    "UNAVAILABLE",
+    manualRepairRequired
+      ? "Candidate commit publication conflicts with durable state; manual repair is required."
+      : "Candidate commit publication is incomplete; retry the publication.",
+  ) as Error & { candidateCommitPublicationManualRepair?: true };
+  if (manualRepairRequired) error.candidateCommitPublicationManualRepair = true;
+  return error;
+}
+
+function candidateDeliveryCommitRequestSha256(
+  manifestSha256: string,
+  subject: string,
+  body: string | undefined,
+): string {
+  return createHash("sha256").update(JSON.stringify({
+    version: 1,
+    manifestSha256,
+    subject,
+    body: body ?? null,
+  }), "utf8").digest("hex");
+}
+
+function candidateCommitPreparedIntentPayload(input: CandidateDeliveryCommitPublicationInput, preparation: unknown) {
+  return {
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    manifestSha256: input.manifestSha256,
+    requestSha256: input.requestSha256,
+    preparation,
+  };
+}
+
+function findCandidateCommitPreparedIntent(
+  input: CandidateDeliveryCommitPublicationInput,
+): CandidateDeliveryCommitPreparation | null {
+  let persisted: unknown;
+  try {
+    persisted = input.store.getPreparedCandidatePublication({
+      sessionId: input.sessionId,
+      nodeId: input.nodeId,
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      runId: input.runId,
+      manifestSha256: input.manifestSha256,
+      requestSha256: input.requestSha256,
+    });
+  } catch {
+    throw candidateCommitPublicationError(true);
+  }
+  if (persisted === null) return null;
+  const preparation = input.parsePreparation(persisted);
+  if (!preparation || stableJson(preparation.expected) !== stableJson(input.expected)) {
+    throw candidateCommitPublicationError(true);
+  }
+  return preparation;
+}
+
+function appendCandidateCommitPreparedIntent(
+  input: CandidateDeliveryCommitPublicationInput,
+  preparation: CandidateDeliveryCommitPreparation,
+): void {
+  const idempotencyKey = `delivery-commit-prepared:${input.laneId}:${input.segmentId}`;
+  const payload = candidateCommitPreparedIntentPayload(input, preparation);
+  const event = input.store.appendPreparedCandidatePublication({
+    sessionId: input.sessionId,
+    nodeId: input.nodeId,
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    runId: input.runId,
+    manifestSha256: input.manifestSha256,
+    requestSha256: input.requestSha256,
+    preparation,
+    now: input.now(),
+  });
+  if (
+    !isRecord(event) ||
+    event.sessionId !== input.sessionId ||
+    event.kind !== "workflow.commit.publication_prepared" ||
+    event.source !== "workflow_store" ||
+    event.laneId !== input.laneId ||
+    event.segmentId !== input.segmentId ||
+    event.idempotencyKey !== idempotencyKey ||
+    stableJson(event.payload) !== stableJson(payload)
+  ) {
+    throw candidateCommitPublicationError(true);
+  }
+}
+
+function appendCandidateCommitCreatedEvent(
+  input: CandidateDeliveryCommitPublicationInput,
+  evidence: CandidateDeliveryCommitEvidence,
+): unknown {
+  const idempotencyKey = `delivery-commit:${evidence.commitSha}`;
+  const payload = {
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    manifestSha256: input.manifestSha256,
+    requestSha256: input.requestSha256,
+    evidence,
+  };
+  const event = input.store.appendWorkflowEvent({
+    sessionId: input.sessionId,
+    kind: "workflow.commit.created",
+    source: "electron-main",
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    idempotencyKey,
+    payload,
+    now: input.now(),
+  });
+  if (
+    !isRecord(event) ||
+    event.sessionId !== input.sessionId ||
+    event.kind !== "workflow.commit.created" ||
+    event.source !== "electron-main" ||
+    event.laneId !== input.laneId ||
+    event.segmentId !== input.segmentId ||
+    event.idempotencyKey !== idempotencyKey ||
+    stableJson(event.payload) !== stableJson(payload)
+  ) {
+    throw candidateCommitPublicationError(true);
+  }
+  return event;
+}
+
+async function publishCandidateDeliveryCommitWithRecovery(
+  input: CandidateDeliveryCommitPublicationInput,
+): Promise<CandidateDeliveryCommitPublicationResult> {
+  let preparation = findCandidateCommitPreparedIntent(input);
+  if (!preparation) {
+    preparation = await input.prepare();
+    try {
+      appendCandidateCommitPreparedIntent(input, preparation);
+    } catch (error) {
+      if (isRecord(error) && error.candidateCommitPublicationManualRepair === true) throw error;
+      throw candidateCommitPublicationError();
+    }
+  }
+
+  let evidence: CandidateDeliveryCommitEvidence;
+  try {
+    evidence = await input.publish(preparation);
+  } catch {
+    throw candidateCommitPublicationError(true);
+  }
+
+  let event: unknown;
+  try {
+    event = appendCandidateCommitCreatedEvent(input, evidence);
+  } catch (error) {
+    if (isRecord(error) && error.candidateCommitPublicationManualRepair === true) throw error;
+    throw candidateCommitPublicationError();
+  }
+  try {
+    input.broadcast();
+  } catch {
+    // The durable terminal event is authoritative; a duplicate IPC call will rebroadcast it.
+  }
+  return {
+    protocolVersion: RUN_PROTOCOL_VERSION,
+    status: "committed",
+    event,
+    evidence,
+  };
+}
+
+function requireWorkflowDeliveryCandidateManifest(
+  value: WorkflowCandidateManifest | null,
+  identity: WorkflowDeliveryCandidateIdentity,
+): WorkflowCandidateManifest {
+  if (
+    !value ||
+    value.sessionId !== identity.sessionId ||
+    value.nodeId !== identity.nodeId ||
+    value.laneId !== identity.laneId ||
+    value.segmentId !== identity.segmentId ||
+    value.runId !== identity.runId ||
+    value.agentKind !== identity.agentKind ||
+    !isCandidateDeliveryAgentKind(value.agentKind) ||
+    value.terminalRunEvidence.status !== "succeeded" ||
+    value.terminalRunEvidence.runId !== identity.runId
+  ) rejectCandidateDelivery();
+  return value;
+}
+
+function assertCandidateManifestCanvasBinding(
+  manifest: Pick<WorkflowCandidateManifest, "executionTarget" | "worktreeId" | "branchName">,
+  canvasSession: Record<string, unknown>,
+  node: Record<string, unknown>,
+): void {
+  if (!isRecord(canvasSession.target) || !isRecord(node.worktree)) rejectCandidateDelivery();
+  if (canvasSession.target.executionTarget !== manifest.executionTarget) rejectCandidateDelivery();
+  const worktreeExecutionTarget = optionalText(node.worktree.executionTarget);
+  if (worktreeExecutionTarget && worktreeExecutionTarget !== manifest.executionTarget) rejectCandidateDelivery();
+  if (optionalText(node.worktree.branchName) !== manifest.branchName) rejectCandidateDelivery();
+  const nodeWorktreeId = optionalText(node.worktree.worktreeId);
+  if (manifest.executionTarget === "current_branch") {
+    if (manifest.worktreeId !== null || nodeWorktreeId) rejectCandidateDelivery();
+    if (optionalText(canvasSession.target.selectedBranch) !== manifest.branchName) rejectCandidateDelivery();
+    return;
+  }
+  if (!manifest.worktreeId || nodeWorktreeId !== manifest.worktreeId || !optionalText(node.worktree.realPath)) {
+    rejectCandidateDelivery();
+  }
+}
+
+function candidateCommitExpectationFromManifest(manifest: WorkflowCandidateManifest) {
+  return {
+    repositoryIdentity: manifest.repositoryIdentity,
+    worktreeIdentity: manifest.worktreeIdentity,
+    branchName: manifest.branchName,
+    beforeHeadCommit: manifest.beforeHeadCommit,
+    afterHeadCommit: manifest.afterHeadCommit,
+    ancestryProofSha256: manifest.ancestryProofSha256,
+    fullPatchSha256: manifest.fullPatchSha256,
+    fullPatchByteLength: manifest.fullPatchByteLength,
+    fileManifestSha256: manifest.fileManifestSha256,
+  };
+}
+
+function assertCandidateDeliveryReviewSnapshot(
+  manifest: WorkflowCandidateManifest,
+  snapshot: CandidateDeliveryReviewSnapshotLike,
+): void {
+  if (
+    snapshot.baselineCommit !== manifest.beforeHeadCommit ||
+    snapshot.headCommit !== manifest.afterHeadCommit ||
+    snapshot.fullPatchSha256 !== manifest.fullPatchSha256 ||
+    snapshot.fullPatchByteLength !== manifest.fullPatchByteLength ||
+    snapshot.fileManifestSha256 !== manifest.fileManifestSha256 ||
+    typeof snapshot.fullPatchBase64 !== "string" ||
+    snapshot.fullPatchBase64.length === 0
+  ) rejectCandidateDelivery();
+}
+
+function candidateReviewRequestFromManifest(
+  manifest: WorkflowCandidateManifest,
+  manifestSha256: string,
+  snapshot: CandidateDeliveryReviewSnapshotLike,
+): CandidateReviewRequest {
+  if (!isCandidateDeliveryAgentKind(manifest.agentKind)) rejectCandidateDelivery();
+  return {
+    version: 1,
+    manifestSha256,
+    identity: {
+      sessionId: manifest.sessionId,
+      nodeId: manifest.nodeId,
+      laneId: manifest.laneId,
+      segmentId: manifest.segmentId,
+      runId: manifest.runId,
+    },
+    candidate: {
+      repositoryIdentity: manifest.repositoryIdentity,
+      worktreeIdentity: manifest.worktreeIdentity,
+      branchName: manifest.branchName,
+      beforeHeadCommit: manifest.beforeHeadCommit,
+      afterHeadCommit: manifest.afterHeadCommit,
+      ancestryProofSha256: manifest.ancestryProofSha256,
+      fileManifestSha256: manifest.fileManifestSha256,
+    },
+    patch: {
+      encoding: "base64",
+      sha256: manifest.fullPatchSha256,
+      byteLength: manifest.fullPatchByteLength,
+      base64: snapshot.fullPatchBase64,
+    },
+  };
+}
+
+function isCandidateDeliveryAgentKind(
+  value: unknown,
+): value is CandidateReviewAgentKind {
+  return typeof value === "string" && candidateDeliveryAgentKinds.has(value);
+}
+
 function assertWorkflowDeliveryCommitLane(store: WorkflowStoreHost, sessionId: string, laneId: string): void {
   const projection = store.materializeFlowProjection(sessionId) as WorkflowDeliveryFlowProjectionLike;
   if (!isRecord(projection) || !Array.isArray(projection.lanes)) {
@@ -6722,6 +7129,44 @@ async function resolveDeliveryCommitWorktreePath(
   return realExpectedWorktreePath;
 }
 
+async function resolveCandidateDeliveryWorktreePath(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  manifest: WorkflowCandidateManifest,
+  projection: WorkflowDeliveryFlowProjectionLike,
+  rawWorktreePath: string | null,
+  realProjectRoot: string,
+): Promise<string> {
+  const canvasSession = store.materializeCanvasSession(sessionId);
+  if (!isRecord(canvasSession) || !Array.isArray(canvasSession.nodes)) rejectCandidateDelivery();
+  const nodes = canvasSession.nodes.filter((node) => isRecord(node) && node.id === manifest.nodeId);
+  if (nodes.length !== 1) rejectCandidateDelivery();
+  const node = nodes[0] as Record<string, unknown>;
+  assertCandidateManifestCanvasBinding(manifest, canvasSession, node);
+
+  let expectedWorktreePath = realProjectRoot;
+  if (manifest.executionTarget === "new_worktree") {
+    const nodeWorktree = node.worktree as Record<string, unknown>;
+    const recordedPath = optionalText(nodeWorktree.realPath);
+    if (!recordedPath) rejectCandidateDelivery();
+    const managed = await assertManagedRollbackWorktree(realProjectRoot, projection, {
+      worktreeId: manifest.worktreeId,
+      worktreePath: recordedPath,
+    });
+    if (managed.branchName !== manifest.branchName) rejectCandidateDelivery();
+    expectedWorktreePath = managed.path;
+  }
+
+  if (rawWorktreePath) {
+    const supplied = path.isAbsolute(rawWorktreePath)
+      ? rawWorktreePath
+      : path.resolve(realProjectRoot, rawWorktreePath);
+    const realSupplied = await fs.realpath(supplied);
+    if (realSupplied !== expectedWorktreePath) rejectCandidateDelivery();
+  }
+  return expectedWorktreePath;
+}
+
 async function findDeliveryCommitEvidence(
   store: WorkflowStoreHost,
   sessionId: string,
@@ -6739,15 +7184,18 @@ async function findDeliveryCommitEvidence(
     const eventSegmentId = optionalText(event.segmentId) ?? optionalText(payload.segmentId);
     if (segmentId && eventSegmentId !== segmentId) continue;
     if (!isRecord(payload.evidence)) continue;
+    const recordedWorktreePath = optionalText(payload.evidence.worktreePath);
     const evidence = {
       commitSha: requireText(payload.evidence.commitSha, "delivery commit sha"),
       branch: requireText(payload.evidence.branch, "delivery branch"),
-      worktreePath: requireText(payload.evidence.worktreePath, "delivery worktree path"),
+      worktreePath,
     };
-    const realEvidenceWorktree = await fs.realpath(evidence.worktreePath).catch(() => path.resolve(evidence.worktreePath));
-    const realWorktreePath = await fs.realpath(worktreePath).catch(() => path.resolve(worktreePath));
-    if (realEvidenceWorktree !== realWorktreePath) {
-      throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Recorded delivery commit worktree does not match the lane worktree.");
+    if (recordedWorktreePath) {
+      const realEvidenceWorktree = await fs.realpath(recordedWorktreePath).catch(() => path.resolve(recordedWorktreePath));
+      const realWorktreePath = await fs.realpath(worktreePath).catch(() => path.resolve(worktreePath));
+      if (realEvidenceWorktree !== realWorktreePath) {
+        throw workflowIpcError("UNSAFE_WORKTREE_PATH", "Recorded delivery commit worktree does not match the lane worktree.");
+      }
     }
     return evidence;
   }
@@ -7127,22 +7575,6 @@ function requireRecord(value: unknown, field: string): Record<string, unknown> {
   return value;
 }
 
-function deliveryFilesFromInput(value: unknown): string[] {
-  if (!Array.isArray(value) || value.length === 0) {
-    throw workflowIpcError("INVALID_INPUT", "Delivery file list must be non-empty.");
-  }
-  return value.map((file) => requireText(file, "delivery file path"));
-}
-
-function deliveryReconciliationStatus(input: Record<string, unknown>): "available" | "empty" | "failed" | "mismatch" | null {
-  const reconciliation = readField(input, "reconciliation");
-  const status = optionalText(readField(input, "reconciliationStatus")) ??
-    (isRecord(reconciliation) ? optionalText(readField(reconciliation, "status")) : null);
-  if (!status) return null;
-  if (status === "available" || status === "empty" || status === "failed" || status === "mismatch") return status;
-  throw workflowIpcError("INVALID_INPUT", "Delivery reconciliation status is invalid.");
-}
-
 function requireText(value: unknown, field: string): string {
   const text = optionalText(value);
   if (!text) throw workflowIpcError("INVALID_INPUT", `${field} is required.`);
@@ -7161,15 +7593,6 @@ function optionalText(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-function normalizeDeliveryCommitIpcError(error: unknown): Error {
-  const message = error instanceof Error ? error.message : String(error);
-  if (isRecord(error)) {
-    const code = deliveryCommitIpcErrorCode(error.code);
-    if (code) return workflowIpcError(code, message);
-  }
-  return normalizeWorkflowIpcError(error);
-}
-
 function normalizeDeliveryRemoteIpcError(error: unknown): Error {
   const message = error instanceof Error ? error.message : String(error);
   if (isRecord(error)) {
@@ -7177,11 +7600,6 @@ function normalizeDeliveryRemoteIpcError(error: unknown): Error {
     if (code) return workflowIpcError(code, message);
   }
   return normalizeWorkflowIpcError(error);
-}
-
-function deliveryCommitIpcErrorCode(value: unknown): WorkflowIpcErrorCode | null {
-  if (value === "INVALID_INPUT" || value === "UNSAFE_WORKTREE_PATH" || value === "DELIVERY_REJECTED") return value;
-  return null;
 }
 
 function isKnownPreMutationDeliveryRemoteError(error: unknown): boolean {

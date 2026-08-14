@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 
 import {
   createWorkflowGitAncestryProofContext,
+  canonicalWorkflowCandidateManifestJson,
   expectedArtifactContractForRequiredEvidence,
   isSuccessfulRunEvidence,
   normalizeSessionTarget,
@@ -18,6 +19,10 @@ import {
   sanitizePublicEvidenceText,
   WORKFLOW_CANDIDATE_MANIFEST_VERSION,
 } from "@skyturn/project-core";
+import {
+  parseCandidateDeliveryCommitPreparation,
+  type CandidateDeliveryCommitPreparation,
+} from "@skyturn/git-worktree";
 import type {
   AgentKind,
   CanvasNode,
@@ -103,7 +108,8 @@ export type WorkflowInternalEventKind =
   | "workflow.plan_finish.bound"
   | "workflow.plan_finish.launch_accepted"
   | "workflow.planner_intent.reconciled"
-  | "workflow.candidate.manifest_recorded";
+  | "workflow.candidate.manifest_recorded"
+  | "workflow.commit.publication_prepared";
 
 export type WorkflowEventKind =
   | "user_input"
@@ -523,6 +529,16 @@ export interface FreezeWorkflowCandidateManifestInput extends WorkflowCandidateM
   now: string;
 }
 
+export interface PreparedCandidatePublicationIdentity extends WorkflowCandidateManifestIdentity {
+  manifestSha256: string;
+  requestSha256: string;
+}
+
+export interface AppendPreparedCandidatePublicationInput extends PreparedCandidatePublicationIdentity {
+  preparation: CandidateDeliveryCommitPreparation;
+  now: string;
+}
+
 export interface WorkflowNodeRollbackInput {
   sessionId: string;
   nodeId?: string;
@@ -850,6 +866,7 @@ export class WorkflowStore {
       }
       this.statements = prepareStatements(this.db);
       this.validatePersistedCandidateManifests();
+      this.validatePersistedPreparedCandidatePublications();
     } catch (error) {
       this.db.close();
       throw error;
@@ -991,6 +1008,9 @@ export class WorkflowStore {
   appendWorkflowEvent(input: AppendWorkflowEventInput): WorkflowEventRecord {
     if (input.kind === "workflow.candidate.manifest_recorded") {
       throw new Error("Workflow candidate manifest is internal and cannot be forged through generic append.");
+    }
+    if (input.kind === "workflow.commit.publication_prepared") {
+      throw new Error("Workflow candidate publication preparation is internal and cannot be forged through generic append.");
     }
     assertGenericCheckpointEventHasNoRestrictedFields(input);
     const laneId = laneIdFromPayload(input.payload);
@@ -2166,6 +2186,49 @@ export class WorkflowStore {
     return event ? this.validateCandidateManifestEvent(event, normalized) : null;
   }
 
+  appendPreparedCandidatePublication(input: AppendPreparedCandidatePublicationInput): WorkflowEventRecord {
+    const normalized = normalizePreparedCandidatePublicationInput(input);
+    const idempotencyKey = preparedCandidatePublicationIdempotencyKey(
+      normalized.laneId,
+      normalized.segmentId,
+    );
+    const payload = preparedCandidatePublicationPayload(normalized);
+    const tx = this.db.transaction(() => {
+      this.assertPreparedCandidatePublicationMatchesManifest(normalized);
+      const existing = this.getEventByIdempotencyKey(normalized.sessionId, idempotencyKey);
+      if (existing) {
+        this.validatePreparedCandidatePublicationEvent(existing, normalized);
+        if (stableJson(existing.payload) !== stableJson(payload)) {
+          throw new Error("Prepared candidate publication conflicts with existing durable input.");
+        }
+        return existing;
+      }
+      return this.insertEventInTransaction({
+        sessionId: normalized.sessionId,
+        kind: "workflow.commit.publication_prepared",
+        source: "workflow_store",
+        laneId: normalized.laneId,
+        segmentId: normalized.segmentId,
+        idempotencyKey,
+        payload,
+        now: normalized.now,
+      });
+    });
+    return tx.immediate();
+  }
+
+  getPreparedCandidatePublication(
+    identity: PreparedCandidatePublicationIdentity,
+  ): CandidateDeliveryCommitPreparation | null {
+    const normalized = normalizePreparedCandidatePublicationIdentity(identity);
+    const event = this.getEventByIdempotencyKey(
+      normalized.sessionId,
+      preparedCandidatePublicationIdempotencyKey(normalized.laneId, normalized.segmentId),
+    );
+    if (!event) return null;
+    return this.validatePreparedCandidatePublicationEvent(event, normalized);
+  }
+
   listPendingCandidateManifestFreezes(): WorkflowCandidateManifestIdentity[] {
     const tx = this.db.transaction(() => {
       const pending: WorkflowCandidateManifestIdentity[] = [];
@@ -2226,6 +2289,83 @@ export class WorkflowStore {
       }
     });
     tx();
+  }
+
+  private validatePersistedPreparedCandidatePublications(): void {
+    const tx = this.db.transaction(() => {
+      for (const sessionId of this.listWorkflowSessionIds()) {
+        for (const row of this.statements.listEvents.all(sessionId) as EventRow[]) {
+          if (row.kind !== "workflow.commit.publication_prepared") continue;
+          this.validatePreparedCandidatePublicationEvent(mapEvent(row));
+        }
+      }
+    });
+    tx();
+  }
+
+  private validatePreparedCandidatePublicationEvent(
+    event: WorkflowEventRecord,
+    expectedIdentity?: PreparedCandidatePublicationIdentity,
+  ): CandidateDeliveryCommitPreparation {
+    const parsed = preparedCandidatePublicationFromEvent(event);
+    const manifest = expectedIdentity
+      ? this.getCandidateManifest(candidateManifestIdentityFields(expectedIdentity))
+      : this.findCandidateManifestForPreparedPublication(event);
+    if (!manifest) throw new Error("Prepared candidate publication has no authoritative candidate manifest.");
+    if (expectedIdentity && !candidateManifestMatchesIdentity(manifest, expectedIdentity)) {
+      throw new Error("Prepared candidate publication candidate identity conflicts with the current manifest.");
+    }
+    const manifestSha256 = createHash("sha256")
+      .update(canonicalWorkflowCandidateManifestJson(manifest), "utf8")
+      .digest("hex");
+    if (
+      parsed.manifestSha256 !== manifestSha256 ||
+      (expectedIdentity && (
+        parsed.manifestSha256 !== expectedIdentity.manifestSha256 ||
+        parsed.requestSha256 !== expectedIdentity.requestSha256
+      )) ||
+      stableJson(parsed.preparation.expected) !== stableJson(candidateCommitExpectationFromManifest(manifest))
+    ) {
+      throw new Error("Prepared candidate publication conflicts with the current candidate manifest.");
+    }
+    return parsed.preparation;
+  }
+
+  private assertPreparedCandidatePublicationMatchesManifest(
+    input: AppendPreparedCandidatePublicationInput,
+  ): void {
+    const manifest = this.getCandidateManifest(candidateManifestIdentityFields(input));
+    if (!manifest) throw new Error("Prepared candidate publication requires an authoritative candidate manifest.");
+    const manifestSha256 = createHash("sha256")
+      .update(canonicalWorkflowCandidateManifestJson(manifest), "utf8")
+      .digest("hex");
+    if (
+      input.manifestSha256 !== manifestSha256 ||
+      stableJson(input.preparation.expected) !== stableJson(candidateCommitExpectationFromManifest(manifest))
+    ) {
+      throw new Error("Prepared candidate publication conflicts with the current candidate manifest.");
+    }
+  }
+
+  private findCandidateManifestForPreparedPublication(
+    event: WorkflowEventRecord,
+  ): WorkflowCandidateManifest | null {
+    const candidates: WorkflowCandidateManifest[] = [];
+    for (const row of this.statements.listEvents.all(event.sessionId) as EventRow[]) {
+      if (row.kind !== "workflow.candidate.manifest_recorded") continue;
+      const candidateEvent = mapEvent(row);
+      const rawManifest = parseWorkflowCandidateManifest(candidateEvent.payload.manifest);
+      if (
+        !rawManifest ||
+        rawManifest.laneId !== event.laneId ||
+        rawManifest.segmentId !== event.segmentId
+      ) continue;
+      candidates.push(this.validateCandidateManifestEvent(candidateEvent, rawManifest));
+    }
+    if (candidates.length !== 1) {
+      throw new Error("Prepared candidate publication must bind exactly one authoritative candidate manifest.");
+    }
+    return candidates[0]!;
   }
 
   private deriveCandidateManifest(
@@ -3997,6 +4137,162 @@ function normalizeCandidateManifestFreezeInput(value: unknown): FreezeWorkflowCa
     throw new Error("Workflow candidate manifest freeze time is invalid.");
   }
   return { ...identity, now: value.now };
+}
+
+const preparedCandidatePublicationPayloadKeys = [
+  "laneId",
+  "manifestSha256",
+  "preparation",
+  "requestSha256",
+  "segmentId",
+] as const;
+
+function normalizePreparedCandidatePublicationIdentity(
+  value: unknown,
+): PreparedCandidatePublicationIdentity {
+  if (!isRecord(value) || !hasExactObjectKeys(value, [
+    "sessionId",
+    "nodeId",
+    "laneId",
+    "segmentId",
+    "runId",
+    "manifestSha256",
+    "requestSha256",
+  ])) {
+    throw new Error("Prepared candidate publication identity contains invalid fields.");
+  }
+  const identity = normalizeCandidateManifestIdentity({
+    sessionId: value.sessionId,
+    nodeId: value.nodeId,
+    laneId: value.laneId,
+    segmentId: value.segmentId,
+    runId: value.runId,
+  });
+  if (!isCanonicalPreparedPublicationDigest(value.manifestSha256) || !isCanonicalPreparedPublicationDigest(value.requestSha256)) {
+    throw new Error("Prepared candidate publication hashes are invalid.");
+  }
+  return {
+    ...identity,
+    manifestSha256: value.manifestSha256,
+    requestSha256: value.requestSha256,
+  };
+}
+
+function normalizePreparedCandidatePublicationInput(
+  value: unknown,
+): AppendPreparedCandidatePublicationInput {
+  if (!isRecord(value) || !hasExactObjectKeys(value, [
+    "sessionId",
+    "nodeId",
+    "laneId",
+    "segmentId",
+    "runId",
+    "manifestSha256",
+    "requestSha256",
+    "preparation",
+    "now",
+  ])) {
+    throw new Error("Prepared candidate publication input contains invalid fields.");
+  }
+  const identity = normalizePreparedCandidatePublicationIdentity({
+    sessionId: value.sessionId,
+    nodeId: value.nodeId,
+    laneId: value.laneId,
+    segmentId: value.segmentId,
+    runId: value.runId,
+    manifestSha256: value.manifestSha256,
+    requestSha256: value.requestSha256,
+  });
+  const preparation = parseCandidateDeliveryCommitPreparation(value.preparation);
+  if (!preparation || !isCanonicalCandidateManifestTimestamp(value.now)) {
+    throw new Error("Prepared candidate publication payload is invalid.");
+  }
+  return { ...identity, preparation, now: value.now };
+}
+
+function preparedCandidatePublicationIdempotencyKey(laneId: string, segmentId: string): string {
+  return `delivery-commit-prepared:${laneId}:${segmentId}`;
+}
+
+function preparedCandidatePublicationPayload(
+  input: AppendPreparedCandidatePublicationInput,
+): Record<string, unknown> {
+  return {
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    manifestSha256: input.manifestSha256,
+    requestSha256: input.requestSha256,
+    preparation: input.preparation,
+  };
+}
+
+function preparedCandidatePublicationFromEvent(event: WorkflowEventRecord): {
+  manifestSha256: string;
+  requestSha256: string;
+  preparation: CandidateDeliveryCommitPreparation;
+} {
+  if (
+    event.kind !== "workflow.commit.publication_prepared" ||
+    event.source !== "workflow_store" ||
+    !event.laneId ||
+    !event.segmentId ||
+    event.idempotencyKey !== preparedCandidatePublicationIdempotencyKey(event.laneId, event.segmentId) ||
+    !hasExactObjectKeys(event.payload, preparedCandidatePublicationPayloadKeys) ||
+    event.payload.laneId !== event.laneId ||
+    event.payload.segmentId !== event.segmentId ||
+    !isCanonicalPreparedPublicationDigest(event.payload.manifestSha256) ||
+    !isCanonicalPreparedPublicationDigest(event.payload.requestSha256)
+  ) {
+    throw new Error("Persisted prepared candidate publication event identity is invalid.");
+  }
+  const preparation = parseCandidateDeliveryCommitPreparation(event.payload.preparation);
+  if (!preparation) throw new Error("Persisted prepared candidate publication payload is invalid.");
+  return {
+    manifestSha256: event.payload.manifestSha256,
+    requestSha256: event.payload.requestSha256,
+    preparation,
+  };
+}
+
+function candidateManifestMatchesIdentity(
+  manifest: WorkflowCandidateManifest,
+  identity: WorkflowCandidateManifestIdentity,
+): boolean {
+  return manifest.sessionId === identity.sessionId &&
+    manifest.nodeId === identity.nodeId &&
+    manifest.laneId === identity.laneId &&
+    manifest.segmentId === identity.segmentId &&
+    manifest.runId === identity.runId;
+}
+
+function candidateManifestIdentityFields(
+  identity: WorkflowCandidateManifestIdentity,
+): WorkflowCandidateManifestIdentity {
+  return {
+    sessionId: identity.sessionId,
+    nodeId: identity.nodeId,
+    laneId: identity.laneId,
+    segmentId: identity.segmentId,
+    runId: identity.runId,
+  };
+}
+
+function candidateCommitExpectationFromManifest(manifest: WorkflowCandidateManifest) {
+  return {
+    repositoryIdentity: manifest.repositoryIdentity,
+    worktreeIdentity: manifest.worktreeIdentity,
+    branchName: manifest.branchName,
+    beforeHeadCommit: manifest.beforeHeadCommit,
+    afterHeadCommit: manifest.afterHeadCommit,
+    ancestryProofSha256: manifest.ancestryProofSha256,
+    fullPatchSha256: manifest.fullPatchSha256,
+    fullPatchByteLength: manifest.fullPatchByteLength,
+    fileManifestSha256: manifest.fileManifestSha256,
+  };
+}
+
+function isCanonicalPreparedPublicationDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
 function candidateIdentityFromCheckpoint(value: Record<string, unknown>): WorkflowCandidateManifestIdentity | null {
@@ -6723,7 +7019,8 @@ function isWorkflowInternalEventKind(kind: WorkflowEventKind): kind is WorkflowI
     kind === "workflow.plan_finish.bound" ||
     kind === "workflow.plan_finish.launch_accepted" ||
     kind === "workflow.planner_intent.reconciled" ||
-    kind === "workflow.candidate.manifest_recorded";
+    kind === "workflow.candidate.manifest_recorded" ||
+    kind === "workflow.commit.publication_prepared";
 }
 
 function userInputDeliveredIdempotencyKey(inputId: string): string {

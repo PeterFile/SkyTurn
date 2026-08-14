@@ -12,7 +12,11 @@ import type {
   WorkflowWorktreeIdentity,
   WorktreeMetadata,
 } from "@skyturn/project-core";
-import { parseChangesetEvidence, parseRunEvidence } from "@skyturn/project-core";
+import {
+  CANDIDATE_REVIEW_MAX_PATCH_BYTES,
+  parseChangesetEvidence,
+  parseRunEvidence,
+} from "@skyturn/project-core";
 
 export const GIT_WORKTREE_CONTRACT_VERSION = 1;
 
@@ -119,6 +123,116 @@ export interface CandidateDeliveryCommitEvidence {
   commitSha: string;
   branch: string;
   parentCommit: string;
+}
+
+export interface CandidateDeliveryCommitPreparation {
+  status: "prepared";
+  commitSha: string;
+  treeSha: string;
+  branch: string;
+  parentCommit: string;
+  expected: CandidateCommitExpectation;
+}
+
+const candidateCommitExpectationKeys = [
+  "afterHeadCommit",
+  "ancestryProofSha256",
+  "beforeHeadCommit",
+  "branchName",
+  "fileManifestSha256",
+  "fullPatchByteLength",
+  "fullPatchSha256",
+  "repositoryIdentity",
+  "worktreeIdentity",
+] as const;
+const candidateDeliveryCommitPreparationKeys = [
+  "branch",
+  "commitSha",
+  "expected",
+  "parentCommit",
+  "status",
+  "treeSha",
+] as const;
+
+export function parseCandidateDeliveryCommitPreparation(
+  value: unknown,
+): CandidateDeliveryCommitPreparation | null {
+  if (!isExactOrdinaryRecord(value, candidateDeliveryCommitPreparationKeys)) return null;
+  const expected = parseCandidateCommitExpectation(value.expected);
+  if (
+    !expected ||
+    value.status !== "prepared" ||
+    !isCanonicalCandidateHex(value.commitSha, 40) ||
+    !isCanonicalCandidateHex(value.treeSha, 40) ||
+    value.branch !== expected.branchName ||
+    value.parentCommit !== expected.afterHeadCommit
+  ) return null;
+  return Object.freeze({
+    status: "prepared",
+    commitSha: value.commitSha,
+    treeSha: value.treeSha,
+    branch: value.branch,
+    parentCommit: value.parentCommit,
+    expected,
+  });
+}
+
+function parseCandidateCommitExpectation(value: unknown): CandidateCommitExpectation | null {
+  if (!isExactOrdinaryRecord(value, candidateCommitExpectationKeys)) return null;
+  if (
+    !isCanonicalCandidateHex(value.repositoryIdentity, 64) ||
+    !isCanonicalCandidateHex(value.worktreeIdentity, 64) ||
+    !isCandidateBranchName(value.branchName) ||
+    !isCanonicalCandidateHex(value.beforeHeadCommit, 40) ||
+    !isCanonicalCandidateHex(value.afterHeadCommit, 40) ||
+    !isCanonicalCandidateHex(value.ancestryProofSha256, 64) ||
+    !isCanonicalCandidateHex(value.fullPatchSha256, 64) ||
+    !Number.isSafeInteger(value.fullPatchByteLength) ||
+    (value.fullPatchByteLength as number) <= 0 ||
+    (value.fullPatchByteLength as number) > CANDIDATE_REVIEW_MAX_PATCH_BYTES ||
+    !isCanonicalCandidateHex(value.fileManifestSha256, 64)
+  ) return null;
+  return Object.freeze({
+    repositoryIdentity: value.repositoryIdentity,
+    worktreeIdentity: value.worktreeIdentity,
+    branchName: value.branchName,
+    beforeHeadCommit: value.beforeHeadCommit,
+    afterHeadCommit: value.afterHeadCommit,
+    ancestryProofSha256: value.ancestryProofSha256,
+    fullPatchSha256: value.fullPatchSha256,
+    fullPatchByteLength: value.fullPatchByteLength as number,
+    fileManifestSha256: value.fileManifestSha256,
+  });
+}
+
+function isExactOrdinaryRecord<const Keys extends readonly string[]>(
+  value: unknown,
+  expectedKeys: Keys,
+): value is Record<Keys[number], unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    return false;
+  }
+  const keys = Object.keys(value).sort();
+  return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index]);
+}
+
+function isCanonicalCandidateHex(value: unknown, length: number): value is string {
+  return typeof value === "string" && new RegExp(`^[0-9a-f]{${length}}$`).test(value);
+}
+
+function isCandidateBranchName(value: unknown): value is string {
+  return typeof value === "string" &&
+    value.length > 0 &&
+    new TextEncoder().encode(value).byteLength <= 1_024 &&
+    !value.includes("\0") &&
+    !value.includes("\r") &&
+    !value.includes("\n");
+}
+
+export interface PublishPreparedCandidateDeliveryCommitInput {
+  projectRoot: string;
+  worktreePath: string;
+  preparation: CandidateDeliveryCommitPreparation;
 }
 
 export interface ManagedWorktreeCreateInput {
