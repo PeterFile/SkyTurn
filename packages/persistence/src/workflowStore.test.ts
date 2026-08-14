@@ -12,8 +12,10 @@ import {
   type WorkflowCardToolCall,
 } from "./workflowStore.js";
 import {
+  canonicalCandidateReviewRequestJson,
   canonicalWorkflowCandidateManifestJson,
   createWorkflowGitAncestryProofContext,
+  type CandidateReviewRequest,
   type RunEvent,
   type RunEvidence,
   type WorkflowGitAncestryProofContext,
@@ -101,15 +103,169 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("persists one strict allowed candidate review attestation across two reopens without projection authority", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const projectionBefore = store.materializeFlowProjection(fixture.identity.sessionId);
+    const ledgerBefore = store.buildLedgerSummary(fixture.identity.sessionId);
+    const event = appendAllowedCandidateReview(store, fixture);
+    const eventBytes = JSON.stringify(event);
+    const eventCount = store.listEvents(fixture.identity.sessionId).length;
+
+    expect(appendAllowedCandidateReview(store, fixture, "2026-08-14T00:00:01.000Z")).toEqual(event);
+    expect(JSON.stringify(appendAllowedCandidateReview(
+      store,
+      fixture,
+      "2026-08-14T00:00:02.000Z",
+    ))).toBe(eventBytes);
+    expect(store.listEvents(fixture.identity.sessionId)).toHaveLength(eventCount);
+    expect(getAllowedCandidateReview(store, fixture)).toEqual(fixture.decision);
+    expect(event).toMatchObject({
+      kind: "workflow.candidate.review_allowed",
+      source: "workflow_store",
+      laneId: fixture.identity.laneId,
+      segmentId: fixture.identity.segmentId,
+      idempotencyKey: `candidate-review-allowed:${fixture.identity.runId}`,
+      payload: {
+        sessionId: fixture.identity.sessionId,
+        nodeId: fixture.identity.nodeId,
+        laneId: fixture.identity.laneId,
+        segmentId: fixture.identity.segmentId,
+        runId: fixture.identity.runId,
+        manifestSha256: fixture.manifestSha256,
+        decision: fixture.decision,
+      },
+    });
+    expect(store.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
+    expect(store.buildLedgerSummary(fixture.identity.sessionId)).toEqual(ledgerBefore);
+    expect(JSON.stringify(event)).not.toMatch(
+      /worktreePath|patch|files|reviewRequest|prompt|credential|subject|body|output/,
+    );
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(getAllowedCandidateReview(reopened, fixture)).toEqual(fixture.decision);
+    expect(reopened.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
+    reopened.close();
+
+    const reopenedAgain = createWorkflowStore({ projectRoot });
+    expect(getAllowedCandidateReview(reopenedAgain, fixture)).toEqual(fixture.decision);
+    expect(reopenedAgain.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
+    reopenedAgain.close();
+  });
+
+  it("opens an old store without an attestation and returns no review authority", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(getAllowedCandidateReview(reopened, fixture)).toBeNull();
+    reopened.close();
+  });
+
+  it("opens an old prepared publication without attestation but refuses to return publication authority", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const databasePath = store.databasePath;
+    store.close();
+    insertPreAttestationPreparedPublicationRow(databasePath, fixture);
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(() => reopened.getPreparedCandidatePublication(fixture.lookup)).toThrow(/review|attestation/i);
+    expect(getAllowedCandidateReview(reopened, fixture)).toBeNull();
+    reopened.close();
+  });
+
+  it("refuses a prepared publication when the allow attestation was appended afterward", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const databasePath = store.databasePath;
+    store.close();
+    insertPreAttestationPreparedPublicationRow(databasePath, fixture);
+
+    const reopened = createWorkflowStore({ projectRoot });
+    appendAllowedCandidateReview(reopened, fixture, "2026-08-14T00:00:01.000Z");
+    expect(() => reopened.getPreparedCandidatePublication(fixture.lookup)).toThrow(/review|attestation|order/i);
+    reopened.close();
+
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(/review|attestation|prepared|digest/i);
+  });
+
+  it("rejects conflicting allowed review replay without writing", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    appendAllowedCandidateReview(store, fixture);
+    const events = store.listEvents(fixture.identity.sessionId);
+
+    expect(() => appendAllowedCandidateReview(store, {
+      ...fixture,
+      decision: { ...fixture.decision, requestSha256: "c".repeat(64) },
+    })).toThrow(/review|attestation|conflict/i);
+    expect(store.listEvents(fixture.identity.sessionId)).toEqual(events);
+    store.close();
+  });
+
+  it.each([
+    ["a forged manifest digest", (row: RawWorkflowEventRow) => {
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      payload.manifestSha256 = "9".repeat(64);
+      row.payload_json = stableTestJson(payload);
+    }],
+    ["a forged request digest", (row: RawWorkflowEventRow) => {
+      const payload = JSON.parse(row.payload_json) as { decision: Record<string, unknown> };
+      payload.decision.requestSha256 = "A".repeat(64);
+      row.payload_json = stableTestJson(payload);
+    }],
+    ["a blocked disposition", (row: RawWorkflowEventRow) => {
+      const payload = JSON.parse(row.payload_json) as { decision: Record<string, unknown> };
+      payload.decision.disposition = "block";
+      row.payload_json = stableTestJson(payload);
+    }],
+    ["an extra payload field", (row: RawWorkflowEventRow) => {
+      const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+      payload.prompt = "untrusted";
+      row.payload_json = stableTestJson(payload);
+    }],
+    ["a forged outer lane", (row: RawWorkflowEventRow) => {
+      row.lane_id = "lane-forged";
+    }],
+    ["a forged idempotency key", (row: RawWorkflowEventRow) => {
+      row.idempotency_key = "candidate-review-allowed:run-forged";
+    }],
+    ["noncanonical payload bytes", (row: RawWorkflowEventRow) => {
+      row.payload_json = `${row.payload_json} `;
+    }],
+    ["malformed payload JSON", (row: RawWorkflowEventRow) => {
+      row.payload_json = "{";
+    }],
+  ])("fails store reopen closed for an allowed review attestation with %s", async (_label, mutate) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const fixture = preparedPublicationFixture(store, projectRoot);
+    const event = appendAllowedCandidateReview(store, fixture) as { id: string };
+    const databasePath = store.databasePath;
+    store.close();
+
+    mutateRawWorkflowEvent(databasePath, event.id, mutate);
+    expect(() => createWorkflowStore({ projectRoot })).toThrow(/review|attestation|candidate|JSON/i);
+  });
+
   it("persists only manifest-bound prepared publication input across reopen without projecting it", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
     const fixture = preparedPublicationFixture(store, projectRoot);
     const projectionBefore = store.materializeFlowProjection(fixture.identity.sessionId);
     const ledgerBefore = store.buildLedgerSummary(fixture.identity.sessionId);
+    appendAllowedCandidateReview(store, fixture);
     const api = store as unknown as {
       appendPreparedCandidatePublication(input: typeof fixture.input): unknown;
-      getPreparedCandidatePublication(input: Omit<typeof fixture.input, "now" | "preparation">): unknown;
+      getPreparedCandidatePublication(input: typeof fixture.lookup): unknown;
     };
     expect(typeof api.appendPreparedCandidatePublication).toBe("function");
     expect(typeof api.getPreparedCandidatePublication).toBe("function");
@@ -147,12 +303,18 @@ describe("SQLite workflow store", () => {
         segmentId: fixture.identity.segmentId,
         manifestSha256: fixture.manifestSha256,
         requestSha256: fixture.input.requestSha256,
+        reviewRequestSha256: fixture.reviewRequestSha256,
         preparation: fixture.preparation,
       },
     });
+    const independentReviewRequestSha256 = createHash("sha256")
+      .update(canonicalCandidateReviewRequestJson(fixture.reviewRequest), "utf8")
+      .digest("hex");
+    expect(fixture.decision.requestSha256).toBe(independentReviewRequestSha256);
+    expect(event.payload.reviewRequestSha256).toBe(independentReviewRequestSha256);
     expect(store.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
     expect(store.buildLedgerSummary(fixture.identity.sessionId)).toEqual(ledgerBefore);
-    expect(JSON.stringify(event)).not.toMatch(/worktreePath|patchPreview|reviewRequest|credential|subject|body/);
+    expect(JSON.stringify(event)).not.toMatch(/worktreePath|fullPatchBase64|patchPreview|credential|subject|body/);
     store.close();
 
     const reopened = createWorkflowStore({ projectRoot });
@@ -163,7 +325,38 @@ describe("SQLite workflow store", () => {
     expect(reopened.materializeFlowProjection(fixture.identity.sessionId)).toEqual(projectionBefore);
     expect(reopened.buildLedgerSummary(fixture.identity.sessionId)).toEqual(ledgerBefore);
     reopened.close();
+
+    const reopenedAgain = createWorkflowStore({ projectRoot });
+    expect(reopenedAgain.getPreparedCandidatePublication(fixture.lookup)).toEqual(fixture.preparation);
+    reopenedAgain.close();
   });
+
+  it.each(["attestation", "prepared publication"])(
+    "fails getter and reopen when the %s has a different legal review request digest",
+    async (corruptedSide) => {
+      const projectRoot = await makeTempRoot();
+      const store = createWorkflowStore({ projectRoot });
+      const fixture = preparedPublicationFixture(store, projectRoot);
+      const attestation = appendAllowedCandidateReview(store, fixture) as { id: string };
+      const prepared = store.appendPreparedCandidatePublication(fixture.input);
+      const targetId = corruptedSide === "attestation" ? attestation.id : prepared.id;
+
+      mutateRawWorkflowEvent(store.databasePath, targetId, (row) => {
+        const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+        if (corruptedSide === "attestation") {
+          (payload.decision as Record<string, unknown>).requestSha256 = fixture.otherReviewRequestSha256;
+        } else {
+          payload.reviewRequestSha256 = fixture.otherReviewRequestSha256;
+        }
+        row.payload_json = stableTestJson(payload);
+      });
+
+      expect(fixture.otherReviewRequestSha256).not.toBe(fixture.reviewRequestSha256);
+      expect(() => store.getPreparedCandidatePublication(fixture.lookup)).toThrow(/review|attestation|prepared|digest/i);
+      store.close();
+      expect(() => createWorkflowStore({ projectRoot })).toThrow(/review|attestation|prepared|digest/i);
+    },
+  );
 
   it("quarantines exact v8 prepared publications before strict validation and permits a fresh strict preparation", async () => {
     const projectRoot = await makeTempRoot();
@@ -216,6 +409,7 @@ describe("SQLite workflow store", () => {
     }));
     for (const value of legacyLogicalValues) expect(JSON.stringify(quarantinedRow)).not.toContain(value);
 
+    appendAllowedCandidateReview(reopened, fixture);
     const fresh = reopened.appendPreparedCandidatePublication(fixture.input);
     expect(fresh.idempotencyKey).toBe(
       `delivery-commit-prepared:${fixture.publicationLaneId}:${fixture.identity.segmentId}`,
@@ -2732,6 +2926,24 @@ describe("SQLite workflow store", () => {
         preparation: {},
       },
     },
+    {
+      kind: "workflow.candidate.review_allowed",
+      idempotencyKey: "candidate-review-allowed:run-forged",
+      payload: {
+        sessionId: "session-1",
+        nodeId: "node-forged",
+        laneId: "lane-forged",
+        segmentId: "segment-forged",
+        runId: "run-forged",
+        manifestSha256: "a".repeat(64),
+        decision: {
+          version: 1,
+          requestSha256: "b".repeat(64),
+          manifestSha256: "a".repeat(64),
+          disposition: "allow",
+        },
+      },
+    },
   ])("rejects generic $kind forgery before idempotency", async ({ kind, idempotencyKey, payload }) => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
@@ -2761,11 +2973,16 @@ describe("SQLite workflow store", () => {
       store.close();
       return;
     }
+    appendAllowedCandidateReview(store, fixture);
     api.appendPreparedCandidatePublication(fixture.input);
     const events = store.listEvents(fixture.identity.sessionId);
+    const { reviewRequestSha256: _reviewRequestSha256, ...missingReviewRequestSha256 } = fixture.input;
 
     for (const invalid of [
       { ...fixture.input, requestSha256: "c".repeat(64) },
+      { ...fixture.input, reviewRequestSha256: fixture.otherReviewRequestSha256 },
+      { ...fixture.input, reviewRequestSha256: "A".repeat(64) },
+      missingReviewRequestSha256,
       { ...fixture.input, candidateLaneId: fixture.publicationLaneId },
       { ...fixture.input, candidateLaneId: " lane-implementation" },
       { ...fixture.input, manifestSha256: "A".repeat(64) },
@@ -2802,6 +3019,9 @@ describe("SQLite workflow store", () => {
     ["a forged manifest digest", (payload: Record<string, unknown>) => {
       payload.manifestSha256 = "9".repeat(64);
     }],
+    ["a malformed review request digest", (payload: Record<string, unknown>) => {
+      payload.reviewRequestSha256 = "A".repeat(64);
+    }],
     ["a malformed preparation SHA", (payload: Record<string, unknown>) => {
       (payload.preparation as Record<string, unknown>).commitSha = "A".repeat(40);
     }],
@@ -2820,6 +3040,7 @@ describe("SQLite workflow store", () => {
       store.close();
       return;
     }
+    appendAllowedCandidateReview(store, fixture);
     const event = api.appendPreparedCandidatePublication(fixture.input) as { id: string };
     store.close();
 
@@ -10292,6 +10513,45 @@ function preparedPublicationFixture(store: TestWorkflowStore, projectRoot: strin
     parentCommit: expected.afterHeadCommit,
     expected,
   };
+  const reviewPatch = Buffer.alloc(manifest.fullPatchByteLength, 0x61);
+  const reviewRequest: CandidateReviewRequest = {
+    version: 1,
+    manifestSha256,
+    identity: {
+      sessionId: manifest.sessionId,
+      nodeId: manifest.nodeId,
+      laneId: manifest.laneId,
+      segmentId: manifest.segmentId,
+      runId: manifest.runId,
+    },
+    candidate: {
+      repositoryIdentity: manifest.repositoryIdentity,
+      worktreeIdentity: manifest.worktreeIdentity,
+      branchName: manifest.branchName,
+      beforeHeadCommit: manifest.beforeHeadCommit,
+      afterHeadCommit: manifest.afterHeadCommit,
+      ancestryProofSha256: manifest.ancestryProofSha256,
+      fileManifestSha256: manifest.fileManifestSha256,
+    },
+    patch: {
+      encoding: "base64",
+      sha256: manifest.fullPatchSha256,
+      byteLength: reviewPatch.byteLength,
+      base64: reviewPatch.toString("base64"),
+    },
+  };
+  const reviewRequestSha256 = createHash("sha256")
+    .update(canonicalCandidateReviewRequestJson(reviewRequest), "utf8")
+    .digest("hex");
+  const otherReviewRequestSha256 = createHash("sha256")
+    .update(canonicalCandidateReviewRequestJson({
+      ...reviewRequest,
+      patch: {
+        ...reviewRequest.patch,
+        base64: Buffer.alloc(reviewPatch.byteLength, 0x62).toString("base64"),
+      },
+    }), "utf8")
+    .digest("hex");
   const lookup = {
     ...identity,
     laneId: publicationLaneId,
@@ -10299,19 +10559,130 @@ function preparedPublicationFixture(store: TestWorkflowStore, projectRoot: strin
     manifestSha256,
     requestSha256: "b".repeat(64),
   };
+  const decision = {
+    version: 1 as const,
+    requestSha256: reviewRequestSha256,
+    manifestSha256,
+    disposition: "allow" as const,
+  };
   return {
     identity,
     publicationLaneId,
     manifest,
     manifestSha256,
+    reviewRequest,
+    reviewRequestSha256,
+    otherReviewRequestSha256,
+    decision,
     preparation,
     lookup,
     input: {
       ...lookup,
+      reviewRequestSha256,
       preparation,
       now: "2026-08-14T00:00:00.000Z",
     },
   };
+}
+
+function appendAllowedCandidateReview(
+  store: TestWorkflowStore,
+  fixture: ReturnType<typeof preparedPublicationFixture>,
+  now = "2026-08-13T23:59:59.000Z",
+): unknown {
+  const api = store as unknown as {
+    appendCandidateReviewAllowed(input: unknown): unknown;
+  };
+  return api.appendCandidateReviewAllowed({
+    ...fixture.identity,
+    manifestSha256: fixture.manifestSha256,
+    decision: fixture.decision,
+    now,
+  });
+}
+
+function getAllowedCandidateReview(
+  store: TestWorkflowStore,
+  fixture: ReturnType<typeof preparedPublicationFixture>,
+): unknown {
+  const api = store as unknown as {
+    getCandidateReviewAllowed(input: unknown): unknown;
+  };
+  return api.getCandidateReviewAllowed({
+    ...fixture.identity,
+    manifestSha256: fixture.manifestSha256,
+  });
+}
+
+function insertPreAttestationPreparedPublicationRow(
+  databasePath: string,
+  fixture: ReturnType<typeof preparedPublicationFixture>,
+): void {
+  const db = new Database(databasePath);
+  const seq = Number((db.prepare("SELECT MAX(seq) AS seq FROM workflow_events WHERE session_id = ?")
+    .get(fixture.identity.sessionId) as { seq: number | null }).seq ?? 0) + 1;
+  const id = `${fixture.identity.sessionId}:event:${String(seq).padStart(8, "0")}`;
+  const idempotencyKey = `delivery-commit-prepared:${fixture.publicationLaneId}:${fixture.identity.segmentId}`;
+  const payload = stableTestJson({
+    laneId: fixture.publicationLaneId,
+    candidateLaneId: fixture.identity.laneId,
+    nodeId: fixture.identity.nodeId,
+    segmentId: fixture.identity.segmentId,
+    runId: fixture.identity.runId,
+    manifestSha256: fixture.manifestSha256,
+    requestSha256: fixture.input.requestSha256,
+    preparation: fixture.preparation,
+  });
+  db.prepare([
+    "INSERT INTO workflow_events(",
+    "id, session_id, seq, kind, source, lane_id, segment_id, causation_id, correlation_id,",
+    "idempotency_key, payload_json, created_at, legacy_evidence_compatibility",
+    ") VALUES (?, ?, ?, 'workflow.commit.publication_prepared', 'workflow_store', ?, ?, NULL, NULL, ?, ?, ?, 0)",
+  ].join(" ")).run(
+    id,
+    fixture.identity.sessionId,
+    seq,
+    fixture.publicationLaneId,
+    fixture.identity.segmentId,
+    idempotencyKey,
+    payload,
+    "2026-08-14T00:00:00.000Z",
+  );
+  db.close();
+}
+
+interface RawWorkflowEventRow {
+  id: string;
+  session_id: string;
+  seq: number;
+  kind: string;
+  source: string;
+  lane_id: string | null;
+  segment_id: string | null;
+  causation_id: string | null;
+  correlation_id: string | null;
+  idempotency_key: string | null;
+  payload_json: string;
+  created_at: string;
+  legacy_evidence_compatibility: number;
+}
+
+function mutateRawWorkflowEvent(
+  databasePath: string,
+  eventId: string,
+  mutate: (row: RawWorkflowEventRow) => void,
+): void {
+  const db = new Database(databasePath);
+  const row = db.prepare("SELECT * FROM workflow_events WHERE id = ?").get(eventId) as RawWorkflowEventRow;
+  mutate(row);
+  db.prepare([
+    "UPDATE workflow_events SET session_id = @session_id, seq = @seq, kind = @kind, source = @source,",
+    "lane_id = @lane_id, segment_id = @segment_id, causation_id = @causation_id,",
+    "correlation_id = @correlation_id, idempotency_key = @idempotency_key,",
+    "payload_json = @payload_json, created_at = @created_at,",
+    "legacy_evidence_compatibility = @legacy_evidence_compatibility WHERE id = @id",
+  ].join(" ")).run(row);
+  db.close();
 }
 
 function insertBaselinePreparedPublicationRow(

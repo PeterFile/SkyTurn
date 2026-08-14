@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -246,6 +247,7 @@ test("Electron main tracks every top-level workflow store operation, not only wo
   );
   assert.match(workflowEventsHandler, /redactWorkflowEventForRenderer/);
   assert.match(workflowEventsHandler, /event\.kind\s*!==\s*"workflow\.commit\.publication_prepared"/);
+  assert.match(workflowEventsHandler, /event\.kind\s*!==\s*"workflow\.candidate\.review_allowed"/);
   assert.doesNotMatch(workflowEventsHandler, /events:\s*store\.listEvents\(sessionId\)\.filter/);
 
   const projectionHandler = main.slice(
@@ -990,25 +992,28 @@ test("workflow delivery commit reviews one store manifest before exact candidate
   const manifestLookup = deliveryCommitHandler.slice(manifestIndex, deliveryCommitHandler.indexOf(");", manifestIndex) + 2);
   assert.doesNotMatch(manifestLookup, /agentKind/);
   assert.match(deliveryCommitHandler, /expected:\s*candidateCommitExpectationFromManifest\(context\.manifest\)/);
-  assert.match(deliveryCommitHandler, /reviewCandidateWithHermes\(\{ request: reviewRequest \}\)/);
+  assert.match(deliveryCommitHandler, /const decision = await reviewCandidateWithHermes\(\{ request: reviewRequest \}\)/);
+  assert.match(deliveryCommitHandler, /return decision/);
   assert.match(deliveryCommitHandler, /segmentId:\s*context\.manifest\.segmentId/);
   assert.doesNotMatch(deliveryCommitHandler, /createDeliveryCommit\s*\(/);
   assert.doesNotMatch(deliveryCommitHandler, /deliveryFilesFromInput|deliveryReconciliationStatus|acceptMismatch/);
   assert.doesNotMatch(deliveryCommitHandler, /readField\(input,\s*"(?:manifest|runId|digest|files|reconciliationStatus|acceptMismatch)"\)/);
 });
 
-test("candidate review material remains ephemeral and candidate commit evidence stays honest", async () => {
+test("candidate review request material remains ephemeral while compact allow attestation stays backend-only", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
   const deliveryCommitHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:delivery:commit"'),
     main.indexOf('ipcMain.handle("workflow:delivery:push"'),
   );
   const publicationHelpers = main.slice(
-    main.indexOf("function candidateCommitPreparedIntentPayload"),
+    main.indexOf("function candidateReviewAllowedIdentity"),
     main.indexOf("function requireWorkflowDeliveryCandidateManifest"),
   );
 
-  assert.doesNotMatch(publicationHelpers, /reviewRequest|decision|fullPatch|fileManifest|files/);
+  assert.doesNotMatch(publicationHelpers, /fullPatch|fileManifest|files|prompt|subject|body|worktreePath/);
+  assert.match(publicationHelpers, /store\.getCandidateReviewAllowed\(/);
+  assert.match(publicationHelpers, /store\.appendCandidateReviewAllowed\(/);
   assert.match(publicationHelpers, /store\.getPreparedCandidatePublication\(/);
   assert.match(publicationHelpers, /store\.appendPreparedCandidatePublication\(/);
   assert.match(publicationHelpers, /candidateLaneId:\s*input\.candidateLaneId/);
@@ -1018,6 +1023,118 @@ test("candidate review material remains ephemeral and candidate commit evidence 
   assert.match(publicationHelpers, /const payload = \{[\s\S]*laneId:\s*input\.laneId,[\s\S]*segmentId:\s*input\.segmentId,[\s\S]*evidence,[\s\S]*\}/);
   assert.doesNotMatch(deliveryCommitHandler, /stagedFiles|worktreePath:\s*evidence\.worktreePath/);
   assert.match(deliveryCommitHandler, /candidateLaneId:\s*context\.manifest\.laneId/);
+});
+
+test("candidate commit captures the real allow decision and persists it before prepare or CAS", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness();
+
+  await runtime.publishCandidateDeliveryCommitWithRecovery(harness.input);
+
+  const attestation = harness.events.find((event) => event.kind === "workflow.candidate.review_allowed");
+  const prepared = harness.events.find((event) => event.kind === "workflow.commit.publication_prepared");
+  const independentReviewRequestSha256 = createHash("sha256")
+    .update(JSON.stringify(harness.reviewRequest), "utf8")
+    .digest("hex");
+  assert.deepEqual(attestation.payload.decision, harness.decision);
+  assert.equal(attestation.payload.decision.requestSha256, independentReviewRequestSha256);
+  assert.equal(prepared.payload.reviewRequestSha256, independentReviewRequestSha256);
+  assert.equal(attestation.laneId, harness.input.candidateLaneId);
+  assert.equal(attestation.segmentId, harness.input.segmentId);
+  assert.ok(harness.callOrder.indexOf("review") < harness.callOrder.indexOf("attest"));
+  assert.ok(harness.callOrder.indexOf("attest") < harness.callOrder.indexOf("prepare"));
+  assert.ok(harness.callOrder.indexOf("prepare") < harness.callOrder.indexOf("prepared"));
+  assert.ok(harness.callOrder.indexOf("prepared") < harness.callOrder.indexOf("publish"));
+  assert.equal(harness.calls.review, 1);
+  assert.equal(harness.calls.attest, 1);
+});
+
+test("candidate review attestation append failure blocks prepare and CAS", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness({ failAttestationAppends: 1 });
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(harness.input),
+    /publication.*retry|retry.*publication/i,
+  );
+
+  assert.equal(harness.calls.capture, 1);
+  assert.equal(harness.calls.review, 1);
+  assert.equal(harness.calls.prepare, 0);
+  assert.equal(harness.calls.publish, 0);
+  assert.equal(harness.calls.cas, 0);
+  assert.equal(harness.events.length, 0);
+});
+
+test("candidate commit retries a crash after attestation without a second Hermes review", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness({ failPrepares: 1 });
+
+  await assert.rejects(runtime.publishCandidateDeliveryCommitWithRecovery(harness.input));
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.candidate.review_allowed").length, 1);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.publication_prepared").length, 0);
+
+  const result = await runtime.publishCandidateDeliveryCommitWithRecovery(harness.input);
+  assert.equal(result.status, "committed");
+  assert.equal(harness.calls.capture, 2);
+  assert.equal(harness.calls.review, 1);
+  assert.equal(harness.calls.prepare, 2);
+  assert.equal(harness.calls.cas, 1);
+});
+
+test("candidate commit blocks a prepared publication that has no allow attestation", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness();
+  seedHarnessPreparedPublication(harness);
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(harness.input),
+    /manual repair/i,
+  );
+
+  assert.equal(harness.calls.capture, 0);
+  assert.equal(harness.calls.review, 0);
+  assert.equal(harness.calls.prepare, 0);
+  assert.equal(harness.calls.publish, 0);
+  assert.equal(harness.calls.cas, 0);
+});
+
+test("candidate commit blocks a conflicting request-bound allow attestation", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness();
+  seedHarnessReviewAttestation(harness, {
+    ...harness.decision,
+    requestSha256: "9".repeat(64),
+  });
+
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(harness.input),
+    /manual repair/i,
+  );
+
+  assert.equal(harness.calls.capture, 1);
+  assert.equal(harness.calls.review, 0);
+  assert.equal(harness.calls.prepare, 0);
+  assert.equal(harness.calls.publish, 0);
+});
+
+test("candidate commit recovery rejects legal but different prepared and attested review digests without publish or CAS", async () => {
+  const runtime = await loadCandidateCommitPublicationRuntime();
+  const harness = candidateCommitPublicationHarness();
+  seedHarnessReviewAttestation(harness);
+  seedHarnessPreparedPublication(harness, harness.otherReviewRequestSha256);
+
+  assert.notEqual(harness.reviewRequestSha256, harness.otherReviewRequestSha256);
+  await assert.rejects(
+    runtime.publishCandidateDeliveryCommitWithRecovery(harness.input),
+    /manual repair/i,
+  );
+
+  assert.equal(harness.calls.capture, 0);
+  assert.equal(harness.calls.review, 0);
+  assert.equal(harness.calls.prepare, 0);
+  assert.equal(harness.calls.publish, 0);
+  assert.equal(harness.calls.cas, 0);
 });
 
 test("candidate commit publication never runs CAS when durable prepared-intent persistence fails", async () => {
@@ -1032,7 +1149,8 @@ test("candidate commit publication never runs CAS when durable prepared-intent p
   assert.equal(harness.state.branchHead, harness.preparation.parentCommit);
   assert.equal(harness.calls.prepare, 1);
   assert.equal(harness.calls.publish, 0);
-  assert.equal(harness.events.length, 0);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.candidate.review_allowed").length, 1);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.publication_prepared").length, 0);
 });
 
 test("candidate commit publication recovers CAS success followed by terminal append failure without another review", async () => {
@@ -1077,7 +1195,9 @@ test("duplicate candidate commit IPC publication replays one prepared intent and
 
   assert.deepEqual(toPlain(retry), toPlain(first));
   assert.equal(harness.calls.prepare, 1);
+  assert.equal(harness.calls.review, 1);
   assert.equal(harness.calls.cas, 1);
+  assert.equal(harness.events.filter((event) => event.kind === "workflow.candidate.review_allowed").length, 1);
   assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.publication_prepared").length, 1);
   assert.equal(harness.events.filter((event) => event.kind === "workflow.commit.created").length, 1);
 });
@@ -1094,6 +1214,8 @@ test("candidate commit publication recovers the same prepared identity after sto
   const result = await runtime.publishCandidateDeliveryCommitWithRecovery(reopened.input);
 
   assert.equal(result.status, "committed");
+  assert.equal(reopened.calls.capture, 0);
+  assert.equal(reopened.calls.review, 0);
   assert.equal(reopened.calls.prepare, 0);
   assert.equal(reopened.calls.cas, 0);
   assert.equal(reopened.events.filter((event) => event.kind === "workflow.commit.created").length, 1);
@@ -1278,6 +1400,45 @@ test("legacy publication quarantine audit exposes no renderer authority", async 
   assert.equal("delivery" in projected.payload, false);
   assert.equal("plannerTurn" in projected.payload, false);
   assert.doesNotMatch(JSON.stringify(projected.payload), /prepared-publication|manifest|request|preparation/);
+});
+
+test("candidate review allow attestation is filtered before renderer event details", async () => {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const workflowEventsHandler = main.slice(
+    main.indexOf('ipcMain.handle("workflow:events"'),
+    main.indexOf('ipcMain.handle("workflow:userDecision:answer"'),
+  );
+  assert.match(
+    workflowEventsHandler,
+    /event\.kind\s*!==\s*"workflow\.candidate\.review_allowed"/,
+  );
+
+  const { redactWorkflowEventForRenderer } = await loadMainDeliveryRendererHelpers();
+  const projected = toPlain(redactWorkflowEventForRenderer({
+    id: "event-review-allow",
+    sessionId: "session-1",
+    seq: 8,
+    kind: "workflow.candidate.review_allowed",
+    source: "workflow_store",
+    laneId: "lane-candidate",
+    segmentId: "segment-candidate",
+    causationId: null,
+    correlationId: null,
+    createdAt: "2026-08-14T00:00:00.000Z",
+    payload: {
+      decision: {
+        version: 1,
+        requestSha256: "b".repeat(64),
+        manifestSha256: "a".repeat(64),
+        disposition: "allow",
+      },
+    },
+  }));
+  assert.deepEqual(projected.payload, {
+    redacted: true,
+    summary: "Workflow event recorded.",
+  });
+  assert.doesNotMatch(JSON.stringify(projected.payload), /a{64}|b{64}|disposition|review_allowed/);
 });
 
 test("workflow checks projection preserves only renderer-safe review and mergeability facts", async () => {
@@ -3590,6 +3751,11 @@ async function loadCandidateCommitPublicationRuntime() {
     extractFunction(main, "stableJson"),
     extractFunction(main, "sortJson"),
     extractFunction(main, "candidateCommitPublicationError"),
+    extractFunction(main, "candidateReviewAllowedIdentity"),
+    extractFunction(main, "candidateReviewAllowedPayload"),
+    extractFunction(main, "findCandidateReviewAllowedDecision"),
+    extractFunction(main, "appendCandidateReviewAllowedDecision"),
+    extractFunction(main, "ensureCandidateReviewAllowed"),
     extractFunction(main, "candidateCommitPreparedIntentPayload"),
     extractFunction(main, "findCandidateCommitPreparedIntent"),
     extractFunction(main, "appendCandidateCommitPreparedIntent"),
@@ -3639,13 +3805,119 @@ function candidateCommitPublicationHarness(options = {}) {
   const state = options.state ?? {
     branchHead: options.branchHead ?? preparation.parentCommit,
   };
-  const calls = { prepare: 0, publish: 0, cas: 0, broadcast: 0 };
+  const calls = { capture: 0, review: 0, attest: 0, prepare: 0, publish: 0, cas: 0, broadcast: 0 };
+  const callOrder = [];
+  const reviewPatch = Buffer.alloc(preparation.expected.fullPatchByteLength, 0x61);
+  const reviewRequest = {
+    version: 1,
+    manifestSha256: "a".repeat(64),
+    identity: {
+      sessionId: "session-1",
+      nodeId: "node-candidate",
+      laneId: "lane-candidate-implementation",
+      segmentId: "segment-candidate",
+      runId: "run-candidate",
+    },
+    candidate: {
+      repositoryIdentity: preparation.expected.repositoryIdentity,
+      worktreeIdentity: preparation.expected.worktreeIdentity,
+      branchName: preparation.expected.branchName,
+      beforeHeadCommit: preparation.expected.beforeHeadCommit,
+      afterHeadCommit: preparation.expected.afterHeadCommit,
+      ancestryProofSha256: preparation.expected.ancestryProofSha256,
+      fileManifestSha256: preparation.expected.fileManifestSha256,
+    },
+    patch: {
+      encoding: "base64",
+      sha256: preparation.expected.fullPatchSha256,
+      byteLength: reviewPatch.byteLength,
+      base64: reviewPatch.toString("base64"),
+    },
+  };
+  const reviewRequestSha256 = createHash("sha256")
+    .update(JSON.stringify(reviewRequest), "utf8")
+    .digest("hex");
+  const otherReviewRequestSha256 = createHash("sha256")
+    .update(JSON.stringify({
+      ...reviewRequest,
+      patch: {
+        ...reviewRequest.patch,
+        base64: Buffer.alloc(reviewPatch.byteLength, 0x62).toString("base64"),
+      },
+    }), "utf8")
+    .digest("hex");
+  const decision = {
+    version: 1,
+    requestSha256: reviewRequestSha256,
+    manifestSha256: "a".repeat(64),
+    disposition: "allow",
+  };
+  let failAttestationAppends = options.failAttestationAppends ?? 0;
+  let failPrepares = options.failPrepares ?? 0;
   let failPreparedAppends = options.failPreparedAppends ?? 0;
   let failTerminalAppends = options.failTerminalAppends ?? 0;
   let failBroadcasts = options.failBroadcasts ?? 0;
   const store = {
     listEvents() {
       return events;
+    },
+    getCandidateReviewAllowed(input) {
+      if (
+        input.sessionId !== "session-1" ||
+        input.nodeId !== "node-candidate" ||
+        input.laneId !== "lane-candidate-implementation" ||
+        input.segmentId !== "segment-candidate" ||
+        input.runId !== "run-candidate" ||
+        input.manifestSha256 !== "a".repeat(64)
+      ) throw new Error("candidate review attestation identity conflict");
+      const event = events.find((candidate) =>
+        candidate.kind === "workflow.candidate.review_allowed" &&
+        candidate.idempotencyKey === `candidate-review-allowed:${input.runId}`
+      );
+      if (!event) return null;
+      if (
+        event.laneId !== input.laneId ||
+        event.segmentId !== input.segmentId ||
+        event.payload.sessionId !== input.sessionId ||
+        event.payload.nodeId !== input.nodeId ||
+        event.payload.laneId !== input.laneId ||
+        event.payload.segmentId !== input.segmentId ||
+        event.payload.runId !== input.runId ||
+        event.payload.manifestSha256 !== input.manifestSha256
+      ) throw new Error("candidate review attestation identity conflict");
+      return structuredClone(event.payload.decision);
+    },
+    appendCandidateReviewAllowed(input) {
+      calls.attest += 1;
+      callOrder.push("attest");
+      if (failAttestationAppends > 0) {
+        failAttestationAppends -= 1;
+        throw new Error("candidate review attestation persistence failed");
+      }
+      const idempotencyKey = `candidate-review-allowed:${input.runId}`;
+      const existing = events.find((event) => event.idempotencyKey === idempotencyKey);
+      if (existing) return existing;
+      const event = {
+        id: `event-${events.length + 1}`,
+        sessionId: input.sessionId,
+        kind: "workflow.candidate.review_allowed",
+        source: "workflow_store",
+        laneId: input.laneId,
+        segmentId: input.segmentId,
+        idempotencyKey,
+        payload: {
+          sessionId: input.sessionId,
+          nodeId: input.nodeId,
+          laneId: input.laneId,
+          segmentId: input.segmentId,
+          runId: input.runId,
+          manifestSha256: input.manifestSha256,
+          decision: structuredClone(input.decision),
+        },
+        createdAt: input.now,
+      };
+      events.push(event);
+      return event;
     },
     getPreparedCandidatePublication(input) {
       if (input.laneId !== "lane-commit" || input.candidateLaneId !== "lane-candidate-implementation") {
@@ -3656,10 +3928,29 @@ function candidateCommitPublicationHarness(options = {}) {
         candidate.idempotencyKey === `delivery-commit-prepared:${input.laneId}:${input.segmentId}`
       );
       if (!event) return null;
+      const decision = store.getCandidateReviewAllowed({
+        sessionId: input.sessionId,
+        nodeId: input.nodeId,
+        laneId: input.candidateLaneId,
+        segmentId: input.segmentId,
+        runId: input.runId,
+        manifestSha256: input.manifestSha256,
+      });
+      if (!events.some((candidate) => candidate.kind === "workflow.candidate.review_allowed")) {
+        throw new Error("prepared publication has no candidate review attestation");
+      }
+      const preparedIndex = events.indexOf(event);
+      const attestationIndex = events.findIndex((candidate) =>
+        candidate.kind === "workflow.candidate.review_allowed" &&
+        candidate.idempotencyKey === `candidate-review-allowed:${input.runId}`
+      );
       if (
+        attestationIndex < 0 ||
+        attestationIndex >= preparedIndex ||
         event.payload.candidateLaneId !== input.candidateLaneId ||
         event.payload.manifestSha256 !== input.manifestSha256 ||
-        event.payload.requestSha256 !== input.requestSha256
+        event.payload.requestSha256 !== input.requestSha256 ||
+        event.payload.reviewRequestSha256 !== decision.requestSha256
       ) throw new Error("prepared publication identity conflict");
       return structuredClone(event.payload.preparation);
     },
@@ -3671,6 +3962,18 @@ function candidateCommitPublicationHarness(options = {}) {
         failPreparedAppends -= 1;
         throw new Error("prepared intent persistence failed");
       }
+      const decision = store.getCandidateReviewAllowed({
+        sessionId: input.sessionId,
+        nodeId: input.nodeId,
+        laneId: input.candidateLaneId,
+        segmentId: input.segmentId,
+        runId: input.runId,
+        manifestSha256: input.manifestSha256,
+      });
+      if (
+        !/^[0-9a-f]{64}$/.test(input.reviewRequestSha256) ||
+        input.reviewRequestSha256 !== decision.requestSha256
+      ) throw new Error("prepared publication review digest conflict");
       const idempotencyKey = `delivery-commit-prepared:${input.laneId}:${input.segmentId}`;
       const existing = events.find((event) => event.idempotencyKey === idempotencyKey);
       if (existing) return existing;
@@ -3688,11 +3991,13 @@ function candidateCommitPublicationHarness(options = {}) {
           runId: input.runId,
           manifestSha256: input.manifestSha256,
           requestSha256: input.requestSha256,
+          reviewRequestSha256: input.reviewRequestSha256,
           preparation: structuredClone(input.preparation),
         },
         createdAt: input.now,
       };
       events.push(event);
+      callOrder.push("prepared");
       return event;
     },
     appendWorkflowEvent(input) {
@@ -3724,12 +4029,43 @@ function candidateCommitPublicationHarness(options = {}) {
     requestSha256: "b".repeat(64),
     expected: structuredClone(preparation.expected),
     parsePreparation: parseCandidateCommitPreparation,
+    parseReviewDecision(value) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      if (Object.keys(value).sort().join(",") !== "disposition,manifestSha256,requestSha256,version") return null;
+      if (
+        value.version !== 1 ||
+        !/^[0-9a-f]{64}$/.test(value.requestSha256) ||
+        !/^[0-9a-f]{64}$/.test(value.manifestSha256) ||
+        (value.disposition !== "allow" && value.disposition !== "block")
+      ) return null;
+      return structuredClone(value);
+    },
+    async captureReviewRequest() {
+      calls.capture += 1;
+      callOrder.push("capture");
+      return {
+        request: structuredClone(reviewRequest),
+        requestSha256: reviewRequestSha256,
+      };
+    },
+    async review(request) {
+      calls.review += 1;
+      callOrder.push("review");
+      assert.deepEqual(request, reviewRequest);
+      return structuredClone(decision);
+    },
     async prepare() {
       calls.prepare += 1;
+      callOrder.push("prepare");
+      if (failPrepares > 0) {
+        failPrepares -= 1;
+        throw new Error("injected crash after review attestation");
+      }
       return structuredClone(preparation);
     },
     async publish(candidate) {
       calls.publish += 1;
+      callOrder.push("publish");
       assert.deepEqual(candidate, preparation);
       if (state.branchHead === preparation.commitSha) {
         return {
@@ -3758,7 +4094,65 @@ function candidateCommitPublicationHarness(options = {}) {
     },
     now: () => "2026-08-14T00:00:00.000Z",
   };
-  return { calls, events, input, preparation, state, store };
+  return {
+    callOrder,
+    calls,
+    decision,
+    events,
+    input,
+    otherReviewRequestSha256,
+    preparation,
+    reviewRequest,
+    reviewRequestSha256,
+    state,
+    store,
+  };
+}
+
+function seedHarnessReviewAttestation(harness, decision = harness.decision) {
+  harness.events.push({
+    id: `event-${harness.events.length + 1}`,
+    sessionId: harness.input.sessionId,
+    kind: "workflow.candidate.review_allowed",
+    source: "workflow_store",
+    laneId: harness.input.candidateLaneId,
+    segmentId: harness.input.segmentId,
+    idempotencyKey: `candidate-review-allowed:${harness.input.runId}`,
+    payload: {
+      sessionId: harness.input.sessionId,
+      nodeId: harness.input.nodeId,
+      laneId: harness.input.candidateLaneId,
+      segmentId: harness.input.segmentId,
+      runId: harness.input.runId,
+      manifestSha256: harness.input.manifestSha256,
+      decision: structuredClone(decision),
+    },
+    createdAt: "2026-08-14T00:00:00.000Z",
+  });
+}
+
+function seedHarnessPreparedPublication(harness, reviewRequestSha256 = harness.reviewRequestSha256) {
+  harness.events.push({
+    id: `event-${harness.events.length + 1}`,
+    sessionId: harness.input.sessionId,
+    kind: "workflow.commit.publication_prepared",
+    source: "workflow_store",
+    laneId: harness.input.laneId,
+    segmentId: harness.input.segmentId,
+    idempotencyKey: `delivery-commit-prepared:${harness.input.laneId}:${harness.input.segmentId}`,
+    payload: {
+      laneId: harness.input.laneId,
+      candidateLaneId: harness.input.candidateLaneId,
+      nodeId: harness.input.nodeId,
+      segmentId: harness.input.segmentId,
+      runId: harness.input.runId,
+      manifestSha256: harness.input.manifestSha256,
+      requestSha256: harness.input.requestSha256,
+      reviewRequestSha256,
+      preparation: structuredClone(harness.preparation),
+    },
+    createdAt: "2026-08-14T00:00:00.000Z",
+  });
 }
 
 function parseCandidateCommitPreparation(value) {

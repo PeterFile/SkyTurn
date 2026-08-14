@@ -9,6 +9,7 @@ import {
   expectedArtifactContractForRequiredEvidence,
   isSuccessfulRunEvidence,
   normalizeSessionTarget,
+  parseCandidateReviewDecision,
   parseChangesetEvidence,
   parseRunEvent,
   parseRunEvidence,
@@ -25,6 +26,7 @@ import {
 } from "@skyturn/git-worktree";
 import type {
   AgentKind,
+  CandidateReviewDecision,
   CanvasNode,
   CanvasSession,
   ChangesetEvidence,
@@ -109,6 +111,7 @@ export type WorkflowInternalEventKind =
   | "workflow.plan_finish.launch_accepted"
   | "workflow.planner_intent.reconciled"
   | "workflow.candidate.manifest_recorded"
+  | "workflow.candidate.review_allowed"
   | "workflow.commit.publication_prepared";
 
 export type WorkflowEventKind =
@@ -529,6 +532,15 @@ export interface FreezeWorkflowCandidateManifestInput extends WorkflowCandidateM
   now: string;
 }
 
+export interface CandidateReviewAllowedIdentity extends WorkflowCandidateManifestIdentity {
+  manifestSha256: string;
+}
+
+export interface AppendCandidateReviewAllowedInput extends CandidateReviewAllowedIdentity {
+  decision: CandidateReviewDecision;
+  now: string;
+}
+
 export interface PreparedCandidatePublicationIdentity {
   sessionId: string;
   nodeId: string;
@@ -541,6 +553,7 @@ export interface PreparedCandidatePublicationIdentity {
 }
 
 export interface AppendPreparedCandidatePublicationInput extends PreparedCandidatePublicationIdentity {
+  reviewRequestSha256: string;
   preparation: CandidateDeliveryCommitPreparation;
   now: string;
 }
@@ -872,6 +885,7 @@ export class WorkflowStore {
       }
       this.statements = prepareStatements(this.db);
       this.validatePersistedCandidateManifests();
+      this.validatePersistedCandidateReviewAttestations();
       this.validatePersistedPreparedCandidatePublications();
     } catch (error) {
       this.db.close();
@@ -1017,6 +1031,9 @@ export class WorkflowStore {
     }
     if (input.kind === "workflow.commit.publication_prepared") {
       throw new Error("Workflow candidate publication preparation is internal and cannot be forged through generic append.");
+    }
+    if (input.kind === "workflow.candidate.review_allowed") {
+      throw new Error("Workflow candidate review attestation is internal and cannot be forged through generic append.");
     }
     assertGenericCheckpointEventHasNoRestrictedFields(input);
     const laneId = laneIdFromPayload(input.payload);
@@ -2192,6 +2209,46 @@ export class WorkflowStore {
     return event ? this.validateCandidateManifestEvent(event, normalized) : null;
   }
 
+  appendCandidateReviewAllowed(input: AppendCandidateReviewAllowedInput): WorkflowEventRecord {
+    const normalized = normalizeCandidateReviewAllowedInput(input);
+    const idempotencyKey = candidateReviewAllowedIdempotencyKey(normalized.runId);
+    const payload = candidateReviewAllowedPayload(normalized);
+    const tx = this.db.transaction(() => {
+      this.assertCandidateReviewAllowedMatchesManifest(normalized);
+      const existing = this.statements.getEventByIdempotencyKey.get(
+        normalized.sessionId,
+        idempotencyKey,
+      ) as EventRow | undefined;
+      if (existing) {
+        this.validateCandidateReviewAllowedRow(existing, normalized);
+        if (existing.payload_json !== stableJson(payload)) {
+          throw new Error("Candidate review attestation conflicts with existing durable input.");
+        }
+        return mapEvent(existing);
+      }
+      return this.insertEventInTransaction({
+        sessionId: normalized.sessionId,
+        kind: "workflow.candidate.review_allowed",
+        source: "workflow_store",
+        laneId: normalized.laneId,
+        segmentId: normalized.segmentId,
+        idempotencyKey,
+        payload,
+        now: normalized.now,
+      });
+    });
+    return tx.immediate();
+  }
+
+  getCandidateReviewAllowed(identity: CandidateReviewAllowedIdentity): CandidateReviewDecision | null {
+    const normalized = normalizeCandidateReviewAllowedIdentity(identity);
+    const row = this.statements.getEventByIdempotencyKey.get(
+      normalized.sessionId,
+      candidateReviewAllowedIdempotencyKey(normalized.runId),
+    ) as EventRow | undefined;
+    return row ? this.validateCandidateReviewAllowedRow(row, normalized) : null;
+  }
+
   appendPreparedCandidatePublication(input: AppendPreparedCandidatePublicationInput): WorkflowEventRecord {
     const normalized = normalizePreparedCandidatePublicationInput(input);
     const idempotencyKey = preparedCandidatePublicationIdempotencyKey(
@@ -2200,9 +2257,14 @@ export class WorkflowStore {
     );
     const payload = preparedCandidatePublicationPayload(normalized);
     const tx = this.db.transaction(() => {
+      const decision = this.requireCandidateReviewAllowedForPublication(normalized);
+      if (normalized.reviewRequestSha256 !== decision.requestSha256) {
+        throw new Error("Prepared candidate publication review digest conflicts with the allowed review attestation.");
+      }
       this.assertPreparedCandidatePublicationMatchesManifest(normalized);
       const existing = this.getEventByIdempotencyKey(normalized.sessionId, idempotencyKey);
       if (existing) {
+        this.requireCandidateReviewAllowedForPublication(normalized, existing.seq);
         this.validatePreparedCandidatePublicationEvent(existing, normalized);
         if (stableJson(existing.payload) !== stableJson(payload)) {
           throw new Error("Prepared candidate publication conflicts with existing durable input.");
@@ -2232,7 +2294,7 @@ export class WorkflowStore {
       preparedCandidatePublicationIdempotencyKey(normalized.laneId, normalized.segmentId),
     );
     if (!event) return null;
-    return this.validatePreparedCandidatePublicationEvent(event, normalized);
+    return this.validatePreparedCandidatePublicationEvent(event, normalized, true);
   }
 
   listPendingCandidateManifestFreezes(): WorkflowCandidateManifestIdentity[] {
@@ -2297,6 +2359,93 @@ export class WorkflowStore {
     tx();
   }
 
+  private validatePersistedCandidateReviewAttestations(): void {
+    const tx = this.db.transaction(() => {
+      for (const sessionId of this.listWorkflowSessionIds()) {
+        for (const row of this.statements.listEvents.all(sessionId) as EventRow[]) {
+          if (row.kind !== "workflow.candidate.review_allowed") continue;
+          this.validateCandidateReviewAllowedRow(row);
+        }
+      }
+    });
+    tx();
+  }
+
+  private validateCandidateReviewAllowedRow(
+    row: EventRow,
+    expectedIdentity?: CandidateReviewAllowedIdentity,
+  ): CandidateReviewDecision {
+    const attestation = candidateReviewAllowedFromRow(row);
+    if (
+      expectedIdentity &&
+      stableJson(attestation.identity) !== stableJson(normalizeCandidateReviewAllowedIdentity({
+        sessionId: expectedIdentity.sessionId,
+        nodeId: expectedIdentity.nodeId,
+        laneId: expectedIdentity.laneId,
+        segmentId: expectedIdentity.segmentId,
+        runId: expectedIdentity.runId,
+        manifestSha256: expectedIdentity.manifestSha256,
+      }))
+    ) {
+      throw new Error("Candidate review attestation identity conflicts with the requested candidate.");
+    }
+    const manifestEvent = this.statements.getEventByIdempotencyKey.get(
+      attestation.identity.sessionId,
+      candidateManifestIdempotencyKey(attestation.identity.runId),
+    ) as EventRow | undefined;
+    const manifest = this.getCandidateManifest(candidateManifestIdentityFromReviewAllowed(attestation.identity));
+    if (!manifest || !manifestEvent || manifestEvent.seq >= row.seq) {
+      throw new Error("Candidate review attestation has no preceding authoritative candidate manifest.");
+    }
+    const manifestSha256 = createHash("sha256")
+      .update(canonicalWorkflowCandidateManifestJson(manifest), "utf8")
+      .digest("hex");
+    if (
+      attestation.identity.manifestSha256 !== manifestSha256 ||
+      attestation.decision.manifestSha256 !== manifestSha256
+    ) {
+      throw new Error("Candidate review attestation conflicts with the authoritative candidate manifest.");
+    }
+    return attestation.decision;
+  }
+
+  private assertCandidateReviewAllowedMatchesManifest(input: AppendCandidateReviewAllowedInput): void {
+    const manifest = this.getCandidateManifest(candidateManifestIdentityFromReviewAllowed(input));
+    if (!manifest) throw new Error("Candidate review attestation requires an authoritative candidate manifest.");
+    const manifestSha256 = createHash("sha256")
+      .update(canonicalWorkflowCandidateManifestJson(manifest), "utf8")
+      .digest("hex");
+    if (input.manifestSha256 !== manifestSha256 || input.decision.manifestSha256 !== manifestSha256) {
+      throw new Error("Candidate review attestation conflicts with the authoritative candidate manifest.");
+    }
+  }
+
+  private requireCandidateReviewAllowedForPublication(
+    input: AppendPreparedCandidatePublicationInput | PreparedCandidatePublicationIdentity,
+    preparedSeq?: number,
+  ): CandidateReviewDecision {
+    const identity = {
+      sessionId: input.sessionId,
+      nodeId: input.nodeId,
+      laneId: input.candidateLaneId,
+      segmentId: input.segmentId,
+      runId: input.runId,
+      manifestSha256: input.manifestSha256,
+    };
+    const row = this.statements.getEventByIdempotencyKey.get(
+      identity.sessionId,
+      candidateReviewAllowedIdempotencyKey(identity.runId),
+    ) as EventRow | undefined;
+    if (!row) {
+      throw new Error("Prepared candidate publication requires an allowed candidate review attestation.");
+    }
+    const decision = this.validateCandidateReviewAllowedRow(row, identity);
+    if (preparedSeq !== undefined && row.seq >= preparedSeq) {
+      throw new Error("Prepared candidate publication requires a preceding allowed review attestation.");
+    }
+    return decision;
+  }
+
   private validatePersistedPreparedCandidatePublications(): void {
     const tx = this.db.transaction(() => {
       for (const sessionId of this.listWorkflowSessionIds()) {
@@ -2311,7 +2460,8 @@ export class WorkflowStore {
 
   private validatePreparedCandidatePublicationEvent(
     event: WorkflowEventRecord,
-    expectedIdentity?: PreparedCandidatePublicationIdentity,
+    expectedIdentity?: PreparedCandidatePublicationIdentity & { reviewRequestSha256?: string },
+    requireRecoveryAuthority = false,
   ): CandidateDeliveryCommitPreparation {
     const parsed = preparedCandidatePublicationFromEvent(event);
     if (expectedIdentity && (
@@ -2347,6 +2497,33 @@ export class WorkflowStore {
       stableJson(parsed.preparation.expected) !== stableJson(candidateCommitExpectationFromManifest(manifest))
     ) {
       throw new Error("Prepared candidate publication conflicts with the current candidate manifest.");
+    }
+    const attestationRow = this.statements.getEventByIdempotencyKey.get(
+      event.sessionId,
+      candidateReviewAllowedIdempotencyKey(parsed.runId),
+    ) as EventRow | undefined;
+    if (parsed.reviewRequestSha256 === null) {
+      if (attestationRow || requireRecoveryAuthority) {
+        throw new Error("Prepared candidate publication has no review request digest authority.");
+      }
+      return parsed.preparation;
+    }
+    const decision = this.requireCandidateReviewAllowedForPublication(expectedIdentity ?? {
+      sessionId: event.sessionId,
+      nodeId: parsed.nodeId,
+      laneId: event.laneId!,
+      candidateLaneId: parsed.candidateLaneId,
+      segmentId: event.segmentId!,
+      runId: parsed.runId,
+      manifestSha256: parsed.manifestSha256,
+      requestSha256: parsed.requestSha256,
+    }, event.seq);
+    if (
+      parsed.reviewRequestSha256 !== decision.requestSha256 ||
+      (expectedIdentity?.reviewRequestSha256 !== undefined &&
+        parsed.reviewRequestSha256 !== expectedIdentity.reviewRequestSha256)
+    ) {
+      throw new Error("Prepared candidate publication review digest conflicts with the allowed review attestation.");
     }
     return parsed.preparation;
   }
@@ -4138,7 +4315,169 @@ function normalizeCandidateManifestFreezeInput(value: unknown): FreezeWorkflowCa
   return { ...identity, now: value.now };
 }
 
+const candidateReviewAllowedPayloadKeys = [
+  "decision",
+  "laneId",
+  "manifestSha256",
+  "nodeId",
+  "runId",
+  "segmentId",
+  "sessionId",
+] as const;
+
+function normalizeCandidateReviewAllowedIdentity(value: unknown): CandidateReviewAllowedIdentity {
+  if (!isRecord(value) || !hasExactObjectKeys(value, [
+    "sessionId",
+    "nodeId",
+    "laneId",
+    "segmentId",
+    "runId",
+    "manifestSha256",
+  ])) {
+    throw new Error("Candidate review attestation identity contains invalid fields.");
+  }
+  const identity = normalizeCandidateManifestIdentity({
+    sessionId: value.sessionId,
+    nodeId: value.nodeId,
+    laneId: value.laneId,
+    segmentId: value.segmentId,
+    runId: value.runId,
+  });
+  if (!isCanonicalPreparedPublicationDigest(value.manifestSha256)) {
+    throw new Error("Candidate review attestation manifest digest is invalid.");
+  }
+  return { ...identity, manifestSha256: value.manifestSha256 };
+}
+
+function normalizeCandidateReviewAllowedInput(value: unknown): AppendCandidateReviewAllowedInput {
+  if (!isRecord(value) || !hasExactObjectKeys(value, [
+    "sessionId",
+    "nodeId",
+    "laneId",
+    "segmentId",
+    "runId",
+    "manifestSha256",
+    "decision",
+    "now",
+  ])) {
+    throw new Error("Candidate review attestation input contains invalid fields.");
+  }
+  const identity = normalizeCandidateReviewAllowedIdentity({
+    sessionId: value.sessionId,
+    nodeId: value.nodeId,
+    laneId: value.laneId,
+    segmentId: value.segmentId,
+    runId: value.runId,
+    manifestSha256: value.manifestSha256,
+  });
+  const decision = parseCandidateReviewDecision(value.decision);
+  if (
+    !decision ||
+    decision.disposition !== "allow" ||
+    decision.manifestSha256 !== identity.manifestSha256 ||
+    !isCanonicalCandidateManifestTimestamp(value.now)
+  ) {
+    throw new Error("Candidate review attestation decision or timestamp is invalid.");
+  }
+  return { ...identity, decision, now: value.now };
+}
+
+function candidateReviewAllowedIdempotencyKey(runId: string): string {
+  return `candidate-review-allowed:${runId}`;
+}
+
+function candidateReviewAllowedPayload(
+  input: AppendCandidateReviewAllowedInput,
+): Record<string, unknown> {
+  return {
+    sessionId: input.sessionId,
+    nodeId: input.nodeId,
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    runId: input.runId,
+    manifestSha256: input.manifestSha256,
+    decision: input.decision,
+  };
+}
+
+function candidateManifestIdentityFromReviewAllowed(
+  identity: CandidateReviewAllowedIdentity,
+): WorkflowCandidateManifestIdentity {
+  return {
+    sessionId: identity.sessionId,
+    nodeId: identity.nodeId,
+    laneId: identity.laneId,
+    segmentId: identity.segmentId,
+    runId: identity.runId,
+  };
+}
+
+function candidateReviewAllowedFromRow(row: EventRow): {
+  identity: CandidateReviewAllowedIdentity;
+  decision: CandidateReviewDecision;
+} {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(row.payload_json) as unknown;
+  } catch {
+    throw new Error("Persisted candidate review attestation payload is malformed.");
+  }
+  if (
+    row.kind !== "workflow.candidate.review_allowed" ||
+    row.source !== "workflow_store" ||
+    !Number.isSafeInteger(row.seq) ||
+    row.seq < 1 ||
+    row.id !== workflowEventId(row.session_id, row.seq) ||
+    row.causation_id !== null ||
+    row.correlation_id !== null ||
+    row.legacy_evidence_compatibility !== 0 ||
+    !isCanonicalCandidateManifestTimestamp(row.created_at) ||
+    !isRecord(payload) ||
+    !hasExactObjectKeys(payload, candidateReviewAllowedPayloadKeys) ||
+    row.payload_json !== stableJson(payload)
+  ) {
+    throw new Error("Persisted candidate review attestation event identity is invalid.");
+  }
+  const identity = normalizeCandidateReviewAllowedIdentity({
+    sessionId: payload.sessionId,
+    nodeId: payload.nodeId,
+    laneId: payload.laneId,
+    segmentId: payload.segmentId,
+    runId: payload.runId,
+    manifestSha256: payload.manifestSha256,
+  });
+  if (
+    row.session_id !== identity.sessionId ||
+    row.lane_id !== identity.laneId ||
+    row.segment_id !== identity.segmentId ||
+    row.idempotency_key !== candidateReviewAllowedIdempotencyKey(identity.runId)
+  ) {
+    throw new Error("Persisted candidate review attestation event identity is invalid.");
+  }
+  const decision = parseCandidateReviewDecision(payload.decision);
+  if (
+    !decision ||
+    decision.disposition !== "allow" ||
+    decision.manifestSha256 !== identity.manifestSha256
+  ) {
+    throw new Error("Persisted candidate review attestation decision is invalid.");
+  }
+  return { identity, decision };
+}
+
 const preparedCandidatePublicationPayloadKeys = [
+  "candidateLaneId",
+  "laneId",
+  "manifestSha256",
+  "nodeId",
+  "preparation",
+  "requestSha256",
+  "reviewRequestSha256",
+  "runId",
+  "segmentId",
+] as const;
+
+const preAttestationPreparedCandidatePublicationPayloadKeys = [
   "candidateLaneId",
   "laneId",
   "manifestSha256",
@@ -4199,6 +4538,7 @@ function normalizePreparedCandidatePublicationInput(
     "runId",
     "manifestSha256",
     "requestSha256",
+    "reviewRequestSha256",
     "preparation",
     "now",
   ])) {
@@ -4214,11 +4554,14 @@ function normalizePreparedCandidatePublicationInput(
     manifestSha256: value.manifestSha256,
     requestSha256: value.requestSha256,
   });
+  if (!isCanonicalPreparedPublicationDigest(value.reviewRequestSha256)) {
+    throw new Error("Prepared candidate publication review request digest is invalid.");
+  }
   const preparation = parseCandidateDeliveryCommitPreparation(value.preparation);
   if (!preparation || !isCanonicalCandidateManifestTimestamp(value.now)) {
     throw new Error("Prepared candidate publication payload is invalid.");
   }
-  return { ...identity, preparation, now: value.now };
+  return { ...identity, reviewRequestSha256: value.reviewRequestSha256, preparation, now: value.now };
 }
 
 function preparedCandidatePublicationIdempotencyKey(laneId: string, segmentId: string): string {
@@ -4240,6 +4583,7 @@ function preparedCandidatePublicationPayload(
     runId: input.runId,
     manifestSha256: input.manifestSha256,
     requestSha256: input.requestSha256,
+    reviewRequestSha256: input.reviewRequestSha256,
     preparation: input.preparation,
   };
 }
@@ -4250,19 +4594,27 @@ function preparedCandidatePublicationFromEvent(event: WorkflowEventRecord): {
   runId: string;
   manifestSha256: string;
   requestSha256: string;
+  reviewRequestSha256: string | null;
   preparation: CandidateDeliveryCommitPreparation;
 } {
+  const hasCurrentPayload = hasExactObjectKeys(event.payload, preparedCandidatePublicationPayloadKeys);
+  const hasPreAttestationPayload = hasExactObjectKeys(
+    event.payload,
+    preAttestationPreparedCandidatePublicationPayloadKeys,
+  );
+  const reviewRequestSha256 = hasCurrentPayload ? event.payload.reviewRequestSha256 : null;
   if (
     event.kind !== "workflow.commit.publication_prepared" ||
     event.source !== "workflow_store" ||
     !event.laneId ||
     !event.segmentId ||
     event.idempotencyKey !== preparedCandidatePublicationIdempotencyKey(event.laneId, event.segmentId) ||
-    !hasExactObjectKeys(event.payload, preparedCandidatePublicationPayloadKeys) ||
+    (!hasCurrentPayload && !hasPreAttestationPayload) ||
     event.payload.laneId !== event.laneId ||
     event.payload.segmentId !== event.segmentId ||
     !isCanonicalPreparedPublicationDigest(event.payload.manifestSha256) ||
-    !isCanonicalPreparedPublicationDigest(event.payload.requestSha256)
+    !isCanonicalPreparedPublicationDigest(event.payload.requestSha256) ||
+    (reviewRequestSha256 !== null && !isCanonicalPreparedPublicationDigest(reviewRequestSha256))
   ) {
     throw new Error("Persisted prepared candidate publication event identity is invalid.");
   }
@@ -4281,6 +4633,7 @@ function preparedCandidatePublicationFromEvent(event: WorkflowEventRecord): {
     runId,
     manifestSha256: event.payload.manifestSha256,
     requestSha256: event.payload.requestSha256,
+    reviewRequestSha256,
     preparation,
   };
 }
@@ -7173,6 +7526,7 @@ function isWorkflowInternalEventKind(kind: WorkflowEventKind): kind is WorkflowI
     kind === "workflow.plan_finish.launch_accepted" ||
     kind === "workflow.planner_intent.reconciled" ||
     kind === "workflow.candidate.manifest_recorded" ||
+    kind === "workflow.candidate.review_allowed" ||
     kind === "workflow.commit.publication_prepared";
 }
 

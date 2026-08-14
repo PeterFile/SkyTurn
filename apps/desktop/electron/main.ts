@@ -22,6 +22,7 @@ import type {
   PlanEvent,
   PlanStateSnapshot,
   CandidateReviewAgentKind,
+  CandidateReviewDecision,
   CandidateReviewRequest,
   WorkflowDeliveryCandidateIdentity,
   WorkflowCandidateManifest,
@@ -379,6 +380,12 @@ interface CandidateDeliveryCommitPublicationInput {
   requestSha256: string;
   expected: CandidateDeliveryCommitPreparation["expected"];
   parsePreparation(value: unknown): CandidateDeliveryCommitPreparation | null;
+  parseReviewDecision(value: unknown): CandidateReviewDecision | null;
+  captureReviewRequest(): Promise<{
+    request: CandidateReviewRequest;
+    requestSha256: string;
+  }>;
+  review(request: CandidateReviewRequest): Promise<CandidateReviewDecision>;
   prepare(): Promise<CandidateDeliveryCommitPreparation>;
   publish(preparation: CandidateDeliveryCommitPreparation): Promise<CandidateDeliveryCommitEvidence>;
   broadcast(): void;
@@ -749,6 +756,8 @@ interface WorkflowStoreHost {
   recordRunCheckpoint(input: unknown): unknown;
   freezeCandidateManifest(input: unknown): unknown;
   getCandidateManifest(identity: unknown): unknown;
+  appendCandidateReviewAllowed(input: unknown): unknown;
+  getCandidateReviewAllowed(identity: unknown): unknown;
   appendPreparedCandidatePublication(input: unknown): unknown;
   getPreparedCandidatePublication(identity: unknown): unknown;
   materializeFlowProjection(sessionId: string): unknown;
@@ -1404,7 +1413,10 @@ ipcMain.handle("workflow:events", workflowHandler(async (projectRoot: string, se
   const store = await getWorkflowStore(projectRoot);
   const events = store.listEvents(workflowSessionId)
     .filter(isWorkflowEventRecord)
-    .filter((event) => event.kind !== "workflow.commit.publication_prepared");
+    .filter((event) =>
+      event.kind !== "workflow.commit.publication_prepared" &&
+      event.kind !== "workflow.candidate.review_allowed"
+    );
   const plannerLaneId = reconciledPlannerLaneIdForRenderer(events);
   const plannerSegments = plannerLaneId ? store.listSegments(workflowSessionId, plannerLaneId) : [];
   const plannerSegmentsById = new Map(plannerSegments.map((segment) => [segment.segmentId, segment]));
@@ -1999,7 +2011,9 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
       try {
         const projection = store.materializeFlowProjection(sessionId) as WorkflowDeliveryFlowProjectionLike;
         const {
+          canonicalCandidateReviewRequestJson,
           canonicalWorkflowCandidateManifestJson,
+          parseCandidateReviewDecision,
           parseCandidateReviewRequest,
           parseWorkflowCandidateManifest,
           resolveWorkflowDeliveryCandidateIdentity,
@@ -2039,6 +2053,8 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
           captureCandidateDeliveryReviewSnapshot,
           manifest,
           manifestSha256,
+          canonicalCandidateReviewRequestJson,
+          parseCandidateReviewDecision,
           parseCandidateReviewRequest,
           parseCandidateDeliveryCommitPreparation,
           prepareCandidateDeliveryCommit,
@@ -2067,7 +2083,8 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
       requestSha256,
       expected: candidateCommitExpectationFromManifest(context.manifest),
       parsePreparation: context.parseCandidateDeliveryCommitPreparation,
-      async prepare() {
+      parseReviewDecision: context.parseCandidateReviewDecision,
+      async captureReviewRequest() {
         try {
           const snapshot = await context.captureCandidateDeliveryReviewSnapshot({
             projectRoot: context.realProjectRoot,
@@ -2079,8 +2096,25 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
             candidateReviewRequestFromManifest(context.manifest, context.manifestSha256, snapshot),
           );
           if (!reviewRequest) rejectCandidateDelivery();
+          const reviewRequestSha256 = createHash("sha256")
+            .update(context.canonicalCandidateReviewRequestJson(reviewRequest), "utf8")
+            .digest("hex");
+          return { request: reviewRequest, requestSha256: reviewRequestSha256 };
+        } catch {
+          rejectCandidateDelivery();
+        }
+      },
+      async review(reviewRequest) {
+        try {
           const { reviewCandidateWithHermes } = await import("@skyturn/agent-bridge");
-          await reviewCandidateWithHermes({ request: reviewRequest });
+          const decision = await reviewCandidateWithHermes({ request: reviewRequest });
+          return decision;
+        } catch {
+          rejectCandidateDelivery();
+        }
+      },
+      async prepare() {
+        try {
           return await context.prepareCandidateDeliveryCommit({
             projectRoot: context.realProjectRoot,
             worktreePath: context.worktreePath,
@@ -6783,7 +6817,112 @@ function candidateDeliveryCommitRequestSha256(
   }), "utf8").digest("hex");
 }
 
-function candidateCommitPreparedIntentPayload(input: CandidateDeliveryCommitPublicationInput, preparation: unknown) {
+function candidateReviewAllowedIdentity(input: CandidateDeliveryCommitPublicationInput) {
+  return {
+    sessionId: input.sessionId,
+    nodeId: input.nodeId,
+    laneId: input.candidateLaneId,
+    segmentId: input.segmentId,
+    runId: input.runId,
+    manifestSha256: input.manifestSha256,
+  };
+}
+
+function candidateReviewAllowedPayload(
+  input: CandidateDeliveryCommitPublicationInput,
+  decision: CandidateReviewDecision,
+) {
+  return {
+    ...candidateReviewAllowedIdentity(input),
+    decision,
+  };
+}
+
+function findCandidateReviewAllowedDecision(
+  input: CandidateDeliveryCommitPublicationInput,
+): CandidateReviewDecision | null {
+  let persisted: unknown;
+  try {
+    persisted = input.store.getCandidateReviewAllowed(candidateReviewAllowedIdentity(input));
+  } catch {
+    throw candidateCommitPublicationError(true);
+  }
+  if (persisted === null) return null;
+  const decision = input.parseReviewDecision(persisted);
+  if (
+    !decision ||
+    decision.disposition !== "allow" ||
+    decision.manifestSha256 !== input.manifestSha256
+  ) {
+    throw candidateCommitPublicationError(true);
+  }
+  return decision;
+}
+
+function appendCandidateReviewAllowedDecision(
+  input: CandidateDeliveryCommitPublicationInput,
+  decision: CandidateReviewDecision,
+): void {
+  const idempotencyKey = `candidate-review-allowed:${input.runId}`;
+  const payload = candidateReviewAllowedPayload(input, decision);
+  const event = input.store.appendCandidateReviewAllowed({
+    ...candidateReviewAllowedIdentity(input),
+    decision,
+    now: input.now(),
+  });
+  if (
+    !isRecord(event) ||
+    event.sessionId !== input.sessionId ||
+    event.kind !== "workflow.candidate.review_allowed" ||
+    event.source !== "workflow_store" ||
+    event.laneId !== input.candidateLaneId ||
+    event.segmentId !== input.segmentId ||
+    event.idempotencyKey !== idempotencyKey ||
+    stableJson(event.payload) !== stableJson(payload)
+  ) {
+    throw candidateCommitPublicationError(true);
+  }
+}
+
+async function ensureCandidateReviewAllowed(
+  input: CandidateDeliveryCommitPublicationInput,
+): Promise<CandidateReviewDecision> {
+  const persisted = findCandidateReviewAllowedDecision(input);
+  const captured = await input.captureReviewRequest();
+  if (!/^[0-9a-f]{64}$/.test(captured.requestSha256)) {
+    throw candidateCommitPublicationError(true);
+  }
+  if (persisted) {
+    if (persisted.requestSha256 !== captured.requestSha256) {
+      throw candidateCommitPublicationError(true);
+    }
+    return persisted;
+  }
+
+  const reviewed = await input.review(captured.request);
+  const decision = input.parseReviewDecision(reviewed);
+  if (
+    !decision ||
+    decision.disposition !== "allow" ||
+    decision.requestSha256 !== captured.requestSha256 ||
+    decision.manifestSha256 !== input.manifestSha256
+  ) {
+    throw candidateCommitPublicationError(true);
+  }
+  try {
+    appendCandidateReviewAllowedDecision(input, decision);
+  } catch (error) {
+    if (isRecord(error) && error.candidateCommitPublicationManualRepair === true) throw error;
+    throw candidateCommitPublicationError();
+  }
+  return decision;
+}
+
+function candidateCommitPreparedIntentPayload(
+  input: CandidateDeliveryCommitPublicationInput,
+  preparation: unknown,
+  reviewRequestSha256: string,
+) {
   return {
     laneId: input.laneId,
     candidateLaneId: input.candidateLaneId,
@@ -6792,6 +6931,7 @@ function candidateCommitPreparedIntentPayload(input: CandidateDeliveryCommitPubl
     runId: input.runId,
     manifestSha256: input.manifestSha256,
     requestSha256: input.requestSha256,
+    reviewRequestSha256,
     preparation,
   };
 }
@@ -6825,9 +6965,10 @@ function findCandidateCommitPreparedIntent(
 function appendCandidateCommitPreparedIntent(
   input: CandidateDeliveryCommitPublicationInput,
   preparation: CandidateDeliveryCommitPreparation,
+  reviewRequestSha256: string,
 ): void {
   const idempotencyKey = `delivery-commit-prepared:${input.laneId}:${input.segmentId}`;
-  const payload = candidateCommitPreparedIntentPayload(input, preparation);
+  const payload = candidateCommitPreparedIntentPayload(input, preparation, reviewRequestSha256);
   const event = input.store.appendPreparedCandidatePublication({
     sessionId: input.sessionId,
     nodeId: input.nodeId,
@@ -6837,6 +6978,7 @@ function appendCandidateCommitPreparedIntent(
     runId: input.runId,
     manifestSha256: input.manifestSha256,
     requestSha256: input.requestSha256,
+    reviewRequestSha256,
     preparation,
     now: input.now(),
   });
@@ -6896,9 +7038,10 @@ async function publishCandidateDeliveryCommitWithRecovery(
 ): Promise<CandidateDeliveryCommitPublicationResult> {
   let preparation = findCandidateCommitPreparedIntent(input);
   if (!preparation) {
+    const decision = await ensureCandidateReviewAllowed(input);
     preparation = await input.prepare();
     try {
-      appendCandidateCommitPreparedIntent(input, preparation);
+      appendCandidateCommitPreparedIntent(input, preparation, decision.requestSha256);
     } catch (error) {
       if (isRecord(error) && error.candidateCommitPublicationManualRepair === true) throw error;
       throw candidateCommitPublicationError();
