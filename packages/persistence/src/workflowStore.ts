@@ -529,7 +529,13 @@ export interface FreezeWorkflowCandidateManifestInput extends WorkflowCandidateM
   now: string;
 }
 
-export interface PreparedCandidatePublicationIdentity extends WorkflowCandidateManifestIdentity {
+export interface PreparedCandidatePublicationIdentity {
+  sessionId: string;
+  nodeId: string;
+  laneId: string;
+  candidateLaneId: string;
+  segmentId: string;
+  runId: string;
   manifestSha256: string;
   requestSha256: string;
 }
@@ -2308,11 +2314,25 @@ export class WorkflowStore {
     expectedIdentity?: PreparedCandidatePublicationIdentity,
   ): CandidateDeliveryCommitPreparation {
     const parsed = preparedCandidatePublicationFromEvent(event);
-    const manifest = expectedIdentity
-      ? this.getCandidateManifest(candidateManifestIdentityFields(expectedIdentity))
-      : this.findCandidateManifestForPreparedPublication(event);
+    if (expectedIdentity && (
+      parsed.candidateLaneId !== expectedIdentity.candidateLaneId ||
+      parsed.nodeId !== expectedIdentity.nodeId ||
+      parsed.runId !== expectedIdentity.runId
+    )) {
+      throw new Error("Prepared candidate publication candidate identity is invalid.");
+    }
+    const manifest = this.getCandidateManifest(candidateManifestIdentityFields(expectedIdentity ?? {
+      sessionId: event.sessionId,
+      nodeId: parsed.nodeId,
+      candidateLaneId: parsed.candidateLaneId,
+      segmentId: event.segmentId!,
+      runId: parsed.runId,
+    }));
     if (!manifest) throw new Error("Prepared candidate publication has no authoritative candidate manifest.");
-    if (expectedIdentity && !candidateManifestMatchesIdentity(manifest, expectedIdentity)) {
+    if (expectedIdentity && !candidateManifestMatchesIdentity(
+      manifest,
+      candidateManifestIdentityFields(expectedIdentity),
+    )) {
       throw new Error("Prepared candidate publication candidate identity conflicts with the current manifest.");
     }
     const manifestSha256 = createHash("sha256")
@@ -2345,27 +2365,6 @@ export class WorkflowStore {
     ) {
       throw new Error("Prepared candidate publication conflicts with the current candidate manifest.");
     }
-  }
-
-  private findCandidateManifestForPreparedPublication(
-    event: WorkflowEventRecord,
-  ): WorkflowCandidateManifest | null {
-    const candidates: WorkflowCandidateManifest[] = [];
-    for (const row of this.statements.listEvents.all(event.sessionId) as EventRow[]) {
-      if (row.kind !== "workflow.candidate.manifest_recorded") continue;
-      const candidateEvent = mapEvent(row);
-      const rawManifest = parseWorkflowCandidateManifest(candidateEvent.payload.manifest);
-      if (
-        !rawManifest ||
-        rawManifest.laneId !== event.laneId ||
-        rawManifest.segmentId !== event.segmentId
-      ) continue;
-      candidates.push(this.validateCandidateManifestEvent(candidateEvent, rawManifest));
-    }
-    if (candidates.length !== 1) {
-      throw new Error("Prepared candidate publication must bind exactly one authoritative candidate manifest.");
-    }
-    return candidates[0]!;
   }
 
   private deriveCandidateManifest(
@@ -3797,7 +3796,7 @@ export class WorkflowStore {
     }
     const max = this.statements.maxSeq.get(input.sessionId) as { seq: number | null } | undefined;
     const seq = Number(max?.seq ?? 0) + 1;
-    const id = `${input.sessionId}:event:${String(seq).padStart(8, "0")}`;
+    const id = workflowEventId(input.sessionId, seq);
     this.statements.insertEvent.run({
       id,
       session_id: input.sessionId,
@@ -4140,10 +4139,13 @@ function normalizeCandidateManifestFreezeInput(value: unknown): FreezeWorkflowCa
 }
 
 const preparedCandidatePublicationPayloadKeys = [
+  "candidateLaneId",
   "laneId",
   "manifestSha256",
+  "nodeId",
   "preparation",
   "requestSha256",
+  "runId",
   "segmentId",
 ] as const;
 
@@ -4154,6 +4156,7 @@ function normalizePreparedCandidatePublicationIdentity(
     "sessionId",
     "nodeId",
     "laneId",
+    "candidateLaneId",
     "segmentId",
     "runId",
     "manifestSha256",
@@ -4161,18 +4164,24 @@ function normalizePreparedCandidatePublicationIdentity(
   ])) {
     throw new Error("Prepared candidate publication identity contains invalid fields.");
   }
-  const identity = normalizeCandidateManifestIdentity({
+  const candidateIdentity = normalizeCandidateManifestIdentity({
     sessionId: value.sessionId,
     nodeId: value.nodeId,
-    laneId: value.laneId,
+    laneId: value.candidateLaneId,
     segmentId: value.segmentId,
     runId: value.runId,
   });
+  const laneId = candidateManifestIdentifier(value.laneId, "laneId");
+  if (laneId === candidateIdentity.laneId) {
+    throw new Error("Prepared candidate publication lane identities must be distinct.");
+  }
   if (!isCanonicalPreparedPublicationDigest(value.manifestSha256) || !isCanonicalPreparedPublicationDigest(value.requestSha256)) {
     throw new Error("Prepared candidate publication hashes are invalid.");
   }
   return {
-    ...identity,
+    ...candidateIdentity,
+    laneId,
+    candidateLaneId: candidateIdentity.laneId,
     manifestSha256: value.manifestSha256,
     requestSha256: value.requestSha256,
   };
@@ -4185,6 +4194,7 @@ function normalizePreparedCandidatePublicationInput(
     "sessionId",
     "nodeId",
     "laneId",
+    "candidateLaneId",
     "segmentId",
     "runId",
     "manifestSha256",
@@ -4198,6 +4208,7 @@ function normalizePreparedCandidatePublicationInput(
     sessionId: value.sessionId,
     nodeId: value.nodeId,
     laneId: value.laneId,
+    candidateLaneId: value.candidateLaneId,
     segmentId: value.segmentId,
     runId: value.runId,
     manifestSha256: value.manifestSha256,
@@ -4214,12 +4225,19 @@ function preparedCandidatePublicationIdempotencyKey(laneId: string, segmentId: s
   return `delivery-commit-prepared:${laneId}:${segmentId}`;
 }
 
+function workflowEventId(sessionId: string, seq: number): string {
+  return `${sessionId}:event:${String(seq).padStart(8, "0")}`;
+}
+
 function preparedCandidatePublicationPayload(
   input: AppendPreparedCandidatePublicationInput,
 ): Record<string, unknown> {
   return {
     laneId: input.laneId,
+    candidateLaneId: input.candidateLaneId,
+    nodeId: input.nodeId,
     segmentId: input.segmentId,
+    runId: input.runId,
     manifestSha256: input.manifestSha256,
     requestSha256: input.requestSha256,
     preparation: input.preparation,
@@ -4227,6 +4245,9 @@ function preparedCandidatePublicationPayload(
 }
 
 function preparedCandidatePublicationFromEvent(event: WorkflowEventRecord): {
+  candidateLaneId: string;
+  nodeId: string;
+  runId: string;
   manifestSha256: string;
   requestSha256: string;
   preparation: CandidateDeliveryCommitPreparation;
@@ -4245,9 +4266,19 @@ function preparedCandidatePublicationFromEvent(event: WorkflowEventRecord): {
   ) {
     throw new Error("Persisted prepared candidate publication event identity is invalid.");
   }
+  const laneId = candidateManifestIdentifier(event.laneId, "laneId");
+  const candidateLaneId = candidateManifestIdentifier(event.payload.candidateLaneId, "candidateLaneId");
+  if (candidateLaneId === laneId) {
+    throw new Error("Persisted prepared candidate publication lane identities must be distinct.");
+  }
+  const nodeId = candidateManifestIdentifier(event.payload.nodeId, "nodeId");
+  const runId = candidateManifestIdentifier(event.payload.runId, "runId");
   const preparation = parseCandidateDeliveryCommitPreparation(event.payload.preparation);
   if (!preparation) throw new Error("Persisted prepared candidate publication payload is invalid.");
   return {
+    candidateLaneId,
+    nodeId,
+    runId,
     manifestSha256: event.payload.manifestSha256,
     requestSha256: event.payload.requestSha256,
     preparation,
@@ -4266,12 +4297,15 @@ function candidateManifestMatchesIdentity(
 }
 
 function candidateManifestIdentityFields(
-  identity: WorkflowCandidateManifestIdentity,
+  identity: Pick<
+    PreparedCandidatePublicationIdentity,
+    "sessionId" | "nodeId" | "candidateLaneId" | "segmentId" | "runId"
+  >,
 ): WorkflowCandidateManifestIdentity {
   return {
     sessionId: identity.sessionId,
     nodeId: identity.nodeId,
-    laneId: identity.laneId,
+    laneId: identity.candidateLaneId,
     segmentId: identity.segmentId,
     runId: identity.runId,
   };
@@ -5871,6 +5905,7 @@ function applyMigrations(
   applyHistoricalOutputDeltaMigration(db);
   applyHistoricalLaneRequiredEvidenceMigration(db);
   applyPlannerIntentReconciliationMigration(db);
+  applyLegacyPreparedPublicationQuarantineMigration(db);
   return requiresHermesHandlePhysicalCleanup;
 }
 
@@ -6140,6 +6175,124 @@ function applyPlannerIntentReconciliationMigration(db: Database.Database): void 
     db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (8, datetime('now'))").run();
   });
   migrate();
+}
+
+const legacyPreparedPublicationPayloadKeys = [
+  "laneId",
+  "manifestSha256",
+  "preparation",
+  "requestSha256",
+  "segmentId",
+] as const;
+
+const quarantinedPreparedPublicationPayload = stableJson({
+  reason: "legacy-prepared-publication-requires-fresh-review",
+  status: "failed",
+});
+
+function applyLegacyPreparedPublicationQuarantineMigration(db: Database.Database): void {
+  if (db.prepare("SELECT 1 FROM schema_migrations WHERE version = 9").get()) return;
+  const migrate = db.transaction(() => {
+    const rows = db.prepare([
+      "SELECT * FROM workflow_events",
+      "WHERE kind = 'workflow.commit.publication_prepared'",
+      "ORDER BY session_id, seq, id",
+    ].join(" ")).all() as EventRow[];
+    const quarantine = db.prepare([
+      "UPDATE workflow_events",
+      "SET kind = 'workflow.run.recovery_failed', lane_id = NULL, segment_id = NULL,",
+      "causation_id = NULL, correlation_id = NULL, idempotency_key = NULL,",
+      "payload_json = @quarantine_payload, legacy_evidence_compatibility = 0",
+      "WHERE id = @id AND session_id = @session_id AND seq = @seq",
+      "AND kind = 'workflow.commit.publication_prepared' AND source = 'workflow_store'",
+      "AND lane_id = @lane_id AND segment_id = @segment_id",
+      "AND causation_id IS NULL AND correlation_id IS NULL",
+      "AND idempotency_key = @idempotency_key AND payload_json = @payload_json",
+      "AND created_at = @created_at AND legacy_evidence_compatibility = 0",
+    ].join(" "));
+    for (const row of rows) {
+      if (!isExactLegacyPreparedPublicationRow(db, row)) continue;
+      const result = quarantine.run({
+        id: row.id,
+        session_id: row.session_id,
+        seq: row.seq,
+        lane_id: row.lane_id,
+        segment_id: row.segment_id,
+        idempotency_key: row.idempotency_key,
+        payload_json: row.payload_json,
+        created_at: row.created_at,
+        quarantine_payload: quarantinedPreparedPublicationPayload,
+      });
+      if (result.changes !== 1) {
+        throw new Error("Legacy prepared publication changed during quarantine migration.");
+      }
+    }
+    db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (9, datetime('now'))").run();
+  });
+  migrate.immediate();
+}
+
+function isExactLegacyPreparedPublicationRow(db: Database.Database, row: EventRow): boolean {
+  if (
+    row.kind !== "workflow.commit.publication_prepared" ||
+    row.source !== "workflow_store" ||
+    !Number.isSafeInteger(row.seq) ||
+    row.seq < 1 ||
+    row.causation_id !== null ||
+    row.correlation_id !== null ||
+    row.legacy_evidence_compatibility !== 0 ||
+    !isCanonicalCandidateManifestTimestamp(row.created_at)
+  ) {
+    return false;
+  }
+  try {
+    const sessionId = candidateManifestIdentifier(row.session_id, "sessionId");
+    const laneId = candidateManifestIdentifier(row.lane_id, "laneId");
+    const segmentId = candidateManifestIdentifier(row.segment_id, "segmentId");
+    if (
+      row.id !== workflowEventId(sessionId, row.seq) ||
+      row.idempotency_key !== preparedCandidatePublicationIdempotencyKey(laneId, segmentId)
+    ) {
+      return false;
+    }
+    const payload = parseJson(row.payload_json);
+    if (
+      !hasExactObjectKeys(payload, legacyPreparedPublicationPayloadKeys) ||
+      payload.laneId !== laneId ||
+      payload.segmentId !== segmentId ||
+      !isCanonicalPreparedPublicationDigest(payload.manifestSha256) ||
+      !isCanonicalPreparedPublicationDigest(payload.requestSha256)
+    ) {
+      return false;
+    }
+    const preparation = parseCandidateDeliveryCommitPreparation(payload.preparation);
+    if (!preparation) return false;
+
+    const manifests: Array<{ manifest: WorkflowCandidateManifest; seq: number }> = [];
+    const manifestRows = db.prepare([
+      "SELECT * FROM workflow_events",
+      "WHERE session_id = ? AND kind = 'workflow.candidate.manifest_recorded'",
+      "ORDER BY seq, id",
+    ].join(" ")).all(sessionId) as EventRow[];
+    for (const manifestRow of manifestRows) {
+      const manifestEvent = mapEvent(manifestRow);
+      const manifest = parseWorkflowCandidateManifest(manifestEvent.payload.manifest);
+      if (!manifest || manifest.laneId !== laneId || manifest.segmentId !== segmentId) continue;
+      manifests.push({
+        manifest: candidateManifestFromEvent(manifestEvent, manifest),
+        seq: manifestRow.seq,
+      });
+    }
+    if (manifests.length !== 1 || manifests[0]!.seq >= row.seq) return false;
+    const manifest = manifests[0]!.manifest;
+    const manifestSha256 = createHash("sha256")
+      .update(canonicalWorkflowCandidateManifestJson(manifest), "utf8")
+      .digest("hex");
+    return payload.manifestSha256 === manifestSha256 &&
+      stableJson(preparation.expected) === stableJson(candidateCommitExpectationFromManifest(manifest));
+  } catch {
+    return false;
+  }
 }
 
 function checkpointRedactedHermesHandles(

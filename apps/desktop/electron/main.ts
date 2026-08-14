@@ -372,6 +372,7 @@ interface CandidateDeliveryCommitPublicationInput {
   sessionId: string;
   nodeId: string;
   laneId: string;
+  candidateLaneId: string;
   segmentId: string;
   runId: string;
   manifestSha256: string;
@@ -2059,6 +2060,7 @@ ipcMain.handle("workflow:delivery:commit", workflowHandler(async (projectRoot: s
       sessionId,
       nodeId: context.manifest.nodeId,
       laneId,
+      candidateLaneId: context.manifest.laneId,
       segmentId: context.manifest.segmentId,
       runId: context.manifest.runId,
       manifestSha256: context.manifestSha256,
@@ -6784,7 +6786,10 @@ function candidateDeliveryCommitRequestSha256(
 function candidateCommitPreparedIntentPayload(input: CandidateDeliveryCommitPublicationInput, preparation: unknown) {
   return {
     laneId: input.laneId,
+    candidateLaneId: input.candidateLaneId,
+    nodeId: input.nodeId,
     segmentId: input.segmentId,
+    runId: input.runId,
     manifestSha256: input.manifestSha256,
     requestSha256: input.requestSha256,
     preparation,
@@ -6800,6 +6805,7 @@ function findCandidateCommitPreparedIntent(
       sessionId: input.sessionId,
       nodeId: input.nodeId,
       laneId: input.laneId,
+      candidateLaneId: input.candidateLaneId,
       segmentId: input.segmentId,
       runId: input.runId,
       manifestSha256: input.manifestSha256,
@@ -6826,6 +6832,7 @@ function appendCandidateCommitPreparedIntent(
     sessionId: input.sessionId,
     nodeId: input.nodeId,
     laneId: input.laneId,
+    candidateLaneId: input.candidateLaneId,
     segmentId: input.segmentId,
     runId: input.runId,
     manifestSha256: input.manifestSha256,
