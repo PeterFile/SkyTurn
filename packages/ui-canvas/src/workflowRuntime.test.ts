@@ -7,6 +7,7 @@ import * as WorkflowRuntime from "./workflowRuntime.js";
 import {
   applyBridgeRunResult,
   buildPromptForNodeRun,
+  loadExactRunEvidence,
   mergeRunEventsIntoWorkspace,
   retryCanvasNode,
   sandboxForNodeRun,
@@ -18,6 +19,66 @@ describe("workflow runtime event merging", () => {
     expect(WorkflowRuntime).not.toHaveProperty("claimCompletedBridgeRunPersistence");
     expect(WorkflowRuntime).not.toHaveProperty("persistCompletedBridgeRunResult");
     expect(WorkflowRuntime).not.toHaveProperty("applyCompletedBridgeRunPersistenceResult");
+  });
+
+  it.each([
+    ["running", null],
+    ["succeeded", "2026-06-10T00:00:01.000Z"],
+  ] as const)("loads exact %s private run evidence from the explicit query root", async (status, completedAt) => {
+    const queryRoot = "/tmp/project-alias";
+    const runId = `run-exact-${status}`;
+    const evidence = {
+      runId,
+      status,
+      exitCode: status === "succeeded" ? 0 : null,
+      changesetId: null,
+      checks: [],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt,
+    } satisfies RunEvidence;
+    const getRunEvidence = vi.fn(async () => ({
+      protocolVersion: 1,
+      evidence,
+    }));
+    vi.stubGlobal("window", { devflow: { getRunEvidence } });
+
+    try {
+      await expect(loadExactRunEvidence(queryRoot, runId)).resolves.toEqual(evidence);
+      expect(getRunEvidence).toHaveBeenCalledWith(queryRoot, runId);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each([
+    ["wrong protocol", (runId: string) => ({
+      protocolVersion: 2,
+      evidence: runEvidenceFor(runId, "succeeded"),
+    })],
+    ["wrong run", (runId: string) => ({
+      protocolVersion: 1,
+      evidence: runEvidenceFor(`${runId}-other`, "succeeded"),
+    })],
+    ["malformed evidence", (runId: string) => ({
+      protocolVersion: 1,
+      evidence: { ...runEvidenceFor(runId, "succeeded"), status: "complete" },
+    })],
+    ["missing evidence", (_runId: string) => ({ protocolVersion: 1 })],
+  ] as const)("rejects a %s private run evidence response", async (_label, responseForRun) => {
+    const runId = "run-exact-rejected";
+    const getRunEvidence = vi.fn(async () => responseForRun(runId));
+    vi.stubGlobal("window", { devflow: { getRunEvidence } });
+
+    try {
+      await expect(loadExactRunEvidence("/tmp/project-alias", runId)).rejects.toThrow(
+        "Invalid exact RunEvidence response.",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("uses the workflow input requirement when building a Hermes planning prompt", () => {
@@ -1187,10 +1248,10 @@ describe("workflow runtime event merging", () => {
       } satisfies AgentRun,
     }));
     const getRunEvents = vi.fn(async () => ({ protocolVersion: 1, events: [] }));
-    const getRunEvidence = vi.fn(async () => ({
+    const getRunEvidence = vi.fn(async (_projectRoot: string, runId: string) => ({
       protocolVersion: 1,
       evidence: {
-        runId: "run-session-1",
+        runId,
         status: "succeeded",
         exitCode: 0,
         changesetId: null,

@@ -57,6 +57,21 @@ const SERIAL_WORKFLOW_PARALLELISM = 1;
 const MAX_WORKFLOW_PARALLELISM = 4;
 const CURRENT_BRANCH_WORKTREE_KEY = "current_branch";
 
+export async function loadExactRunEvidence(queryRoot: string, runId: string): Promise<RunEvidence> {
+  if (typeof window === "undefined" || !window.devflow) {
+    throw new Error("Run evidence is unavailable.");
+  }
+  const response = await window.devflow.getRunEvidence(queryRoot, runId);
+  if (!response || response.protocolVersion !== RUN_EVENT_PROTOCOL_VERSION) {
+    throw new Error("Invalid exact RunEvidence response.");
+  }
+  const evidence = parseRunEvidence(response.evidence);
+  if (!evidence || evidence.runId !== runId) {
+    throw new Error("Invalid exact RunEvidence response.");
+  }
+  return evidence;
+}
+
 export async function startBridgeRun(
   project: ImportedProject,
   session: CanvasSession,
@@ -90,11 +105,10 @@ export async function startBridgeRun(
     prompt: promptForNodeRun(session, node, ledger),
   });
   if (!result || !window.devflow) return null;
-  const [eventsResult, evidenceResult] = await Promise.all([
+  const [eventsResult, evidence] = await Promise.all([
     window.devflow.getRunEvents(project.rootPath, node.runId),
-    window.devflow.getRunEvidence(project.rootPath, node.runId),
+    loadExactRunEvidence(project.rootPath, node.runId),
   ]);
-  const evidence = requireRunEvidence(evidenceResult.evidence);
   return { run: result.run, events: eventsResult.events, evidence, workflowSession: null };
 }
 
