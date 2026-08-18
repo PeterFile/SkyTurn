@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import * as realFs from "node:fs/promises";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -1172,6 +1172,82 @@ test("workspace persistence preserves unavailable projects without trusting them
     });
     assert.equal(reachable.projectRoot, reachableRoot);
   } finally {
+    await rm(userDataPath, { recursive: true, force: true });
+  }
+});
+
+test("restarted run evidence keeps persisted symlink aliases as the narrow root authority", async () => {
+  const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-run-evidence-alias-restart-"));
+  const projectRoot = join(userDataPath, "project-real");
+  const aliasRoot = join(userDataPath, "project-alias");
+  const runId = "run-private-evidence-alias";
+  const evidence = {
+    runId,
+    status: "running",
+    exitCode: null,
+    changesetId: null,
+    checks: [],
+    artifacts: [],
+    review: null,
+    errorReason: null,
+    cancelReason: null,
+    completedAt: null,
+  };
+  const getEvidenceCalls = [];
+  const agentBridge = {
+    async close() {},
+    onRunEvent() { return () => undefined; },
+    listRuns() { return []; },
+    async loadEvents() { return []; },
+    async getEvidence(projectRoot, requestedRunId) {
+      getEvidenceCalls.push([projectRoot, requestedRunId]);
+      return evidence;
+    },
+    async discoverAgents() { return []; },
+  };
+  let loaded;
+  try {
+    await mkdir(projectRoot);
+    const canonicalRoot = await realFs.realpath(projectRoot);
+    await symlink(canonicalRoot, aliasRoot, process.platform === "win32" ? "junction" : "dir");
+    const workspace = workspaceSnapshot(aliasRoot, "persisted-symlink-alias");
+    workspace.projects[0].canonicalRootPath = canonicalRoot;
+    await writeFile(join(userDataPath, "workspace.json"), JSON.stringify(workspace, null, 2), "utf8");
+
+    loaded = await loadMainModule([], {
+      userDataPath,
+      openProjectRoot: canonicalRoot,
+      agentBridge,
+      projectIdentityRegistry: {
+        async remember(rootPath) { return realFs.realpath(rootPath); },
+        async canonicalize(rootPath) { return realFs.realpath(rootPath); },
+      },
+    });
+    const restartedWorkspace = await loaded.ipcHandlers.get("workspace:load")();
+    assert.equal(restartedWorkspace.projects[0].rootPath, aliasRoot);
+    assert.equal(restartedWorkspace.projects[0].canonicalRootPath, canonicalRoot);
+    assert.equal(loaded.exports.openedProjectRoots.has(aliasRoot), true);
+    assert.equal(loaded.exports.openedProjectRoots.has(canonicalRoot), false);
+
+    const getRunEvidence = loaded.ipcHandlers.get("run:evidence");
+    assert.deepEqual(toPlain(await getRunEvidence({}, aliasRoot, runId)), {
+      protocolVersion: 1,
+      evidence,
+    });
+    assert.deepEqual(getEvidenceCalls, [[aliasRoot, runId]]);
+
+    await assert.rejects(
+      getRunEvidence({}, canonicalRoot, runId),
+      /Project root is not open in SkyTurn\./,
+    );
+    assert.deepEqual(getEvidenceCalls, [[aliasRoot, runId]]);
+
+    const opened = await loaded.ipcHandlers.get("project:open")();
+    assert.equal(opened.project.rootPath, canonicalRoot);
+    await getRunEvidence({}, canonicalRoot, runId);
+    assert.deepEqual(getEvidenceCalls, [[aliasRoot, runId], [canonicalRoot, runId]]);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
     await rm(userDataPath, { recursive: true, force: true });
   }
 });
