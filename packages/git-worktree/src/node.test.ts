@@ -2635,6 +2635,93 @@ describe("delivery remote actions", () => {
     }
   });
 
+  it("treats explicit empty review decisions with complete review data as pending unless a review is actionable", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-empty-review-gates-");
+    tempRoots.push(repo.tempRoot);
+    const cases: ReadonlyArray<{
+      label: string;
+      reviewDecision: string | undefined;
+      reviewsJson: unknown;
+      expected: "approved" | "changes_requested" | "pending";
+    }> = [
+      { label: "no-reviews", reviewDecision: "", reviewsJson: [], expected: "pending" },
+      {
+        label: "non-actionable",
+        reviewDecision: "",
+        reviewsJson: [{ state: "COMMENTED" }, { state: "DISMISSED" }, { state: "PENDING" }],
+        expected: "pending",
+      },
+      { label: "approved", reviewDecision: "", reviewsJson: [{ state: "APPROVED" }], expected: "approved" },
+      {
+        label: "changes",
+        reviewDecision: "UNRECOGNIZED",
+        reviewsJson: [{ state: "CHANGES_REQUESTED" }],
+        expected: "changes_requested",
+      },
+    ];
+
+    for (const item of cases) {
+      const fakeGh = await installFakeGh(join(repo.tempRoot, item.label), {
+        prHeadSha: repo.baseCommit,
+        reviewDecision: item.reviewDecision,
+        reviewsJson: item.reviewsJson,
+        checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+      });
+
+      await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+        await expect(checkDeliveryPullRequest({
+          projectRoot: repo.repoRoot,
+          prNumber: 1,
+          expectedHeadSha: repo.baseCommit,
+        })).resolves.toMatchObject({
+          status: "passed",
+          review: { status: item.expected },
+          gate: { reviewStatus: item.expected },
+        });
+      });
+    }
+  });
+
+  it("keeps incomplete, malformed, and unrecognized pull request review data unknown", async () => {
+    const repo = await createTestRepo("skyturn-delivery-pr-unknown-review-gates-");
+    tempRoots.push(repo.tempRoot);
+    const cases: ReadonlyArray<{
+      label: string;
+      reviewDecision?: string;
+      reviewsJson?: unknown;
+    }> = [
+      { label: "missing-decision", reviewsJson: [] },
+      { label: "missing-reviews", reviewDecision: "" },
+      { label: "non-array-reviews", reviewDecision: "", reviewsJson: { state: "COMMENTED" } },
+      { label: "unrecognized-decision", reviewDecision: "UNRECOGNIZED", reviewsJson: [] },
+      { label: "unrecognized-review", reviewDecision: "", reviewsJson: [{ state: "UNRECOGNIZED" }] },
+      { label: "aggregate-review-required", reviewDecision: "", reviewsJson: [{ state: "REVIEW_REQUIRED" }] },
+      { label: "aggregate-review-required-text", reviewDecision: "", reviewsJson: [{ state: "review required" }] },
+      { label: "malformed-review", reviewDecision: "", reviewsJson: [null] },
+    ];
+
+    for (const item of cases) {
+      const fakeGh = await installFakeGh(join(repo.tempRoot, item.label), {
+        prHeadSha: repo.baseCommit,
+        reviewDecision: item.reviewDecision,
+        reviewsJson: item.reviewsJson,
+        checksJson: [{ name: "unit", state: "SUCCESS", workflow: "ci" }],
+      });
+
+      await withFakeGh(fakeGh.binDir, fakeGh.argsPath, async () => {
+        await expect(checkDeliveryPullRequest({
+          projectRoot: repo.repoRoot,
+          prNumber: 1,
+          expectedHeadSha: repo.baseCommit,
+        })).resolves.toMatchObject({
+          status: "passed",
+          review: { status: "unknown" },
+          gate: { reviewStatus: "unknown" },
+        });
+      });
+    }
+  });
+
   it("reports failed and pending pull request checks without merging", async () => {
     const repo = await createTestRepo("skyturn-delivery-pr-checks-status-");
     tempRoots.push(repo.tempRoot);
