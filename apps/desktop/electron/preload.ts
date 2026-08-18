@@ -25,6 +25,11 @@ import type {
   WorkflowPendingInsertBeforeRequest,
   WorkflowPendingInsertBeforeResult,
 } from "@skyturn/persistence" with { "resolution-mode": "import" };
+import {
+  WORKFLOW_EVENT_CHANNEL,
+  parseWorkflowBroadcastEnvelope,
+  parseWorkflowResponseEnvelope,
+} from "./workflowIpcContracts";
 
 const terminal = {
   start: (input: TerminalStartInput): Promise<TerminalStartResult> => ipcRenderer.invoke("terminal:start", input),
@@ -50,37 +55,82 @@ const plan = {
   getState: (input) => ipcRenderer.invoke("plan:getState", input),
 } satisfies PlanApi;
 
+type WorkflowEnvelopeExpectation = "none" | "optional" | "required";
+
+async function invokeWorkflow<T>(
+  channel: string,
+  projectRoot: string,
+  requestArgs: readonly unknown[],
+  envelopeExpectation: WorkflowEnvelopeExpectation = "none",
+): Promise<T> {
+  const expectedSessionId = workflowRequestSessionId(requestArgs[0]);
+  const result: unknown = await ipcRenderer.invoke(channel, projectRoot, ...requestArgs);
+  if (envelopeExpectation === "none") return result as T;
+  if (
+    envelopeExpectation === "optional" &&
+    isRecord(result) &&
+    result.status !== "blocked" &&
+    !Object.hasOwn(result, "canvasSession")
+  ) {
+    return result as T;
+  }
+  return parseWorkflowResponseEnvelope(result, expectedSessionId) as T;
+}
+
+function workflowRequestSessionId(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (!isRecord(value)) return undefined;
+  const direct = typeof value.id === "string"
+    ? value.id
+    : typeof value.sessionId === "string"
+      ? value.sessionId
+      : undefined;
+  if (direct?.trim()) return direct.trim();
+  return isRecord(value.session) && typeof value.session.id === "string" && value.session.id.trim()
+    ? value.session.id.trim()
+    : undefined;
+}
+
 const reassignWorkflowLane = (
   projectRoot: string,
   input: WorkflowLaneReassignRequest,
 ): Promise<WorkflowLaneReassignResult> =>
-  ipcRenderer.invoke("workflow:lane:reassign", projectRoot, input) as Promise<WorkflowLaneReassignResult>;
+  invokeWorkflow("workflow:lane:reassign", projectRoot, [input], "required");
 
 const reassignLane: WorkflowApi["reassignLane"] = reassignWorkflowLane;
 
 const workflow = {
-  createSession: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:createSession", projectRoot, input),
-  finishPlan: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:finishPlan", projectRoot, input),
-  appendUserInput: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:appendUserInput", projectRoot, input),
-  getLedger: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:ledger", projectRoot, sessionId),
+  createSession: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:createSession", projectRoot, [input], "required"),
+  finishPlan: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:finishPlan", projectRoot, [input], "required"),
+  appendUserInput: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:appendUserInput", projectRoot, [input], "required"),
+  getLedger: (projectRoot: string, sessionId: string) => invokeWorkflow("workflow:ledger", projectRoot, [sessionId]),
   updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) =>
-    ipcRenderer.invoke("workflow:nodePosition:update", projectRoot, input),
-  getProjection: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:projection", projectRoot, sessionId),
-  getEvents: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:events", projectRoot, sessionId),
+    invokeWorkflow("workflow:nodePosition:update", projectRoot, [input], "required"),
+  getProjection: (projectRoot: string, sessionId: string) =>
+    invokeWorkflow("workflow:projection", projectRoot, [sessionId], "required"),
+  getEvents: (projectRoot: string, sessionId: string) => invokeWorkflow("workflow:events", projectRoot, [sessionId]),
   reassignLane,
-  getCheckpoints: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:checkpoints", projectRoot, input),
+  getCheckpoints: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:checkpoints", projectRoot, [input]),
   getPendingInsertBeforeRequest: (
     projectRoot: string,
     input: WorkflowPendingInsertBeforeRequest,
-  ): Promise<WorkflowPendingInsertBeforeResult> => ipcRenderer.invoke("workflow:insertBefore:pending", projectRoot, input),
+  ): Promise<WorkflowPendingInsertBeforeResult> => invokeWorkflow("workflow:insertBefore:pending", projectRoot, [input]),
   insertBefore: (projectRoot: string, input: WorkflowInsertBeforeRequest): Promise<WorkflowInsertBeforeResult> =>
-    ipcRenderer.invoke("workflow:insertBefore", projectRoot, input),
-  getRollbackEligibility: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:rollback:eligibility", projectRoot, input),
-  applyRollback: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:rollback:apply", projectRoot, input),
-  requestRepair: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:repair:create", projectRoot, input),
-  requestVariant: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:variant:create", projectRoot, input),
-  answerUserDecision: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:userDecision:answer", projectRoot, input),
-  createWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:create", projectRoot, input),
+    invokeWorkflow("workflow:insertBefore", projectRoot, [input], "required"),
+  getRollbackEligibility: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:rollback:eligibility", projectRoot, [input]),
+  applyRollback: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:rollback:apply", projectRoot, [input], "required"),
+  requestRepair: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:repair:create", projectRoot, [input], "required"),
+  requestVariant: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:variant:create", projectRoot, [input], "required"),
+  answerUserDecision: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:userDecision:answer", projectRoot, [input], "required"),
+  createWorktree: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:worktree:create", projectRoot, [input]),
   compareWorktrees: async (projectRoot: string, input: WorktreeComparisonRequest) => {
     const {
       INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR,
@@ -88,7 +138,7 @@ const workflow = {
       parseWorktreeComparisonRequest,
     } = await import("@skyturn/git-worktree");
     const request = parseWorktreeComparisonRequest(input);
-    const result: unknown = await ipcRenderer.invoke("workflow:worktree:compare", projectRoot, request);
+    const result: unknown = await invokeWorkflow("workflow:worktree:compare", projectRoot, [request]);
     if (!isRecord(result) || typeof result.protocolVersion !== "number") {
       throw new Error(INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
     }
@@ -97,16 +147,23 @@ const workflow = {
       comparison: parseVariantComparisonEvidence(result.comparison),
     };
   },
-  adoptWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:adopt", projectRoot, input),
-  cleanWorktree: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:worktree:clean", projectRoot, input),
-  createDeliveryCommit: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:commit", projectRoot, input),
-  pushDeliveryBranch: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:push", projectRoot, input),
-  createPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:create", projectRoot, input),
-  checkPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:checks", projectRoot, input),
-  mergePullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:merge", projectRoot, input),
-  syncMain: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:syncMain", projectRoot, input),
-  getChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset", projectRoot, input),
-  reconcileFinalChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset:reconcileFinal", projectRoot, input),
+  adoptWorktree: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:worktree:adopt", projectRoot, [input]),
+  cleanWorktree: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:worktree:clean", projectRoot, [input]),
+  createDeliveryCommit: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:delivery:commit", projectRoot, [input]),
+  pushDeliveryBranch: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:delivery:push", projectRoot, [input], "optional"),
+  createPullRequest: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:pullRequest:create", projectRoot, [input], "optional"),
+  checkPullRequest: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:pullRequest:checks", projectRoot, [input]),
+  mergePullRequest: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:pullRequest:merge", projectRoot, [input], "optional"),
+  syncMain: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:delivery:syncMain", projectRoot, [input], "optional"),
+  getChangeset: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:changeset", projectRoot, [input]),
+  reconcileFinalChangeset: (projectRoot: string, input: unknown) =>
+    invokeWorkflow("workflow:changeset:reconcileFinal", projectRoot, [input]),
 } satisfies WorkflowApi;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -129,20 +186,20 @@ contextBridge.exposeInMainWorld("devflow", {
   getRunEvents: (projectRoot: string, runId: string) => ipcRenderer.invoke("run:events", projectRoot, runId),
   listAgentRuns: () => ipcRenderer.invoke("run:list"),
   getRunEvidence: (projectRoot: string, runId: string) => ipcRenderer.invoke("run:evidence", projectRoot, runId),
-  createWorkflowSession: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:createSession", projectRoot, input),
-  finishPlanWorkflow: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:finishPlan", projectRoot, input),
-  appendWorkflowUserInput: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:appendUserInput", projectRoot, input),
-  getWorkflowLedger: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:ledger", projectRoot, sessionId),
+  createWorkflowSession: workflow.createSession,
+  finishPlanWorkflow: workflow.finishPlan,
+  appendWorkflowUserInput: workflow.appendUserInput,
+  getWorkflowLedger: workflow.getLedger,
   getChangeset: (projectRoot: string, node: unknown) => ipcRenderer.invoke("changeset:get", projectRoot, node),
-  reconcileFinalChangeset: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:changeset:reconcileFinal", projectRoot, input),
-  getWorkflowProjection: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:projection", projectRoot, sessionId),
-  getWorkflowEvents: (projectRoot: string, sessionId: string) => ipcRenderer.invoke("workflow:events", projectRoot, sessionId),
-  createWorkflowDeliveryCommit: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:commit", projectRoot, input),
-  pushWorkflowDeliveryBranch: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:push", projectRoot, input),
-  createWorkflowPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:create", projectRoot, input),
-  checkWorkflowPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:checks", projectRoot, input),
-  mergeWorkflowPullRequest: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:pullRequest:merge", projectRoot, input),
-  syncWorkflowMain: (projectRoot: string, input: unknown) => ipcRenderer.invoke("workflow:delivery:syncMain", projectRoot, input),
+  reconcileFinalChangeset: workflow.reconcileFinalChangeset,
+  getWorkflowProjection: workflow.getProjection,
+  getWorkflowEvents: workflow.getEvents,
+  createWorkflowDeliveryCommit: workflow.createDeliveryCommit,
+  pushWorkflowDeliveryBranch: workflow.pushDeliveryBranch,
+  createWorkflowPullRequest: workflow.createPullRequest,
+  checkWorkflowPullRequest: workflow.checkPullRequest,
+  mergeWorkflowPullRequest: workflow.mergePullRequest,
+  syncWorkflowMain: workflow.syncMain,
   workflow,
   terminal,
   plan,
@@ -152,9 +209,13 @@ contextBridge.exposeInMainWorld("devflow", {
     return () => ipcRenderer.removeListener("run:event", handler);
   },
   onWorkflowEvent: (listener: (event: unknown) => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, value: unknown) => listener(value);
-    ipcRenderer.on("workflow:event", handler);
-    return () => ipcRenderer.removeListener("workflow:event", handler);
+    const handler = (_event: Electron.IpcRendererEvent, value: unknown) => {
+      try {
+        listener(parseWorkflowBroadcastEnvelope(value));
+      } catch {}
+    };
+    ipcRenderer.on(WORKFLOW_EVENT_CHANNEL, handler);
+    return () => ipcRenderer.removeListener(WORKFLOW_EVENT_CHANNEL, handler);
   },
   onPlanEvent: (listener: (event: PlanEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, value: PlanEvent) => listener(value);

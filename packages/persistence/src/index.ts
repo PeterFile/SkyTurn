@@ -70,6 +70,27 @@ export interface OpenProjectResult {
   };
 }
 
+export type WorkflowBroadcastCause =
+  | "repair-request"
+  | "terminal-reconciliation"
+  | "projection-query"
+  | "workflow-mutation"
+  | "workflow-advance";
+
+export interface WorkflowSessionEnvelope {
+  protocolVersion: 1;
+  projectRoot: string;
+  sessionId: string;
+  canvasSession: CanvasSession;
+}
+
+export interface WorkflowBroadcastEnvelope extends WorkflowSessionEnvelope {
+  cause: WorkflowBroadcastCause;
+  projection: unknown;
+}
+
+export type WorkflowSessionResult<T extends object> = T & WorkflowSessionEnvelope;
+
 export interface WorkflowInsertBeforeRequest {
   sessionId: string;
   targetLaneId: string;
@@ -86,13 +107,11 @@ export interface WorkflowPendingInsertBeforeResult {
   requestId: string | null;
 }
 
-export interface WorkflowInsertBeforeResult {
-  protocolVersion: number;
+export interface WorkflowInsertBeforeResult extends WorkflowSessionEnvelope {
   status: "inserted";
   laneId: string;
   event: unknown;
   projection: unknown;
-  canvasSession: CanvasSession | null;
 }
 
 export interface WorkflowNodePositionUpdateRequest {
@@ -121,11 +140,9 @@ export interface WorkflowLaneReassignedEvent {
   };
 }
 
-export interface WorkflowLaneReassignResult {
-  protocolVersion: number;
+export interface WorkflowLaneReassignResult extends WorkflowSessionEnvelope {
   event: WorkflowLaneReassignedEvent;
   projection: unknown;
-  canvasSession: CanvasSession;
 }
 
 export type WorkflowRollbackBlockCode =
@@ -148,14 +165,12 @@ export interface WorkflowRollbackBlockReason {
   manualRepairRequired?: boolean;
 }
 
-export interface WorkflowDeliveryBlockedResult {
-  protocolVersion: number;
+export interface WorkflowDeliveryBlockedResult extends WorkflowSessionEnvelope {
   status: "blocked";
   event: unknown | null;
   blockedReason: WorkflowRollbackBlockReason;
   manualRepairRequired: true;
   projection: unknown;
-  canvasSession: CanvasSession | null;
 }
 
 export type WorkflowDeliveryPushResult =
@@ -279,12 +294,12 @@ export interface PlanApi {
 }
 
 export interface WorkflowApi {
-  createSession: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; session: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  finishPlan: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  appendUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  createSession: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ session: unknown; projection: unknown }>>;
+  finishPlan: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ event: unknown; ledger: unknown; projection: unknown }>>;
+  appendUserInput: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ event: unknown; ledger: unknown; projection: unknown }>>;
   getLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: WorkflowLedgerSummary }>;
-  updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) => Promise<{ protocolVersion: number; event: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  getProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
+  updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) => Promise<WorkflowSessionResult<{ event: unknown; projection: unknown }>>;
+  getProjection: (projectRoot: string, sessionId: string) => Promise<WorkflowSessionResult<{ projection: unknown }>>;
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   reassignLane: (projectRoot: string, input: WorkflowLaneReassignRequest) => Promise<WorkflowLaneReassignResult>;
   getCheckpoints: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; checkpoints: WorkflowNodeCheckpoint[] }>;
@@ -299,8 +314,7 @@ export interface WorkflowApi {
     blockedReason: WorkflowRollbackBlockReason | null;
     manualRepairRequired: boolean;
   }>;
-  applyRollback: (projectRoot: string, input: unknown) => Promise<{
-    protocolVersion: number;
+  applyRollback: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{
     status: "applied" | "blocked";
     event?: unknown;
     requestedEvent?: unknown;
@@ -308,23 +322,18 @@ export interface WorkflowApi {
     blockedReason: WorkflowRollbackBlockReason | null;
     manualRepairRequired: boolean;
     projection: unknown;
-    canvasSession: CanvasSession | null;
-  }>;
-  requestRepair: (projectRoot: string, input: unknown) => Promise<{
-    protocolVersion: number;
+  }>>;
+  requestRepair: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{
     status: "requested";
     event: unknown;
     projection: unknown;
-    canvasSession: CanvasSession | null;
-  }>;
-  requestVariant: (projectRoot: string, input: unknown) => Promise<{
-    protocolVersion: number;
+  }>>;
+  requestVariant: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{
     status: "requested";
     event: unknown;
     projection: unknown;
-    canvasSession: CanvasSession | null;
-  }>;
-  answerUserDecision: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  }>>;
+  answerUserDecision: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ event: unknown; projection: unknown }>>;
   createWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown; worktree: WorkflowWorktreeIdentity }>;
   compareWorktrees: (projectRoot: string, input: WorktreeComparisonRequest) => Promise<{ protocolVersion: number; comparison: VariantComparisonEvidence }>;
   adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "adopted" | "failed"; event: unknown | null; adoption: WorkflowVariantAdoption & { status: "adopted" | "failed" } }>;
@@ -354,13 +363,13 @@ export interface DevflowApi {
   getRunEvents: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; events: RunEvent[] }>;
   listAgentRuns: () => Promise<{ protocolVersion: number; runs: AgentRun[] }>;
   getRunEvidence: (projectRoot: string, runId: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;
-  createWorkflowSession: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; session: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  finishPlanWorkflow: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
-  appendWorkflowUserInput: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; event: unknown; ledger: unknown; projection: unknown; canvasSession: CanvasSession | null }>;
+  createWorkflowSession: WorkflowApi["createSession"];
+  finishPlanWorkflow: WorkflowApi["finishPlan"];
+  appendWorkflowUserInput: WorkflowApi["appendUserInput"];
   getWorkflowLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: unknown }>;
   getChangeset: (projectRoot: string, node: CanvasNode) => Promise<{ protocolVersion: number; changeset: Changeset }>;
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
-  getWorkflowProjection: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; projection: unknown; canvasSession: CanvasSession | null }>;
+  getWorkflowProjection: WorkflowApi["getProjection"];
   workflow: WorkflowApi;
   terminal: TerminalApi;
   plan: PlanApi;
@@ -372,7 +381,7 @@ export interface DevflowApi {
   mergeWorkflowPullRequest: (projectRoot: string, input: unknown) => Promise<WorkflowPullRequestMergeResult>;
   syncWorkflowMain: (projectRoot: string, input: unknown) => Promise<WorkflowDeliveryMainSyncResult>;
   onRunEvent: (listener: (event: RunEvent) => void) => () => void;
-  onWorkflowEvent: (listener: (event: unknown) => void) => () => void;
+  onWorkflowEvent: (listener: (event: WorkflowBroadcastEnvelope) => void) => () => void;
   onPlanEvent: (listener: (event: PlanEvent) => void) => () => void;
 }
 

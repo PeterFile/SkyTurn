@@ -150,7 +150,11 @@ test("Electron main tracks every top-level workflow store operation, not only wo
   assert.equal(workflowChannels.length, 28);
   assert.equal(registeredWorkflowHandlers.length, workflowChannels.length);
   assert.match(main, /const workflowStoreOperationTasks = new Set<Promise<unknown>>\(\)/);
-  assert.match(main, /return await registerWorkflowStoreOperation\(\(\) => handler\(\.\.\.args\)\)/);
+  assert.match(
+    main,
+    /return await registerWorkflowStoreOperation\(async \(\) => \{\s*assertKnownProjectRoot\(queryProjectRoot\);\s*const sourceProjectRoot = await planProjectIdentities\.canonicalize\(queryProjectRoot\);\s*const result = await handler\(\.\.\.args\);/,
+  );
+  assert.match(main, /return decorateWorkflowResponseEnvelope\(result, sourceProjectRoot\)/);
   assert.match(main, /workflowStoreOperationTasks\.add\(operation\)/);
   const workflowOperationRegistry = main.slice(
     main.indexOf("function registerWorkflowStoreOperation"),
@@ -265,8 +269,10 @@ test("Electron main tracks every top-level workflow store operation, not only wo
   assert.match(workflowBroadcast, /cause:\s*WorkflowBroadcastCause\s*=\s*"workflow-mutation"/);
   assert.match(
     workflowBroadcast,
-    /send\("workflow:event",\s*\{\s*projectRoot,\s*sessionId,\s*cause,\s*projection,\s*canvasSession\s*\}\)/,
+    /send\(WORKFLOW_EVENT_CHANNEL,\s*envelope\)/,
   );
+  assert.match(workflowBroadcast, /publishedWorkflowStoreIdentity\(store\)/);
+  assert.match(workflowBroadcast, /parseWorkflowBroadcastEnvelope/);
 
   const checkpointHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:checkpoints"'),
@@ -2208,7 +2214,7 @@ test("workflow lane reassignment public contract is typed and returns the author
   assert.match(contract, /agentKind:\s*AgentKind/);
   assert.match(contract, /kind:\s*"workflow\.lane\.reassigned"/);
   assert.match(contract, /previousAgentKind:\s*AgentKind/);
-  assert.match(contract, /canvasSession:\s*CanvasSession/);
+  assert.match(contract, /WorkflowLaneReassignResult extends WorkflowSessionEnvelope/);
 });
 
 test("workflow insert-before contract is narrow and returns authoritative lane identity", async () => {
@@ -2228,7 +2234,7 @@ test("workflow insert-before contract is narrow and returns authoritative lane i
   assert.doesNotMatch(request, /runtimePolicy|executable|sandbox|agentKind/);
   assert.match(result, /status:\s*"inserted"/);
   assert.match(result, /laneId:\s*string/);
-  assert.match(result, /canvasSession:\s*CanvasSession \| null/);
+  assert.match(result, /WorkflowInsertBeforeResult extends WorkflowSessionEnvelope/);
 });
 
 test("workflow insert-before pending identity is resolved only by Electron backend truth", async () => {
@@ -3338,6 +3344,244 @@ test("branch facts IPC stays in Electron main and uses git-worktree node helpers
   assert.match(preload, /getProjectBranchFacts:\s*\(projectRoot: string\) => ipcRenderer\.invoke\("project:branchFacts", projectRoot\)/);
 });
 
+test("workflow transport parsers accept only exact self-consistent session envelopes", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const canvasSession = workflowCanvasSession("session-1");
+  const response = {
+    protocolVersion: 1,
+    projectRoot: "/canonical/project",
+    sessionId: "session-1",
+    projection: { lanes: [] },
+    canvasSession,
+  };
+  const broadcast = {
+    ...response,
+    cause: "workflow-mutation",
+  };
+
+  assert.equal(contracts.WORKFLOW_IPC_PROTOCOL_VERSION, 1);
+  assert.equal(contracts.WORKFLOW_EVENT_CHANNEL, "workflow:event");
+  assert.equal(contracts.parseWorkflowResponseEnvelope(response, "session-1"), response);
+  assert.equal(contracts.parseWorkflowBroadcastEnvelope(broadcast), broadcast);
+
+  for (const invalid of [
+    { ...response, protocolVersion: undefined },
+    { ...response, protocolVersion: 2 },
+    { ...response, projectRoot: "" },
+    { ...response, projectRoot: "relative/project" },
+    { ...response, projectRoot: "/canonical/../project" },
+    { ...response, sessionId: undefined },
+    { ...response, sessionId: "session-2" },
+    { ...response, canvasSession: null },
+    { ...response, canvasSession: { ...canvasSession, kind: "plan" } },
+    { ...response, canvasSession: { ...canvasSession, nodes: undefined } },
+    Object.create(response),
+  ]) {
+    assert.throws(
+      () => contracts.parseWorkflowResponseEnvelope(invalid, "session-1"),
+      /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT/,
+    );
+  }
+  assert.throws(
+    () => contracts.parseWorkflowResponseEnvelope(response, "session-2"),
+    /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT/,
+  );
+  for (const invalid of [
+    { ...broadcast, cause: "renderer-refresh" },
+    { ...broadcast, cause: undefined },
+    { ...broadcast, projection: undefined },
+  ]) {
+    assert.throws(
+      () => contracts.parseWorkflowBroadcastEnvelope(invalid),
+      /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT/,
+    );
+  }
+});
+
+test("workflow handler registers before identity resolution and preserves caller arguments", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const events = [];
+  const aliasRoot = "/opened/project-alias";
+  const canonicalRoot = "/canonical/project";
+  const input = { sessionId: "session-1" };
+  let handlerCalls = 0;
+  const runtime = await loadMainWorkflowTransportRuntime({
+    contracts,
+    assertKnownProjectRoot(projectRoot) {
+      events.push(`authorize:${projectRoot}`);
+      assert.equal(projectRoot, aliasRoot);
+    },
+    async canonicalize(projectRoot) {
+      events.push(`canonicalize:${projectRoot}`);
+      assert.equal(projectRoot, aliasRoot);
+      return canonicalRoot;
+    },
+    registerWorkflowStoreOperation(task) {
+      events.push("register");
+      return Promise.resolve().then(task);
+    },
+  });
+  const wrapped = runtime.workflowHandler(async (projectRoot, receivedInput) => {
+    handlerCalls += 1;
+    events.push("handler");
+    assert.equal(projectRoot, aliasRoot);
+    assert.equal(receivedInput, input);
+    return {
+      protocolVersion: 99,
+      projection: { lanes: [] },
+      canvasSession: workflowCanvasSession("session-1"),
+    };
+  });
+
+  const result = await wrapped({}, aliasRoot, input);
+  assert.equal(handlerCalls, 1);
+  assert.deepEqual(events, [
+    "register",
+    `authorize:${aliasRoot}`,
+    `canonicalize:${aliasRoot}`,
+    "handler",
+  ]);
+  assert.equal(result.protocolVersion, 1);
+  assert.equal(result.projectRoot, canonicalRoot);
+  assert.equal(result.sessionId, "session-1");
+
+  let remappedHandlerCalls = 0;
+  const remapped = await loadMainWorkflowTransportRuntime({
+    contracts,
+    assertKnownProjectRoot() {},
+    async canonicalize() {
+      throw new Error("Project root is not open in SkyTurn.");
+    },
+    registerWorkflowStoreOperation(task) {
+      return Promise.resolve().then(task);
+    },
+  });
+  const remappedHandler = remapped.workflowHandler(() => {
+    remappedHandlerCalls += 1;
+    return { ok: true };
+  });
+  await assert.rejects(remappedHandler({}, aliasRoot, input), /Project root is not open in SkyTurn/);
+  assert.equal(remappedHandlerCalls, 0);
+});
+
+test("workflow broadcasts use the unique published store identity and never caller aliases", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const sent = [];
+  const firstStore = workflowBroadcastStore("session-shared", "first");
+  const secondStore = workflowBroadcastStore("session-shared", "second");
+  const workflowStores = new Map([
+    ["/canonical/first", firstStore],
+    ["/canonical/second", secondStore],
+  ]);
+  const runtime = await loadMainWorkflowTransportRuntime({
+    contracts,
+    workflowStores,
+    send(channel, value) {
+      sent.push({ channel, value });
+    },
+  });
+
+  runtime.broadcastWorkflowProjection("/alias/first", "session-shared", firstStore);
+  runtime.broadcastWorkflowProjection("/alias/second", "session-shared", secondStore, "projection-query");
+  assert.deepEqual(sent.map(({ channel, value }) => ({
+    channel,
+    projectRoot: value.projectRoot,
+    sessionId: value.sessionId,
+    canvasSessionId: value.canvasSession.id,
+    cause: value.cause,
+  })), [
+    {
+      channel: "workflow:event",
+      projectRoot: "/canonical/first",
+      sessionId: "session-shared",
+      canvasSessionId: "session-shared",
+      cause: "workflow-mutation",
+    },
+    {
+      channel: "workflow:event",
+      projectRoot: "/canonical/second",
+      sessionId: "session-shared",
+      canvasSessionId: "session-shared",
+      cause: "projection-query",
+    },
+  ]);
+
+  const unregisteredStore = workflowBroadcastStore("session-shared", "unregistered");
+  runtime.broadcastWorkflowProjection("/canonical/unregistered", "session-shared", unregisteredStore);
+  workflowStores.set("/canonical/duplicate", firstStore);
+  runtime.broadcastWorkflowProjection("/canonical/first", "session-shared", firstStore);
+  assert.equal(sent.length, 2);
+});
+
+test("mocked preload rejects invalid workflow responses and drops invalid broadcasts", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const exactResponse = {
+    protocolVersion: 1,
+    projectRoot: "/canonical/project",
+    sessionId: "session-1",
+    projection: { lanes: [] },
+    canvasSession: workflowCanvasSession("session-1"),
+  };
+  const runtime = await loadPreloadRuntime(contracts);
+  runtime.setInvoke(async (channel, projectRoot, sessionId) => {
+    assert.equal(channel, "workflow:projection");
+    assert.equal(projectRoot, "/opened/project-alias");
+    assert.equal(sessionId, "session-1");
+    return exactResponse;
+  });
+  assert.equal(
+    await runtime.api.workflow.getProjection("/opened/project-alias", "session-1"),
+    exactResponse,
+  );
+  assert.equal(
+    await runtime.api.getWorkflowProjection("/opened/project-alias", "session-1"),
+    exactResponse,
+  );
+
+  for (const invalid of [
+    { ...exactResponse, protocolVersion: 2 },
+    { ...exactResponse, projectRoot: "/canonical/../project" },
+    { ...exactResponse, sessionId: "session-2" },
+    { ...exactResponse, canvasSession: { ...exactResponse.canvasSession, id: "session-2" } },
+  ]) {
+    runtime.setInvoke(async () => invalid);
+    await assert.rejects(
+      runtime.api.workflow.getProjection("/opened/project-alias", "session-1"),
+      /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT/,
+    );
+  }
+
+  runtime.setInvoke(async () => ({ protocolVersion: 1, status: "blocked" }));
+  await assert.rejects(
+    runtime.api.workflow.pushDeliveryBranch("/opened/project-alias", { sessionId: "session-1" }),
+    /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT/,
+  );
+
+  runtime.setInvoke(async () => exactResponse);
+  assert.equal(
+    await runtime.api.workflow.createSession("/opened/project-alias", {
+      id: "session-1",
+      sessionId: "ignored-session-id",
+    }),
+    exactResponse,
+  );
+
+  let resolveResponse;
+  runtime.setInvoke(() => new Promise((resolve) => { resolveResponse = resolve; }));
+  const request = { sessionId: "session-1", text: "Continue." };
+  const pending = runtime.api.workflow.appendUserInput("/opened/project-alias", request);
+  request.sessionId = "session-2";
+  resolveResponse(exactResponse);
+  assert.equal(await pending, exactResponse);
+
+  const received = [];
+  const unsubscribe = runtime.api.onWorkflowEvent((event) => received.push(event));
+  runtime.emit("workflow:event", { ...exactResponse, cause: "unexpected" });
+  runtime.emit("workflow:event", { ...exactResponse, cause: "workflow-mutation" });
+  assert.deepEqual(received, [{ ...exactResponse, cause: "workflow-mutation" }]);
+  unsubscribe();
+});
+
 test("workflow IPC contract errors are recognizable and block decision nodes", async () => {
   const contracts = await loadWorkflowIpcContracts();
 
@@ -3511,6 +3755,145 @@ async function loadWorkflowIpcContracts() {
   const module = { exports: {} };
   vm.runInNewContext(output, { module, exports: module.exports }, { filename: "workflowIpcContracts.ts" });
   return module.exports;
+}
+
+async function loadMainWorkflowTransportRuntime({
+  contracts,
+  assertKnownProjectRoot = () => undefined,
+  canonicalize = async (projectRoot) => projectRoot,
+  registerWorkflowStoreOperation = (task) => Promise.resolve().then(task),
+  workflowStores = new Map(),
+  send = () => undefined,
+}) {
+  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const source = [
+    extractFunction(main, "decorateWorkflowResponseEnvelope"),
+    extractFunction(main, "workflowHandler"),
+    extractFunction(main, "publishedWorkflowStoreIdentity"),
+    extractFunction(main, "broadcastWorkflowProjection"),
+    "module.exports = { workflowHandler, broadcastWorkflowProjection };",
+  ].join("\n");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  const module = { exports: {} };
+  vm.runInNewContext(output, {
+    BrowserWindow: {
+      getAllWindows: () => [{ webContents: { send } }],
+    },
+    WORKFLOW_IPC_PROTOCOL_VERSION: contracts.WORKFLOW_IPC_PROTOCOL_VERSION,
+    WORKFLOW_EVENT_CHANNEL: contracts.WORKFLOW_EVENT_CHANNEL,
+    assertKnownProjectRoot,
+    isRecord(value) {
+      return !!value && typeof value === "object" && !Array.isArray(value);
+    },
+    materializeRendererCanvasSession(store, sessionId) {
+      return store.materializeCanvasSession(sessionId);
+    },
+    module,
+    exports: module.exports,
+    normalizeWorkflowIpcError(error) {
+      return error instanceof Error ? error : new Error(String(error));
+    },
+    parseWorkflowBroadcastEnvelope: contracts.parseWorkflowBroadcastEnvelope,
+    parseWorkflowResponseEnvelope: contracts.parseWorkflowResponseEnvelope,
+    planProjectIdentities: { canonicalize },
+    registerWorkflowStoreOperation,
+    workflowStores,
+  }, { filename: "mainWorkflowTransport.ts" });
+  return module.exports;
+}
+
+async function loadPreloadRuntime(contracts) {
+  const source = await readFile(join(root, "electron", "preload.ts"), "utf8");
+  const ts = require("typescript");
+  const output = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  let api;
+  let invoke = async () => undefined;
+  const listeners = new Map();
+  const ipcRenderer = {
+    invoke(...args) {
+      return invoke(...args);
+    },
+    on(channel, listener) {
+      const channelListeners = listeners.get(channel) ?? new Set();
+      channelListeners.add(listener);
+      listeners.set(channel, channelListeners);
+    },
+    removeListener(channel, listener) {
+      listeners.get(channel)?.delete(listener);
+    },
+  };
+  const module = { exports: {} };
+  vm.runInNewContext(output, {
+    module,
+    exports: module.exports,
+    require(specifier) {
+      if (specifier === "electron") {
+        return {
+          contextBridge: {
+            exposeInMainWorld(name, value) {
+              assert.equal(name, "devflow");
+              api = value;
+            },
+          },
+          ipcRenderer,
+        };
+      }
+      if (specifier === "./workflowIpcContracts") return contracts;
+      return require(specifier);
+    },
+  }, { filename: "preload.ts" });
+  assert.ok(api);
+  return {
+    api,
+    emit(channel, value) {
+      for (const listener of listeners.get(channel) ?? []) listener({}, value);
+    },
+    setInvoke(nextInvoke) {
+      invoke = nextInvoke;
+    },
+  };
+}
+
+function workflowCanvasSession(id) {
+  return {
+    id,
+    projectId: "project-1",
+    title: "Workflow",
+    goal: "Implement the task.",
+    mode: "fast",
+    target: { executionTarget: "current_branch", branch: "main" },
+    createdAt: "2026-08-19T00:00:00.000Z",
+    updatedAt: "2026-08-19T00:00:00.000Z",
+    kind: "canvas",
+    hermesPlannerSessionId: `hermes-${id}`,
+    plannerNodeId: "planner-node",
+    nodes: [],
+    edges: [],
+    activeNodeId: null,
+  };
+}
+
+function workflowBroadcastStore(sessionId, marker) {
+  return {
+    materializeFlowProjection() {
+      return { marker };
+    },
+    materializeCanvasSession(receivedSessionId) {
+      assert.equal(receivedSessionId, sessionId);
+      return workflowCanvasSession(sessionId);
+    },
+  };
 }
 
 async function loadWorktreeComparisonRuntime() {
