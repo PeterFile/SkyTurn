@@ -1676,7 +1676,9 @@ function normalizePullRequestMergeable(value: unknown): boolean {
 function normalizePullRequestReviewGate(value: Record<string, unknown>): DeliveryPullRequestReviewGate {
   const decision = textFromUnknown(value.reviewDecision);
   const latestReview = latestActionableReview(value.reviews);
-  const status = reviewStatusFromDecision(decision) ?? reviewStatusFromDecision(latestReview?.state) ?? "unknown";
+  const status = reviewStatusFromDecision(decision)
+    ?? reviewStatusFromDecision(latestReview?.state)
+    ?? (hasOnlyExplicitNonActionableReviews(value.reviewDecision, value.reviews) ? "pending" : "unknown");
   return {
     status,
     decision: sanitizeCommandOutput(decision ?? latestReview?.state ?? "UNKNOWN"),
@@ -1684,6 +1686,19 @@ function normalizePullRequestReviewGate(value: Record<string, unknown>): Deliver
     ...(latestReview?.reviewer ? { reviewer: sanitizeCommandOutput(latestReview.reviewer) } : {}),
     ...(latestReview?.link ? { link: sanitizeCommandOutput(latestReview.link) } : {}),
   };
+}
+
+function hasOnlyExplicitNonActionableReviews(decision: unknown, value: unknown): boolean {
+  if (decision !== "" || !Array.isArray(value)) return false;
+  return value.every((review) => {
+    if (!isRecord(review)) return false;
+    const state = textFromUnknown(review.state) ?? textFromUnknown(review.reviewDecision);
+    if (!state) return false;
+    const normalizedState = state.toLowerCase();
+    return normalizedState === "commented"
+      || normalizedState === "dismissed"
+      || normalizedState === "pending";
+  });
 }
 
 function latestActionableReview(value: unknown): { state: string; reviewer?: string; detail?: string; link?: string } | null {
