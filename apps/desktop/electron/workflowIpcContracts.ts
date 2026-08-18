@@ -1,4 +1,35 @@
+import type { CanvasSession } from "@skyturn/project-core" with { "resolution-mode": "import" };
+
+export const WORKFLOW_IPC_PROTOCOL_VERSION = 1 as const;
+export const WORKFLOW_EVENT_CHANNEL = "workflow:event" as const;
 export const WORKFLOW_IPC_ERROR_PREFIX = "SKYTURN_WORKFLOW_IPC_ERROR";
+
+export type WorkflowBroadcastCause =
+  | "repair-request"
+  | "terminal-reconciliation"
+  | "projection-query"
+  | "workflow-mutation"
+  | "workflow-advance";
+
+export interface WorkflowSessionEnvelope {
+  protocolVersion: typeof WORKFLOW_IPC_PROTOCOL_VERSION;
+  projectRoot: string;
+  sessionId: string;
+  canvasSession: CanvasSession;
+}
+
+export interface WorkflowBroadcastEnvelope extends WorkflowSessionEnvelope {
+  cause: WorkflowBroadcastCause;
+  projection: unknown;
+}
+
+const workflowBroadcastCauses: readonly WorkflowBroadcastCause[] = [
+  "repair-request",
+  "terminal-reconciliation",
+  "projection-query",
+  "workflow-mutation",
+  "workflow-advance",
+];
 
 export const WORKFLOW_IPC_CHANNELS = {
   createSession: "workflow:createSession",
@@ -29,6 +60,47 @@ export const WORKFLOW_IPC_CHANNELS = {
   changeset: "workflow:changeset",
   changesetReconcileFinal: "workflow:changeset:reconcileFinal",
 } as const;
+
+export function parseWorkflowResponseEnvelope<T>(
+  value: T,
+  expectedSessionId?: string,
+): T & WorkflowSessionEnvelope {
+  if (!isRecord(value)) throw workflowIpcError("INVALID_INPUT", "Workflow response must be an object.");
+  if (!hasOwnFields(value, ["protocolVersion", "projectRoot", "sessionId", "canvasSession"])) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow response provenance is missing.");
+  }
+  if (value.protocolVersion !== WORKFLOW_IPC_PROTOCOL_VERSION) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow response protocol version is invalid.");
+  }
+  if (!isCanonicalProjectRoot(value.projectRoot)) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow response project root is not canonical.");
+  }
+  if (!isExactNonEmptyString(value.sessionId)) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow response session id is invalid.");
+  }
+  if (expectedSessionId !== undefined && (
+    !isExactNonEmptyString(expectedSessionId) || value.sessionId !== expectedSessionId
+  )) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow response session does not match the request.");
+  }
+  assertWorkflowCanvasSession(value.canvasSession);
+  if (value.canvasSession.id !== value.sessionId) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow response session identity is inconsistent.");
+  }
+  return value as T & WorkflowSessionEnvelope;
+}
+
+export function parseWorkflowBroadcastEnvelope(value: unknown): WorkflowBroadcastEnvelope {
+  const envelope = parseWorkflowResponseEnvelope(value);
+  const record = envelope as WorkflowSessionEnvelope & Record<string, unknown>;
+  if (!workflowBroadcastCauses.includes(record.cause as WorkflowBroadcastCause)) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow broadcast cause is invalid.");
+  }
+  if (!Object.hasOwn(record, "projection") || record.projection === undefined) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow broadcast projection is missing.");
+  }
+  return record as unknown as WorkflowBroadcastEnvelope;
+}
 
 export interface WorkflowNodePositionUpdateInput {
   sessionId: string;
@@ -202,6 +274,75 @@ function requiredEvidenceFromBackendRecord(value: Record<string, unknown>): stri
 
 function sameStrings(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function assertWorkflowCanvasSession(value: unknown): asserts value is CanvasSession {
+  if (
+    !isRecord(value) ||
+    !hasOwnFields(value, [
+      "id",
+      "projectId",
+      "title",
+      "goal",
+      "mode",
+      "target",
+      "createdAt",
+      "updatedAt",
+      "kind",
+      "hermesPlannerSessionId",
+      "plannerNodeId",
+      "nodes",
+      "edges",
+      "activeNodeId",
+    ]) ||
+    value.kind !== "canvas" ||
+    !isExactNonEmptyString(value.id) ||
+    !isExactNonEmptyString(value.projectId) ||
+    !isExactNonEmptyString(value.title) ||
+    typeof value.goal !== "string" ||
+    (value.mode !== "fast" && value.mode !== "plan") ||
+    !isRecord(value.target) ||
+    !isExactNonEmptyString(value.createdAt) ||
+    !isExactNonEmptyString(value.updatedAt) ||
+    !isExactNonEmptyString(value.hermesPlannerSessionId) ||
+    !isExactNonEmptyString(value.plannerNodeId) ||
+    !Array.isArray(value.nodes) ||
+    !Array.isArray(value.edges) ||
+    (value.activeNodeId !== null && !isExactNonEmptyString(value.activeNodeId))
+  ) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow response canvas session is invalid.");
+  }
+}
+
+function isCanonicalProjectRoot(value: unknown): value is string {
+  if (!isExactNonEmptyString(value) || value.includes("\0")) return false;
+  if (value.startsWith("/")) {
+    if (value === "/") return true;
+    if (value.endsWith("/")) return false;
+    return hasCanonicalPathSegments(value.slice(1).split("/"));
+  }
+  if (/^[A-Za-z]:\\/.test(value)) {
+    if (value.includes("/") || (value.length > 3 && value.endsWith("\\"))) return false;
+    return value.length === 3 || hasCanonicalPathSegments(value.slice(3).split("\\"));
+  }
+  if (value.startsWith("\\\\")) {
+    if (value.includes("/") || value.endsWith("\\")) return false;
+    const segments = value.slice(2).split("\\");
+    return segments.length >= 2 && hasCanonicalPathSegments(segments);
+  }
+  return false;
+}
+
+function hasCanonicalPathSegments(segments: string[]): boolean {
+  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+function hasOwnFields(value: Record<string, unknown>, fields: readonly string[]): boolean {
+  return fields.every((field) => Object.hasOwn(value, field));
+}
+
+function isExactNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value === value.trim();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

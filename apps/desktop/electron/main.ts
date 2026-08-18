@@ -31,13 +31,18 @@ import type {
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core" with { "resolution-mode": "import" };
 import {
+  WORKFLOW_EVENT_CHANNEL,
+  WORKFLOW_IPC_PROTOCOL_VERSION,
   authorizeRunStartExpectedArtifacts,
   isTrustedPlannerRootStartInput,
   normalizeWorkflowIpcError,
   normalizeWorkflowNodePositionUpdate,
+  parseWorkflowBroadcastEnvelope,
+  parseWorkflowResponseEnvelope,
   rejectMissingWorkflowProjectionNode,
   workflowIpcError,
   workflowStartInputError,
+  type WorkflowBroadcastCause,
   type WorkflowIpcErrorCode,
 } from "./workflowIpcContracts";
 import { compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
@@ -651,12 +656,6 @@ const workspaceSaveError = "Workspace could not be saved.";
 const workspaceSaveUnavailableError = "Workspace saving is unavailable while SkyTurn is shutting down.";
 const workspaceProjectAuthorizationError = "Workspace contains a project that is not open in SkyTurn.";
 const workflowAdvanceShutdownError = "Workflow advancement is unavailable while SkyTurn is shutting down.";
-type WorkflowBroadcastCause =
-  | "repair-request"
-  | "terminal-reconciliation"
-  | "projection-query"
-  | "workflow-mutation"
-  | "workflow-advance";
 const openedProjectRoots = new Set<string>();
 const planProjectIdentities = createPlanProjectIdentityRegistry();
 let agentBridge: AgentBridgeHost | null = null;
@@ -851,6 +850,7 @@ ipcMain.handle("project:open", async (): Promise<OpenProjectResult> => {
 
   const rootPath = result.filePaths[0];
   const canonicalRootPath = await planProjectIdentities.remember(rootPath);
+  await planProjectIdentities.remember(canonicalRootPath, canonicalRootPath);
   openedProjectRoots.add(rootPath);
   openedProjectRoots.add(canonicalRootPath);
   return {
@@ -3792,16 +3792,33 @@ function terminalWorkflowBroadcastCause(
 }
 
 function broadcastWorkflowProjection(
-  projectRoot: string,
+  _projectRoot: string,
   sessionId: string,
   store: WorkflowStoreHost,
   cause: WorkflowBroadcastCause = "workflow-mutation",
 ): void {
+  const projectRoot = publishedWorkflowStoreIdentity(store);
+  if (!projectRoot) return;
   const projection = store.materializeFlowProjection(sessionId);
   const canvasSession = materializeRendererCanvasSession(store, sessionId);
+  const envelope = parseWorkflowBroadcastEnvelope({
+    protocolVersion: WORKFLOW_IPC_PROTOCOL_VERSION,
+    projectRoot,
+    sessionId,
+    cause,
+    projection,
+    canvasSession,
+  });
   for (const window of BrowserWindow.getAllWindows()) {
-    window.webContents.send("workflow:event", { projectRoot, sessionId, cause, projection, canvasSession });
+    window.webContents.send(WORKFLOW_EVENT_CHANNEL, envelope);
   }
+}
+
+function publishedWorkflowStoreIdentity(store: WorkflowStoreHost): string | null {
+  const identities = [...workflowStores.entries()]
+    .filter(([, candidate]) => candidate === store)
+    .map(([projectRoot]) => projectRoot);
+  return identities.length === 1 ? identities[0] : null;
 }
 
 function broadcastTerminalEvent(event: TerminalRendererEvent): void {
@@ -6291,12 +6308,29 @@ function recordRunCheckpointFailure(
   recordWorkflowCheckpointFailure(store, input);
 }
 
-function workflowHandler<T extends unknown[], R>(
+function decorateWorkflowResponseEnvelope<R>(result: R, projectRoot: string): R {
+  if (!isRecord(result) || !Object.hasOwn(result, "canvasSession")) return result;
+  const sessionId = isRecord(result.canvasSession) ? result.canvasSession.id : undefined;
+  return parseWorkflowResponseEnvelope({
+    ...result,
+    protocolVersion: WORKFLOW_IPC_PROTOCOL_VERSION,
+    projectRoot,
+    sessionId,
+  }) as R;
+}
+
+function workflowHandler<T extends [string, ...unknown[]], R>(
   handler: (...args: T) => Promise<R> | R,
 ): (_event: Electron.IpcMainInvokeEvent, ...args: T) => Promise<R> {
   return async (_event, ...args) => {
+    const queryProjectRoot = args[0];
     try {
-      return await registerWorkflowStoreOperation(() => handler(...args));
+      return await registerWorkflowStoreOperation(async () => {
+        assertKnownProjectRoot(queryProjectRoot);
+        const sourceProjectRoot = await planProjectIdentities.canonicalize(queryProjectRoot);
+        const result = await handler(...args);
+        return decorateWorkflowResponseEnvelope(result, sourceProjectRoot);
+      });
     } catch (error) {
       throw normalizeWorkflowIpcError(error);
     }
