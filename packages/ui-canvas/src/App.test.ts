@@ -115,6 +115,107 @@ function canvasSessionForTest(id: string, projectId = "project-1"): CanvasSessio
   };
 }
 
+interface WorkflowResponseGuardForTest {
+  projectId: string;
+  queryRoot: string;
+  canonicalRoot: string;
+  sessionId: string;
+  requestSession: CanvasSession | null;
+  generation: number;
+}
+
+type ApplyWorkflowResponseForTest = (
+  workspace: WorkspaceState,
+  response: unknown,
+  guard: WorkflowResponseGuardForTest,
+  currentGeneration: number,
+) => WorkspaceState;
+
+type ApplyWorkflowBroadcastForTest = (
+  workspace: WorkspaceState,
+  event: unknown,
+  submissions: ReadonlyMap<string, NewSessionSubmissionStateForTest>,
+) => WorkspaceState;
+
+type DecorateNewSessionInstallationForTest = (
+  workspace: WorkspaceState,
+  authoritative: CanvasSession,
+) => WorkspaceState;
+
+function applyWorkflowResponseForTest(): ApplyWorkflowResponseForTest {
+  const helper = Reflect.get(AppModule, "applyAuthoritativeWorkflowSessionResponse");
+  expect(helper).toBeTypeOf("function");
+  return helper as ApplyWorkflowResponseForTest;
+}
+
+function applyWorkflowBroadcastForTest(): ApplyWorkflowBroadcastForTest {
+  const helper = Reflect.get(AppModule, "applyAuthoritativeWorkflowBroadcast");
+  expect(helper).toBeTypeOf("function");
+  return helper as ApplyWorkflowBroadcastForTest;
+}
+
+function decorateNewSessionInstallationForTest(): DecorateNewSessionInstallationForTest {
+  const helper = Reflect.get(AppModule, "decorateNewSessionInstallation");
+  expect(helper).toBeTypeOf("function");
+  return helper as DecorateNewSessionInstallationForTest;
+}
+
+function workflowProjectForTest(
+  id: string,
+  rootPath: string,
+  canonicalRootPath: string | undefined,
+) {
+  return {
+    id,
+    name: id,
+    rootPath,
+    ...(canonicalRootPath === undefined ? {} : { canonicalRootPath }),
+    devflowPath: `${rootPath}/.devflow`,
+    openedAt: "2026-07-21T00:00:00.000Z",
+  };
+}
+
+function workflowEnvelopeForTest(
+  canvasSession: CanvasSession,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    protocolVersion: 1,
+    projectRoot: "/canonical/project-1",
+    sessionId: canvasSession.id,
+    canvasSession,
+    ...overrides,
+  };
+}
+
+function workflowGuardForTest(
+  requestSession: CanvasSession | null,
+  overrides: Partial<WorkflowResponseGuardForTest> = {},
+): WorkflowResponseGuardForTest {
+  return {
+    projectId: requestSession?.projectId ?? "project-1",
+    queryRoot: "/opened/project-1-alias",
+    canonicalRoot: "/canonical/project-1",
+    sessionId: requestSession?.id ?? "session-1",
+    requestSession,
+    generation: 1,
+    ...overrides,
+  };
+}
+
+function workflowWorkspaceForTest(
+  projects: WorkspaceState["projects"],
+  sessions: WorkspaceState["sessions"],
+): WorkspaceState {
+  return {
+    ...emptyWorkspace(),
+    projects,
+    sessions,
+    activeProjectId: projects[0]?.id ?? null,
+    activeSessionId: sessions[0]?.id ?? null,
+  };
+}
+
 function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
   return {
     id: "test-node",
@@ -279,9 +380,66 @@ describe("Plan finish workflow handoff", () => {
     expect(stale.workspace.sessions[0]).toEqual(changedPlan);
   });
 
+  it("installs the exact project's finished Canvas when another project has the same session id", () => {
+    const capture = Reflect.get(AppModule, "capturePlanFinishBoundary") as undefined | ((session: PlanSession) => unknown);
+    const install = Reflect.get(AppModule, "installFinishedPlanCanvas") as undefined | ((
+      workspace: ReturnType<typeof workspaceWithPlan>,
+      boundary: unknown,
+      canvas: ReturnType<typeof convertPlanToCanvas>,
+    ) => { workspace: ReturnType<typeof workspaceWithPlan>; installed: boolean });
+    expect(capture).toBeTypeOf("function");
+    expect(install).toBeTypeOf("function");
+    const plan = editablePlanSession();
+    const unrelatedPlan = { ...plan, projectId: "project-2" };
+    const workspace = {
+      ...workspaceWithPlan(plan),
+      sessions: [unrelatedPlan, plan],
+    };
+    const boundary = capture!(plan);
+    const canvas = convertPlanToCanvas(plan);
+
+    const result = install!(workspace, boundary, canvas);
+
+    expect(result.installed).toBe(true);
+    expect(result.workspace.sessions[0]).toBe(unrelatedPlan);
+    expect(result.workspace.sessions[1]).toEqual(canvas);
+  });
+
+  it.each([
+    ["another project", "project-2", "other-project-session", "project-2"],
+    ["another session", "project-1", "other-session", "project-1"],
+  ])("installs a late finished Canvas without stealing focus from %s", (
+    _label,
+    activeProjectId,
+    activeSessionId,
+    activeSessionProjectId,
+  ) => {
+    const plan = editablePlanSession();
+    const activeSession = canvasSessionForTest(activeSessionId, activeSessionProjectId);
+    const workspace = {
+      ...workspaceWithPlan(plan),
+      projects: [
+        workflowProjectForTest("project-1", "/project-1", "/project-1"),
+        workflowProjectForTest("project-2", "/project-2", "/project-2"),
+      ],
+      sessions: [plan, activeSession],
+      activeProjectId,
+      activeSessionId,
+    };
+    const boundary = AppModule.capturePlanFinishBoundary(plan);
+    const canvas = convertPlanToCanvas(plan);
+
+    const result = AppModule.installFinishedPlanCanvas(workspace, boundary, canvas);
+
+    expect(result.installed).toBe(true);
+    expect(result.workspace.sessions).toEqual([canvas, activeSession]);
+    expect(result.workspace.activeProjectId).toBe(activeProjectId);
+    expect(result.workspace.activeSessionId).toBe(activeSessionId);
+  });
+
   it("hands the exact approved Plan to the dedicated backend finish boundary and returns its authoritative canvas", async () => {
     const finish = Reflect.get(AppModule, "finishPlanSession") as undefined | ((
-      project: { id: string; name: string; rootPath: string; devflowPath: string; openedAt: string },
+      project: { id: string; name: string; rootPath: string; canonicalRootPath: string; devflowPath: string; openedAt: string },
       session: PlanSession,
     ) => Promise<unknown>);
     expect(finish).toBeTypeOf("function");
@@ -304,9 +462,18 @@ describe("Plan finish workflow handoff", () => {
     const calls: Array<{ kind: string; input: unknown }> = [];
     vi.stubGlobal("window", {
       devflow: {
-        finishPlanWorkflow: async (_projectRoot: string, input: unknown) => {
+        finishPlanWorkflow: async (projectRoot: string, input: unknown) => {
+          expect(projectRoot).toBe("/opened/repo-alias");
           calls.push({ kind: "finish", input });
-          return { protocolVersion: 1, event: {}, ledger: {}, projection: {}, canvasSession: authoritativeCanvas };
+          return {
+            protocolVersion: 1,
+            projectRoot: "/repo",
+            sessionId: plan.id,
+            event: {},
+            ledger: {},
+            projection: {},
+            canvasSession: authoritativeCanvas,
+          };
         },
       },
     });
@@ -314,7 +481,8 @@ describe("Plan finish workflow handoff", () => {
       const result = await finish({
         id: "project-1",
         name: "Project",
-        rootPath: "/repo",
+        rootPath: "/opened/repo-alias",
+        canonicalRootPath: "/repo",
         devflowPath: "/repo/.devflow",
         openedAt: "2026-07-17T00:00:00.000Z",
       }, plan);
@@ -348,11 +516,20 @@ describe("Plan finish workflow handoff", () => {
     if (!finish) return;
     vi.stubGlobal("window", {
       devflow: {
-        finishPlanWorkflow: async () => ({ canvasSession: null }),
+        finishPlanWorkflow: async () => ({
+          protocolVersion: 1,
+          projectRoot: "/repo",
+          sessionId: "plan-edit-test",
+          canvasSession: null,
+        }),
       },
     });
     try {
-      await expect(finish({ rootPath: "/repo" }, editablePlanSession())).rejects.toThrow(
+      await expect(finish({
+        id: "project-1",
+        rootPath: "/opened/repo-alias",
+        canonicalRootPath: "/repo",
+      }, editablePlanSession())).rejects.toThrow(
         "Authoritative canvas session was not returned.",
       );
     } finally {
@@ -468,7 +645,7 @@ describe("deriveSessionTarget", () => {
     expect(appSource).not.toContain("function insertBeforeBrowserFallback");
     expect(INSERT_BEFORE_UNAVAILABLE_ERROR).toBe("Insert before is unavailable because the desktop workflow backend is not connected.");
     expect(submitIntent).toContain("result.canvasSession");
-    expect(submitIntent).toContain("replaceCanvasSession(result.canvasSession)");
+    expect(submitIntent).toContain("replaceCanvasSession(result.canvasSession, result)");
   });
 
   it("uses current_branch executionTarget and selectedBranch", () => {
@@ -1481,7 +1658,10 @@ describe("UI source validation", () => {
       /claimCompletedBridgeRunPersistence|persistCompletedBridgeRunResult|applyCompletedBridgeRunPersistenceResult/,
     );
     expect(workflowEventEffect).toContain("applyAuthoritativeWorkflowBroadcast");
-    expect(workflowEventEffect).toContain("workflowProjectionGenerationRef.current.set");
+    expect(workflowEventEffect).toContain("advanceWorkflowGeneration(workflowProjectionGenerationRef.current");
+    expect(workflowEventEffect).toContain("projectId: envelope.canvasSession.projectId");
+    expect(workflowEventEffect).toContain("canonicalRoot: envelope.projectRoot");
+    expect(workflowEventEffect).toContain("sessionId: envelope.sessionId");
   });
 
   it("renders compact agent readiness near canvas composer but not on start page", async () => {
@@ -1526,10 +1706,9 @@ describe("UI source validation", () => {
     expect(fnBody).toContain("selectedOption");
     expect(fnBody).toContain("action");
 
-    expect(fnBody).toContain("const { canvasSession } = result");
-    expect(fnBody).toContain("if (canvasSession)");
-    expect(fnBody).toContain("captureWorkflowSessionResponseGuard(activeSession.id, activeSession)");
-    expect(fnBody).toContain("applyGuardedWorkflowSessionResponse(canvasSession, responseGuard)");
+    expect(fnBody).toContain("captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession)");
+    expect(fnBody).toContain("answerUserDecision(responseGuard.queryRoot");
+    expect(fnBody).toContain("applyGuardedWorkflowSessionResponse(result, responseGuard)");
 
     const devflowCheck = fnBody.indexOf("if (window.devflow");
     const fallbackUpdate = fnBody.indexOf("updateCanvasSession(activeSession.id");
@@ -1576,9 +1755,9 @@ describe("UI source validation", () => {
     expect(fnBody).toContain("sessionId: activeSession.id");
     expect(fnBody).toContain("laneId: nodeId");
     expect(fnBody).toContain("agentKind: nextAgent");
-    expect(fnBody).toContain("const { canvasSession } = result");
-    expect(fnBody).toContain("captureWorkflowSessionResponseGuard(activeSession.id, activeSession)");
-    expect(fnBody).toContain("applyGuardedWorkflowSessionResponse(canvasSession, responseGuard)");
+    expect(fnBody).toContain("captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession)");
+    expect(fnBody).toContain("reassignLane(responseGuard.queryRoot");
+    expect(fnBody).toContain("applyGuardedWorkflowSessionResponse(result, responseGuard)");
 
     expect(fnBody).toContain('setNodeActionError("Workflow backend unavailable.")');
     expect(fnBody).toContain(".catch((error)");
@@ -1978,55 +2157,224 @@ describe("Slice C UI behavior", () => {
     expect(new Set([first.id, afterSuccess.id, otherProject.id]).size).toBe(3);
   });
 
-  it("keeps a newer workflow broadcast when an older mutation response arrives last", () => {
-    const applyResponse = Reflect.get(AppModule, "applyAuthoritativeWorkflowSessionResponse") as undefined | ((
-      workspace: { sessions: Array<CanvasSession | PlanSession> },
-      response: CanvasSession,
-      guard: { sessionId: string; requestSession: CanvasSession | null; generation: number },
-      currentGeneration: number,
-    ) => { sessions: Array<CanvasSession | PlanSession> });
-    expect(applyResponse).toBeTypeOf("function");
-    if (!applyResponse) return;
-    const requested = canvasSessionForTest("session-race");
-    const staleResponse = { ...requested, title: "stale mutation response" };
-    const broadcast = { ...requested, title: "newer workflow broadcast" };
-    const workspace = { sessions: [broadcast] };
+  it("accepts an alias query root only with the captured canonical response provenance", () => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const requested = canvasSessionForTest("session-alias");
+    const authoritative = { ...requested, title: "Authoritative alias response" };
+    const workspace = workflowWorkspaceForTest(
+      [workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1")],
+      [requested],
+    );
+    const guard = workflowGuardForTest(requested, { sessionId: requested.id });
 
-    const next = applyResponse(workspace, staleResponse, {
-      sessionId: requested.id,
-      requestSession: requested,
-      generation: 7,
-    }, 8);
+    const next = applyResponse(
+      workspace,
+      workflowEnvelopeForTest(authoritative),
+      guard,
+      guard.generation,
+    );
 
-    expect(next).toBe(workspace);
-    expect(next.sessions[0]).toBe(broadcast);
+    expect(next).not.toBe(workspace);
+    expect(next.sessions).toEqual([authoritative]);
   });
 
-  it("applies a matching authoritative mutation response and rejects a switched request session", () => {
-    const applyResponse = Reflect.get(AppModule, "applyAuthoritativeWorkflowSessionResponse") as undefined | ((
-      workspace: { sessions: Array<CanvasSession | PlanSession> },
-      response: CanvasSession,
-      guard: { sessionId: string; requestSession: CanvasSession | null; generation: number },
-      currentGeneration: number,
-    ) => { sessions: Array<CanvasSession | PlanSession> });
-    expect(applyResponse).toBeTypeOf("function");
-    if (!applyResponse) return;
-    const requested = canvasSessionForTest("session-race");
-    const response = { ...requested, title: "authoritative response" };
-    const workspace = { sessions: [requested] };
+  it.each([
+    ["missing protocol", { protocolVersion: undefined }],
+    ["wrong protocol", { protocolVersion: 2 }],
+    ["wrong root", { projectRoot: "/canonical/project-other" }],
+    ["wrong envelope session", { sessionId: "session-other" }],
+    ["wrong canvas id", { canvasSession: canvasSessionForTest("session-other") }],
+    ["wrong logical project", { canvasSession: canvasSessionForTest("session-authority", "project-2") }],
+  ])("rejects a workflow response with %s", (_label, overrides) => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const requested = canvasSessionForTest("session-authority");
+    const workspace = workflowWorkspaceForTest(
+      [workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1")],
+      [requested],
+    );
+    const guard = workflowGuardForTest(requested);
 
-    expect(applyResponse(workspace, response, {
-      sessionId: requested.id,
-      requestSession: requested,
-      generation: 2,
-    }, 2).sessions[0]).toBe(response);
+    expect(applyResponse(
+      workspace,
+      workflowEnvelopeForTest({ ...requested, title: "Rejected" }, overrides),
+      guard,
+      guard.generation,
+    )).toBe(workspace);
+  });
 
-    const switched = { sessions: [{ ...requested, title: "switched away and back" }] };
-    expect(applyResponse(switched, response, {
-      sessionId: requested.id,
-      requestSession: requested,
-      generation: 2,
-    }, 2)).toBe(switched);
+  it("rejects a workflow response with an absent protocol field or unavailable canonical authority", () => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const requested = canvasSessionForTest("session-missing-authority");
+    const project = workflowProjectForTest(
+      "project-1",
+      "/opened/project-1-alias",
+      "/canonical/project-1",
+    );
+    const workspace = workflowWorkspaceForTest([project], [requested]);
+    const guard = workflowGuardForTest(requested);
+    const response = workflowEnvelopeForTest(requested);
+    const { protocolVersion: _protocolVersion, ...missingProtocol } = response;
+    const missingCanonicalWorkspace = workflowWorkspaceForTest([
+      workflowProjectForTest("project-1", project.rootPath, undefined),
+    ], [requested]);
+
+    expect(applyResponse(workspace, missingProtocol, guard, guard.generation)).toBe(workspace);
+    expect(applyResponse(
+      missingCanonicalWorkspace,
+      response,
+      guard,
+      guard.generation,
+    )).toBe(missingCanonicalWorkspace);
+    expect(applyResponse(
+      workspace,
+      response,
+      { ...guard, canonicalRoot: "/canonical/../project-1" },
+      guard.generation,
+    )).toBe(workspace);
+  });
+
+  it("rejects responses after query-root remap or request-session replacement", () => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const requested = canvasSessionForTest("session-remap");
+    const authoritative = { ...requested, title: "Stale response" };
+    const guard = workflowGuardForTest(requested, { sessionId: requested.id });
+    const remapped = workflowWorkspaceForTest(
+      [workflowProjectForTest("project-1", "/opened/project-1-new-alias", "/canonical/project-1")],
+      [requested],
+    );
+    const replaced = workflowWorkspaceForTest(
+      [workflowProjectForTest("project-1", guard.queryRoot, guard.canonicalRoot)],
+      [{ ...requested, title: "Newer local identity" }],
+    );
+
+    expect(applyResponse(
+      remapped,
+      workflowEnvelopeForTest(authoritative),
+      guard,
+      guard.generation,
+    )).toBe(remapped);
+    expect(applyResponse(
+      replaced,
+      workflowEnvelopeForTest(authoritative),
+      guard,
+      guard.generation,
+    )).toBe(replaced);
+  });
+
+  it("isolates identical session ids by logical project", () => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const first = canvasSessionForTest("shared-session", "project-1");
+    const second = canvasSessionForTest("shared-session", "project-2");
+    const authoritativeSecond = { ...second, title: "Project 2 update" };
+    const workspace = workflowWorkspaceForTest([
+      workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1"),
+      workflowProjectForTest("project-2", "/opened/project-2-alias", "/canonical/project-2"),
+    ], [first, second]);
+    const firstGuard = workflowGuardForTest(first);
+    const secondGuard = workflowGuardForTest(second, {
+      projectId: "project-2",
+      queryRoot: "/opened/project-2-alias",
+      canonicalRoot: "/canonical/project-2",
+    });
+
+    expect(applyResponse(
+      workspace,
+      workflowEnvelopeForTest(authoritativeSecond, {
+        projectRoot: secondGuard.canonicalRoot,
+        canvasSession: authoritativeSecond,
+      }),
+      firstGuard,
+      firstGuard.generation,
+    )).toBe(workspace);
+
+    const next = applyResponse(
+      workspace,
+      workflowEnvelopeForTest(authoritativeSecond, {
+        projectRoot: secondGuard.canonicalRoot,
+        canvasSession: authoritativeSecond,
+      }),
+      secondGuard,
+      secondGuard.generation,
+    );
+    expect(next.sessions).toEqual([first, authoritativeSecond]);
+  });
+
+  it("lets two sessions in one project complete without invalidating each other", () => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const first = canvasSessionForTest("session-a");
+    const second = canvasSessionForTest("session-b");
+    const workspace = workflowWorkspaceForTest(
+      [workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1")],
+      [first, second],
+    );
+    const firstResult = { ...first, title: "Session A result" };
+    const secondResult = { ...second, title: "Session B result" };
+    const firstGuard = workflowGuardForTest(first);
+    const secondGuard = workflowGuardForTest(second);
+
+    const afterFirst = applyResponse(
+      workspace,
+      workflowEnvelopeForTest(firstResult),
+      firstGuard,
+      firstGuard.generation,
+    );
+    const afterSecond = applyResponse(
+      afterFirst,
+      workflowEnvelopeForTest(secondResult),
+      secondGuard,
+      secondGuard.generation,
+    );
+
+    expect(afterSecond.sessions).toEqual([firstResult, secondResult]);
+  });
+
+  it("rejects one stale scoped response while an unrelated identity remains valid", () => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const stale = canvasSessionForTest("session-stale");
+    const unrelated = canvasSessionForTest("session-valid", "project-2");
+    const workspace = workflowWorkspaceForTest([
+      workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1"),
+      workflowProjectForTest("project-2", "/opened/project-2-alias", "/canonical/project-2"),
+    ], [stale, unrelated]);
+    const staleGuard = workflowGuardForTest(stale, { generation: 4 });
+    const unrelatedGuard = workflowGuardForTest(unrelated, {
+      projectId: "project-2",
+      queryRoot: "/opened/project-2-alias",
+      canonicalRoot: "/canonical/project-2",
+      generation: 9,
+    });
+
+    expect(applyResponse(
+      workspace,
+      workflowEnvelopeForTest({ ...stale, title: "Stale" }),
+      staleGuard,
+      5,
+    )).toBe(workspace);
+
+    const authoritative = { ...unrelated, title: "Still valid" };
+    const next = applyResponse(
+      workspace,
+      workflowEnvelopeForTest(authoritative, {
+        projectRoot: unrelatedGuard.canonicalRoot,
+        canvasSession: authoritative,
+      }),
+      unrelatedGuard,
+      unrelatedGuard.generation,
+    );
+    expect(next.sessions).toEqual([stale, authoritative]);
+  });
+
+  it("keys workflow generations by logical project, canonical root, and session", async () => {
+    const appSource = await readSource("./App.tsx");
+    const generationKey = appSource.slice(
+      appSource.indexOf("function workflowAuthorityGenerationKey"),
+      appSource.indexOf("function currentWorkflowGeneration"),
+    );
+
+    expect(generationKey).toContain(
+      "JSON.stringify([authority.projectId, authority.canonicalRoot, authority.sessionId])",
+    );
+    expect(generationKey).not.toContain("authority.queryRoot");
   });
 
   it("retries a failed New Session with the same session and input identities", async () => {
@@ -2135,40 +2483,74 @@ describe("Slice C UI behavior", () => {
     const original = canvasSessionForTest("session-1");
     const replacement = { ...original, title: "Authoritative replacement" };
     const inserted = canvasSessionForTest("session-2");
+    const sameIdOtherProject = canvasSessionForTest("session-1", "project-2");
 
     expect(upsertCanvasSession!([original], replacement)).toEqual([replacement]);
     expect(upsertCanvasSession!([original], inserted)).toEqual([original, inserted]);
+    expect(upsertCanvasSession!([original, sameIdOtherProject], replacement)).toEqual([
+      replacement,
+      sameIdOtherProject,
+    ]);
+  });
+
+  it.each([
+    {
+      label: "another project's Start Page",
+      activeProjectId: "project-2",
+      activeSessionId: null,
+      activeSessionProjectId: null,
+    },
+    {
+      label: "another session",
+      activeProjectId: "project-1",
+      activeSessionId: "other-session",
+      activeSessionProjectId: "project-1",
+    },
+  ])("installs a late New Session in the background without stealing focus from $label", ({
+    activeProjectId,
+    activeSessionId,
+    activeSessionProjectId,
+  }) => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const decorate = decorateNewSessionInstallationForTest();
+    const authoritative = canvasSessionForTest("late-new-session");
+    const activeSession = activeSessionId && activeSessionProjectId
+      ? canvasSessionForTest(activeSessionId, activeSessionProjectId)
+      : null;
+    const workspace = {
+      ...workflowWorkspaceForTest([
+        workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1"),
+        workflowProjectForTest("project-2", "/opened/project-2-alias", "/canonical/project-2"),
+      ], activeSession ? [activeSession] : []),
+      activeProjectId,
+      activeSessionId,
+    };
+    const guard = workflowGuardForTest(null, { sessionId: authoritative.id });
+
+    const guarded = applyResponse(
+      workspace,
+      workflowEnvelopeForTest(authoritative),
+      guard,
+      guard.generation,
+    );
+    const next = decorate(guarded, authoritative);
+
+    expect(next.sessions).toEqual(activeSession ? [activeSession, authoritative] : [authoritative]);
+    expect(next.changesets).toEqual(guarded.changesets);
+    expect(next.activeProjectId).toBe(activeProjectId);
+    expect(next.activeSessionId).toBe(activeSessionId);
   });
 
   it("activates a busy New Session from its authoritative broadcast and rejects the stale create response", () => {
-    const applyBroadcast = Reflect.get(AppModule, "applyAuthoritativeWorkflowBroadcast") as undefined | ((
-      workspace: WorkspaceState,
-      session: CanvasSession,
-      submissions: ReadonlyMap<string, NewSessionSubmissionStateForTest>,
-    ) => WorkspaceState);
-    const applyResponse = Reflect.get(AppModule, "applyAuthoritativeWorkflowSessionResponse") as undefined | ((
-      workspace: WorkspaceState,
-      response: CanvasSession,
-      guard: { sessionId: string; requestSession: CanvasSession | null; generation: number },
-      currentGeneration: number,
-    ) => WorkspaceState);
-    expect(applyBroadcast).toBeTypeOf("function");
-    expect(applyResponse).toBeTypeOf("function");
-    if (!applyBroadcast || !applyResponse) return;
+    const applyBroadcast = applyWorkflowBroadcastForTest();
+    const applyResponse = applyWorkflowResponseForTest();
 
     const seed = canvasSessionForTest("session-broadcast");
     const authoritative = { ...seed, title: "Authoritative planner projection" };
-    const workspace: WorkspaceState = {
-      ...emptyWorkspace(),
-      projects: [{
-        id: "project-1",
-        name: "Project",
-        rootPath: "/repo",
-        devflowPath: "/repo/.devflow",
-        openedAt: "2026-07-21T00:00:00.000Z",
-      }],
-      activeProjectId: "project-1",
-    };
+    const workspace = workflowWorkspaceForTest(
+      [workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1")],
+      [],
+    );
     const submissions = new Map<string, NewSessionSubmissionStateForTest>([["scope", {
       session: seed,
       inputId: "composer-session-broadcast",
@@ -2176,73 +2558,101 @@ describe("Slice C UI behavior", () => {
       error: null,
     }]]);
 
-    const broadcastWorkspace = applyBroadcast(workspace, authoritative, submissions);
+    const broadcastWorkspace = applyBroadcast(
+      workspace,
+      {
+        ...workflowEnvelopeForTest(authoritative),
+        cause: "workflow-mutation",
+        projection: {},
+      },
+      submissions,
+    );
     expect(broadcastWorkspace.activeProjectId).toBe(authoritative.projectId);
     expect(broadcastWorkspace.activeSessionId).toBe(authoritative.id);
     expect(broadcastWorkspace.sessions).toEqual([authoritative]);
 
     const staleResponse = { ...authoritative, title: "Stale create response" };
-    const afterStaleResponse = applyResponse(broadcastWorkspace, staleResponse, {
-      sessionId: seed.id,
-      requestSession: null,
-      generation: 0,
-    }, 1);
+    const guard = workflowGuardForTest(null, { sessionId: seed.id, generation: 1 });
+    const afterStaleResponse = applyResponse(
+      broadcastWorkspace,
+      workflowEnvelopeForTest(staleResponse),
+      guard,
+      2,
+    );
     expect(afterStaleResponse).toBe(broadcastWorkspace);
     expect(afterStaleResponse.activeSessionId).toBe(authoritative.id);
     expect(afterStaleResponse.sessions).toEqual([authoritative]);
   });
 
-  it.each([
-    ["finished attempt", { busy: false }],
-    ["different attempt session", { sessionId: "session-other" }],
-    ["different attempt project", { attemptProjectId: "project-2" }],
-    ["switched project", { activeProjectId: "project-2" }],
-    ["opened session", { activeSessionId: "session-existing" }],
-  ])("only upserts a workflow broadcast for a %s", (_label, override) => {
-    const applyBroadcast = Reflect.get(AppModule, "applyAuthoritativeWorkflowBroadcast") as undefined | ((
-      workspace: WorkspaceState,
-      session: CanvasSession,
-      submissions: ReadonlyMap<string, NewSessionSubmissionStateForTest>,
-    ) => WorkspaceState);
-    expect(applyBroadcast).toBeTypeOf("function");
-    if (!applyBroadcast) return;
-
-    const authoritative = canvasSessionForTest("session-broadcast");
-    const attempt = canvasSessionForTest(
-      override.sessionId ?? authoritative.id,
-      override.attemptProjectId ?? authoritative.projectId,
+  it("accepts an exact broadcast for an existing registered Canvas session", () => {
+    const applyBroadcast = applyWorkflowBroadcastForTest();
+    const current = canvasSessionForTest("session-existing");
+    const authoritative = { ...current, title: "Broadcast update" };
+    const workspace = workflowWorkspaceForTest(
+      [workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1")],
+      [current],
     );
-    const workspace: WorkspaceState = {
-      ...emptyWorkspace(),
-      activeProjectId: override.activeProjectId ?? authoritative.projectId,
-      activeSessionId: override.activeSessionId ?? null,
-    };
-    const submissions = new Map<string, NewSessionSubmissionStateForTest>([["scope", {
-      session: attempt,
-      inputId: "composer-session-broadcast",
-      busy: override.busy ?? true,
-      error: null,
-    }]]);
 
-    const next = applyBroadcast(workspace, authoritative, submissions);
+    const next = applyBroadcast(workspace, {
+      ...workflowEnvelopeForTest(authoritative),
+      cause: "workflow-advance",
+      projection: {},
+    }, new Map());
+
     expect(next.sessions).toEqual([authoritative]);
-    expect(next.activeProjectId).toBe(workspace.activeProjectId);
-    expect(next.activeSessionId).toBe(workspace.activeSessionId);
   });
 
-  it("rejects a projection response after the requested session identity or generation changes", () => {
-    const shouldApplyWorkflowProjection = Reflect.get(AppModule, "shouldApplyWorkflowProjection") as undefined | ((
-      requestedSession: CanvasSession,
-      currentSession: CanvasSession | null,
-      requestedGeneration: number,
-      currentGeneration: number,
-    ) => boolean);
-    expect(shouldApplyWorkflowProjection).toBeTypeOf("function");
-    const requested = canvasSessionForTest("session-1");
+  it("rejects invalid, stale, and conflicting workflow broadcasts without workspace mutation", () => {
+    const applyBroadcast = applyWorkflowBroadcastForTest();
+    const current = canvasSessionForTest("session-broadcast");
+    const authoritative = { ...current, title: "Rejected broadcast" };
+    const project = workflowProjectForTest(
+      "project-1",
+      "/opened/project-1-alias",
+      "/canonical/project-1",
+    );
+    const workspace = workflowWorkspaceForTest([project], [current]);
+    const exactEvent = {
+      ...workflowEnvelopeForTest(authoritative),
+      cause: "workflow-mutation",
+      projection: {},
+    };
+    const { protocolVersion: _protocolVersion, ...missingProtocol } = exactEvent;
+    const wrongProjectCanvas = canvasSessionForTest(current.id, "project-2");
+    const wrongCanvasId = canvasSessionForTest("session-other");
+    const planConflict = { ...editablePlanSession(), id: current.id };
+    const staleWorkspace = workflowWorkspaceForTest(
+      [workflowProjectForTest("project-1", project.rootPath, "/canonical/project-remapped")],
+      [current],
+    );
+    const currentSessionConflict = workflowWorkspaceForTest([project], [planConflict]);
+    const sameIdOtherProject = workflowWorkspaceForTest([
+      project,
+      workflowProjectForTest("project-2", "/opened/project-2-alias", "/canonical/project-2"),
+    ], [canvasSessionForTest(current.id, "project-2")]);
 
-    expect(shouldApplyWorkflowProjection!(requested, requested, 3, 3)).toBe(true);
-    expect(shouldApplyWorkflowProjection!(requested, { ...requested }, 3, 3)).toBe(false);
-    expect(shouldApplyWorkflowProjection!(requested, requested, 3, 4)).toBe(false);
+    const cases: Array<[string, WorkspaceState, unknown]> = [
+      ["missing protocol", workspace, missingProtocol],
+      ["unsupported protocol", workspace, { ...exactEvent, protocolVersion: 2 }],
+      ["wrong project", workspace, {
+        ...exactEvent,
+        canvasSession: wrongProjectCanvas,
+      }],
+      ["wrong root", workspace, { ...exactEvent, projectRoot: "/canonical/project-other" }],
+      ["wrong session", workspace, { ...exactEvent, sessionId: "session-other" }],
+      ["wrong canvas id", workspace, { ...exactEvent, canvasSession: wrongCanvasId }],
+      ["stale registered root", staleWorkspace, exactEvent],
+      ["non-Canvas current session", currentSessionConflict, exactEvent],
+      ["same id in another project", sameIdOtherProject, exactEvent],
+      ["no intended session", workflowWorkspaceForTest([project], []), exactEvent],
+    ];
+
+    for (const [label, candidateWorkspace, event] of cases) {
+      expect(
+        applyBroadcast(candidateWorkspace, event, new Map()),
+        label,
+      ).toBe(candidateWorkspace);
+    }
   });
 
   it("catches a failed bottom submission and reuses its input id on retry", async () => {
@@ -2405,13 +2815,13 @@ describe("Slice C UI behavior", () => {
     const composer = appSource.slice(appSource.indexOf("function CanvasComposer("));
     expect(submitHandler).toContain("async function appendRequirementNode(action?: ComposerAction)");
     expect(submitHandler).toContain("await submitSelectedNodeAction(action, text)");
-    expect(appSource).toContain("workflow.requestRepair(projectRoot");
-    expect(appSource).toContain("workflow.requestVariant(projectRoot");
-    expect(appSource).toContain("workflow.applyRollback(projectRoot");
+    expect(appSource).toContain("workflow.requestRepair(responseGuard.queryRoot");
+    expect(appSource).toContain("workflow.requestVariant(responseGuard.queryRoot");
+    expect(appSource).toContain("workflow.applyRollback(responseGuard.queryRoot");
     expect(appSource).toContain("instruction: requestText");
-    expect(appSource).toContain("activeSession?.updatedAt, selectedNode]");
+    expect(appSource).toContain("activeSession?.updatedAt,");
     expect(appSource).not.toContain("activeSession?.updatedAt, selectedNode?.id");
-    expect(appSource).toContain("workflow.getProjection(projectRoot, sessionId)");
+    expect(appSource).toContain("workflow.getProjection(authority.queryRoot, sessionId)");
     expect(appSource).toContain("const projectionState = buildSelectedNodeActionState");
     expect(appSource).toContain("const rollbackPayload = projectionState.rollbackPayload");
     expect(appSource).not.toContain("hydrateSelectedNodeActionStateFromEvents");
@@ -2427,7 +2837,7 @@ describe("Slice C UI behavior", () => {
     expect(submitHandler).toContain("nodeActionPayloadMatchesSelection(selectedNodeActionScopeRef.current, actionScope.sessionId, actionScope.nodeId) &&");
     expect(submitHandler).toContain("selectedNodeActionGenerationRef.current === actionGeneration");
     expect(submitHandler).toContain("if (!actionStillCurrent()) return;");
-    expect(submitHandler).toContain("applyWorkflowActionResult(result, workflowResponseGuard, actionStillCurrent)");
+    expect(submitHandler).toContain("applyWorkflowActionResult(result, responseGuard, actionStillCurrent)");
     expect(submitHandler).toContain("await refreshWorkflowProjection(actionStillCurrent)");
     expect(submitHandler).toContain("if (actionStillCurrent()) setNodeActionError");
     expect(submitHandler).toContain("if (actionStillCurrent()) setNodeActionBusy(null)");
@@ -2445,26 +2855,27 @@ describe("Slice C UI behavior", () => {
     const importProject = appSource.slice(appSource.indexOf("async function importProject"), appSource.indexOf("function openProjectStartPage"));
     const addSession = appSource.slice(appSource.indexOf("async function addSessionFromComposer"), appSource.indexOf("function updatePlanSection"));
     const appendRequirement = appSource.slice(appSource.indexOf("async function appendRequirementNode"), appSource.indexOf("async function submitSelectedNodeAction"));
-    const persistSession = appSource.slice(appSource.indexOf("async function persistCanvasWorkflowSession"), appSource.indexOf("function canvasSessionFromWorkflowEvent"));
+    const persistSession = appSource.slice(appSource.indexOf("async function persistCanvasWorkflowSession"), appSource.indexOf("function rollbackBlockedMessage"));
 
-    expect(importProject).toContain("initialSession = await persistCanvasWorkflowSession");
+    expect(importProject).toContain("initialWorkflowResponse = await persistCanvasWorkflowSession");
+    expect(importProject).toContain("initialResponseGuard.queryRoot");
     expect(addSession).toContain("const session = await submitNewSessionAttempt");
-    expect(addSession).toContain("const createResponseGuard = captureWorkflowSessionResponseGuard");
-    expect(addSession).toContain("installAuthoritativeSession(session, createResponseGuard)");
+    expect(addSession).toContain("const guard = captureWorkflowSessionResponseGuard");
+    expect(addSession).toContain("createResponseGuard = guard");
+    expect(addSession).toContain("applyGuardedWorkflowSessionResponse(createWorkflowResponse, createResponseGuard");
     expect(addSession).not.toContain("appendResponseGuard");
     expect(addSession).not.toContain("createdSession");
     expect(addSession).toContain("inputId: `composer-${seed.id}`");
-    expect(appendRequirement).toContain("const authoritativeSession = await submitBottomComposerAttempt");
-    expect(appendRequirement).toContain("return result.canvasSession");
-    expect(appendRequirement).toContain("applyGuardedWorkflowSessionResponse(authoritativeSession, responseGuard)");
+    expect(appendRequirement).toContain("const response = await submitBottomComposerAttempt");
+    expect(appendRequirement).toContain("return result;");
+    expect(appendRequirement).toContain("applyGuardedWorkflowSessionResponse(response, responseGuard)");
     expect(appendRequirement).toContain("return;");
     expect(appendRequirement.indexOf("return;")).toBeLessThan(appendRequirement.indexOf("addRequirementPlanningNode"));
-    expect(persistSession).toContain("const created = await window.devflow.createWorkflowSession");
-    expect(persistSession).toContain("created.canvasSession");
+    expect(persistSession).toContain("return window.devflow.createWorkflowSession(queryRoot");
     expect(persistSession).toContain("inputId");
     expect(persistSession).not.toContain("appendWorkflowUserInput");
     expect(persistSession).not.toContain("onCreated");
-    expect(persistSession).toContain("throw new Error(\"Authoritative canvas session was not returned.\")");
+    expect(appendRequirement).toContain("canvasSessionForWorkflowAuthority(result, responseGuard)");
     expect(persistSession).not.toContain("requireAuthoritativeCanvas");
   });
 

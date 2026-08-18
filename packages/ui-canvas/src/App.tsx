@@ -375,16 +375,35 @@ export function upsertCanvasSession(
   sessions: CanvasSessionTab[],
   authoritative: CanvasSession,
 ): CanvasSessionTab[] {
-  return sessions.some((session) => session.id === authoritative.id)
-    ? sessions.map((session) => (session.id === authoritative.id ? authoritative : session))
+  return sessions.some((session) => (
+    session.id === authoritative.id && session.projectId === authoritative.projectId
+  ))
+    ? sessions.map((session) => (
+        session.id === authoritative.id && session.projectId === authoritative.projectId
+          ? authoritative
+          : session
+      ))
     : [...sessions, authoritative];
 }
 
 export function applyAuthoritativeWorkflowBroadcast(
   workspace: WorkspaceState,
-  authoritative: CanvasSession,
+  event: unknown,
   submissions: ReadonlyMap<string, NewSessionSubmissionState>,
 ): WorkspaceState {
+  const envelope = workflowSessionEnvelope(event);
+  if (!envelope) return workspace;
+  const authoritative = envelope.canvasSession;
+  const project = workspace.projects.find((item) => item.id === authoritative.projectId);
+  if (
+    !project ||
+    !isCanonicalWorkflowProjectRoot(project.canonicalRootPath) ||
+    project.canonicalRootPath !== envelope.projectRoot
+  ) return workspace;
+
+  const currentSession = workspace.sessions.find((session) => (
+    session.id === authoritative.id && session.projectId === authoritative.projectId
+  ));
   const sessions = upsertCanvasSession(workspace.sessions, authoritative);
   let pendingActivation = false;
   for (const submission of submissions.values()) {
@@ -396,6 +415,9 @@ export function applyAuthoritativeWorkflowBroadcast(
       pendingActivation = true;
       break;
     }
+  }
+  if ((!currentSession && !pendingActivation) || (currentSession && currentSession.kind !== "canvas")) {
+    return workspace;
   }
   if (
     !pendingActivation ||
@@ -414,26 +436,67 @@ export function applyAuthoritativeWorkflowBroadcast(
 }
 
 export interface WorkflowSessionResponseGuard {
+  projectId: string;
+  queryRoot: string;
+  canonicalRoot: string;
   sessionId: string;
   requestSession: CanvasSession | null;
   generation: number;
 }
 
-export function applyAuthoritativeWorkflowSessionResponse<T extends { sessions: CanvasSessionTab[] }>(
-  workspace: T,
-  authoritative: CanvasSession,
+export function applyAuthoritativeWorkflowSessionResponse(
+  workspace: WorkspaceState,
+  response: unknown,
   guard: WorkflowSessionResponseGuard,
   currentGeneration: number,
-): T {
-  if (authoritative.id !== guard.sessionId) return workspace;
-  const current = workspace.sessions.find((session) => session.id === guard.sessionId);
+): WorkspaceState {
+  const authoritative = currentCanvasSessionForWorkflowResponse(
+    workspace,
+    response,
+    guard,
+    currentGeneration,
+  );
+  if (!authoritative) return workspace;
+  return { ...workspace, sessions: upsertCanvasSession(workspace.sessions, authoritative) };
+}
+
+export function decorateNewSessionInstallation(
+  workspace: WorkspaceState,
+  authoritative: CanvasSession,
+): WorkspaceState {
+  const shouldActivate = workspace.activeProjectId === authoritative.projectId &&
+    workspace.activeSessionId === null;
+  return {
+    ...workspace,
+    changesets: { ...workspace.changesets, ...changesetsForSession(authoritative) },
+    ...(shouldActivate
+      ? {
+          activeProjectId: authoritative.projectId,
+          activeSessionId: authoritative.id,
+        }
+      : {}),
+  };
+}
+
+function currentCanvasSessionForWorkflowResponse(
+  workspace: WorkspaceState,
+  response: unknown,
+  guard: WorkflowSessionResponseGuard,
+  currentGeneration: number,
+): CanvasSession | null {
+  const authoritative = canvasSessionForWorkflowAuthority(response, guard);
+  if (!authoritative || !workspaceMatchesWorkflowAuthority(workspace, guard)) return null;
+  const current = workspace.sessions.find((session) => (
+    session.id === guard.sessionId && session.projectId === guard.projectId
+  ));
+  if (current && current.kind !== "canvas") return null;
   if (!shouldApplyWorkflowProjection(
     guard.requestSession,
     current?.kind === "canvas" ? current : null,
     guard.generation,
     currentGeneration,
-  )) return workspace;
-  return { ...workspace, sessions: upsertCanvasSession(workspace.sessions, authoritative) };
+  )) return null;
+  return authoritative;
 }
 
 export function shouldApplyWorkflowProjection(
@@ -443,6 +506,119 @@ export function shouldApplyWorkflowProjection(
   currentGeneration: number,
 ): boolean {
   return currentSession === requestedSession && currentGeneration === requestedGeneration;
+}
+
+interface WorkflowSessionEnvelopeValue {
+  protocolVersion: 1;
+  projectRoot: string;
+  sessionId: string;
+  canvasSession: CanvasSession;
+}
+
+type WorkflowGenerationAuthority = Pick<
+  WorkflowSessionResponseGuard,
+  "projectId" | "canonicalRoot" | "sessionId"
+>;
+
+function workflowSessionEnvelope(value: unknown): WorkflowSessionEnvelopeValue | null {
+  if (!isRecord(value) || value.protocolVersion !== 1) return null;
+  if (!isCanonicalWorkflowProjectRoot(value.projectRoot) || typeof value.sessionId !== "string") return null;
+  if (!isCanvasSession(value.canvasSession) || value.canvasSession.id !== value.sessionId) return null;
+  return {
+    protocolVersion: 1,
+    projectRoot: value.projectRoot,
+    sessionId: value.sessionId,
+    canvasSession: value.canvasSession,
+  };
+}
+
+function canvasSessionForWorkflowAuthority(
+  value: unknown,
+  authority: Pick<
+    WorkflowSessionResponseGuard,
+    "projectId" | "canonicalRoot" | "sessionId"
+  >,
+): CanvasSession | null {
+  const envelope = workflowSessionEnvelope(value);
+  if (
+    !envelope ||
+    !isCanonicalWorkflowProjectRoot(authority.canonicalRoot) ||
+    envelope.projectRoot !== authority.canonicalRoot ||
+    envelope.sessionId !== authority.sessionId ||
+    envelope.canvasSession.projectId !== authority.projectId
+  ) return null;
+  return envelope.canvasSession;
+}
+
+function workspaceMatchesWorkflowAuthority(
+  workspace: Pick<WorkspaceState, "projects">,
+  authority: Pick<
+    WorkflowSessionResponseGuard,
+    "projectId" | "queryRoot" | "canonicalRoot"
+  >,
+): boolean {
+  const project = workspace.projects.find((item) => item.id === authority.projectId);
+  return !!project &&
+    project.rootPath === authority.queryRoot &&
+    project.canonicalRootPath === authority.canonicalRoot &&
+    isCanonicalWorkflowProjectRoot(project.canonicalRootPath);
+}
+
+function workflowAuthorityGenerationKey(authority: WorkflowGenerationAuthority): string {
+  return JSON.stringify([authority.projectId, authority.canonicalRoot, authority.sessionId]);
+}
+
+function currentWorkflowGeneration(
+  generations: ReadonlyMap<string, number>,
+  authority: WorkflowGenerationAuthority,
+): number {
+  return generations.get(workflowAuthorityGenerationKey(authority)) ?? 0;
+}
+
+function advanceWorkflowGeneration(
+  generations: Map<string, number>,
+  authority: WorkflowGenerationAuthority,
+): number {
+  const key = workflowAuthorityGenerationKey(authority);
+  const generation = (generations.get(key) ?? 0) + 1;
+  generations.set(key, generation);
+  return generation;
+}
+
+function isCanonicalWorkflowProjectRoot(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim() || value.includes("\0")) {
+    return false;
+  }
+  if (value.startsWith("/")) {
+    return value === "/" || (!value.endsWith("/") && hasCanonicalWorkflowPathSegments(value.slice(1).split("/")));
+  }
+  if (/^[A-Za-z]:\\/.test(value)) {
+    if (value.includes("/") || (value.length > 3 && value.endsWith("\\"))) return false;
+    return value.length === 3 || hasCanonicalWorkflowPathSegments(value.slice(3).split("\\"));
+  }
+  if (value.startsWith("\\\\")) {
+    if (value.includes("/") || value.endsWith("\\")) return false;
+    const segments = value.slice(2).split("\\");
+    return segments.length >= 2 && hasCanonicalWorkflowPathSegments(segments);
+  }
+  return false;
+}
+
+function hasCanonicalWorkflowPathSegments(segments: string[]): boolean {
+  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+function workflowRequestAuthority(
+  project: ImportedProject,
+  sessionId: string,
+): Pick<WorkflowSessionResponseGuard, "projectId" | "queryRoot" | "canonicalRoot" | "sessionId"> | null {
+  if (!isCanonicalWorkflowProjectRoot(project.canonicalRootPath) || !sessionId) return null;
+  return {
+    projectId: project.id,
+    queryRoot: project.rootPath,
+    canonicalRoot: project.canonicalRootPath,
+    sessionId,
+  };
 }
 
 export default function App() {
@@ -563,30 +739,40 @@ export default function App() {
     : null;
 
   function captureWorkflowSessionResponseGuard(
+    project: ImportedProject,
     sessionId: string,
     requestSession: CanvasSession | null,
-  ): WorkflowSessionResponseGuard {
+  ): WorkflowSessionResponseGuard | null {
+    const authority = workflowRequestAuthority(project, sessionId);
+    if (
+      !authority ||
+      (requestSession !== null && (
+        requestSession.id !== sessionId || requestSession.projectId !== project.id
+      ))
+    ) return null;
     return {
-      sessionId,
+      ...authority,
       requestSession,
-      generation: workflowProjectionGenerationRef.current.get(sessionId) ?? 0,
+      generation: advanceWorkflowGeneration(workflowProjectionGenerationRef.current, authority),
     };
   }
 
   function applyGuardedWorkflowSessionResponse(
-    authoritative: CanvasSession,
+    response: unknown,
     guard: WorkflowSessionResponseGuard,
-    decorate?: (workspace: WorkspaceState) => WorkspaceState,
+    decorate?: (workspace: WorkspaceState, authoritative: CanvasSession) => WorkspaceState,
   ): void {
     setWorkspace((current) => {
       const guarded = applyAuthoritativeWorkflowSessionResponse(
         current,
-        authoritative,
+        response,
         guard,
-        workflowProjectionGenerationRef.current.get(guard.sessionId) ?? 0,
+        currentWorkflowGeneration(workflowProjectionGenerationRef.current, guard),
       );
       if (guarded === current) return current;
-      const next = decorate ? decorate(guarded) : guarded;
+      const authoritative = canvasSessionForWorkflowAuthority(response, guard);
+      if (!authoritative) return current;
+      const next = decorate ? decorate(guarded, authoritative) : guarded;
       workspaceRef.current = next;
       return next;
     });
@@ -661,18 +847,20 @@ export default function App() {
   useEffect(() => {
     if (!window.devflow) return;
     return window.devflow.onWorkflowEvent((event) => {
-      const canvasSession = canvasSessionFromWorkflowEvent(event);
-      if (!canvasSession) return;
-      workflowProjectionGenerationRef.current.set(
-        canvasSession.id,
-        (workflowProjectionGenerationRef.current.get(canvasSession.id) ?? 0) + 1,
-      );
+      const envelope = workflowSessionEnvelope(event);
+      if (!envelope) return;
       setWorkspace((current) => {
         const next = applyAuthoritativeWorkflowBroadcast(
           current,
-          canvasSession,
+          event,
           newSessionSubmissionsRef.current,
         );
+        if (next === current) return current;
+        advanceWorkflowGeneration(workflowProjectionGenerationRef.current, {
+          projectId: envelope.canvasSession.projectId,
+          canonicalRoot: envelope.projectRoot,
+          sessionId: envelope.sessionId,
+        });
         workspaceRef.current = next;
         return next;
       });
@@ -760,15 +948,21 @@ export default function App() {
   useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
     let active = true;
-    const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, activeSession);
-    void window.devflow.getWorkflowProjection(activeProject.rootPath, activeSession.id).then((result) => {
-      if (!active || !result.canvasSession) return;
-      applyGuardedWorkflowSessionResponse(result.canvasSession, responseGuard);
+    const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
+    if (!responseGuard) return;
+    void window.devflow.getWorkflowProjection(responseGuard.queryRoot, responseGuard.sessionId).then((result) => {
+      if (!active) return;
+      applyGuardedWorkflowSessionResponse(result, responseGuard);
     });
     return () => {
       active = false;
     };
-  }, [activeProject?.id, activeSession?.id]);
+  }, [
+    activeProject?.id,
+    activeProject?.rootPath,
+    activeProject?.canonicalRootPath,
+    activeSession?.id,
+  ]);
 
   useEffect(() => {
     if (!window.devflow || !activeProject || !selectedNode) return;
@@ -815,9 +1009,15 @@ export default function App() {
     setSelectedNodeActionState(null);
 
     let active = true;
-    const projectRoot = activeProject.rootPath;
     const sessionId = activeSession.id;
-    void workflow.getProjection(projectRoot, sessionId).then(async (projectionResult) => {
+    const authority = workflowRequestAuthority(activeProject, sessionId);
+    if (!authority) return;
+    void workflow.getProjection(authority.queryRoot, sessionId).then(async (projectionResult) => {
+      if (
+        !active ||
+        !canvasSessionForWorkflowAuthority(projectionResult, authority) ||
+        !workspaceMatchesWorkflowAuthority(workspaceRef.current, authority)
+      ) return;
       const projectionState = buildSelectedNodeActionState({
         sessionId,
         selectedNode,
@@ -828,7 +1028,7 @@ export default function App() {
         if (active) setSelectedNodeActionState(projectionState);
         return;
       }
-      const eligibilityResult = await workflow.getRollbackEligibility(projectRoot, {
+      const eligibilityResult = await workflow.getRollbackEligibility(authority.queryRoot, {
         sessionId,
         nodeId: selectedNode.id,
         laneId: rollbackPayload.laneId,
@@ -853,7 +1053,14 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, [activeProject?.rootPath, activeSession?.id, activeSession?.kind, activeSession?.updatedAt, selectedNode]);
+  }, [
+    activeProject?.rootPath,
+    activeProject?.canonicalRootPath,
+    activeSession?.id,
+    activeSession?.kind,
+    activeSession?.updatedAt,
+    selectedNode,
+  ]);
 
   const activeCanvasSessionId = activeSession?.kind === "canvas" ? activeSession.id : null;
   const commitActiveNodePosition = useCallback(
@@ -863,11 +1070,14 @@ export default function App() {
       const workflow = window.devflow?.workflow;
 
       if (workflow && activeProject) {
-        const requestSession = workspaceRef.current.sessions.find((session) => session.id === activeCanvasSessionId);
+        const requestSession = workspaceRef.current.sessions.find((session) => (
+          session.id === activeCanvasSessionId && session.projectId === activeProject.id
+        ));
         if (requestSession?.kind !== "canvas") throw new Error("Canvas session is unavailable.");
-        const responseGuard = captureWorkflowSessionResponseGuard(activeCanvasSessionId, requestSession);
+        const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeCanvasSessionId, requestSession);
+        if (!responseGuard) throw new Error("Canvas project authority is unavailable.");
         const updateId = crypto.randomUUID();
-        const persistPosition = () => workflow.updateNodePosition(activeProject.rootPath, {
+        const persistPosition = () => workflow.updateNodePosition(responseGuard.queryRoot, {
           sessionId: activeCanvasSessionId,
           updateId,
           nodeId: update.id,
@@ -879,15 +1089,15 @@ export default function App() {
         } catch {
           result = await persistPosition();
         }
-        const persistedSession = result.canvasSession;
-        if (!persistedSession || persistedSession.id !== activeCanvasSessionId) {
+        const persistedSession = canvasSessionForWorkflowAuthority(result, responseGuard);
+        if (!persistedSession) {
           throw new Error("Saved canvas session was not returned.");
         }
         if (!persistedSession.nodes.some((node) => node.id === update.id)) {
           throw new Error("Saved canvas node was not returned.");
         }
 
-        applyGuardedWorkflowSessionResponse(persistedSession, responseGuard);
+        applyGuardedWorkflowSessionResponse(result, responseGuard);
         return;
       }
 
@@ -927,12 +1137,15 @@ export default function App() {
     let initialSession = goal
       ? createSession(project.id, goal, initialMode, target)
       : null;
-    const initialResponseGuard = initialSession?.kind === "canvas"
-      ? captureWorkflowSessionResponseGuard(initialSession.id, null)
+    const persistInitialCanvas = !!window.devflow && initialSession?.kind === "canvas";
+    const initialResponseGuard = persistInitialCanvas
+      ? captureWorkflowSessionResponseGuard(project, initialSession.id, null)
       : null;
-    if (initialSession?.kind === "canvas") {
-      initialSession = await persistCanvasWorkflowSession(
-        project,
+    let initialWorkflowResponse: unknown = null;
+    if (persistInitialCanvas) {
+      if (!initialResponseGuard) throw new Error("Workflow project authority is unavailable.");
+      initialWorkflowResponse = await persistCanvasWorkflowSession(
+        initialResponseGuard.queryRoot,
         initialSession,
         `initial-${initialSession.id}`,
       );
@@ -940,25 +1153,30 @@ export default function App() {
 
     setWorkspace((current) => {
       const withProject = { ...current, projects: upsertProject(current.projects, project) };
-      const withInitialSession = initialSession?.kind === "canvas" && initialResponseGuard
+      const withInitialSession = persistInitialCanvas && initialResponseGuard
         ? applyAuthoritativeWorkflowSessionResponse(
             withProject,
-            initialSession,
+            initialWorkflowResponse,
             initialResponseGuard,
-            workflowProjectionGenerationRef.current.get(initialSession.id) ?? 0,
+            currentWorkflowGeneration(workflowProjectionGenerationRef.current, initialResponseGuard),
           )
         : initialSession
           ? { ...withProject, sessions: [...withProject.sessions, initialSession] }
           : withProject;
       const sessions = withInitialSession.sessions;
+      const installedInitialSession = initialSession
+        ? sessions.find((session) => (
+            session.id === initialSession.id && session.projectId === initialSession.projectId
+          )) ?? null
+        : null;
       const next = {
         ...withInitialSession,
-        changesets: initialSession
-          ? { ...withInitialSession.changesets, ...changesetsForSession(initialSession) }
+        changesets: installedInitialSession
+          ? { ...withInitialSession.changesets, ...changesetsForSession(installedInitialSession) }
           : withInitialSession.changesets,
         activeProjectId: project.id,
         activeSessionId:
-          initialSession?.id ?? chooseActiveSessionIdForProject(sessions, current.activeSessionId, project.id),
+          installedInitialSession?.id ?? chooseActiveSessionIdForProject(sessions, current.activeSessionId, project.id),
       };
       workspaceRef.current = next;
       return next;
@@ -999,36 +1217,43 @@ export default function App() {
       setNewTaskGoal("");
       return;
     }
-    const existingSeedSession = workspaceRef.current.sessions.find((session) => session.id === seed.id);
-    const createResponseGuard = captureWorkflowSessionResponseGuard(
-      seed.id,
-      existingSeedSession?.kind === "canvas" ? existingSeedSession : null,
-    );
-    const installAuthoritativeSession = (
-      session: CanvasSession,
-      responseGuard: WorkflowSessionResponseGuard,
-    ): void => {
-      applyGuardedWorkflowSessionResponse(session, responseGuard, (current) => ({
-        ...current,
-        changesets: { ...current.changesets, ...changesetsForSession(session) },
-        activeProjectId: projectId,
-        activeSessionId: session.id,
-      }));
-    };
+    let createResponseGuard: WorkflowSessionResponseGuard | null = null;
+    let createWorkflowResponse: unknown = null;
     const session = await submitNewSessionAttempt({
       states: newSessionSubmissionsRef.current,
       scope,
       createAttempt: () => ({ session: seed, inputId: `composer-${seed.id}` }),
-      submit: (attempt) => persistCanvasWorkflowSession(
-        project,
-        attempt.session,
-        attempt.inputId,
-      ),
+      submit: (attempt) => {
+        if (!window.devflow) return Promise.resolve(attempt.session);
+        const existingSeedSession = workspaceRef.current.sessions.find((session) => (
+          session.id === attempt.session.id && session.projectId === projectId
+        ));
+        const guard = captureWorkflowSessionResponseGuard(
+          project,
+          attempt.session.id,
+          existingSeedSession?.kind === "canvas" ? existingSeedSession : null,
+        );
+        createResponseGuard = guard;
+        if (!guard) return Promise.reject(new Error("Workflow project authority is unavailable."));
+        return persistCanvasWorkflowSession(
+          guard.queryRoot,
+          attempt.session,
+          attempt.inputId,
+        ).then((result) => {
+          const authoritative = canvasSessionForWorkflowAuthority(result, guard);
+          if (!authoritative) {
+            throw new Error("Authoritative canvas session was not returned.");
+          }
+          createWorkflowResponse = result;
+          return authoritative;
+        });
+      },
       onStateChange: refreshNewSessionState,
     });
     if (!session) return;
     if (window.devflow) {
-      installAuthoritativeSession(session, createResponseGuard);
+      if (!createResponseGuard || !createWorkflowResponse) return;
+      applyGuardedWorkflowSessionResponse(createWorkflowResponse, createResponseGuard, decorateNewSessionInstallation);
     } else {
       setWorkspace((current) => {
         const next = {
@@ -1223,14 +1448,22 @@ export default function App() {
     try {
       const project = workspaceRef.current.projects.find((item) => item.id === session.projectId);
       if (!project || !canStartPlanRequest(planRuntimeRecovery, session.id)) return;
-      const acceptedResult = await planMutationQueue().acceptStage(project.rootPath, session.id, "tasks");
-      const accepted = workspaceRef.current.sessions.find((item) => item.id === session.id);
+      const finishAuthority = workflowRequestAuthority(project, session.id);
+      if (!finishAuthority) return;
+      const acceptedResult = await planMutationQueue().acceptStage(finishAuthority.queryRoot, session.id, "tasks");
+      const accepted = workspaceRef.current.sessions.find((item) => (
+        item.id === session.id && item.projectId === project.id
+      ));
       if (accepted?.kind !== "plan" || !acceptedResult.snapshot.accepted.tasks || !canFinishPlan(accepted)) return;
       const boundary = capturePlanFinishBoundary(accepted);
-      const responseGeneration = workflowProjectionGenerationRef.current.get(accepted.id) ?? 0;
+      const responseGuard = captureWorkflowSessionResponseGuard(project, accepted.id, null);
+      if (!responseGuard) return;
       const canvas = await finishPlanSession(project, accepted);
       setWorkspace((current) => {
-        if ((workflowProjectionGenerationRef.current.get(accepted.id) ?? 0) !== responseGeneration) return current;
+        if (
+          !workspaceMatchesWorkflowAuthority(current, responseGuard) ||
+          currentWorkflowGeneration(workflowProjectionGenerationRef.current, responseGuard) !== responseGuard.generation
+        ) return current;
         const result = installFinishedPlanCanvas(current, boundary, canvas);
         workspaceRef.current = result.workspace;
         return result.workspace;
@@ -1317,30 +1550,32 @@ export default function App() {
     if (window.devflow) {
       const devflow = window.devflow;
       if (!activeProject || !bottomComposerScope) return;
-      const projectRoot = activeProject.rootPath;
+      const project = activeProject;
       const sessionId = activeSession.id;
-      const responseGuard = captureWorkflowSessionResponseGuard(sessionId, activeSession);
-      const authoritativeSession = await submitBottomComposerAttempt({
+      let responseGuard: WorkflowSessionResponseGuard | null = null;
+      const response = await submitBottomComposerAttempt({
         states: bottomComposerSubmissionsRef.current,
         scope: bottomComposerScope,
         text,
         createInputId: () => `bottom-${globalThis.crypto.randomUUID()}`,
         submit: async (inputId) => {
-          const result = await devflow.appendWorkflowUserInput(projectRoot, {
+          responseGuard = captureWorkflowSessionResponseGuard(project, sessionId, activeSession);
+          if (!responseGuard) throw new Error("Workflow project authority is unavailable.");
+          const result = await devflow.appendWorkflowUserInput(responseGuard.queryRoot, {
             sessionId,
             inputId,
             text,
             now: new Date().toISOString(),
           });
-          if (!isCanvasSession(result.canvasSession) || result.canvasSession.id !== sessionId) {
+          if (!canvasSessionForWorkflowAuthority(result, responseGuard)) {
             throw new Error("Authoritative canvas session was not returned.");
           }
-          return result.canvasSession;
+          return result;
         },
         onStateChange: refreshBottomComposerState,
       });
-      if (!authoritativeSession) return;
-      applyGuardedWorkflowSessionResponse(authoritativeSession, responseGuard);
+      if (!response || !responseGuard) return;
+      applyGuardedWorkflowSessionResponse(response, responseGuard);
       if (activeBottomComposerScopeRef.current === bottomComposerScope) {
         setBottomGoal((current) => current.trim() === text ? "" : current);
       }
@@ -1369,13 +1604,11 @@ export default function App() {
 
     const actionState = selectedNodeActionState;
     const actionScope = { sessionId: activeSession.id, nodeId: selectedNode.id };
-    const workflowResponseGuard = captureWorkflowSessionResponseGuard(activeSession.id, activeSession);
     const actionGeneration = selectedNodeActionGenerationRef.current + 1;
     selectedNodeActionGenerationRef.current = actionGeneration;
     const actionStillCurrent = () =>
       nodeActionPayloadMatchesSelection(selectedNodeActionScopeRef.current, actionScope.sessionId, actionScope.nodeId) &&
       selectedNodeActionGenerationRef.current === actionGeneration;
-    const projectRoot = activeProject.rootPath;
     setNodeActionBusy(action);
     setNodeActionError(null);
     setNodeActionStatus(null);
@@ -1391,12 +1624,14 @@ export default function App() {
           setNodeActionError("Selected node action is stale. Reselect the node and try again.");
           return;
         }
-        const result = await workflow.requestRepair(projectRoot, {
+        const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
+        if (!responseGuard) return;
+        const result = await workflow.requestRepair(responseGuard.queryRoot, {
           ...repairPayload,
           instruction: requestText,
         });
         if (!actionStillCurrent()) return;
-        applyWorkflowActionResult(result, workflowResponseGuard, actionStillCurrent);
+        applyWorkflowActionResult(result, responseGuard, actionStillCurrent);
         setNodeActionStatus("Repair lane requested.");
         setNodeActionText("");
         return;
@@ -1412,12 +1647,14 @@ export default function App() {
           setNodeActionError("Selected node action is stale. Reselect the node and try again.");
           return;
         }
-        const result = await workflow.requestVariant(projectRoot, {
+        const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
+        if (!responseGuard) return;
+        const result = await workflow.requestVariant(responseGuard.queryRoot, {
           ...variantPayload,
           instruction: requestText,
         });
         if (!actionStillCurrent()) return;
-        applyWorkflowActionResult(result, workflowResponseGuard, actionStillCurrent);
+        applyWorkflowActionResult(result, responseGuard, actionStillCurrent);
         setNodeActionStatus("Variant lane requested.");
         setNodeActionText("");
         return;
@@ -1432,18 +1669,26 @@ export default function App() {
         setNodeActionError("Selected node action is stale. Reselect the node and try again.");
         return;
       }
-      const result = await workflow.applyRollback(projectRoot, {
+      const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
+      if (!responseGuard) return;
+      const result = await workflow.applyRollback(responseGuard.queryRoot, {
         ...rollbackPayload,
         text: requestText,
       });
       if (!actionStillCurrent()) return;
+      if (!currentCanvasSessionForWorkflowResponse(
+        workspaceRef.current,
+        result,
+        responseGuard,
+        currentWorkflowGeneration(workflowProjectionGenerationRef.current, responseGuard),
+      )) return;
       const blockedMessage = rollbackBlockedMessage(result);
       if (blockedMessage) {
         setNodeActionError(blockedMessage);
         await refreshWorkflowProjection(actionStillCurrent);
         return;
       }
-      applyWorkflowActionResult(result, workflowResponseGuard, actionStillCurrent);
+      applyWorkflowActionResult(result, responseGuard, actionStillCurrent);
       setNodeActionStatus("Rollback affects selected and downstream workflow state, not evidence/history.");
       setNodeActionText("");
     } catch (error) {
@@ -1459,9 +1704,8 @@ export default function App() {
     shouldApply?: () => boolean,
   ) {
     if (shouldApply && !shouldApply()) return;
-    const canvasSession = canvasSessionFromWorkflowResult(result);
-    if (canvasSession) {
-      applyGuardedWorkflowSessionResponse(canvasSession, responseGuard);
+    if (canvasSessionForWorkflowAuthority(result, responseGuard)) {
+      applyGuardedWorkflowSessionResponse(result, responseGuard);
       return;
     }
     void refreshWorkflowProjection(shouldApply);
@@ -1470,13 +1714,15 @@ export default function App() {
   async function refreshWorkflowProjection(shouldApply?: () => boolean) {
     if (shouldApply && !shouldApply()) return;
     if (!activeProject || activeSession?.kind !== "canvas" || !window.devflow?.workflow) return;
-    const requestSession = workspaceRef.current.sessions.find((session) => session.id === activeSession.id);
+    const requestSession = workspaceRef.current.sessions.find((session) => (
+      session.id === activeSession.id && session.projectId === activeProject.id
+    ));
     if (requestSession?.kind !== "canvas") return;
-    const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, requestSession);
-    const result = await window.devflow.workflow.getProjection(activeProject.rootPath, activeSession.id);
+    const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, requestSession);
+    if (!responseGuard) return;
+    const result = await window.devflow.workflow.getProjection(responseGuard.queryRoot, responseGuard.sessionId);
     if (shouldApply && !shouldApply()) return;
-    if (!result.canvasSession) return;
-    applyGuardedWorkflowSessionResponse(result.canvasSession, responseGuard);
+    applyGuardedWorkflowSessionResponse(result, responseGuard);
   }
 
   function retryNode(nodeId: string) {
@@ -1492,17 +1738,15 @@ export default function App() {
     const action = actionForDecisionOption(selectedOption);
 
     if (window.devflow && activeProject) {
-      const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, activeSession);
-      void window.devflow.workflow.answerUserDecision(activeProject.rootPath, {
+      const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
+      if (!responseGuard) return;
+      void window.devflow.workflow.answerUserDecision(responseGuard.queryRoot, {
         sessionId: activeSession.id,
         decisionId: nodeId,
         selectedOption,
         action,
       }).then((result) => {
-        const { canvasSession } = result;
-        if (canvasSession) {
-          applyGuardedWorkflowSessionResponse(canvasSession, responseGuard);
-        }
+        applyGuardedWorkflowSessionResponse(result, responseGuard);
       });
       return;
     }
@@ -1543,15 +1787,15 @@ export default function App() {
 
     setNodeActionError(null);
     const requestId = crypto.randomUUID();
-    const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, activeSession);
-    void window.devflow.workflow.reassignLane(activeProject.rootPath, {
+    const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
+    if (!responseGuard) return;
+    void window.devflow.workflow.reassignLane(responseGuard.queryRoot, {
       requestId,
       sessionId: activeSession.id,
       laneId: nodeId,
       agentKind: nextAgent,
     }).then((result) => {
-      const { canvasSession } = result;
-      applyGuardedWorkflowSessionResponse(canvasSession, responseGuard);
+      applyGuardedWorkflowSessionResponse(result, responseGuard);
     }).catch((error) => {
       setNodeActionError(error instanceof Error ? error.message : "Failed to reassign workflow lane.");
     });
@@ -1566,7 +1810,9 @@ export default function App() {
     const getPendingInsertBeforeRequest = window.devflow?.workflow?.getPendingInsertBeforeRequest;
     if (desktopInsertBefore && getPendingInsertBeforeRequest) {
       try {
-        const pending = await getPendingInsertBeforeRequest(activeProject.rootPath, {
+        const insertAuthority = workflowRequestAuthority(activeProject, activeSession.id);
+        if (!insertAuthority) return;
+        const pending = await getPendingInsertBeforeRequest(insertAuthority.queryRoot, {
           sessionId: activeSession.id,
           targetLaneId: nodeId,
         });
@@ -1575,17 +1821,26 @@ export default function App() {
           nodeId,
           pending.requestId ?? undefined,
         );
-        const requestSession = workspaceRef.current.sessions.find((session) => session.id === activeSession.id);
+        const requestSession = workspaceRef.current.sessions.find((session) => (
+          session.id === activeSession.id && session.projectId === activeProject.id
+        ));
         if (requestSession?.kind !== "canvas") return;
-        const responseGuard = captureWorkflowSessionResponseGuard(activeSession.id, requestSession);
+        const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, requestSession);
+        if (!responseGuard || !workspaceMatchesWorkflowAuthority(workspaceRef.current, responseGuard)) return;
         await submitInsertBeforeIntent({
-          projectRoot: activeProject.rootPath,
+          projectRoot: responseGuard.queryRoot,
           sessionId: activeSession.id,
           targetLaneId: nodeId,
           requestId,
           insertBefore: desktopInsertBefore,
-          replaceCanvasSession: (session) => {
-            applyGuardedWorkflowSessionResponse(session, responseGuard);
+          replaceCanvasSession: (_session, result) => {
+            if (!currentCanvasSessionForWorkflowResponse(
+              workspaceRef.current,
+              result,
+              responseGuard,
+              currentWorkflowGeneration(workflowProjectionGenerationRef.current, responseGuard),
+            )) return;
+            applyGuardedWorkflowSessionResponse(result, responseGuard);
             insertBeforeIntentRequests.current.clear(activeSession.id, nodeId);
           },
         });
@@ -6835,20 +7090,29 @@ export function installFinishedPlanCanvas(
   if (canvas.id !== boundary.planSessionId || canvas.projectId !== boundary.projectId) {
     return { workspace, installed: false };
   }
-  const index = workspace.sessions.findIndex((session) => session.id === boundary.planSessionId);
+  const index = workspace.sessions.findIndex((session) => (
+    session.id === boundary.planSessionId && session.projectId === boundary.projectId
+  ));
   const session = workspace.sessions[index];
   if (!session || session.kind !== "plan" || !planMatchesFinishBoundary(session, boundary)) {
     return { workspace, installed: false };
   }
   const sessions = [...workspace.sessions];
   sessions[index] = canvas;
+  const shouldActivate = workspace.activeProjectId === boundary.projectId &&
+    workspace.activeSessionId === boundary.planSessionId;
   return {
     installed: true,
     workspace: {
       ...workspace,
       sessions,
       changesets: { ...workspace.changesets, ...changesetsForSession(canvas) },
-      activeSessionId: canvas.id,
+      ...(shouldActivate
+        ? {
+            activeProjectId: boundary.projectId,
+            activeSessionId: canvas.id,
+          }
+        : {}),
     },
   };
 }
@@ -6917,7 +7181,9 @@ export async function finishPlanSession(
   if (!canFinishPlan(session)) throw new Error("Approved Plan is invalid.");
   const canvas = convertPlanToCanvas(session);
   if (!window.devflow) return canvas;
-  const result = await window.devflow.finishPlanWorkflow(project.rootPath, {
+  const authority = workflowRequestAuthority(project, session.id);
+  if (!authority) throw new Error("Workflow project authority is unavailable.");
+  const result = await window.devflow.finishPlanWorkflow(authority.queryRoot, {
     planSessionId: session.id,
     session: {
       id: canvas.id,
@@ -6928,19 +7194,20 @@ export async function finishPlanSession(
       target: canvas.target,
     },
   });
-  if (!isCanvasSession(result.canvasSession) || result.canvasSession.id !== session.id) {
+  const authoritative = canvasSessionForWorkflowAuthority(result, authority);
+  if (!authoritative) {
     throw new Error("Authoritative canvas session was not returned.");
   }
-  return result.canvasSession;
+  return authoritative;
 }
 
 async function persistCanvasWorkflowSession(
-  project: ImportedProject,
+  queryRoot: string,
   session: CanvasSession,
   inputId: string,
-): Promise<CanvasSession> {
+): Promise<unknown> {
   if (!window.devflow) return session;
-  const created = await window.devflow.createWorkflowSession(project.rootPath, {
+  return window.devflow.createWorkflowSession(queryRoot, {
     id: session.id,
     projectId: session.projectId,
     title: session.title,
@@ -6953,21 +7220,6 @@ async function persistCanvasWorkflowSession(
     inputId,
     now: session.createdAt,
   });
-  if (!isCanvasSession(created.canvasSession) || created.canvasSession.id !== session.id) {
-    throw new Error("Authoritative canvas session was not returned.");
-  }
-  return created.canvasSession;
-}
-
-function canvasSessionFromWorkflowEvent(event: unknown): CanvasSession | null {
-  if (!event || typeof event !== "object") return null;
-  const canvasSession = (event as { canvasSession?: unknown }).canvasSession;
-  return isCanvasSession(canvasSession) ? canvasSession : null;
-}
-
-function canvasSessionFromWorkflowResult(result: unknown): CanvasSession | null {
-  if (!isRecord(result)) return null;
-  return isCanvasSession(result.canvasSession) ? result.canvasSession : null;
 }
 
 function rollbackBlockedMessage(result: unknown): string | null {
@@ -7131,14 +7383,14 @@ export async function submitInsertBeforeIntent(input: {
   targetLaneId: string;
   requestId: string;
   insertBefore: (projectRoot: string, request: { sessionId: string; targetLaneId: string; requestId: string }) => Promise<{ canvasSession: CanvasSession | null }>;
-  replaceCanvasSession: (session: CanvasSession) => void;
+  replaceCanvasSession: (session: CanvasSession, result: unknown) => void;
 }): Promise<true> {
   const result = await input.insertBefore(input.projectRoot, {
     sessionId: input.sessionId,
     targetLaneId: input.targetLaneId,
     requestId: input.requestId,
   });
-  if (result.canvasSession) input.replaceCanvasSession(result.canvasSession);
+  if (result.canvasSession) input.replaceCanvasSession(result.canvasSession, result);
   return true;
 }
 
