@@ -933,7 +933,8 @@ export class AgentBridge {
     if (durableClaim.kind === "invalid") throw new InvalidDurableRunStartClaimError();
     const volatileTerminal = this.terminalPersistenceEvidence.get(runTerminalKey(projectRoot, runId));
     if (volatileTerminal) return volatileTerminal;
-    const liveRun = this.runs.get(runId);
+    let liveRun = this.runs.get(runId);
+    if (liveRun?.projectRoot !== projectRoot) liveRun = undefined;
     const run = liveRun ?? makePersistedRun(projectRoot, runId);
     let events: RunEvent[];
     try {

@@ -142,6 +142,50 @@ type DecorateNewSessionInstallationForTest = (
   authoritative: CanvasSession,
 ) => WorkspaceState;
 
+interface EvidenceHydrationScopeForTest {
+  projectId: string;
+  queryRoot: string;
+  canonicalRoot: string;
+  sessionId: string;
+  generation: number;
+}
+
+interface EvidenceHydrationRequestForTest extends EvidenceHydrationScopeForTest {
+  nodeId: string;
+  runId: string;
+}
+
+interface EvidenceDisplayScopeForTest extends Omit<EvidenceHydrationRequestForTest, "generation"> {}
+
+type PrepareEvidenceHydrationForTest = (
+  previous: WorkspaceState,
+  installed: WorkspaceState,
+  authoritative: CanvasSession,
+  scope: EvidenceHydrationScopeForTest,
+) => {
+  workspace: WorkspaceState;
+  requests: EvidenceHydrationRequestForTest[];
+  clearedRunIds: string[];
+};
+
+interface EvidenceHydratorForTest {
+  schedule(requests: EvidenceHydrationRequestForTest[]): Promise<void>;
+  evidenceFor(scope: EvidenceDisplayScopeForTest): RunEvidence | undefined;
+  discard(runIds: readonly string[]): void;
+}
+
+type CreateEvidenceHydratorForTest = (options: {
+  getWorkspace: () => WorkspaceState;
+  getGeneration: (scope: EvidenceHydrationScopeForTest) => number;
+  loadEvidence: (queryRoot: string, runId: string) => Promise<RunEvidence>;
+  replaceWorkspace: (workspace: WorkspaceState) => void;
+}) => EvidenceHydratorForTest;
+
+type WorkspaceForRendererLoadForTest = (
+  workspace: WorkspaceState,
+  desktopBackendAvailable: boolean,
+) => WorkspaceState;
+
 function applyWorkflowResponseForTest(): ApplyWorkflowResponseForTest {
   const helper = Reflect.get(AppModule, "applyAuthoritativeWorkflowSessionResponse");
   expect(helper).toBeTypeOf("function");
@@ -158,6 +202,24 @@ function decorateNewSessionInstallationForTest(): DecorateNewSessionInstallation
   const helper = Reflect.get(AppModule, "decorateNewSessionInstallation");
   expect(helper).toBeTypeOf("function");
   return helper as DecorateNewSessionInstallationForTest;
+}
+
+function prepareEvidenceHydrationForTest(): PrepareEvidenceHydrationForTest {
+  const helper = Reflect.get(AppModule, "prepareAuthoritativeRunEvidenceHydration");
+  expect(helper).toBeTypeOf("function");
+  return helper as PrepareEvidenceHydrationForTest;
+}
+
+function createEvidenceHydratorForTest(): CreateEvidenceHydratorForTest {
+  const helper = Reflect.get(AppModule, "createAuthoritativeRunEvidenceHydrator");
+  expect(helper).toBeTypeOf("function");
+  return helper as CreateEvidenceHydratorForTest;
+}
+
+function workspaceForRendererLoadForTest(): WorkspaceForRendererLoadForTest {
+  const helper = Reflect.get(AppModule, "workspaceForRendererLoad");
+  expect(helper).toBeTypeOf("function");
+  return helper as WorkspaceForRendererLoadForTest;
 }
 
 function workflowProjectForTest(
@@ -258,6 +320,55 @@ function mockRunEvidence(overrides: Partial<RunEvidence> = {}): RunEvidence {
     cancelReason: null,
     completedAt: "2026-06-27T00:00:00.000Z",
     ...overrides,
+  };
+}
+
+function terminalCanvasSessionForTest(
+  sessionId: string,
+  projectId: string,
+  nodeId: string,
+  runId: string,
+  status: "completed" | "failed" = "completed",
+): CanvasSession {
+  return {
+    ...canvasSessionForTest(sessionId, projectId),
+    activeNodeId: nodeId,
+    nodes: [{
+      ...mockNode("codex"),
+      id: nodeId,
+      runId,
+      status,
+    }],
+  };
+}
+
+function evidenceHydrationScopeForTest(
+  session: CanvasSession,
+  overrides: Partial<EvidenceHydrationScopeForTest> = {},
+): EvidenceHydrationScopeForTest {
+  return {
+    projectId: session.projectId,
+    queryRoot: `/opened/${session.projectId}-alias`,
+    canonicalRoot: `/canonical/${session.projectId}`,
+    sessionId: session.id,
+    generation: 1,
+    ...overrides,
+  };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolvePromise: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve(value) {
+      resolvePromise?.(value);
+    },
   };
 }
 
@@ -2123,6 +2234,349 @@ describe("UI source validation", () => {
     expect(deleteBranchMessage).toContain("Delete branch: skyturn/session-1");
   });
 
+});
+
+describe("authoritative terminal RunEvidence hydration", () => {
+  it("installs exact terminal private evidence through the alias root and changes only runEvidence", async () => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const prepare = prepareEvidenceHydrationForTest();
+    const createHydrator = createEvidenceHydratorForTest();
+    const requested = terminalCanvasSessionForTest(
+      "session-terminal",
+      "project-1",
+      "node-terminal",
+      "run-terminal",
+      "completed",
+    );
+    const authoritative = {
+      ...requested,
+      nodes: requested.nodes.map((node) => ({ ...node, progress: "Authoritative completion" })),
+    };
+    const project = workflowProjectForTest(
+      "project-1",
+      "/opened/project-1-alias",
+      "/canonical/project-1",
+    );
+    const previous = workflowWorkspaceForTest([project], [requested]);
+    previous.runEvidence["run-terminal"] = mockRunEvidence({
+      runId: "run-terminal",
+      status: "failed",
+      exitCode: 1,
+    });
+    previous.runEvidence["run-unrelated"] = mockRunEvidence({ runId: "run-unrelated" });
+    const guard = workflowGuardForTest(requested, { sessionId: requested.id });
+    const accepted = applyResponse(
+      previous,
+      workflowEnvelopeForTest(authoritative),
+      guard,
+      guard.generation,
+    );
+    const scope = evidenceHydrationScopeForTest(authoritative, {
+      queryRoot: guard.queryRoot,
+      canonicalRoot: guard.canonicalRoot,
+      generation: guard.generation,
+    });
+    const prepared = prepare(previous, accepted, authoritative, scope);
+    const evidence = mockRunEvidence({ runId: "run-terminal", status: "succeeded" });
+    const loadEvidence = vi.fn(async () => evidence);
+    let current = prepared.workspace;
+    const beforeHydration = current;
+    const hydrator = createHydrator({
+      getWorkspace: () => current,
+      getGeneration: () => guard.generation,
+      loadEvidence,
+      replaceWorkspace: (next) => { current = next; },
+    });
+    hydrator.discard(prepared.clearedRunIds);
+
+    expect(current.runEvidence["run-terminal"]).toBeUndefined();
+    expect(current.runEvidence["run-unrelated"]?.runId).toBe("run-unrelated");
+    await hydrator.schedule(prepared.requests);
+
+    expect(loadEvidence).toHaveBeenCalledTimes(1);
+    expect(loadEvidence).toHaveBeenCalledWith("/opened/project-1-alias", "run-terminal");
+    expect(current.runEvidence["run-terminal"]).toEqual(evidence);
+    expect(current.sessions).toBe(beforeHydration.sessions);
+    expect(current.projects).toBe(beforeHydration.projects);
+    expect(current.runs).toBe(beforeHydration.runs);
+    expect(current.runEvents).toBe(beforeHydration.runEvents);
+    expect((current.sessions[0] as CanvasSession).nodes[0]).toBe(authoritative.nodes[0]);
+    expect(hydrator.evidenceFor({ ...scope, nodeId: "node-terminal", runId: "run-terminal" })).toEqual(evidence);
+
+    await hydrator.schedule(prepared.requests);
+    expect(loadEvidence).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["running evidence", async () => mockRunEvidence({ runId: "run-rejected", status: "running", completedAt: null })],
+    ["wrong-run evidence", async () => mockRunEvidence({ runId: "run-other" })],
+    ["query rejection", async () => { throw new Error("private evidence unavailable"); }],
+  ] as const)("does not install %s for a terminal-looking Canvas", async (_label, loadEvidence) => {
+    const prepare = prepareEvidenceHydrationForTest();
+    const createHydrator = createEvidenceHydratorForTest();
+    const session = terminalCanvasSessionForTest(
+      "session-rejected",
+      "project-1",
+      "node-rejected",
+      "run-rejected",
+      "failed",
+    );
+    const project = workflowProjectForTest(
+      "project-1",
+      "/opened/project-1-alias",
+      "/canonical/project-1",
+    );
+    const scope = evidenceHydrationScopeForTest(session);
+    const installed = workflowWorkspaceForTest([project], [session]);
+    const prepared = prepare(installed, installed, session, scope);
+    let current = prepared.workspace;
+    const hydrator = createHydrator({
+      getWorkspace: () => current,
+      getGeneration: () => scope.generation,
+      loadEvidence,
+      replaceWorkspace: (next) => { current = next; },
+    });
+
+    await expect(hydrator.schedule(prepared.requests)).resolves.toBeUndefined();
+    expect(current.runEvidence[session.nodes[0]!.runId]).toBeUndefined();
+  });
+
+  it("discards a pending root-A result after the same project id is remapped to root B", async () => {
+    const prepare = prepareEvidenceHydrationForTest();
+    const createHydrator = createEvidenceHydratorForTest();
+    const session = terminalCanvasSessionForTest("session-remap", "project-1", "node-1", "run-remap");
+    const rootA = workflowProjectForTest("project-1", "/opened/root-a", "/canonical/root-a");
+    const scope = evidenceHydrationScopeForTest(session, {
+      queryRoot: rootA.rootPath,
+      canonicalRoot: rootA.canonicalRootPath,
+    });
+    const initial = workflowWorkspaceForTest([rootA], [session]);
+    const prepared = prepare(initial, initial, session, scope);
+    const pending = deferred<RunEvidence>();
+    let current = prepared.workspace;
+    const loadEvidence = vi.fn(() => pending.promise);
+    const hydrator = createHydrator({
+      getWorkspace: () => current,
+      getGeneration: () => scope.generation,
+      loadEvidence,
+      replaceWorkspace: (next) => { current = next; },
+    });
+
+    const hydration = hydrator.schedule(prepared.requests);
+    expect(loadEvidence).toHaveBeenCalledWith("/opened/root-a", "run-remap");
+    current = {
+      ...current,
+      projects: [workflowProjectForTest("project-1", "/opened/root-b", "/canonical/root-b")],
+    };
+    pending.resolve(mockRunEvidence({ runId: "run-remap" }));
+    await hydration;
+
+    expect(current.runEvidence["run-remap"]).toBeUndefined();
+  });
+
+  it.each(["session", "node", "run", "generation"] as const)(
+    "discards a pending result after %s replacement",
+    async (replacement) => {
+      const prepare = prepareEvidenceHydrationForTest();
+      const createHydrator = createEvidenceHydratorForTest();
+      const session = terminalCanvasSessionForTest("session-pending", "project-1", "node-1", "run-pending");
+      const project = workflowProjectForTest(
+        "project-1",
+        "/opened/project-1-alias",
+        "/canonical/project-1",
+      );
+      const scope = evidenceHydrationScopeForTest(session);
+      const initial = workflowWorkspaceForTest([project], [session]);
+      const prepared = prepare(initial, initial, session, scope);
+      const pending = deferred<RunEvidence>();
+      let current = prepared.workspace;
+      let generation = scope.generation;
+      const hydrator = createHydrator({
+        getWorkspace: () => current,
+        getGeneration: () => generation,
+        loadEvidence: () => pending.promise,
+        replaceWorkspace: (next) => { current = next; },
+      });
+
+      const hydration = hydrator.schedule(prepared.requests);
+      if (replacement === "session") {
+        const other = terminalCanvasSessionForTest("session-other", "project-1", "node-1", "run-pending");
+        current = { ...current, sessions: [...current.sessions, other], activeSessionId: other.id };
+      } else if (replacement === "node") {
+        current = {
+          ...current,
+          sessions: [{ ...session, nodes: [{ ...session.nodes[0]!, id: "node-other" }] }],
+        };
+      } else if (replacement === "run") {
+        current = {
+          ...current,
+          sessions: [{ ...session, nodes: [{ ...session.nodes[0]!, runId: "run-other" }] }],
+        };
+      } else {
+        generation += 1;
+      }
+      pending.resolve(mockRunEvidence({ runId: "run-pending" }));
+      await hydration;
+
+      expect(current.runEvidence["run-pending"]).toBeUndefined();
+    },
+  );
+
+  it("scopes identical run ids across project and session switches", async () => {
+    const prepare = prepareEvidenceHydrationForTest();
+    const createHydrator = createEvidenceHydratorForTest();
+    const sharedRunId = "run-shared";
+    const sessionA = terminalCanvasSessionForTest("session-a", "project-a", "node-a", sharedRunId);
+    const sessionB = terminalCanvasSessionForTest("session-b", "project-b", "node-b", sharedRunId, "failed");
+    const projectA = workflowProjectForTest("project-a", "/opened/a", "/canonical/a");
+    const projectB = workflowProjectForTest("project-b", "/opened/b", "/canonical/b");
+    const scopeA = evidenceHydrationScopeForTest(sessionA, {
+      queryRoot: projectA.rootPath,
+      canonicalRoot: projectA.canonicalRootPath,
+    });
+    const scopeB = evidenceHydrationScopeForTest(sessionB, {
+      queryRoot: projectB.rootPath,
+      canonicalRoot: projectB.canonicalRootPath,
+    });
+    let current = {
+      ...workflowWorkspaceForTest([projectA, projectB], [sessionA, sessionB]),
+      activeProjectId: projectA.id,
+      activeSessionId: sessionA.id,
+    };
+    const evidenceA = mockRunEvidence({ runId: sharedRunId, status: "succeeded" });
+    const evidenceB = mockRunEvidence({ runId: sharedRunId, status: "failed", exitCode: 1 });
+    const hydrator = createHydrator({
+      getWorkspace: () => current,
+      getGeneration: () => 1,
+      loadEvidence: async (queryRoot) => queryRoot === projectA.rootPath ? evidenceA : evidenceB,
+      replaceWorkspace: (next) => { current = next; },
+    });
+
+    const preparedA = prepare(current, current, sessionA, scopeA);
+    current = preparedA.workspace;
+    hydrator.discard(preparedA.clearedRunIds);
+    await hydrator.schedule(preparedA.requests);
+    expect(hydrator.evidenceFor({ ...scopeA, nodeId: "node-a", runId: sharedRunId })).toEqual(evidenceA);
+
+    current = { ...current, activeProjectId: projectB.id, activeSessionId: sessionB.id };
+    expect(hydrator.evidenceFor({ ...scopeB, nodeId: "node-b", runId: sharedRunId })).toBeUndefined();
+
+    const preparedB = prepare(current, current, sessionB, scopeB);
+    current = preparedB.workspace;
+    hydrator.discard(preparedB.clearedRunIds);
+    await hydrator.schedule(preparedB.requests);
+    expect(hydrator.evidenceFor({ ...scopeB, nodeId: "node-b", runId: sharedRunId })).toEqual(evidenceB);
+    expect(hydrator.evidenceFor({ ...scopeA, nodeId: "node-a", runId: sharedRunId })).toBeUndefined();
+  });
+
+  it("keeps active evidence when an inactive project installs the same run id in the background", () => {
+    const prepare = prepareEvidenceHydrationForTest();
+    const sharedRunId = "run-shared-background";
+    const sessionA = terminalCanvasSessionForTest("session-a", "project-a", "node-a", sharedRunId);
+    const sessionB = terminalCanvasSessionForTest("session-b", "project-b", "node-b", sharedRunId, "failed");
+    const projectA = workflowProjectForTest("project-a", "/opened/a", "/canonical/a");
+    const projectB = workflowProjectForTest("project-b", "/opened/b", "/canonical/b");
+    const scopeB = evidenceHydrationScopeForTest(sessionB, {
+      queryRoot: projectB.rootPath,
+      canonicalRoot: projectB.canonicalRootPath,
+    });
+    const current = {
+      ...workflowWorkspaceForTest([projectA, projectB], [sessionA, sessionB]),
+      activeProjectId: projectA.id,
+      activeSessionId: sessionA.id,
+      runEvidence: {
+        [sharedRunId]: mockRunEvidence({ runId: sharedRunId, status: "succeeded" }),
+      },
+    };
+
+    const prepared = prepare(current, current, sessionB, scopeB);
+
+    expect(prepared.workspace).toBe(current);
+    expect(prepared.workspace.runEvidence[sharedRunId]).toEqual(current.runEvidence[sharedRunId]);
+    expect(prepared.requests).toEqual([]);
+    expect(prepared.clearedRunIds).toEqual([]);
+  });
+
+  it("drops persisted desktop evidence before hydration while preserving browser persistence", async () => {
+    const forRendererLoad = workspaceForRendererLoadForTest();
+    const persisted = workflowWorkspaceForTest([], []);
+    persisted.runEvidence["run-persisted"] = mockRunEvidence({
+      runId: "run-persisted",
+      status: "failed",
+      exitCode: 99,
+    });
+
+    const desktop = forRendererLoad(persisted, true);
+    const browser = forRendererLoad(persisted, false);
+
+    expect(desktop).not.toBe(persisted);
+    expect(desktop.runEvidence).toEqual({});
+    expect(browser).toBe(persisted);
+    expect(browser.runEvidence["run-persisted"]?.exitCode).toBe(99);
+  });
+
+  it("prepares terminal nodes from accepted pulls and canonical broadcasts without changing Canvas state", () => {
+    const applyResponse = applyWorkflowResponseForTest();
+    const applyBroadcast = applyWorkflowBroadcastForTest();
+    const prepare = prepareEvidenceHydrationForTest();
+    const requested = terminalCanvasSessionForTest("session-authority", "project-1", "node-1", "run-1");
+    const authoritative = {
+      ...requested,
+      nodes: requested.nodes.map((node) => ({ ...node, progress: "Backend terminal state" })),
+    };
+    const project = workflowProjectForTest(
+      "project-1",
+      "/opened/project-1-alias",
+      "/canonical/project-1",
+    );
+    const workspace = workflowWorkspaceForTest([project], [requested]);
+    const guard = workflowGuardForTest(requested, { sessionId: requested.id });
+    const responseWorkspace = applyResponse(
+      workspace,
+      workflowEnvelopeForTest(authoritative),
+      guard,
+      guard.generation,
+    );
+    const broadcastWorkspace = applyBroadcast(
+      workspace,
+      workflowEnvelopeForTest(authoritative),
+      new Map(),
+    );
+    const scope = evidenceHydrationScopeForTest(authoritative);
+
+    const fromResponse = prepare(workspace, responseWorkspace, authoritative, scope);
+    const fromBroadcast = prepare(workspace, broadcastWorkspace, authoritative, scope);
+
+    expect(fromResponse.requests).toEqual(fromBroadcast.requests);
+    expect(fromResponse.requests).toEqual([{
+      ...scope,
+      nodeId: "node-1",
+      runId: "run-1",
+    }]);
+    expect((fromResponse.workspace.sessions[0] as CanvasSession).nodes[0]).toBe(authoritative.nodes[0]);
+    expect((fromBroadcast.workspace.sessions[0] as CanvasSession).nodes[0]).toBe(authoritative.nodes[0]);
+  });
+
+  it("keeps cancellation responses and observability outside desktop RunEvidence authority", async () => {
+    const appSource = await readSource("./App.tsx");
+    const activeStop = appSource.slice(
+      appSource.indexOf("function stopActiveRun()"),
+      appSource.indexOf("function stopNodeRun("),
+    );
+    const nodeStop = appSource.slice(
+      appSource.indexOf("function stopNodeRun("),
+      appSource.indexOf("async function appendRequirementNode"),
+    );
+
+    for (const source of [activeStop, nodeStop]) {
+      expect(source).toContain("cancelAgentRun");
+      expect(source).not.toContain("result.evidence");
+      expect(source).not.toContain("runEvidence:");
+      expect(source).toMatch(/if \(window\.devflow\) \{[\s\S]*?cancelAgentRun[\s\S]*?return;/);
+    }
+    expect(appSource).toContain("applyRunEventToWorkspace(current, event)");
+    expect(appSource).not.toContain("cancelAgentRun(target.runId, \"Stopped from node modal\").then");
+  });
 });
 
 describe("Slice C UI behavior", () => {

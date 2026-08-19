@@ -2201,6 +2201,42 @@ describe("agent bridge", () => {
     expect(deriveEvidenceFromEvents(run, events).status).toBe("succeeded");
   });
 
+  it("does not reuse terminal evidence across projects with the same run id", async () => {
+    const projectA = await makeTempRoot();
+    const projectB = await makeTempRoot();
+    const runId = "run-cross-project-evidence";
+    const bridge = new AgentBridge({ adapters: [createMockAgentAdapter()] });
+
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId,
+      nodeId: "node-project-a",
+      sessionId: "session-project-a",
+      projectRoot: projectA,
+      worktreePath: projectA,
+      agentKind: "codex",
+      prompt: "Complete project A",
+    });
+
+    await expect(bridge.getEvidence(projectB, runId)).resolves.toEqual({
+      runId,
+      status: "running",
+      exitCode: null,
+      changesetId: null,
+      checks: [],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: null,
+    });
+    await expect(bridge.getEvidence(projectA, runId)).resolves.toMatchObject({
+      runId,
+      status: "succeeded",
+      exitCode: 0,
+    });
+  });
+
   it("preserves nested lossless payloads through listeners, NDJSON reopen, and output aggregation", async () => {
     const projectRoot = await makeTempRoot();
     const content = "  first\r\n\tsecond  \n\n";
