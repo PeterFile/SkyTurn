@@ -95,6 +95,7 @@ import {
 import {
   NODE_MODAL_TABS,
   deriveNodeStatusFromEvidence,
+  parseRunEvidence,
   summarizeRunEvidence,
   type AgentKind,
   type AgentWorkflowReadinessSummary,
@@ -194,6 +195,7 @@ import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.j
 import { agentIdentityForNode, canUseAgentNodeActions, nodeFooterForNode } from "./nodeDisplay.js";
 import {
   applyRunEventToWorkspace,
+  loadExactTerminalRunEvidence,
   mergeRunEventsIntoWorkspace,
   retryCanvasNode,
 } from "./workflowRuntime.js";
@@ -621,6 +623,253 @@ function workflowRequestAuthority(
   };
 }
 
+export interface AuthoritativeRunEvidenceHydrationScope {
+  projectId: string;
+  queryRoot: string;
+  canonicalRoot: string;
+  sessionId: string;
+  generation: number;
+}
+
+export interface AuthoritativeRunEvidenceHydrationRequest extends AuthoritativeRunEvidenceHydrationScope {
+  nodeId: string;
+  runId: string;
+}
+
+type AuthoritativeRunEvidenceDisplayScope = Omit<AuthoritativeRunEvidenceHydrationRequest, "generation">;
+
+export interface AuthoritativeRunEvidenceHydrator {
+  schedule(requests: AuthoritativeRunEvidenceHydrationRequest[]): Promise<void>;
+  evidenceFor(scope: AuthoritativeRunEvidenceDisplayScope): RunEvidence | undefined;
+  discard(runIds: readonly string[]): void;
+}
+
+export function workspaceForRendererLoad(
+  workspace: WorkspaceState,
+  desktopBackendAvailable: boolean,
+): WorkspaceState {
+  return desktopBackendAvailable ? { ...workspace, runEvidence: {} } : workspace;
+}
+
+export function prepareAuthoritativeRunEvidenceHydration(
+  previous: WorkspaceState,
+  installed: WorkspaceState,
+  authoritative: CanvasSession,
+  scope: AuthoritativeRunEvidenceHydrationScope,
+): {
+  workspace: WorkspaceState;
+  requests: AuthoritativeRunEvidenceHydrationRequest[];
+  clearedRunIds: string[];
+} {
+  const installedSession = installed.sessions.find((session) => (
+    session.id === scope.sessionId && session.projectId === scope.projectId
+  ));
+  if (
+    authoritative.id !== scope.sessionId ||
+    authoritative.projectId !== scope.projectId ||
+    installedSession !== authoritative ||
+    !workspaceMatchesWorkflowAuthority(installed, scope)
+  ) {
+    return { workspace: installed, requests: [], clearedRunIds: [] };
+  }
+  if (
+    installed.activeProjectId !== scope.projectId ||
+    installed.activeSessionId !== scope.sessionId
+  ) {
+    return { workspace: installed, requests: [], clearedRunIds: [] };
+  }
+
+  const replacedSession = previous.sessions.find((session) => (
+    session.kind === "canvas" &&
+    session.id === scope.sessionId &&
+    session.projectId === scope.projectId
+  ));
+  const clearedRunIds = [...new Set([
+    ...(replacedSession?.kind === "canvas" ? replacedSession.nodes.map((node) => node.runId) : []),
+    ...authoritative.nodes.map((node) => node.runId),
+  ].filter(isConcreteRunId))];
+  const runEvidence = { ...installed.runEvidence };
+  let changed = false;
+  for (const runId of clearedRunIds) {
+    if (!(runId in runEvidence)) continue;
+    delete runEvidence[runId];
+    changed = true;
+  }
+  const workspace = changed ? { ...installed, runEvidence } : installed;
+  const requests = authoritative.nodes.flatMap((node): AuthoritativeRunEvidenceHydrationRequest[] => (
+    isConcreteRunId(node.runId) && (node.status === "completed" || node.status === "failed")
+      ? [{ ...scope, nodeId: node.id, runId: node.runId }]
+      : []
+  ));
+  return { workspace, requests, clearedRunIds };
+}
+
+export function createAuthoritativeRunEvidenceHydrator(options: {
+  getWorkspace: () => WorkspaceState;
+  getGeneration: (scope: AuthoritativeRunEvidenceHydrationScope) => number;
+  loadEvidence: (queryRoot: string, runId: string) => Promise<RunEvidence>;
+  replaceWorkspace: (workspace: WorkspaceState) => void;
+}): AuthoritativeRunEvidenceHydrator {
+  const requestOwners = new Map<string, { requestKey: string; runId: string }>();
+  const pending = new Map<string, Promise<void>>();
+  const installedRequests = new Map<string, string>();
+  const installedOwners = new Map<string, AuthoritativeRunEvidenceDisplayScope>();
+
+  const run = async (request: AuthoritativeRunEvidenceHydrationRequest): Promise<void> => {
+    const requestKey = runEvidenceHydrationRequestKey(request);
+    const targetKey = runEvidenceHydrationTargetKey(request);
+    if (!authoritativeRunEvidenceRequestIsCurrent(
+      options.getWorkspace(),
+      request,
+      options.getGeneration(request),
+    )) return;
+
+    let loaded: RunEvidence;
+    try {
+      loaded = await options.loadEvidence(request.queryRoot, request.runId);
+    } catch {
+      return;
+    }
+    const evidence = parseRunEvidence(loaded);
+    if (
+      requestOwners.get(targetKey)?.requestKey !== requestKey ||
+      !evidence ||
+      evidence.runId !== request.runId ||
+      !isTerminalRunEvidenceStatus(evidence.status)
+    ) return;
+
+    const current = options.getWorkspace();
+    if (!authoritativeRunEvidenceRequestIsCurrent(
+      current,
+      request,
+      options.getGeneration(request),
+    )) return;
+    const next = {
+      ...current,
+      runEvidence: { ...current.runEvidence, [request.runId]: evidence },
+    };
+    installedRequests.set(requestKey, request.runId);
+    installedOwners.set(request.runId, runEvidenceDisplayScope(request));
+    options.replaceWorkspace(next);
+  };
+
+  return {
+    async schedule(requests) {
+      const scheduled = requests.map((request) => {
+        const requestKey = runEvidenceHydrationRequestKey(request);
+        const targetKey = runEvidenceHydrationTargetKey(request);
+        requestOwners.set(targetKey, { requestKey, runId: request.runId });
+        if (installedRequests.has(requestKey)) return Promise.resolve();
+        const existing = pending.get(requestKey);
+        if (existing) return existing;
+        const started = run(request).finally(() => {
+          if (pending.get(requestKey) === started) pending.delete(requestKey);
+        });
+        pending.set(requestKey, started);
+        return started;
+      });
+      await Promise.all(scheduled);
+    },
+    evidenceFor(scope) {
+      const owner = installedOwners.get(scope.runId);
+      if (!owner || !sameRunEvidenceDisplayScope(owner, scope)) return undefined;
+      const workspace = options.getWorkspace();
+      if (!authoritativeRunEvidenceDisplayScopeIsCurrent(workspace, scope)) return undefined;
+      const evidence = parseRunEvidence(workspace.runEvidence[scope.runId]);
+      return evidence && evidence.runId === scope.runId && isTerminalRunEvidenceStatus(evidence.status)
+        ? evidence
+        : undefined;
+    },
+    discard(runIds) {
+      const discarded = new Set(runIds);
+      for (const runId of discarded) installedOwners.delete(runId);
+      for (const [requestKey, runId] of installedRequests) {
+        if (discarded.has(runId)) installedRequests.delete(requestKey);
+      }
+      for (const [targetKey, owner] of requestOwners) {
+        if (discarded.has(owner.runId)) requestOwners.delete(targetKey);
+      }
+    },
+  };
+}
+
+function authoritativeRunEvidenceRequestIsCurrent(
+  workspace: WorkspaceState,
+  request: AuthoritativeRunEvidenceHydrationRequest,
+  currentGeneration: number,
+): boolean {
+  return currentGeneration === request.generation &&
+    authoritativeRunEvidenceDisplayScopeIsCurrent(workspace, request);
+}
+
+function authoritativeRunEvidenceDisplayScopeIsCurrent(
+  workspace: WorkspaceState,
+  scope: AuthoritativeRunEvidenceDisplayScope,
+): boolean {
+  if (
+    !workspaceMatchesWorkflowAuthority(workspace, scope) ||
+    workspace.activeProjectId !== scope.projectId ||
+    workspace.activeSessionId !== scope.sessionId
+  ) return false;
+  const session = workspace.sessions.find((candidate) => (
+    candidate.kind === "canvas" &&
+    candidate.id === scope.sessionId &&
+    candidate.projectId === scope.projectId
+  ));
+  if (session?.kind !== "canvas") return false;
+  const node = session.nodes.find((candidate) => candidate.id === scope.nodeId);
+  return node?.runId === scope.runId && (node.status === "completed" || node.status === "failed");
+}
+
+function runEvidenceHydrationRequestKey(request: AuthoritativeRunEvidenceHydrationRequest): string {
+  return JSON.stringify([
+    request.projectId,
+    request.canonicalRoot,
+    request.queryRoot,
+    request.sessionId,
+    request.nodeId,
+    request.runId,
+    request.generation,
+  ]);
+}
+
+function runEvidenceHydrationTargetKey(request: AuthoritativeRunEvidenceHydrationRequest): string {
+  return JSON.stringify([
+    request.projectId,
+    request.canonicalRoot,
+    request.queryRoot,
+    request.sessionId,
+    request.nodeId,
+  ]);
+}
+
+function runEvidenceDisplayScope(
+  request: AuthoritativeRunEvidenceHydrationRequest,
+): AuthoritativeRunEvidenceDisplayScope {
+  const { generation: _generation, ...scope } = request;
+  return scope;
+}
+
+function sameRunEvidenceDisplayScope(
+  left: AuthoritativeRunEvidenceDisplayScope,
+  right: AuthoritativeRunEvidenceDisplayScope,
+): boolean {
+  return left.projectId === right.projectId &&
+    left.canonicalRoot === right.canonicalRoot &&
+    left.queryRoot === right.queryRoot &&
+    left.sessionId === right.sessionId &&
+    left.nodeId === right.nodeId &&
+    left.runId === right.runId;
+}
+
+function isConcreteRunId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value === value.trim() && !value.includes("\0");
+}
+
+function isTerminalRunEvidenceStatus(status: RunEvidence["status"]): boolean {
+  return status === "succeeded" || status === "failed" || status === "cancelled" || status === "timed-out";
+}
+
 export default function App() {
   const [workspace, setWorkspace] = useState<WorkspaceState>(() => {
     return emptyWorkspace();
@@ -659,6 +908,7 @@ export default function App() {
   const activeBottomComposerScopeRef = useRef<string | null>(null);
   const newSessionSubmissionsRef = useRef(new Map<string, NewSessionSubmissionState>());
   const workflowProjectionGenerationRef = useRef(new Map<string, number>());
+  const authoritativeRunEvidenceHydratorRef = useRef<AuthoritativeRunEvidenceHydrator | null>(null);
   const planRuntimeRecoveryGeneration = useRef(0);
   const planAdapterRef = useRef<ReturnType<typeof createPlanAdapter> | null>(null);
   const planMutationQueueRef = useRef<ReturnType<typeof createPlanMutationQueue> | null>(null);
@@ -696,6 +946,17 @@ export default function App() {
       () => workspaceRef.current,
       setWorkspaceSaveError,
     );
+  }
+  if (!authoritativeRunEvidenceHydratorRef.current) {
+    authoritativeRunEvidenceHydratorRef.current = createAuthoritativeRunEvidenceHydrator({
+      getWorkspace: () => workspaceRef.current,
+      getGeneration: (scope) => currentWorkflowGeneration(workflowProjectionGenerationRef.current, scope),
+      loadEvidence: loadExactTerminalRunEvidence,
+      replaceWorkspace: (next) => {
+        workspaceRef.current = next;
+        setWorkspace(next);
+      },
+    });
   }
 
   const activeProject = workspace.projects.find((project) => project.id === workspace.activeProjectId) ?? null;
@@ -738,6 +999,24 @@ export default function App() {
       )) ?? null
     : null;
 
+  function activeNodeRunEvidence(node: CanvasNode | null): RunEvidence | null {
+    if (!node) return null;
+    if (!window.devflow) return workspace.runEvidence[node.runId] ?? null;
+    if (
+      !activeProject ||
+      activeSession?.kind !== "canvas" ||
+      !isCanonicalWorkflowProjectRoot(activeProject.canonicalRootPath)
+    ) return null;
+    return authoritativeRunEvidenceHydratorRef.current!.evidenceFor({
+      projectId: activeProject.id,
+      queryRoot: activeProject.rootPath,
+      canonicalRoot: activeProject.canonicalRootPath,
+      sessionId: activeSession.id,
+      nodeId: node.id,
+      runId: node.runId,
+    }) ?? null;
+  }
+
   function captureWorkflowSessionResponseGuard(
     project: ImportedProject,
     sessionId: string,
@@ -762,20 +1041,40 @@ export default function App() {
     guard: WorkflowSessionResponseGuard,
     decorate?: (workspace: WorkspaceState, authoritative: CanvasSession) => WorkspaceState,
   ): void {
-    setWorkspace((current) => {
-      const guarded = applyAuthoritativeWorkflowSessionResponse(
-        current,
-        response,
-        guard,
-        currentWorkflowGeneration(workflowProjectionGenerationRef.current, guard),
-      );
-      if (guarded === current) return current;
-      const authoritative = canvasSessionForWorkflowAuthority(response, guard);
-      if (!authoritative) return current;
-      const next = decorate ? decorate(guarded, authoritative) : guarded;
-      workspaceRef.current = next;
-      return next;
-    });
+    const current = workspaceRef.current;
+    const guarded = applyAuthoritativeWorkflowSessionResponse(
+      current,
+      response,
+      guard,
+      currentWorkflowGeneration(workflowProjectionGenerationRef.current, guard),
+    );
+    if (guarded === current) return;
+    const authoritative = canvasSessionForWorkflowAuthority(response, guard);
+    if (!authoritative) return;
+    installAuthoritativeCanvasSession(
+      current,
+      decorate ? decorate(guarded, authoritative) : guarded,
+      authoritative,
+      guard,
+    );
+  }
+
+  function installAuthoritativeCanvasSession(
+    previous: WorkspaceState,
+    installed: WorkspaceState,
+    authoritative: CanvasSession,
+    scope: AuthoritativeRunEvidenceHydrationScope,
+  ): void {
+    const prepared = prepareAuthoritativeRunEvidenceHydration(
+      previous,
+      installed,
+      authoritative,
+      scope,
+    );
+    authoritativeRunEvidenceHydratorRef.current!.discard(prepared.clearedRunIds);
+    workspaceRef.current = prepared.workspace;
+    setWorkspace(prepared.workspace);
+    void authoritativeRunEvidenceHydratorRef.current!.schedule(prepared.requests);
   }
 
   useEffect(() => {
@@ -783,7 +1082,9 @@ export default function App() {
     setWorkspaceLoadError(null);
     void loadWorkspaceState().then((state) => {
       if (!active) return;
-      setWorkspace(state);
+      const loaded = workspaceForRendererLoad(state, !!window.devflow);
+      workspaceRef.current = loaded;
+      setWorkspace(loaded);
       setWorkspaceLoaded(true);
     }).catch(() => {
       if (!active) return;
@@ -849,20 +1150,27 @@ export default function App() {
     return window.devflow.onWorkflowEvent((event) => {
       const envelope = workflowSessionEnvelope(event);
       if (!envelope) return;
-      setWorkspace((current) => {
-        const next = applyAuthoritativeWorkflowBroadcast(
-          current,
-          event,
-          newSessionSubmissionsRef.current,
-        );
-        if (next === current) return current;
-        advanceWorkflowGeneration(workflowProjectionGenerationRef.current, {
-          projectId: envelope.canvasSession.projectId,
-          canonicalRoot: envelope.projectRoot,
-          sessionId: envelope.sessionId,
-        });
-        workspaceRef.current = next;
-        return next;
+      const current = workspaceRef.current;
+      const next = applyAuthoritativeWorkflowBroadcast(
+        current,
+        event,
+        newSessionSubmissionsRef.current,
+      );
+      if (next === current) return;
+      const project = current.projects.find((candidate) => (
+        candidate.id === envelope.canvasSession.projectId &&
+        candidate.canonicalRootPath === envelope.projectRoot
+      ));
+      const authority = project ? workflowRequestAuthority(project, envelope.sessionId) : null;
+      if (!authority) return;
+      const generation = advanceWorkflowGeneration(workflowProjectionGenerationRef.current, {
+        projectId: envelope.canvasSession.projectId,
+        canonicalRoot: envelope.projectRoot,
+        sessionId: envelope.sessionId,
+      });
+      installAuthoritativeCanvasSession(current, next, envelope.canvasSession, {
+        ...authority,
+        generation,
       });
     });
   }, []);
@@ -1459,15 +1767,14 @@ export default function App() {
       const responseGuard = captureWorkflowSessionResponseGuard(project, accepted.id, null);
       if (!responseGuard) return;
       const canvas = await finishPlanSession(project, accepted);
-      setWorkspace((current) => {
-        if (
-          !workspaceMatchesWorkflowAuthority(current, responseGuard) ||
-          currentWorkflowGeneration(workflowProjectionGenerationRef.current, responseGuard) !== responseGuard.generation
-        ) return current;
-        const result = installFinishedPlanCanvas(current, boundary, canvas);
-        workspaceRef.current = result.workspace;
-        return result.workspace;
-      });
+      const current = workspaceRef.current;
+      if (
+        !workspaceMatchesWorkflowAuthority(current, responseGuard) ||
+        currentWorkflowGeneration(workflowProjectionGenerationRef.current, responseGuard) !== responseGuard.generation
+      ) return;
+      const result = installFinishedPlanCanvas(current, boundary, canvas);
+      if (!result.installed) return;
+      installAuthoritativeCanvasSession(current, result.workspace, canvas, responseGuard);
     } catch {
       setPlanFinishError({ sessionId: session.id, message: "Plan finish failed. Retry." });
     } finally {
@@ -1507,12 +1814,8 @@ export default function App() {
     );
     if (!running) return;
     if (window.devflow) {
-      void window.devflow.cancelAgentRun(running.runId, "Stopped from workspace controls").then((result) => {
-        setWorkspace((current) => ({
-          ...current,
-          runEvidence: { ...current.runEvidence, [running.runId]: result.evidence },
-        }));
-      });
+      void window.devflow.cancelAgentRun(running.runId, "Stopped from workspace controls").catch(() => undefined);
+      return;
     }
     updateNode(running.id, (node) => ({
       ...node,
@@ -1524,12 +1827,8 @@ export default function App() {
 
   function stopNodeRun(target: CanvasNode) {
     if (window.devflow) {
-      void window.devflow.cancelAgentRun(target.runId, "Stopped from node modal").then((result) => {
-        setWorkspace((current) => ({
-          ...current,
-          runEvidence: { ...current.runEvidence, [target.runId]: result.evidence },
-        }));
-      });
+      void window.devflow.cancelAgentRun(target.runId, "Stopped from node modal").catch(() => undefined);
+      return;
     }
     updateNode(target.id, (node) => ({
       ...node,
@@ -1992,7 +2291,7 @@ export default function App() {
               composerDisabled={!selectedNode && bottomComposerState?.busy === true}
               bottomComposerState={bottomComposerState}
               selectedNode={selectedNode}
-              selectedRunEvidence={selectedNode ? workspace.runEvidence?.[selectedNode.runId] ?? null : null}
+              selectedRunEvidence={activeNodeRunEvidence(selectedNode)}
               selectedNodeActionScopeKey={selectedNodeActionScopeKey}
               selectedNodeActionState={selectedNodeActionState}
               nodeActionBusy={nodeActionBusy}
@@ -2038,7 +2337,7 @@ export default function App() {
           projectRoot={activeProject.rootPath}
           session={activeSession}
           runEvents={workspace.runEvents?.[inspectedNode.runId] ?? []}
-          runEvidence={workspace.runEvidence?.[inspectedNode.runId] ?? null}
+          runEvidence={activeNodeRunEvidence(inspectedNode)}
           tab={modalTab}
           onTab={setModalTab}
           onClose={() => setInspectedNodeId(null)}

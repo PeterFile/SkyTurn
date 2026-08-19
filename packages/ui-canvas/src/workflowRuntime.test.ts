@@ -8,6 +8,7 @@ import {
   applyBridgeRunResult,
   buildPromptForNodeRun,
   loadExactRunEvidence,
+  loadExactTerminalRunEvidence,
   mergeRunEventsIntoWorkspace,
   retryCanvasNode,
   sandboxForNodeRun,
@@ -75,6 +76,44 @@ describe("workflow runtime event merging", () => {
     try {
       await expect(loadExactRunEvidence("/tmp/project-alias", runId)).rejects.toThrow(
         "Invalid exact RunEvidence response.",
+      );
+      await expect(loadExactTerminalRunEvidence("/tmp/project-alias", runId)).rejects.toThrow(
+        "Invalid exact RunEvidence response.",
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it.each(["succeeded", "failed", "cancelled", "timed-out"] as const)(
+    "loads exact %s terminal evidence without changing the compatible exact loader",
+    async (status) => {
+      const queryRoot = "/tmp/project-alias";
+      const runId = `run-terminal-${status}`;
+      const evidence = runEvidenceFor(runId, status);
+      const getRunEvidence = vi.fn(async () => ({ protocolVersion: 1, evidence }));
+      vi.stubGlobal("window", { devflow: { getRunEvidence } });
+
+      try {
+        await expect(loadExactTerminalRunEvidence(queryRoot, runId)).resolves.toEqual(evidence);
+        expect(getRunEvidence).toHaveBeenCalledWith(queryRoot, runId);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it("rejects nonterminal exact evidence while the startBridgeRun-compatible loader still accepts it", async () => {
+    const queryRoot = "/tmp/project-alias";
+    const runId = "run-terminal-running";
+    const evidence = runEvidenceFor(runId, "running");
+    const getRunEvidence = vi.fn(async () => ({ protocolVersion: 1, evidence }));
+    vi.stubGlobal("window", { devflow: { getRunEvidence } });
+
+    try {
+      await expect(loadExactRunEvidence(queryRoot, runId)).resolves.toEqual(evidence);
+      await expect(loadExactTerminalRunEvidence(queryRoot, runId)).rejects.toThrow(
+        "RunEvidence response is not terminal.",
       );
     } finally {
       vi.unstubAllGlobals();

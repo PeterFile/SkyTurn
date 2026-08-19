@@ -72,6 +72,14 @@ export async function loadExactRunEvidence(queryRoot: string, runId: string): Pr
   return evidence;
 }
 
+export async function loadExactTerminalRunEvidence(queryRoot: string, runId: string): Promise<RunEvidence> {
+  const evidence = await loadExactRunEvidence(queryRoot, runId);
+  if (!isFinalRunStatus(evidence.status)) {
+    throw new Error("RunEvidence response is not terminal.");
+  }
+  return evidence;
+}
+
 export async function startBridgeRun(
   project: ImportedProject,
   session: CanvasSession,
