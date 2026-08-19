@@ -38,10 +38,13 @@ test("rendererDevCommand starts Vite with an exact strict port", () => {
   ]);
 });
 
-test("desktop Electron build script force-rebuilds stale incremental output", async () => {
+test("desktop Electron build script force-rebuilds TypeScript before bundling the sandboxed preload", async () => {
   const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 
-  assert.equal(packageJson.scripts["build:electron"], "tsc -b tsconfig.electron.json --force");
+  assert.equal(
+    packageJson.scripts["build:electron"],
+    "tsc -b tsconfig.electron.json --force && vite build --config vite.preload.config.ts",
+  );
 });
 
 test("root dev refreshes desktop dependencies and the ui-canvas source root", async () => {
