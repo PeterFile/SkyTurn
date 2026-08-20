@@ -710,7 +710,7 @@ export function evaluateGate(projection: FlowProjection, operation: WorkflowInte
     const target = projection.lanes.find((lane) => lane.id === operation.targetLaneId);
     if (!source) return blocked("DeclareEdge requires an existing source lane; missing source lane.");
     if (operation.sourceLaneId === operation.targetLaneId) return blocked("Edge would create a cycle.");
-    if (target?.kind === "planner" || target?.kind === "intake" || /planner|intake/.test(operation.targetLaneId)) {
+    if ((target && isPlannerOrIntakeLane(target)) || /planner|intake/i.test(operation.targetLaneId)) {
       return blocked("Planner/intake lanes cannot have incoming edges.");
     }
     if (!target) return blocked("DeclareEdge requires an existing target lane; missing target lane.");
@@ -1963,13 +1963,24 @@ function exactJsonEqual(left: unknown, right: unknown): boolean {
 }
 
 function assertCompleteGraphHygiene(projection: FlowProjection, context: string): void {
-  const lanesById = new Map(projection.lanes.map((lane) => [lane.id, lane]));
+  const lanesById = new Map<string, FlowLane>();
+  const lanesBySemanticKey = new Map<string, FlowLane>();
+  for (const lane of projection.lanes) {
+    if (lanesById.has(lane.id)) throw new Error(`${context} has duplicate lane ID ${lane.id}.`);
+    if (lanesBySemanticKey.has(lane.semanticKey)) {
+      throw new Error(`${context} has duplicate lane semantic key ${lane.semanticKey}.`);
+    }
+    lanesById.set(lane.id, lane);
+    lanesBySemanticKey.set(lane.semanticKey, lane);
+  }
   const edgesById = new Map<string, FlowEdge>();
+  const edgesByEndpoints = new Map<string, FlowEdge>();
   for (const edge of projection.edges) {
     if (!lanesById.has(edge.sourceLaneId)) throw new Error(`${context} references missing source lane ${edge.sourceLaneId}.`);
     const target = lanesById.get(edge.targetLaneId);
     if (!target) throw new Error(`${context} references missing target lane ${edge.targetLaneId}.`);
-    if (target.kind === "planner" || target.kind === "intake" || /planner|intake/.test(edge.targetLaneId)) {
+    if (edge.sourceLaneId === edge.targetLaneId) throw new Error(`${context} contains a self-edge ${edge.id}.`);
+    if (isPlannerOrIntakeLane(target)) {
       throw new Error(`${context} cannot target planner/intake lane ${edge.targetLaneId}.`);
     }
     const existing = edgesById.get(edge.id);
@@ -1977,7 +1988,12 @@ function assertCompleteGraphHygiene(projection: FlowProjection, context: string)
       throw new Error(`${context} has edge ID conflict ${edge.id}.`);
     }
     edgesById.set(edge.id, edge);
+    const endpoints = `${edge.sourceLaneId}\0${edge.targetLaneId}`;
+    const duplicate = edgesByEndpoints.get(endpoints);
+    if (duplicate && duplicate.id !== edge.id) throw new Error(`${context} has duplicate edge endpoints.`);
+    edgesByEndpoints.set(endpoints, edge);
   }
+  if (graphHasCycle(projection.edges)) throw new Error(`${context} contains a cycle.`);
 }
 
 function assertNoRetainedEdgeIdCollisions(retainedEdges: FlowEdge[], newEdges: FlowEdge[], context: string): void {
@@ -2155,11 +2171,61 @@ function laneAndEdgeEvents(
   now: string,
   keyPrefix: string,
 ): FlowEvent[] {
+  let candidate: LaneAndEdgeCandidate;
+  try {
+    candidate = preflightLaneAndEdgeCandidate(projection, suggestions);
+  } catch {
+    throw new Error(WORKFLOW_GRAPH_PREFLIGHT_ERROR);
+  }
+
   let working = projection;
   const events: FlowEvent[] = [];
-  const existingLaneIds = new Set(projection.lanes.map((lane) => lane.id));
-  const existingSemanticKeys = new Set(projection.lanes.map((lane) => lane.semanticKey));
-  const existingEdges = new Set(projection.edges.map((edge) => `${edge.sourceLaneId}->${edge.targetLaneId}`));
+
+  for (const lane of candidate.lanes) {
+    const event = makeEvent(working, {
+      kind: "workflow.lane.declared",
+      source: "workflow-kernel",
+      payload: { lane },
+      now,
+      idempotencyKey: `${keyPrefix}:lane:${lane.semanticKey}`,
+    });
+    events.push(event);
+    working = reduceWorkflowEvents([...working.events, event]);
+  }
+
+  for (const edge of candidate.edges) {
+    const edgeKey = `${edge.sourceLaneId}->${edge.targetLaneId}`;
+    const event = makeEvent(working, {
+      kind: "workflow.edge.declared",
+      source: "workflow-kernel",
+      payload: { edge },
+      now,
+      idempotencyKey: `${keyPrefix}:edge:${edgeKey}`,
+    });
+    events.push(event);
+    working = reduceWorkflowEvents([...working.events, event]);
+  }
+
+  return events;
+}
+
+const WORKFLOW_GRAPH_PREFLIGHT_ERROR = "Workflow graph preflight failed.";
+
+interface LaneAndEdgeCandidate {
+  lanes: FlowLane[];
+  edges: FlowEdge[];
+}
+
+function preflightLaneAndEdgeCandidate(
+  projection: FlowProjection,
+  suggestions: LaneSuggestion[],
+): LaneAndEdgeCandidate {
+  assertCompleteGraphHygiene(projection, "Workflow graph preflight");
+  const candidateLanes = [...projection.lanes];
+  const lanesById = new Map(candidateLanes.map((lane) => [lane.id, lane]));
+  const lanesBySemanticKey = new Map(candidateLanes.map((lane) => [lane.semanticKey, lane]));
+  const lanes: FlowLane[] = [];
+  const normalizedSuggestions: Array<{ lane: FlowLane; dependencies: string[] }> = [];
 
   for (const suggestion of suggestions) {
     const lane = normalizeLane({
@@ -2171,51 +2237,95 @@ function laneAndEdgeEvents(
       packageScopes: suggestion.packageScopes ?? [],
       requiredEvidence: suggestion.requiredEvidence ?? [],
     });
-    if (!existingLaneIds.has(lane.id) && !existingSemanticKeys.has(lane.semanticKey)) {
-      const event = makeEvent(working, {
-        kind: "workflow.lane.declared",
-        source: "workflow-kernel",
-        payload: { lane },
-        now,
-        idempotencyKey: `${keyPrefix}:lane:${lane.semanticKey}`,
-      });
-      events.push(event);
-      working = reduceWorkflowEvents([...working.events, event]);
-      existingLaneIds.add(lane.id);
-      existingSemanticKeys.add(lane.semanticKey);
-    }
-  }
-
-  for (const suggestion of suggestions) {
-    for (const dependency of suggestion.dependsOn ?? []) {
-      const edgeKey = `${dependency}->${suggestion.id}`;
-      if (existingEdges.has(edgeKey)) continue;
-      const edge = { id: `edge-${dependency.replace(/^lane-/, "")}-${suggestion.id.replace(/^lane-/, "")}`, sourceLaneId: dependency, targetLaneId: suggestion.id };
-      const gate = evaluateGate(working, { type: "DeclareEdge", sourceLaneId: dependency, targetLaneId: suggestion.id });
-      if (!gate.allowed) {
-        events.push(makeEvent(working, {
-          kind: "workflow.intent.rejected",
-          source: "workflow-gate",
-          payload: { intentId: keyPrefix, reason: gate.reason },
-          now,
-          idempotencyKey: `${keyPrefix}:edge-rejected:${edgeKey}`,
-        }));
-        continue;
+    const existingById = lanesById.get(lane.id);
+    const existingBySemanticKey = lanesBySemanticKey.get(lane.semanticKey);
+    if (existingById || existingBySemanticKey) {
+      if (
+        !existingById ||
+        !existingBySemanticKey ||
+        existingById !== existingBySemanticKey ||
+        !sameLaneDeclaration(existingById, lane)
+      ) {
+        throw new Error("Workflow lane identity collision.");
       }
-      const event = makeEvent(working, {
-        kind: "workflow.edge.declared",
-        source: "workflow-kernel",
-        payload: { edge },
-        now,
-        idempotencyKey: `${keyPrefix}:edge:${edgeKey}`,
-      });
-      events.push(event);
-      working = reduceWorkflowEvents([...working.events, event]);
-      existingEdges.add(edgeKey);
+    } else {
+      lanes.push(lane);
+      candidateLanes.push(lane);
+      lanesById.set(lane.id, lane);
+      lanesBySemanticKey.set(lane.semanticKey, lane);
+    }
+    normalizedSuggestions.push({ lane, dependencies: suggestion.dependsOn ?? [] });
+  }
+
+  const existingEndpoints = new Set(projection.edges.map(edgeEndpointKey));
+  const generatedEndpoints = new Set<string>();
+  const generatedById = new Map<string, FlowEdge>();
+  const edges: FlowEdge[] = [];
+  for (const { lane, dependencies } of normalizedSuggestions) {
+    for (const dependency of dependencies) {
+      const edge: FlowEdge = {
+        id: generatedLaneEdgeId(dependency, lane.id),
+        sourceLaneId: dependency,
+        targetLaneId: lane.id,
+      };
+      const endpoints = edgeEndpointKey(edge);
+      if (existingEndpoints.has(endpoints) || generatedEndpoints.has(endpoints)) continue;
+      const generatedCollision = generatedById.get(edge.id);
+      if (generatedCollision && edgeEndpointKey(generatedCollision) !== endpoints) {
+        throw new Error("Workflow generated edge ID collision.");
+      }
+      generatedById.set(edge.id, edge);
+      generatedEndpoints.add(endpoints);
+      edges.push(edge);
     }
   }
 
-  return events;
+  assertNoRetainedEdgeIdCollisions(projection.edges, edges, "Workflow generated edge ID collision");
+  let working = { ...projection, lanes: candidateLanes };
+  for (const edge of edges) {
+    const gate = evaluateGate(working, {
+      type: "DeclareEdge",
+      sourceLaneId: edge.sourceLaneId,
+      targetLaneId: edge.targetLaneId,
+    });
+    if (!gate.allowed) throw new Error("Workflow graph gate rejected an edge.");
+    working = { ...working, edges: [...working.edges, edge] };
+  }
+  assertCompleteGraphHygiene(working, "Workflow graph preflight candidate");
+  return { lanes, edges };
+}
+
+function sameLaneDeclaration(left: FlowLane, right: FlowLane): boolean {
+  const declaration = (lane: FlowLane) => ({
+    id: lane.id,
+    semanticKey: lane.semanticKey,
+    kind: lane.kind,
+    laneKind: lane.laneKind,
+    semanticSubtype: lane.semanticSubtype,
+    title: lane.title,
+    brief: lane.brief ?? null,
+    agentKind: lane.agentKind,
+    nodeKind: lane.nodeKind,
+    executable: lane.executable,
+    runtimePolicy: lane.runtimePolicy,
+    fileScopes: lane.fileScopes,
+    packageScopes: lane.packageScopes,
+    requiredEvidence: lane.requiredEvidence,
+  });
+  return exactJsonEqual(declaration(left), declaration(right));
+}
+
+function generatedLaneEdgeId(sourceLaneId: string, targetLaneId: string): string {
+  return `edge-${sourceLaneId.replace(/^lane-/, "")}-${targetLaneId.replace(/^lane-/, "")}`;
+}
+
+function edgeEndpointKey(edge: Pick<FlowEdge, "sourceLaneId" | "targetLaneId">): string {
+  return `${edge.sourceLaneId}\0${edge.targetLaneId}`;
+}
+
+function isPlannerOrIntakeLane(lane: FlowLane): boolean {
+  return [lane.id, lane.semanticKey, lane.kind, lane.semanticSubtype]
+    .some((value) => /planner|intake/i.test(value));
 }
 
 function suggestedLanesForPolicy(
@@ -2223,9 +2333,110 @@ function suggestedLanesForPolicy(
   projectProfile: ProjectProfile,
   requirementProfile: RequirementProfile,
 ): LaneSuggestion[] {
-  const packs = policy.policyPacks.filter((pack) => pack.detects({ projectProfile, requirementProfile }));
-  const lanes = packs.flatMap((pack) => pack.suggestedLanes({ projectProfile, requirementProfile }));
-  return [...new Map(lanes.map((lane) => [lane.id, lane])).values()];
+  try {
+    const input = { projectProfile, requirementProfile };
+    const eligiblePacks = policy.policyPacks.filter((pack) => pack.detects(input));
+    const requirementCapabilities = new Set(requirementProfile.capabilities);
+    const requirementPacks = eligiblePacks.filter((pack) =>
+      pack.capabilities.some((capability) => requirementCapabilities.has(capability))
+    );
+    const packs = requirementPacks.length > 0 ? requirementPacks : eligiblePacks;
+    return composePolicyPackLanes(packs, projectProfile, requirementProfile);
+  } catch {
+    throw new Error(WORKFLOW_GRAPH_PREFLIGHT_ERROR);
+  }
+}
+
+function composePolicyPackLanes(
+  packs: PolicyPack[],
+  projectProfile: ProjectProfile,
+  requirementProfile: RequirementProfile,
+): LaneSuggestion[] {
+  const selected = packs.map((pack) => {
+    const lanes = pack.suggestedLanes({ projectProfile, requirementProfile });
+    const dependedOn = new Set(lanes.flatMap((lane) => lane.dependsOn ?? []));
+    return {
+      lanes,
+      terminalSinks: lanes
+        .filter((lane) => !dependedOn.has(lane.id))
+        .map((lane) => ({ id: lane.id, commit: normalizeLane(lane).laneKind === "commit" })),
+    };
+  });
+  const order: string[] = [];
+  const composed = new Map<string, LaneSuggestion>();
+
+  for (const { lanes } of selected) {
+    for (const suggestion of lanes) {
+      const existing = composed.get(suggestion.id);
+      if (!existing) {
+        order.push(suggestion.id);
+        composed.set(suggestion.id, canonicalPolicyPackSuggestion(suggestion));
+        continue;
+      }
+      assertCompatiblePolicyPackCollision(existing, suggestion);
+      composed.set(suggestion.id, {
+        ...existing,
+        dependsOn: stableStringUnion(existing.dependsOn ?? [], suggestion.dependsOn ?? []),
+        fileScopes: stableStringUnion(existing.fileScopes ?? [], suggestion.fileScopes ?? []),
+        packageScopes: stableStringUnion(existing.packageScopes ?? [], suggestion.packageScopes ?? []),
+        requiredEvidence: deduplicatedRequiredEvidence([
+          ...(existing.requiredEvidence ?? []),
+          ...(suggestion.requiredEvidence ?? []),
+        ]),
+      });
+    }
+  }
+
+  const nonCommitTerminalSinkIds = stableStringUnion(selected.flatMap(({ terminalSinks }) =>
+    terminalSinks.filter((sink) => !sink.commit).map((sink) => sink.id)
+  ));
+  for (const laneId of order) {
+    const lane = composed.get(laneId);
+    if (!lane || normalizeLane(lane).laneKind !== "commit") continue;
+    composed.set(laneId, {
+      ...lane,
+      dependsOn: stableStringUnion(lane.dependsOn ?? [], nonCommitTerminalSinkIds),
+    });
+  }
+
+  return order.map((laneId) => composed.get(laneId)!);
+}
+
+function canonicalPolicyPackSuggestion(suggestion: LaneSuggestion): LaneSuggestion {
+  return {
+    ...suggestion,
+    dependsOn: stableStringUnion(suggestion.dependsOn ?? []),
+    fileScopes: stableStringUnion(suggestion.fileScopes ?? []),
+    packageScopes: stableStringUnion(suggestion.packageScopes ?? []),
+    requiredEvidence: deduplicatedRequiredEvidence(suggestion.requiredEvidence),
+  };
+}
+
+function assertCompatiblePolicyPackCollision(left: LaneSuggestion, right: LaneSuggestion): void {
+  const semantics = (suggestion: LaneSuggestion) => {
+    const lane = normalizeLane(suggestion);
+    return {
+      semanticKey: lane.semanticKey,
+      kind: lane.kind,
+      laneKind: lane.laneKind,
+      semanticSubtype: lane.semanticSubtype,
+      agentKind: lane.agentKind,
+      nodeKind: lane.nodeKind,
+      executable: lane.executable,
+      runtimePolicy: {
+        executable: lane.runtimePolicy.executable,
+        sandbox: lane.runtimePolicy.sandbox,
+        sideEffects: lane.runtimePolicy.sideEffects,
+      },
+    };
+  };
+  if (JSON.stringify(semantics(left)) !== JSON.stringify(semantics(right))) {
+    throw new Error(WORKFLOW_GRAPH_PREFLIGHT_ERROR);
+  }
+}
+
+function stableStringUnion(...values: string[][]): string[] {
+  return [...new Set(values.flat())];
 }
 
 function inferRequirementProfile(requirement: string): RequirementProfile {
@@ -2246,7 +2457,7 @@ function inferRequirementProfile(requirement: string): RequirementProfile {
   ].filter((value): value is string => Boolean(value));
   return {
     text: requirement,
-    capabilities: capabilities.length > 0 ? capabilities : ["frontend-ui"],
+    capabilities,
     risk: capabilities.includes("fullstack-settings") ? "high" : "medium",
   };
 }
@@ -2482,14 +2693,10 @@ function laneDenotesBrowserScreenshotValidation(record: Record<string, unknown>)
 
   const kind = semanticEvidenceKey(record.kind);
   const semanticSubtype = semanticEvidenceKey(record.semanticSubtype);
-  if (isBrowserScreenshotValidationSemantic(kind) || isBrowserScreenshotValidationSemantic(semanticSubtype)) {
-    return true;
-  }
-
   const laneKind = semanticEvidenceKey(record.laneKind) || laneKindForLegacyKind(kind);
   if (laneKind !== "validation" && laneKind !== "regression") return false;
-  return isBoundedBrowserScreenshotValidationText(record.title) ||
-    isBoundedBrowserScreenshotValidationText(record.brief);
+  return isBrowserScreenshotValidationSemantic(kind) ||
+    isBrowserScreenshotValidationSemantic(semanticSubtype);
 }
 
 function semanticEvidenceKey(value: unknown): string {
@@ -2500,15 +2707,6 @@ function semanticEvidenceKey(value: unknown): string {
 
 function isBrowserScreenshotValidationSemantic(value: string): boolean {
   return /^(?:browser|screenshot|browser_screenshot)_(?:validation|test|check)$/.test(value);
-}
-
-function isBoundedBrowserScreenshotValidationText(value: unknown): boolean {
-  if (typeof value !== "string") return false;
-  const text = value.trim().toLowerCase().replace(/\s+/g, " ");
-  if (!text || text.length > 120) return false;
-  return /^(?:capture|take|record|validate|verify) (?:a |the )?(?:browser )?screenshot(?: (?:evidence|proof))?$/.test(text) ||
-    /^(?:validate|verify|test)(?: [a-z0-9][a-z0-9 ._-]{0,60})? in (?:the )?browser$/.test(text) ||
-    /^(?:browser|browser screenshot|screenshot) (?:validation|test|check|evidence|proof)$/.test(text);
 }
 
 function laneKindForLegacyKind(kind: string): WorkflowLaneKind {
@@ -2554,12 +2752,22 @@ function normalizeRuntimePolicy(
   const effectiveExecutable = executable && value.executable !== false;
   if (!effectiveExecutable) return defaultRuntimePolicyForLaneSemantics(lane, laneKind, semanticSubtype, false);
   const requestedSandbox = isAgentRunSandbox(value.sandbox) ? value.sandbox : fallback.sandbox;
+  const browserScreenshotWriteRequired = requiresBrowserScreenshotWorkspaceWrite(
+    lane,
+    laneKind,
+    semanticSubtype,
+    true,
+  );
   return {
     source: "workflow_projection",
     trusted: true,
     executable: true,
-    sandbox: tighterSandbox(requestedSandbox, fallback.sandbox),
-    sideEffects: normalizeSideEffects(value.sideEffects, fallback.sideEffects),
+    sandbox: browserScreenshotWriteRequired
+      ? fallback.sandbox
+      : tighterSandbox(requestedSandbox, fallback.sandbox),
+    sideEffects: browserScreenshotWriteRequired
+      ? fallback.sideEffects
+      : normalizeSideEffects(value.sideEffects, fallback.sideEffects),
     reason: fallback.reason,
   };
 }
@@ -2572,9 +2780,17 @@ function defaultRuntimePolicyForLaneSemantics(
 ): WorkflowRuntimePolicy {
   if (!executable) return defaultRuntimePolicyForLane(laneKind, false);
   const semanticKinds = canonicalRuntimeLaneKinds(lane, laneKind, semanticSubtype);
-  const sandbox = semanticKinds
-    .map(sandboxForRuntimeLaneKind)
-    .reduce(tighterSandbox);
+  const writesBrowserScreenshotArtifact = requiresBrowserScreenshotWorkspaceWrite(
+    lane,
+    laneKind,
+    semanticSubtype,
+    executable,
+  );
+  const sandbox = writesBrowserScreenshotArtifact
+    ? "workspace-write"
+    : semanticKinds
+      .map(sandboxForRuntimeLaneKind)
+      .reduce(tighterSandbox);
   const sideEffects = semanticKinds
     .map(sideEffectsForRuntimeLaneKind)
     .reduce(intersectSideEffects);
@@ -2587,6 +2803,21 @@ function defaultRuntimePolicyForLaneSemantics(
     sideEffects,
     reason: `Runtime policy derived from workflow lane kind ${semanticReason}.`,
   };
+}
+
+function requiresBrowserScreenshotWorkspaceWrite(
+  lane: Record<string, unknown>,
+  laneKind: WorkflowLaneKind,
+  semanticSubtype: WorkflowLaneSemanticSubtype,
+  executable: boolean,
+): boolean {
+  if (!executable || (laneKind !== "validation" && laneKind !== "regression")) return false;
+  const semanticKinds = canonicalRuntimeLaneKinds(lane, laneKind, semanticSubtype);
+  const requiredEvidence = canonicalRequiredEvidenceForLane(lane);
+  return semanticKinds.every((kind) => kind === "validation" || kind === "regression") &&
+    laneDenotesBrowserScreenshotValidation(lane) &&
+    requiredEvidence.includes("browser") &&
+    requiredEvidence.includes("screenshot");
 }
 
 type RuntimeLaneKind = WorkflowLaneKind | "planner";
@@ -4228,8 +4459,12 @@ function intersects(left: string[], right: string[]): boolean {
 }
 
 function createsCycle(edges: FlowEdge[], sourceLaneId: string, targetLaneId: string): boolean {
+  return graphHasCycle([...edges, { id: "candidate", sourceLaneId, targetLaneId }]);
+}
+
+function graphHasCycle(edges: FlowEdge[]): boolean {
   const outgoing = new Map<string, string[]>();
-  for (const edge of [...edges, { id: "candidate", sourceLaneId, targetLaneId }]) {
+  for (const edge of edges) {
     outgoing.set(edge.sourceLaneId, [...(outgoing.get(edge.sourceLaneId) ?? []), edge.targetLaneId]);
   }
   const visited = new Set<string>();

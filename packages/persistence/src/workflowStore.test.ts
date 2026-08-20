@@ -8719,7 +8719,7 @@ describe("SQLite workflow store", () => {
           id: "lane-browser",
           semanticKey: "lane-browser",
           kind: "browser_validation",
-          title: "Capture browser screenshot",
+          title: "Opaque verification step 51",
           agentKind: "codex",
           status: "pending",
           requiredEvidence: ["browser", "screenshot"],
@@ -8833,40 +8833,74 @@ describe("SQLite workflow store", () => {
     ]);
     expect(declaredLanes.find((lane) => lane.id === "lane-browser-prose-neighbor")?.requiredEvidence).toEqual([]);
 
-    const scheduled = store.scheduleReadyLanes("session-1", {
+    const projectedLanes = store.materializeFlowProjection("session-1").lanes;
+    expect(projectedLanes.find((lane) => lane.id === "lane-browser-omitted")).toMatchObject({
+      laneKind: "validation",
+      semanticSubtype: "browser_validation",
+      requiredEvidence: ["browser", "screenshot"],
+      runtimePolicy: { sandbox: "workspace-write" },
+    });
+    expect(projectedLanes.find((lane) => lane.id === "lane-browser-empty")).toMatchObject({
+      laneKind: "validation",
+      semanticSubtype: "browser_validation",
+      requiredEvidence: ["browser", "screenshot"],
+      runtimePolicy: { sandbox: "workspace-write" },
+    });
+    expect(projectedLanes.find((lane) => lane.id === "lane-browser-prose-neighbor")).toMatchObject({
+      laneKind: "implementation",
+      requiredEvidence: [],
+      runtimePolicy: { sandbox: "workspace-write" },
+    });
+
+    const firstSchedule = store.scheduleReadyLanes("session-1", {
       allowedParallelism: 3,
       now: "2026-06-14T00:00:02.000Z",
     });
-    expect(scheduled.readyLanes.map((lane) => lane.id)).toEqual([
-      "lane-browser-omitted",
-      "lane-browser-empty",
-      "lane-browser-prose-neighbor",
+    expect(firstSchedule.readyLanes).toEqual([
+      expect.objectContaining({
+        id: "lane-browser-omitted",
+        segmentId: "segment-session-1-lane-browser-omitted",
+        runId: "run-session-1-lane-browser-omitted",
+      }),
     ]);
-
-    store.recordRunResult({
-      sessionId: "session-1",
-      laneId: "lane-browser-omitted",
-      segmentId: "segment-session-1-lane-browser-omitted",
-      runId: "run-session-1-lane-browser-omitted",
-      agentKind: "codex",
-      outputSummary: "Browser screenshot captured successfully.",
-      evidence: terminalRunEvidence(
-        "run-session-1-lane-browser-omitted",
+    const firstWriter = firstSchedule.readyLanes[0]!;
+    const firstEvidence = {
+      ...terminalRunEvidence(
+        firstWriter.runId,
         "succeeded",
         0,
         [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
         [],
       ),
-      now: "2026-06-14T00:00:03.000Z",
-    });
+      completedAt: "2026-06-14T00:00:03.000Z",
+    } satisfies RunEvidence;
+
     store.recordRunResult({
       sessionId: "session-1",
-      laneId: "lane-browser-empty",
-      segmentId: "segment-session-1-lane-browser-empty",
-      runId: "run-session-1-lane-browser-empty",
+      laneId: firstWriter.id,
+      segmentId: firstWriter.segmentId,
+      runId: firstWriter.runId,
       agentKind: "codex",
-      evidence: terminalRunEvidence(
-        "run-session-1-lane-browser-empty",
+      outputSummary: "Browser screenshot captured successfully.",
+      evidence: firstEvidence,
+      now: firstEvidence.completedAt,
+    });
+
+    const secondSchedule = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 3,
+      now: "2026-06-14T00:00:04.000Z",
+    });
+    expect(secondSchedule.readyLanes).toEqual([
+      expect.objectContaining({
+        id: "lane-browser-empty",
+        segmentId: "segment-session-1-lane-browser-empty",
+        runId: "run-session-1-lane-browser-empty",
+      }),
+    ]);
+    const secondWriter = secondSchedule.readyLanes[0]!;
+    const secondEvidence = {
+      ...terminalRunEvidence(
+        secondWriter.runId,
         "succeeded",
         0,
         [
@@ -8875,25 +8909,53 @@ describe("SQLite workflow store", () => {
         ],
         [".devflow/acceptance/react-app.png"],
       ),
-      now: "2026-06-14T00:00:03.100Z",
-    });
+      completedAt: "2026-06-14T00:00:05.000Z",
+    } satisfies RunEvidence;
+
     store.recordRunResult({
       sessionId: "session-1",
-      laneId: "lane-browser-prose-neighbor",
-      segmentId: "segment-session-1-lane-browser-prose-neighbor",
-      runId: "run-session-1-lane-browser-prose-neighbor",
+      laneId: secondWriter.id,
+      segmentId: secondWriter.segmentId,
+      runId: secondWriter.runId,
       agentKind: "codex",
-      evidence: terminalRunEvidence(
-        "run-session-1-lane-browser-prose-neighbor",
+      evidence: secondEvidence,
+      now: secondEvidence.completedAt,
+    });
+
+    const thirdSchedule = store.scheduleReadyLanes("session-1", {
+      allowedParallelism: 3,
+      now: "2026-06-14T00:00:06.000Z",
+    });
+    expect(thirdSchedule.readyLanes).toEqual([
+      expect.objectContaining({
+        id: "lane-browser-prose-neighbor",
+        segmentId: "segment-session-1-lane-browser-prose-neighbor",
+        runId: "run-session-1-lane-browser-prose-neighbor",
+      }),
+    ]);
+    const thirdWriter = thirdSchedule.readyLanes[0]!;
+    const thirdEvidence = {
+      ...terminalRunEvidence(
+        thirdWriter.runId,
         "succeeded",
         0,
         [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
         [],
       ),
-      now: "2026-06-14T00:00:03.200Z",
+      completedAt: "2026-06-14T00:00:07.000Z",
+    } satisfies RunEvidence;
+
+    store.recordRunResult({
+      sessionId: "session-1",
+      laneId: thirdWriter.id,
+      segmentId: thirdWriter.segmentId,
+      runId: thirdWriter.runId,
+      agentKind: "codex",
+      evidence: thirdEvidence,
+      now: thirdEvidence.completedAt,
     });
 
-    const assertCanonical = (current: ReturnType<typeof createWorkflowStore>) => {
+    const assertCanonical = (current: ReturnType<typeof createWorkflowStore>, now: string) => {
       const projection = current.materializeFlowProjection("session-1");
       const canvas = current.materializeCanvasSession("session-1");
       expect(projection.lanes.find((lane) => lane.id === "lane-browser-omitted")).toMatchObject({
@@ -8914,14 +8976,14 @@ describe("SQLite workflow store", () => {
       ]);
       expect(current.scheduleReadyLanes("session-1", {
         allowedParallelism: 4,
-        now: "2026-06-14T00:00:04.000Z",
+        now,
       }).readyLanes.map((lane) => lane.id)).not.toContain("lane-browser-review");
     };
 
-    assertCanonical(store);
+    assertCanonical(store, "2026-06-14T00:00:08.000Z");
     store.close();
     const reopened = createWorkflowStore({ projectRoot });
-    assertCanonical(reopened);
+    assertCanonical(reopened, "2026-06-14T00:00:09.000Z");
     reopened.close();
   });
 
@@ -8938,9 +9000,20 @@ describe("SQLite workflow store", () => {
           id: "lane-historical-browser",
           semanticKey: "lane-historical-browser",
           kind: "browser_validation",
+          laneKind: "validation",
+          semanticSubtype: "browser_validation",
           title: "Capture browser screenshot",
           agentKind: "codex",
           status: "pending",
+          requiredEvidence: ["browser", "screenshot"],
+          runtimePolicy: {
+            source: "workflow_projection",
+            trusted: true,
+            executable: true,
+            sandbox: "read-only",
+            sideEffects: [],
+            reason: "Historical projected policy.",
+          },
         },
       },
       now: "2026-06-14T00:00:01.000Z",
@@ -8962,22 +9035,22 @@ describe("SQLite workflow store", () => {
 
     const reopened = createWorkflowStore({ projectRoot });
     const event = reopened.listEvents("session-1").find((item) => item.idempotencyKey === "lane:historical-browser");
-    expect((event?.payload.lane as { requiredEvidence?: string[] }).requiredEvidence).toEqual([
-      "browser",
-      "screenshot",
-    ]);
-    expect(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-historical-browser")?.requiredEvidence).toEqual([
-      "browser",
-      "screenshot",
-    ]);
-    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-historical-browser")?.requiredEvidence).toEqual([
-      "browser",
-      "screenshot",
-    ]);
+    expect(event?.payload.lane).toMatchObject({
+      requiredEvidence: ["browser", "screenshot"],
+      runtimePolicy: { sandbox: "read-only", sideEffects: [] },
+    });
+    expect(reopened.materializeFlowProjection("session-1").lanes.find((lane) => lane.id === "lane-historical-browser")).toMatchObject({
+      requiredEvidence: ["browser", "screenshot"],
+      runtimePolicy: { sandbox: "workspace-write", sideEffects: ["process", "artifact"] },
+    });
+    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-historical-browser")).toMatchObject({
+      requiredEvidence: ["browser", "screenshot"],
+      runtimePolicy: { sandbox: "workspace-write", sideEffects: ["process", "artifact"] },
+    });
     reopened.close();
   });
 
-  it("normalizes a pre-evidence browser lane row before canvas materialization and terminal reconciliation", async () => {
+  it("does not infer browser authority from pre-evidence lane-row prose", async () => {
     const store = await makeSeededStore();
     const projectRoot = dirname(dirname(store.databasePath));
     store.close();
@@ -9005,14 +9078,8 @@ describe("SQLite workflow store", () => {
     legacy.close();
 
     const reopened = createWorkflowStore({ projectRoot });
-    expect(reopened.getLane("session-1", "lane-legacy-browser")?.requiredEvidence).toEqual([
-      "browser",
-      "screenshot",
-    ]);
-    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-legacy-browser")?.requiredEvidence).toEqual([
-      "browser",
-      "screenshot",
-    ]);
+    expect(reopened.getLane("session-1", "lane-legacy-browser")?.requiredEvidence).toEqual([]);
+    expect(reopened.materializeCanvasSession("session-1")?.nodes.find((node) => node.id === "lane-legacy-browser")?.requiredEvidence).toEqual([]);
     const segment = reopened.recordSegmentEvidence({
       sessionId: "session-1",
       laneId: "lane-legacy-browser",
@@ -9031,7 +9098,7 @@ describe("SQLite workflow store", () => {
       },
       now: "2026-06-14T00:00:02.000Z",
     });
-    expect(segment.status).toBe("failed");
+    expect(segment.status).toBe("succeeded");
     reopened.close();
   });
 

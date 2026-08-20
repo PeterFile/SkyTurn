@@ -1028,7 +1028,7 @@ describe("Flow Kernel intent compiler", () => {
     expect(replayed.edges).toEqual(first.edges);
   });
 
-  it("routes small repository code changes to code execution lanes instead of frontend UI lanes", () => {
+  it("keeps a single code-change requirement in a frontend project on the exact four-lane chain", () => {
     const policy = createDefaultFlowPolicy({ allowedParallelism: 1 });
     const intent: WorkflowIntent = {
       intentId: "intent-code-change-1",
@@ -1039,7 +1039,7 @@ describe("Flow Kernel intent compiler", () => {
           requirement:
             "In this git repository, update src/tasks.js and add node:test coverage for listTasks status filtering.",
         },
-        { type: "DiscoverProject", profile: { languages: ["javascript"], capabilities: [] } },
+        { type: "DiscoverProject", profile: { languages: ["javascript"], capabilities: ["frontend-ui"] } },
         { type: "ProposeLanes" },
       ],
     };
@@ -1058,6 +1058,602 @@ describe("Flow Kernel intent compiler", () => {
       ["lane-review", "lane-commit"],
     ]);
   });
+
+  it("composes code-change and backend-api packs into one dependency-safe DAG", () => {
+    const policy = createDefaultFlowPolicy({ allowedParallelism: 4 });
+    const intent: WorkflowIntent = {
+      intentId: "intent-code-change-backend-api-1",
+      sessionId: "session-1",
+      operations: [
+        {
+          type: "AnalyzeRequirement",
+          requirement: "In this git repository, update src/server.mjs for the /tasks API endpoint and add tests.",
+        },
+        { type: "DiscoverProject", profile: { languages: ["javascript"], capabilities: ["frontend-ui"] } },
+        { type: "ProposeLanes" },
+      ],
+    };
+
+    let projection = reduceWorkflowEvents(compileWorkflowIntent(
+      intent,
+      emptyProjection("session-1"),
+      policy,
+      now,
+    ).events);
+
+    expect(projection.lanes.map((lane) => lane.id)).toEqual([
+      "lane-implementation",
+      "lane-validation",
+      "lane-review",
+      "lane-commit",
+      "lane-discovery",
+      "lane-contract-analysis",
+      "lane-unit-test",
+      "lane-integration-test",
+    ]);
+    expect(projection.lanes.find((lane) => lane.id === "lane-implementation")).toMatchObject({
+      fileScopes: ["src/server.mjs"],
+      packageScopes: ["app", "backend"],
+      requiredEvidence: ["run-exit"],
+    });
+    expect(projection.edges.map((edge) => [edge.sourceLaneId, edge.targetLaneId])).toEqual([
+      ["lane-contract-analysis", "lane-implementation"],
+      ["lane-implementation", "lane-validation"],
+      ["lane-validation", "lane-review"],
+      ["lane-integration-test", "lane-review"],
+      ["lane-review", "lane-commit"],
+      ["lane-discovery", "lane-contract-analysis"],
+      ["lane-implementation", "lane-unit-test"],
+      ["lane-unit-test", "lane-integration-test"],
+    ]);
+
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-discovery",
+    ]);
+    projection = completeLane(projection, "lane-discovery");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-contract-analysis",
+    ]);
+    projection = completeLane(projection, "lane-contract-analysis");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-implementation",
+    ]);
+    projection = completeLane(projection, "lane-implementation");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-validation",
+      "lane-unit-test",
+    ]);
+    projection = completeLane(projection, "lane-validation");
+    projection = completeLane(projection, "lane-unit-test");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-integration-test",
+    ]);
+    expect(projection.lanes.find((lane) => lane.id === "lane-review")?.status).toBe("pending");
+    expect(projection.lanes.find((lane) => lane.id === "lane-commit")?.status).toBe("pending");
+    projection = completeLane(projection, "lane-integration-test");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-review",
+    ]);
+    projection = completeLane(projection, "lane-review");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-commit",
+    ]);
+  });
+
+  it("makes a code-change commit wait for the data-script regression sink", () => {
+    const policy = createDefaultFlowPolicy({ allowedParallelism: 4 });
+    const intent: WorkflowIntent = {
+      intentId: "intent-code-change-data-script-1",
+      sessionId: "session-1",
+      operations: [
+        {
+          type: "AnalyzeRequirement",
+          requirement: "In this git repository, update scripts/clean.mjs to clean CSV data and add regression tests.",
+        },
+        { type: "DiscoverProject", profile: { languages: ["javascript"], capabilities: ["frontend-ui"] } },
+        { type: "ProposeLanes" },
+      ],
+    };
+
+    let projection = reduceWorkflowEvents(compileWorkflowIntent(
+      intent,
+      emptyProjection("session-1"),
+      policy,
+      now,
+    ).events);
+
+    expect(projection.edges.map((edge) => [edge.sourceLaneId, edge.targetLaneId])).toEqual([
+      ["lane-data-contract-analysis", "lane-implementation"],
+      ["lane-implementation", "lane-validation"],
+      ["lane-validation", "lane-review"],
+      ["lane-review", "lane-commit"],
+      ["lane-regression-check", "lane-commit"],
+      ["lane-implementation", "lane-fixture-validation"],
+      ["lane-fixture-validation", "lane-regression-check"],
+    ]);
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-data-contract-analysis",
+    ]);
+    projection = completeLane(projection, "lane-data-contract-analysis");
+    projection = completeLane(projection, "lane-implementation");
+    projection = completeLane(projection, "lane-validation");
+    projection = completeLane(projection, "lane-review");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-fixture-validation",
+    ]);
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).not.toContain("lane-commit");
+    projection = completeLane(projection, "lane-fixture-validation");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-regression-check",
+    ]);
+    projection = completeLane(projection, "lane-regression-check");
+    expect(scheduleReadyLanes(projection, { allowedParallelism: 4 }).map((lane) => lane.id)).toEqual([
+      "lane-commit",
+    ]);
+  });
+
+  it("fails closed before emitting a graph for incompatible policy-pack lane collisions", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [
+      {
+        id: "first-custom-pack",
+        capabilities: ["code-change"],
+        detects: () => true,
+        suggestedLanes: () => [{
+          id: "lane-shared",
+          kind: "implementation",
+          title: "Sensitive first title",
+          agentKind: "codex",
+        }],
+        evidence: [],
+        validation: [],
+      },
+      {
+        id: "second-custom-pack",
+        capabilities: ["code-change"],
+        detects: () => true,
+        suggestedLanes: () => [{
+          id: "lane-shared",
+          kind: "implementation",
+          title: "Sensitive second title",
+          agentKind: "hermes",
+        }],
+        evidence: [],
+        validation: [],
+      },
+    ];
+    const projection = emptyProjection("session-1");
+    const before = structuredClone(projection);
+    const compile = () => compileWorkflowIntent({
+      intentId: "intent-incompatible-policy-collision",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now);
+
+    expect(compile).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("uses detects as the authority before requirement-capability pack selection", () => {
+    const policy = createDefaultFlowPolicy();
+    const detectCalls: string[] = [];
+    let rejectedSuggestions = 0;
+    policy.policyPacks = [
+      {
+        id: "ineligible-requirement-pack",
+        capabilities: ["code-change"],
+        detects: () => {
+          detectCalls.push("ineligible-requirement-pack");
+          return false;
+        },
+        suggestedLanes: () => {
+          rejectedSuggestions += 1;
+          throw new Error("sensitive ineligible suggestion failure");
+        },
+        evidence: [],
+        validation: [],
+      },
+      {
+        id: "eligible-project-fallback-pack",
+        capabilities: ["frontend-ui"],
+        detects: () => {
+          detectCalls.push("eligible-project-fallback-pack");
+          return true;
+        },
+        suggestedLanes: () => [{
+          id: "lane-project-fallback",
+          kind: "discovery",
+          title: "Use eligible project fallback",
+          agentKind: "hermes",
+        }],
+        evidence: [],
+        validation: [],
+      },
+    ];
+
+    const compiled = compileWorkflowIntent({
+      intentId: "intent-detects-authority",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["frontend-ui"] } },
+        { type: "ProposeLanes" },
+      ],
+    }, emptyProjection("session-1"), policy, now);
+    const projection = reduceWorkflowEvents(compiled.events);
+
+    expect(compiled.ok).toBe(true);
+    expect(detectCalls).toEqual([
+      "ineligible-requirement-pack",
+      "eligible-project-fallback-pack",
+    ]);
+    expect(rejectedSuggestions).toBe(0);
+    expect(projection.lanes.map((lane) => lane.id)).toEqual(["lane-project-fallback"]);
+  });
+
+  it("fails closed without leaking a detects error or mutating the projection", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [{
+      id: "throwing-detects-pack",
+      capabilities: ["code-change"],
+      detects: () => {
+        throw new Error("sensitive project path and permission details");
+      },
+      suggestedLanes: () => [],
+      evidence: [],
+      validation: [],
+    }];
+    const projection = emptyProjection("session-1");
+    const before = structuredClone(projection);
+
+    expect(() => compileWorkflowIntent({
+      intentId: "intent-throwing-detects",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now)).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("fails closed when eligible requirement packs reuse an ID with distinct semantic keys", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = ["first", "second"].map((suffix) => ({
+      id: `${suffix}-semantic-pack`,
+      capabilities: ["code-change"],
+      detects: () => true,
+      suggestedLanes: () => [{
+        id: "lane-shared-semantic",
+        semanticKey: `${suffix}:shared-semantic`,
+        kind: "implementation",
+        title: "Shared implementation",
+        agentKind: "codex" as const,
+      }],
+      evidence: [],
+      validation: [],
+    }));
+    const projection = emptyProjection("session-1");
+    const before = structuredClone(projection);
+
+    expect(() => compileWorkflowIntent({
+      intentId: "intent-distinct-semantic-keys",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now)).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("composes an omitted semantic key with an explicit key equal to the lane ID", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [
+      {
+        id: "omitted-semantic-pack",
+        capabilities: ["code-change"],
+        detects: () => true,
+        suggestedLanes: () => [{
+          id: "lane-shared-semantic",
+          kind: "implementation",
+          title: "Shared implementation",
+          agentKind: "codex",
+        }],
+        evidence: [],
+        validation: [],
+      },
+      {
+        id: "explicit-semantic-pack",
+        capabilities: ["code-change"],
+        detects: () => true,
+        suggestedLanes: () => [{
+          id: "lane-shared-semantic",
+          semanticKey: "lane-shared-semantic",
+          kind: "implementation",
+          title: "Shared implementation",
+          agentKind: "codex",
+        }],
+        evidence: [],
+        validation: [],
+      },
+    ];
+
+    const compiled = compileWorkflowIntent({
+      intentId: "intent-compatible-semantic-keys",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, emptyProjection("session-1"), policy, now);
+    const projection = reduceWorkflowEvents(compiled.events);
+
+    expect(compiled.ok).toBe(true);
+    expect(projection.lanes).toHaveLength(1);
+    expect(projection.lanes[0]).toMatchObject({
+      id: "lane-shared-semantic",
+      semanticKey: "lane-shared-semantic",
+    });
+  });
+
+  it("fails a matched policy pack atomically when a dependency endpoint is missing", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [{
+      id: "missing-dependency-pack",
+      capabilities: ["code-change"],
+      detects: () => true,
+      suggestedLanes: () => [{
+        id: "lane-implementation",
+        kind: "implementation",
+        title: "Sensitive implementation title",
+        agentKind: "codex",
+        dependsOn: ["lane-missing-sensitive-endpoint"],
+      }],
+      evidence: [],
+      validation: [],
+    }];
+    const projection = emptyProjection("session-1");
+    const before = structuredClone(projection);
+
+    expect(() => compileWorkflowIntent({
+      intentId: "intent-missing-policy-dependency",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now)).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("fails a matched policy pack atomically when its suggestions contain a cycle", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [{
+      id: "cyclic-pack",
+      capabilities: ["code-change"],
+      detects: () => true,
+      suggestedLanes: () => [
+        { id: "lane-a", kind: "implementation", title: "Sensitive lane A", dependsOn: ["lane-b"] },
+        { id: "lane-b", kind: "validation", title: "Sensitive lane B", dependsOn: ["lane-a"] },
+      ],
+      evidence: [],
+      validation: [],
+    }];
+    const projection = emptyProjection("session-1");
+    const before = structuredClone(projection);
+
+    expect(() => compileWorkflowIntent({
+      intentId: "intent-cyclic-policy-pack",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now)).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("fails a matched policy pack atomically when a lane depends on itself", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [{
+      id: "self-edge-pack",
+      capabilities: ["code-change"],
+      detects: () => true,
+      suggestedLanes: () => [{
+        id: "lane-self",
+        kind: "implementation",
+        title: "Sensitive self-dependent lane",
+        dependsOn: ["lane-self"],
+      }],
+      evidence: [],
+      validation: [],
+    }];
+    const projection = emptyProjection("session-1");
+    const before = structuredClone(projection);
+
+    expect(() => compileWorkflowIntent({
+      intentId: "intent-self-edge-policy-pack",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now)).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("fails a matched policy pack atomically when an edge targets planner semantics", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [{
+      id: "planner-target-pack",
+      capabilities: ["code-change"],
+      detects: () => true,
+      suggestedLanes: () => [
+        { id: "lane-source", kind: "implementation", title: "Source" },
+        {
+          id: "lane-root",
+          kind: "planner_root",
+          title: "Sensitive planner root",
+          agentKind: "hermes",
+          dependsOn: ["lane-source"],
+        },
+      ],
+      evidence: [],
+      validation: [],
+    }];
+    const projection = emptyProjection("session-1");
+    const before = structuredClone(projection);
+
+    expect(() => compileWorkflowIntent({
+      intentId: "intent-planner-target-policy-pack",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now)).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("fails policy composition atomically when commit-sink closure creates a cycle", () => {
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [
+      {
+        id: "commit-pack",
+        capabilities: ["code-change"],
+        detects: () => true,
+        suggestedLanes: () => [{ id: "lane-commit", kind: "commit", title: "Commit verified change" }],
+        evidence: [],
+        validation: [],
+      },
+      {
+        id: "post-commit-pack",
+        capabilities: ["code-change"],
+        detects: () => true,
+        suggestedLanes: () => [{
+          id: "lane-post-commit-validation",
+          kind: "validation",
+          title: "Sensitive post-commit validation",
+          dependsOn: ["lane-commit"],
+        }],
+        evidence: [],
+        validation: [],
+      },
+    ];
+    const projection = emptyProjection("session-1");
+    const before = structuredClone(projection);
+
+    expect(() => compileWorkflowIntent({
+      intentId: "intent-commit-closure-cycle",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now)).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("fails atomically when a generated edge ID collides with an existing different edge", () => {
+    const projection = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-existing-a", "implementation") }),
+      event("workflow.lane.declared", { lane: lane("lane-existing-b", "validation") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-source-target", sourceLaneId: "lane-existing-a", targetLaneId: "lane-existing-b" },
+      }),
+    ]);
+    const before = structuredClone(projection);
+    const policy = createDefaultFlowPolicy();
+    policy.policyPacks = [{
+      id: "edge-id-collision-pack",
+      capabilities: ["code-change"],
+      detects: () => true,
+      suggestedLanes: () => [
+        { id: "lane-source", kind: "implementation", title: "Source" },
+        { id: "lane-target", kind: "validation", title: "Target", dependsOn: ["lane-source"] },
+      ],
+      evidence: [],
+      validation: [],
+    }];
+
+    expect(() => compileWorkflowIntent({
+      intentId: "intent-generated-edge-id-collision",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Update src/index.ts in this git repository." },
+        { type: "ProposeLanes" },
+      ],
+    }, projection, policy, now)).toThrowError("Workflow graph preflight failed.");
+    expect(projection).toEqual(before);
+  });
+
+  it("uses a discovered backend profile when a generic requirement has no inferred capability", () => {
+    const policy = createDefaultFlowPolicy({ allowedParallelism: 1 });
+    const intent: WorkflowIntent = {
+      intentId: "intent-generic-backend-1",
+      sessionId: "session-1",
+      operations: [
+        { type: "AnalyzeRequirement", requirement: "Improve the existing project behavior." },
+        { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: ["backend-api"] } },
+        { type: "ProposeLanes" },
+      ],
+    };
+
+    const projection = reduceWorkflowEvents(compileWorkflowIntent(intent, emptyProjection("session-1"), policy, now).events);
+
+    expect(projection.lanes.map((lane) => [lane.kind, lane.title])).toEqual([
+      ["discovery", "Discover API surface"],
+      ["contract_analysis", "Analyze endpoint contract"],
+      ["implementation", "Implement API endpoint"],
+      ["unit_test", "Run unit tests"],
+      ["integration_test", "Run integration tests"],
+      ["review", "Review API evidence"],
+    ]);
+    expect(projection.lanes.map((lane) => lane.id)).not.toContain("lane-design");
+    expect(projection.lanes.map((lane) => lane.id)).not.toContain("lane-browser-validation");
+  });
+
+  it.each([
+    ["data-script", [
+      "lane-data-contract-analysis",
+      "lane-implementation",
+      "lane-fixture-validation",
+      "lane-regression-check",
+    ]],
+    ["fullstack-settings", [
+      "lane-discovery",
+      "lane-frontend-implementation",
+      "lane-backend-implementation",
+      "lane-persistence-implementation",
+      "lane-integration-join",
+      "lane-validation",
+      "lane-review",
+    ]],
+  ] as const)(
+    "uses the discovered %s profile for a generic requirement without frontend fallback",
+    (capability, expectedLaneIds) => {
+      const policy = createDefaultFlowPolicy({ allowedParallelism: 4 });
+      const compiled = compileWorkflowIntent({
+        intentId: `intent-generic-${capability}`,
+        sessionId: "session-1",
+        operations: [
+          { type: "AnalyzeRequirement", requirement: "Improve the existing project behavior." },
+          { type: "DiscoverProject", profile: { languages: ["typescript"], capabilities: [capability] } },
+          { type: "ProposeLanes" },
+        ],
+      }, emptyProjection("session-1"), policy, now);
+      const projection = reduceWorkflowEvents(compiled.events);
+
+      expect(compiled.ok).toBe(true);
+      expect(projection.lanes.map((lane) => lane.id)).toEqual(expectedLaneIds);
+      expect(projection.lanes.map((lane) => lane.id)).not.toContain("lane-design");
+      expect(projection.lanes.map((lane) => lane.id)).not.toContain("lane-browser-validation");
+    },
+  );
 
   it("gates WorkflowIntent operations against prior operations in the same intent", () => {
     const policy = createDefaultFlowPolicy({ allowedParallelism: 1 });
@@ -1197,6 +1793,12 @@ describe("Flow Kernel intent compiler", () => {
           kind: "browser_validation",
           title: "Capture browser screenshot",
           agentKind: "codex",
+          executable: false,
+          runtimePolicy: {
+            executable: false,
+            sandbox: "danger-full-access",
+            sideEffects: ["git"],
+          },
           ...evidenceInput,
         }],
       }],
@@ -1217,7 +1819,18 @@ describe("Flow Kernel intent compiler", () => {
       "browser",
       "screenshot",
     ]);
-    expect(projection.lanes[0]?.requiredEvidence).toEqual(["browser", "screenshot"]);
+    expect(projection.lanes[0]).toMatchObject({
+      agentKind: "codex",
+      laneKind: "validation",
+      semanticSubtype: "browser_validation",
+      executable: true,
+      requiredEvidence: ["browser", "screenshot"],
+      runtimePolicy: {
+        executable: true,
+        sandbox: "workspace-write",
+        sideEffects: ["process", "artifact"],
+      },
+    });
   });
 
   it("unions derived browser evidence without allowing prose neighbors to create artifact contracts", () => {
@@ -1253,7 +1866,73 @@ describe("Flow Kernel intent compiler", () => {
     ]);
     expect(projection.lanes.find((item) => item.id === "lane-negative-title")?.requiredEvidence).toEqual([]);
     expect(projection.lanes.find((item) => item.id === "lane-negative-brief")?.requiredEvidence).toEqual([]);
+    expect(projection.lanes.find((item) => item.id === "lane-negative-title")?.runtimePolicy.sandbox).toBe("workspace-write");
+    expect(projection.lanes.find((item) => item.id === "lane-negative-brief")?.runtimePolicy.sandbox).toBe("read-only");
   });
+
+  it.each([
+    ["validation", "Capture browser screenshot", undefined],
+    ["regression", "Run regression checks", "Capture browser screenshot"],
+  ] as const)(
+    "keeps generic %s prose read-only without browser evidence",
+    (laneKind, title, brief) => {
+      const projection = reduceWorkflowEvents([
+        event("workflow.lane.declared", {
+          lane: {
+            ...lane(`lane-generic-${laneKind}`, laneKind),
+            laneKind,
+            semanticSubtype: laneKind,
+            title,
+            ...(brief ? { brief } : {}),
+            agentKind: "codex",
+            requiredEvidence: [],
+          },
+        }),
+      ]);
+
+      expect(projection.lanes[0]).toMatchObject({
+        laneKind,
+        semanticSubtype: laneKind,
+        requiredEvidence: [],
+        runtimePolicy: {
+          executable: true,
+          sandbox: "read-only",
+        },
+      });
+    },
+  );
+
+  it.each([
+    ["validation", "browser_validation"],
+    ["regression", "screenshot_validation"],
+  ] as const)(
+    "keeps canonical %s %s evidence authoritative and workspace-write",
+    (laneKind, semanticSubtype) => {
+      const projection = reduceWorkflowEvents([
+        event("workflow.lane.declared", {
+          lane: {
+            ...lane(`lane-canonical-${laneKind}`, laneKind),
+            laneKind,
+            semanticSubtype,
+            title: "Opaque verification step",
+            agentKind: "codex",
+            requiredEvidence: ["browser", "screenshot"],
+          },
+        }),
+      ]);
+
+      expect(projection.lanes[0]).toMatchObject({
+        laneKind,
+        semanticSubtype,
+        requiredEvidence: ["browser", "screenshot"],
+        runtimePolicy: {
+          executable: true,
+          sandbox: "workspace-write",
+          sideEffects: ["process", "artifact"],
+        },
+      });
+    },
+  );
 
   it("strips untrusted runtime controls from Hermes lane suggestions while preserving agy agent kind", () => {
     const parsed = parseWorkflowIntent(
@@ -1507,6 +2186,42 @@ describe("Flow Kernel intent compiler", () => {
       runtimePolicy: { sandbox: "read-only", sideEffects: ["process"] },
     });
   });
+
+  it.each(["validation", "regression"] as const)(
+    "restores mandatory workspace-write for a historical read-only browser %s lane",
+    (laneKind) => {
+      const projection = reduceWorkflowEvents([
+        event("workflow.lane.declared", {
+          lane: {
+            ...lane(`lane-historical-browser-${laneKind}`, laneKind),
+            laneKind,
+            semanticSubtype: "browser_validation",
+            agentKind: "codex",
+            requiredEvidence: ["browser", "screenshot"],
+            runtimePolicy: {
+              source: "workflow_projection",
+              trusted: true,
+              executable: true,
+              sandbox: "read-only",
+              sideEffects: [],
+              reason: "Historical projected policy.",
+            },
+          },
+        }),
+      ]);
+
+      expect(projection.lanes[0]).toMatchObject({
+        laneKind,
+        semanticSubtype: "browser_validation",
+        requiredEvidence: ["browser", "screenshot"],
+        runtimePolicy: {
+          executable: true,
+          sandbox: "workspace-write",
+          sideEffects: ["process", "artifact"],
+        },
+      });
+    },
+  );
 
   it("keeps decision gates non-executable and planner lanes read-only", () => {
     const projection = reduceWorkflowEvents([
