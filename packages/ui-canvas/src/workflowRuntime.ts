@@ -899,11 +899,14 @@ function codexLaneInstruction(node: CanvasNode): string {
   const expectedArtifacts = expectedArtifactsForNode(node);
   if (nodeHasBrowserScreenshotContract(node, expectedArtifacts)) {
     return [
-      "Capture browser screenshot evidence with a bounded command.",
-      "Prefer repo-provided screenshot scripts over ad hoc browser automation.",
-      `Run \`node scripts/capture-screenshot.mjs ${expectedArtifacts[0]}\` and report that artifact path.`,
-      "Start any dev server only if needed, write the screenshot artifact, and Stop any dev server before exiting.",
+      "First, load all applicable repository instructions.",
+      `Then, from the repository root, perform exactly one bounded validation action: run \`node scripts/capture-screenshot.mjs ${expectedArtifacts[0]}\` exactly once and wait for it to exit.`,
+      "The fixed helper is the only permitted artifact producer; it starts and closes bounded Vite and Electron processes.",
+      "Do not start a separate dev server, browser, or Electron process. Do not use ad-hoc automation or retry the helper.",
+      "Do not do unrelated work, edit the helper, or edit any tracked source.",
+      "Do not produce the artifact through alternate commands, copies, synthetic output, manual capture, mocks, or direct app execution.",
       "Do not create a git commit in this lane; the commit lane owns commits.",
+      "If the helper exits nonzero or the artifact gate rejects the result, report the blocker and exit this lane nonzero.",
     ].join(" ");
   }
   if (/implementation|implement|change|update|edit/.test(laneKind.toLowerCase())) {

@@ -3646,7 +3646,7 @@ test("terminal planner intentId reuse is invalid, topology-stable, and renderer-
   }
 });
 
-for (const failureStage of ["apply", "schedule", "disposition"]) {
+for (const failureStage of ["apply", "disposition"]) {
   test(`planner reconciliation keeps its SQLite candidate across transient ${failureStage} failure`, async () => {
     const projectRoot = await mkdtemp(join(tmpdir(), `skyturn-workflow-planner-${failureStage}-failure-`));
     let loaded;
@@ -3666,7 +3666,6 @@ for (const failureStage of ["apply", "schedule", "disposition"]) {
       });
       const bridge = plannerTerminalBridge(runId, plannerIntent(`intent-${failureStage}-retry`, `lane-${failureStage}-retry`));
       const originalApply = store.applyWorkflowIntent.bind(store);
-      const originalSchedule = store.scheduleReadyLanes.bind(store);
       const originalDisposition = store.completePlannerIntentReconciliation.bind(store);
       let failed = false;
       if (failureStage === "apply") {
@@ -3676,14 +3675,6 @@ for (const failureStage of ["apply", "schedule", "disposition"]) {
             throw new Error("transient apply failure");
           }
           return originalApply(...args);
-        };
-      } else if (failureStage === "schedule") {
-        store.scheduleReadyLanes = (...args) => {
-          if (!failed) {
-            failed = true;
-            throw new Error("transient schedule failure");
-          }
-          return originalSchedule(...args);
         };
       } else {
         store.completePlannerIntentReconciliation = (...args) => {
@@ -3728,6 +3719,66 @@ for (const failureStage of ["apply", "schedule", "disposition"]) {
     }
   });
 }
+
+test("planner applied marker survives a transient downstream schedule failure and explicit advance converges", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-planner-schedule-failure-"));
+  let loaded;
+  try {
+    loaded = await loadMainModule([], {
+      createRunStartHandler: () => async (input) => ({ id: input.runId, status: "running" }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const created = await createWorkflowSessionThroughMain(loaded.ipcHandlers, projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const runId = "run-planner-schedule-retry";
+    const { segment } = store.claimPlannerRunStart({
+      sessionId: "session-1",
+      laneId: created.canvasSession.plannerNodeId,
+      runId,
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-07-22T04:00:00.000Z",
+    });
+    const bridge = plannerTerminalBridge(
+      runId,
+      plannerIntent("intent-schedule-retry", "lane-schedule-retry"),
+    );
+    const originalSchedule = store.scheduleReadyLanes.bind(store);
+    let failed = false;
+    store.scheduleReadyLanes = (...args) => {
+      if (!failed) {
+        failed = true;
+        throw new Error("transient schedule failure");
+      }
+      return originalSchedule(...args);
+    };
+
+    await assert.rejects(
+      loaded.exports.reconcileTerminalWorkflowRun(store, bridge, projectRoot, segment),
+      /transient schedule failure/,
+    );
+    assert.deepEqual(store.listPendingPlannerIntentReconciliations(), []);
+    const reconciled = store.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.planner_intent.reconciled" && event.payload.runId === runId
+    );
+    assert.equal(reconciled.length, 1);
+    assert.equal(reconciled[0].payload.disposition, "applied");
+
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, "session-1");
+    await loaded.exports.reconcileTerminalWorkflowRun(store, bridge, projectRoot, segment);
+
+    const events = store.listEvents("session-1");
+    assert.equal(events.filter((event) => event.kind === "workflow.intent.accepted").length, 1);
+    assert.equal(events.filter((event) => event.kind === "workflow.lane.declared").length, 1);
+    assert.equal(events.filter((event) => event.kind === "workflow.planner_intent.reconciled").length, 1);
+    assert.equal(events.filter((event) =>
+      event.kind === "workflow.segment.started" && event.laneId === "lane-schedule-retry"
+    ).length, 1);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
 
 test("workflow planner turn facts fail closed when reconciled event and durable segment facts disagree", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-planner-safe-facts-"));
@@ -4983,6 +5034,129 @@ test("terminal Finish planner output is applied and scheduled by Electron main w
     expectFlowLane(projection, "lane-review-b", "running");
     assert.equal(store.listEvents("session-1").some((event) => event.kind === "workflow.intent.accepted"), true);
   } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("planner applied marker is durable before a blocked downstream start and the session lock serializes the next turn", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-planner-applied-before-start-"));
+  const downstreamGate = deferred();
+  let factoryIndex = 0;
+  let plannerStarts = 0;
+  let downstreamStarts = 0;
+  let downstreamFailed = false;
+  let loaded;
+  try {
+    const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+      "../dist-electron/electron/runStartHandler.js"
+    );
+    loaded = await loadMainModule([], {
+      createRunStartHandler: (dependencies) => {
+        const currentFactoryIndex = factoryIndex;
+        factoryIndex += 1;
+        if (currentFactoryIndex === 1) {
+          return productionCreateRunStartHandler({
+            ...dependencies,
+            assertStartInput: async () => undefined,
+            prepareBeforeCheckpoint: async () => true,
+            startRun: async () => {
+              downstreamStarts += 1;
+              downstreamGate.started.resolve();
+              await downstreamGate.release.promise;
+              downstreamFailed = true;
+              throw new Error("injected downstream start failure");
+            },
+            reconcileTerminal: async () => {
+              throw new Error("injected missing downstream terminal evidence");
+            },
+            enrichAfterCheckpoint: async () => undefined,
+          });
+        }
+        if (currentFactoryIndex === 0) {
+          return async (input) => {
+            const identity = plannerStartIdentity(input);
+            const store = await dependencies.acquireStore(identity);
+            const claim = await dependencies.claimUnscheduledStart(input, store, identity);
+            assert.equal(claim?.created, true);
+            plannerStarts += 1;
+            return { id: input.runId, status: "running" };
+          };
+        }
+        return async (input) => ({ id: input.runId, status: "running" });
+      },
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const created = await createWorkflowSessionThroughMain(loaded.ipcHandlers, projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const runId = "run-planner-applied-before-start";
+    const { segment } = store.claimPlannerRunStart({
+      sessionId: "session-1",
+      laneId: created.canvasSession.plannerNodeId,
+      runId,
+      agentKind: "hermes",
+      worktreePath: projectRoot,
+      now: "2026-08-20T00:00:00.000Z",
+    });
+    const terminal = plannerTerminalBridge(
+      runId,
+      plannerIntent("intent-applied-before-start", "lane-blocked-start"),
+    );
+    const bridge = {
+      ...terminal,
+      listRuns() {
+        return [{
+          id: runId,
+          projectRoot,
+          sessionId: segment.sessionId,
+          nodeId: segment.laneId,
+          agentKind: segment.agentKind,
+          status: "succeeded",
+        }];
+      },
+    };
+
+    const reconciliation = loaded.exports.reconcileTerminalRunEvent(bridge, {
+      protocolVersion: 1,
+      runId,
+      seq: 2,
+      timestamp: "2026-08-20T00:00:01.000Z",
+      kind: "status",
+      payload: { status: "succeeded", exitCode: 0 },
+    });
+    await withTimeout(downstreamGate.started.promise, 2_000, "downstream start did not block");
+
+    const eventsWhileBlocked = store.listEvents("session-1");
+    const appliedMarkersWhileBlocked = eventsWhileBlocked.filter((event) =>
+      event.kind === "workflow.planner_intent.reconciled" && event.payload.runId === runId
+    );
+    assert.equal(appliedMarkersWhileBlocked.length, 1);
+    assert.equal(appliedMarkersWhileBlocked[0].payload.disposition, "applied");
+    assert.deepEqual(store.listPendingPlannerIntentReconciliations(), []);
+
+    const nextTurn = loaded.ipcHandlers.get("workflow:appendUserInput")({}, projectRoot, {
+      sessionId: "session-1",
+      inputId: "input-after-applied-marker",
+      text: "Plan only after prior downstream scheduling settles.",
+      now: "2026-08-20T00:00:02.000Z",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(plannerStarts, 0);
+
+    downstreamGate.release.resolve();
+    await withTimeout(reconciliation, 2_000, "terminal reconciliation did not finish");
+    await withTimeout(nextTurn, 2_000, "serialized planner turn did not start");
+
+    const eventsAfterFailure = store.listEvents("session-1");
+    assert.equal(downstreamStarts, 1);
+    assert.equal(downstreamFailed, true);
+    assert.equal(plannerStarts, 1);
+    assert.equal(eventsAfterFailure.filter((event) =>
+      event.kind === "workflow.planner_intent.reconciled" && event.payload.runId === runId
+    ).length, 1);
+    assert.deepEqual(store.listPendingPlannerIntentReconciliations(), []);
+  } finally {
+    downstreamGate.release.resolve();
     await loaded?.exports.closeWorkflowStores();
     await rm(projectRoot, { recursive: true, force: true });
   }
