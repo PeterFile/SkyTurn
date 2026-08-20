@@ -1,11 +1,13 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import { createRequire } from "node:module";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inflateSync } from "node:zlib";
 
 import {
   RENDERER_HOST,
@@ -64,8 +66,23 @@ export function assertBrowserDeadline(deadline, {
     throw new Error("Danger authorization deadline expired.");
   }
 }
-const requiredLaneKinds = ["implementation", "validation", "browser_validation", "review", "commit"];
+const requiredLaneKinds = ["implementation", "validation", "review", "commit"];
 const browserScreenshotArtifact = ".devflow/acceptance/react-app.png";
+const independentBrowserScreenshotArtifact = ".devflow/acceptance/react-app.verify.png";
+const minimumScreenshotBytes = 1_000;
+const maximumPngFileBytes = 64 * 1024 * 1024;
+const pngReadChunkBytes = 64 * 1024;
+const maximumPngDimension = 16_384;
+const maximumInflatedPngBytes = 256 * 1024 * 1024;
+const maximumPngChunkCount = 4_096;
+const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const pngCrcTable = Uint32Array.from({ length: 256 }, (_, value) => {
+  let crc = value;
+  for (let bit = 0; bit < 8; bit += 1) {
+    crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return crc >>> 0;
+});
 
 const requirement = [
   "Turn this fresh blank React app into a visible SkyTurn delivery status screen.",
@@ -73,19 +90,31 @@ const requirement = [
   "All three strings must render with exact case; CSS text-transform must not alter them.",
   "Keep the app in src/App.jsx and styling in src/App.css.",
   "Only src/App.jsx and src/App.css may be changed or committed.",
-  "Do not modify scripts/verify.mjs or scripts/capture-screenshot.mjs; they are fixed validation contracts.",
-  "Plan exactly this serial lane chain: implementation -> validation -> browser_validation -> review -> commit.",
-  "In this planning turn, declare only the lanes and their dependency edges; do not emit StartImplementation, RequestValidation, RequestReview, or Commit operations because the scheduler executes the accepted lanes.",
-  "The browser_validation lane must declare browser and screenshot evidence, run the fixed capture helper, and produce .devflow/acceptance/react-app.png.",
-  "The commit lane must commit only src/App.jsx and src/App.css after review succeeds.",
+  "Do not modify the fixed verification or screenshot-capture contract scripts.",
+  "Use exactly these three workflow operations in this order: AnalyzeRequirement, DiscoverProject, then ProposeLanes. Do not emit any other operation.",
+  "ProposeLanes must omit its lanes field so the Kernel selects the trusted code-change policy pack.",
+  "The trusted policy pack must produce the initial serial chain implementation -> validation -> review -> commit.",
+  "Do not emit StartImplementation, RequestValidation, RequestReview, Commit, or DeclareEdge; do not request browser validation in this turn.",
+  "The trusted delivery commit must include only src/App.jsx and src/App.css after review succeeds.",
 ].join("\n");
 
 const followUpRequirement = [
-  "Re-check the completed delivery against the existing verification evidence.",
-  "Add exactly one validation lane using Codex, dependent only on the completed commit lane.",
-  "Do not modify files, create commits, push, or open a pull request.",
+  "Use exactly one WorkflowIntent operation in this turn: ProposeLanes. Do not emit any other operation.",
+  "ProposeLanes must include an explicit lanes array containing exactly one unprivileged Codex browser-validation suggestion.",
+  "That single suggestion must use laneKind validation and semanticSubtype browser_validation, depend only on the completed commit lane, and require browser plus screenshot evidence.",
+  "Let the Kernel's authoritative artifact contract provide the concrete screenshot declaration; do not name a capture helper or artifact path in planner output.",
+  "The executable lane may write only its Kernel-declared screenshot artifact; it must not modify tracked source or contract scripts, create another commit, push, or open a pull request.",
   "Keep the planner root stable and add only the minimum verification work needed.",
 ].join("\n");
+
+const expectedFirstPlannerOperationSummary = [
+  { type: "AnalyzeRequirement" },
+  { type: "DiscoverProject" },
+  { type: "ProposeLanes", lanesMode: "omitted" },
+];
+const expectedSecondPlannerOperationSummary = [
+  { type: "ProposeLanes", lanesMode: "explicit" },
+];
 
 export async function runNewSessionUiAcceptance() {
   const demo = await loadDemoHelpers();
@@ -268,6 +297,7 @@ export async function runNewSessionUiAcceptance() {
             path: verification.screenshotPath,
             bytes: verification.screenshotBytes,
           },
+          screenshotVerification: verification.screenshotVerification,
           verificationCommand: verification.verificationCommand,
           verificationScript: verification.verificationScript,
           captureScript: verification.captureScript,
@@ -606,6 +636,346 @@ function hasManagedOutputOverflow(error) {
 
 export async function fileSha256(filePath) {
   return createHash("sha256").update(await readFile(filePath)).digest("hex");
+}
+
+export async function verifyScreenshotCausalBinding({
+  demo,
+  expectedCaptureScriptHash,
+  projectRoot,
+}) {
+  const captureScriptPath = join(projectRoot, "scripts", "capture-screenshot.mjs");
+  const lanePath = join(projectRoot, browserScreenshotArtifact);
+  const independentPath = join(projectRoot, independentBrowserScreenshotArtifact);
+  const captureScriptBeforeSha256 = await fileSha256OrNull(captureScriptPath);
+  const captureScriptPreflightValid = captureScriptBeforeSha256 === expectedCaptureScriptHash;
+  const laneBefore = await inspectPngArtifact(lanePath);
+  const independentBefore = await inspectPngArtifact(independentPath);
+  const canCapture = captureScriptPreflightValid && !independentBefore.exists &&
+    laneBefore.bytes > minimumScreenshotBytes && laneBefore.validPng;
+  const command = `${process.execPath} scripts/capture-screenshot.mjs ${independentPath}`;
+  const captureResult = canCapture
+    ? await demo.runCapture(
+        process.execPath,
+        ["scripts/capture-screenshot.mjs", independentPath],
+        projectRoot,
+        { allowFailure: true },
+      )
+    : skippedCommandResult("lane screenshot or fixed capture helper failed preflight");
+  const captureScriptAfterSha256 = await fileSha256OrNull(captureScriptPath);
+  const captureScriptUnchanged = captureScriptPreflightValid &&
+    captureScriptAfterSha256 === expectedCaptureScriptHash;
+  const laneAfter = await inspectPngArtifact(lanePath);
+  const independent = captureResult.code === 0
+    ? await inspectPngArtifact(independentPath)
+    : emptyPngArtifact(independentPath);
+  const laneUnchanged = samePngArtifactSnapshot(laneBefore, laneAfter);
+  const independentStableRegularFile = independent.exists && independent.identity !== null;
+  const contentIdentity = laneBefore.validPng && independent.validPng && independentStableRegularFile &&
+    laneBefore.sha256 !== null && laneBefore.sha256 === independent.sha256;
+  const failures = [];
+
+  if (!captureScriptUnchanged) failures.push("capture-script-changed");
+  if (independentBefore.exists) failures.push("independent-screenshot-preexisting");
+  if (!laneBefore.exists) failures.push("lane-screenshot-missing");
+  if (laneBefore.exists && laneBefore.bytes <= minimumScreenshotBytes) failures.push("lane-screenshot-too-small");
+  if (laneBefore.exists && !laneBefore.validPng) failures.push("lane-screenshot-invalid-png");
+  if (canCapture && captureResult.code !== 0) failures.push(`capture-exit-${captureResult.code}`);
+  if (captureResult.code === 0) {
+    if (!independent.exists) failures.push("independent-screenshot-missing");
+    if (independent.exists && independent.bytes <= minimumScreenshotBytes) failures.push("independent-screenshot-too-small");
+    if (independent.exists && !independent.validPng) failures.push("independent-screenshot-invalid-png");
+    if (laneBefore.validPng && independent.validPng && !contentIdentity) {
+      failures.push("screenshot-content-mismatch");
+    }
+  }
+  if (!laneUnchanged) failures.push("lane-screenshot-mutated");
+
+  return {
+    ok: failures.length === 0,
+    failures,
+    command,
+    captureResult: boundedCommandOutput(captureResult, commandOutputLimitBytes),
+    captureScript: {
+      path: captureScriptPath,
+      unchanged: captureScriptUnchanged,
+      expectedSha256: expectedCaptureScriptHash,
+      actualSha256: captureScriptAfterSha256,
+      beforeSha256: captureScriptBeforeSha256,
+      afterSha256: captureScriptAfterSha256,
+    },
+    lane: {
+      path: lanePath,
+      exists: laneBefore.exists,
+      bytes: laneBefore.bytes,
+      sha256: laneBefore.sha256,
+      validPng: laneBefore.validPng,
+      identity: laneBefore.identity,
+      unchanged: laneUnchanged,
+      afterExists: laneAfter.exists,
+      afterBytes: laneAfter.bytes,
+      afterSha256: laneAfter.sha256,
+      afterIdentity: laneAfter.identity,
+    },
+    independent,
+    contentIdentity,
+  };
+}
+
+async function inspectPngArtifact(path) {
+  const noFollow = fsConstants.O_NOFOLLOW;
+  if (
+    process.platform === "win32" ||
+    typeof noFollow !== "number" ||
+    noFollow === 0
+  ) {
+    return inspectUnsafePathArtifact(path);
+  }
+
+  let handle;
+  let descriptorBefore = null;
+  let result;
+  try {
+    const nonBlocking = typeof fsConstants.O_NONBLOCK === "number" ? fsConstants.O_NONBLOCK : 0;
+    handle = await open(path, fsConstants.O_RDONLY | noFollow | nonBlocking);
+    descriptorBefore = await handle.stat({ bigint: true });
+    result = await inspectOpenedPngArtifact(path, handle, descriptorBefore);
+  } catch {
+    result = descriptorBefore
+      ? invalidPngArtifact(path, descriptorBefore)
+      : await inspectUnsafePathArtifact(path);
+  } finally {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {
+        result = descriptorBefore
+          ? invalidPngArtifact(path, descriptorBefore)
+          : await inspectUnsafePathArtifact(path);
+      }
+    }
+  }
+  return result ?? emptyPngArtifact(path);
+}
+
+async function inspectOpenedPngArtifact(path, handle, descriptorBefore) {
+  if (!descriptorBefore.isFile() || descriptorBefore.size > BigInt(maximumPngFileBytes)) {
+    const descriptorAfter = await handle.stat({ bigint: true });
+    const pathAfter = await lstat(path, { bigint: true });
+    const identity = sameStableStat(descriptorBefore, descriptorAfter) &&
+      samePathObject(descriptorAfter, pathAfter)
+      ? pngArtifactIdentity(descriptorAfter)
+      : null;
+    return invalidPngArtifact(path, descriptorAfter, identity);
+  }
+
+  const chunks = [];
+  let totalBytes = 0;
+  while (totalBytes <= maximumPngFileBytes) {
+    const remaining = maximumPngFileBytes + 1 - totalBytes;
+    if (remaining <= 0) break;
+    const buffer = Buffer.allocUnsafe(Math.min(pngReadChunkBytes, remaining));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, totalBytes);
+    if (bytesRead === 0) break;
+    chunks.push(buffer.subarray(0, bytesRead));
+    totalBytes += bytesRead;
+  }
+
+  const descriptorAfter = await handle.stat({ bigint: true });
+  const pathAfter = await lstat(path, { bigint: true });
+  const stable = sameStableStat(descriptorBefore, descriptorAfter) &&
+    descriptorAfter.isFile() && pathAfter.isFile() &&
+    sameStableStat(descriptorAfter, pathAfter);
+  if (
+    !stable ||
+    descriptorAfter.size > BigInt(maximumPngFileBytes) ||
+    totalBytes !== Number(descriptorAfter.size)
+  ) {
+    return invalidPngArtifact(path, descriptorAfter);
+  }
+
+  const bytes = Buffer.concat(chunks, totalBytes);
+  return {
+    path,
+    exists: true,
+    bytes: totalBytes,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    validPng: validPng(bytes),
+    identity: pngArtifactIdentity(descriptorAfter),
+  };
+}
+
+async function inspectUnsafePathArtifact(path) {
+  try {
+    return invalidPngArtifact(path, await lstat(path, { bigint: true }));
+  } catch {
+    return emptyPngArtifact(path);
+  }
+}
+
+function invalidPngArtifact(path, metadata, identity = null) {
+  return {
+    path,
+    exists: true,
+    bytes: boundedStatSize(metadata.size),
+    sha256: null,
+    validPng: false,
+    identity,
+  };
+}
+
+function boundedStatSize(size) {
+  const maximum = BigInt(Number.MAX_SAFE_INTEGER);
+  return Number(size > maximum ? maximum : size);
+}
+
+function pngArtifactIdentity(metadata) {
+  return {
+    device: metadata.dev.toString(),
+    inode: metadata.ino.toString(),
+    size: metadata.size.toString(),
+    mtimeNs: metadata.mtimeNs.toString(),
+    ctimeNs: metadata.ctimeNs.toString(),
+  };
+}
+
+function sameStableStat(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode &&
+    left.size === right.size && left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+function samePathObject(descriptor, pathMetadata) {
+  return descriptor.dev === pathMetadata.dev && descriptor.ino === pathMetadata.ino;
+}
+
+function samePngArtifactSnapshot(before, after) {
+  if (before.exists !== after.exists) return false;
+  if (!before.exists) return true;
+  if (before.identity === null || after.identity === null) return false;
+  return before.bytes === after.bytes && before.sha256 === after.sha256 &&
+    before.identity.device === after.identity.device &&
+    before.identity.inode === after.identity.inode &&
+    before.identity.size === after.identity.size &&
+    before.identity.mtimeNs === after.identity.mtimeNs &&
+    before.identity.ctimeNs === after.identity.ctimeNs;
+}
+
+function validPng(bytes) {
+  if (bytes.length < 45 || !bytes.subarray(0, pngSignature.length).equals(pngSignature)) return false;
+
+  let offset = pngSignature.length;
+  let chunkIndex = 0;
+  let ihdr = null;
+  let paletteEntries = null;
+  let sawIdat = false;
+  let endedIdat = false;
+  let sawIend = false;
+  let compressedBytes = 0;
+  const idatParts = [];
+
+  while (offset < bytes.length) {
+    if (sawIend || chunkIndex >= maximumPngChunkCount || bytes.length - offset < 12) return false;
+    const length = bytes.readUInt32BE(offset);
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + length;
+    const chunkEnd = dataEnd + 4;
+    if (length > maximumPngFileBytes || chunkEnd > bytes.length) return false;
+
+    const typeBytes = bytes.subarray(offset + 4, dataStart);
+    const type = typeBytes.toString("ascii");
+    if (!/^[A-Za-z]{4}$/.test(type) || (typeBytes[2] & 0x20) !== 0) return false;
+    const data = bytes.subarray(dataStart, dataEnd);
+    if (pngCrc32(typeBytes, data) !== bytes.readUInt32BE(dataEnd)) return false;
+    if (chunkIndex === 0 && type !== "IHDR") return false;
+
+    if (type === "IHDR") {
+      if (chunkIndex !== 0 || ihdr !== null || length !== 13) return false;
+      ihdr = parsePngHeader(data);
+      if (ihdr === null) return false;
+    } else if (type === "PLTE") {
+      if (ihdr === null || paletteEntries !== null || sawIdat || length === 0 || length % 3 !== 0 || length > 768) {
+        return false;
+      }
+      if (ihdr.colorType === 0 || ihdr.colorType === 4) return false;
+      paletteEntries = length / 3;
+      if (ihdr.colorType === 3 && paletteEntries > 2 ** ihdr.bitDepth) return false;
+    } else if (type === "IDAT") {
+      if (ihdr === null || endedIdat) return false;
+      if (ihdr.colorType === 3 && paletteEntries === null) return false;
+      sawIdat = true;
+      compressedBytes += length;
+      if (compressedBytes > maximumPngFileBytes) return false;
+      idatParts.push(data);
+    } else if (type === "IEND") {
+      if (ihdr === null || !sawIdat || length !== 0) return false;
+      sawIend = true;
+    } else {
+      if ((typeBytes[0] & 0x20) === 0) return false;
+      if (sawIdat) endedIdat = true;
+    }
+
+    if (sawIdat && type !== "IDAT" && type !== "IEND") endedIdat = true;
+    offset = chunkEnd;
+    chunkIndex += 1;
+  }
+
+  if (!sawIend || offset !== bytes.length || ihdr === null) return false;
+  return validInflatedPngData(Buffer.concat(idatParts, compressedBytes), ihdr);
+}
+
+function parsePngHeader(data) {
+  const width = data.readUInt32BE(0);
+  const height = data.readUInt32BE(4);
+  const bitDepth = data[8];
+  const colorType = data[9];
+  const legalBitDepths = {
+    0: [1, 2, 4, 8, 16],
+    2: [8, 16],
+    3: [1, 2, 4, 8],
+    4: [8, 16],
+    6: [8, 16],
+  };
+  if (
+    width === 0 || height === 0 ||
+    width > maximumPngDimension || height > maximumPngDimension ||
+    data[10] !== 0 || data[11] !== 0 || data[12] !== 0 ||
+    !legalBitDepths[colorType]?.includes(bitDepth)
+  ) {
+    return null;
+  }
+  return { width, height, bitDepth, colorType };
+}
+
+function validInflatedPngData(compressed, header) {
+  const channelsByColorType = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+  const channels = channelsByColorType[header.colorType];
+  const rowBytes = Math.ceil((header.width * channels * header.bitDepth) / 8);
+  const expectedBytes = header.height * (rowBytes + 1);
+  if (expectedBytes === 0 || expectedBytes > maximumInflatedPngBytes) return false;
+
+  try {
+    const inflated = inflateSync(compressed, { maxOutputLength: expectedBytes });
+    if (inflated.length !== expectedBytes) return false;
+    for (let row = 0; row < header.height; row += 1) {
+      if (inflated[row * (rowBytes + 1)] > 4) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pngCrc32(typeBytes, data) {
+  let crc = 0xffffffff;
+  for (const bytes of [typeBytes, data]) {
+    for (const byte of bytes) {
+      crc = (crc >>> 8) ^ pngCrcTable[(crc ^ byte) & 0xff];
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function emptyPngArtifact(path) {
+  return { path, exists: false, bytes: 0, sha256: null, validPng: false, identity: null };
 }
 
 async function fileSha256OrNull(filePath) {
@@ -1523,6 +1893,12 @@ export function plannerTurnReplayVerification({ first, second, reopened }) {
       identityStable ? null : "planner-identity-changed",
       onePlannerRoot ? null : "planner-root-invalid",
       distinctTerminalRuns ? null : "planner-run-evidence-invalid",
+      distinctTerminalRuns && !turnSemantics.firstTurnOperationSummaryValid
+        ? "first-turn-operation-summary-invalid"
+        : null,
+      distinctTerminalRuns && !turnSemantics.secondTurnOperationSummaryValid
+        ? "second-turn-operation-summary-invalid"
+        : null,
       distinctTerminalRuns && !turnSemantics.intentsAccepted ? "planner-intent-not-accepted" : null,
       distinctTerminalRuns && turnSemantics.intentsAccepted && !turnSemantics.secondTurnLaneSetValid
         ? "second-turn-lane-set-invalid"
@@ -1544,14 +1920,23 @@ export function plannerTurnReplayVerification({ first, second, reopened }) {
     plannerRunIds,
     inputReplay,
     reopenedProjectionMatches,
+    plannerOperationSummaries: turnSemantics.operationSummaries,
     secondTurnLaneIds: turnSemantics.secondTurnLaneIds,
   };
 }
 
 function plannerTurnSemanticVerification({ first, second, reopened, plannerTurns }) {
-  const firstTurnWindow = plannerTurnWindow(first, plannerTurnRecords(first)[0], null);
+  const firstPlannerTurns = plannerTurnRecords(first);
+  const firstTurnWindow = plannerTurnWindow(first, firstPlannerTurns[0], null);
   const secondFirstTurnWindow = plannerTurnWindow(second, plannerTurns[0], null);
   const secondTurnWindow = plannerTurnWindow(second, plannerTurns[1], plannerTurns[0]);
+  const firstTurnOperationSummaryValid = firstPlannerTurns.length === 1 &&
+    exactPlannerOperationSummary(firstPlannerTurns[0]?.operationSummary, expectedFirstPlannerOperationSummary) &&
+    exactPlannerOperationSummary(plannerTurns[0]?.operationSummary, expectedFirstPlannerOperationSummary);
+  const secondTurnOperationSummaryValid = exactPlannerOperationSummary(
+    plannerTurns[1]?.operationSummary,
+    expectedSecondPlannerOperationSummary,
+  );
   const intentsAccepted = firstTurnWindow.intentAccepted &&
     secondFirstTurnWindow.intentAccepted && secondTurnWindow.intentAccepted;
   const secondTurnLaneIds = secondTurnWindow.declaredLaneIds.filter((laneId) =>
@@ -1571,13 +1956,17 @@ function plannerTurnSemanticVerification({ first, second, reopened, plannerTurns
     reopened.canvasSession.nodes.find((node) => node?.id === laneId)?.status === "completed"
   );
   return {
-    ok: intentsAccepted && secondTurnLaneSetValid && secondTurnOperationDeclared &&
+    ok: firstTurnOperationSummaryValid && secondTurnOperationSummaryValid &&
+      intentsAccepted && secondTurnLaneSetValid && secondTurnOperationDeclared &&
       secondTurnOperationProjected && secondTurnOperationCompleted,
+    firstTurnOperationSummaryValid,
+    secondTurnOperationSummaryValid,
     intentsAccepted,
     secondTurnLaneSetValid,
     secondTurnOperationDeclared,
     secondTurnOperationProjected,
     secondTurnOperationCompleted,
+    operationSummaries: plannerTurns.map((turn) => turn.operationSummary),
     secondTurnLaneIds,
   };
 }
@@ -1585,11 +1974,14 @@ function plannerTurnSemanticVerification({ first, second, reopened, plannerTurns
 function emptyPlannerTurnSemanticVerification() {
   return {
     ok: false,
+    firstTurnOperationSummaryValid: false,
+    secondTurnOperationSummaryValid: false,
     intentsAccepted: false,
     secondTurnLaneSetValid: false,
     secondTurnOperationDeclared: false,
     secondTurnOperationProjected: false,
     secondTurnOperationCompleted: false,
+    operationSummaries: [],
     secondTurnLaneIds: [],
   };
 }
@@ -1646,14 +2038,18 @@ function plannerTurnRecords(state) {
   const plannerNodeId = state?.canvasSession?.plannerNodeId;
   if (typeof plannerNodeId !== "string") return [];
   return (state?.events ?? []).flatMap((event) => {
-    const turn = event?.payload?.plannerTurn;
+    const payload = event?.payload;
+    const turn = payload?.plannerTurn;
     if (
       event?.kind !== "workflow.planner_intent.reconciled" ||
       event.laneId !== plannerNodeId ||
       !Number.isSafeInteger(event.seq) || event.seq < 0 ||
       typeof event.segmentId !== "string" ||
+      !payload || typeof payload !== "object" || Array.isArray(payload) ||
+      Object.keys(payload).sort().join(",") !== "plannerTurn,redacted,summary" ||
+      payload.redacted !== true || typeof payload.summary !== "string" ||
       !turn || typeof turn !== "object" || Array.isArray(turn) ||
-      Object.keys(turn).sort().join(",") !== "exitCode,hermesCliExitPassed,intentDisposition,runId,segmentId,status" ||
+      Object.keys(turn).sort().join(",") !== "exitCode,hermesCliExitPassed,intentDisposition,operationSummary,runId,segmentId,status" ||
       turn.segmentId !== event.segmentId ||
       typeof turn.runId !== "string" || !turn.runId ||
       !terminalSegmentStatus(turn.status) ||
@@ -1661,8 +2057,52 @@ function plannerTurnRecords(state) {
       typeof turn.hermesCliExitPassed !== "boolean" ||
       turn.intentDisposition !== "applied"
     ) return [];
-    return [{ ...turn, seq: event.seq }];
+    const operationSummary = safePlannerOperationSummary(turn.operationSummary);
+    if (!operationSummary) return [];
+    return [{ ...turn, operationSummary, seq: event.seq }];
   }).sort((left, right) => left.seq - right.seq);
+}
+
+function exactPlannerOperationSummary(actual, expected) {
+  const normalized = safePlannerOperationSummary(actual);
+  return normalized !== null && stableJson(normalized) === stableJson(expected);
+}
+
+function safePlannerOperationSummary(value) {
+  if (!Array.isArray(value) || value.length > 64) return null;
+  const operationTypes = new Set([
+    "AnalyzeRequirement",
+    "DiscoverProject",
+    "ProposeLanes",
+    "SplitLane",
+    "JoinLanes",
+    "StartImplementation",
+    "RequestValidation",
+    "RequestReview",
+    "RequestUserDecision",
+    "ReplanFromEvidence",
+    "Commit",
+    "DeclareEdge",
+  ]);
+  const summary = [];
+  for (const entry of value) {
+    if (
+      !entry || typeof entry !== "object" || Array.isArray(entry) ||
+      typeof entry.type !== "string" || !operationTypes.has(entry.type)
+    ) return null;
+    const keys = Object.keys(entry).sort().join(",");
+    if (entry.type === "ProposeLanes") {
+      if (
+        keys !== "lanesMode,type" ||
+        (entry.lanesMode !== "omitted" && entry.lanesMode !== "explicit")
+      ) return null;
+      summary.push({ type: "ProposeLanes", lanesMode: entry.lanesMode });
+      continue;
+    }
+    if (keys !== "type") return null;
+    summary.push({ type: entry.type });
+  }
+  return summary;
 }
 
 function hasSuccessfulPlannerEvidence(segment) {
@@ -1910,16 +2350,6 @@ function summarizeRequiredLaneCandidate(kind, node, evidence) {
 
   const requiredEvidence = Array.isArray(node?.requiredEvidence) ? [...node.requiredEvidence] : [];
   const artifacts = Array.isArray(evidence?.artifacts) ? [...evidence.artifacts] : [];
-  if (kind === "browser_validation") {
-    for (const required of ["browser", "screenshot"]) {
-      if (!requiredEvidence.includes(required)) failures.push(`missing-required-evidence:${required}`);
-    }
-    if (!(evidence?.checks ?? []).some((check) => check?.kind === "artifact" && check.status === "passed")) {
-      failures.push("missing-passed-artifact-check");
-    }
-    if (!artifacts.includes(browserScreenshotArtifact)) failures.push("missing-screenshot-artifact");
-  }
-
   return {
     ok: failures.length === 0,
     kind,
@@ -1993,15 +2423,14 @@ export function strictWorkflowAcceptanceSummary({
     kind,
     initialNodes.filter((node) => projectedLaneKind(node) === kind),
   ]));
-  const initialLaneSetValid = nonPlannerNodes.length === 6 && followUpNodes.length === 1 &&
-    initialNodes.length === 5 &&
+  const initialLaneSetValid = nonPlannerNodes.length === 5 && followUpNodes.length === 1 &&
+    initialNodes.length === 4 &&
     requiredLaneKinds.every((kind) => roleNodes[kind].length === 1) &&
     initialNodes.every((node) => requiredLaneKinds.includes(projectedLaneKind(node)));
   const initialByRole = Object.fromEntries(requiredLaneKinds.map((kind) => [kind, roleNodes[kind][0] ?? null]));
   const expectedAgents = {
     implementation: "codex",
     validation: "codex",
-    browser_validation: "codex",
     review: "hermes",
     commit: "codex",
   };
@@ -2011,22 +2440,21 @@ export function strictWorkflowAcceptanceSummary({
   const expectedDependencies = initialLaneSetValid ? {
     implementation: [],
     validation: [initialByRole.implementation.id],
-    browser_validation: [initialByRole.validation.id],
-    review: [initialByRole.browser_validation.id],
+    review: [initialByRole.validation.id],
     commit: [initialByRole.review.id],
   } : null;
   const dependencyChainValid = expectedDependencies !== null && requiredLaneKinds.every((kind) =>
     exactStringArray(initialByRole[kind]?.context?.dependencies, expectedDependencies[kind])
   );
   const followUp = followUpNodes[0] ?? null;
-  const followUpStructureValid = initialLaneSetValid && followUp?.laneKind === "validation" &&
+  const followUpStructureValid = initialLaneSetValid && projectedLaneKind(followUp) === "browser_validation" &&
     followUp.agent === "codex" && followUp.status === "completed" &&
+    followUp.runtimePolicy?.sandbox === "workspace-write" &&
     exactStringArray(followUp?.context?.dependencies, [initialByRole.commit.id]);
   const expectedEdgePairs = followUpStructureValid && dependencyChainValid
     ? [
         [initialByRole.implementation.id, initialByRole.validation.id],
-        [initialByRole.validation.id, initialByRole.browser_validation.id],
-        [initialByRole.browser_validation.id, initialByRole.review.id],
+        [initialByRole.validation.id, initialByRole.review.id],
         [initialByRole.review.id, initialByRole.commit.id],
         [initialByRole.commit.id, followUp.id],
       ]
@@ -2037,8 +2465,8 @@ export function strictWorkflowAcceptanceSummary({
     : [];
   const encodedExpectedEdgePairs = expectedEdgePairs.map(encodeEdgePair).sort();
   const encodedActualEdgePairs = actualEdgePairs.map(encodeEdgePair).sort();
-  const edgeSetValid = expectedEdgePairs.length === 5 && actualEdgePairs.length === 5 &&
-    new Set(encodedActualEdgePairs).size === 5 &&
+  const edgeSetValid = expectedEdgePairs.length === 4 && actualEdgePairs.length === 4 &&
+    new Set(encodedActualEdgePairs).size === 4 &&
     stableJson(encodedActualEdgePairs) === stableJson(encodedExpectedEdgePairs);
   const matchingSegments = followUpId === null
     ? []
@@ -2053,12 +2481,16 @@ export function strictWorkflowAcceptanceSummary({
   const authoritativeRunEvidence = typeof followUp?.runId === "string"
     ? authoritativeEvidence?.runEvidence?.[followUp.runId]
     : null;
+  const projectedBrowserEvidenceFailures = browserLaneEvidenceFailures(followUp, projectedRunEvidence);
+  const authoritativeBrowserEvidenceFailures = browserLaneEvidenceFailures(followUp, authoritativeRunEvidence);
   const followUpEvidenceValid = followUpStructureValid && matchingSegments.length === 1 &&
     matchingEvidence.length === 1 && matchingEvidence[0]?.status === "passed" &&
     typeof followUp.runId === "string" && followUp.runId.length > 0 &&
     segment?.runId === followUp.runId && segment.status === "succeeded" &&
     successfulCodexEvidence(projectedRunEvidence, followUp.runId) &&
     successfulCodexEvidence(authoritativeRunEvidence, followUp.runId) &&
+    projectedBrowserEvidenceFailures.length === 0 &&
+    authoritativeBrowserEvidenceFailures.length === 0 &&
     stableJson(projectedRunEvidence) === stableJson(authoritativeRunEvidence);
   const deliveryCheckpoints = deliveryCheckpointAcceptanceSummary({
     baselineCommitSha,
@@ -2095,11 +2527,15 @@ export function strictWorkflowAcceptanceSummary({
     followUp: {
       nodeId: followUp?.id ?? null,
       runId: followUp?.runId ?? null,
+      requiredEvidence: Array.isArray(followUp?.requiredEvidence) ? [...followUp.requiredEvidence] : [],
+      artifacts: Array.isArray(authoritativeRunEvidence?.artifacts) ? [...authoritativeRunEvidence.artifacts] : [],
       segmentCount: matchingSegments.length,
       evidenceCount: matchingEvidence.length,
       failures: [
         followUpStructureValid ? null : "follow-up-invalid",
         followUpEvidenceValid ? null : "follow-up-evidence-invalid",
+        ...projectedBrowserEvidenceFailures.map((failure) => `projected:${failure}`),
+        ...authoritativeBrowserEvidenceFailures.map((failure) => `authoritative:${failure}`),
       ].filter(Boolean),
     },
   };
@@ -2123,7 +2559,6 @@ export function deliveryCheckpointAcceptanceSummary({
   const laneSpecs = [
     ["implementation", initialByRole?.implementation, baselineCommitSha, baselineCommitSha, false],
     ["validation", initialByRole?.validation, baselineCommitSha, baselineCommitSha, false],
-    ["browser_validation", initialByRole?.browser_validation, baselineCommitSha, baselineCommitSha, false],
     ["review", initialByRole?.review, baselineCommitSha, baselineCommitSha, false],
     ["commit", initialByRole?.commit, baselineCommitSha, finalHeadCommitSha, true],
     ["followUp", followUp, finalHeadCommitSha, finalHeadCommitSha, false],
@@ -2327,6 +2762,21 @@ function successfulCodexEvidence(evidence, runId) {
     (evidence.checks ?? []).some((check) =>
       check?.kind === "run-exit" && check.name === "Codex CLI exit" && check.status === "passed"
     );
+}
+
+function browserLaneEvidenceFailures(node, evidence) {
+  const failures = [];
+  const requiredEvidence = Array.isArray(node?.requiredEvidence) ? node.requiredEvidence : [];
+  for (const required of ["browser", "screenshot"]) {
+    if (!requiredEvidence.includes(required)) failures.push(`missing-required-evidence:${required}`);
+  }
+  if (!(evidence?.checks ?? []).some((check) => check?.kind === "artifact" && check.status === "passed")) {
+    failures.push("missing-passed-artifact-check");
+  }
+  if (!(evidence?.artifacts ?? []).includes(browserScreenshotArtifact)) {
+    failures.push("missing-screenshot-artifact");
+  }
+  return failures;
 }
 
 export function workflowGraphAcceptanceSummary(graph) {
@@ -2642,23 +3092,21 @@ async function collectFinalVerification({
   session,
 }) {
   const verifyScriptPath = join(projectRoot, "scripts", "verify.mjs");
-  const captureScriptPath = join(projectRoot, "scripts", "capture-screenshot.mjs");
   const actualVerifyScriptHash = await fileSha256(verifyScriptPath);
-  const actualCaptureScriptHash = await fileSha256(captureScriptPath);
   const verifyScriptUnchanged = actualVerifyScriptHash === expectedVerifyScriptHash;
-  const captureScriptUnchanged = actualCaptureScriptHash === expectedCaptureScriptHash;
   const verifyCommand = `${process.execPath} scripts/verify.mjs`;
-  const screenshotPath = join(projectRoot, browserScreenshotArtifact);
-  const captureCommand = `${process.execPath} scripts/capture-screenshot.mjs ${screenshotPath}`;
   const testResult = verifyScriptUnchanged
     ? await demo.runCapture(process.execPath, ["scripts/verify.mjs"], projectRoot, { allowFailure: true })
     : skippedCommandResult("fixed verification script hash changed");
-  const captureResult = captureScriptUnchanged
-    ? await demo.runCapture(process.execPath, ["scripts/capture-screenshot.mjs", screenshotPath], projectRoot, { allowFailure: true })
-    : skippedCommandResult("fixed capture script hash changed");
-  const screenshotBytes = captureResult.code === 0
-    ? await fileSizeOrZero(screenshotPath)
-    : 0;
+  const screenshotVerification = await verifyScreenshotCausalBinding({
+    demo,
+    expectedCaptureScriptHash,
+    projectRoot,
+  });
+  const captureResult = screenshotVerification.captureResult;
+  const captureScriptUnchanged = screenshotVerification.captureScript.unchanged;
+  const screenshotPath = screenshotVerification.lane.path;
+  const screenshotBytes = screenshotVerification.lane.bytes;
   const commitCount = await gitCommitCount(projectRoot);
   const deliveryFiles = await collectDeliveryFileRange({ baselineCommitSha, demo, projectRoot });
   const {
@@ -2703,8 +3151,7 @@ async function collectFinalVerification({
     graph.duplicateSemanticKeys.length === 0 &&
     graphAcceptance.ok &&
     testResult.code === 0 &&
-    captureResult.code === 0 &&
-    screenshotBytes > 1_000 &&
+    screenshotVerification.ok &&
     verifyScriptUnchanged &&
     captureScriptUnchanged &&
     commitCount > 1 &&
@@ -2744,6 +3191,7 @@ async function collectFinalVerification({
           laneKindEvidence,
           strictWorkflow,
           sessionTarget,
+          screenshotVerification,
           screenshotBytes,
           testResult,
           verifyScriptUnchanged,
@@ -2756,25 +3204,21 @@ async function collectFinalVerification({
       expectedSha256: expectedVerifyScriptHash,
       actualSha256: actualVerifyScriptHash,
     },
-    captureScript: {
-      path: captureScriptPath,
-      unchanged: captureScriptUnchanged,
-      expectedSha256: expectedCaptureScriptHash,
-      actualSha256: actualCaptureScriptHash,
-    },
+    captureScript: screenshotVerification.captureScript,
     verificationCommand: {
       verify: {
         command: verifyCommand,
         ...boundedCommandOutput(testResult, commandOutputLimitBytes),
       },
       captureScreenshot: {
-        command: captureCommand,
+        command: screenshotVerification.command,
         ...boundedCommandOutput(captureResult, commandOutputLimitBytes),
       },
     },
     sessionTarget,
     screenshotPath,
     screenshotBytes,
+    screenshotVerification,
     commitCount,
     deliveryCommitCount,
     commitSha,
@@ -2808,6 +3252,9 @@ function acceptanceFailureDiagnostic(input) {
   if ((input.unexpectedChangedFiles ?? []).length > 0) failures.push(`unexpected-delivery-files:${input.unexpectedChangedFiles.join("|")}`);
   if ((input.missingChangedFiles ?? []).length > 0) failures.push(`missing-delivery-files:${input.missingChangedFiles.join("|")}`);
   if (input.screenshotBytes <= 1_000) failures.push("screenshot-too-small");
+  for (const failure of input.screenshotVerification?.failures ?? ["screenshot-verification-missing"]) {
+    failures.push(`screenshot:${failure}`);
+  }
   if (input.commitCount <= 1) failures.push("no-delivery-commit");
   if (input.deliveryCommitCount !== 1) failures.push(`delivery-commit-count:${input.deliveryCommitCount}`);
   if (typeof input.baselineCommitSha !== "string" || input.baselineCommitSha.length !== 40) failures.push("missing-baseline-sha");
@@ -2991,6 +3438,7 @@ function emptyAcceptanceResult(projectRoot, readiness) {
     runEvidence: {},
     agentRunEvidence: { hermes: [], codex: [] },
     screenshot: { path: null, bytes: 0 },
+    screenshotVerification: null,
     verificationCommand: {
       verify: {
         command: `${process.execPath} scripts/verify.mjs`,

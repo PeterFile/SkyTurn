@@ -5833,6 +5833,7 @@ describe("SQLite workflow store", () => {
     store.completePlannerIntentReconciliation(segment, {
       disposition: "applied",
       intentId: "intent-plan-finish",
+      operationSummary: [],
     }, "2026-07-18T00:00:03.000Z");
 
     expect(store.listPendingPlannerIntentReconciliations()).toEqual([]);
@@ -5850,6 +5851,133 @@ describe("SQLite workflow store", () => {
     store.close();
   });
 
+  it("persists an ordered planner operation summary and compares it across reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    let store = createWorkflowStore({ projectRoot });
+    const { session, segment } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-operation-summary",
+      "planner output is already authenticated separately",
+    );
+    const operationSummary = [
+      { type: "AnalyzeRequirement" },
+      { type: "DiscoverProject" },
+      { type: "ProposeLanes", lanesMode: "omitted" },
+    ];
+    const first = store.completePlannerIntentReconciliation(segment, {
+      disposition: "applied",
+      intentId: "intent-operation-summary",
+      operationSummary,
+    }, "2026-07-22T01:59:03.000Z");
+    const firstEvents = store.listEvents(session.id);
+
+    expect(first.payload).toEqual({
+      runId: segment.runId,
+      agentKind: "hermes",
+      disposition: "applied",
+      intentId: "intent-operation-summary",
+      operationSummary,
+    });
+    store.close();
+
+    store = createWorkflowStore({ projectRoot });
+    expect(store.completePlannerIntentReconciliation(segment, {
+      disposition: "applied",
+      intentId: "intent-operation-summary",
+      operationSummary: structuredClone(operationSummary),
+    }, "2026-07-22T01:59:04.000Z")).toEqual(first);
+    expect(store.listEvents(session.id)).toEqual(firstEvents);
+    expect(() => store.completePlannerIntentReconciliation(segment, {
+      disposition: "applied",
+      intentId: "intent-operation-summary",
+      operationSummary: [
+        { type: "AnalyzeRequirement" },
+        { type: "DiscoverProject" },
+        { type: "ProposeLanes", lanesMode: "explicit" },
+      ],
+    }, "2026-07-22T01:59:05.000Z")).toThrow(/conflict/i);
+    expect(store.listEvents(session.id)).toEqual(firstEvents);
+    store.close();
+  });
+
+  it.each([
+    ["explicit undefined", undefined],
+    ["non-array", { type: "AnalyzeRequirement" }],
+    ["unknown operation", [{ type: "LaunchUnknownAgent" }]],
+    ["extra operation key", [{ type: "AnalyzeRequirement", requirement: "must stay private" }]],
+    ["missing ProposeLanes mode", [{ type: "ProposeLanes" }]],
+    ["unknown ProposeLanes mode", [{ type: "ProposeLanes", lanesMode: "defaulted" }]],
+    ["extra ProposeLanes key", [{ type: "ProposeLanes", lanesMode: "omitted", lanes: [] }]],
+    ["unbounded operation count", Array.from({ length: 65 }, () => ({ type: "AnalyzeRequirement" }))],
+  ])("rejects %s in a planner operation summary before reconciliation persistence", async (label, operationSummary) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const { session, segment } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      `run-planner-operation-summary-${label.replaceAll(" ", "-")}`,
+      "planner summary normalization fixture",
+    );
+    const eventsBefore = store.listEvents(session.id);
+
+    expect(() => store.completePlannerIntentReconciliation(segment, {
+      disposition: "applied",
+      intentId: "intent-operation-summary-invalid",
+      operationSummary,
+    }, "2026-07-22T01:59:03.000Z")).toThrow(/operation summary/i);
+    expect(store.listEvents(session.id)).toEqual(eventsBefore);
+    expect(store.listPendingPlannerIntentReconciliations()).toEqual([{
+      sessionId: segment.sessionId,
+      laneId: segment.laneId,
+      segmentId: segment.segmentId,
+      runId: segment.runId,
+      agentKind: segment.agentKind,
+    }]);
+    store.close();
+  });
+
+  it("rejects a missing planner operation summary before reconciliation persistence", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const { session, segment } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-operation-summary-missing",
+      "planner summary presence fixture",
+    );
+    const eventsBefore = store.listEvents(session.id);
+
+    expect(() => store.completePlannerIntentReconciliation(segment, {
+      disposition: "applied",
+      intentId: "intent-operation-summary-missing",
+    } as unknown as Parameters<typeof store.completePlannerIntentReconciliation>[1], "2026-07-22T01:59:03.000Z"))
+      .toThrow(/operation summary/i);
+    expect(store.listEvents(session.id)).toEqual(eventsBefore);
+    expect(store.listPendingPlannerIntentReconciliations()).toHaveLength(1);
+    store.close();
+  });
+
+  it("persists an explicit empty operation summary for an unparsed invalid planner turn", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const { segment } = seedSucceededPlannerIntentCandidate(
+      store,
+      projectRoot,
+      "run-planner-empty-operation-summary",
+      "not a WorkflowIntent",
+    );
+
+    const event = store.completePlannerIntentReconciliation(segment, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+      operationSummary: [],
+    }, "2026-07-22T01:59:03.000Z");
+
+    expect(event.payload.operationSummary).toEqual([]);
+    store.close();
+  });
+
   it("finalizes invalid planner intent without changing exact successful process evidence or output", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
@@ -5864,6 +5992,7 @@ describe("SQLite workflow store", () => {
     const disposition = store.completePlannerIntentReconciliation(segment, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:00:03.000Z");
 
     expect(disposition).toMatchObject({
@@ -5902,6 +6031,7 @@ describe("SQLite workflow store", () => {
     const first = store.completePlannerIntentReconciliation(segment, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:01:03.000Z");
     const firstEvents = store.listEvents(session.id);
     const firstLane = store.getLane(session.id, session.plannerLaneId);
@@ -5909,6 +6039,7 @@ describe("SQLite workflow store", () => {
     expect(store.completePlannerIntentReconciliation(segment, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:01:04.000Z")).toEqual(first);
     expect(store.listEvents(session.id)).toEqual(firstEvents);
     expect(store.getLane(session.id, session.plannerLaneId)).toEqual(firstLane);
@@ -5916,15 +6047,18 @@ describe("SQLite workflow store", () => {
       disposition: "rejected",
       intentId: "intent-conflict",
       reasonCode: "policy_rejected",
+      operationSummary: [],
     }, "2026-07-22T02:01:05.000Z")).toThrow(/conflict/i);
     expect(() => store.completePlannerIntentReconciliation(segment, {
       disposition: "invalid",
       intentId: "intent-conflict",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:01:05.500Z")).toThrow(/conflict/i);
     expect(() => store.completePlannerIntentReconciliation({ ...segment, laneId: "lane-conflict" }, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:01:06.000Z")).toThrow(/conflict/i);
     expect(store.listEvents(session.id)).toEqual(firstEvents);
     store.close();
@@ -5933,6 +6067,7 @@ describe("SQLite workflow store", () => {
     expect(store.completePlannerIntentReconciliation(segment, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:01:07.000Z")).toEqual(first);
     expect(store.listEvents(session.id)).toEqual(firstEvents);
     expect(store.getLane(session.id, session.plannerLaneId)).toEqual(firstLane);
@@ -5960,6 +6095,7 @@ describe("SQLite workflow store", () => {
     expect(() => store.completePlannerIntentReconciliation(segment, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:01:03.000Z")).toThrow("injected planner disposition transaction failure");
     expect(store.listPendingPlannerIntentReconciliations()).toHaveLength(1);
     expect(store.listEvents(session.id).some((event) => event.kind === "workflow.planner_intent.reconciled")).toBe(false);
@@ -5970,6 +6106,7 @@ describe("SQLite workflow store", () => {
     store.completePlannerIntentReconciliation(segment, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:01:04.000Z");
     expect(store.listPendingPlannerIntentReconciliations()).toEqual([]);
     expect(store.getLane(session.id, session.plannerLaneId)?.status).toBe("failed");
@@ -5988,6 +6125,7 @@ describe("SQLite workflow store", () => {
     store.completePlannerIntentReconciliation(segment, {
       disposition: "applied",
       intentId: "intent-original",
+      operationSummary: [],
     }, "2026-07-22T02:01:03.000Z");
     store.close();
 
@@ -6001,6 +6139,7 @@ describe("SQLite workflow store", () => {
     const legacy = store.completePlannerIntentReconciliation(segment, {
       disposition: "applied",
       intentId: "intent-historical-unknown",
+      operationSummary: [],
     }, "2026-07-22T02:01:04.000Z");
     expect(legacy.payload).toEqual({ runId: segment.runId });
     expect(store.listEvents(session.id)).toEqual(before);
@@ -6029,6 +6168,7 @@ describe("SQLite workflow store", () => {
     store.completePlannerIntentReconciliation(first.segment, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:02:04.000Z");
     expect(store.getLane(first.session.id, first.session.plannerLaneId)?.status).toBe("running");
     expect(store.listEvents(first.session.id).some((event) =>
@@ -6047,6 +6187,7 @@ describe("SQLite workflow store", () => {
     store.completePlannerIntentReconciliation(secondClaim.segment, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:02:06.000Z");
     expect(store.getLane(first.session.id, first.session.plannerLaneId)?.status).toBe("failed");
 
@@ -6087,6 +6228,7 @@ describe("SQLite workflow store", () => {
     expect(() => store.completePlannerIntentReconciliation(candidate!, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:03:03.000Z")).toThrow(/identity|planner/i);
     expect(store.listPendingPlannerIntentReconciliations()).toEqual([candidate]);
     expect(store.listSegments(segment.sessionId, segment.laneId).at(-1)?.status).toBe("succeeded");
@@ -6119,6 +6261,7 @@ describe("SQLite workflow store", () => {
     expect(() => store.completePlannerIntentReconciliation(candidate!, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     }, "2026-07-22T02:04:03.000Z")).toThrow(/identity|evidence/i);
     expect(store.listPendingPlannerIntentReconciliations()).toEqual([candidate]);
     expect(store.listEvents(segment.sessionId)).toEqual(eventsBefore);

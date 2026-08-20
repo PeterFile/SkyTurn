@@ -1,18 +1,19 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { open, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { deflateSync } from "node:zlib";
 
 const root = new URL("..", import.meta.url);
 const strictNodeIds = {
   implementation: "n-7f3a",
   validation: "n-a910",
-  browserValidation: "n-02cd",
   review: "n-d44e",
   commit: "n-5be1",
   followUp: "n-c08f",
@@ -20,13 +21,89 @@ const strictNodeIds = {
 const strictRunIds = {
   implementation: "r-18b2",
   validation: "r-f06c",
-  browserValidation: "r-991d",
   review: "r-3ae7",
   commit: "r-742f",
   followUp: "r-b511",
 };
 const baselineHead = "a".repeat(40);
 const finalHead = "b".repeat(40);
+const maximumPngFileBytes = 64 * 1024 * 1024;
+
+const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function pngCrc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const typeBytes = Buffer.from(type, "ascii");
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(pngCrc32(Buffer.concat([typeBytes, data])));
+  return Buffer.concat([length, typeBytes, data, crc]);
+}
+
+function validPng(seed, { filter = 0 } = {}) {
+  const width = 64;
+  const height = 8;
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  const scanlines = Buffer.alloc(height * (1 + width * 4));
+  let state = seed >>> 0;
+  for (let row = 0; row < height; row += 1) {
+    const rowOffset = row * (1 + width * 4);
+    scanlines[rowOffset] = filter;
+    for (let index = 1; index <= width * 4; index += 1) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      scanlines[rowOffset + index] = state & 0xff;
+    }
+  }
+  return Buffer.concat([
+    pngSignature,
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", deflateSync(scanlines)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function replacePngChunk(png, type, replace) {
+  let offset = pngSignature.length;
+  while (offset < png.length) {
+    const length = png.readUInt32BE(offset);
+    const end = offset + 12 + length;
+    if (png.toString("ascii", offset + 4, offset + 8) === type) {
+      return Buffer.concat([png.subarray(0, offset), replace(png.subarray(offset, end)), png.subarray(end)]);
+    }
+    offset = end;
+  }
+  throw new Error(`Missing PNG chunk ${type}.`);
+}
+
+async function screenshotVerificationFixture(seed, lanePng = validPng(seed)) {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-screenshot-binding-"));
+  const scriptsDir = join(projectRoot, "scripts");
+  const acceptanceDir = join(projectRoot, ".devflow", "acceptance");
+  const capturePath = join(scriptsDir, "capture-screenshot.mjs");
+  const lanePath = join(acceptanceDir, "react-app.png");
+  await mkdir(scriptsDir, { recursive: true });
+  await mkdir(acceptanceDir, { recursive: true });
+  await writeFile(capturePath, "// fixed screenshot helper\n");
+  await writeFile(lanePath, lanePng);
+  return { capturePath, lanePath, lanePng, projectRoot };
+}
 
 test("New Session UI acceptance opens the project and drives both real renderer inputs", async () => {
   const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
@@ -317,6 +394,98 @@ test("New Session UI acceptance verifies stable planner identity and determinist
   assert.deepEqual(result.plannerRunIds, ["run-planner-1", "run-planner-2"]);
   assert.deepEqual(result.inputReplay, ["First input", "Second input"]);
   assert.equal(result.reopenedProjectionMatches, true);
+});
+
+test("New Session UI acceptance requires the exact ordered operation shape for both planner turns", async () => {
+  const { plannerTurnReplayVerification } = await import("./newSessionUiAcceptance.mjs");
+  const first = authoritativePlannerState("run-planner-1", "First input", ["lane-1"]);
+  const second = authoritativePlannerState("run-planner-2", "Second input", ["lane-1", "lane-2"]);
+
+  const result = plannerTurnReplayVerification({ first, second, reopened: structuredClone(second) });
+
+  assert.equal(result.ok, true);
+});
+
+test("New Session UI acceptance rejects missing, stale, reordered, extra, or wrong-mode planner operation summaries", async () => {
+  const { plannerTurnReplayVerification } = await import("./newSessionUiAcceptance.mjs");
+  const cases = [
+    ["missing-first", ({ first }) => {
+      delete plannerTurnEvent(first, 0).payload.plannerTurn.operationSummary;
+    }],
+    ["missing-second", ({ second }) => {
+      delete plannerTurnEvent(second, 1).payload.plannerTurn.operationSummary;
+    }],
+    ["missing-discovery", ({ first, second }) => {
+      const summary = [{ type: "AnalyzeRequirement" }, { type: "ProposeLanes", lanesMode: "omitted" }];
+      plannerTurnEvent(first, 0).payload.plannerTurn.operationSummary = structuredClone(summary);
+      plannerTurnEvent(second, 0).payload.plannerTurn.operationSummary = structuredClone(summary);
+    }],
+    ["reordered-first", ({ first, second }) => {
+      const summary = [
+        { type: "DiscoverProject" },
+        { type: "AnalyzeRequirement" },
+        { type: "ProposeLanes", lanesMode: "omitted" },
+      ];
+      plannerTurnEvent(first, 0).payload.plannerTurn.operationSummary = structuredClone(summary);
+      plannerTurnEvent(second, 0).payload.plannerTurn.operationSummary = structuredClone(summary);
+    }],
+    ["extra-first-operation", ({ first, second }) => {
+      const summary = [
+        ...firstPlannerOperationSummary,
+        { type: "RequestValidation" },
+      ];
+      plannerTurnEvent(first, 0).payload.plannerTurn.operationSummary = structuredClone(summary);
+      plannerTurnEvent(second, 0).payload.plannerTurn.operationSummary = structuredClone(summary);
+    }],
+    ["explicit-first-lanes", ({ first, second }) => {
+      const summary = [
+        { type: "AnalyzeRequirement" },
+        { type: "DiscoverProject" },
+        { type: "ProposeLanes", lanesMode: "explicit" },
+      ];
+      plannerTurnEvent(first, 0).payload.plannerTurn.operationSummary = structuredClone(summary);
+      plannerTurnEvent(second, 0).payload.plannerTurn.operationSummary = structuredClone(summary);
+    }],
+    ["omitted-second-lanes", ({ second }) => {
+      plannerTurnEvent(second, 1).payload.plannerTurn.operationSummary = [
+        { type: "ProposeLanes", lanesMode: "omitted" },
+      ];
+    }],
+    ["extra-summary-key", ({ second }) => {
+      plannerTurnEvent(second, 1).payload.plannerTurn.operationSummary = [
+        { type: "ProposeLanes", lanesMode: "explicit", laneCount: 1 },
+      ];
+    }],
+    ["unknown-operation", ({ second }) => {
+      plannerTurnEvent(second, 1).payload.plannerTurn.operationSummary = [{ type: "LaunchUnknownAgent" }];
+    }],
+    ["extra-planner-turn-key", ({ second }) => {
+      plannerTurnEvent(second, 1).payload.plannerTurn.rawOperations = [];
+    }],
+    ["extra-renderer-payload-key", ({ second }) => {
+      plannerTurnEvent(second, 1).payload.rawOperations = [];
+    }],
+    ["stale-second-summary", ({ second }) => {
+      plannerTurnEvent(second, 1).payload.plannerTurn.operationSummary = structuredClone(firstPlannerOperationSummary);
+    }],
+    ["reopen-summary-mismatch", ({ reopened }) => {
+      plannerTurnEvent(reopened, 1).payload.plannerTurn.operationSummary = structuredClone(firstPlannerOperationSummary);
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    const fixture = {
+      first: authoritativePlannerState("run-planner-1", "First input", ["lane-1"]),
+      second: authoritativePlannerState("run-planner-2", "Second input", ["lane-1", "lane-2"]),
+    };
+    fixture.reopened = structuredClone(fixture.second);
+    mutate(fixture);
+    if (name !== "reopen-summary-mismatch") fixture.reopened = structuredClone(fixture.second);
+
+    const result = plannerTurnReplayVerification(fixture);
+
+    assert.equal(result.ok, false, name);
+  }
 });
 
 test("New Session UI acceptance waits for terminal checkpoint enrichment before restart", async () => {
@@ -841,7 +1010,7 @@ test("New Session UI acceptance keeps the verification script as fixed evidence"
     const secondHash = await fileSha256(verifyScript);
 
     assert.notEqual(firstHash, secondHash);
-    assert.match(source, /Do not modify scripts\/verify\.mjs/);
+    assert.match(source, /Do not modify the fixed verification or screenshot-capture contract scripts/);
     assert.match(source, /scripts\/capture-screenshot\.mjs/);
     assert.match(source, /Only src\/App\.jsx and src\/App\.css may be changed or committed/);
     assert.match(source, /verification-script-changed/);
@@ -876,13 +1045,451 @@ test("New Session UI acceptance guards both fixed validation scripts by checksum
   assert.match(source, /captureScriptHashUnchanged/);
 });
 
-test("New Session UI acceptance requires the explicit five-lane delivery chain", async () => {
+test("New Session UI acceptance exposes causal screenshot verification", async () => {
+  const acceptance = await import("./newSessionUiAcceptance.mjs");
+
+  assert.equal(typeof acceptance.verifyScreenshotCausalBinding, "function");
+});
+
+test("causal screenshot verification captures to a different path and binds identical PNG content", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(41);
+  const calls = [];
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: {
+        async runCapture(command, args, cwd, options) {
+          calls.push({ command, args, cwd, options });
+          assert.notEqual(args[1], fixture.lanePath);
+          await writeFile(args[1], fixture.lanePng);
+          return { code: 0, stdout: "captured", stderr: "" };
+        },
+      },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(result.failures, []);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].args[0], "scripts/capture-screenshot.mjs");
+    assert.equal(calls[0].args[1], result.independent.path);
+    assert.notEqual(result.independent.path, result.lane.path);
+    assert.equal(result.lane.path, fixture.lanePath);
+    assert.equal(result.lane.bytes, fixture.lanePng.length);
+    assert.equal(result.lane.validPng, true);
+    assert.equal(result.lane.unchanged, true);
+    assert.equal(typeof result.lane.identity.device, "string");
+    assert.equal(typeof result.lane.identity.inode, "string");
+    assert.equal(result.independent.validPng, true);
+    assert.equal(typeof result.independent.identity.device, "string");
+    assert.doesNotThrow(() => JSON.stringify(result));
+    assert.equal(result.contentIdentity, true);
+    assert.equal(result.lane.sha256, result.independent.sha256);
+    assert.equal(result.captureScript.unchanged, true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects a symlink to a valid PNG without following it", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(55);
+  const targetPath = join(fixture.projectRoot, "valid-target.png");
+  let captureCalls = 0;
+
+  try {
+    await writeFile(targetPath, fixture.lanePng);
+    await rm(fixture.lanePath);
+    await symlink(targetPath, fixture.lanePath);
+    const result = await verifyScreenshotCausalBinding({
+      demo: { async runCapture() { captureCalls += 1; return { code: 0, stdout: "", stderr: "" }; } },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(captureCalls, 0);
+    assert.equal(result.lane.exists, true);
+    assert.equal(result.lane.validPng, false);
+    assert.equal(result.lane.identity, null);
+    assert.equal(result.failures.includes("lane-screenshot-invalid-png"), true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects a sparse regular PNG over the byte cap", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(56);
+  let captureCalls = 0;
+  let handle;
+
+  try {
+    handle = await open(fixture.lanePath, "w");
+    await handle.truncate(maximumPngFileBytes + 1);
+    await handle.close();
+    handle = undefined;
+    const result = await verifyScreenshotCausalBinding({
+      demo: { async runCapture() { captureCalls += 1; return { code: 0, stdout: "", stderr: "" }; } },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(captureCalls, 0);
+    assert.equal(result.lane.exists, true);
+    assert.equal(result.lane.bytes, maximumPngFileBytes + 1);
+    assert.equal(result.lane.validPng, false);
+  } finally {
+    await handle?.close();
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects a FIFO without blocking", {
+  skip: process.platform === "win32" || spawnSync("sh", ["-c", "command -v mkfifo >/dev/null 2>&1"]).status !== 0,
+}, async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(57);
+  let captureCalls = 0;
+
+  try {
+    await rm(fixture.lanePath);
+    const created = spawnSync("mkfifo", [fixture.lanePath], { encoding: "utf8" });
+    assert.equal(created.status, 0, created.stderr);
+    const result = await verifyScreenshotCausalBinding({
+      demo: { async runCapture() { captureCalls += 1; return { code: 0, stdout: "", stderr: "" }; } },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(captureCalls, 0);
+    assert.equal(result.lane.exists, true);
+    assert.equal(result.lane.validPng, false);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification accepts a stable Electron-style RGBA PNG", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(58);
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: {
+        async runCapture(_command, args) {
+          await writeFile(args[1], fixture.lanePng);
+          return { code: 0, stdout: "captured", stderr: "" };
+        },
+      },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.lane.validPng, true);
+    assert.equal(result.independent.validPng, true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects a preexisting non-PNG before independent capture", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(42, Buffer.alloc(2_048, 42));
+  let captureCalls = 0;
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: { async runCapture() { captureCalls += 1; return { code: 0, stdout: "", stderr: "" }; } },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(captureCalls, 0);
+    assert.equal(result.lane.bytes, 2_048);
+    assert.equal(result.lane.validPng, false);
+    assert.equal(result.failures.includes("lane-screenshot-invalid-png"), true);
+    assert.equal(result.captureResult.skipped, true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects a PNG with a bad chunk CRC before capture", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const badCrcPng = replacePngChunk(validPng(51), "IDAT", (chunk) => {
+    const corrupted = Buffer.from(chunk);
+    corrupted[corrupted.length - 1] ^= 0xff;
+    return corrupted;
+  });
+  const fixture = await screenshotVerificationFixture(51, badCrcPng);
+  let captureCalls = 0;
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: { async runCapture() { captureCalls += 1; return { code: 0, stdout: "", stderr: "" }; } },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(captureCalls, 0);
+    assert.equal(result.lane.validPng, false);
+    assert.equal(result.failures.includes("lane-screenshot-invalid-png"), true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects invalid chunk framing and trailing PNG bytes", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const terminalIend = pngChunk("IEND", Buffer.alloc(0));
+  const corruptions = [
+    Buffer.concat([
+      pngSignature,
+      Buffer.from([0x00, 0x00, 0x08, 0x00]),
+      Buffer.from("IDAT", "ascii"),
+      Buffer.alloc(1_024, 0x61),
+      terminalIend,
+    ]),
+    Buffer.concat([validPng(52), Buffer.from("trailing-bytes"), terminalIend]),
+  ];
+
+  for (const [index, png] of corruptions.entries()) {
+    const fixture = await screenshotVerificationFixture(52 + index, png);
+    let captureCalls = 0;
+    try {
+      const result = await verifyScreenshotCausalBinding({
+        demo: { async runCapture() { captureCalls += 1; return { code: 0, stdout: "", stderr: "" }; } },
+        expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+        projectRoot: fixture.projectRoot,
+      });
+
+      assert.equal(result.ok, false, `corruption ${index}`);
+      assert.equal(captureCalls, 0, `corruption ${index}`);
+      assert.equal(result.lane.validPng, false, `corruption ${index}`);
+      assert.equal(result.failures.includes("lane-screenshot-invalid-png"), true, `corruption ${index}`);
+    } finally {
+      await rm(fixture.projectRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("causal screenshot verification rejects invalid independently captured scanline data", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(54);
+  let captureCalls = 0;
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: {
+        async runCapture(_command, args) {
+          captureCalls += 1;
+          await writeFile(args[1], validPng(54, { filter: 5 }));
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(captureCalls, 1);
+    assert.equal(result.lane.validPng, true);
+    assert.equal(result.independent.validPng, false);
+    assert.equal(result.failures.includes("independent-screenshot-invalid-png"), true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects deterministic content mismatch without changing lane evidence", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(43);
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: {
+        async runCapture(_command, args) {
+          await writeFile(args[1], validPng(44));
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.lane.unchanged, true);
+    assert.equal(result.contentIdentity, false);
+    assert.equal(result.failures.includes("screenshot-content-mismatch"), true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects lane mutation during independent capture", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(45);
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: {
+        async runCapture(_command, args) {
+          await writeFile(args[1], fixture.lanePng);
+          await writeFile(fixture.lanePath, validPng(46));
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.lane.unchanged, false);
+    assert.equal(result.failures.includes("lane-screenshot-mutated"), true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects same-byte lane path replacement with a different inode", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(59);
+  const replacementPath = join(fixture.projectRoot, ".devflow", "acceptance", "replacement.png");
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: {
+        async runCapture(_command, args) {
+          await writeFile(args[1], fixture.lanePng);
+          await writeFile(replacementPath, fixture.lanePng);
+          await rename(replacementPath, fixture.lanePath);
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.lane.unchanged, false);
+    assert.equal(result.lane.bytes, result.lane.afterBytes);
+    assert.equal(result.lane.sha256, result.lane.afterSha256);
+    assert.notEqual(result.lane.identity.inode, result.lane.afterIdentity.inode);
+    assert.equal(result.failures.includes("lane-screenshot-mutated"), true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification skips capture when the fixed helper hash changed", async () => {
+  const { verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(47);
+  let captureCalls = 0;
+
+  try {
+    const result = await verifyScreenshotCausalBinding({
+      demo: { async runCapture() { captureCalls += 1; return { code: 0, stdout: "", stderr: "" }; } },
+      expectedCaptureScriptHash: "0".repeat(64),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(captureCalls, 0);
+    assert.equal(result.captureScript.unchanged, false);
+    assert.equal(result.failures.includes("capture-script-changed"), true);
+    assert.equal(result.captureResult.skipped, true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects a preexisting independent artifact", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(48);
+  const independentPath = join(fixture.projectRoot, ".devflow", "acceptance", "react-app.verify.png");
+  let captureCalls = 0;
+
+  try {
+    await writeFile(independentPath, fixture.lanePng);
+    const result = await verifyScreenshotCausalBinding({
+      demo: { async runCapture() { captureCalls += 1; return { code: 0, stdout: "", stderr: "" }; } },
+      expectedCaptureScriptHash: await fileSha256(fixture.capturePath),
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(captureCalls, 0);
+    assert.equal(result.failures.includes("independent-screenshot-preexisting"), true);
+    assert.equal(result.captureResult.skipped, true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("causal screenshot verification rejects a helper modified during capture", async () => {
+  const { fileSha256, verifyScreenshotCausalBinding } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = await screenshotVerificationFixture(49);
+
+  try {
+    const expectedCaptureScriptHash = await fileSha256(fixture.capturePath);
+    const result = await verifyScreenshotCausalBinding({
+      demo: {
+        async runCapture(_command, args) {
+          await writeFile(args[1], fixture.lanePng);
+          await writeFile(fixture.capturePath, "// modified screenshot helper\n");
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      },
+      expectedCaptureScriptHash,
+      projectRoot: fixture.projectRoot,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.captureScript.unchanged, false);
+    assert.notEqual(result.captureScript.afterSha256, expectedCaptureScriptHash);
+    assert.equal(result.failures.includes("capture-script-changed"), true);
+  } finally {
+    await rm(fixture.projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("New Session UI acceptance requests a trusted four-lane policy pack before browser validation", async () => {
   const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
+  const firstGoal = source.slice(
+    source.indexOf("const requirement = ["),
+    source.indexOf("const followUpRequirement = ["),
+  );
+  const followUpGoal = source.slice(
+    source.indexOf("const followUpRequirement = ["),
+    source.indexOf("export async function runNewSessionUiAcceptance"),
+  );
 
   assert.match(source, /sessionTarget\?\.executionTarget === "current_branch"/);
-  assert.match(source, /implementation -> validation -> browser_validation -> review -> commit/);
-  assert.match(source, /do not emit StartImplementation, RequestValidation, RequestReview, or Commit operations/);
-  assert.match(source, /\.devflow\/acceptance\/react-app\.png/);
+  assert.match(firstGoal, /exactly these three workflow operations[^\n]*AnalyzeRequirement, DiscoverProject, then ProposeLanes/);
+  assert.match(firstGoal, /Do not emit any other operation/);
+  assert.match(firstGoal, /ProposeLanes[^\n]*omit[^\n]*lanes field/);
+  assert.match(firstGoal, /implementation -> validation -> review -> commit/);
+  assert.match(firstGoal, /Do not emit StartImplementation, RequestValidation, RequestReview, Commit, or DeclareEdge/);
+  assert.doesNotMatch(firstGoal, /browser_validation|commit lane|ProposeLanes[^\n]*lanes:/);
+  assert.match(followUpGoal, /exactly one WorkflowIntent operation[^\n]*ProposeLanes/);
+  assert.match(followUpGoal, /explicit lanes array containing exactly one unprivileged Codex browser-validation suggestion/);
+  assert.match(followUpGoal, /laneKind validation[^\n]*semanticSubtype browser_validation/);
+  assert.match(followUpGoal, /depend only on the completed commit lane/);
+  assert.match(followUpGoal, /require browser plus screenshot evidence/);
+  assert.match(followUpGoal, /Kernel's authoritative artifact contract provide the concrete screenshot declaration/);
+  assert.match(followUpGoal, /may write only its Kernel-declared screenshot artifact/i);
+  assert.match(followUpGoal, /must not modify tracked source or contract scripts/i);
+  assert.doesNotMatch(`${firstGoal}\n${followUpGoal}`, /(?:scripts[\\/])?capture-screenshot\.mjs/i);
+  assert.doesNotMatch(`${firstGoal}\n${followUpGoal}`, /\.devflow[\\/]acceptance[\\/]react-app(?:\.verify)?\.png/i);
+  assert.doesNotMatch(followUpGoal, /must not modify files/i);
   assert.match(source, /laneKindEvidence/);
   assert.match(source, /secondTurnLaneIds: replay\.secondTurnLaneIds/);
   assert.match(source, /requiredLaneEvidenceSummary\(session, authoritativeEvidence, secondTurnLaneIds\)/);
@@ -1128,7 +1735,6 @@ test("New Session UI acceptance omits renderer workspace evidence from terminal 
   assert.deepEqual(Object.keys(result.laneKindEvidence.lanes), [
     "implementation",
     "validation",
-    "browser_validation",
     "review",
     "commit",
   ]);
@@ -1660,16 +2266,12 @@ test("New Session UI acceptance validates production-shaped terminal evidence fo
   assert.deepEqual(Object.keys(result.lanes), [
     "implementation",
     "validation",
-    "browser_validation",
     "review",
     "commit",
   ]);
   assert.equal(Object.values(result.lanes).every((lane) => lane.ok), true);
   assert.equal(Object.values(result.lanes).every((lane) => lane.candidateCount === 1), true);
   assert.equal(result.lanes.validation.nodeId, "lane-validation");
-  assert.equal(result.lanes.browser_validation.nodeId, "lane-browser-validation");
-  assert.deepEqual(result.lanes.browser_validation.requiredEvidence, ["browser", "screenshot"]);
-  assert.deepEqual(result.lanes.browser_validation.artifacts, [".devflow/acceptance/react-app.png"]);
 });
 
 test("New Session UI acceptance rejects a duplicate required lane kind even when one candidate succeeded", async () => {
@@ -1771,9 +2373,11 @@ test("New Session UI acceptance strict oracle accepts opaque ids and arbitrary t
 
   assert.equal(result.ok, true);
   assert.deepEqual(result.failures, []);
-  assert.equal(result.nonPlannerNodeCount, 6);
-  assert.equal(result.initialNodeCount, 5);
+  assert.equal(result.nonPlannerNodeCount, 5);
+  assert.equal(result.initialNodeCount, 4);
   assert.equal(result.followUp.nodeId, fixture.secondTurnLaneIds[0]);
+  assert.deepEqual(result.followUp.requiredEvidence, ["browser", "screenshot"]);
+  assert.deepEqual(result.followUp.artifacts, [".devflow/acceptance/react-app.png"]);
   assert.equal(result.deliveryCheckpoints.ok, true);
   assert.equal(result.deliveryCheckpoints.deliveryCommitCount, 1);
 });
@@ -1873,8 +2477,8 @@ test("New Session UI acceptance excludes authorization decisions from executable
 
   const result = strictWorkflowAcceptanceSummary(fixture);
   assert.equal(result.ok, true);
-  assert.equal(result.nonPlannerNodeCount, 6);
-  assert.equal(result.initialNodeCount, 5);
+  assert.equal(result.nonPlannerNodeCount, 5);
+  assert.equal(result.initialNodeCount, 4);
 });
 
 test("New Session UI acceptance rejects an unresolved ordinary user decision", async () => {
@@ -1905,7 +2509,6 @@ test("New Session UI acceptance rejects an implementation commit followed by a c
   for (const nodeId of [
     strictNodeIds.implementation,
     strictNodeIds.validation,
-    strictNodeIds.browserValidation,
     strictNodeIds.review,
     strictNodeIds.commit,
   ]) {
@@ -1982,6 +2585,21 @@ test("New Session UI acceptance strict delivery gate rejects malformed checkpoin
   }
 });
 
+test("New Session UI acceptance binds follow-up checkpoints to its exact run, segment, evidence, and changeset", async () => {
+  const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
+
+  for (const phase of ["before", "after"]) {
+    for (const [name, mutate] of checkpointReferenceMutationCases(strictNodeIds.followUp, phase)) {
+      const fixture = strictWorkflowFixture();
+      mutate(fixture);
+      const result = strictWorkflowAcceptanceSummary(fixture);
+      assert.equal(result.ok, false, `${phase} ${name}`);
+      assert.equal(result.failures.includes("delivery-checkpoints-invalid"), true, `${phase} ${name}`);
+      assert.equal(result.deliveryCheckpoints.lanes.followUp.ok, false, `${phase} ${name}`);
+    }
+  }
+});
+
 test("New Session UI acceptance rejects a follow-up HEAD move", async () => {
   const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
   const fixture = strictWorkflowFixture();
@@ -2040,10 +2658,9 @@ test("New Session UI acceptance strict oracle rejects every required agent swap"
   const cases = [
     ["implementation", strictNodeIds.implementation, "hermes"],
     ["validation", strictNodeIds.validation, "hermes"],
-    ["browser validation", strictNodeIds.browserValidation, "hermes"],
     ["initial review", strictNodeIds.review, "codex"],
     ["commit", strictNodeIds.commit, "hermes"],
-    ["follow-up validation", strictNodeIds.followUp, "hermes"],
+    ["follow-up browser validation", strictNodeIds.followUp, "hermes"],
   ];
 
   for (const [name, nodeId, agent] of cases) {
@@ -2062,8 +2679,7 @@ test("New Session UI acceptance strict oracle rejects every dependency mutation"
   const chain = [
     [strictNodeIds.implementation, []],
     [strictNodeIds.validation, [strictNodeIds.implementation]],
-    [strictNodeIds.browserValidation, [strictNodeIds.validation]],
-    [strictNodeIds.review, [strictNodeIds.browserValidation]],
+    [strictNodeIds.review, [strictNodeIds.validation]],
     [strictNodeIds.commit, [strictNodeIds.review]],
     [strictNodeIds.followUp, [strictNodeIds.commit]],
   ];
@@ -2110,6 +2726,9 @@ test("New Session UI acceptance strict oracle rejects malformed follow-up struct
   const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
   const cases = [
     ["wrong kind", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).laneKind = "review"; }],
+    ["wrong subtype", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).semanticSubtype = "unit_checks"; }],
+    ["wrong sandbox", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).runtimePolicy.sandbox = "read-only"; }],
+    ["overprivileged", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).runtimePolicy.sandbox = "danger-full-access"; }],
     ["no dependency", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).context.dependencies = []; }],
     ["wrong dependency", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).context.dependencies = [strictNodeIds.review]; }],
     ["extra dependency", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).context.dependencies = [strictNodeIds.commit, strictNodeIds.review]; }],
@@ -2134,6 +2753,10 @@ test("New Session UI acceptance strict oracle requires independent follow-up ter
     ["nonzero", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].exitCode = 1; }],
     ["missing cli check", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].checks = []; }],
     ["wrong cli check", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].checks[0].name = "Hermes CLI exit"; }],
+    ["missing browser requirement", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).requiredEvidence = ["screenshot"]; }],
+    ["missing screenshot requirement", (fixture) => { fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).requiredEvidence = ["browser"]; }],
+    ["missing artifact check", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].checks = fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].checks.filter((check) => check.kind !== "artifact"); }],
+    ["wrong screenshot artifact", (fixture) => { fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].artifacts = [".devflow/acceptance/wrong.png"]; }],
     ["absent projection", (fixture) => { fixture.projection.segments = fixture.projection.segments.filter((segment) => segment.laneId !== strictNodeIds.followUp); }],
     ["duplicate projection", (fixture) => { fixture.projection.segments.push(structuredClone(fixture.projection.segments.at(-1))); }],
     ["missing projection evidence", (fixture) => { fixture.projection.evidence = fixture.projection.evidence.filter((evidence) => evidence.laneId !== strictNodeIds.followUp); }],
@@ -2181,7 +2804,7 @@ test("New Session UI acceptance rejects disconnected, mismatched, and duplicate-
 
 test("New Session UI acceptance fails when any required lane kind is missing", async () => {
   const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const requiredKinds = ["implementation", "validation", "browser_validation", "review", "commit"];
+  const requiredKinds = ["implementation", "validation", "review", "commit"];
 
   for (const kind of requiredKinds) {
     const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
@@ -2207,70 +2830,44 @@ test("New Session UI acceptance rejects lane evidence with a mismatched run id",
   assert.deepEqual(result.lanes.validation.failures, ["run-id-mismatch"]);
 });
 
-test("New Session UI acceptance requires browser declarations, artifact check, and fixed screenshot artifact", async () => {
-  const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
+test("New Session UI acceptance requires authoritative browser evidence on the follow-up lane", async () => {
+  const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
   const cases = [
-    ["requiredEvidence", (session, authoritativeEvidence) => {
-      const browserNode = requiredLaneFixtureNode(session, "browser_validation");
-      browserNode.semanticSubtype = "browser_validation";
-      browserNode.requiredEvidence = ["browser"];
+    ["requiredEvidence", (fixture) => {
+      fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).requiredEvidence = ["browser"];
     }, "missing-required-evidence:screenshot"],
-    ["artifact check", (session, authoritativeEvidence) => {
-      authoritativeEvidence.runEvidence["run-browser_validation"].checks =
-        authoritativeEvidence.runEvidence["run-browser_validation"].checks
+    ["artifact check", (fixture) => {
+      fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].checks =
+        fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].checks
         .filter((check) => check.kind !== "artifact");
     }, "missing-passed-artifact-check"],
-    ["artifact path", (session, authoritativeEvidence) => {
-      authoritativeEvidence.runEvidence["run-browser_validation"].artifacts = [];
+    ["artifact path", (fixture) => {
+      fixture.authoritativeEvidence.runEvidence[strictRunIds.followUp].artifacts = [];
     }, "missing-screenshot-artifact"],
   ];
 
   for (const [name, mutate, expectedFailure] of cases) {
-    const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
-    mutate(session, authoritativeEvidence);
-    const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
+    const fixture = strictWorkflowFixture();
+    mutate(fixture);
+    const result = strictWorkflowAcceptanceSummary(fixture);
     assert.equal(result.ok, false, name);
-    assert.equal(result.lanes.browser_validation.failures.includes(expectedFailure), true, name);
+    assert.equal(
+      result.followUp.failures.some((failure) => failure.endsWith(expectedFailure)),
+      true,
+      name,
+    );
   }
 });
 
-test("New Session UI acceptance does not classify ordinary validation as browser validation", async () => {
-  const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
+test("New Session UI acceptance does not infer follow-up browser validation from evidence alone", async () => {
+  const { strictWorkflowAcceptanceSummary } = await import("./newSessionUiAcceptance.mjs");
+  const fixture = strictWorkflowFixture();
+  delete fixture.session.nodes.find((node) => node.id === strictNodeIds.followUp).semanticSubtype;
 
-  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
+  const result = strictWorkflowAcceptanceSummary(fixture);
 
-  assert.equal(result.lanes.validation.nodeId, "lane-validation");
-  assert.equal(result.lanes.validation.candidateCount, 1);
-  assert.equal(result.lanes.browser_validation.nodeId, "lane-browser-validation");
-  assert.equal(result.lanes.browser_validation.candidateCount, 1);
-});
-
-test("New Session UI acceptance does not infer browser validation from evidence when subtype is absent", async () => {
-  const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
-  delete requiredLaneFixtureNode(session, "browser_validation").semanticSubtype;
-
-  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
-
-  assert.deepEqual(result.lanes.browser_validation.failures, ["missing-lane"]);
-  assert.equal(result.lanes.browser_validation.candidateCount, 0);
-  assert.equal(result.lanes.validation.candidateCount, 2);
-});
-
-test("New Session UI acceptance lets browser subtype override canonical validation lane kind", async () => {
-  const { requiredLaneEvidenceSummary } = await import("./newSessionUiAcceptance.mjs");
-  const { session, authoritativeEvidence } = completeRequiredLaneEvidenceFixture();
-  const browserNode = requiredLaneFixtureNode(session, "browser_validation");
-  browserNode.semanticSubtype = "browser_validation";
-  browserNode.requiredEvidence = ["browser"];
-
-  const result = requiredLaneEvidenceSummary(session, authoritativeEvidence);
-
-  assert.equal(result.lanes.browser_validation.nodeId, "lane-browser-validation");
-  assert.equal(result.lanes.browser_validation.candidateCount, 1);
-  assert.equal(result.lanes.validation.candidateCount, 1);
-  assert.equal(result.lanes.browser_validation.failures.includes("missing-required-evidence:screenshot"), true);
+  assert.equal(result.ok, false);
+  assert.equal(result.failures.includes("follow-up-invalid"), true);
 });
 
 test("New Session UI acceptance rejects review and commit lanes without their own terminal evidence", async () => {
@@ -3063,14 +3660,35 @@ test("New Session UI acceptance is exposed as an explicit desktop package script
   assert.equal(packageJson.scripts["acceptance:new-session"], "pnpm run acceptance:new-session-ui");
 });
 
+const firstPlannerOperationSummary = [
+  { type: "AnalyzeRequirement" },
+  { type: "DiscoverProject" },
+  { type: "ProposeLanes", lanesMode: "omitted" },
+];
+const secondPlannerOperationSummary = [
+  { type: "ProposeLanes", lanesMode: "explicit" },
+];
+
 function authoritativePlannerState(runId, input, laneIds) {
   const plannerNodeId = "planner-node-1";
   const plannerTurns = input === "Second input"
     ? [
-        { runId: "run-planner-1", segmentId: "segment-planner-1" },
-        { runId, segmentId: "segment-planner-2" },
+        {
+          runId: "run-planner-1",
+          segmentId: "segment-planner-1",
+          operationSummary: firstPlannerOperationSummary,
+        },
+        {
+          runId,
+          segmentId: "segment-planner-2",
+          operationSummary: secondPlannerOperationSummary,
+        },
       ]
-    : [{ runId, segmentId: "segment-planner-1" }];
+    : [{
+        runId,
+        segmentId: "segment-planner-1",
+        operationSummary: firstPlannerOperationSummary,
+      }];
   const canvasSession = {
     id: "session-1",
     kind: "canvas",
@@ -3131,19 +3749,22 @@ function strictWorkflowFixture() {
   const nodeSpecs = [
     [strictNodeIds.implementation, strictRunIds.implementation, "implementation", "frontend_delivery", "codex", []],
     [strictNodeIds.validation, strictRunIds.validation, "validation", "unit_checks", "codex", [strictNodeIds.implementation]],
-    [strictNodeIds.browserValidation, strictRunIds.browserValidation, "validation", "browser_validation", "codex", [strictNodeIds.validation]],
-    [strictNodeIds.review, strictRunIds.review, "review", "evidence_review", "hermes", [strictNodeIds.browserValidation]],
+    [strictNodeIds.review, strictRunIds.review, "review", "evidence_review", "hermes", [strictNodeIds.validation]],
     [strictNodeIds.commit, strictRunIds.commit, "commit", "git_commit", "codex", [strictNodeIds.review]],
-    [strictNodeIds.followUp, strictRunIds.followUp, "validation", "anything", "codex", [strictNodeIds.commit]],
+    [strictNodeIds.followUp, strictRunIds.followUp, "validation", "browser_validation", "codex", [strictNodeIds.commit]],
   ];
   const nodes = nodeSpecs.map(([id, runId, laneKind, semanticSubtype, agent, dependencies], index) => ({
     ...completedOpaqueNode({ id, runId, laneKind, semanticSubtype, agent, dependencies }),
     title: `Random title ${91 - index}`,
-    requiredEvidence: id === strictNodeIds.browserValidation ? ["browser", "screenshot"] : [],
+    requiredEvidence: id === strictNodeIds.followUp ? ["browser", "screenshot"] : [],
+    runtimePolicy: {
+      executable: true,
+      sandbox: "workspace-write",
+    },
   }));
   const runEvidence = Object.fromEntries(nodes.map((node) => [
     node.runId,
-    successfulOpaqueEvidence(node.runId, node.agent, node.id === strictNodeIds.browserValidation),
+    successfulOpaqueEvidence(node.runId, node.agent, node.id === strictNodeIds.followUp),
   ]));
   const projection = {
     segments: nodes.map((node) => ({
@@ -3160,7 +3781,7 @@ function strictWorkflowFixture() {
       kind: "run-exit",
       status: "passed",
       checks: [`run-exit:${node.agent === "hermes" ? "Hermes" : "Codex"} CLI exit:passed`],
-      artifacts: node.id === strictNodeIds.browserValidation ? [".devflow/acceptance/react-app.png"] : [],
+      artifacts: node.id === strictNodeIds.followUp ? [".devflow/acceptance/react-app.png"] : [],
       runEvidence: structuredClone(runEvidence[node.runId]),
     })),
     changesetEvidence: nodes.flatMap((node) => [
@@ -3459,29 +4080,27 @@ function successfulOpaqueEvidence(runId, agent, browser = false) {
 }
 
 function completeRequiredLaneEvidenceFixture() {
-  const kinds = ["implementation", "validation", "browser_validation", "review", "commit"];
+  const kinds = ["implementation", "validation", "review", "commit"];
   const semanticSubtypes = {
     implementation: "frontend_implementation",
     validation: "regression_check",
-    browser_validation: "browser_validation",
     review: "evidence_review",
     commit: "git_commit",
   };
-  const nodeIds = kinds.map((kind) => kind === "browser_validation" ? "lane-browser-validation" : `lane-${kind}`);
+  const nodeIds = kinds.map((kind) => `lane-${kind}`);
   const nodes = kinds.map((kind, index) => {
     const agent = kind === "review" ? "hermes" : "codex";
-    const browserValidation = kind === "browser_validation";
     return {
       id: nodeIds[index],
       runId: `run-${kind}`,
       agent,
       title: kind,
       status: "completed",
-      laneKind: browserValidation ? "validation" : kind,
+      laneKind: kind,
       semanticSubtype: semanticSubtypes[kind],
-      requiredEvidence: browserValidation ? ["browser", "screenshot"] : [],
+      requiredEvidence: [],
       display: {
-        meta: [browserValidation ? "validation" : kind, `lane-${kind}`, "flow-kernel"],
+        meta: [kind, `lane-${kind}`, "flow-kernel"],
       },
       context: { dependencies: index === 0 ? [] : [nodeIds[index - 1]] },
     };
@@ -3497,13 +4116,8 @@ function completeRequiredLaneEvidenceFixture() {
         name: node.agent === "hermes" ? "Hermes CLI exit" : "Codex CLI exit",
         status: "passed",
       },
-      ...(node.runId === "run-browser_validation"
-        ? [{ kind: "artifact", name: "Expected artifacts", status: "passed" }]
-        : []),
     ],
-    artifacts: node.runId === "run-browser_validation"
-      ? [".devflow/acceptance/react-app.png"]
-      : [],
+    artifacts: [],
     review: null,
     errorReason: null,
     cancelReason: null,
@@ -3569,7 +4183,7 @@ function safeWorkflowEvent(seq, kind, laneId, causationId) {
   };
 }
 
-function plannerTurnEvents(seq, laneId, { runId, segmentId }) {
+function plannerTurnEvents(seq, laneId, { runId, segmentId, operationSummary }) {
   return [{
     seq,
     kind: "workflow.planner_intent.reconciled",
@@ -3586,9 +4200,16 @@ function plannerTurnEvents(seq, laneId, { runId, segmentId }) {
         exitCode: 0,
         hermesCliExitPassed: true,
         intentDisposition: "applied",
+        operationSummary: structuredClone(operationSummary),
       },
     },
   }];
+}
+
+function plannerTurnEvent(state, index) {
+  return state.events
+    .filter((event) => event.kind === "workflow.planner_intent.reconciled")
+    .sort((left, right) => left.seq - right.seq)[index];
 }
 
 async function waitForCondition(predicate, timeoutMs = 2_000) {

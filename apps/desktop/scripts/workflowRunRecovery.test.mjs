@@ -1342,6 +1342,7 @@ test("getWorkflowStore converges an invalid SQLite planner candidate without Age
       agentKind: "hermes",
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
     });
     firstHarness.closeWorkflowStores();
     firstHarness = undefined;
@@ -1419,6 +1420,7 @@ test("getWorkflowStore invalidates a cross-run intentId reuse without AgentBridg
     store.completePlannerIntentReconciliation(first, {
       disposition: "applied",
       intentId,
+      operationSummary: [{ type: "AnalyzeRequirement" }],
     }, firstCompletedAt);
 
     const secondIntent = {
@@ -1497,6 +1499,7 @@ test("getWorkflowStore invalidates a cross-run intentId reuse without AgentBridg
       disposition: "invalid",
       intentId,
       reasonCode: "intent_id_reused",
+      operationSummary: [{ type: "ProposeLanes", lanesMode: "explicit" }],
     });
     assert.equal(persistedSecond?.status, "succeeded");
     assert.deepEqual(persistedSecond?.evidence, secondEvidence);

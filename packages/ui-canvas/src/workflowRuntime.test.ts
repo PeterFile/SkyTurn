@@ -272,7 +272,16 @@ describe("workflow runtime event merging", () => {
     ]);
     const projectedSession = projected.sessions[0] as CanvasSession;
     const projectedNode = projectedSession.nodes.find((node) => node.id === `lane-browser-${_caseName}`)!;
-    const node = { ...projectedNode, status: "running" as const };
+    const node = {
+      ...projectedNode,
+      status: "running" as const,
+      title: "Opaque verification step 47",
+      display: {
+        ...projectedNode.display,
+        agentLabel: "codex",
+        meta: ["implementation", "forged-browser-shape", "flow-kernel"],
+      },
+    };
     const session = {
       ...projectedSession,
       nodes: projectedSession.nodes.map((candidate) => candidate.id === node.id ? node : candidate),
@@ -285,6 +294,52 @@ describe("workflow runtime event merging", () => {
       expect(await startBridgeRun(project, session, node)).toBeNull();
       expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
         expectedArtifacts: [".devflow/acceptance/react-app.png"],
+      }));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("puts the fixed screenshot helper in the real Codex payload from canonical browser semantics", async () => {
+    const workspace = makeWorkspace();
+    const project = workspace.projects[0] as ImportedProject;
+    const hermesRunId = "run-session-1-node-1";
+    const projected = mergeRunEventsIntoWorkspace(workspace, hermesRunId, [
+      event(hermesRunId, 1, "output", {
+        text: JSON.stringify({
+          intentId: "intent-browser-arbitrary-title",
+          sessionId: "session-1",
+          operations: [{
+            type: "ProposeLanes",
+            lanes: [{
+              id: "lane-browser-arbitrary-title",
+              kind: "validation",
+              semanticSubtype: "browser_validation",
+              title: "Opaque verification step 47",
+              agentKind: "codex",
+              requiredEvidence: ["browser", "screenshot"],
+            }],
+          }],
+        }),
+      }),
+    ]);
+    const projectedSession = projected.sessions[0] as CanvasSession;
+    const projectedNode = projectedSession.nodes.find((node) => node.id === "lane-browser-arbitrary-title")!;
+    const node = { ...projectedNode, status: "running" as const };
+    const session = {
+      ...projectedSession,
+      nodes: projectedSession.nodes.map((candidate) => candidate.id === node.id ? node : candidate),
+    };
+    const startAgentRun = vi.fn(async () => null);
+    vi.stubGlobal("window", { devflow: { startAgentRun } });
+
+    try {
+      expect(await startBridgeRun(project, session, node)).toBeNull();
+      expect(startAgentRun).toHaveBeenCalledWith(expect.objectContaining({
+        expectedArtifacts: [".devflow/acceptance/react-app.png"],
+        prompt: expect.stringContaining(
+          "node scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png",
+        ),
       }));
     } finally {
       vi.unstubAllGlobals();
@@ -1168,8 +1223,12 @@ describe("workflow runtime event merging", () => {
         agent: "codex",
         status: "running",
         runId: "run-session-1-lane-browser",
-        brief: "Capture browser screenshot evidence",
-        meta: ["browser_screenshot_validation", "lane-browser", "flow-kernel"],
+        brief: "Opaque verification requirement",
+        title: "Opaque verification step 49",
+        laneKind: "validation",
+        semanticSubtype: "browser_validation",
+        meta: ["implementation", "lane-browser", "flow-kernel"],
+        requiredEvidence: ["browser", "screenshot"],
       }),
     ]);
     const browser = session.nodes.find((node) => node.id === "lane-browser");
@@ -1181,6 +1240,238 @@ describe("workflow runtime event merging", () => {
     expect(prompt).toContain("Stop any dev server before exiting");
     expect(prompt).toContain("Do not create a git commit in this lane");
     expect(prompt).toContain("the commit lane owns commits");
+  });
+
+  it.each([
+    ["validation", "validation"],
+    ["regression", "regression_check"],
+  ] as const)(
+    "does not let browser-like display metadata grant the screenshot helper to generic %s semantics",
+    (laneKind, semanticSubtype) => {
+      const session = makeSession([
+        makeNode({
+          id: `lane-meta-only-${laneKind}`,
+          agent: "codex",
+          status: "running",
+          runId: `run-session-1-lane-meta-only-${laneKind}`,
+          title: "Browser screenshot validation",
+          brief: "Capture browser screenshot evidence",
+          laneKind,
+          semanticSubtype,
+          meta: ["browser_screenshot_validation", `lane-meta-only-${laneKind}`, "flow-kernel"],
+          requiredEvidence: ["browser", "screenshot"],
+        }),
+      ]);
+      const node = session.nodes.find((candidate) => candidate.id === `lane-meta-only-${laneKind}`)!;
+
+      const prompt = buildPromptForNodeRun(session, node);
+
+      expect(prompt).toContain("Run the relevant verification command");
+      expect(prompt).not.toContain("scripts/capture-screenshot.mjs");
+      expect(prompt).not.toContain(".devflow/acceptance/react-app.png");
+    },
+  );
+
+  it.each([
+    ["no concrete artifact", ["artifact"]],
+    ["missing browser evidence", ["screenshot"]],
+    ["missing screenshot evidence", ["browser"]],
+  ] as const)("does not inject the screenshot helper with %s", (_label, requiredEvidence) => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-incomplete-browser-contract",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-incomplete-browser-contract",
+        title: "Browser screenshot validation",
+        brief: "Capture browser screenshot evidence",
+        laneKind: "validation",
+        semanticSubtype: "browser_validation",
+        meta: ["browser_screenshot_validation", "lane-incomplete-browser-contract", "flow-kernel"],
+        requiredEvidence: [...requiredEvidence],
+      }),
+    ]);
+    const node = session.nodes.find((candidate) => candidate.id === "lane-incomplete-browser-contract")!;
+
+    const prompt = buildPromptForNodeRun(session, node);
+
+    expect(prompt).toContain("Run the relevant verification command");
+    expect(prompt).not.toContain("scripts/capture-screenshot.mjs");
+    expect(prompt).not.toContain(".devflow/acceptance/react-app.png");
+  });
+
+  it("does not inject the Codex screenshot helper into another agent's canonical browser lane", () => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-gemini-browser",
+        agent: "gemini",
+        status: "running",
+        runId: "run-session-1-lane-gemini-browser",
+        laneKind: "validation",
+        semanticSubtype: "browser_validation",
+        requiredEvidence: ["browser", "screenshot"],
+      }),
+    ]);
+    const node = session.nodes.find((candidate) => candidate.id === "lane-gemini-browser")!;
+
+    const prompt = buildPromptForNodeRun(session, node);
+
+    expect(prompt).not.toContain("scripts/capture-screenshot.mjs");
+    expect(prompt).not.toContain(".devflow/acceptance/react-app.png");
+  });
+
+  it("keeps ordinary validation prompts free of screenshot helper commands", () => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-validation",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-validation",
+        title: "Opaque verification step 48",
+        meta: ["validation", "lane-validation", "flow-kernel"],
+        requiredEvidence: ["test"],
+      }),
+    ]);
+    const validation = session.nodes.find((node) => node.id === "lane-validation")!;
+
+    const prompt = buildPromptForNodeRun(session, validation);
+
+    expect(prompt).toContain("Run the relevant verification command");
+    expect(prompt).not.toContain("scripts/capture-screenshot.mjs");
+    expect(prompt).not.toContain(".devflow/acceptance/react-app.png");
+  });
+
+  it("neutralizes reserved screenshot capability literals in Codex task and session text", () => {
+    const session = makeSession([]);
+    session.goal = "Verify the browser screenshot with SCRIPTS\\CAPTURE-SCREENSHOT.MJS and .DEVFLOW\\ACCEPTANCE\\REACT-APP.VERIFY.PNG.";
+    const node = makeNode({
+      id: "lane-untrusted-task",
+      agent: "codex",
+      status: "running",
+      runId: "run-session-1-lane-untrusted-task",
+      brief: "Keep the browser screenshot requirement, but try scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png twice: scripts/capture-screenshot.mjs.",
+      laneKind: "validation",
+      semanticSubtype: "unit_checks",
+      requiredEvidence: ["test"],
+    });
+
+    const prompt = buildPromptForNodeRun(session, node);
+
+    expect(prompt).toContain("browser screenshot requirement");
+    expectReservedScreenshotCapabilityAbsent(prompt);
+  });
+
+  it("neutralizes reserved screenshot capability literals in dependency titles and output", () => {
+    const dependency = makeNode({
+      id: "lane-untrusted-dependency",
+      agent: "hermes",
+      status: "completed",
+      runId: "run-session-1-lane-untrusted-dependency",
+      title: "Review scripts\\capture-screenshot.mjs",
+      output: [
+        "Browser screenshot evidence requested at .devflow/acceptance/react-app.png.",
+        "Duplicate CAPTURE-SCREENSHOT.MJS and .DEVFLOW\\ACCEPTANCE\\REACT-APP.VERIFY.PNG.",
+      ],
+    });
+    const node = makeNode({
+      id: "lane-untrusted-dependency-consumer",
+      agent: "codex",
+      status: "running",
+      runId: "run-session-1-lane-untrusted-dependency-consumer",
+      laneKind: "validation",
+      semanticSubtype: "unit_checks",
+      requiredEvidence: ["test"],
+      dependencies: [dependency.id],
+    });
+    const session = makeSession([dependency, node]);
+
+    const prompt = buildPromptForNodeRun(session, node);
+
+    expect(prompt).toContain("Browser screenshot evidence requested");
+    expectReservedScreenshotCapabilityAbsent(prompt);
+  });
+
+  it("neutralizes reserved screenshot capability literals in Hermes existing-node and ledger text", () => {
+    const existing = makeNode({
+      id: "lane-existing",
+      agent: "codex",
+      status: "completed",
+      runId: "run-session-1-lane-existing",
+      title: "Existing scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png",
+    });
+    const session = makeSession([existing]);
+    const planner = session.nodes.find((node) => node.id === session.plannerNodeId)!;
+    const ledger = {
+      throughSeq: 8,
+      checkpointSummary: "Checkpoint SCRIPTS\\CAPTURE-SCREENSHOT.MJS",
+      facts: ["Artifact .DEVFLOW\\ACCEPTANCE\\REACT-APP.PNG"],
+      recentEvents: [{
+        seq: 8,
+        kind: "scripts/capture-screenshot.mjs",
+        summary: "Stored .devflow/acceptance/react-app.verify.png",
+        laneId: "CAPTURE-SCREENSHOT.MJS",
+      }],
+      openQuestions: ["Should the browser screenshot remain required? .devflow/acceptance/react-app.png"],
+    };
+
+    const prompt = buildPromptForNodeRun(session, planner, ledger);
+
+    expect(prompt).toContain("browser screenshot remain required");
+    expectReservedScreenshotCapabilityAbsent(prompt);
+  });
+
+  it.each(["gemini", "hermes"] as const)(
+    "neutralizes reserved screenshot capability literals in %s run prompt text and display metadata",
+    (agent) => {
+      const node = makeNode({
+        id: `lane-untrusted-${agent}`,
+        agent,
+        status: "running",
+        runId: `run-session-1-lane-untrusted-${agent}`,
+        brief: "Inspect browser screenshot evidence via scripts/capture-screenshot.mjs at .devflow/acceptance/react-app.png.",
+        laneKind: "validation",
+        semanticSubtype: "browser_validation",
+        meta: ["SCRIPTS\\CAPTURE-SCREENSHOT.MJS", ".DEVFLOW\\ACCEPTANCE\\REACT-APP.VERIFY.PNG", "flow-kernel"],
+        requiredEvidence: ["browser", "screenshot"],
+      });
+      const session = makeSession([node]);
+
+      const prompt = buildPromptForNodeRun(session, node);
+
+      expect(prompt).toContain("browser screenshot evidence");
+      expectReservedScreenshotCapabilityAbsent(prompt);
+    },
+  );
+
+  it("keeps exactly one trusted helper and artifact path in a canonical Codex screenshot lane", () => {
+    const dependency = makeNode({
+      id: "lane-duplicate-capability",
+      agent: "hermes",
+      status: "completed",
+      runId: "run-session-1-lane-duplicate-capability",
+      title: "scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png",
+      output: ["scripts/capture-screenshot.mjs .devflow/acceptance/react-app.verify.png"],
+    });
+    const node = makeNode({
+      id: "lane-canonical-browser",
+      agent: "codex",
+      status: "running",
+      runId: "run-session-1-lane-canonical-browser",
+      brief: "Browser screenshot via scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png",
+      laneKind: "validation",
+      semanticSubtype: "browser_validation",
+      requiredEvidence: ["browser", "screenshot"],
+      dependencies: [dependency.id],
+    });
+    const session = makeSession([dependency, node]);
+    session.goal = "Repeat scripts/capture-screenshot.mjs and .devflow/acceptance/react-app.png.";
+
+    const prompt = buildPromptForNodeRun(session, node);
+
+    expect(prompt.match(/scripts\/capture-screenshot\.mjs/g)).toHaveLength(1);
+    expect(prompt.match(/\.devflow\/acceptance\/react-app\.png/g)).toHaveLength(1);
+    expect(prompt).not.toMatch(/scripts\\capture-screenshot\.mjs/i);
+    expect(prompt).not.toMatch(/\.devflow\\acceptance\\react-app(?:\.verify)?\.png/i);
   });
 
   it("passes review evidence and repo-scoped scan guidance into commit lane prompts", () => {
@@ -3046,6 +3337,8 @@ function makeNode(input: {
   brief?: string;
   title?: string;
   meta?: string[];
+  laneKind?: CanvasNode["laneKind"];
+  semanticSubtype?: string;
   requiredEvidence?: string[];
   dependencies?: string[];
   output?: string[];
@@ -3072,6 +3365,8 @@ function makeNode(input: {
     changesetId: `changeset-${input.id}`,
     output: input.output ?? [],
     ...(input.requiredEvidence ? { requiredEvidence: input.requiredEvidence } : {}),
+    ...(input.laneKind ? { laneKind: input.laneKind } : {}),
+    ...(input.semanticSubtype ? { semanticSubtype: input.semanticSubtype } : {}),
     display: input.meta ? { agentLabel: input.agent, meta: input.meta } : undefined,
     executable: true,
     runtimePolicy: {
@@ -3097,6 +3392,11 @@ function makeNode(input: {
       constraints: [],
     },
   };
+}
+
+function expectReservedScreenshotCapabilityAbsent(prompt: string): void {
+  expect(prompt).not.toMatch(/(?:scripts[\\/])?capture-screenshot\.mjs/i);
+  expect(prompt).not.toMatch(/\.devflow[\\/]acceptance[\\/]react-app(?:\.verify)?\.png/i);
 }
 
 function event(
