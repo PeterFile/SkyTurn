@@ -15,6 +15,10 @@ import type {
   CandidateDeliveryCommitPreparation,
 } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
 import type {
+  PlannerIntentDisposition,
+  PlannerIntentOperationSummary,
+} from "@skyturn/persistence/workflow-store" with { "resolution-mode": "import" };
+import type {
   AgentDescriptor,
   CanvasSession,
   PlanBootstrapRequest,
@@ -30,6 +34,10 @@ import type {
   WorkflowLedgerSummary,
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core" with { "resolution-mode": "import" };
+import type {
+  WorkflowIntentOperation,
+  WorkflowIntentOperationType,
+} from "@skyturn/workflow-kernel" with { "resolution-mode": "import" };
 import {
   WORKFLOW_EVENT_CHANNEL,
   WORKFLOW_IPC_PROTOCOL_VERSION,
@@ -782,7 +790,11 @@ interface WorkflowStoreHost {
     output: string;
     completedAt: string;
   };
-  completePlannerIntentReconciliation(segment: unknown, disposition: unknown, now: string): unknown;
+  completePlannerIntentReconciliation(
+    segment: unknown,
+    disposition: PlannerIntentDisposition & { operationSummary: PlannerIntentOperationSummary },
+    now: string,
+  ): unknown;
   recordPlannerIntentReconciled(segment: unknown, now: string): unknown;
   listPendingRunCheckpointEnrichments(): Array<{
     sessionId: string;
@@ -3098,6 +3110,16 @@ async function reconcilePendingPlannerWorkflowIntent(
     store.completePlannerIntentReconciliation(candidate, {
       disposition: "invalid",
       reasonCode: "parse_invalid",
+      operationSummary: [],
+    }, facts.completedAt);
+    return false;
+  }
+  const operationSummary = summarizePlannerIntentOperations(parsed.intent.operations);
+  if (!operationSummary) {
+    store.completePlannerIntentReconciliation(candidate, {
+      disposition: "invalid",
+      reasonCode: "parse_invalid",
+      operationSummary: [],
     }, facts.completedAt);
     return false;
   }
@@ -3106,6 +3128,7 @@ async function reconcilePendingPlannerWorkflowIntent(
       disposition: "invalid",
       intentId: parsed.intent.intentId,
       reasonCode: "session_mismatch",
+      operationSummary,
     }, facts.completedAt);
     return false;
   }
@@ -3122,6 +3145,7 @@ async function reconcilePendingPlannerWorkflowIntent(
       disposition: "invalid",
       intentId: parsed.intent.intentId,
       reasonCode: "intent_id_reused",
+      operationSummary,
     }, facts.completedAt);
     return false;
   }
@@ -3130,6 +3154,7 @@ async function reconcilePendingPlannerWorkflowIntent(
       disposition: "rejected",
       intentId: parsed.intent.intentId,
       reasonCode: "policy_rejected",
+      operationSummary,
     }, facts.completedAt);
     return false;
   }
@@ -3138,8 +3163,21 @@ async function reconcilePendingPlannerWorkflowIntent(
   store.completePlannerIntentReconciliation(candidate, {
     disposition: "applied",
     intentId: parsed.intent.intentId,
+    operationSummary,
   }, facts.completedAt);
   return true;
+}
+
+function summarizePlannerIntentOperations(
+  operations: readonly WorkflowIntentOperation[],
+): PlannerIntentOperationSummary | null {
+  if (operations.length > 64) return null;
+  return operations.map((operation) => operation.type === "ProposeLanes"
+    ? {
+        type: "ProposeLanes",
+        lanesMode: Object.prototype.hasOwnProperty.call(operation, "lanes") ? "explicit" : "omitted",
+      }
+    : { type: operation.type });
 }
 
 async function advanceWorkflowSession(
@@ -4288,6 +4326,7 @@ function plannerTurnFactsForRenderer(
   hermesCliExitPassed: boolean;
   intentDisposition: "applied" | "invalid" | "rejected";
   intentReasonCode?: "parse_invalid" | "session_mismatch" | "intent_id_reused" | "policy_rejected";
+  operationSummary: PlannerIntentOperationSummary;
 } | null {
   if (
     event.kind !== "workflow.planner_intent.reconciled" ||
@@ -4341,6 +4380,8 @@ function plannerTurnFactsForRenderer(
     intentReasonCode === "policy_rejected"
     ? intentReasonCode
     : undefined;
+  const operationSummary = plannerIntentOperationSummaryForRenderer(event.payload.operationSummary);
+  if (!operationSummary) return null;
   return {
     runId: segment.runId,
     segmentId: segment.segmentId,
@@ -4349,7 +4390,48 @@ function plannerTurnFactsForRenderer(
     hermesCliExitPassed,
     intentDisposition,
     ...(safeIntentReasonCode ? { intentReasonCode: safeIntentReasonCode } : {}),
+    operationSummary,
   };
+}
+
+function plannerIntentOperationSummaryForRenderer(value: unknown): PlannerIntentOperationSummary | null {
+  if (!Array.isArray(value) || value.length > 64) return null;
+  const operationTypes = new Set<WorkflowIntentOperationType>([
+    "AnalyzeRequirement",
+    "DiscoverProject",
+    "ProposeLanes",
+    "SplitLane",
+    "JoinLanes",
+    "StartImplementation",
+    "RequestValidation",
+    "RequestReview",
+    "RequestUserDecision",
+    "ReplanFromEvidence",
+    "Commit",
+    "DeclareEdge",
+  ]);
+  const summary: PlannerIntentOperationSummary = [];
+  for (const entry of value) {
+    if (
+      !isRecord(entry) ||
+      typeof entry.type !== "string" ||
+      !operationTypes.has(entry.type as WorkflowIntentOperationType)
+    ) return null;
+    const keys = Object.keys(entry).sort().join(",");
+    if (entry.type === "ProposeLanes") {
+      if (
+        keys !== "lanesMode,type" ||
+        (entry.lanesMode !== "omitted" && entry.lanesMode !== "explicit")
+      ) return null;
+      summary.push({ type: "ProposeLanes", lanesMode: entry.lanesMode });
+      continue;
+    }
+    if (keys !== "type") return null;
+    summary.push({
+      type: entry.type as Exclude<WorkflowIntentOperationType, "ProposeLanes">,
+    });
+  }
+  return summary;
 }
 
 function deliveryLifecycleFactsForRenderer(event: Record<string, unknown> & { kind: string }): Record<string, unknown> | null {

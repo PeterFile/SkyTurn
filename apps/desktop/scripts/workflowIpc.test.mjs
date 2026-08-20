@@ -1380,6 +1380,61 @@ test("workflow events expose renderer-safe delivery lifecycle facts without raw 
   assert.doesNotMatch(deliveryFactsHelper, /worktreePath|command|commands|stdout|stderr|rawStdout/);
 });
 
+test("planner turn renderer facts expose only a strict operation summary bound to terminal evidence", async () => {
+  const { redactWorkflowEventForRenderer } = await loadMainDeliveryRendererHelpers();
+  const operationSummary = [
+    { type: "AnalyzeRequirement" },
+    { type: "DiscoverProject" },
+    { type: "ProposeLanes", lanesMode: "omitted" },
+  ];
+  const event = plannerReconciliationRendererEvent(operationSummary);
+  const plannerSegments = plannerRendererSegments();
+
+  const projected = toPlain(redactWorkflowEventForRenderer(event, plannerSegments));
+
+  assert.deepEqual(projected.payload, {
+    redacted: true,
+    summary: "Workflow event recorded.",
+    plannerTurn: {
+      runId: "run-planner-1",
+      segmentId: "segment-planner-1",
+      status: "succeeded",
+      exitCode: 0,
+      hermesCliExitPassed: true,
+      intentDisposition: "applied",
+      operationSummary,
+    },
+  });
+  assert.doesNotMatch(JSON.stringify(projected.payload), /requirement text|project profile|lane payload|raw output/);
+});
+
+test("planner turn renderer facts reject missing, malformed, unknown, extra-key, and unbounded operation summaries", async () => {
+  const { redactWorkflowEventForRenderer } = await loadMainDeliveryRendererHelpers();
+  const cases = [
+    ["missing", undefined],
+    ["not-array", { type: "AnalyzeRequirement" }],
+    ["unknown-operation", [{ type: "LaunchUnknownAgent" }]],
+    ["extra-operation-key", [{ type: "AnalyzeRequirement", requirement: "private" }]],
+    ["missing-lanes-mode", [{ type: "ProposeLanes" }]],
+    ["invalid-lanes-mode", [{ type: "ProposeLanes", lanesMode: "defaulted" }]],
+    ["extra-propose-key", [{ type: "ProposeLanes", lanesMode: "explicit", lanes: [] }]],
+    ["unbounded", Array.from({ length: 65 }, () => ({ type: "AnalyzeRequirement" }))],
+  ];
+
+  for (const [name, operationSummary] of cases) {
+    const projected = toPlain(redactWorkflowEventForRenderer(
+      plannerReconciliationRendererEvent(operationSummary),
+      plannerRendererSegments(),
+    ));
+
+    assert.equal("plannerTurn" in projected.payload, false, name);
+    assert.deepEqual(projected.payload, {
+      redacted: true,
+      summary: "Workflow event recorded.",
+    }, name);
+  }
+});
+
 test("legacy publication quarantine audit exposes no renderer authority", async () => {
   const { redactWorkflowEventForRenderer } = await loadMainDeliveryRendererHelpers();
   const projected = toPlain(redactWorkflowEventForRenderer({
@@ -4041,6 +4096,48 @@ async function loadMainRendererCanvasSessionHelpers() {
   const module = { exports: {} };
   vm.runInNewContext(output, { module, exports: module.exports }, { filename: "main.rendererCanvasSession.ts" });
   return module.exports;
+}
+
+function plannerReconciliationRendererEvent(operationSummary) {
+  return {
+    id: "event-planner-reconciled-1",
+    sessionId: "session-1",
+    seq: 9,
+    kind: "workflow.planner_intent.reconciled",
+    source: "electron-main",
+    laneId: "planner-node-1",
+    segmentId: "segment-planner-1",
+    causationId: null,
+    correlationId: null,
+    createdAt: "2026-08-20T00:00:00.000Z",
+    payload: {
+      runId: "run-planner-1",
+      agentKind: "hermes",
+      disposition: "applied",
+      intentId: "intent-planner-1",
+      ...(operationSummary === undefined ? {} : { operationSummary }),
+      requirement: "requirement text must not be exposed",
+      profile: "project profile must not be exposed",
+      lanes: "lane payload must not be exposed",
+      output: "raw output must not be exposed",
+    },
+  };
+}
+
+function plannerRendererSegments() {
+  return new Map([["segment-planner-1", {
+    laneId: "planner-node-1",
+    segmentId: "segment-planner-1",
+    runId: "run-planner-1",
+    status: "succeeded",
+    exitCode: 0,
+    evidence: {
+      runId: "run-planner-1",
+      status: "succeeded",
+      exitCode: 0,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+    },
+  }]]);
 }
 
 async function loadMainDeliveryRendererHelpers() {

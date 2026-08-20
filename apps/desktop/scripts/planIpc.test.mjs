@@ -10,6 +10,11 @@ import vm from "node:vm";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
+const standardPlannerOperationSummary = [
+  { type: "AnalyzeRequirement" },
+  { type: "DiscoverProject" },
+  { type: "ProposeLanes", lanesMode: "explicit" },
+];
 
 test("Plan IPC contracts strictly parse runs, transitions, cancel, and state requests", async () => {
   const contracts = await loadContracts();
@@ -3304,12 +3309,14 @@ test("workflow append owns PTY-disabled planner turns, retries once, and replays
         exitCode: 0,
         hermesCliExitPassed: true,
         intentDisposition: "applied",
+        operationSummary: standardPlannerOperationSummary,
       },
     });
     assert.deepEqual(Object.keys(firstReconciledEvent.payload.plannerTurn).sort(), [
       "exitCode",
       "hermesCliExitPassed",
       "intentDisposition",
+      "operationSummary",
       "runId",
       "segmentId",
       "status",
@@ -3356,6 +3363,7 @@ test("workflow append owns PTY-disabled planner turns, retries once, and replays
         exitCode: 0,
         hermesCliExitPassed: true,
         intentDisposition: "applied",
+        operationSummary: standardPlannerOperationSummary,
       },
       {
         runId: starts[1].runId,
@@ -3364,6 +3372,7 @@ test("workflow append owns PTY-disabled planner turns, retries once, and replays
         exitCode: 0,
         hermesCliExitPassed: true,
         intentDisposition: "applied",
+        operationSummary: standardPlannerOperationSummary,
       },
     ]);
 
@@ -3410,6 +3419,7 @@ for (const scenario of [
     },
     disposition: "invalid",
     reasonCode: "parse_invalid",
+    operationSummary: [],
     rejectedEvents: 0,
   },
   {
@@ -3423,6 +3433,7 @@ for (const scenario of [
     },
     disposition: "invalid",
     reasonCode: "session_mismatch",
+    operationSummary: standardPlannerOperationSummary,
     rejectedEvents: 0,
   },
   {
@@ -3440,6 +3451,10 @@ for (const scenario of [
     },
     disposition: "rejected",
     reasonCode: "policy_rejected",
+    operationSummary: [
+      ...standardPlannerOperationSummary,
+      { type: "RequestReview" },
+    ],
     rejectedEvents: 1,
   },
 ]) {
@@ -3480,6 +3495,7 @@ for (const scenario of [
           ? { intentId: scenario.intent().intentId }
           : {}),
         reasonCode: scenario.reasonCode,
+        operationSummary: scenario.operationSummary,
       });
       const rejected = eventsAfterFirstReplay.filter((event) => event.kind === "workflow.intent.rejected");
       assert.equal(rejected.length, scenario.rejectedEvents);
@@ -3514,6 +3530,7 @@ for (const scenario of [
         hermesCliExitPassed: true,
         intentDisposition: scenario.disposition,
         intentReasonCode: scenario.reasonCode,
+        operationSummary: scenario.operationSummary,
       });
     } finally {
       await loaded?.exports.closeWorkflowStores();
@@ -3594,6 +3611,7 @@ test("terminal planner intentId reuse is invalid, topology-stable, and renderer-
       disposition: "invalid",
       intentId,
       reasonCode: "intent_id_reused",
+      operationSummary: [{ type: "ProposeLanes", lanesMode: "explicit" }],
     });
     const persistedSecond = store.listSegments("session-1", plannerNodeId)
       .find((segment) => segment.runId === second.runId);
@@ -3616,6 +3634,7 @@ test("terminal planner intentId reuse is invalid, topology-stable, and renderer-
       hermesCliExitPassed: true,
       intentDisposition: "invalid",
       intentReasonCode: "intent_id_reused",
+      operationSummary: [{ type: "ProposeLanes", lanesMode: "explicit" }],
     });
 
     await loaded.exports.closeWorkflowStores();
@@ -3698,6 +3717,7 @@ for (const failureStage of ["apply", "schedule", "disposition"]) {
         agentKind: "hermes",
         disposition: "applied",
         intentId: `intent-${failureStage}-retry`,
+        operationSummary: standardPlannerOperationSummary,
       });
       assert.deepEqual(store.listSegments("session-1", created.canvasSession.plannerNodeId).at(-1)?.evidence?.checks, [
         { kind: "run-exit", name: "Hermes CLI exit", status: "passed" },

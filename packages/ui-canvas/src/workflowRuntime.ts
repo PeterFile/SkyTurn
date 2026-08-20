@@ -56,6 +56,11 @@ export interface WorkflowSchedulingPolicy {
 const SERIAL_WORKFLOW_PARALLELISM = 1;
 const MAX_WORKFLOW_PARALLELISM = 4;
 const CURRENT_BRANCH_WORKTREE_KEY = "current_branch";
+const MAX_UNTRUSTED_PROMPT_FRAGMENT_LENGTH = 8_192;
+const MAX_UNTRUSTED_PROMPT_LIST_ITEMS = 64;
+const RESERVED_SCREENSHOT_CAPABILITY_MARKER = "[reserved screenshot capability]";
+const RESERVED_SCREENSHOT_HELPER_PATTERN = /(?:scripts[\\/]+)?capture-screenshot\.mjs/gi;
+const RESERVED_SCREENSHOT_ARTIFACT_PATTERN = /\.devflow[\\/]+acceptance[\\/]+react-app(?:\.verify)?\.png/gi;
 
 export async function loadExactRunEvidence(queryRoot: string, runId: string): Promise<RunEvidence> {
   if (typeof window === "undefined" || !window.devflow) {
@@ -789,9 +794,9 @@ export function buildPromptForNodeRun(
     if (node.display?.meta.includes("flow-kernel") && node.id !== session.plannerNodeId) {
       const dependencyEvidence = dependencyEvidenceForPrompt(session, node);
       return [
-        `Task: ${node.context.brief}`,
-        `Session goal: ${session.goal}`,
-        `Node: ${node.id}`,
+        `Task: ${sanitizeUntrustedPromptFragment(node.context.brief)}`,
+        `Session goal: ${sanitizeUntrustedPromptFragment(session.goal)}`,
+        `Node: ${sanitizeUntrustedPromptFragment(node.id)}`,
         dependencyEvidence,
         "Read-only review lane: do not modify files, do not stage changes, do not create commits, and do not create branches.",
         "You may inspect repository state and run verification commands, but the Codex commit lane owns any commit.",
@@ -800,36 +805,35 @@ export function buildPromptForNodeRun(
       ].filter(Boolean).join("\n");
     }
     return buildHermesWorkflowPrompt({
-      goal: hermesGoalForNode(session, node),
-      sessionId: session.id,
-      plannerSessionId: session.hermesPlannerSessionId || makeHermesPlannerSessionId(session.id),
-      nodeId: node.id,
-      sessionLedger,
+      goal: sanitizeUntrustedPromptFragment(hermesGoalForNode(session, node)),
+      sessionId: sanitizeUntrustedPromptFragment(session.id),
+      plannerSessionId: sanitizeUntrustedPromptFragment(
+        session.hermesPlannerSessionId || makeHermesPlannerSessionId(session.id),
+      ),
+      nodeId: sanitizeUntrustedPromptFragment(node.id),
+      sessionLedger: sanitizeWorkflowLedgerSummaryForPrompt(sessionLedger),
       existingNodes: session.nodes.map((item) => ({
-        id: item.id,
-        title: item.title,
+        id: sanitizeUntrustedPromptFragment(item.id),
+        title: sanitizeUntrustedPromptFragment(item.title),
         agent: item.agent,
         status: item.status,
-        taskKey: item.workflowTrace?.taskKey,
-        dependencies: item.context.dependencies,
+        taskKey: item.workflowTrace?.taskKey
+          ? sanitizeUntrustedPromptFragment(item.workflowTrace.taskKey)
+          : undefined,
+        dependencies: item.context.dependencies.map(sanitizeUntrustedPromptFragment),
       })),
     });
   }
 
-  const laneKind = node.display?.meta[0] ?? "";
-  const laneInstruction = codexLaneInstruction(laneKind, node.title);
-  const screenshotHelperInstruction = /browser|screenshot/.test(`${laneKind} ${node.title}`.toLowerCase())
-    ? "If the repository provides `scripts/capture-screenshot.mjs`, run `node scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png` and report that artifact path."
-    : "";
+  const laneInstruction = codexLaneInstruction(node);
   const dependencyEvidence = dependencyEvidenceForPrompt(session, node);
   return [
-    `Task: ${node.context.brief}`,
-    `Session goal: ${session.goal}`,
-    `Node: ${node.id}`,
-    `Worktree reference: ${node.worktree.path}`,
+    `Task: ${sanitizeUntrustedPromptFragment(node.context.brief)}`,
+    `Session goal: ${sanitizeUntrustedPromptFragment(session.goal)}`,
+    `Node: ${sanitizeUntrustedPromptFragment(node.id)}`,
+    `Worktree reference: ${sanitizeUntrustedPromptFragment(node.worktree.path)}`,
     dependencyEvidence,
     laneInstruction,
-    screenshotHelperInstruction,
     "Stay inside the current git repository. Do not run broad parent-directory scans such as `find ..`; if checking agent instructions, inspect only repo-local paths.",
     "Return a concise result summary and any blocker or verification evidence. Do not claim completion without evidence.",
   ].filter(Boolean).join("\n");
@@ -881,8 +885,8 @@ function hermesGoalForNode(session: CanvasSession, node: CanvasNode): string {
   return `${session.goal}\nCurrent requirement: ${brief}`;
 }
 
-function codexLaneInstruction(laneKind: string, title = ""): string {
-  const laneText = `${laneKind} ${title}`.toLowerCase();
+function codexLaneInstruction(node: CanvasNode): string {
+  const laneKind = node.laneKind ?? node.display?.meta[0] ?? "";
   if (laneKind === "commit") {
     return [
       "Before committing, read the dependency evidence above.",
@@ -892,16 +896,39 @@ function codexLaneInstruction(laneKind: string, title = ""): string {
       "Do not stage `.devflow/`.",
     ].join(" ");
   }
-  if (/browser|screenshot/.test(laneText)) {
-    return "Capture browser screenshot evidence with a bounded command. Prefer repo-provided screenshot scripts over ad hoc browser automation. Start any dev server only if needed, write the screenshot artifact, and Stop any dev server before exiting. Do not create a git commit in this lane; the commit lane owns commits.";
+  const expectedArtifacts = expectedArtifactsForNode(node);
+  if (nodeHasBrowserScreenshotContract(node, expectedArtifacts)) {
+    return [
+      "Capture browser screenshot evidence with a bounded command.",
+      "Prefer repo-provided screenshot scripts over ad hoc browser automation.",
+      `Run \`node scripts/capture-screenshot.mjs ${expectedArtifacts[0]}\` and report that artifact path.`,
+      "Start any dev server only if needed, write the screenshot artifact, and Stop any dev server before exiting.",
+      "Do not create a git commit in this lane; the commit lane owns commits.",
+    ].join(" ");
   }
-  if (/implementation|implement|change|update|edit/.test(laneText)) {
+  if (/implementation|implement|change|update|edit/.test(laneKind.toLowerCase())) {
     return "Implement the requested code and test change in this git repository. Run the relevant tests. Do not create a git commit in this lane. Do not capture browser screenshots in this lane. Do not start persistent dev servers.";
   }
-  if (/validation|test|regression/.test(laneText)) {
+  if (/validation|test|regression/.test(laneKind.toLowerCase())) {
     return "Run the relevant verification command and report the exact result. Do not create a git commit in this lane.";
   }
   return "";
+}
+
+function nodeHasBrowserScreenshotContract(node: CanvasNode, expectedArtifacts: string[]): boolean {
+  if (node.agent !== "codex" || !isExecutableNode(node)) return false;
+  if (expectedArtifacts.length === 0) return false;
+  const requiredEvidence = new Set((node.requiredEvidence ?? []).map((kind) => kind.trim().toLowerCase()));
+  if (!requiredEvidence.has("browser") || !requiredEvidence.has("screenshot")) return false;
+  const semanticSubtype = canonicalLaneSemantic(node.semanticSubtype);
+  return (node.laneKind === "validation" || node.laneKind === "regression") &&
+    /^(?:browser|screenshot|browser_screenshot)_(?:validation|test|check)$/.test(semanticSubtype);
+}
+
+function canonicalLaneSemantic(value: unknown): string {
+  return typeof value === "string"
+    ? value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")
+    : "";
 }
 
 function expectedArtifactsInputForNode(node: CanvasNode): Pick<StartAgentRunInput, "expectedArtifacts"> | Record<string, never> {
@@ -934,11 +961,60 @@ function dependencyEvidenceForPrompt(session: CanvasSession, node: CanvasNode): 
   const sections = dependencies.map((dependency) => {
     const output = dependency.output.join("\n").trim() || "(no output captured)";
     return [
-      `Dependency ${dependency.id} (${dependency.title}, ${dependency.agent}, ${dependency.status}):`,
-      trimForPrompt(output, 2_000),
+      `Dependency ${sanitizeUntrustedPromptFragment(dependency.id)} (${sanitizeUntrustedPromptFragment(dependency.title)}, ${dependency.agent}, ${dependency.status}):`,
+      sanitizeUntrustedPromptFragment(trimForPrompt(output, 2_000)),
     ].join("\n");
   });
   return ["Dependency evidence:", ...sections].join("\n");
+}
+
+function sanitizeUntrustedPromptFragment(value: string): string {
+  const bounded = value.slice(0, MAX_UNTRUSTED_PROMPT_FRAGMENT_LENGTH);
+  return bounded
+    .replace(RESERVED_SCREENSHOT_HELPER_PATTERN, RESERVED_SCREENSHOT_CAPABILITY_MARKER)
+    .replace(RESERVED_SCREENSHOT_ARTIFACT_PATTERN, RESERVED_SCREENSHOT_CAPABILITY_MARKER)
+    .slice(0, MAX_UNTRUSTED_PROMPT_FRAGMENT_LENGTH);
+}
+
+function sanitizeWorkflowLedgerSummaryForPrompt(
+  ledger: WorkflowLedgerSummary | undefined,
+): WorkflowLedgerSummary | undefined {
+  if (!ledger) return undefined;
+  const facts = sanitizePromptStringList(ledger.facts);
+  const openQuestions = sanitizePromptStringList(ledger.openQuestions);
+  const recentEvents = ledger.recentEvents.slice(-MAX_UNTRUSTED_PROMPT_LIST_ITEMS).flatMap((event) => {
+    if (
+      !event || typeof event !== "object" ||
+      !Number.isSafeInteger(event.seq) ||
+      typeof event.kind !== "string" ||
+      typeof event.summary !== "string" ||
+      (event.laneId !== undefined && typeof event.laneId !== "string")
+    ) return [];
+    return [{
+      seq: event.seq,
+      kind: sanitizeUntrustedPromptFragment(event.kind),
+      summary: sanitizeUntrustedPromptFragment(event.summary),
+      ...(event.laneId === undefined
+        ? {}
+        : { laneId: sanitizeUntrustedPromptFragment(event.laneId) }),
+    }];
+  });
+  return {
+    throughSeq: ledger.throughSeq,
+    checkpointSummary: typeof ledger.checkpointSummary === "string"
+      ? sanitizeUntrustedPromptFragment(ledger.checkpointSummary)
+      : null,
+    facts,
+    recentEvents,
+    openQuestions,
+  };
+}
+
+function sanitizePromptStringList(values: unknown[]): string[] {
+  return values
+    .slice(-MAX_UNTRUSTED_PROMPT_LIST_ITEMS)
+    .filter((value): value is string => typeof value === "string")
+    .map(sanitizeUntrustedPromptFragment);
 }
 
 function trimForPrompt(value: string, maxLength: number): string {

@@ -73,6 +73,7 @@ import {
   type FlowLane,
   type FlowProjection,
   type InsertClarificationBeforeRequest,
+  type WorkflowIntentOperationType,
 } from "@skyturn/workflow-kernel";
 
 export type WorkflowLaneKind =
@@ -338,7 +339,13 @@ export interface RunningWorkflowSegment {
 export type RunCheckpointEnrichmentCandidate = Omit<RunningWorkflowSegment, "status">;
 export type PlannerIntentReconciliationCandidate = RunCheckpointEnrichmentCandidate;
 
-export type PlannerIntentDisposition =
+export type PlannerIntentOperationSummaryEntry =
+  | { type: Exclude<WorkflowIntentOperationType, "ProposeLanes"> }
+  | { type: "ProposeLanes"; lanesMode: "omitted" | "explicit" };
+
+export type PlannerIntentOperationSummary = PlannerIntentOperationSummaryEntry[];
+
+type PlannerIntentDispositionFields =
   | { disposition: "applied"; intentId?: string }
   | {
       disposition: "invalid";
@@ -346,6 +353,14 @@ export type PlannerIntentDisposition =
       reasonCode: "parse_invalid" | "session_mismatch" | "intent_id_reused";
     }
   | { disposition: "rejected"; intentId: string; reasonCode: "policy_rejected" };
+
+export type PlannerIntentDisposition = PlannerIntentDispositionFields & {
+  operationSummary: unknown;
+};
+
+type NormalizedPlannerIntentDisposition = PlannerIntentDispositionFields & {
+  operationSummary: PlannerIntentOperationSummary;
+};
 
 export interface PlannerIntentReconciliationFacts {
   candidate: PlannerIntentReconciliationCandidate;
@@ -3045,7 +3060,10 @@ export class WorkflowStore {
     candidate: PlannerIntentReconciliationCandidate,
     now: string,
   ): WorkflowEventRecord {
-    return this.completePlannerIntentReconciliation(candidate, { disposition: "applied" }, now);
+    return this.completePlannerIntentReconciliation(candidate, {
+      disposition: "applied",
+      operationSummary: [],
+    }, now);
   }
 
   private plannerIntentReconciliationFacts(
@@ -7454,13 +7472,17 @@ function normalizePlannerIntentReconciliationCandidate(
   };
 }
 
-function normalizePlannerIntentDisposition(disposition: PlannerIntentDisposition): PlannerIntentDisposition {
+function normalizePlannerIntentDisposition(disposition: PlannerIntentDisposition): NormalizedPlannerIntentDisposition {
   const intentId = disposition.intentId === undefined
     ? undefined
     : requireIdentifier(disposition.intentId, "planner intent intentId");
+  if (!Object.prototype.hasOwnProperty.call(disposition, "operationSummary")) {
+    throw new Error("Planner intent operation summary is required.");
+  }
+  const operationSummary = normalizePlannerIntentOperationSummary(disposition.operationSummary);
   if (disposition.disposition === "applied") {
     if ("reasonCode" in disposition) throw new Error("Applied planner intent disposition cannot have a reason code.");
-    return { disposition: "applied", ...(intentId ? { intentId } : {}) };
+    return { disposition: "applied", ...(intentId ? { intentId } : {}), operationSummary };
   }
   if (disposition.disposition === "invalid") {
     if (
@@ -7470,21 +7492,69 @@ function normalizePlannerIntentDisposition(disposition: PlannerIntentDisposition
     ) {
       throw new Error("Invalid planner intent disposition reason code is unsupported.");
     }
-    return { disposition: "invalid", ...(intentId ? { intentId } : {}), reasonCode: disposition.reasonCode };
+    return {
+      disposition: "invalid",
+      ...(intentId ? { intentId } : {}),
+      reasonCode: disposition.reasonCode,
+      operationSummary,
+    };
   }
   if (disposition.disposition === "rejected") {
     if (!intentId || disposition.reasonCode !== "policy_rejected") {
       throw new Error("Rejected planner intent disposition requires a bounded intentId and policy reason.");
     }
-    return { disposition: "rejected", intentId, reasonCode: "policy_rejected" };
+    return { disposition: "rejected", intentId, reasonCode: "policy_rejected", operationSummary };
   }
   throw new Error("Planner intent disposition is unsupported.");
+}
+
+const MAX_PLANNER_INTENT_OPERATION_SUMMARY_ITEMS = 64;
+const PLANNER_INTENT_OPERATION_TYPES = new Set<WorkflowIntentOperationType>([
+  "AnalyzeRequirement",
+  "DiscoverProject",
+  "ProposeLanes",
+  "SplitLane",
+  "JoinLanes",
+  "StartImplementation",
+  "RequestValidation",
+  "RequestReview",
+  "RequestUserDecision",
+  "ReplanFromEvidence",
+  "Commit",
+  "DeclareEdge",
+]);
+
+function normalizePlannerIntentOperationSummary(value: unknown): PlannerIntentOperationSummary {
+  if (!Array.isArray(value) || value.length > MAX_PLANNER_INTENT_OPERATION_SUMMARY_ITEMS) {
+    throw new Error("Planner intent operation summary must be a bounded array.");
+  }
+  return value.map((entry): PlannerIntentOperationSummaryEntry => {
+    if (!isRecord(entry) || typeof entry.type !== "string" || !PLANNER_INTENT_OPERATION_TYPES.has(
+      entry.type as WorkflowIntentOperationType,
+    )) {
+      throw new Error("Planner intent operation summary contains an unsupported operation.");
+    }
+    const keys = Object.keys(entry).sort().join(",");
+    if (entry.type === "ProposeLanes") {
+      if (
+        keys !== "lanesMode,type" ||
+        (entry.lanesMode !== "omitted" && entry.lanesMode !== "explicit")
+      ) {
+        throw new Error("Planner intent operation summary ProposeLanes entry is malformed.");
+      }
+      return { type: "ProposeLanes", lanesMode: entry.lanesMode };
+    }
+    if (keys !== "type") {
+      throw new Error("Planner intent operation summary entry has unsupported fields.");
+    }
+    return { type: entry.type as Exclude<WorkflowIntentOperationType, "ProposeLanes"> };
+  });
 }
 
 function assertMatchingPlannerIntentReconciliationEvent(
   event: WorkflowEventRecord,
   candidate: PlannerIntentReconciliationCandidate,
-  disposition: PlannerIntentDisposition,
+  disposition: NormalizedPlannerIntentDisposition,
 ): void {
   const legacyApplied = event.payload.disposition === undefined;
   const matchingDisposition = legacyApplied
@@ -7493,7 +7563,18 @@ function assertMatchingPlannerIntentReconciliationEvent(
         disposition: event.payload.disposition,
         ...(event.payload.intentId !== undefined ? { intentId: event.payload.intentId } : {}),
         ...(event.payload.reasonCode !== undefined ? { reasonCode: event.payload.reasonCode } : {}),
-      }) === stableJson(disposition);
+        ...(event.payload.operationSummary !== undefined
+          ? { operationSummary: normalizePlannerIntentOperationSummary(event.payload.operationSummary) }
+          : {}),
+      }) === stableJson(
+        event.payload.operationSummary === undefined
+          ? {
+              disposition: disposition.disposition,
+              ...(disposition.intentId !== undefined ? { intentId: disposition.intentId } : {}),
+              ...("reasonCode" in disposition ? { reasonCode: disposition.reasonCode } : {}),
+            }
+          : disposition,
+      );
   if (
     event.kind !== "workflow.planner_intent.reconciled" ||
     event.sessionId !== candidate.sessionId ||
