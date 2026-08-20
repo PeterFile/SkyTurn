@@ -1216,7 +1216,7 @@ describe("workflow runtime event merging", () => {
     expect(prompt).toContain("Do not start persistent dev servers");
   });
 
-  it("tells browser screenshot lanes to stop any temporary dev server before exiting", () => {
+  it("gives canonical browser screenshot lanes one exact bounded helper contract", () => {
     const session = makeSession([
       makeNode({
         id: "lane-browser",
@@ -1235,11 +1235,25 @@ describe("workflow runtime event merging", () => {
 
     const prompt = buildPromptForNodeRun(session, browser!);
 
-    expect(prompt).toContain("Capture browser screenshot evidence");
-    expect(prompt).toContain("node scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png");
-    expect(prompt).toContain("Stop any dev server before exiting");
+    const command = "node scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png";
+    expect(prompt.split(command)).toHaveLength(2);
+    expect(prompt).toContain("First, load all applicable repository instructions");
+    expect(prompt.indexOf("First, load all applicable repository instructions")).toBeLessThan(
+      prompt.indexOf(command),
+    );
+    expect(prompt).toContain("from the repository root");
+    expect(prompt).toContain("perform exactly one bounded validation action");
+    expect(prompt).toContain("exactly once and wait for it to exit");
+    expect(prompt).toContain("The fixed helper is the only permitted artifact producer");
+    expect(prompt).toContain("starts and closes bounded Vite and Electron processes");
+    expect(prompt).toContain("Do not start a separate dev server, browser, or Electron process");
+    expect(prompt).toContain("Do not use ad-hoc automation or retry the helper");
+    expect(prompt).toContain("Do not do unrelated work, edit the helper, or edit any tracked source");
+    expect(prompt).toContain("alternate commands, copies, synthetic output, manual capture, mocks, or direct app execution");
     expect(prompt).toContain("Do not create a git commit in this lane");
     expect(prompt).toContain("the commit lane owns commits");
+    expect(prompt).toContain("helper exits nonzero or the artifact gate rejects the result");
+    expect(prompt).toContain("report the blocker and exit this lane nonzero");
   });
 
   it.each([

@@ -1523,8 +1523,8 @@ test("getWorkflowStore invalidates a cross-run intentId reuse without AgentBridg
   }
 });
 
-for (const crashWindow of ["intent-applied", "lanes-scheduled"]) {
-  test(`getWorkflowStore converges when a crash leaves Finish planner ${crashWindow} without reconciliation`, async () => {
+for (const crashWindow of ["intent-applied", "intent-reconciled", "lanes-scheduled"]) {
+  test(`getWorkflowStore converges when a crash leaves Finish planner ${crashWindow} before downstream completion`, async () => {
     const root = await makeRoot();
     let harness;
     try {
@@ -1545,6 +1545,17 @@ for (const crashWindow of ["intent-applied", "lanes-scheduled"]) {
         ...finishPlannerIntent(segment.sessionId),
         causationId: segment.runId,
       }, evidence.completedAt);
+      if (crashWindow === "intent-reconciled") {
+        store.completePlannerIntentReconciliation(segment, {
+          disposition: "applied",
+          intentId: "finish-plan-intent-1",
+          operationSummary: [
+            { type: "AnalyzeRequirement" },
+            { type: "DiscoverProject" },
+            { type: "ProposeLanes", lanesMode: "explicit" },
+          ],
+        }, evidence.completedAt);
+      }
       if (crashWindow === "lanes-scheduled") {
         store.scheduleReadyLanes(segment.sessionId, { allowedParallelism: 2, now: evidence.completedAt });
       }
@@ -2317,6 +2328,12 @@ function assertFinishPlannerConverged(store, segment, laneStatus = "running") {
   assert.equal(plannerFacts.filter((event) => event.kind === "workflow.intent.accepted").length, 1);
   assert.equal(plannerFacts.filter((event) => event.kind === "workflow.lane.declared").length, 2);
   assert.equal(plannerFacts.every((event) => event.causationId === segment.runId), true);
+  const reconciled = store.listEvents(segment.sessionId).filter((event) =>
+    event.kind === "workflow.planner_intent.reconciled" && event.payload.runId === segment.runId
+  );
+  assert.equal(reconciled.length, 1);
+  assert.equal(reconciled[0].payload.disposition, "applied");
+  assert.deepEqual(store.listPendingPlannerIntentReconciliations(), []);
 }
 
 async function makeRoot() {

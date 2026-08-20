@@ -3093,7 +3093,7 @@ async function reconcilePendingPlannerWorkflowIntent(
   projectRoot: string,
   store: WorkflowStoreHost,
   segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
-  deferApplied = false,
+  deferAdvance = false,
 ): Promise<boolean> {
   const candidate = store.listPendingPlannerIntentReconciliations().find((pending) =>
     pending.sessionId === segment.sessionId &&
@@ -3158,13 +3158,13 @@ async function reconcilePendingPlannerWorkflowIntent(
     }, facts.completedAt);
     return false;
   }
-  if (deferApplied) return false;
-  await advanceWorkflowSession(projectRoot, store, segment.sessionId, true);
   store.completePlannerIntentReconciliation(candidate, {
     disposition: "applied",
     intentId: parsed.intent.intentId,
     operationSummary,
   }, facts.completedAt);
+  if (deferAdvance) return false;
+  await advanceWorkflowSession(projectRoot, store, segment.sessionId, true);
   return true;
 }
 
