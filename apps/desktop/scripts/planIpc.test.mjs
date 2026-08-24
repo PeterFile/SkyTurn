@@ -5662,6 +5662,182 @@ test("ordinary workspace-write scheduling remains automatic", async () => {
   }
 });
 
+test("scheduler grants one exact canonical browser capture capability and rejects forged reuse", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-browser-host-capability-"));
+  const starts = [];
+  const captures = [];
+  const publications = [];
+  const publisher = {
+    async publish(path, bytes) {
+      publications.push({ path, bytes: Buffer.from(bytes).toString("utf8") });
+    },
+  };
+  let codexOptions;
+  let loaded;
+  const bridge = {
+    async startRun(input) {
+      starts.push(input);
+      return { id: input.runId, status: "running" };
+    },
+    onRunEvent() { return () => undefined; },
+    listRuns() { return []; },
+    async loadEvents() { return []; },
+    async getEvidence() { return null; },
+    async discoverAgents() { return []; },
+    async close() {},
+  };
+  try {
+    const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+      "../dist-electron/electron/runStartHandler.js"
+    );
+    loaded = await loadMainModule([], {
+      agentBridge: bridge,
+      platform: "darwin",
+      onCodexAdapterCreated(options) {
+        codexOptions = options;
+      },
+      hostCaptureProducer: async (input, publishPng, signal) => {
+        captures.push({ input, aborted: signal.aborted });
+        await publishPng(Buffer.from("validated-png"));
+      },
+      createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
+        ...dependencies,
+        assertStartInput: async () => undefined,
+        prepareBeforeCheckpoint: async () => true,
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedScheduledLane(store, projectRoot, {
+      id: "lane-browser",
+      kind: "browser_validation",
+      laneKind: "validation",
+      semanticSubtype: "browser_validation",
+      title: "Opaque browser verification",
+      requiredEvidence: ["browser", "screenshot"],
+    });
+
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0].sandbox, "workspace-write");
+    assert.deepEqual(starts[0].expectedArtifacts, [".devflow/acceptance/react-app.png"]);
+    assert.match(starts[0].prompt, /git diff --check/);
+    assert.doesNotMatch(starts[0].prompt, /capture-screenshot\.mjs/);
+    assert.equal(typeof codexOptions?.postCloseArtifactProducer, "function");
+    assert.equal(
+      await codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
+      "produced",
+    );
+    assert.deepEqual(toPlain(captures), [{
+      input: {
+        worktreePath: starts[0].worktreePath,
+      },
+      aborted: false,
+    }]);
+    assert.deepEqual(toPlain(publications), [{
+      path: ".devflow/acceptance/react-app.png",
+      bytes: "validated-png",
+    }]);
+
+    await assert.rejects(
+      codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
+      /authorization|segment|consumed/i,
+    );
+    assert.equal(captures.length, 1);
+
+    const forgedArtifact = {
+      ...starts[0],
+      expectedArtifacts: [".devflow/acceptance/other.png"],
+    };
+    assert.equal(
+      await codexOptions.postCloseArtifactProducer(forgedArtifact, publisher, new AbortController().signal),
+      "not-applicable",
+    );
+    assert.equal(
+      await codexOptions.postCloseArtifactProducer(
+        { ...starts[0], agentKind: "hermes" },
+        publisher,
+        new AbortController().signal,
+      ),
+      "not-applicable",
+    );
+    const aborted = new AbortController();
+    aborted.abort("cancelled");
+    await assert.rejects(codexOptions.postCloseArtifactProducer(starts[0], publisher, aborted.signal), /abort|cancel/i);
+    assert.equal(captures.length, 1);
+
+    await assert.rejects(
+      loaded.ipcHandlers.get("run:start")({}, starts[0]),
+      /scheduled|renderer|main-owned/i,
+    );
+    assert.equal(starts.length, 1);
+
+    await loaded.exports.closeWorkflowStores();
+    await loaded.exports.getWorkflowStore(projectRoot);
+    await assert.rejects(
+      codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
+      /authorization|segment|stale|consumed/i,
+    );
+    assert.equal(captures.length, 1);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+for (const platform of ["linux", "win32"]) {
+  test(`scheduler preserves the fixed browser helper on ${platform}`, async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), `skyturn-browser-helper-${platform}-`));
+    const starts = [];
+    let loaded;
+    try {
+      const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+        "../dist-electron/electron/runStartHandler.js"
+      );
+      loaded = await loadMainModule([], {
+        platform,
+        agentBridge: {
+          async startRun(input) {
+            starts.push(input);
+            return { id: input.runId, status: "running" };
+          },
+          onRunEvent() { return () => undefined; },
+          listRuns() { return []; },
+          async loadEvents() { return []; },
+          async getEvidence() { return null; },
+          async discoverAgents() { return []; },
+          async close() {},
+        },
+        createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
+          ...dependencies,
+          assertStartInput: async () => undefined,
+          prepareBeforeCheckpoint: async () => true,
+        }),
+      });
+      loaded.exports.openedProjectRoots.add(projectRoot);
+      const store = await loaded.exports.getWorkflowStore(projectRoot);
+      const session = seedScheduledLane(store, projectRoot, {
+        id: `lane-browser-${platform}`,
+        kind: "browser_validation",
+        laneKind: "validation",
+        semanticSubtype: "browser_validation",
+        title: "Opaque browser verification",
+        requiredEvidence: ["browser", "screenshot"],
+      });
+
+      await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+
+      assert.equal(starts.length, 1);
+      assert.match(starts[0].prompt, /node scripts\/capture-screenshot\.mjs \.devflow\/acceptance\/react-app\.png/);
+      assert.doesNotMatch(starts[0].prompt, /git diff --check/);
+    } finally {
+      await loaded?.exports.closeWorkflowStores();
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+}
+
 test("generic workflow creation concurrent exact retries serialize one planner launch", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-workflow-input-concurrent-retry-"));
   const gate = deferred();
@@ -6836,7 +7012,10 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
   const agentBridgeModule = {
     ...realAgentBridgeModule,
     AgentBridge,
-    createCodexCliAdapter: () => ({}),
+    createCodexCliAdapter: (adapterOptions) => {
+      options.onCodexAdapterCreated?.(adapterOptions);
+      return {};
+    },
     createHermesCliAdapter: () => ({}),
     createDurableRunClaimStore: options.createDurableRunClaimStore
       ?? (() => ({ initialize: async () => undefined })),
@@ -6916,6 +7095,11 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
         if (specifier === "./planIpcContracts") return contracts;
         if (specifier === "./workflowIpcContracts") return workflowContracts;
         if (specifier === "./workflowCheckpointRuntime") return workflowCheckpointRuntime;
+        if (specifier === "./browserScreenshotHostCapture") {
+          return {
+            createBrowserScreenshotHostProducer: () => options.hostCaptureProducer ?? (async () => undefined),
+          };
+        }
         if (specifier === "./workflowRunRecovery" && options.workflowRunRecoveryModule) {
           return options.workflowRunRecoveryModule;
         }
