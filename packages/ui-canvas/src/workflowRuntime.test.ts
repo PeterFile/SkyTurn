@@ -10,6 +10,7 @@ import {
   loadExactRunEvidence,
   loadExactTerminalRunEvidence,
   mergeRunEventsIntoWorkspace,
+  isCanonicalBrowserScreenshotCaptureNode,
   retryCanvasNode,
   sandboxForNodeRun,
   startBridgeRun,
@@ -300,7 +301,7 @@ describe("workflow runtime event merging", () => {
     }
   });
 
-  it("puts the fixed screenshot helper in the real Codex payload from canonical browser semantics", async () => {
+  it("keeps the fixed screenshot helper in the default browser payload", async () => {
     const workspace = makeWorkspace();
     const project = workspace.projects[0] as ImportedProject;
     const hermesRunId = "run-session-1-node-1";
@@ -341,6 +342,8 @@ describe("workflow runtime event merging", () => {
           "node scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png",
         ),
       }));
+      const prompt = startAgentRun.mock.calls[0]?.[0].prompt ?? "";
+      expect(prompt).not.toContain("git diff --check");
     } finally {
       vi.unstubAllGlobals();
     }
@@ -1216,7 +1219,7 @@ describe("workflow runtime event merging", () => {
     expect(prompt).toContain("Do not start persistent dev servers");
   });
 
-  it("gives canonical browser screenshot lanes one exact bounded helper contract", () => {
+  it("gives canonical browser screenshot lanes the fixed helper contract by default", () => {
     const session = makeSession([
       makeNode({
         id: "lane-browser",
@@ -1241,19 +1244,60 @@ describe("workflow runtime event merging", () => {
     expect(prompt.indexOf("First, load all applicable repository instructions")).toBeLessThan(
       prompt.indexOf(command),
     );
-    expect(prompt).toContain("from the repository root");
     expect(prompt).toContain("perform exactly one bounded validation action");
     expect(prompt).toContain("exactly once and wait for it to exit");
     expect(prompt).toContain("The fixed helper is the only permitted artifact producer");
-    expect(prompt).toContain("starts and closes bounded Vite and Electron processes");
     expect(prompt).toContain("Do not start a separate dev server, browser, or Electron process");
-    expect(prompt).toContain("Do not use ad-hoc automation or retry the helper");
     expect(prompt).toContain("Do not do unrelated work, edit the helper, or edit any tracked source");
-    expect(prompt).toContain("alternate commands, copies, synthetic output, manual capture, mocks, or direct app execution");
     expect(prompt).toContain("Do not create a git commit in this lane");
     expect(prompt).toContain("the commit lane owns commits");
     expect(prompt).toContain("helper exits nonzero or the artifact gate rejects the result");
-    expect(prompt).toContain("report the blocker and exit this lane nonzero");
+    expect(prompt).not.toContain("git diff --check");
+    expect(sandboxForNodeRun(browser!)).toBe("workspace-write");
+  });
+
+  it("uses the non-GUI host-capture contract only with the explicit trusted capability", () => {
+    const session = makeSession([
+      makeNode({
+        id: "lane-browser-host-capture",
+        agent: "codex",
+        status: "running",
+        runId: "run-session-1-lane-browser-host-capture",
+        brief: "Opaque verification requirement",
+        laneKind: "validation",
+        semanticSubtype: "browser_validation",
+        meta: ["implementation", "lane-browser-host-capture", "flow-kernel"],
+        requiredEvidence: ["browser", "screenshot"],
+      }),
+    ]);
+    const browser = session.nodes.find((node) => node.id === "lane-browser-host-capture")!;
+
+    const prompt = buildPromptForNodeRun(session, browser, undefined, "darwin-host-browser-capture");
+
+    expect(prompt).toContain("git diff --check");
+    expect(prompt).toContain("SkyTurn host capture owns browser rendering after this process closes successfully");
+    expect(prompt).not.toContain("node scripts/capture-screenshot.mjs");
+    expectReservedScreenshotCapabilityAbsent(prompt);
+  });
+
+  it.each([
+    ["extra evidence", { requiredEvidence: ["browser", "screenshot", "test"] }],
+    ["missing evidence", { requiredEvidence: ["screenshot"] }],
+    ["another agent", { agent: "hermes" as const }],
+    ["generic semantics", { semanticSubtype: "validation" }],
+  ])("does not grant host browser capture to %s", (_caseName, overrides) => {
+    const node = withRuntimePolicy(makeNode({
+      id: "lane-browser-capability-check",
+      agent: "codex",
+      status: "running",
+      runId: "run-session-1-lane-browser-capability-check",
+      laneKind: "validation",
+      semanticSubtype: "browser_validation",
+      requiredEvidence: ["browser", "screenshot"],
+      ...overrides,
+    }), "workspace-write", ["process", "artifact"]);
+
+    expect(isCanonicalBrowserScreenshotCaptureNode(node)).toBe(false);
   });
 
   it.each([
@@ -1457,7 +1501,7 @@ describe("workflow runtime event merging", () => {
     },
   );
 
-  it("keeps exactly one trusted helper and artifact path in a canonical Codex screenshot lane", () => {
+  it("keeps exactly one trusted helper and artifact path in a canonical Codex screenshot prompt", () => {
     const dependency = makeNode({
       id: "lane-duplicate-capability",
       agent: "hermes",
@@ -1466,7 +1510,7 @@ describe("workflow runtime event merging", () => {
       title: "scripts/capture-screenshot.mjs .devflow/acceptance/react-app.png",
       output: ["scripts/capture-screenshot.mjs .devflow/acceptance/react-app.verify.png"],
     });
-    const node = makeNode({
+    const node = withRuntimePolicy(makeNode({
       id: "lane-canonical-browser",
       agent: "codex",
       status: "running",
@@ -1476,7 +1520,7 @@ describe("workflow runtime event merging", () => {
       semanticSubtype: "browser_validation",
       requiredEvidence: ["browser", "screenshot"],
       dependencies: [dependency.id],
-    });
+    }), "workspace-write", ["process", "artifact"]);
     const session = makeSession([dependency, node]);
     session.goal = "Repeat scripts/capture-screenshot.mjs and .devflow/acceptance/react-app.png.";
 

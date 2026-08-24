@@ -60,6 +60,7 @@ test("Electron workflow shutdown awaits bridge reap before closing SQLite and pr
     planRuntime: { close: async () => events.push("plan:close") },
     reopenWorkflowAdvanceAdmission: () => events.push("workflow:admission-reopen"),
     reopenWorkflowTerminalReconciliationAdmission: () => events.push("terminal:admission-reopen"),
+    scheduledBrowserScreenshotCaptures: new Map(),
     workflowStores: new Map([["/project", store]]),
     workflowStoresClosePromise: null,
     workflowTerminalReconciliationFailures: [],
@@ -620,7 +621,11 @@ test("public run:start and private planner delivery have separate main-only auth
     main.indexOf("async function resolveScheduledWorkflowWorktree"),
   );
   assert.match(scheduledInputBuilder, /runtime\.sandboxForNodeRun\(node\)/);
-  assert.match(scheduledInputBuilder, /prompt:\s*runtime\.buildPromptForNodeRun\(session, node, ledger\)/);
+  assert.match(
+    scheduledInputBuilder,
+    /const prompt = process\.platform === "darwin"\s*\?\s*runtime\.buildPromptForNodeRun\(session, node, ledger, "darwin-host-browser-capture"\)\s*:\s*runtime\.buildPromptForNodeRun\(session, node, ledger\);/,
+  );
+  assert.match(scheduledInputBuilder, /\n\s+prompt,\n/);
 });
 
 test("scheduled New-worktree lanes use the real Git service to create, reuse, reopen, and separate durable candidates", async (t) => {
@@ -5127,6 +5132,8 @@ async function runBlockedWriterObserverBackfill() {
       runId: segment.runId,
     }),
     trustedRunStartIdentity: async () => ({}),
+    registerScheduledBrowserScreenshotCapture() {},
+    revokeScheduledBrowserScreenshotCapture() {},
     compensateScheduledWorkflowStartBuildFailure: async () => {
       throw new Error("Unexpected start-input compensation.");
     },

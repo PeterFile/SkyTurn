@@ -2396,6 +2396,8 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     "function broadcastWorkflowProjection() {}",
     "function requireWorkflowCanvasSession(store, sessionId) { const session = store.materializeCanvasSession(sessionId); if (!session || session.kind !== 'canvas') throw new Error('missing CanvasSession'); return session; }",
     "function compensateFailedWorkflowRun(store, segment, error) { store.recordRunResult({ ...segment, evidence: { runId: segment.runId, status: 'failed', exitCode: 1, changesetId: null, checks: [{ kind: 'run-exit', name: 'Coordinator start', status: 'failed' }], artifacts: [], review: null, errorReason: error instanceof Error ? error.message : String(error), cancelReason: null, completedAt: new Date().toISOString() }, now: new Date().toISOString() }); }",
+    "function registerScheduledBrowserScreenshotCapture() {}",
+    "function revokeScheduledBrowserScreenshotCapture() {}",
     "async function publicRunStartHandler(input, ownership) { launchedRuns.push({ input, ownership }); return { id: input.runId, status: 'running' }; }",
     "async function trustedRunStartIdentity(input) { return { projectRoot: input.projectRoot, sessionId: input.sessionId, laneId: input.nodeId, runId: input.runId, agentKind: input.agentKind, worktreePath: input.worktreePath, startFingerprint: `test:${input.runId}` }; }",
     `async function resolveExecutableRunIdentity(input, _phase, knownStore) {
@@ -2507,6 +2509,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     Error,
     Map,
     Promise,
+    process: { platform: process.platform },
     path: { isAbsolute: (value) => typeof value === "string" && value.startsWith("/") },
     fs: { realpath },
     module,

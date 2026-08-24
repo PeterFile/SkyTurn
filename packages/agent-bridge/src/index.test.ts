@@ -2663,7 +2663,7 @@ describe("agent bridge", () => {
     });
     const completed = waitForEvent(
       bridge,
-      (event) => event.kind === "status" && event.payload.status === "succeeded",
+      (event) => event.kind === "status" && ["succeeded", "failed"].includes(event.payload.status),
     );
 
     const run = await bridge.startRun({
@@ -2675,7 +2675,8 @@ describe("agent bridge", () => {
       agentKind: "codex",
       prompt: "Implement the task",
     });
-    await completed;
+    const terminal = await completed;
+    expect(terminal).toMatchObject({ kind: "status", payload: { status: "succeeded" } });
 
     const events = await loadRunEvents(projectRoot, run.id);
     const output = await readTaskOutput(projectRoot, "node-codex");
@@ -4847,6 +4848,584 @@ describe("agent bridge", () => {
       status: "failed",
       detail: "verified=0 missing=0 empty=1 unsafe=0",
     });
+  });
+
+  it("runs one Codex post-close producer before the unchanged artifact verifier and terminal pair", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    await mkdir(join(projectRoot, ".devflow/acceptance"), { recursive: true });
+    const artifact = ".devflow/acceptance/post-close.png";
+    await writeFile(join(projectRoot, artifact), "previous-bytes");
+    const childClosedMarker = join(projectRoot, "child-closed");
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(codexPath, `#!/bin/sh\nprintf closed > '${childClosedMarker}'\nexit 0\n`, { mode: 0o755 });
+    const order: string[] = [];
+    let producerCalls = 0;
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          async postCloseArtifactProducer(input, publisher, signal) {
+            producerCalls += 1;
+            expect(signal.aborted).toBe(false);
+            expect(await readFile(childClosedMarker, "utf8")).toBe("closed");
+            expect(input.expectedArtifacts).toEqual([artifact]);
+            order.push("producer");
+            await publisher.publish(artifact, Buffer.from("png-bytes"));
+            return "produced";
+          },
+          artifactVerificationHooks: {
+            beforeHelperStart() {
+              order.push("verifier");
+            },
+          },
+        }),
+      ],
+    });
+    const completed = waitForEvent(bridge, (event) => {
+      if (event.kind === "status" && ["succeeded", "failed"].includes(event.payload.status)) order.push("terminal");
+      return event.kind === "status" && ["succeeded", "failed"].includes(event.payload.status);
+    });
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-post-close-producer",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "workspace-write",
+      prompt: "Run one non-GUI validation.",
+      expectedArtifacts: [artifact],
+    });
+
+    const terminal = await completed;
+    const evidence = deriveEvidenceFromEvents(run, await loadRunEvents(projectRoot, run.id));
+
+    expect(terminal).toMatchObject({ kind: "status", payload: { status: "succeeded" } });
+    expect(producerCalls).toBe(1);
+    expect(order).toEqual(["producer", "verifier", "terminal"]);
+    expect(await readFile(join(projectRoot, artifact), "utf8")).toBe("png-bytes");
+    expect(evidence.status).toBe("succeeded");
+    expect(evidence.checks).toContainEqual(expect.objectContaining({ kind: "artifact", status: "passed" }));
+
+    await writeFile(codexPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const failedRunId = "run-post-close-producer-nonzero";
+    const failed = waitForEvent(
+      bridge,
+      (event) => event.runId === failedRunId && event.kind === "status" && event.payload.status === "failed",
+    );
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: failedRunId,
+      nodeId: "node-post-close-producer-nonzero",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "workspace-write",
+      prompt: "Fail one non-GUI validation.",
+      expectedArtifacts: [artifact],
+    });
+    await failed;
+    expect(producerCalls).toBe(1);
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "publishes through the retained worktree fd after the worktree pathname is replaced",
+    async () => {
+      const projectRoot = await makeTempRoot();
+      const originalRoot = `${projectRoot}-original`;
+      roots.push(originalRoot);
+      const replacementRoot = await makeTempRoot();
+      await mkdir(join(projectRoot, ".git"));
+      await mkdir(join(replacementRoot, ".git"));
+      const artifact = ".devflow/acceptance/anchored.png";
+      const binRoot = await makeTempRoot();
+      const codexPath = join(binRoot, "codex");
+      await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      let retainedFd = -1;
+      const bridge = new AgentBridge({
+        adapters: [
+          createCodexCliAdapter({
+            executablePath: codexPath,
+            async postCloseArtifactProducer(_input, publisher) {
+              await publisher.publish(artifact, Buffer.from("anchored-png"));
+              return "produced";
+            },
+            artifactVerificationHooks: {
+              async afterWorktreeOpen(fd) {
+                retainedFd = fd;
+                await rename(projectRoot, originalRoot);
+                await symlink(replacementRoot, projectRoot);
+              },
+            },
+          }),
+        ],
+      });
+      const terminal = waitForEvent(
+        bridge,
+        (event) => event.kind === "status" && ["succeeded", "failed"].includes(event.payload.status),
+      );
+
+      const run = await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: "node-anchored-publication",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "codex",
+        sandbox: "workspace-write",
+        prompt: "Publish through the retained worktree.",
+        expectedArtifacts: [artifact],
+      });
+      const status = await terminal;
+      const events = await loadRunEvents(projectRoot, run.id);
+
+      expect(status).toMatchObject({ kind: "status", payload: { status: "succeeded" } });
+      expect(retainedFd).toBeGreaterThan(2);
+      expect(await readFile(join(originalRoot, artifact), "utf8")).toBe("anchored-png");
+      await expect(lstat(join(replacementRoot, artifact))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(deriveEvidenceFromEvents(run, events)).toMatchObject({
+        status: "succeeded",
+        artifacts: [artifact],
+      });
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects a symlink publication target without writing outside the retained worktree",
+    async () => {
+      const projectRoot = await makeTempRoot();
+      await mkdir(join(projectRoot, ".git"));
+      await mkdir(join(projectRoot, ".devflow/acceptance"), { recursive: true });
+      const artifact = ".devflow/acceptance/target-guard.png";
+      const outsideRoot = await makeTempRoot();
+      const outsideTarget = join(outsideRoot, "outside.png");
+      await writeFile(outsideTarget, "outside-bytes");
+      await symlink(outsideTarget, join(projectRoot, artifact));
+      const binRoot = await makeTempRoot();
+      const codexPath = join(binRoot, "codex");
+      await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const bridge = new AgentBridge({
+        adapters: [
+          createCodexCliAdapter({
+            executablePath: codexPath,
+            async postCloseArtifactProducer(_input, publisher) {
+              await publisher.publish(artifact, Buffer.from("host-png"));
+              return "produced";
+            },
+          }),
+        ],
+      });
+      const failed = waitForEvent(
+        bridge,
+        (event) => event.kind === "status" && event.payload.status === "failed",
+      );
+      const run = await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: "node-symlink-publication",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "codex",
+        sandbox: "workspace-write",
+        prompt: "Reject the symlink target.",
+        expectedArtifacts: [artifact],
+      });
+
+      await failed;
+      const events = await loadRunEvents(projectRoot, run.id);
+
+      expect(await readFile(outsideTarget, "utf8")).toBe("outside-bytes");
+      expect((await lstat(join(projectRoot, artifact))).isSymbolicLink()).toBe(true);
+      expect(JSON.stringify(events)).not.toContain(outsideRoot);
+      expect(deriveEvidenceFromEvents(run, events)).toMatchObject({ status: "failed", artifacts: [] });
+    },
+  );
+
+  it.each([
+    ["undeclared path", async (publisher: { publish(path: string, bytes: Uint8Array): Promise<void> }) => {
+      await publisher.publish(".devflow/acceptance/forged.png", Buffer.from("png"));
+      return "produced" as const;
+    }],
+    ["duplicate publish", async (publisher: { publish(path: string, bytes: Uint8Array): Promise<void> }, artifact: string) => {
+      await publisher.publish(artifact, Buffer.from("png"));
+      await publisher.publish(artifact, Buffer.from("png-again"));
+      return "produced" as const;
+    }],
+    ["empty payload", async (publisher: { publish(path: string, bytes: Uint8Array): Promise<void> }, artifact: string) => {
+      await publisher.publish(artifact, Buffer.alloc(0));
+      return "produced" as const;
+    }],
+    ["oversized payload", async (publisher: { publish(path: string, bytes: Uint8Array): Promise<void> }, artifact: string) => {
+      await publisher.publish(artifact, Buffer.alloc(32 * 1024 * 1024 + 1));
+      return "produced" as const;
+    }],
+    ["forged produced result", async () => "produced" as const],
+  ])("fails closed for a post-close producer with %s", async (_label, action) => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const artifact = ".devflow/acceptance/bounded.png";
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    let verifierCalls = 0;
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          async postCloseArtifactProducer(_input, publisher) {
+            return action(publisher, artifact);
+          },
+          artifactVerificationHooks: {
+            beforeHelperStart() {
+              verifierCalls += 1;
+            },
+          },
+        }),
+      ],
+    });
+    const failed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "failed",
+    );
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: `node-bounded-${String(_label).replaceAll(" ", "-")}`,
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "workspace-write",
+      prompt: "Reject an invalid host publication.",
+      expectedArtifacts: [artifact],
+    });
+
+    await failed;
+    const events = await loadRunEvents(projectRoot, run.id);
+
+    expect(verifierCalls).toBe(0);
+    expect(terminalRunStatuses(events)).toHaveLength(1);
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ kind: "status", payload: expect.objectContaining({ status: "succeeded" }) }),
+    );
+    expect(JSON.stringify(events)).not.toContain(artifact);
+    expect(deriveEvidenceFromEvents(run, events).artifacts).toEqual([]);
+  });
+
+  it.each(["failure", "timeout"] as const)(
+    "reaps a post-close publication helper after %s without publishing success",
+    async (mode) => {
+      const projectRoot = await makeTempRoot();
+      await mkdir(join(projectRoot, ".git"));
+      const artifact = ".devflow/acceptance/helper-failure.png";
+      const binRoot = await makeTempRoot();
+      const codexPath = join(binRoot, "codex");
+      const helperPath = join(binRoot, "artifact-helper");
+      const helperPidPath = join(binRoot, "artifact-helper.pid");
+      await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await writeFile(helperPath, mode === "failure"
+        ? "#!/bin/sh\nexit 1\n"
+        : `#!/bin/sh\nprintf $$ > '${helperPidPath}'\nwhile true; do sleep 1; done\n`, { mode: 0o755 });
+      const bridge = new AgentBridge({
+        adapters: [
+          createCodexCliAdapter({
+            executablePath: codexPath,
+            async postCloseArtifactProducer(_input, publisher) {
+              await publisher.publish(artifact, Buffer.from("png"));
+              return "produced";
+            },
+            artifactVerificationHooks: { helperPath, helperTimeoutMs: 25 },
+          }),
+        ],
+      });
+      const failed = waitForEvent(
+        bridge,
+        (event) => event.kind === "status" && event.payload.status === "failed",
+      );
+      const run = await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: `node-publication-helper-${mode}`,
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "codex",
+        sandbox: "workspace-write",
+        prompt: "Fail the publication helper.",
+        expectedArtifacts: [artifact],
+      });
+
+      await failed;
+      const events = await loadRunEvents(projectRoot, run.id);
+
+      if (mode === "timeout") {
+        const helperPid = Number(await waitForFile(helperPidPath));
+        expect(isPidAlive(helperPid)).toBe(false);
+      }
+      expect(terminalRunStatuses(events)).toHaveLength(1);
+      expect(deriveEvidenceFromEvents(run, events)).toMatchObject({ status: "failed", artifacts: [] });
+    },
+  );
+
+  it("aborts and reaps an in-flight post-close publication helper before cancellation settles", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const artifact = ".devflow/acceptance/aborted-helper.png";
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    const helperPath = join(binRoot, "artifact-helper");
+    const helperPidPath = join(binRoot, "artifact-helper.pid");
+    await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await writeFile(
+      helperPath,
+      `#!/bin/sh\nprintf $$ > '${helperPidPath}'\nwhile true; do sleep 1; done\n`,
+      { mode: 0o755 },
+    );
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          async postCloseArtifactProducer(_input, publisher) {
+            await publisher.publish(artifact, Buffer.from("png"));
+            return "produced";
+          },
+          artifactVerificationHooks: { helperPath, helperTimeoutMs: 5_000 },
+        }),
+      ],
+    });
+    const cancelled = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "cancelled",
+    );
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-publication-helper-abort",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "workspace-write",
+      prompt: "Abort the publication helper.",
+      expectedArtifacts: [artifact],
+    });
+    const helperPid = Number(await waitForFile(helperPidPath));
+
+    const evidence = await bridge.cancelRun(run.id, "Cancel host publication");
+    await cancelled;
+    const events = await loadRunEvents(projectRoot, run.id);
+
+    expect(isPidAlive(helperPid)).toBe(false);
+    expect(evidence).toMatchObject({ status: "cancelled", artifacts: [] });
+    expect(terminalRunStatuses(events)).toHaveLength(1);
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ kind: "status", payload: expect.objectContaining({ status: "succeeded" }) }),
+    );
+  });
+
+  it("rejects post-close publication through the Windows verifier boundary", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const artifact = ".devflow/acceptance/non-posix.png";
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          async postCloseArtifactProducer(_input, publisher) {
+            await publisher.publish(artifact, Buffer.from("png"));
+            return "produced";
+          },
+          artifactVerificationHooks: {
+            platform: "win32",
+            windowsVerifierDependencies: fakeWindowsVerifierDependencies({
+              status: "passed",
+              artifacts: [artifact],
+              counts: { verified: 1, missing: 0, empty: 0, unsafe: 0 },
+            }),
+          },
+        }),
+      ],
+    });
+    const failed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "failed",
+    );
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-non-posix-publication",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "workspace-write",
+      prompt: "Reject a non-POSIX host publication.",
+      expectedArtifacts: [artifact],
+    });
+
+    await failed;
+    const events = await loadRunEvents(projectRoot, run.id);
+
+    expect(terminalRunStatuses(events)).toHaveLength(1);
+    expect(deriveEvidenceFromEvents(run, events)).toMatchObject({ status: "failed", artifacts: [] });
+  });
+
+  it.each([
+    ["omitted", undefined],
+    ["empty", []],
+  ] as const)("does not invoke the Codex post-close producer for %s expected artifacts", async (_label, expectedArtifacts) => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    let producerCalls = 0;
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          async postCloseArtifactProducer() {
+            producerCalls += 1;
+            throw new Error("producer must not receive an empty capability");
+          },
+        }),
+      ],
+    });
+    const completed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "succeeded",
+    );
+
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: `node-post-close-${_label}`,
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "workspace-write",
+      prompt: "Run without artifact capability.",
+      ...(expectedArtifacts === undefined ? {} : { expectedArtifacts }),
+    });
+
+    await completed;
+    expect(producerCalls).toBe(0);
+    expect(deriveEvidenceFromEvents(run, await loadRunEvents(projectRoot, run.id))).toMatchObject({
+      status: "succeeded",
+      artifacts: [],
+    });
+  });
+
+  it("fails closed before verification when the Codex post-close producer fails", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    await mkdir(join(projectRoot, ".devflow/acceptance"), { recursive: true });
+    const artifact = ".devflow/acceptance/preexisting.png";
+    await writeFile(join(projectRoot, artifact), "preexisting-png-bytes");
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    let verifierCalls = 0;
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          async postCloseArtifactProducer() {
+            throw new Error("host producer failed");
+          },
+          artifactVerificationHooks: {
+            beforeHelperStart() {
+              verifierCalls += 1;
+            },
+          },
+        }),
+      ],
+    });
+    const failed = waitForEvent(
+      bridge,
+      (event) => event.kind === "status" && event.payload.status === "failed",
+    );
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-post-close-producer-failure",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "workspace-write",
+      prompt: "Run one non-GUI validation.",
+      expectedArtifacts: [artifact],
+    });
+
+    await failed;
+    const events = await loadRunEvents(projectRoot, run.id);
+
+    expect(verifierCalls).toBe(0);
+    expect(terminalRunStatuses(events)).toHaveLength(1);
+    expect(deriveEvidenceFromEvents(run, events)).toMatchObject({ status: "failed", artifacts: [] });
+  });
+
+  it("aborts one in-flight Codex post-close producer without publishing success", async () => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const codexPath = join(binRoot, "codex");
+    await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const producerStarted = deferred<void>();
+    const producerAborted = deferred<void>();
+    const releaseProducerCleanup = deferred<void>();
+    let producerCalls = 0;
+    const bridge = new AgentBridge({
+      adapters: [
+        createCodexCliAdapter({
+          executablePath: codexPath,
+          postCloseArtifactProducer: async (_input, _publisher, signal) => {
+            producerCalls += 1;
+            producerStarted.resolve();
+            await new Promise<void>((resolve) => {
+              const abort = () => resolve();
+              signal.addEventListener("abort", abort, { once: true });
+              if (signal.aborted) abort();
+            });
+            producerAborted.resolve();
+            await releaseProducerCleanup.promise;
+            throw new Error("producer aborted after cleanup");
+          },
+        }),
+      ],
+    });
+    const run = await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-post-close-producer-cancel",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox: "workspace-write",
+      prompt: "Run one non-GUI validation.",
+      expectedArtifacts: [".devflow/acceptance/cancelled.png"],
+    });
+    await Promise.race([
+      producerStarted.promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("producer did not start")), 500)),
+    ]);
+
+    const cancellation = bridge.cancelRun(run.id, "Cancel host capture");
+    await producerAborted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(terminalRunStatuses(await loadRunEvents(projectRoot, run.id))).toEqual([]);
+    releaseProducerCleanup.resolve();
+    const evidence = await cancellation;
+    const events = await loadRunEvents(projectRoot, run.id);
+
+    expect(producerCalls).toBe(1);
+    expect(evidence.status).toBe("cancelled");
+    expect(terminalRunStatuses(events)).toHaveLength(1);
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ kind: "status", payload: expect.objectContaining({ status: "succeeded" }) }),
+    );
   });
 
   it.runIf(process.platform !== "win32")(

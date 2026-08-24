@@ -6,6 +6,7 @@ import {
 } from "@skyturn/orchestrator";
 import type { WorkspaceState } from "@skyturn/persistence";
 import {
+  BROWSER_SCREENSHOT_EXPECTED_ARTIFACT,
   RUN_EVENT_PROTOCOL_VERSION,
   deriveRunEvidenceFromRunEvents,
   deriveNodeStatusFromEvidence,
@@ -61,6 +62,8 @@ const MAX_UNTRUSTED_PROMPT_LIST_ITEMS = 64;
 const RESERVED_SCREENSHOT_CAPABILITY_MARKER = "[reserved screenshot capability]";
 const RESERVED_SCREENSHOT_HELPER_PATTERN = /(?:scripts[\\/]+)?capture-screenshot\.mjs/gi;
 const RESERVED_SCREENSHOT_ARTIFACT_PATTERN = /\.devflow[\\/]+acceptance[\\/]+react-app(?:\.verify)?\.png/gi;
+
+export type WorkflowPromptCapability = "darwin-host-browser-capture";
 
 export async function loadExactRunEvidence(queryRoot: string, runId: string): Promise<RunEvidence> {
   if (typeof window === "undefined" || !window.devflow) {
@@ -789,6 +792,7 @@ export function buildPromptForNodeRun(
   session: CanvasSession,
   node: CanvasNode,
   sessionLedger?: WorkflowLedgerSummary,
+  promptCapability?: WorkflowPromptCapability,
 ): string {
   if (node.agent === "hermes") {
     if (node.display?.meta.includes("flow-kernel") && node.id !== session.plannerNodeId) {
@@ -825,7 +829,7 @@ export function buildPromptForNodeRun(
     });
   }
 
-  const laneInstruction = codexLaneInstruction(node);
+  const laneInstruction = codexLaneInstruction(node, promptCapability);
   const dependencyEvidence = dependencyEvidenceForPrompt(session, node);
   return [
     `Task: ${sanitizeUntrustedPromptFragment(node.context.brief)}`,
@@ -885,7 +889,10 @@ function hermesGoalForNode(session: CanvasSession, node: CanvasNode): string {
   return `${session.goal}\nCurrent requirement: ${brief}`;
 }
 
-function codexLaneInstruction(node: CanvasNode): string {
+function codexLaneInstruction(
+  node: CanvasNode,
+  promptCapability?: WorkflowPromptCapability,
+): string {
   const laneKind = node.laneKind ?? node.display?.meta[0] ?? "";
   if (laneKind === "commit") {
     return [
@@ -896,17 +903,27 @@ function codexLaneInstruction(node: CanvasNode): string {
       "Do not stage `.devflow/`.",
     ].join(" ");
   }
-  const expectedArtifacts = expectedArtifactsForNode(node);
-  if (nodeHasBrowserScreenshotContract(node, expectedArtifacts)) {
+  if (isCanonicalBrowserScreenshotCaptureNode(node)) {
+    if (promptCapability !== "darwin-host-browser-capture") {
+      return [
+        "First, load all applicable repository instructions.",
+        `Then, from the repository root, perform exactly one bounded validation action: run \`node scripts/capture-screenshot.mjs ${BROWSER_SCREENSHOT_EXPECTED_ARTIFACT}\` exactly once and wait for it to exit.`,
+        "The fixed helper is the only permitted artifact producer; it starts and closes bounded Vite and Electron processes.",
+        "Do not start a separate dev server, browser, or Electron process. Do not use ad-hoc automation or retry the helper.",
+        "Do not do unrelated work, edit the helper, or edit any tracked source.",
+        "Do not produce the artifact through alternate commands, copies, synthetic output, manual capture, mocks, or direct app execution.",
+        "Do not create a git commit in this lane; the commit lane owns commits.",
+        "If the helper exits nonzero or the artifact gate rejects the result, report the blocker and exit this lane nonzero.",
+      ].join(" ");
+    }
     return [
       "First, load all applicable repository instructions.",
-      `Then, from the repository root, perform exactly one bounded validation action: run \`node scripts/capture-screenshot.mjs ${expectedArtifacts[0]}\` exactly once and wait for it to exit.`,
-      "The fixed helper is the only permitted artifact producer; it starts and closes bounded Vite and Electron processes.",
-      "Do not start a separate dev server, browser, or Electron process. Do not use ad-hoc automation or retry the helper.",
-      "Do not do unrelated work, edit the helper, or edit any tracked source.",
-      "Do not produce the artifact through alternate commands, copies, synthetic output, manual capture, mocks, or direct app execution.",
+      "Then, from the repository root, run exactly one bounded non-GUI validation command: `git diff --check` exactly once and wait for it to exit.",
+      "Do not start Vite, a development server, a browser, or Electron. Do not run any screenshot capture or GUI automation command.",
+      "Do not create or modify screenshot artifacts; SkyTurn host capture owns browser rendering after this process closes successfully.",
+      "Do not do unrelated work or edit tracked source.",
       "Do not create a git commit in this lane; the commit lane owns commits.",
-      "If the helper exits nonzero or the artifact gate rejects the result, report the blocker and exit this lane nonzero.",
+      "If the validation command fails, report the blocker and exit this lane nonzero.",
     ].join(" ");
   }
   if (/implementation|implement|change|update|edit/.test(laneKind.toLowerCase())) {
@@ -918,11 +935,25 @@ function codexLaneInstruction(node: CanvasNode): string {
   return "";
 }
 
-function nodeHasBrowserScreenshotContract(node: CanvasNode, expectedArtifacts: string[]): boolean {
+export function isCanonicalBrowserScreenshotCaptureNode(node: CanvasNode): boolean {
   if (node.agent !== "codex" || !isExecutableNode(node)) return false;
-  if (expectedArtifacts.length === 0) return false;
-  const requiredEvidence = new Set((node.requiredEvidence ?? []).map((kind) => kind.trim().toLowerCase()));
-  if (!requiredEvidence.has("browser") || !requiredEvidence.has("screenshot")) return false;
+  if (
+    node.requiredEvidence?.length !== 2 ||
+    node.requiredEvidence[0] !== "browser" ||
+    node.requiredEvidence[1] !== "screenshot"
+  ) return false;
+  const expectedArtifacts = expectedArtifactsForNode(node);
+  if (
+    expectedArtifacts.length !== 1 ||
+    expectedArtifacts[0] !== BROWSER_SCREENSHOT_EXPECTED_ARTIFACT
+  ) return false;
+  const policy = node.runtimePolicy;
+  if (
+    policy?.source !== "workflow_projection" ||
+    policy.trusted !== true ||
+    policy.executable !== true ||
+    policy.sandbox !== "workspace-write"
+  ) return false;
   const semanticSubtype = canonicalLaneSemantic(node.semanticSubtype);
   return (node.laneKind === "validation" || node.laneKind === "regression") &&
     /^(?:browser|screenshot|browser_screenshot)_(?:validation|test|check)$/.test(semanticSubtype);

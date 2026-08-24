@@ -139,6 +139,7 @@ const defaultTerminalCols = 80;
 const defaultTerminalRows = 24;
 const defaultTerminalScrollbackBytes = 256_000;
 const artifactHelperTimeoutMs = 2_000;
+const maxExpectedArtifactPublicationBytes = 32 * 1024 * 1024;
 
 type CliFailureCategory =
   | "cli-missing"
@@ -362,6 +363,15 @@ export interface CodexCliAdapterOptions {
   pathValue?: string;
   codexConfigRoot?: string | null;
   codexAuthFilePath?: string | null;
+  postCloseArtifactProducer?: (
+    input: Readonly<StartAgentRunInput>,
+    publisher: ExpectedArtifactPublisher,
+    signal: AbortSignal,
+  ) => Promise<"not-applicable" | "produced">;
+}
+
+export interface ExpectedArtifactPublisher {
+  publish(artifact: string, bytes: Uint8Array): Promise<void>;
 }
 
 export interface HermesCliAdapterOptions {
@@ -2303,11 +2313,13 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
       const retainedWorktree = worktreeHandle;
       const artifactVerificationAbort = new AbortController();
       let windowsVerifier: WindowsExpectedArtifactVerifierSession | null = null;
+      let postCloseArtifactProducerPromise: Promise<void> | null = null;
       let closeRunResourcesPromise: Promise<void> | null = null;
       const closeRunResources = (): Promise<void> => {
         if (closeRunResourcesPromise) return closeRunResourcesPromise;
         closeRunResourcesPromise = Promise.resolve().then(async () => {
           artifactVerificationAbort.abort();
+          await postCloseArtifactProducerPromise?.catch(() => undefined);
           await windowsVerifier?.abort().catch(() => undefined);
           await retainedWorktree?.close().catch(() => undefined);
         });
@@ -2488,6 +2500,20 @@ export function createCodexCliAdapter(options: CodexCliAdapterOptions = {}): Loc
               });
             }
             try {
+              if (
+                exitCode === 0 &&
+                options.postCloseArtifactProducer &&
+                hasNonEmptyStrictExpectedArtifactDeclarations(input.expectedArtifacts)
+              ) {
+                postCloseArtifactProducerPromise = runPostCloseArtifactProducer(
+                  options.postCloseArtifactProducer,
+                  input,
+                  retainedWorktree?.fd ?? null,
+                  artifactVerificationHooks,
+                  artifactVerificationAbort.signal,
+                );
+                await postCloseArtifactProducerPromise;
+              }
               artifactVerification = await verifyExpectedArtifacts(
                 input,
                 workdir,
@@ -3064,6 +3090,162 @@ async function verifyExpectedArtifacts(
     },
     passed,
   };
+}
+
+function hasNonEmptyStrictExpectedArtifactDeclarations(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length === 0) return false;
+  const declarations = parseExpectedArtifactDeclarations(value);
+  return declarations !== null &&
+    declarations.length === value.length &&
+    declarations.every((declaration, index) => declaration === value[index]);
+}
+
+async function runPostCloseArtifactProducer(
+  producer: NonNullable<CodexCliAdapterOptions["postCloseArtifactProducer"]>,
+  input: Readonly<StartAgentRunInput>,
+  worktreeFd: number | null,
+  hooks: ArtifactVerificationHooks | undefined,
+  signal: AbortSignal,
+): Promise<void> {
+  const declarations = strictExpectedArtifactDeclarations(input.expectedArtifacts);
+  let active = true;
+  let attempted = false;
+  let published = false;
+  let publication: Promise<void> | null = null;
+  const publisher: ExpectedArtifactPublisher = {
+    publish(artifact, bytes) {
+      if (!active || attempted) {
+        return Promise.reject(new Error("Expected artifact publisher is unavailable."));
+      }
+      attempted = true;
+      publication = publishExpectedArtifact(
+        worktreeFd,
+        declarations,
+        artifact,
+        bytes,
+        hooks,
+        signal,
+      ).then(() => {
+        published = true;
+      });
+      return publication;
+    },
+  };
+
+  let result: "not-applicable" | "produced" | undefined;
+  let producerError: unknown = null;
+  try {
+    result = await producer(input, publisher, signal);
+  } catch (error) {
+    producerError = error;
+  } finally {
+    active = false;
+  }
+  let publicationError: unknown = null;
+  try {
+    await publication;
+  } catch (error) {
+    publicationError = error;
+  }
+  if (producerError) throw producerError;
+  if (publicationError) throw publicationError;
+  if (result !== "not-applicable" && result !== "produced") {
+    throw new Error("Codex post-close artifact producer returned an invalid result.");
+  }
+  if ((result === "produced") !== published) {
+    throw new Error("Codex post-close artifact producer did not match its publication result.");
+  }
+}
+
+async function publishExpectedArtifact(
+  worktreeFd: number | null,
+  declarations: readonly string[],
+  artifact: string,
+  bytes: Uint8Array,
+  hooks: ArtifactVerificationHooks | undefined,
+  signal: AbortSignal,
+): Promise<void> {
+  if (
+    signal.aborted ||
+    artifactVerificationPlatform(hooks) === "win32" ||
+    worktreeFd === null ||
+    !declarations.includes(artifact) ||
+    parseExpectedArtifactDeclaration(artifact) !== artifact ||
+    !(bytes instanceof Uint8Array) ||
+    bytes.byteLength === 0 ||
+    bytes.byteLength > maxExpectedArtifactPublicationBytes
+  ) {
+    throw new Error("Expected artifact publication was rejected.");
+  }
+  const payload = Buffer.from(bytes);
+  const helperPath = hooks?.helperPath ?? fileURLToPath(new URL("./native/artifact-gate", import.meta.url));
+  const published = await runArtifactPublicationHelper(
+    helperPath,
+    worktreeFd,
+    artifact,
+    payload,
+    hooks?.helperTimeoutMs ?? artifactHelperTimeoutMs,
+    signal,
+  );
+  if (!published) throw new Error("Expected artifact publication failed.");
+}
+
+function runArtifactPublicationHelper(
+  helperPath: string,
+  worktreeFd: number,
+  artifact: string,
+  bytes: Buffer,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(helperPath, ["write", artifact], {
+        stdio: ["pipe", "pipe", "ignore", worktreeFd],
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    const helperInput = child.stdin!;
+    const helperOutput = child.stdout!;
+    let output = "";
+    let killIssued = false;
+    const terminate = (): void => {
+      if (killIssued) return;
+      killIssued = true;
+      helperInput.destroy();
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    };
+    signal.addEventListener("abort", terminate, { once: true });
+    if (signal.aborted) terminate();
+    const timeout = setTimeout(terminate, timeoutMs);
+    helperInput.on("error", () => undefined);
+    helperOutput.setEncoding("utf8");
+    helperOutput.on("data", (chunk: string) => {
+      if (output.length + chunk.length > 256) {
+        terminate();
+        return;
+      }
+      output += chunk;
+    });
+    child.once("error", terminate);
+    child.once("close", (code) => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", terminate);
+      helperInput.destroy();
+      resolve(
+        !signal.aborted &&
+        code === 0 &&
+        /^(?:RESULT published\n?)$/.test(output),
+      );
+    });
+    if (!killIssued) helperInput.end(bytes);
+  });
 }
 
 async function inspectExpectedArtifact(

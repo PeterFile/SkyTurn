@@ -38,6 +38,7 @@ import type {
   WorkflowIntentOperation,
   WorkflowIntentOperationType,
 } from "@skyturn/workflow-kernel" with { "resolution-mode": "import" };
+import type { ExpectedArtifactPublisher } from "@skyturn/agent-bridge" with { "resolution-mode": "import" };
 import {
   WORKFLOW_EVENT_CHANNEL,
   WORKFLOW_IPC_PROTOCOL_VERSION,
@@ -89,6 +90,7 @@ import {
 } from "./planIpcContracts";
 import { createPlanRuntime } from "./planRuntime";
 import { createPlanProjectIdentityRegistry } from "./planProjectIdentity";
+import { createBrowserScreenshotHostProducer } from "./browserScreenshotHostCapture";
 import {
   normalizeTerminalIpcError,
   terminalCancelInputError,
@@ -687,6 +689,7 @@ let workflowTerminalReconciliationAdmissionOpen = true;
 const MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT = 4;
 const DANGER_FULL_ACCESS_AUTHORIZATION_OPTION = "Authorize this run";
 const inFlightRemoteSideEffects = new Map<string, InFlightRemoteSideEffect>();
+const scheduledBrowserScreenshotCaptures = new Map<string, ScheduledBrowserScreenshotCaptureAuthorization>();
 const workflowSessionMutationLocks = new Map<string, Promise<void>>();
 let remoteSideEffectSequence = 0;
 const workspaceSaveWriter = createWorkspaceSaveWriter();
@@ -694,6 +697,10 @@ const terminalRuntime = createTerminalRuntime({
   protocolVersion: RUN_PROTOCOL_VERSION,
   featureEnabled: terminalPtyFeatureEnabled,
   broadcastEvent: broadcastTerminalEvent,
+});
+const browserScreenshotHostProducer = createBrowserScreenshotHostProducer({
+  createBrowserWindow: (options) => new BrowserWindow(options),
+  cacheRoot: path.join(app.getPath("userData"), "browser-capture-cache"),
 });
 
 interface AgentBridgeHost {
@@ -716,6 +723,18 @@ interface TerminalPersistenceFailureLike {
   agentKind: string;
   reason: "terminal-persistence-failed";
   evidence: unknown;
+}
+
+interface ScheduledBrowserScreenshotCaptureAuthorization {
+  store: WorkflowStoreHost;
+  segment: {
+    sessionId: string;
+    laneId: string;
+    segmentId: string;
+    runId: string;
+    agentKind: string;
+  };
+  identity: TrustedRunStartIdentity;
 }
 
 interface WorkflowSegmentRendererFacts {
@@ -2843,6 +2862,7 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
       ...watchdogOptions,
       ...(process.env.SKYTURN_CODEX_SANDBOX === "workspace-write" ? { sandbox: "workspace-write" as const } : {}),
       ...(process.env.SKYTURN_CODEX_IGNORE_USER_CONFIG === "1" ? { extraArgs: ["--ignore-user-config"] } : {}),
+      postCloseArtifactProducer: produceScheduledBrowserScreenshotArtifact,
     };
     const durableRunClaimStore = createDurableRunClaimStore({
       root: path.join(app.getPath("userData"), "run-claims"),
@@ -2857,6 +2877,13 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
         registerWorkflowTerminalReconciliation(() => compensateTerminalPersistenceFailure(failure)),
     }) as AgentBridgeHost;
     bridge.onRunEvent((event) => {
+      if (isRecord(event) && event.kind === "status" && isRecord(event.payload)) {
+        const runId = optionalText(event.runId);
+        const status = optionalText(event.payload.status);
+        if (runId && status && new Set(["succeeded", "failed", "cancelled", "timed-out"]).has(status)) {
+          scheduledBrowserScreenshotCaptures.delete(runId);
+        }
+      }
       for (const window of BrowserWindow.getAllWindows()) {
         window.webContents.send("run:event", event);
       }
@@ -3311,8 +3338,16 @@ async function advanceOneWorkflowSession(
         continue;
       }
       try {
+        registerScheduledBrowserScreenshotCapture(
+          store,
+          segment,
+          input,
+          identity,
+          runtime,
+        );
         await scheduledWorkflowRunStartHandler(input, { store, segment, identity });
       } catch {
+        revokeScheduledBrowserScreenshotCapture(segment.runId, segment.segmentId);
         // The run-start boundary owns compensation; claim conflicts preserve the existing owner.
       }
     }
@@ -3504,6 +3539,9 @@ async function buildScheduledWorkflowRunStartInput(
   }
   const ledger = node.agent === "hermes" ? store.buildLedgerSummary(session.id) : undefined;
   const sandbox = runtime.sandboxForNodeRun(node);
+  const prompt = process.platform === "darwin"
+    ? runtime.buildPromptForNodeRun(session, node, ledger, "darwin-host-browser-capture")
+    : runtime.buildPromptForNodeRun(session, node, ledger);
   return {
     protocolVersion: RUN_PROTOCOL_VERSION,
     runId: segment.runId,
@@ -3522,8 +3560,186 @@ async function buildScheduledWorkflowRunStartInput(
     ...(artifactContract.declarations.length > 0
       ? { expectedArtifacts: artifactContract.declarations }
       : {}),
-    prompt: runtime.buildPromptForNodeRun(session, node, ledger),
+    prompt,
   };
+}
+
+function registerScheduledBrowserScreenshotCapture(
+  store: WorkflowStoreHost,
+  segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
+  input: StartAgentRunInput,
+  identity: TrustedRunStartIdentity,
+  runtime: {
+    isCanonicalBrowserScreenshotCaptureNode(node: CanvasSession["nodes"][number]): boolean;
+    sandboxForNodeRun(node: CanvasSession["nodes"][number]): string | undefined;
+  },
+): void {
+  if (process.platform !== "darwin") return;
+  const session = requireWorkflowCanvasSession(store, segment.sessionId);
+  const node = session.nodes.find((candidate) => candidate.id === segment.laneId);
+  const durableSegment = store.listRunningSegments().find((candidate) =>
+    candidate.sessionId === segment.sessionId &&
+    candidate.laneId === segment.laneId &&
+    candidate.segmentId === segment.segmentId &&
+    candidate.runId === segment.runId &&
+    candidate.agentKind === segment.agentKind
+  );
+  if (
+    !node ||
+    !durableSegment ||
+    node.runId !== segment.runId ||
+    node.agent !== "codex" ||
+    segment.agentKind !== "codex" ||
+    input.agentKind !== "codex" ||
+    input.sandbox !== "workspace-write" ||
+    runtime.sandboxForNodeRun(node) !== "workspace-write" ||
+    !runtime.isCanonicalBrowserScreenshotCaptureNode(node) ||
+    identity.projectRoot !== input.projectRoot ||
+    identity.sessionId !== segment.sessionId ||
+    identity.laneId !== segment.laneId ||
+    identity.runId !== segment.runId ||
+    identity.agentKind !== segment.agentKind ||
+    identity.worktreePath !== input.worktreePath
+  ) return;
+  const existing = scheduledBrowserScreenshotCaptures.get(segment.runId);
+  if (existing) return;
+  scheduledBrowserScreenshotCaptures.set(segment.runId, {
+    store,
+    segment: { ...segment },
+    identity: { ...identity },
+  });
+}
+
+function revokeScheduledBrowserScreenshotCapture(runId: string, segmentId: string): void {
+  const authorization = scheduledBrowserScreenshotCaptures.get(runId);
+  if (authorization?.segment.segmentId === segmentId) {
+    scheduledBrowserScreenshotCaptures.delete(runId);
+  }
+}
+
+async function produceScheduledBrowserScreenshotArtifact(
+  input: Readonly<StartAgentRunInput>,
+  publisher: ExpectedArtifactPublisher,
+  signal: AbortSignal,
+): Promise<"not-applicable" | "produced"> {
+  throwIfBrowserScreenshotCaptureAborted(signal);
+  if (process.platform !== "darwin") return "not-applicable";
+  const { BROWSER_SCREENSHOT_EXPECTED_ARTIFACT } = await import("@skyturn/project-core");
+  if (
+    input.agentKind !== "codex" ||
+    input.sandbox !== "workspace-write" ||
+    !isExactStringArray(input.expectedArtifacts, [BROWSER_SCREENSHOT_EXPECTED_ARTIFACT])
+  ) return "not-applicable";
+  const runId = optionalText(input.runId);
+  if (!runId) return "not-applicable";
+  const authorization = scheduledBrowserScreenshotCaptures.get(runId);
+  if (!authorization) {
+    if (await isAuthoritativeCanonicalBrowserScreenshotStart(input)) {
+      throw new Error("Host screenshot capture authorization is missing or already consumed.");
+    }
+    return "not-applicable";
+  }
+  scheduledBrowserScreenshotCaptures.delete(runId);
+  throwIfBrowserScreenshotCaptureAborted(signal);
+
+  const projectIdentity = await workflowStoreIdentity(authorization.identity.projectRoot);
+  if (workflowStores.get(projectIdentity) !== authorization.store) {
+    throw new Error("Host screenshot capture authorization is stale.");
+  }
+  const durableSegments = authorization.store.listRunningSegments().filter((candidate) =>
+    candidate.sessionId === authorization.segment.sessionId &&
+    candidate.laneId === authorization.segment.laneId &&
+    candidate.segmentId === authorization.segment.segmentId &&
+    candidate.runId === authorization.segment.runId &&
+    candidate.agentKind === authorization.segment.agentKind
+  );
+  if (durableSegments.length !== 1) {
+    throw new Error("Host screenshot capture segment is not the durable running attempt.");
+  }
+  const session = requireWorkflowCanvasSession(authorization.store, authorization.segment.sessionId);
+  const node = session.nodes.find((candidate) => candidate.id === authorization.segment.laneId);
+  const runtime = await import("@skyturn/ui-canvas/workflow-runtime");
+  if (
+    !node ||
+    node.runId !== authorization.segment.runId ||
+    node.agent !== authorization.segment.agentKind ||
+    runtime.sandboxForNodeRun(node) !== "workspace-write" ||
+    !runtime.isCanonicalBrowserScreenshotCaptureNode(node)
+  ) {
+    throw new Error("Host screenshot capture lane authorization is stale.");
+  }
+
+  const rebuiltInput = await buildScheduledWorkflowRunStartInput(
+    authorization.identity.projectRoot,
+    authorization.store,
+    authorization.segment,
+  );
+  const authorizedInput = await authorizeWorkflowRunStartInput(
+    { ...input } as StartAgentRunInput,
+    "scheduler",
+    authorization.store,
+  );
+  const [rebuiltIdentity, callbackIdentity] = await Promise.all([
+    trustedRunStartIdentity(rebuiltInput, false),
+    trustedRunStartIdentity(authorizedInput, false),
+  ]);
+  if (
+    !sameTrustedRunStartIdentity(rebuiltIdentity, authorization.identity) ||
+    !sameTrustedRunStartIdentity(callbackIdentity, authorization.identity) ||
+    !isExactStringArray(rebuiltInput.expectedArtifacts, [BROWSER_SCREENSHOT_EXPECTED_ARTIFACT])
+  ) {
+    throw new Error("Host screenshot capture start identity is stale.");
+  }
+  throwIfBrowserScreenshotCaptureAborted(signal);
+  await browserScreenshotHostProducer({
+    worktreePath: rebuiltIdentity.worktreePath,
+  }, (png) => publisher.publish(BROWSER_SCREENSHOT_EXPECTED_ARTIFACT, png), signal);
+  throwIfBrowserScreenshotCaptureAborted(signal);
+  return "produced";
+}
+
+async function isAuthoritativeCanonicalBrowserScreenshotStart(
+  input: Readonly<StartAgentRunInput>,
+): Promise<boolean> {
+  const projectRoot = optionalText(input.projectRoot);
+  const sessionId = optionalText(input.sessionId);
+  const nodeId = optionalText(input.nodeId);
+  if (!projectRoot || !sessionId || !nodeId) return false;
+  const projectIdentity = await workflowStoreIdentity(projectRoot).catch(() => null);
+  if (!projectIdentity) return false;
+  const store = workflowStores.get(projectIdentity);
+  if (!store) return false;
+  const session = store.materializeCanvasSession(sessionId);
+  if (!isRecord(session) || !Array.isArray(session.nodes)) return false;
+  const node = session.nodes.find((candidate) => isRecord(candidate) && candidate.id === nodeId);
+  if (!isRecord(node)) return false;
+  const runtime = await import("@skyturn/ui-canvas/workflow-runtime");
+  return runtime.isCanonicalBrowserScreenshotCaptureNode(
+    node as unknown as CanvasSession["nodes"][number],
+  );
+}
+
+function sameTrustedRunStartIdentity(left: TrustedRunStartIdentity, right: TrustedRunStartIdentity): boolean {
+  return left.projectRoot === right.projectRoot &&
+    left.sessionId === right.sessionId &&
+    left.laneId === right.laneId &&
+    left.runId === right.runId &&
+    left.agentKind === right.agentKind &&
+    left.worktreePath === right.worktreePath &&
+    left.startFingerprint === right.startFingerprint &&
+    left.plannerSessionId === right.plannerSessionId &&
+    left.plannerInputId === right.plannerInputId &&
+    left.hermesSessionHandle === right.hermesSessionHandle &&
+    left.transport === right.transport;
+}
+
+function isExactStringArray(value: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(value) && value.length === expected.length &&
+    value.every((candidate, index) => candidate === expected[index]);
+}
+
+function throwIfBrowserScreenshotCaptureAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new Error("Host screenshot capture aborted.");
 }
 
 async function resolveScheduledWorkflowWorktree(
@@ -8045,6 +8261,7 @@ function closeWorkflowStores(): Promise<void> {
   if (workflowStoresClosePromise) return workflowStoresClosePromise;
   closeWorkflowAdvanceAdmission();
   agentBridgeAdmissionOpen = false;
+  scheduledBrowserScreenshotCaptures.clear();
   const closing = (async () => {
     workspaceSaveWriter.closeAdmission();
     try {
