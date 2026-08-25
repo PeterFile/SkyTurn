@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { dirname, join } from "node:path";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -130,6 +131,33 @@ test("MVP demo verification script checks renderable Vite output", async () => {
 
   assert.match(source, /import \{ build \} from 'vite';/);
   assert.match(source, /await build\(\{ root: fileURLToPath\(new URL\('\.\.', import\.meta\.url\)\), logLevel: 'silent', build: \{ write: false \} \}\);/);
+});
+
+test("MVP seeded independent capture uses the exact host canonical CSS before settling and capture", async () => {
+  const product = await import("../dist-electron/electron/browserScreenshotHostCapture.js");
+  const demo = await import("./mvpWorkflowDemo.mjs");
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-demo-canonical-capture-"));
+
+  try {
+    await demo.seedBlankReactProject(projectRoot);
+    const seededCapture = await readFile(join(projectRoot, "scripts", "capture-screenshot.mjs"), "utf8");
+    const injectionIndex = seededCapture.indexOf(
+      `await win.webContents.insertCSS('${demo.INDEPENDENT_BROWSER_SCREENSHOT_CSS}')`,
+    );
+    const settleIndex = seededCapture.indexOf("setTimeout(resolve, 1200)");
+    const captureIndex = seededCapture.indexOf("win.webContents.capturePage()");
+
+    assert.equal(
+      demo.INDEPENDENT_BROWSER_SCREENSHOT_CSS,
+      "*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }",
+    );
+    assert.equal(demo.INDEPENDENT_BROWSER_SCREENSHOT_CSS, product.CANONICAL_BROWSER_SCREENSHOT_CSS);
+    assert.ok(injectionIndex >= 0, "seeded independent capture must inject canonical CSS.");
+    assert.ok(injectionIndex < settleIndex, "canonical CSS injection must precede the 1200 ms settle.");
+    assert.ok(settleIndex < captureIndex, "the 1200 ms settle must precede PNG capture.");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });
 
 test("MVP demo readiness preflight runs before workflow node execution", async () => {

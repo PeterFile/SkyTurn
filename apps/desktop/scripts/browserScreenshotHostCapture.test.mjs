@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import {
+import * as browserScreenshotHostCapture from "../dist-electron/electron/browserScreenshotHostCapture.js";
+
+const {
   BROWSER_SCREENSHOT_CAPTURE_STAGES,
   BrowserScreenshotCaptureStageError,
-  createBrowserScreenshotHostProducer as createProductionBrowserScreenshotHostProducer,
-} from "../dist-electron/electron/browserScreenshotHostCapture.js";
+  CANONICAL_BROWSER_SCREENSHOT_CSS,
+  createBrowserScreenshotHostProducer: createProductionBrowserScreenshotHostProducer,
+} = browserScreenshotHostCapture;
 
 const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
@@ -111,6 +115,11 @@ test("host capture uses isolated Vite cache and BrowserWindow settings, then cle
   const window = {
     webContents: {
       ...inertBrowserSecuritySurface(),
+      async insertCSS(css) {
+        assert.equal(css, CANONICAL_BROWSER_SCREENSHOT_CSS);
+        order.push("canonicalize");
+        return "canonical-css";
+      },
       async capturePage(...args) {
         assert.equal(args.length, 0);
         order.push("capture");
@@ -192,6 +201,7 @@ test("host capture uses isolated Vite cache and BrowserWindow settings, then cle
     assert.deepEqual(order, [
       "listen",
       "load",
+      "canonicalize",
       "capture",
       "destroy-window",
       "close-server",
@@ -237,6 +247,11 @@ test("host capture registers readiness before load and captures only after first
         },
         webContents: {
           ...inertBrowserSecuritySurface(),
+          async insertCSS(css) {
+            assert.equal(css, CANONICAL_BROWSER_SCREENSHOT_CSS);
+            order.push("canonicalize");
+            return "canonical-css";
+          },
           async capturePage() {
             captureCalls += 1;
             order.push("capture");
@@ -280,11 +295,179 @@ test("host capture registers readiness before load and captures only after first
     "listen-ready",
     "load",
     "remove-ready",
+    "canonicalize",
     "capture",
     "destroy-window",
     "close-server",
     "publish",
   ]);
+});
+
+test("host capture reports canonical CSS injection failures without publishing and still cleans up", async () => {
+  const sensitiveDetail = "/private/project/animated-secret";
+  const order = [];
+  let destroyed = false;
+  const producer = createBrowserScreenshotHostProducer({
+    async createViteServer() {
+      return {
+        httpServer: { address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43152 }) },
+        async listen() {},
+        async close() { order.push("close-server"); },
+      };
+    },
+    createBrowserWindow() {
+      return {
+        webContents: {
+          ...inertBrowserSecuritySurface(),
+          async insertCSS(css) {
+            assert.equal(css, CANONICAL_BROWSER_SCREENSHOT_CSS);
+            order.push("canonicalize");
+            throw new Error(sensitiveDetail);
+          },
+          async capturePage() {
+            order.push("capture");
+            return { isEmpty: () => false, toPNG: () => png };
+          },
+        },
+        async loadURL() { order.push("load"); },
+        isDestroyed: () => destroyed,
+        destroy() {
+          destroyed = true;
+          order.push("destroy-window");
+        },
+      };
+    },
+    async removeCacheDir(directory) {
+      await rm(directory, { recursive: true, force: true });
+      order.push("remove-cache");
+    },
+    captureTimeoutMs: 1_000,
+  });
+
+  await assert.rejects(
+    producer(
+      { worktreePath: "/project" },
+      async () => { order.push("publish"); },
+      new AbortController().signal,
+    ),
+    (error) => {
+      assert.equal(error instanceof BrowserScreenshotCaptureStageError, true);
+      assert.equal(error.stage, "window_load");
+      assert.doesNotMatch(error.message, /private|project|secret|animated/);
+      return true;
+    },
+  );
+  assert.deepEqual(order, [
+    "load",
+    "canonicalize",
+    "destroy-window",
+    "close-server",
+    "remove-cache",
+  ]);
+});
+
+test("host capture redacts abort reasons while canonical CSS injection is pending", async () => {
+  const sensitiveDetail = "/private/project/css-injection-secret";
+  const cacheRoot = await mkdtemp(join(tmpdir(), "skyturn-host-css-abort-"));
+  const controller = new AbortController();
+  const injectionStarted = deferred();
+  const injectionGate = deferred();
+  const injectionFinished = deferred();
+  let cacheDir;
+  let readyListener;
+  let readyListeners = 0;
+  let captures = 0;
+  let publications = 0;
+  let destroyed = 0;
+  let closed = 0;
+  let removed = 0;
+  const producer = createProductionBrowserScreenshotHostProducer({
+    async createViteServer(config) {
+      cacheDir = config.cacheDir;
+      return {
+        httpServer: { address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43153 }) },
+        async listen() {},
+        async close() { closed += 1; },
+      };
+    },
+    createBrowserWindow() {
+      return {
+        once(event, listener) {
+          assert.equal(event, "ready-to-show");
+          readyListener = listener;
+          readyListeners += 1;
+        },
+        removeListener(event, listener) {
+          assert.equal(event, "ready-to-show");
+          if (readyListener === listener) {
+            readyListener = undefined;
+            readyListeners -= 1;
+          }
+        },
+        webContents: {
+          ...inertBrowserSecuritySurface(),
+          async insertCSS(css) {
+            assert.equal(css, CANONICAL_BROWSER_SCREENSHOT_CSS);
+            injectionStarted.resolve();
+            try {
+              await injectionGate.promise;
+              return "canonical-css";
+            } finally {
+              injectionFinished.resolve();
+            }
+          },
+          async capturePage() {
+            captures += 1;
+            return { isEmpty: () => false, toPNG: () => png };
+          },
+        },
+        async loadURL() { readyListener?.(); },
+        isDestroyed: () => destroyed > 0,
+        destroy() { destroyed += 1; },
+      };
+    },
+    async removeCacheDir(directory) {
+      assert.equal(directory, cacheDir);
+      await rm(directory, { recursive: true, force: true });
+      removed += 1;
+    },
+    cacheRoot,
+    captureSettleMs: 1,
+    captureTimeoutMs: 1_000,
+  });
+
+  try {
+    const capture = producer(
+      { worktreePath: "/project" },
+      async () => { publications += 1; },
+      controller.signal,
+    );
+    await injectionStarted.promise;
+    controller.abort(sensitiveDetail);
+
+    await assert.rejects(capture, (error) => {
+      assert.equal(error instanceof BrowserScreenshotCaptureStageError, true);
+      assert.equal(error.name, "BrowserScreenshotCaptureStageError");
+      assert.equal(error.stage, "window_load");
+      assert.equal(error.message, "Host screenshot PNG capture failed at stage window_load.");
+      assert.equal(error.stack, `${error.name}: ${error.message}`);
+      assert.doesNotMatch(`${error.name}\n${error.message}\n${error.stack}`, /private|project|secret|injection/);
+      return true;
+    });
+    assert.equal(captures, 0);
+    assert.equal(publications, 0);
+    assert.equal(destroyed, 1);
+    assert.equal(closed, 1);
+    assert.equal(removed, 1);
+    assert.equal(readyListeners, 0);
+    assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+    assert.deepEqual(await readdir(cacheRoot), []);
+  } finally {
+    injectionGate.resolve();
+    await injectionFinished.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
 });
 
 test("host capture aborts cleanly while waiting for readiness or compositor settle", async () => {
@@ -842,6 +1025,7 @@ test("host capture restricts the renderer session to its exact Vite HTTP and Web
           },
           on(event, handler) { events.set(event, handler); },
           setWindowOpenHandler(handler) { windowOpenHandler = handler; },
+          async insertCSS() { return "canonical-css"; },
           async capturePage() { return { isEmpty: () => false, toPNG: () => png }; },
         },
         async loadURL() {
@@ -1045,6 +1229,7 @@ function inertBrowserSecuritySurface() {
       setPermissionRequestHandler() {},
       setPermissionCheckHandler() {},
     },
+    async insertCSS() { return "canonical-css"; },
     on() {},
     setWindowOpenHandler() {},
   };
