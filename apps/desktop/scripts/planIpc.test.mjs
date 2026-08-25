@@ -5664,46 +5664,87 @@ test("ordinary workspace-write scheduling remains automatic", async () => {
 
 test("scheduler grants one exact canonical browser capture capability and rejects forged reuse", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-browser-host-capability-"));
+  const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-browser-host-private-"));
+  const binRoot = await mkdtemp(join(tmpdir(), "skyturn-browser-host-bin-"));
+  const codexPath = join(binRoot, "codex");
+  const childClosedMarker = join(projectRoot, "child-closed");
   const starts = [];
   const captures = [];
-  const publications = [];
+  const lifecycle = [];
+  const producerGate = deferred();
+  const workspaceSaveGate = deferred();
+  const fsPromises = instrumentWorkspaceWrites({
+    blockPayload: '"label": "browser-shutdown-boundary"',
+    onBlocked: workspaceSaveGate.started,
+    release: workspaceSaveGate.release,
+  });
   const publisher = {
-    async publish(path, bytes) {
-      publications.push({ path, bytes: Buffer.from(bytes).toString("utf8") });
-    },
+    async publish() {},
   };
   let codexOptions;
   let loaded;
-  const bridge = {
-    async startRun(input) {
-      starts.push(input);
-      return { id: input.runId, status: "running" };
-    },
-    onRunEvent() { return () => undefined; },
-    listRuns() { return []; },
-    async loadEvents() { return []; },
-    async getEvidence() { return null; },
-    async discoverAgents() { return []; },
-    async close() {},
-  };
+  let unsubscribe;
+  let shutdown;
   try {
+    await mkdir(join(projectRoot, ".git"));
+    await writeFile(
+      codexPath,
+      "#!/bin/sh\nprintf closed > child-closed\nexit 0\n",
+      { mode: 0o755 },
+    );
     const { createRunStartHandler: productionCreateRunStartHandler } = await import(
       "../dist-electron/electron/runStartHandler.js"
     );
     loaded = await loadMainModule([], {
-      agentBridge: bridge,
+      useRealAgentBridge: true,
+      codexExecutablePath: codexPath,
+      userDataPath,
+      fsPromises,
       platform: "darwin",
       onCodexAdapterCreated(options) {
         codexOptions = options;
       },
+      onCodexAdapterStart(input) {
+        starts.push(input);
+        lifecycle.push("adapter-started");
+      },
+      beforePostCloseArtifactProducer: async () => {
+        assert.equal(await readFile(childClosedMarker, "utf8"), "closed");
+        lifecycle.push("child-closed");
+        producerGate.started.resolve();
+        await producerGate.release.promise;
+      },
       hostCaptureProducer: async (input, publishPng, signal) => {
         captures.push({ input, aborted: signal.aborted });
         await publishPng(Buffer.from("validated-png"));
+        lifecycle.push("producer-completed");
       },
       createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
         ...dependencies,
         assertStartInput: async () => undefined,
-        prepareBeforeCheckpoint: async () => true,
+        prepareBeforeCheckpoint: async (input, store, segment) => {
+          lifecycle.push("before-checkpoint-started");
+          store.recordRunCheckpoint({
+            sessionId: input.sessionId,
+            nodeId: input.nodeId,
+            laneId: segment.laneId,
+            runId: input.runId,
+            segmentId: segment.segmentId,
+            phase: "before",
+            executionTarget: "current_branch",
+            worktreePath: input.worktreePath,
+            branchName: "main",
+            headCommit: "a".repeat(40),
+            worktreeState: "clean",
+            evidenceRefs: [
+              { kind: "run", id: input.runId },
+              { kind: "segment", id: segment.segmentId },
+            ],
+            now: "2026-07-23T00:00:03.000Z",
+          });
+          lifecycle.push("before-checkpoint-recorded");
+          return true;
+        },
       }),
     });
     loaded.exports.openedProjectRoots.add(projectRoot);
@@ -5716,8 +5757,53 @@ test("scheduler grants one exact canonical browser capture capability and reject
       title: "Opaque browser verification",
       requiredEvidence: ["browser", "screenshot"],
     });
+    const bridge = await loaded.exports.getAgentBridge();
+    const terminal = new Promise((resolve) => {
+      unsubscribe = bridge.onRunEvent((event) => {
+        if (
+          event.kind === "status" &&
+          ["succeeded", "failed", "cancelled", "timed-out"].includes(event.payload.status)
+        ) {
+          lifecycle.push("terminal-status-emitted");
+          resolve(event);
+        }
+      });
+    });
 
     await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+    await producerGate.started.promise;
+    await assert.rejects(
+      loaded.ipcHandlers.get("run:start")({}, starts[0]),
+      /scheduled|renderer|main-owned/i,
+    );
+    assert.equal(starts.length, 1);
+    const pendingWorkspaceSave = loaded.ipcHandlers.get("workspace:save")({},
+      workspaceSnapshot(projectRoot, "browser-shutdown-boundary"));
+    await workspaceSaveGate.started.promise;
+    shutdown = loaded.exports.closeWorkflowStores();
+    lifecycle.push("shutdown-started");
+    producerGate.release.resolve();
+    const terminalEvent = await terminal;
+    const evidence = await bridge.getEvidence(projectRoot, starts[0].runId);
+    const events = await bridge.loadEvents(projectRoot, starts[0].runId);
+    assert.equal(terminalEvent.runId, starts[0].runId);
+    assert.equal(terminalEvent.kind, "status");
+    assert.equal(
+      terminalEvent.payload.status,
+      "succeeded",
+      JSON.stringify(evidence.checks),
+    );
+    assert.equal(terminalEvent.payload.exitCode, 0);
+    assert.deepEqual(evidence.artifacts, [".devflow/acceptance/react-app.png"]);
+    assert.equal(
+      evidence.checks.some((check) => check.kind === "artifact" && check.status === "passed"),
+      true,
+    );
+    assert.equal(
+      events.filter((event) => event.kind === "status" &&
+        ["succeeded", "failed", "cancelled", "timed-out"].includes(event.payload.status)).length,
+      1,
+    );
 
     assert.equal(starts.length, 1);
     assert.equal(starts[0].sandbox, "workspace-write");
@@ -5725,20 +5811,25 @@ test("scheduler grants one exact canonical browser capture capability and reject
     assert.match(starts[0].prompt, /git diff --check/);
     assert.doesNotMatch(starts[0].prompt, /capture-screenshot\.mjs/);
     assert.equal(typeof codexOptions?.postCloseArtifactProducer, "function");
-    assert.equal(
-      await codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
-      "produced",
-    );
+    assert.deepEqual(lifecycle, [
+      "before-checkpoint-started",
+      "before-checkpoint-recorded",
+      "adapter-started",
+      "child-closed",
+      "shutdown-started",
+      "producer-completed",
+      "terminal-status-emitted",
+    ]);
     assert.deepEqual(toPlain(captures), [{
       input: {
         worktreePath: starts[0].worktreePath,
       },
       aborted: false,
     }]);
-    assert.deepEqual(toPlain(publications), [{
-      path: ".devflow/acceptance/react-app.png",
-      bytes: "validated-png",
-    }]);
+    assert.equal(
+      await readFile(join(projectRoot, ".devflow/acceptance/react-app.png"), "utf8"),
+      "validated-png",
+    );
 
     await assert.rejects(
       codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
@@ -5767,13 +5858,9 @@ test("scheduler grants one exact canonical browser capture capability and reject
     await assert.rejects(codexOptions.postCloseArtifactProducer(starts[0], publisher, aborted.signal), /abort|cancel/i);
     assert.equal(captures.length, 1);
 
-    await assert.rejects(
-      loaded.ipcHandlers.get("run:start")({}, starts[0]),
-      /scheduled|renderer|main-owned/i,
-    );
-    assert.equal(starts.length, 1);
-
-    await loaded.exports.closeWorkflowStores();
+    workspaceSaveGate.release.resolve();
+    await pendingWorkspaceSave;
+    await shutdown;
     await loaded.exports.getWorkflowStore(projectRoot);
     await assert.rejects(
       codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
@@ -5781,8 +5868,15 @@ test("scheduler grants one exact canonical browser capture capability and reject
     );
     assert.equal(captures.length, 1);
   } finally {
+    producerGate.release.resolve();
+    workspaceSaveGate.release.resolve();
+    unsubscribe?.();
     await loaded?.exports.closeWorkflowStores();
-    await rm(projectRoot, { recursive: true, force: true });
+    await Promise.all([
+      rm(projectRoot, { recursive: true, force: true }),
+      rm(userDataPath, { recursive: true, force: true }),
+      rm(binRoot, { recursive: true, force: true }),
+    ]);
   }
 });
 
@@ -7009,21 +7103,48 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
     async close() {}
   }
   const realAgentBridgeModule = await import("@skyturn/agent-bridge");
-  const agentBridgeModule = {
-    ...realAgentBridgeModule,
-    AgentBridge,
-    createCodexCliAdapter: (adapterOptions) => {
-      options.onCodexAdapterCreated?.(adapterOptions);
-      return {};
-    },
-    createHermesCliAdapter: () => ({}),
-    createDurableRunClaimStore: options.createDurableRunClaimStore
-      ?? (() => ({ initialize: async () => undefined })),
-    createPrivateRunEventStore: () => ({}),
-    ...(options.assertExpectedArtifactVerifierCapability
-      ? { assertExpectedArtifactVerifierCapability: options.assertExpectedArtifactVerifierCapability }
-      : {}),
+  const createCodexAdapter = (adapterOptions) => {
+    options.onCodexAdapterCreated?.(adapterOptions);
+    if (!options.useRealAgentBridge) return {};
+    const postCloseArtifactProducer = adapterOptions.postCloseArtifactProducer;
+    const adapter = realAgentBridgeModule.createCodexCliAdapter({
+      ...adapterOptions,
+      executablePath: options.codexExecutablePath,
+      ...(postCloseArtifactProducer && options.beforePostCloseArtifactProducer
+        ? {
+            postCloseArtifactProducer: async (input, publisher, signal) => {
+              await options.beforePostCloseArtifactProducer(input);
+              return postCloseArtifactProducer(input, publisher, signal);
+            },
+          }
+        : {}),
+    });
+    if (!options.onCodexAdapterStart) return adapter;
+    return {
+      ...adapter,
+      async startRun(input, sink, context) {
+        options.onCodexAdapterStart(input);
+        return adapter.startRun(input, sink, context);
+      },
+    };
   };
+  const agentBridgeModule = options.useRealAgentBridge
+    ? {
+        ...realAgentBridgeModule,
+        createCodexCliAdapter: createCodexAdapter,
+      }
+    : {
+        ...realAgentBridgeModule,
+        AgentBridge,
+        createCodexCliAdapter: createCodexAdapter,
+        createHermesCliAdapter: () => ({}),
+        createDurableRunClaimStore: options.createDurableRunClaimStore
+          ?? (() => ({ initialize: async () => undefined })),
+        createPrivateRunEventStore: () => ({}),
+        ...(options.assertExpectedArtifactVerifierCapability
+          ? { assertExpectedArtifactVerifierCapability: options.assertExpectedArtifactVerifierCapability }
+          : {}),
+      };
   const genericModule = new Proxy({}, {
     get: (_target, property) => {
       if (property === "createTerminalRuntime") return () => terminalRuntime;

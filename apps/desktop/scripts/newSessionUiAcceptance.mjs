@@ -19,7 +19,7 @@ import {
 
 const require = createRequire(import.meta.url);
 const desktopRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const waitTimeoutMs = Number(process.env.SKYTURN_NEW_SESSION_UI_WAIT_TIMEOUT_MS ?? 25 * 60 * 1_000);
+const waitTimeoutMs = Number(process.env.SKYTURN_NEW_SESSION_UI_WAIT_TIMEOUT_MS ?? 35 * 60 * 1_000);
 const agentWatchdogTimeoutMs = Math.max(1_000, Math.min(12 * 60 * 1_000, waitTimeoutMs - 60_000));
 const pollIntervalMs = Number(process.env.SKYTURN_NEW_SESSION_UI_POLL_MS ?? 2_000);
 const commandOutputLimitBytes = Number(process.env.SKYTURN_NEW_SESSION_UI_OUTPUT_LIMIT_BYTES ?? 4_000);
