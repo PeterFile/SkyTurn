@@ -15,6 +15,7 @@ import type {
   CandidateDeliveryCommitPreparation,
 } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
 import type {
+  CommitLaneCompletionFacts,
   PlannerIntentDisposition,
   PlannerIntentOperationSummary,
 } from "@skyturn/persistence/workflow-store" with { "resolution-mode": "import" };
@@ -25,6 +26,7 @@ import type {
   PlanCancelRequest,
   PlanEvent,
   PlanStateSnapshot,
+  RunEvidence,
   CandidateReviewAgentKind,
   CandidateReviewDecision,
   CandidateReviewRequest,
@@ -62,6 +64,10 @@ import {
   recoverPendingPlannerIntentReconciliations,
   recoverTerminalWorkflowRuns,
 } from "./workflowRunRecovery";
+import {
+  completeWorkflowRun,
+  type WorkflowRunCompletionScope,
+} from "./workflowCommitCompletion";
 import {
   assertPublicRunStartIsNotScheduled,
   createRunStartHandler,
@@ -784,6 +790,8 @@ interface WorkflowStoreHost {
   resolveCurrentBranchTarget(input: unknown): unknown;
   recordCanvasNodePosition(input: unknown): unknown;
   recordRunCheckpoint(input: unknown): unknown;
+  recordCommitLaneCompletionFacts(input: unknown): CommitLaneCompletionFacts;
+  getCommitLaneCompletionFacts(identity: unknown): CommitLaneCompletionFacts | null;
   freezeCandidateManifest(input: unknown): unknown;
   getCandidateManifest(identity: unknown): unknown;
   appendCandidateReviewAllowed(input: unknown): unknown;
@@ -3105,19 +3113,128 @@ async function reconcileTerminalWorkflowRun(
     knownEvidence === undefined ? bridge.getEvidence(projectRoot, segment.runId) : Promise.resolve(knownEvidence),
   ]);
   assertTerminalRunEvidence(evidence, segment.runId);
-  const now = optionalText(readField(evidence, "completedAt")) ?? new Date().toISOString();
-  store.recordRunResult({
+  const { parseRunEvidence } = await import("@skyturn/project-core");
+  const rawEvidence = parseRunEvidence(evidence);
+  if (!rawEvidence || rawEvidence.runId !== segment.runId) {
+    throw workflowIpcError("INVALID_INPUT", "RunEvidence is not strict current-format terminal evidence.");
+  }
+  const now = rawEvidence.completedAt ?? new Date().toISOString();
+  const scope = workflowRunCompletionScope(store, segment);
+  await completeWorkflowRun(scope, rawEvidence, {
+    readCommitFacts: () => store.getCommitLaneCompletionFacts({
+      sessionId: segment.sessionId,
+      nodeId: segment.laneId,
+      laneId: segment.laneId,
+      segmentId: segment.segmentId,
+      runId: segment.runId,
+    }),
+    captureAndRecordCommitFacts: () => captureCommitLaneCompletionFacts(
+      store,
+      projectRoot,
+      segment,
+      events,
+      now,
+    ),
+    recordRunResult: (authoritativeEvidence) => {
+      store.recordRunResult({
+        sessionId: segment.sessionId,
+        laneId: segment.laneId,
+        segmentId: segment.segmentId,
+        runId: segment.runId,
+        agentKind: assertWorkflowAgentKind(segment.agentKind),
+        outputSummary: summarizeRunOutput(events),
+        runEvents: events,
+        evidence: authoritativeEvidence,
+        now,
+      });
+    },
+    freezeCandidateManifest: () => {
+      store.freezeCandidateManifest({
+        sessionId: segment.sessionId,
+        nodeId: segment.laneId,
+        laneId: segment.laneId,
+        segmentId: segment.segmentId,
+        runId: segment.runId,
+        now,
+      });
+    },
+  });
+  return reconcilePendingPlannerWorkflowIntent(projectRoot, store, segment);
+}
+
+function workflowRunCompletionScope(
+  store: WorkflowStoreHost,
+  segment: { sessionId: string; laneId: string; segmentId: string; runId: string },
+): WorkflowRunCompletionScope {
+  const projection = store.materializeFlowProjection(segment.sessionId) as FlowProjectionLike;
+  const lane = projection.lanes.find((candidate) => candidate.id === segment.laneId);
+  if (!lane) {
+    const planner = store.getPlannerStartAuthorization(segment.sessionId);
+    if (isRecord(planner) && planner.plannerNodeId === segment.laneId && planner.executable === true) {
+      return {
+        laneKind: "planner",
+        executable: true,
+        sessionId: segment.sessionId,
+        nodeId: segment.laneId,
+        laneId: segment.laneId,
+        segmentId: segment.segmentId,
+        runId: segment.runId,
+      };
+    }
+    throw workflowIpcError("INVALID_INPUT", "Workflow completion lane identity is unavailable.");
+  }
+  return {
+    laneKind: lane.laneKind ?? "",
+    executable: lane.executable === true,
     sessionId: segment.sessionId,
+    nodeId: segment.laneId,
     laneId: segment.laneId,
     segmentId: segment.segmentId,
     runId: segment.runId,
+  };
+}
+
+async function captureCommitLaneCompletionFacts(
+  store: WorkflowStoreHost,
+  projectRoot: string,
+  segment: { sessionId: string; laneId: string; segmentId: string; runId: string; agentKind: string },
+  events: unknown[],
+  now: string,
+): Promise<CommitLaneCompletionFacts> {
+  const identity = await resolveExecutableRunIdentity({
+    projectRoot,
+    sessionId: segment.sessionId,
+    nodeId: segment.laneId,
+    runId: segment.runId,
     agentKind: assertWorkflowAgentKind(segment.agentKind),
-    outputSummary: summarizeRunOutput(events),
-    runEvents: events,
-    evidence,
+  }, "after", store);
+  if (identity.segmentId !== segment.segmentId) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow result segment identity mismatch.");
+  }
+  const changeset = await reconcileRunChangeset(projectRoot, identity, events);
+  const stableIdentity = await verifyRunGitIdentityAtCheckpoint(identity);
+  const ancestry = await createAfterCheckpointAncestryProof(store, {
+    ...stableIdentity,
+    repositoryPath: await fs.realpath(projectRoot),
+  }, await workflowGitAncestryProofAuthority());
+  const finalIdentity = await verifyRunGitIdentityAtCheckpoint(stableIdentity);
+  return store.recordCommitLaneCompletionFacts({
+    sessionId: finalIdentity.sessionId,
+    nodeId: finalIdentity.nodeId,
+    laneId: finalIdentity.laneId,
+    segmentId: finalIdentity.segmentId,
+    runId: finalIdentity.runId,
+    executionTarget: finalIdentity.executionTarget,
+    ...(finalIdentity.worktreeId ? { worktreeId: finalIdentity.worktreeId } : {}),
+    worktreePath: finalIdentity.worktreePath,
+    branchName: finalIdentity.branchName,
+    baselineHeadCommit: finalIdentity.baselineHeadCommit,
+    afterHeadCommit: finalIdentity.headCommit,
+    afterWorktreeState: finalIdentity.worktreeState,
+    changeset,
+    ...ancestry,
     now,
   });
-  return reconcilePendingPlannerWorkflowIntent(projectRoot, store, segment);
 }
 
 async function reconcilePendingPlannerWorkflowIntent(
@@ -4026,6 +4143,7 @@ async function enrichTerminalWorkflowRun(
   knownEvidence?: unknown,
 ): Promise<void> {
   if (!isExecutableCheckpointLane(store, segment.sessionId, segment.laneId)) return;
+  if (workflowRunCompletionScope(store, segment).laneKind === "commit") return;
   const events = knownEvents ?? (bridge ? await bridge.loadEvents(projectRoot, segment.runId) : []);
   const identity = await resolveExecutableRunIdentity({
     projectRoot,
