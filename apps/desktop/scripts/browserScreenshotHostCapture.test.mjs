@@ -8,7 +8,7 @@ import { test } from "node:test";
 import {
   BROWSER_SCREENSHOT_CAPTURE_STAGES,
   BrowserScreenshotCaptureStageError,
-  createBrowserScreenshotHostProducer,
+  createBrowserScreenshotHostProducer as createProductionBrowserScreenshotHostProducer,
 } from "../dist-electron/electron/browserScreenshotHostCapture.js";
 
 const png = Buffer.from(
@@ -173,8 +173,8 @@ test("host capture uses isolated Vite cache and BrowserWindow settings, then cle
     await assert.rejects(stat(cacheDir), /ENOENT/);
     assert.equal(windowOptions.length, 1);
     assert.deepEqual(windowOptions[0], {
-      width: 1440,
-      height: 900,
+      width: 1280,
+      height: 800,
       show: false,
       webPreferences: {
         nodeIntegration: false,
@@ -202,6 +202,175 @@ test("host capture uses isolated Vite cache and BrowserWindow settings, then cle
     await rm(projectRoot, { recursive: true, force: true });
     await rm(cacheRoot, { recursive: true, force: true });
   }
+});
+
+test("host capture registers readiness before load and captures only after first paint settles", async () => {
+  const order = [];
+  const loadStarted = deferred();
+  let readyListener;
+  let readyListenerCount = 0;
+  let captureCalls = 0;
+  let destroyed = false;
+  const producer = createBrowserScreenshotHostProducer({
+    async createViteServer() {
+      return {
+        httpServer: { address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43135 }) },
+        async listen() {},
+        async close() { order.push("close-server"); },
+      };
+    },
+    createBrowserWindow() {
+      return {
+        once(event, listener) {
+          assert.equal(event, "ready-to-show");
+          readyListener = listener;
+          readyListenerCount += 1;
+          order.push("listen-ready");
+        },
+        removeListener(event, listener) {
+          assert.equal(event, "ready-to-show");
+          if (readyListener === listener) {
+            readyListener = undefined;
+            readyListenerCount -= 1;
+          }
+          order.push("remove-ready");
+        },
+        webContents: {
+          ...inertBrowserSecuritySurface(),
+          async capturePage() {
+            captureCalls += 1;
+            order.push("capture");
+            return { isEmpty: () => false, toPNG: () => png };
+          },
+        },
+        async loadURL() {
+          order.push("load");
+          loadStarted.resolve();
+        },
+        isDestroyed: () => destroyed,
+        destroy() {
+          destroyed = true;
+          order.push("destroy-window");
+        },
+      };
+    },
+    captureSettleMs: 40,
+    captureTimeoutMs: 1_000,
+  });
+
+  const capture = producer({ worktreePath: "/project" }, async () => {
+    order.push("publish");
+  }, new AbortController().signal);
+  await loadStarted.promise;
+  await new Promise((resolve) => setImmediate(resolve));
+  const listenerWasRegisteredBeforeLoad = order.indexOf("listen-ready") < order.indexOf("load");
+  const capturedBeforeReady = captureCalls > 0;
+  readyListener?.();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const capturedBeforeSettle = captureCalls > 0;
+  await capture;
+
+  assert.equal(listenerWasRegisteredBeforeLoad, true);
+  assert.equal(capturedBeforeReady, false);
+  assert.equal(capturedBeforeSettle, false);
+  assert.equal(captureCalls, 1);
+  assert.equal(readyListenerCount, 0);
+  assert.equal(order.indexOf("capture") > order.indexOf("remove-ready"), true);
+  assert.deepEqual(order, [
+    "listen-ready",
+    "load",
+    "remove-ready",
+    "capture",
+    "destroy-window",
+    "close-server",
+    "publish",
+  ]);
+});
+
+test("host capture aborts cleanly while waiting for readiness or compositor settle", async () => {
+  for (const phase of ["readiness", "settle"]) {
+    const controller = new AbortController();
+    const loadStarted = deferred();
+    let readyListener;
+    let readyListenerCount = 0;
+    let destroyed = 0;
+    let closed = 0;
+    let removed = 0;
+    let captured = 0;
+    let published = 0;
+    const producer = createBrowserScreenshotHostProducer({
+      async createViteServer() {
+        return {
+          httpServer: { address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43136 }) },
+          async listen() {},
+          async close() { closed += 1; },
+        };
+      },
+      createBrowserWindow() {
+        return {
+          once(event, listener) {
+            assert.equal(event, "ready-to-show");
+            readyListener = listener;
+            readyListenerCount += 1;
+          },
+          removeListener(event, listener) {
+            assert.equal(event, "ready-to-show");
+            if (readyListener === listener) {
+              readyListener = undefined;
+              readyListenerCount -= 1;
+            }
+          },
+          webContents: {
+            ...inertBrowserSecuritySurface(),
+            async capturePage() {
+              captured += 1;
+              return { isEmpty: () => false, toPNG: () => png };
+            },
+          },
+          async loadURL() { loadStarted.resolve(); },
+          isDestroyed: () => destroyed > 0,
+          destroy() { destroyed += 1; },
+        };
+      },
+      async removeCacheDir(directory) {
+        await rm(directory, { recursive: true, force: true });
+        removed += 1;
+      },
+      captureSettleMs: 10_000,
+      captureTimeoutMs: 1_000,
+    });
+
+    const capture = producer(
+      { worktreePath: "/project" },
+      async () => { published += 1; },
+      controller.signal,
+    );
+    await loadStarted.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    if (phase === "settle") {
+      readyListener?.();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    controller.abort(`cancel during ${phase}`);
+
+    await assert.rejects(capture, new RegExp(`abort|cancel during ${phase}`, "i"));
+    assert.equal(readyListenerCount, 0, phase);
+    assert.equal(captured, 0, phase);
+    assert.equal(published, 0, phase);
+    assert.equal(destroyed, 1, phase);
+    assert.equal(closed, 1, phase);
+    assert.equal(removed, 1, phase);
+  }
+});
+
+test("host capture rejects an invalid test settle duration", () => {
+  assert.throws(
+    () => createProductionBrowserScreenshotHostProducer({
+      createBrowserWindow() { assert.fail("invalid configuration must fail before capture"); },
+      captureSettleMs: 0,
+    }),
+    /settle/i,
+  );
 });
 
 test("host capture releases its positive loopback port before creating Vite", async () => {
@@ -835,6 +1004,38 @@ function deferred() {
   let resolve;
   const promise = new Promise((done) => { resolve = done; });
   return { promise, resolve };
+}
+
+function createBrowserScreenshotHostProducer(dependencies) {
+  const createBrowserWindow = dependencies.createBrowserWindow;
+  return createProductionBrowserScreenshotHostProducer({
+    captureSettleMs: 1,
+    ...dependencies,
+    createBrowserWindow(options) {
+      return withAutomaticReadyToShow(createBrowserWindow(options));
+    },
+  });
+}
+
+function withAutomaticReadyToShow(window) {
+  if (typeof window.once === "function" && typeof window.removeListener === "function") return window;
+  const loadURL = window.loadURL.bind(window);
+  let readyListener;
+  return {
+    ...window,
+    once(event, listener) {
+      assert.equal(event, "ready-to-show");
+      readyListener = listener;
+    },
+    removeListener(event, listener) {
+      assert.equal(event, "ready-to-show");
+      if (readyListener === listener) readyListener = undefined;
+    },
+    async loadURL(url) {
+      await loadURL(url);
+      readyListener?.();
+    },
+  };
 }
 
 function inertBrowserSecuritySurface() {
