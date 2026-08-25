@@ -4,12 +4,93 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { createBrowserScreenshotHostProducer } from "../dist-electron/electron/browserScreenshotHostCapture.js";
+import {
+  BROWSER_SCREENSHOT_CAPTURE_STAGES,
+  BrowserScreenshotCaptureStageError,
+  createBrowserScreenshotHostProducer,
+} from "../dist-electron/electron/browserScreenshotHostCapture.js";
 
 const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
 );
+
+test("host capture reports only fixed non-sensitive failure stages", async () => {
+  assert.deepEqual(BROWSER_SCREENSHOT_CAPTURE_STAGES, [
+    "authorization_lookup",
+    "durable_segment_lane_check",
+    "callback_identity_check",
+    "vite_create",
+    "vite_listen",
+    "window_load",
+    "window_capture",
+    "cleanup",
+    "publish",
+    "verify",
+  ]);
+
+  for (const expectedStage of [
+    "vite_create",
+    "vite_listen",
+    "window_load",
+    "window_capture",
+    "cleanup",
+    "publish",
+  ]) {
+    const sensitiveDetail = `/private/project/${expectedStage}/secret`;
+    const producer = createBrowserScreenshotHostProducer({
+      async createViteServer() {
+        if (expectedStage === "vite_create") throw new Error(sensitiveDetail);
+        return {
+          httpServer: { address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43140 }) },
+          async listen() {
+            if (expectedStage === "vite_listen") throw new Error(sensitiveDetail);
+          },
+          async close() {
+            if (expectedStage === "cleanup") throw new Error(sensitiveDetail);
+          },
+        };
+      },
+      createBrowserWindow() {
+        let destroyed = false;
+        return {
+          webContents: {
+            ...inertBrowserSecuritySurface(),
+            async capturePage() {
+              if (expectedStage === "window_capture") throw new Error(sensitiveDetail);
+              return { isEmpty: () => false, toPNG: () => png };
+            },
+          },
+          async loadURL() {
+            if (expectedStage === "window_load") throw new Error(sensitiveDetail);
+          },
+          isDestroyed: () => destroyed,
+          destroy() { destroyed = true; },
+        };
+      },
+      captureTimeoutMs: 1_000,
+    });
+
+    await assert.rejects(
+      producer(
+        { worktreePath: "/project" },
+        async () => {
+          if (expectedStage === "publish") throw new Error(sensitiveDetail);
+        },
+        new AbortController().signal,
+      ),
+      (error) => {
+        assert.equal(error instanceof BrowserScreenshotCaptureStageError, true);
+        assert.equal(error.stage, expectedStage);
+        assert.equal(BROWSER_SCREENSHOT_CAPTURE_STAGES.includes(error.stage), true);
+        assert.doesNotMatch(error.message, /private|project|secret/);
+        assert.equal(error.stack, `${error.name}: ${error.message}`);
+        assert.deepEqual(Object.keys(error).sort(), ["stage"]);
+        return true;
+      },
+    );
+  }
+});
 
 test("host capture uses isolated Vite cache and BrowserWindow settings, then cleans up after close", async () => {
   const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-host-capture-"));
