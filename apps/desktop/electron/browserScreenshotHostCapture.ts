@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 
 import type { BrowserWindowConstructorOptions, WebContents } from "electron";
@@ -61,6 +62,7 @@ interface ViteServerLike {
 interface BrowserScreenshotHostProducerDependencies {
   createBrowserWindow(options: BrowserWindowConstructorOptions): BrowserWindowLike;
   createViteServer?(config: InlineConfig): Promise<ViteServerLike>;
+  allocateVitePort?(): Promise<number>;
   captureTimeoutMs?: number;
   cacheRoot?: string;
   removeCacheDir?(cacheDir: string): Promise<void>;
@@ -79,6 +81,7 @@ export function createBrowserScreenshotHostProducer(
   signal: AbortSignal,
 ) => Promise<void> {
   const createViteServer = dependencies.createViteServer ?? defaultCreateViteServer;
+  const allocateVitePort = dependencies.allocateVitePort ?? allocateEphemeralLoopbackPort;
   const captureTimeoutMs = positiveTimeout(dependencies.captureTimeoutMs, defaultCaptureTimeoutMs);
   const cacheRoot = dependencies.cacheRoot ?? defaultCacheRoot;
   const removeCacheDir = dependencies.removeCacheDir ?? removeCaptureCacheDir;
@@ -93,6 +96,7 @@ export function createBrowserScreenshotHostProducer(
         {
           ...dependencies,
           createViteServer,
+          allocateVitePort,
           publishPng,
           captureTimeoutMs,
           cacheRoot,
@@ -110,7 +114,7 @@ async function captureOnce(
   outerSignal: AbortSignal,
   dependencies: Required<Pick<
     BrowserScreenshotHostProducerDependencies,
-    "createBrowserWindow" | "createViteServer" | "captureTimeoutMs" | "cacheRoot" | "removeCacheDir"
+    "createBrowserWindow" | "createViteServer" | "allocateVitePort" | "captureTimeoutMs" | "cacheRoot" | "removeCacheDir"
   >> & { publishPng: BrowserScreenshotPngPublisher },
 ): Promise<void> {
   const controller = new AbortController();
@@ -152,9 +156,17 @@ async function captureOnce(
         controller.signal,
       );
       throwIfAborted(controller.signal);
+      const vitePort = await captureStage("vite_create", async () => {
+        const port = await abortable(dependencies.allocateVitePort(), controller.signal);
+        if (!Number.isSafeInteger(port) || port <= 0 || port > 65_535) {
+          throw new Error("Host screenshot port allocator returned an invalid TCP port.");
+        }
+        return port;
+      }, controller.signal);
+      throwIfAborted(controller.signal);
       server = await captureStage(
         "vite_create",
-        () => dependencies.createViteServer(viteConfig(input.worktreePath, cacheDir!)),
+        () => dependencies.createViteServer(viteConfig(input.worktreePath, cacheDir!, vitePort)),
         controller.signal,
       );
       throwIfAborted(controller.signal);
@@ -283,7 +295,7 @@ function isAllowedViteHttpUrl(candidate: string, viteUrl: string): boolean {
   }
 }
 
-function viteConfig(worktreePath: string, cacheDir: string): InlineConfig {
+function viteConfig(worktreePath: string, cacheDir: string, port: number): InlineConfig {
   return {
     root: worktreePath,
     cacheDir,
@@ -294,10 +306,40 @@ function viteConfig(worktreePath: string, cacheDir: string): InlineConfig {
     clearScreen: false,
     server: {
       host: "127.0.0.1",
-      port: 0,
+      port,
       strictPort: true,
     },
   };
+}
+
+async function allocateEphemeralLoopbackPort(): Promise<number> {
+  const reservation = createNetServer();
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => {
+      reservation.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      reservation.off("error", onError);
+      resolve();
+    };
+    reservation.once("error", onError);
+    reservation.once("listening", onListening);
+    reservation.listen(0, "127.0.0.1");
+  });
+
+  try {
+    const address = reservation.address();
+    if (!address || typeof address === "string" ||
+      !Number.isSafeInteger(address.port) || address.port <= 0 || address.port > 65_535) {
+      throw new Error("Host screenshot port reservation returned an invalid TCP port.");
+    }
+    return address.port;
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      reservation.close((error) => error ? reject(error) : resolve());
+    });
+  }
 }
 
 function browserWindowOptions(): BrowserWindowConstructorOptions {
