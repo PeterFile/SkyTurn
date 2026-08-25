@@ -48,6 +48,8 @@ interface BrowserWindowLike {
   webContents: Pick<WebContents, "session" | "on" | "setWindowOpenHandler"> & {
     capturePage(): Promise<CapturedImageLike>;
   };
+  once(event: "ready-to-show", listener: () => void): void;
+  removeListener(event: "ready-to-show", listener: () => void): void;
   loadURL(url: string): Promise<void>;
   isDestroyed(): boolean;
   destroy(): void;
@@ -64,11 +66,13 @@ interface BrowserScreenshotHostProducerDependencies {
   createViteServer?(config: InlineConfig): Promise<ViteServerLike>;
   allocateVitePort?(): Promise<number>;
   captureTimeoutMs?: number;
+  captureSettleMs?: number;
   cacheRoot?: string;
   removeCacheDir?(cacheDir: string): Promise<void>;
 }
 
 const defaultCaptureTimeoutMs = 30_000;
+const defaultCaptureSettleMs = 1_200;
 const defaultCacheRoot = path.join(tmpdir(), "skyturn-browser-capture-cache");
 const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const pngIend = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
@@ -83,6 +87,11 @@ export function createBrowserScreenshotHostProducer(
   const createViteServer = dependencies.createViteServer ?? defaultCreateViteServer;
   const allocateVitePort = dependencies.allocateVitePort ?? allocateEphemeralLoopbackPort;
   const captureTimeoutMs = positiveTimeout(dependencies.captureTimeoutMs, defaultCaptureTimeoutMs);
+  const captureSettleMs = requiredPositiveDuration(
+    dependencies.captureSettleMs,
+    defaultCaptureSettleMs,
+    "Host screenshot capture settle duration must be a positive integer.",
+  );
   const cacheRoot = dependencies.cacheRoot ?? defaultCacheRoot;
   const removeCacheDir = dependencies.removeCacheDir ?? removeCaptureCacheDir;
   let tail: Promise<void> = Promise.resolve();
@@ -99,6 +108,7 @@ export function createBrowserScreenshotHostProducer(
           allocateVitePort,
           publishPng,
           captureTimeoutMs,
+          captureSettleMs,
           cacheRoot,
           removeCacheDir,
         },
@@ -114,7 +124,7 @@ async function captureOnce(
   outerSignal: AbortSignal,
   dependencies: Required<Pick<
     BrowserScreenshotHostProducerDependencies,
-    "createBrowserWindow" | "createViteServer" | "allocateVitePort" | "captureTimeoutMs" | "cacheRoot" | "removeCacheDir"
+    "createBrowserWindow" | "createViteServer" | "allocateVitePort" | "captureTimeoutMs" | "captureSettleMs" | "cacheRoot" | "removeCacheDir"
   >> & { publishPng: BrowserScreenshotPngPublisher },
 ): Promise<void> {
   const controller = new AbortController();
@@ -179,7 +189,16 @@ async function captureOnce(
       await captureStage("window_load", async () => {
         window = dependencies.createBrowserWindow(browserWindowOptions());
         restrictBrowserWindow(window, url);
-        await abortable(window.loadURL(url), controller.signal);
+        const readiness = waitForFirstPaint(window, controller.signal);
+        try {
+          await Promise.all([
+            abortable(window.loadURL(url), controller.signal),
+            readiness.promise,
+          ]);
+          await abortableDelay(dependencies.captureSettleMs, controller.signal);
+        } finally {
+          readiness.dispose();
+        }
       }, controller.signal);
       const image = await captureStage(
         "window_capture",
@@ -344,8 +363,8 @@ async function allocateEphemeralLoopbackPort(): Promise<number> {
 
 function browserWindowOptions(): BrowserWindowConstructorOptions {
   return {
-    width: 1440,
-    height: 900,
+    width: 1280,
+    height: 800,
     show: false,
     webPreferences: {
       nodeIntegration: false,
@@ -414,6 +433,56 @@ function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+function waitForFirstPaint(
+  window: BrowserWindowLike,
+  signal: AbortSignal,
+): { promise: Promise<void>; dispose(): void } {
+  let settled = false;
+  let disposed = false;
+  let resolveReady: (() => void) | null = null;
+  let rejectReady: ((error: Error) => void) | null = null;
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    window.removeListener("ready-to-show", onReady);
+    signal.removeEventListener("abort", onAbort);
+  };
+  const finish = (action: () => void): void => {
+    if (settled) return;
+    settled = true;
+    dispose();
+    action();
+  };
+  const onReady = (): void => finish(() => resolveReady?.());
+  const onAbort = (): void => finish(() => rejectReady?.(abortError(signal)));
+  const promise = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+    window.once("ready-to-show", onReady);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  return { promise, dispose };
+}
+
+function abortableDelay(durationMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (action: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      action();
+    };
+    const onAbort = (): void => finish(() => reject(abortError(signal)));
+    const timer = setTimeout(() => finish(resolve), durationMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw abortError(signal);
 }
@@ -427,4 +496,10 @@ function abortError(signal: AbortSignal): Error {
 
 function positiveTimeout(value: number | undefined, fallback: number): number {
   return Number.isSafeInteger(value) && (value ?? 0) > 0 ? value! : fallback;
+}
+
+function requiredPositiveDuration(value: number | undefined, fallback: number, message: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(message);
+  return value;
 }
