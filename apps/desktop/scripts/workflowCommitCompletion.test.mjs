@@ -48,6 +48,69 @@ test("clean advanced commits succeed for current branch and new worktree with bo
   }
 });
 
+test("collector changeset evidence is run-bound before atomic commit-fact persistence", async () => {
+  const { bindCommitChangesetEvidence } = await loadRuntime();
+  const collectorEvidence = {
+    evidenceId: "changeset-evidence-changeset-lane-commit",
+    changesetId: "changeset-lane-commit",
+    source: "git",
+    status: "available",
+    files: ["src/index.ts"],
+    diffStat: { added: 1, changed: 1, deleted: 0 },
+    patchPreviewTruncated: false,
+    worktreeId: "worktree-candidate",
+    collectedAt: "2026-08-16T00:00:07.000Z",
+    artifactPaths: ["artifacts/report.json"],
+    fullPatchSha256: "4".repeat(64),
+    fullPatchByteLength: 16,
+    fileManifestSha256: "5".repeat(64),
+  };
+  const input = {
+    sessionId: "session-1",
+    nodeId: "lane-commit",
+    laneId: "lane-commit",
+    segmentId: "segment-commit",
+    runId: "run-commit",
+    executionTarget: "new_worktree",
+    worktreeId: "worktree-candidate",
+    worktreePath: "/repo.worktrees/candidate",
+    branchName: "skyturn/session/candidate",
+    baselineHeadCommit: "a".repeat(40),
+    afterHeadCommit: "b".repeat(40),
+    afterWorktreeState: "clean",
+    changeset: {
+      evidence: collectorEvidence,
+      collectedAt: "2026-08-16T00:00:08.000Z",
+    },
+    ancestryProof: "strict-proof",
+    ancestryProofContext: { authority: "git" },
+    now: "2026-08-16T00:00:08.000Z",
+  };
+  let atomicStoreInput;
+  const atomicStore = {
+    recordCommitLaneCompletionFacts(value) {
+      atomicStoreInput = value;
+    },
+  };
+
+  atomicStore.recordCommitLaneCompletionFacts(bindCommitChangesetEvidence(input));
+
+  assert.deepEqual(JSON.parse(JSON.stringify(atomicStoreInput)), {
+    ...input,
+    changeset: {
+      ...input.changeset,
+      evidence: {
+        ...collectorEvidence,
+        evidenceId: "changeset-evidence:run-commit:after",
+        collectedAt: input.changeset.collectedAt,
+      },
+    },
+  });
+  assert.equal(atomicStoreInput.changeset.evidence.fullPatchSha256, collectorEvidence.fullPatchSha256);
+  assert.equal(atomicStoreInput.changeset.evidence.fullPatchByteLength, collectorEvidence.fullPatchByteLength);
+  assert.equal(atomicStoreInput.changeset.evidence.fileManifestSha256, collectorEvidence.fileManifestSha256);
+});
+
 test("raw failed, cancelled, and timed-out commit evidence stays exact", async () => {
   const { adjudicateWorkflowRunEvidence } = await loadRuntime();
   for (const raw of [
