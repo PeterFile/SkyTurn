@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -155,6 +156,8 @@ test("host capture uses isolated Vite cache and BrowserWindow settings, then cle
       new AbortController().signal,
     );
 
+    const vitePort = viteConfigs[0]?.server?.port;
+    assert.equal(Number.isSafeInteger(vitePort) && vitePort > 0, true);
     assert.deepEqual(viteConfigs, [{
       root: projectRoot,
       configFile: false,
@@ -163,7 +166,7 @@ test("host capture uses isolated Vite cache and BrowserWindow settings, then cle
       logLevel: "silent",
       clearScreen: false,
       cacheDir,
-      server: { host: "127.0.0.1", port: 0, strictPort: true },
+      server: { host: "127.0.0.1", port: vitePort, strictPort: true },
     }]);
     assert.equal(cacheDir.startsWith(`${cacheRoot}/`), true);
     assert.equal(cacheDir.startsWith(`${projectRoot}/`), false);
@@ -197,6 +200,85 @@ test("host capture uses isolated Vite cache and BrowserWindow settings, then cle
     ]);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
+    await rm(cacheRoot, { recursive: true, force: true });
+  }
+});
+
+test("host capture releases its positive loopback port before creating Vite", async () => {
+  let probedPort;
+  const producer = createBrowserScreenshotHostProducer({
+    async createViteServer(config) {
+      assert.equal(config.server.host, "127.0.0.1");
+      assert.equal(config.server.strictPort, true);
+      assert.equal(Number.isSafeInteger(config.server.port) && config.server.port > 0, true);
+      probedPort = config.server.port;
+
+      const probe = createNetServer();
+      await new Promise((resolve, reject) => {
+        probe.once("error", reject);
+        probe.listen(probedPort, "127.0.0.1", resolve);
+      });
+      await new Promise((resolve, reject) => {
+        probe.close((error) => error ? reject(error) : resolve());
+      });
+
+      return {
+        httpServer: { address: () => ({ address: "127.0.0.1", family: "IPv4", port: probedPort }) },
+        async listen() {},
+        async close() {},
+      };
+    },
+    createBrowserWindow() {
+      let destroyed = false;
+      return {
+        webContents: {
+          ...inertBrowserSecuritySurface(),
+          async capturePage() { return { isEmpty: () => false, toPNG: () => png }; },
+        },
+        async loadURL() {},
+        isDestroyed: () => destroyed,
+        destroy() { destroyed = true; },
+      };
+    },
+    captureTimeoutMs: 1_000,
+  });
+
+  await producer({ worktreePath: "/project" }, async () => {}, new AbortController().signal);
+  assert.equal(Number.isSafeInteger(probedPort) && probedPort > 0, true);
+});
+
+test("host capture reports allocator failure as vite_create and removes its cache", async () => {
+  const cacheRoot = await mkdtemp(join(tmpdir(), "skyturn-host-allocation-failure-"));
+  let viteCreations = 0;
+  const producer = createBrowserScreenshotHostProducer({
+    async allocateVitePort() {
+      throw new Error("sensitive allocator failure on port 43199");
+    },
+    async createViteServer() {
+      viteCreations += 1;
+      throw new Error("Vite creation must not run after allocator failure");
+    },
+    createBrowserWindow() {
+      assert.fail("BrowserWindow creation must not run after allocator failure");
+    },
+    cacheRoot,
+    captureTimeoutMs: 1_000,
+  });
+
+  try {
+    await assert.rejects(
+      producer({ worktreePath: "/project" }, async () => {}, new AbortController().signal),
+      (error) => {
+        assert.equal(error instanceof BrowserScreenshotCaptureStageError, true);
+        assert.equal(error.stage, "vite_create");
+        assert.doesNotMatch(error.message, /allocator|43199|sensitive/);
+        assert.equal(error.stack, `${error.name}: ${error.message}`);
+        return true;
+      },
+    );
+    assert.equal(viteCreations, 0);
+    assert.deepEqual(await readdir(cacheRoot), []);
+  } finally {
     await rm(cacheRoot, { recursive: true, force: true });
   }
 });
