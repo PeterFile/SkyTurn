@@ -25,6 +25,8 @@ const require = createRequire(import.meta.url);
 const desktopRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const defaultDemoWaitTimeoutMs = 20 * 60 * 1_000;
 const defaultDemoAgentWatchdogTimeoutMs = 8 * 60 * 1_000;
+export const INDEPENDENT_BROWSER_SCREENSHOT_CSS =
+  "*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }";
 const demoTimeouts = demoTimeoutsFromEnv(process.env);
 const waitTimeoutMs = demoTimeouts.waitTimeoutMs;
 const agentWatchdogTimeoutMs = demoTimeouts.agentWatchdogTimeoutMs;
@@ -426,6 +428,7 @@ export async function seedBlankReactProject(projectRoot) {
     "    \"  for (const expected of ['SkyTurn delivery complete', 'Hermes -> Codex', 'Ready for verification']) {\",",
     "    \"    if (!text.includes(expected)) throw new Error(`missing rendered text: ${expected}`);\",",
     "    \"  }\",",
+    `    "  await win.webContents.insertCSS('${INDEPENDENT_BROWSER_SCREENSHOT_CSS}');",`,
     "    \"  await new Promise((resolve) => setTimeout(resolve, 1200));\",",
     "    \"  const image = await win.webContents.capturePage();\",",
     "    \"  fs.writeFileSync(out, image.toPNG());\",",
@@ -606,6 +609,7 @@ async function captureWithElectron(url, screenshotPath, projectRoot) {
     "  const timeout = setTimeout(() => { console.error('capture timeout'); app.exit(1); }, 30000);",
     "  const win = new BrowserWindow({ width: 1280, height: 800, show: false });",
     "  await win.loadURL(url);",
+    `  await win.webContents.insertCSS('${INDEPENDENT_BROWSER_SCREENSHOT_CSS}');`,
     "  await new Promise((resolve) => setTimeout(resolve, 1200));",
     "  const image = await win.webContents.capturePage();",
     "  fs.writeFileSync(out, image.toPNG());",

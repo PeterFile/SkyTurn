@@ -13,6 +13,9 @@ export interface BrowserScreenshotHostCaptureInput {
 
 export type BrowserScreenshotPngPublisher = (png: Buffer) => Promise<void>;
 
+export const CANONICAL_BROWSER_SCREENSHOT_CSS =
+  "*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }";
+
 export const BROWSER_SCREENSHOT_CAPTURE_STAGES = [
   "authorization_lookup",
   "durable_segment_lane_check",
@@ -46,6 +49,7 @@ interface CapturedImageLike {
 
 interface BrowserWindowLike {
   webContents: Pick<WebContents, "session" | "on" | "setWindowOpenHandler"> & {
+    insertCSS(css: string): Promise<string>;
     capturePage(): Promise<CapturedImageLike>;
   };
   once(event: "ready-to-show", listener: () => void): void;
@@ -195,6 +199,11 @@ async function captureOnce(
             abortable(window.loadURL(url), controller.signal),
             readiness.promise,
           ]);
+          try {
+            await abortable(window.webContents.insertCSS(CANONICAL_BROWSER_SCREENSHOT_CSS), controller.signal);
+          } catch {
+            throw new BrowserScreenshotCaptureStageError("window_load");
+          }
           await abortableDelay(dependencies.captureSettleMs, controller.signal);
         } finally {
           readiness.dispose();

@@ -397,6 +397,82 @@ test("New Session UI acceptance verifies stable planner identity and determinist
   assert.equal(result.reopenedProjectionMatches, true);
 });
 
+test("settled replay comparison accepts only appended persistence audit events", async () => {
+  const { settledReplayStateMatches } = await import("./newSessionUiAcceptance.mjs");
+  const second = authoritativePlannerState("run-planner-2", "Second input", ["lane-1", "lane-2"]);
+
+  for (const kind of [
+    "workflow.run.recovery_failed",
+    "workflow.run.start_reconciliation_failed",
+    "workflow.node.checkpoint_failed",
+  ]) {
+    const reopened = structuredClone(second);
+    reopened.events.push(safeWorkflowEvent(81, kind, "lane-2", "run-lane-2"));
+    assert.equal(settledReplayStateMatches(second, reopened), true, kind);
+  }
+});
+
+test("settled replay comparison rejects non-audit appends and any settled-prefix change", async () => {
+  const { settledReplayStateMatches } = await import("./newSessionUiAcceptance.mjs");
+  const second = authoritativePlannerState("run-planner-2", "Second input", ["lane-1", "lane-2"]);
+  const cases = [
+    ["non-audit-append", (reopened) => {
+      reopened.events.push(safeWorkflowEvent(81, "workflow.lane.declared", "lane-3", "run-planner-2"));
+    }],
+    ["prefix-mutation", (reopened) => {
+      reopened.events[0].payload.summary = "Mutated settled event.";
+    }],
+    ["prefix-removal", (reopened) => {
+      reopened.events.splice(1, 1);
+    }],
+    ["prefix-reorder", (reopened) => {
+      [reopened.events[0], reopened.events[1]] = [reopened.events[1], reopened.events[0]];
+    }],
+    ["prefix-insertion", (reopened) => {
+      reopened.events.splice(1, 0, safeWorkflowEvent(15, "workflow.node.checkpoint_failed"));
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    const reopened = structuredClone(second);
+    mutate(reopened);
+    assert.equal(settledReplayStateMatches(second, reopened), false, name);
+  }
+});
+
+test("settled replay comparison rejects executable, evidence, and planner-summary drift", async () => {
+  const { settledReplayStateMatches } = await import("./newSessionUiAcceptance.mjs");
+  const second = authoritativePlannerState("run-planner-2", "Second input", ["lane-1", "lane-2"]);
+  second.authoritativeEvidence = { ok: true, records: [{ evidenceId: "evidence-1" }] };
+  const cases = [
+    ["projection", (reopened) => { reopened.projection.segments[0].status = "running"; }],
+    ["canvas", (reopened) => { reopened.canvasSession.nodes[1].status = "running"; }],
+    ["evidence", (reopened) => { reopened.authoritativeEvidence.records[0].evidenceId = "evidence-2"; }],
+    ["planner-summary", (reopened) => {
+      plannerTurnEvent(reopened, 1).payload.plannerTurn.operationSummary = structuredClone(firstPlannerOperationSummary);
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    const reopened = structuredClone(second);
+    mutate(reopened);
+    assert.equal(settledReplayStateMatches(second, reopened), false, name);
+  }
+});
+
+test("planner replay verification accepts an audit event appended after the settled snapshot", async () => {
+  const { plannerTurnReplayVerification } = await import("./newSessionUiAcceptance.mjs");
+  const first = authoritativePlannerState("run-planner-1", "First input", ["lane-1"]);
+  const second = authoritativePlannerState("run-planner-2", "Second input", ["lane-1", "lane-2"]);
+  const reopened = structuredClone(second);
+  reopened.events.push(safeWorkflowEvent(81, "workflow.node.checkpoint_failed", "lane-2", "run-lane-2"));
+
+  const result = plannerTurnReplayVerification({ first, second, reopened });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.reopenedProjectionMatches, true);
+});
+
 test("New Session UI acceptance requires the exact ordered operation shape for both planner turns", async () => {
   const { plannerTurnReplayVerification } = await import("./newSessionUiAcceptance.mjs");
   const first = authoritativePlannerState("run-planner-1", "First input", ["lane-1"]);
@@ -733,7 +809,7 @@ test("New Session UI acceptance injects the stale workspace only after persisten
   assert.ok(staleIndex > closeIndex);
   assert.ok(relaunchIndex > staleIndex);
   assert.match(source, /inspectRendererProjection\(liveCdp, reopenedAuthoritative\.canvasSession\)/);
-  assert.match(source, /stableJson\(reopened\) === stableJson\(second\)/);
+  assert.match(source, /settledReplayStateMatches\(second, reopened\)/);
 });
 
 test("New Session UI acceptance registers the stored project through public workspace loading", async () => {

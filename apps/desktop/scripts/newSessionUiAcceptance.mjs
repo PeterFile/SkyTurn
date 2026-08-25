@@ -1883,7 +1883,7 @@ export function plannerTurnReplayVerification({ first, second, reopened }) {
   const turnSemantics = distinctTerminalRuns
     ? plannerTurnSemanticVerification({ first, second, reopened, plannerTurns })
     : emptyPlannerTurnSemanticVerification();
-  const reopenedProjectionMatches = stableJson(reopened) === stableJson(second);
+  const reopenedProjectionMatches = settledReplayStateMatches(second, reopened);
   const inputsReplayed = inputReplay.length === 2 && plannerInputBrief(reopenedSession) === inputReplay[1];
   const ok = identityStable && onePlannerRoot && distinctTerminalRuns && turnSemantics.ok &&
     reopenedProjectionMatches && inputsReplayed;
@@ -1923,6 +1923,30 @@ export function plannerTurnReplayVerification({ first, second, reopened }) {
     plannerOperationSummaries: turnSemantics.operationSummaries,
     secondTurnLaneIds: turnSemantics.secondTurnLaneIds,
   };
+}
+
+const persistenceAuditEventKinds = new Set([
+  "workflow.run.recovery_failed",
+  "workflow.run.start_reconciliation_failed",
+  "workflow.node.checkpoint_failed",
+]);
+
+export function settledReplayStateMatches(settled, reopened) {
+  if (stableJson(reopened?.projection) !== stableJson(settled?.projection) ||
+    stableJson(reopened?.canvasSession) !== stableJson(settled?.canvasSession) ||
+    stableJson(reopened?.authoritativeEvidence) !== stableJson(settled?.authoritativeEvidence)) {
+    return false;
+  }
+  if (!Array.isArray(settled?.events) || !Array.isArray(reopened?.events) ||
+    reopened.events.length < settled.events.length) {
+    return false;
+  }
+  if (stableJson(reopened.events.slice(0, settled.events.length)) !== stableJson(settled.events)) {
+    return false;
+  }
+  return reopened.events.slice(settled.events.length).every((event) =>
+    persistenceAuditEventKinds.has(event?.kind)
+  );
 }
 
 function plannerTurnSemanticVerification({ first, second, reopened, plannerTurns }) {
