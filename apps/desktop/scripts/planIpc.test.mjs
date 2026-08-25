@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import * as realFs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
@@ -6,10 +7,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import vm from "node:vm";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
+const execFileAsync = promisify(execFile);
 const standardPlannerOperationSummary = [
   { type: "AnalyzeRequirement" },
   { type: "DiscoverProject" },
@@ -5833,7 +5836,11 @@ test("scheduler grants one exact canonical browser capture capability and reject
 
     await assert.rejects(
       codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
-      /authorization|segment|consumed/i,
+      (error) => {
+        assert.equal(error?.stage, "authorization_lookup");
+        assert.deepEqual(Object.keys(error).sort(), ["stage"]);
+        return true;
+      },
     );
     assert.equal(captures.length, 1);
 
@@ -5874,6 +5881,204 @@ test("scheduler grants one exact canonical browser capture capability and reject
     await loaded?.exports.closeWorkflowStores();
     await Promise.all([
       rm(projectRoot, { recursive: true, force: true }),
+      rm(userDataPath, { recursive: true, force: true }),
+      rm(binRoot, { recursive: true, force: true }),
+    ]);
+  }
+});
+
+test("scheduler grants one exact canonical browser capture capability under concurrent reuse", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-browser-host-concurrent-capability-"));
+  const starts = [];
+  const captures = [];
+  const publications = [];
+  let codexOptions;
+  let loaded;
+  try {
+    const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+      "../dist-electron/electron/runStartHandler.js"
+    );
+    loaded = await loadMainModule([], {
+      platform: "darwin",
+      onCodexAdapterCreated(options) {
+        codexOptions = options;
+      },
+      hostCaptureProducer: async (input, publishPng, signal) => {
+        captures.push({ input, aborted: signal.aborted });
+        await publishPng(Buffer.from("validated-png"));
+      },
+      createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
+        ...dependencies,
+        assertStartInput: async () => undefined,
+        prepareBeforeCheckpoint: async () => true,
+        startRun: async (input) => {
+          starts.push(input);
+          return { id: input.runId, status: "running" };
+        },
+      }),
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedScheduledLane(store, projectRoot, {
+      id: "lane-browser-concurrent",
+      kind: "browser_validation",
+      laneKind: "validation",
+      semanticSubtype: "browser_validation",
+      title: "Opaque concurrent browser verification",
+      requiredEvidence: ["browser", "screenshot"],
+    });
+
+    await loaded.exports.getAgentBridge();
+    await loaded.exports.advanceWorkflowSession(projectRoot, store, session.id);
+
+    assert.equal(starts.length, 1);
+    assert.equal(typeof codexOptions?.postCloseArtifactProducer, "function");
+    const publisher = {
+      async publish(path, contents) {
+        publications.push({ path, contents: contents.toString("utf8") });
+      },
+    };
+    const results = await Promise.allSettled([
+      codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
+      codexOptions.postCloseArtifactProducer(starts[0], publisher, new AbortController().signal),
+    ]);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+
+    assert.deepEqual(fulfilled.map((result) => result.value), ["produced"]);
+    assert.equal(rejected.length, 1);
+    assert.equal(rejected[0].reason?.stage, "authorization_lookup");
+    assert.deepEqual(Object.keys(rejected[0].reason).sort(), ["stage"]);
+    assert.equal(captures.length, 1);
+    assert.deepEqual(publications, [{
+      path: ".devflow/acceptance/react-app.png",
+      contents: "validated-png",
+    }]);
+  } finally {
+    await loaded?.exports.closeWorkflowStores();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("new-worktree browser capture keeps its scheduled start identity through the real before checkpoint", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-browser-checkpoint-identity-"));
+  const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-browser-checkpoint-private-"));
+  const binRoot = await mkdtemp(join(tmpdir(), "skyturn-browser-checkpoint-bin-"));
+  const codexPath = join(binRoot, "codex");
+  const captures = [];
+  const producerFailureStages = [];
+  const starts = [];
+  let checkpointStarts = 0;
+  let checkpointCompletions = 0;
+  let loaded;
+  let unsubscribe;
+  try {
+    await execFileAsync("git", ["init", "-b", "main"], { cwd: projectRoot });
+    await execFileAsync("git", ["config", "user.name", "SkyTurn Test"], { cwd: projectRoot });
+    await execFileAsync("git", ["config", "user.email", "skyturn-test@example.invalid"], { cwd: projectRoot });
+    await writeFile(join(projectRoot, "README.md"), "# Browser capture checkpoint identity\n");
+    await execFileAsync("git", ["add", "README.md"], { cwd: projectRoot });
+    await execFileAsync("git", ["commit", "-m", "test: initialize repository"], { cwd: projectRoot });
+    await writeFile(codexPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    const { createRunStartHandler: productionCreateRunStartHandler } = await import(
+      "../dist-electron/electron/runStartHandler.js"
+    );
+    loaded = await loadMainModule([], {
+      useRealAgentBridge: true,
+      codexExecutablePath: codexPath,
+      userDataPath,
+      platform: "darwin",
+      useRealGitWorktree: true,
+      createRunStartHandler: (dependencies) => productionCreateRunStartHandler({
+        ...dependencies,
+        prepareBeforeCheckpoint: async (...args) => {
+          checkpointStarts += 1;
+          const result = await dependencies.prepareBeforeCheckpoint(...args);
+          checkpointCompletions += 1;
+          return result;
+        },
+      }),
+      onCodexAdapterStart(input) {
+        starts.push(input);
+      },
+      onPostCloseArtifactProducerError(error) {
+        producerFailureStages.push(error?.stage ?? "verify");
+      },
+      hostCaptureProducer: async (input, publishPng, signal) => {
+        captures.push({ input, aborted: signal.aborted });
+        await publishPng(Buffer.from("validated-png"));
+      },
+    });
+    loaded.exports.openedProjectRoots.add(projectRoot);
+    const store = await loaded.exports.getWorkflowStore(projectRoot);
+    const session = seedScheduledLane(store, projectRoot, {
+      id: "lane-browser-checkpoint",
+      kind: "browser_validation",
+      laneKind: "validation",
+      semanticSubtype: "browser_validation",
+      title: "Opaque browser verification",
+      requiredEvidence: ["browser", "screenshot"],
+    }, {
+      executionTarget: "new_worktree",
+      selectedBranch: "main",
+      baseRef: "main",
+    });
+    const bridge = await loaded.exports.getAgentBridge();
+    const terminal = new Promise((resolve) => {
+      unsubscribe = bridge.onRunEvent((event) => {
+        if (
+          event.kind === "status" &&
+          ["succeeded", "failed", "cancelled", "timed-out"].includes(event.payload.status)
+        ) resolve(event);
+      });
+    });
+
+    try {
+      await withTimeout(
+        loaded.exports.advanceWorkflowSession(projectRoot, store, session.id),
+        5_000,
+        "production-like browser lane did not finish scheduling",
+      );
+    } catch {
+      assert.fail(
+        `scheduling_timeout starts=${starts.length} checkpoints=${checkpointStarts}/${checkpointCompletions} captures=${captures.length} stage=${producerFailureStages[0] ?? "verify"}`,
+      );
+    }
+    assert.equal(starts.length, 1, "production-like browser lane did not reach the Codex adapter");
+    const terminalEvent = await withTimeout(terminal, 5_000, "production-like browser lane emitted no terminal event");
+    const evidence = await bridge.getEvidence(projectRoot, terminalEvent.runId);
+    assert.equal(
+      terminalEvent.payload.status,
+      "succeeded",
+      `stage=${producerFailureStages[0] ?? "verify"} checks=${JSON.stringify(evidence.checks)}`,
+    );
+    assert.deepEqual(producerFailureStages, []);
+    assert.equal(checkpointStarts, 1);
+    assert.equal(checkpointCompletions, 1);
+    assert.equal(captures.length, 1);
+    assert.equal(captures[0].aborted, false);
+    const realProjectRoot = await realFs.realpath(projectRoot);
+    assert.equal(captures[0].input.worktreePath.startsWith(`${realProjectRoot}.worktrees/`), true);
+    assert.deepEqual(evidence.artifacts, [".devflow/acceptance/react-app.png"]);
+    assert.equal(
+      evidence.checks.some((check) => check.kind === "artifact" && check.status === "passed"),
+      true,
+    );
+    assert.equal(
+      store.listNodeCheckpoints({
+        sessionId: session.id,
+        nodeId: "lane-browser-checkpoint",
+        phase: "before",
+      }).length,
+      1,
+    );
+  } finally {
+    unsubscribe?.();
+    await loaded?.exports.closeWorkflowStores();
+    await Promise.all([
+      rm(projectRoot, { recursive: true, force: true }),
+      rm(`${projectRoot}.worktrees`, { recursive: true, force: true }),
       rm(userDataPath, { recursive: true, force: true }),
       rm(binRoot, { recursive: true, force: true }),
     ]);
@@ -7014,14 +7219,19 @@ function declareCoordinatorLane(store, sessionId, laneId) {
   });
 }
 
-function seedScheduledLane(store, projectRoot, lane) {
+function seedScheduledLane(
+  store,
+  projectRoot,
+  lane,
+  target = { executionTarget: "current_branch", selectedBranch: "main" },
+) {
   const session = store.createWorkflowSession({
     id: "session-1",
     projectId: "project-1",
     title: "Backend scheduling",
     goal: "Start the backend-owned lane",
     mode: "fast",
-    target: { executionTarget: "current_branch", selectedBranch: "main" },
+    target,
     plannerProfile: "default",
     transport: "hermes_replay_recovery",
     recoveryReason: "Test setup has no live Hermes session.",
@@ -7071,8 +7281,12 @@ async function loadMainModule(windows, options = {}) {
     ? options.wrapWorkflowStoreModule(workflowStore)
     : workflowStore;
   const projectCore = await import("@skyturn/project-core");
+  const gitWorktreeNode = await import("@skyturn/git-worktree/node");
   const orchestrator = await import("@skyturn/orchestrator");
   const uiCanvasWorkflowRuntime = await import("@skyturn/ui-canvas/workflow-runtime");
+  const browserScreenshotHostCapture = await import(
+    "../dist-electron/electron/browserScreenshotHostCapture.js"
+  );
   const source = `${await readFile(join(root, "electron", "main.ts"), "utf8")}
 export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getAgentBridge, getWorkflowStore, isWorkflowAdvanceAdmissionOpen, observeWorkflowTerminalReconciliation, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, registerWorkflowTerminalReconciliation, workflowStoreOperationTasks, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowProjectAdvanceTails, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workflowTerminalReconciliationTasks, workspaceSaveWriter };`;
   const ts = require("typescript");
@@ -7110,11 +7324,18 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
     const adapter = realAgentBridgeModule.createCodexCliAdapter({
       ...adapterOptions,
       executablePath: options.codexExecutablePath,
-      ...(postCloseArtifactProducer && options.beforePostCloseArtifactProducer
+      ...(postCloseArtifactProducer && (
+        options.beforePostCloseArtifactProducer || options.onPostCloseArtifactProducerError
+      )
         ? {
             postCloseArtifactProducer: async (input, publisher, signal) => {
-              await options.beforePostCloseArtifactProducer(input);
-              return postCloseArtifactProducer(input, publisher, signal);
+              await options.beforePostCloseArtifactProducer?.(input);
+              try {
+                return await postCloseArtifactProducer(input, publisher, signal);
+              } catch (error) {
+                options.onPostCloseArtifactProducerError?.(error);
+                throw error;
+              }
             },
           }
         : {}),
@@ -7218,6 +7439,7 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
         if (specifier === "./workflowCheckpointRuntime") return workflowCheckpointRuntime;
         if (specifier === "./browserScreenshotHostCapture") {
           return {
+            ...browserScreenshotHostCapture,
             createBrowserScreenshotHostProducer: () => options.hostCaptureProducer ?? (async () => undefined),
           };
         }
@@ -7230,6 +7452,7 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
         if (specifier === "@skyturn/persistence") return persistence;
         if (specifier === "@skyturn/persistence/workflow-store") return selectedWorkflowStore;
         if (specifier === "@skyturn/project-core") return projectCore;
+        if (specifier === "@skyturn/git-worktree/node" && options.useRealGitWorktree) return gitWorktreeNode;
         if (specifier === "@skyturn/orchestrator") return orchestrator;
         if (specifier === "@skyturn/ui-canvas/workflow-runtime") return uiCanvasWorkflowRuntime;
         if (specifier === "@skyturn/agent-bridge") return agentBridgeModule;

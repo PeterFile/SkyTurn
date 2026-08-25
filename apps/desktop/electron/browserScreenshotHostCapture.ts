@@ -12,6 +12,32 @@ export interface BrowserScreenshotHostCaptureInput {
 
 export type BrowserScreenshotPngPublisher = (png: Buffer) => Promise<void>;
 
+export const BROWSER_SCREENSHOT_CAPTURE_STAGES = [
+  "authorization_lookup",
+  "durable_segment_lane_check",
+  "callback_identity_check",
+  "vite_create",
+  "vite_listen",
+  "window_load",
+  "window_capture",
+  "cleanup",
+  "publish",
+  "verify",
+] as const;
+
+export type BrowserScreenshotCaptureStage = typeof BROWSER_SCREENSHOT_CAPTURE_STAGES[number];
+
+export class BrowserScreenshotCaptureStageError extends Error {
+  readonly stage: BrowserScreenshotCaptureStage;
+
+  constructor(stage: BrowserScreenshotCaptureStage) {
+    super(`Host screenshot PNG capture failed at stage ${stage}.`);
+    Object.defineProperty(this, "name", { value: "BrowserScreenshotCaptureStageError" });
+    Object.defineProperty(this, "stack", { value: `${this.name}: ${this.message}`, configurable: true });
+    this.stage = stage;
+  }
+}
+
 interface CapturedImageLike {
   isEmpty(): boolean;
   toPNG(): Buffer;
@@ -120,20 +146,40 @@ async function captureOnce(
   try {
     try {
       throwIfAborted(controller.signal);
-      cacheDir = await createCaptureCacheDir(dependencies.cacheRoot, input.worktreePath);
+      cacheDir = await captureStage(
+        "vite_create",
+        () => createCaptureCacheDir(dependencies.cacheRoot, input.worktreePath),
+        controller.signal,
+      );
       throwIfAborted(controller.signal);
-      server = await dependencies.createViteServer(viteConfig(input.worktreePath, cacheDir));
+      server = await captureStage(
+        "vite_create",
+        () => dependencies.createViteServer(viteConfig(input.worktreePath, cacheDir!)),
+        controller.signal,
+      );
       throwIfAborted(controller.signal);
-      await abortable(Promise.resolve(server.listen()).then(() => undefined), controller.signal);
+      await captureStage(
+        "vite_listen",
+        () => abortable(Promise.resolve(server!.listen()).then(() => undefined), controller.signal),
+        controller.signal,
+      );
       const url = exactLoopbackUrl(server);
-      window = dependencies.createBrowserWindow(browserWindowOptions());
-      restrictBrowserWindow(window, url);
-      await abortable(window.loadURL(url), controller.signal);
-      const image = await abortable(window.webContents.capturePage(), controller.signal);
+      await captureStage("window_load", async () => {
+        window = dependencies.createBrowserWindow(browserWindowOptions());
+        restrictBrowserWindow(window, url);
+        await abortable(window.loadURL(url), controller.signal);
+      }, controller.signal);
+      const image = await captureStage(
+        "window_capture",
+        () => abortable(window!.webContents.capturePage(), controller.signal),
+        controller.signal,
+      );
       throwIfAborted(controller.signal);
-      if (image.isEmpty()) throw new Error("Host screenshot capture returned an empty PNG.");
-      png = image.toPNG();
-      if (!isValidPng(png)) throw new Error("Host screenshot capture returned an invalid PNG.");
+      await captureStage("window_capture", async () => {
+        if (image.isEmpty()) throw new Error("Host screenshot capture returned an empty PNG.");
+        png = image.toPNG();
+        if (!isValidPng(png)) throw new Error("Host screenshot capture returned an invalid PNG.");
+      }, controller.signal);
     } catch (error) {
       bodyError = error;
     }
@@ -159,19 +205,33 @@ async function captureOnce(
       }
     }
     if (cleanupError) {
-      throw new Error("Host screenshot cleanup failed.", {
-        cause: bodyError ? new AggregateError([bodyError, cleanupError]) : cleanupError,
-      });
+      throw new BrowserScreenshotCaptureStageError("cleanup");
     }
     if (bodyError) throw bodyError;
     throwIfAborted(controller.signal);
-    if (!png) throw new Error("Host screenshot capture produced no PNG.");
-    await dependencies.publishPng(png);
+    await captureStage("publish", async () => {
+      if (!png) throw new Error("Host screenshot capture produced no PNG.");
+      await dependencies.publishPng(png);
+    }, controller.signal);
     throwIfAborted(controller.signal);
   } finally {
     clearTimeout(timeout);
     outerSignal.removeEventListener("abort", forwardAbort);
     controller.signal.removeEventListener("abort", abortResources);
+  }
+}
+
+async function captureStage<T>(
+  stage: BrowserScreenshotCaptureStage,
+  action: () => T | Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    if (signal.aborted) throw error;
+    if (error instanceof BrowserScreenshotCaptureStageError) throw error;
+    throw new BrowserScreenshotCaptureStageError(stage);
   }
 }
 
