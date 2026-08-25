@@ -199,6 +199,7 @@ export interface WorkflowStoreOptions {
     afterSchedulePreview?: (projection: FlowProjection) => void;
     afterCandidateBindingBeforeSegment?: () => void;
     afterCheckpointCandidateEvents?: () => void;
+    afterCommitChangesetBeforeCheckpoint?: () => void;
   };
 }
 
@@ -525,6 +526,38 @@ export interface RecordRunCheckpointInput {
   ancestryProof?: string;
   ancestryProofContext?: WorkflowGitAncestryProofContext;
   now: string;
+}
+
+export interface CommitLaneCompletionIdentity {
+  sessionId: string;
+  nodeId: string;
+  laneId: string;
+  segmentId: string;
+  runId: string;
+}
+
+export interface RecordCommitLaneCompletionFactsInput extends CommitLaneCompletionIdentity {
+  executionTarget: WorkflowNodeCheckpoint["executionTarget"];
+  worktreeId?: string;
+  worktreePath: string;
+  branchName: string;
+  baselineHeadCommit: string;
+  afterHeadCommit: string;
+  afterWorktreeState: NonNullable<WorkflowNodeCheckpoint["worktreeState"]>;
+  changeset: {
+    evidence: unknown;
+    collectedAt: string;
+  };
+  ancestryProof: string;
+  ancestryProofContext: WorkflowGitAncestryProofContext;
+  now: string;
+}
+
+export interface CommitLaneCompletionFacts extends CommitLaneCompletionIdentity {
+  baselineHeadCommit: string;
+  beforeCheckpoint: WorkflowNodeCheckpoint;
+  afterCheckpoint: WorkflowNodeCheckpoint;
+  changesetEvidence: ChangesetEvidence;
 }
 
 export interface WorkflowNodeCheckpointQuery {
@@ -1843,6 +1876,180 @@ export class WorkflowStore {
   }
 
   recordRunCheckpoint(input: RecordRunCheckpointInput): WorkflowNodeCheckpoint {
+    const checkpoint = this.prepareRunCheckpoint(input, false);
+    const idempotencyKey = `checkpoint:${input.runId}:${input.phase}`;
+    const event = this.appendValidatedRunCheckpointEvent({
+      sessionId: input.sessionId,
+      kind: "workflow.node.checkpoint_recorded",
+      source: "backend",
+      laneId: input.laneId,
+      segmentId: input.segmentId,
+      idempotencyKey,
+      payload: { checkpoint },
+      now: input.now,
+    }, checkpoint);
+    return event.payload.checkpoint as unknown as WorkflowNodeCheckpoint;
+  }
+
+  recordCommitLaneCompletionFacts(
+    input: RecordCommitLaneCompletionFactsInput,
+  ): CommitLaneCompletionFacts {
+    assertRecordCommitLaneCompletionFactsInput(input);
+    const identity = commitLaneCompletionIdentity(input);
+    const tx = this.db.transaction(() => {
+      const existing = this.getCommitLaneCompletionFacts(identity);
+      if (existing) {
+        assertCommitLaneCompletionFactsReplay(existing, input);
+        return existing;
+      }
+
+      const projection = this.materializeFlowProjection(input.sessionId);
+      const lane = projection.lanes.find((candidate) => candidate.id === input.laneId);
+      const node = projection.projectionNodes.find((candidate) =>
+        candidate.id === input.nodeId && candidate.laneId === input.laneId
+      );
+      const segment = projection.segments.find((candidate) => candidate.id === input.segmentId);
+      if (!lane || lane.kind !== "commit" || !node?.executable) {
+        throw new Error("Commit lane completion facts require one executable commit lane.");
+      }
+      if (
+        !segment ||
+        segment.laneId !== input.laneId ||
+        segment.runId !== input.runId ||
+        segment.status !== "running"
+      ) {
+        throw new Error("Commit lane completion facts require the matching running segment identity.");
+      }
+
+      const beforeCandidates = projection.checkpoints.filter((checkpoint) =>
+        checkpoint.phase === "before" &&
+        checkpoint.sessionId === input.sessionId &&
+        checkpoint.nodeId === input.nodeId &&
+        checkpoint.laneId === input.laneId &&
+        checkpoint.segmentId === input.segmentId &&
+        checkpoint.runId === input.runId
+      );
+      if (beforeCandidates.length !== 1) {
+        throw new Error("Commit lane completion facts require exactly one matching before checkpoint.");
+      }
+      const beforeCheckpoint = beforeCandidates[0]!;
+      const baselineHeadCommit = canonicalCommitSha(input.baselineHeadCommit, "commit facts baseline");
+      const afterHeadCommit = canonicalCommitSha(input.afterHeadCommit, "commit facts after HEAD");
+      if (beforeCheckpoint.headCommit !== baselineHeadCommit) {
+        throw new Error("Commit lane completion facts baseline conflicts with the before checkpoint.");
+      }
+      if (afterHeadCommit === baselineHeadCommit) {
+        throw new Error("Commit lane completion facts require HEAD to advance from the before checkpoint.");
+      }
+      if (input.afterWorktreeState !== "clean") {
+        throw new Error("Commit lane completion facts require a clean after worktree.");
+      }
+
+      const changesetEvidence = strictCommitChangesetEvidence(input);
+      const afterCheckpoint = this.prepareRunCheckpoint({
+        sessionId: input.sessionId,
+        nodeId: input.nodeId,
+        laneId: input.laneId,
+        segmentId: input.segmentId,
+        runId: input.runId,
+        phase: "after",
+        executionTarget: input.executionTarget,
+        ...(input.worktreeId ? { worktreeId: input.worktreeId } : {}),
+        worktreePath: input.worktreePath,
+        branchName: input.branchName,
+        headCommit: afterHeadCommit,
+        worktreeState: input.afterWorktreeState,
+        evidenceRefs: [
+          { kind: "run", id: input.runId },
+          { kind: "segment", id: input.segmentId },
+          { kind: "evidence", id: `evidence-${input.segmentId}` },
+          { kind: "changeset", id: changesetEvidence.evidenceId },
+        ],
+        ancestryProof: input.ancestryProof,
+        ancestryProofContext: input.ancestryProofContext,
+        now: input.now,
+      }, true);
+      const changesetInput: AppendWorkflowEventInput = {
+        sessionId: input.sessionId,
+        kind: "workflow.changeset.evidence_recorded",
+        source: "backend",
+        laneId: input.laneId,
+        segmentId: input.segmentId,
+        idempotencyKey: `checkpoint-changeset:${input.runId}:after`,
+        payload: {
+          laneId: input.laneId,
+          segmentId: input.segmentId,
+          baselineHeadCommit,
+          evidence: changesetEvidence,
+        },
+        now: input.changeset.collectedAt,
+      };
+      const checkpointInput: AppendWorkflowEventInput = {
+        sessionId: input.sessionId,
+        kind: "workflow.node.checkpoint_recorded",
+        source: "backend",
+        laneId: input.laneId,
+        segmentId: input.segmentId,
+        idempotencyKey: `checkpoint:${input.runId}:after`,
+        payload: { checkpoint: afterCheckpoint },
+        now: input.now,
+      };
+      this.insertEventInTransaction(changesetInput);
+      this.faultInjection?.afterCommitChangesetBeforeCheckpoint?.();
+      this.appendValidatedRunCheckpointEventInTransaction(checkpointInput, afterCheckpoint);
+      const recorded = this.getCommitLaneCompletionFacts(identity);
+      if (!recorded) throw new Error("Commit lane completion facts were not durably recorded.");
+      return recorded;
+    });
+    return tx.immediate();
+  }
+
+  getCommitLaneCompletionFacts(
+    input: CommitLaneCompletionIdentity,
+  ): CommitLaneCompletionFacts | null {
+    const identity = normalizeCommitLaneCompletionIdentity(input);
+    const changesetEvent = this.getEventByIdempotencyKey(
+      identity.sessionId,
+      `checkpoint-changeset:${identity.runId}:after`,
+    );
+    const checkpointEvent = this.getEventByIdempotencyKey(
+      identity.sessionId,
+      `checkpoint:${identity.runId}:after`,
+    );
+    if (!changesetEvent && !checkpointEvent) return null;
+    if (!changesetEvent || !checkpointEvent) {
+      throw new Error("Commit lane completion facts are incomplete.");
+    }
+    const projection = this.materializeFlowProjection(identity.sessionId);
+    const lane = projection.lanes.find((candidate) => candidate.id === identity.laneId);
+    const node = projection.projectionNodes.find((candidate) =>
+      candidate.id === identity.nodeId && candidate.laneId === identity.laneId
+    );
+    const segment = projection.segments.find((candidate) => candidate.id === identity.segmentId);
+    if (
+      !lane || lane.kind !== "commit" || !node?.executable ||
+      !segment || segment.laneId !== identity.laneId || segment.runId !== identity.runId
+    ) {
+      throw new Error("Commit lane completion facts conflict with workflow identity.");
+    }
+    return parseStoredCommitLaneCompletionFacts(
+      identity,
+      changesetEvent,
+      checkpointEvent,
+      projection.checkpoints.filter((checkpoint) =>
+        checkpoint.sessionId === identity.sessionId &&
+        checkpoint.laneId === identity.laneId &&
+        checkpoint.segmentId === identity.segmentId &&
+        checkpoint.runId === identity.runId
+      ),
+      this.listEvents(identity.sessionId),
+    );
+  }
+
+  private prepareRunCheckpoint(
+    input: RecordRunCheckpointInput,
+    allowRunningCommitAfter: boolean,
+  ): WorkflowNodeCheckpoint {
     assertRecordRunCheckpointHasNoUnexpectedProofFields(input);
     const proofProvided = input.ancestryProof !== undefined;
     const contextProvided = input.ancestryProofContext !== undefined;
@@ -1900,8 +2107,15 @@ export class WorkflowStore {
     if (input.phase === "before" && segment.status !== "running") {
       throw new Error("Before run checkpoint requires a running scheduled segment.");
     }
-    if (input.phase === "after" && segment.status === "running") {
+    if (input.phase === "after" && segment.status === "running" && !allowRunningCommitAfter) {
       throw new Error("After run checkpoint requires terminal RunEvidence.");
+    }
+    if (
+      input.phase === "after" &&
+      allowRunningCommitAfter &&
+      (segment.status !== "running" || lane.kind !== "commit")
+    ) {
+      throw new Error("Commit completion after checkpoint requires a running commit lane.");
     }
     if (input.phase === "after") {
       const beforeCandidates = projection.checkpoints.filter((item) =>
@@ -1966,37 +2180,31 @@ export class WorkflowStore {
       evidenceRefs: input.evidenceRefs,
       ...(input.ancestryProof !== undefined ? { ancestryProof: input.ancestryProof } : {}),
     };
-    const idempotencyKey = `checkpoint:${input.runId}:${input.phase}`;
-    const event = this.appendValidatedRunCheckpointEvent({
-      sessionId: input.sessionId,
-      kind: "workflow.node.checkpoint_recorded",
-      source: "backend",
-      laneId: input.laneId,
-      segmentId: input.segmentId,
-      idempotencyKey,
-      payload: { checkpoint },
-      now: input.now,
-    }, checkpoint);
-    return event.payload.checkpoint as unknown as WorkflowNodeCheckpoint;
+    return checkpoint;
   }
 
   private appendValidatedRunCheckpointEvent(
     input: AppendWorkflowEventInput,
     checkpoint: WorkflowNodeCheckpoint,
   ): WorkflowEventRecord {
-    const tx = this.db.transaction(() => {
-      const existing = input.idempotencyKey
-        ? this.getEventByIdempotencyKey(input.sessionId, input.idempotencyKey)
-        : null;
-      if (existing) {
-        assertMatchingRunCheckpointEvent(existing, input, checkpoint);
-        return existing;
-      }
-      const event = this.insertEventInTransaction(input);
-      this.projectEventInTransaction(event);
-      return event;
-    });
+    const tx = this.db.transaction(() => this.appendValidatedRunCheckpointEventInTransaction(input, checkpoint));
     return tx.immediate();
+  }
+
+  private appendValidatedRunCheckpointEventInTransaction(
+    input: AppendWorkflowEventInput,
+    checkpoint: WorkflowNodeCheckpoint,
+  ): WorkflowEventRecord {
+    const existing = input.idempotencyKey
+      ? this.getEventByIdempotencyKey(input.sessionId, input.idempotencyKey)
+      : null;
+    if (existing) {
+      assertMatchingRunCheckpointEvent(existing, input, checkpoint);
+      return existing;
+    }
+    const event = this.insertEventInTransaction(input);
+    this.projectEventInTransaction(event);
+    return event;
   }
 
   private recordPlannerRunResult(
@@ -2172,10 +2380,28 @@ export class WorkflowStore {
   }
 
   materializeFlowProjection(sessionId: string): FlowProjection {
-    const flowEvents = this.readValidatedEventRows(sessionId)
+    const validatedEvents = this.readValidatedEventRows(sessionId);
+    const flowEvents = validatedEvents
       .filter(({ row }) => isFlowEventKind(row.kind))
       .map(({ row, event }) => mapEventRowToFlowEvent(row, event));
-    return reduceWorkflowEvents([seedFlowUserInputEvent(sessionId), ...flowEvents]);
+    const seed = seedFlowUserInputEvent(sessionId);
+    const projection = reduceWorkflowEvents([seed, ...flowEvents]);
+    const manifestedSegmentIds = new Set(
+      validatedEvents.flatMap(({ row }) =>
+        row.kind === "workflow.candidate.manifest_recorded" && row.segment_id
+          ? [row.segment_id]
+          : []
+      ),
+    );
+    const invalidSegmentIds = legacyCommitCompletionSegmentsWithoutFacts(
+      projection,
+      manifestedSegmentIds,
+    );
+    if (invalidSegmentIds.size === 0) return projection;
+    return reduceWorkflowEvents([
+      seed,
+      ...flowEvents.map((event) => adjudicateLegacyCommitCompletionEvent(event, invalidSegmentIds)),
+    ]);
   }
 
   getLoopEngineeringState(
@@ -3124,7 +3350,7 @@ export class WorkflowStore {
       return projection.segments.flatMap((segment) => {
         if (segment.status === "running") return [];
         const lane = projection.lanes.find((item) => item.id === segment.laneId);
-        if (!lane || lane.executable === false) return [];
+        if (!lane || lane.executable === false || lane.kind === "commit") return [];
         const checkpoints = projection.checkpoints.filter((checkpoint) =>
           checkpoint.sessionId === sessionId &&
           checkpoint.laneId === segment.laneId &&
@@ -4882,6 +5108,263 @@ function isCompleteCandidateChangeset(
     typeof value.fullPatchByteLength === "number" &&
     typeof value.fileManifestSha256 === "string",
   );
+}
+
+function normalizeCommitLaneCompletionIdentity(value: unknown): CommitLaneCompletionIdentity {
+  if (!isRecord(value) || !hasExactObjectKeys(value, ["sessionId", "nodeId", "laneId", "segmentId", "runId"])) {
+    throw new Error("Commit lane completion identity accepts only session, node, lane, segment, and run ids.");
+  }
+  return {
+    sessionId: candidateManifestIdentifier(value.sessionId, "commit facts session id"),
+    nodeId: candidateManifestIdentifier(value.nodeId, "commit facts node id"),
+    laneId: candidateManifestIdentifier(value.laneId, "commit facts lane id"),
+    segmentId: candidateManifestIdentifier(value.segmentId, "commit facts segment id"),
+    runId: candidateManifestIdentifier(value.runId, "commit facts run id"),
+  };
+}
+
+function commitLaneCompletionIdentity(
+  input: RecordCommitLaneCompletionFactsInput,
+): CommitLaneCompletionIdentity {
+  return normalizeCommitLaneCompletionIdentity({
+    sessionId: input.sessionId,
+    nodeId: input.nodeId,
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    runId: input.runId,
+  });
+}
+
+function assertRecordCommitLaneCompletionFactsInput(value: unknown): asserts value is RecordCommitLaneCompletionFactsInput {
+  if (!isRecord(value)) throw new Error("Commit lane completion facts input is invalid.");
+  const keys = [
+    "sessionId",
+    "nodeId",
+    "laneId",
+    "segmentId",
+    "runId",
+    "executionTarget",
+    ...(Object.hasOwn(value, "worktreeId") ? ["worktreeId"] : []),
+    "worktreePath",
+    "branchName",
+    "baselineHeadCommit",
+    "afterHeadCommit",
+    "afterWorktreeState",
+    "changeset",
+    "ancestryProof",
+    "ancestryProofContext",
+    "now",
+  ];
+  if (!hasExactObjectKeys(value, keys)) {
+    throw new Error("Commit lane completion facts accept only the public fact fields.");
+  }
+  if (!isRecord(value.changeset) || !hasExactObjectKeys(value.changeset, ["evidence", "collectedAt"])) {
+    throw new Error("Commit lane completion facts changeset input is invalid.");
+  }
+}
+
+function canonicalCommitSha(value: unknown, field: string): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{40}$/i.test(value)) {
+    throw new Error(`Commit lane completion ${field} must be a full commit SHA.`);
+  }
+  return value.toLowerCase();
+}
+
+function strictCommitChangesetEvidence(
+  input: Pick<RecordCommitLaneCompletionFactsInput, "runId" | "changeset">,
+): CompleteCandidateChangeset {
+  if (!isRecord(input.changeset) || !isRecord(input.changeset.evidence)) {
+    throw new Error("Commit lane completion facts require strict Git changeset evidence.");
+  }
+  if (!isCanonicalCandidateManifestTimestamp(input.changeset.collectedAt)) {
+    throw new Error("Commit lane completion changeset timestamp is invalid.");
+  }
+  const evidenceId = `changeset-evidence:${input.runId}:after`;
+  const rawEvidence = input.changeset.evidence;
+  if (rawEvidence.evidenceId !== undefined && rawEvidence.evidenceId !== evidenceId) {
+    throw new Error("Commit lane completion changeset evidence identity conflicts with the run.");
+  }
+  if (rawEvidence.collectedAt !== undefined && rawEvidence.collectedAt !== input.changeset.collectedAt) {
+    throw new Error("Commit lane completion changeset collection time conflicts with the fact set.");
+  }
+  const normalizedRaw = {
+    ...rawEvidence,
+    evidenceId,
+    collectedAt: input.changeset.collectedAt,
+  };
+  const parsed = parseChangesetEvidence(normalizedRaw);
+  if (!isCompleteCandidateChangeset(parsed, normalizedRaw)) {
+    throw new Error("Commit lane completion facts require non-empty complete Git changeset evidence.");
+  }
+  candidateManifestIdentifier(parsed.evidenceId, "commit facts changeset evidence id");
+  candidateManifestIdentifier(parsed.changesetId, "commit facts changeset id");
+  return parsed;
+}
+
+function parseStoredCommitLaneCompletionFacts(
+  identity: CommitLaneCompletionIdentity,
+  changesetEvent: WorkflowEventRecord,
+  checkpointEvent: WorkflowEventRecord,
+  checkpoints: WorkflowNodeCheckpoint[],
+  events: WorkflowEventRecord[],
+): CommitLaneCompletionFacts {
+  const beforeCandidates = checkpoints.filter((checkpoint) => checkpoint.phase === "before");
+  const afterCandidates = checkpoints.filter((checkpoint) => checkpoint.phase === "after");
+  if (beforeCandidates.length !== 1 || afterCandidates.length !== 1) {
+    throw new Error("Commit lane completion facts require unique before and after checkpoints.");
+  }
+  const beforeCheckpoint = beforeCandidates[0]!;
+  const afterCheckpoint = afterCandidates[0]!;
+  const { authority: _afterAuthority, ...projectedAfterCheckpoint } = afterCheckpoint;
+  const expectedChangesetKey = `checkpoint-changeset:${identity.runId}:after`;
+  const expectedCheckpointKey = `checkpoint:${identity.runId}:after`;
+  if (
+    changesetEvent.kind !== "workflow.changeset.evidence_recorded" ||
+    changesetEvent.source !== "backend" ||
+    changesetEvent.sessionId !== identity.sessionId ||
+    changesetEvent.laneId !== identity.laneId ||
+    changesetEvent.segmentId !== identity.segmentId ||
+    changesetEvent.idempotencyKey !== expectedChangesetKey ||
+    !hasExactObjectKeys(changesetEvent.payload, ["laneId", "segmentId", "baselineHeadCommit", "evidence"]) ||
+    changesetEvent.payload.laneId !== identity.laneId ||
+    changesetEvent.payload.segmentId !== identity.segmentId ||
+    !isRecord(changesetEvent.payload.evidence)
+  ) {
+    throw new Error("Commit lane completion changeset fact identity is invalid.");
+  }
+  if (
+    checkpointEvent.kind !== "workflow.node.checkpoint_recorded" ||
+    checkpointEvent.source !== "backend" ||
+    checkpointEvent.sessionId !== identity.sessionId ||
+    checkpointEvent.laneId !== identity.laneId ||
+    checkpointEvent.segmentId !== identity.segmentId ||
+    checkpointEvent.idempotencyKey !== expectedCheckpointKey ||
+    !hasExactObjectKeys(checkpointEvent.payload, ["checkpoint"]) ||
+    !isRecord(checkpointEvent.payload.checkpoint) ||
+    stableJson(checkpointEvent.payload.checkpoint) !== stableJson(projectedAfterCheckpoint)
+  ) {
+    throw new Error("Commit lane completion checkpoint fact identity is invalid.");
+  }
+  if (
+    beforeCheckpoint.id !== `checkpoint:${identity.runId}:before` ||
+    beforeCheckpoint.nodeId !== identity.nodeId ||
+    beforeCheckpoint.laneId !== identity.laneId ||
+    beforeCheckpoint.segmentId !== identity.segmentId ||
+    beforeCheckpoint.runId !== identity.runId ||
+    beforeCheckpoint.source !== "backend" ||
+    afterCheckpoint.id !== expectedCheckpointKey ||
+    afterCheckpoint.nodeId !== identity.nodeId ||
+    afterCheckpoint.laneId !== identity.laneId ||
+    afterCheckpoint.segmentId !== identity.segmentId ||
+    afterCheckpoint.runId !== identity.runId ||
+    afterCheckpoint.source !== "backend" ||
+    afterCheckpoint.worktreeState !== "clean" ||
+    beforeCheckpoint.executionTarget !== afterCheckpoint.executionTarget ||
+    beforeCheckpoint.worktreeId !== afterCheckpoint.worktreeId ||
+    beforeCheckpoint.worktreePath !== afterCheckpoint.worktreePath ||
+    beforeCheckpoint.branchName !== afterCheckpoint.branchName
+  ) {
+    throw new Error("Commit lane completion checkpoint authority is invalid.");
+  }
+  const baselineHeadCommit = canonicalCommitSha(
+    changesetEvent.payload.baselineHeadCommit,
+    "stored baseline",
+  );
+  if (
+    baselineHeadCommit !== beforeCheckpoint.headCommit ||
+    afterCheckpoint.headCommit === baselineHeadCommit ||
+    typeof afterCheckpoint.ancestryProof !== "string"
+  ) {
+    throw new Error("Commit lane completion Git commit facts are invalid.");
+  }
+  const proof = parsePersistedWorkflowGitAncestryProof(afterCheckpoint.ancestryProof);
+  if (
+    proof.beforeHeadCommit !== baselineHeadCommit ||
+    proof.afterHeadCommit !== afterCheckpoint.headCommit
+  ) {
+    throw new Error("Commit lane completion ancestry proof binding is invalid.");
+  }
+  const changesetEvidence = parseChangesetEvidence(changesetEvent.payload.evidence);
+  if (!isCompleteCandidateChangeset(changesetEvidence, changesetEvent.payload.evidence)) {
+    throw new Error("Commit lane completion stored changeset evidence is invalid.");
+  }
+  if (
+    changesetEvidence.evidenceId !== `changeset-evidence:${identity.runId}:after` ||
+    !hasUniqueCheckpointEvidenceRef(afterCheckpoint.evidenceRefs, "run", identity.runId) ||
+    !hasUniqueCheckpointEvidenceRef(afterCheckpoint.evidenceRefs, "segment", identity.segmentId) ||
+    !hasUniqueCheckpointEvidenceRef(afterCheckpoint.evidenceRefs, "evidence", `evidence-${identity.segmentId}`) ||
+    !hasUniqueCheckpointEvidenceRef(afterCheckpoint.evidenceRefs, "changeset", changesetEvidence.evidenceId)
+  ) {
+    throw new Error("Commit lane completion evidence binding is invalid.");
+  }
+  const matchingChangesets = events.filter((event) =>
+    event.kind === "workflow.changeset.evidence_recorded" &&
+    isRecord(event.payload.evidence) &&
+    event.payload.evidence.evidenceId === changesetEvidence.evidenceId
+  );
+  if (matchingChangesets.length !== 1 || matchingChangesets[0]!.id !== changesetEvent.id) {
+    throw new Error("Commit lane completion changeset evidence identity is ambiguous.");
+  }
+  return {
+    sessionId: identity.sessionId,
+    nodeId: identity.nodeId,
+    laneId: identity.laneId,
+    segmentId: identity.segmentId,
+    runId: identity.runId,
+    baselineHeadCommit,
+    beforeCheckpoint,
+    afterCheckpoint,
+    changesetEvidence,
+  };
+}
+
+function assertCommitLaneCompletionFactsReplay(
+  existing: CommitLaneCompletionFacts,
+  input: RecordCommitLaneCompletionFactsInput,
+): void {
+  const changesetEvidence = strictCommitChangesetEvidence(input);
+  const baselineHeadCommit = canonicalCommitSha(input.baselineHeadCommit, "replay baseline");
+  const afterHeadCommit = canonicalCommitSha(input.afterHeadCommit, "replay after HEAD");
+  const proof = parseWorkflowGitAncestryProof(input.ancestryProof, input.ancestryProofContext);
+  const expected = {
+    sessionId: input.sessionId,
+    nodeId: input.nodeId,
+    laneId: input.laneId,
+    segmentId: input.segmentId,
+    runId: input.runId,
+    baselineHeadCommit,
+    executionTarget: input.executionTarget,
+    worktreeId: input.worktreeId ?? null,
+    worktreePath: canonicalPath(input.worktreePath),
+    branchName: input.branchName,
+    afterHeadCommit,
+    afterWorktreeState: input.afterWorktreeState,
+    ancestryProof: input.ancestryProof,
+    proofBeforeHeadCommit: proof.beforeHeadCommit,
+    proofAfterHeadCommit: proof.afterHeadCommit,
+    changesetEvidence,
+  };
+  const actual = {
+    sessionId: existing.sessionId,
+    nodeId: existing.nodeId,
+    laneId: existing.laneId,
+    segmentId: existing.segmentId,
+    runId: existing.runId,
+    baselineHeadCommit: existing.baselineHeadCommit,
+    executionTarget: existing.afterCheckpoint.executionTarget,
+    worktreeId: existing.afterCheckpoint.worktreeId ?? null,
+    worktreePath: existing.afterCheckpoint.worktreePath,
+    branchName: existing.afterCheckpoint.branchName,
+    afterHeadCommit: existing.afterCheckpoint.headCommit,
+    afterWorktreeState: existing.afterCheckpoint.worktreeState,
+    ancestryProof: existing.afterCheckpoint.ancestryProof,
+    proofBeforeHeadCommit: existing.baselineHeadCommit,
+    proofAfterHeadCommit: existing.afterCheckpoint.headCommit,
+    changesetEvidence: existing.changesetEvidence,
+  };
+  if (stableJson(actual) !== stableJson(expected)) {
+    throw new Error("Commit lane completion facts conflict with existing durable facts.");
+  }
 }
 
 function hasUniqueCheckpointEvidenceRef(
@@ -7303,6 +7786,102 @@ function persistedFlowEventPayload(row: EventRow, payload: Record<string, unknow
       artifacts: current.artifacts,
       detail: current.errorReason ?? current.cancelReason ?? current.review?.detail ?? null,
       runEvidence: current,
+    },
+  };
+}
+
+const LEGACY_COMMIT_COMPLETION_FAILURE_REASON = "Authoritative Git commit verification failed.";
+const AUTHORITATIVE_COMMIT_CHECK_NAME = "Authoritative Git commit";
+
+function legacyCommitCompletionSegmentsWithoutFacts(
+  projection: FlowProjection,
+  manifestedSegmentIds: ReadonlySet<string>,
+): Set<string> {
+  const invalid = new Set<string>();
+  for (const segment of projection.segments) {
+    const lane = projection.lanes.find((candidate) => candidate.id === segment.laneId);
+    if (
+      !lane ||
+      lane.kind !== "commit" ||
+      lane.executable === false ||
+      segment.status !== "succeeded" ||
+      manifestedSegmentIds.has(segment.id)
+    ) {
+      continue;
+    }
+    const checkpoints = projection.checkpoints.filter((checkpoint) =>
+      checkpoint.sessionId === projection.sessionId &&
+      checkpoint.laneId === segment.laneId &&
+      checkpoint.segmentId === segment.id &&
+      checkpoint.runId === segment.runId
+    );
+    if (
+      checkpoints.filter((checkpoint) => checkpoint.phase === "before").length !== 1 ||
+      checkpoints.some((checkpoint) => checkpoint.phase === "after")
+    ) {
+      continue;
+    }
+    const successfulTerminalEvidence = projection.evidence.filter((evidence) =>
+      evidence.segmentId === segment.id &&
+      evidence.runEvidence?.runId === segment.runId &&
+      evidence.runEvidence.status === "succeeded" &&
+      evidence.runEvidence.exitCode === 0
+    );
+    if (successfulTerminalEvidence.length === 1) invalid.add(segment.id);
+  }
+  return invalid;
+}
+
+function adjudicateLegacyCommitCompletionEvent(
+  event: FlowEvent,
+  invalidSegmentIds: ReadonlySet<string>,
+): FlowEvent {
+  if (
+    event.kind !== "workflow.evidence.recorded" ||
+    typeof event.payload.segmentId !== "string" ||
+    !invalidSegmentIds.has(event.payload.segmentId) ||
+    !isRecord(event.payload.evidence)
+  ) {
+    return event;
+  }
+  const evidence = event.payload.evidence;
+  const runEvidence = parseRunEvidence(evidence.runEvidence);
+  if (!runEvidence || runEvidence.status !== "succeeded" || runEvidence.exitCode !== 0) return event;
+  const failedCheck: EvidenceCheck = {
+    kind: "git",
+    name: AUTHORITATIVE_COMMIT_CHECK_NAME,
+    status: "failed",
+    detail: LEGACY_COMMIT_COMPLETION_FAILURE_REASON,
+  };
+  const failedRunEvidence = parseRunEvidence({
+    ...runEvidence,
+    status: "failed",
+    changesetId: null,
+    checks: [
+      ...runEvidence.checks.filter((check) =>
+        check.kind !== failedCheck.kind || check.name !== failedCheck.name
+      ),
+      failedCheck,
+    ],
+    errorReason: LEGACY_COMMIT_COMPLETION_FAILURE_REASON,
+    cancelReason: null,
+  });
+  if (!failedRunEvidence) {
+    throw new Error("Legacy commit completion adjudication produced invalid RunEvidence.");
+  }
+  return {
+    ...event,
+    payload: {
+      ...event.payload,
+      evidence: {
+        ...evidence,
+        status: "failed",
+        changesetId: null,
+        checks: failedRunEvidence.checks.map((check) => `${check.kind}:${check.name}:${check.status}`),
+        artifacts: failedRunEvidence.artifacts,
+        detail: LEGACY_COMMIT_COMPLETION_FAILURE_REASON,
+        runEvidence: failedRunEvidence,
+      },
     },
   };
 }

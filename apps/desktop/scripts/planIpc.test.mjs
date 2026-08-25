@@ -7287,6 +7287,9 @@ async function loadMainModule(windows, options = {}) {
   const browserScreenshotHostCapture = await import(
     "../dist-electron/electron/browserScreenshotHostCapture.js"
   );
+  const workflowCommitCompletion = await import(
+    "../dist-electron/electron/workflowCommitCompletion.js"
+  );
   const source = `${await readFile(join(root, "electron", "main.ts"), "utf8")}
 export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getAgentBridge, getWorkflowStore, isWorkflowAdvanceAdmissionOpen, observeWorkflowTerminalReconciliation, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, registerWorkflowTerminalReconciliation, workflowStoreOperationTasks, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowProjectAdvanceTails, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workflowTerminalReconciliationTasks, workspaceSaveWriter };`;
   const ts = require("typescript");
@@ -7443,6 +7446,7 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
             createBrowserScreenshotHostProducer: () => options.hostCaptureProducer ?? (async () => undefined),
           };
         }
+        if (specifier === "./workflowCommitCompletion") return workflowCommitCompletion;
         if (specifier === "./workflowRunRecovery" && options.workflowRunRecoveryModule) {
           return options.workflowRunRecoveryModule;
         }

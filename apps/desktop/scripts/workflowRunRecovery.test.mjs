@@ -18,6 +18,7 @@ import {
   loadRunEvents,
 } from "@skyturn/agent-bridge";
 import { createWorkflowStore } from "@skyturn/persistence/workflow-store";
+import { createWorkflowGitAncestryProofContext } from "@skyturn/project-core";
 
 import {
   compensateFailedWorkflowRun,
@@ -25,6 +26,7 @@ import {
   recoverPendingPlannerIntentReconciliations,
   recoverTerminalWorkflowRuns,
 } from "../dist-electron/electron/workflowRunRecovery.js";
+import { completeWorkflowRun } from "../dist-electron/electron/workflowCommitCompletion.js";
 
 const require = createRequire(import.meta.url);
 const previousStateHome = process.env.SKYTURN_STATE_HOME;
@@ -1118,28 +1120,253 @@ test("restart recovery freezes only the post-checkpoint candidate manifest crash
   assert.deepEqual(calls, ["list-manifest-freezes"]);
 });
 
-test("desktop terminal path orders evidence, final changeset, after checkpoint, then manifest freeze", async () => {
-  const main = await readFile(new URL("../electron/main.ts", import.meta.url), "utf8");
-  const liveTerminal = extractSourceRange(
-    main,
-    "async function reconcileTerminalRunEvent",
-    "async function getWorkflowStore",
-  );
-  const terminal = extractSourceRange(
-    main,
-    "async function reconcileTerminalWorkflowRun",
-    "async function reconcilePendingPlannerWorkflowIntent",
-  );
-  const enrichment = extractSourceRange(
-    main,
-    "async function enrichTerminalWorkflowRun",
-    "async function workflowStoreIdentity",
-  );
+for (const scenario of ["A-to-A-dirty", "A-to-A-clean-empty", "A-to-B-dirty"]) {
+  test(`${scenario} commit completion fails authoritatively without downstream or manifest`, async () => {
+    const root = await makeRoot();
+    try {
+      const fixture = seedRunningCommitStore(root, "current_branch");
+      const input = commitFactsInput(fixture, {
+        afterHeadCommit: scenario === "A-to-A-dirty" || scenario === "A-to-A-clean-empty"
+          ? fixture.beforeHeadCommit
+          : "b".repeat(40),
+        afterWorktreeState: scenario === "A-to-A-clean-empty" ? "clean" : "dirty",
+        emptyChangeset: scenario === "A-to-A-clean-empty",
+      });
 
-  assert.ok(liveTerminal.indexOf("reconcileTerminalWorkflowRun") < liveTerminal.indexOf("enrichTerminalWorkflowRun"));
-  assert.match(terminal, /store\.recordRunResult\(/);
-  assert.ok(enrichment.indexOf("recordRunChangesetEvidence") < enrichment.indexOf("store.recordRunCheckpoint"));
-  assert.ok(enrichment.indexOf("store.recordRunCheckpoint") < enrichment.indexOf("store.freezeCandidateManifest"));
+      const result = await completeWorkflowRun(fixture.scope, succeededCommitEvidence(fixture.segment.runId), {
+        readCommitFacts: () => fixture.store.getCommitLaneCompletionFacts(commitFactsIdentity(fixture)),
+        captureAndRecordCommitFacts: async () => fixture.store.recordCommitLaneCompletionFacts(input),
+        recordRunResult: (evidence) => fixture.store.recordRunResult(commitRunResult(fixture.segment, evidence)),
+        freezeCandidateManifest: () => fixture.store.freezeCandidateManifest(manifestFreezeInput(fixture)),
+      });
+      const scheduled = fixture.store.scheduleReadyLanes("session-1", {
+        allowedParallelism: 1,
+        now: "2026-08-16T00:00:09.000Z",
+      });
+
+      assert.equal(result.evidence.status, "failed");
+      assert.equal(result.evidence.exitCode, 0);
+      assert.equal(fixture.store.materializeFlowProjection("session-1").lanes.find((lane) =>
+        lane.id === "lane-downstream"
+      )?.status, "pending");
+      assert.equal(scheduled.readyLanes.length, 0);
+      assert.deepEqual(fixture.store.listPendingRunCheckpointEnrichments(), []);
+      assert.equal(fixture.store.listEvents("session-1").filter((event) =>
+        event.kind === "workflow.candidate.manifest_recorded"
+      ).length, 0);
+      fixture.store.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const executionTarget of ["current_branch", "new_worktree"]) {
+  test(`A-to-B clean non-empty ${executionTarget} commit records one manifest and releases downstream once`, async () => {
+    const root = await makeRoot();
+    try {
+      const fixture = seedRunningCommitStore(root, executionTarget);
+      const result = await completeWorkflowRun(fixture.scope, succeededCommitEvidence(fixture.segment.runId), {
+        readCommitFacts: () => fixture.store.getCommitLaneCompletionFacts(commitFactsIdentity(fixture)),
+        captureAndRecordCommitFacts: async () => fixture.store.recordCommitLaneCompletionFacts(
+          commitFactsInput(fixture),
+        ),
+        recordRunResult: (evidence) => fixture.store.recordRunResult(commitRunResult(fixture.segment, evidence)),
+        freezeCandidateManifest: () => fixture.store.freezeCandidateManifest(manifestFreezeInput(fixture)),
+      });
+      const first = fixture.store.scheduleReadyLanes("session-1", {
+        allowedParallelism: 1,
+        now: "2026-08-16T00:00:09.000Z",
+      });
+      const second = fixture.store.scheduleReadyLanes("session-1", {
+        allowedParallelism: 1,
+        now: "2026-08-16T00:00:10.000Z",
+      });
+
+      assert.equal(result.evidence.status, "succeeded");
+      assert.deepEqual(first.readyLanes.map((lane) => lane.id), ["lane-downstream"]);
+      assert.deepEqual(second.readyLanes, []);
+      assert.equal(fixture.store.listEvents("session-1").filter((event) =>
+        event.kind === "workflow.candidate.manifest_recorded"
+      ).length, 1);
+      assert.equal(fixture.store.listEvents("session-1").filter((event) =>
+        event.kind === "workflow.changeset.evidence_recorded" ||
+        event.kind === "workflow.node.checkpoint_recorded" && event.payload.checkpoint?.phase === "after"
+      ).length, 2);
+      fixture.store.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("restart after atomic commit facts uses SQLite despite opposite live Git and performs no recollection", async () => {
+  const root = await makeRoot();
+  try {
+    let fixture = seedRunningCommitStore(root, "current_branch");
+    fixture.store.recordCommitLaneCompletionFacts(commitFactsInput(fixture));
+    fixture.store.close();
+
+    const reopened = createWorkflowStore({ projectRoot: root });
+    let gitRecollections = 0;
+    const result = await completeWorkflowRun(fixture.scope, succeededCommitEvidence(fixture.segment.runId), {
+      readCommitFacts: () => reopened.getCommitLaneCompletionFacts(commitFactsIdentity(fixture)),
+      async captureAndRecordCommitFacts() {
+        gitRecollections += 1;
+        throw new Error("opposite live Git state must not be read");
+      },
+      recordRunResult: (evidence) => reopened.recordRunResult(commitRunResult(fixture.segment, evidence)),
+      freezeCandidateManifest: () => reopened.freezeCandidateManifest(manifestFreezeInput(fixture)),
+    });
+
+    assert.equal(result.evidence.status, "succeeded");
+    assert.equal(gitRecollections, 0);
+    assert.equal(reopened.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.changeset.evidence_recorded"
+    ).length, 1);
+    assert.equal(reopened.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.segment.finished"
+    ).length, 1);
+    reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart fails a legacy successful commit without facts before advancement and never recollects Git", async () => {
+  const root = await makeRoot();
+  try {
+    const fixture = seedRunningCommitStore(root, "current_branch");
+    fixture.store.recordRunResult(commitRunResult(
+      fixture.segment,
+      succeededCommitEvidence(fixture.segment.runId),
+    ));
+    const storedEvents = fixture.store.listEvents("session-1");
+    assert.equal(storedEvents.find((event) =>
+      event.idempotencyKey === `segment:${fixture.segment.segmentId}:evidence`
+    )?.payload.evidence.runEvidence.status, "succeeded");
+    fixture.store.close();
+
+    const reopened = createWorkflowStore({ projectRoot: root });
+    let bridgeReads = 0;
+    let gitRecollections = 0;
+    await recoverTerminalWorkflowRuns(
+      root,
+      reopened,
+      {
+        async getEvidence() {
+          bridgeReads += 1;
+          assert.fail("legacy terminal adjudication must not read opposite bridge evidence");
+        },
+        async loadEvents() {
+          bridgeReads += 1;
+          assert.fail("legacy terminal adjudication must not replay bridge events");
+        },
+        listRuns() {
+          bridgeReads += 1;
+          assert.fail("legacy terminal adjudication must not inspect the live run catalog");
+        },
+      },
+      () => "unused",
+      () => "2026-08-16T00:00:09.000Z",
+      async () => {
+        gitRecollections += 1;
+        assert.fail("legacy terminal adjudication must not recollect opposite live Git");
+      },
+    );
+
+    const projection = reopened.materializeFlowProjection("session-1");
+    const evidence = projection.evidence.find((candidate) =>
+      candidate.segmentId === fixture.segment.segmentId &&
+      candidate.runEvidence?.runId === fixture.segment.runId
+    );
+    assert.equal(bridgeReads, 0);
+    assert.equal(gitRecollections, 0);
+    assert.equal(projection.segments.find((segment) => segment.id === fixture.segment.segmentId)?.status, "failed");
+    assert.equal(projection.lanes.find((lane) => lane.id === "lane-commit")?.status, "failed");
+    assert.equal(projection.lanes.find((lane) => lane.id === "lane-downstream")?.status, "pending");
+    assert.equal(evidence?.status, "failed");
+    assert.equal(evidence?.runEvidence?.status, "failed");
+    assert.equal(evidence?.runEvidence?.exitCode, 0);
+    assert.equal(evidence?.runEvidence?.errorReason, "Authoritative Git commit verification failed.");
+    assert.deepEqual(reopened.scheduleReadyLanes("session-1", {
+      allowedParallelism: 2,
+      now: "2026-08-16T00:00:10.000Z",
+    }).readyLanes, []);
+    assert.equal(reopened.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.candidate.manifest_recorded"
+    ).length, 0);
+    assert.deepEqual(reopened.listEvents("session-1"), storedEvents);
+    reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("desktop reconciliation reuses reopened atomic commit facts without entering its Git capture path", async () => {
+  const root = await makeRoot();
+  let harness;
+  try {
+    const fixture = seedRunningCommitStore(root, "current_branch");
+    fixture.store.recordCommitLaneCompletionFacts(commitFactsInput(fixture));
+    fixture.store.close();
+    const reopened = createWorkflowStore({ projectRoot: root });
+    harness = await loadMainWorkflowStoreHarness();
+    const bridge = {
+      async loadEvents() { return []; },
+      async getEvidence() { assert.fail("known evidence must avoid an AgentBridge evidence read"); },
+    };
+
+    await harness.reconcileTerminalWorkflowRun(
+      reopened,
+      bridge,
+      root,
+      fixture.segment,
+      succeededCommitEvidence(fixture.segment.runId),
+    );
+
+    assert.equal(reopened.materializeFlowProjection("session-1").lanes.find((lane) =>
+      lane.id === "lane-commit"
+    )?.status, "completed");
+    assert.deepEqual(Array.from(harness.reconciledBaselines()), []);
+    assert.equal(reopened.listEvents("session-1").filter((event) =>
+      event.kind === "workflow.candidate.manifest_recorded"
+    ).length, 1);
+    reopened.close();
+  } finally {
+    harness?.closeWorkflowStores();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart after terminal before manifest freezes once without facts, terminal, or Git replay", async () => {
+  const root = await makeRoot();
+  try {
+    const fixture = seedRunningCommitStore(root, "current_branch");
+    const facts = fixture.store.recordCommitLaneCompletionFacts(commitFactsInput(fixture));
+    await assert.rejects(completeWorkflowRun(fixture.scope, succeededCommitEvidence(fixture.segment.runId), {
+      readCommitFacts: () => facts,
+      async captureAndRecordCommitFacts() { assert.fail("stored facts must avoid live Git"); },
+      recordRunResult: (evidence) => fixture.store.recordRunResult(commitRunResult(fixture.segment, evidence)),
+      freezeCandidateManifest() { throw new Error("crash-after-terminal"); },
+    }), /crash-after-terminal/);
+    const eventsBeforeReopen = fixture.store.listEvents("session-1");
+    fixture.store.close();
+
+    const reopened = createWorkflowStore({ projectRoot: root });
+    recoverPendingCandidateManifestFreezes(reopened, () => "2026-08-16T00:00:09.000Z");
+    recoverPendingCandidateManifestFreezes(reopened, () => "2026-08-16T00:00:10.000Z");
+    const events = reopened.listEvents("session-1");
+
+    assert.equal(events.filter((event) => event.kind === "workflow.changeset.evidence_recorded").length, 1);
+    assert.equal(events.filter((event) => event.kind === "workflow.node.checkpoint_recorded").length, 2);
+    assert.equal(events.filter((event) => event.kind === "workflow.segment.finished").length, 1);
+    assert.equal(events.filter((event) => event.kind === "workflow.candidate.manifest_recorded").length, 1);
+    assert.equal(events.length, eventsBeforeReopen.length + 1);
+    reopened.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("getWorkflowStore completes pending checkpoint enrichment without waiting on its own recovery", { timeout: 10_000 }, async () => {
@@ -2083,6 +2310,305 @@ function runInput(projectRoot) {
   };
 }
 
+const evidenceTime = "2026-08-16T00:00:08.000Z";
+
+function seedRunningCommitStore(projectRoot, executionTarget) {
+  const store = createWorkflowStore({ projectRoot });
+  const session = store.createWorkflowSession({
+    id: "session-1",
+    projectId: "project-1",
+    title: "Commit recovery",
+    goal: "Record an authoritative local commit",
+    mode: "fast",
+    plannerProfile: "default",
+    transport: "hermes_replay_recovery",
+    recoveryReason: "Test commit completion recovery.",
+    ...(executionTarget === "new_worktree" ? {
+      target: { executionTarget: "new_worktree", selectedBranch: "main", baseRef: "origin/main" },
+    } : {}),
+    now: "2026-08-16T00:00:00.000Z",
+  });
+  const plannerRunId = "run-session-1-initial-planner-turn";
+  const { segment: plannerSegment } = store.claimPlannerRunStart({
+    sessionId: session.id,
+    laneId: session.plannerLaneId,
+    runId: plannerRunId,
+    agentKind: "hermes",
+    worktreePath: projectRoot,
+    now: "2026-08-16T00:00:00.500Z",
+  });
+  store.recordRunResult({
+    ...plannerSegment,
+    outputSummary: "Initial planner turn completed.",
+    evidence: {
+      runId: plannerRunId,
+      status: "succeeded",
+      exitCode: 0,
+      changesetId: null,
+      checks: [{ kind: "run-exit", name: "Hermes CLI exit", status: "passed" }],
+      artifacts: [],
+      review: null,
+      errorReason: null,
+      cancelReason: null,
+      completedAt: "2026-08-16T00:00:01.000Z",
+    },
+    now: "2026-08-16T00:00:01.000Z",
+  });
+  store.recordPlannerIntentReconciled(plannerSegment, "2026-08-16T00:00:01.500Z");
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.lane.declared",
+    source: "test",
+    idempotencyKey: "lane:commit",
+    payload: {
+      lane: {
+        id: "lane-commit",
+        semanticKey: "lane-commit",
+        kind: "commit",
+        title: "Commit",
+        agentKind: "codex",
+        status: "running",
+      },
+    },
+    now: "2026-08-16T00:00:02.000Z",
+  });
+  const segment = {
+    sessionId: "session-1",
+    laneId: "lane-commit",
+    segmentId: "segment-session-1-lane-commit",
+    runId: "run-session-1-lane-commit",
+    agentKind: "codex",
+  };
+  let worktreeId;
+  let worktreePath = projectRoot;
+  let branchName = "HEAD";
+  if (executionTarget === "new_worktree") {
+    worktreeId = "worktree-session-1-candidate";
+    worktreePath = join(projectRoot, ".devflow", "worktrees", "candidate");
+    branchName = "skyturn/session-1/candidate";
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.lane.candidate_bound",
+      source: "test",
+      idempotencyKey: "candidate-binding:lane-commit:bound",
+      payload: {
+        binding: {
+          sessionId: "session-1",
+          laneId: "lane-commit",
+          variantId: "candidate",
+          worktreeId,
+          lineageId: "lineage-session-1-candidate",
+          reason: "default",
+          predecessorLaneIds: [],
+        },
+      },
+      now: "2026-08-16T00:00:02.100Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.worktree.created",
+      source: "test",
+      idempotencyKey: "worktree:commit:created",
+      payload: {
+        worktree: {
+          worktreeId,
+          variantId: "candidate",
+          path: worktreePath,
+          realPath: worktreePath,
+          gitdir: join(projectRoot, ".git", "worktrees", "candidate"),
+          repoRoot: projectRoot,
+          branchName,
+          baseCommit: "a".repeat(40),
+          headCommit: "a".repeat(40),
+          parentLaneId: "lane-commit",
+        },
+      },
+      now: "2026-08-16T00:00:02.200Z",
+    });
+  }
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.segment.started",
+    source: "codex",
+    laneId: segment.laneId,
+    segmentId: segment.segmentId,
+    idempotencyKey: `segment:${segment.segmentId}:started`,
+    payload: {
+      laneId: segment.laneId,
+      segment: {
+        id: segment.segmentId,
+        laneId: segment.laneId,
+        runId: segment.runId,
+        status: "running",
+      },
+    },
+    now: "2026-08-16T00:00:03.000Z",
+  });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.lane.declared",
+    source: "test",
+    idempotencyKey: "lane:downstream",
+    payload: {
+      lane: {
+        id: "lane-downstream",
+        semanticKey: "lane-downstream",
+        kind: "validation",
+        title: "Downstream",
+        agentKind: "codex",
+        status: "pending",
+      },
+    },
+    now: "2026-08-16T00:00:03.100Z",
+  });
+  store.appendWorkflowEvent({
+    sessionId: "session-1",
+    kind: "workflow.edge.declared",
+    source: "test",
+    idempotencyKey: "edge:commit-downstream",
+    payload: {
+      edge: {
+        id: "edge-commit-downstream",
+        sourceLaneId: "lane-commit",
+        targetLaneId: "lane-downstream",
+      },
+    },
+    now: "2026-08-16T00:00:03.200Z",
+  });
+  const beforeHeadCommit = "a".repeat(40);
+  store.recordRunCheckpoint({
+    ...segment,
+    nodeId: segment.laneId,
+    phase: "before",
+    executionTarget,
+    ...(worktreeId ? { worktreeId } : {}),
+    worktreePath,
+    branchName,
+    headCommit: beforeHeadCommit,
+    worktreeState: "clean",
+    evidenceRefs: [{ kind: "run", id: segment.runId }],
+    now: "2026-08-16T00:00:04.000Z",
+  });
+  return {
+    store,
+    segment,
+    beforeHeadCommit,
+    executionTarget,
+    worktreeId,
+    worktreePath,
+    branchName,
+    scope: {
+      laneKind: "commit",
+      executable: true,
+      sessionId: segment.sessionId,
+      nodeId: segment.laneId,
+      laneId: segment.laneId,
+      segmentId: segment.segmentId,
+      runId: segment.runId,
+    },
+  };
+}
+
+function commitFactsInput(fixture, options = {}) {
+  const afterHeadCommit = options.afterHeadCommit ?? "b".repeat(40);
+  const emptyChangeset = options.emptyChangeset === true;
+  const ancestryProofContext = createWorkflowGitAncestryProofContext(
+    fixture.beforeHeadCommit,
+    afterHeadCommit,
+    "1".repeat(64),
+    "2".repeat(64),
+  );
+  return {
+    sessionId: fixture.segment.sessionId,
+    nodeId: fixture.segment.laneId,
+    laneId: fixture.segment.laneId,
+    segmentId: fixture.segment.segmentId,
+    runId: fixture.segment.runId,
+    executionTarget: fixture.executionTarget,
+    ...(fixture.worktreeId ? { worktreeId: fixture.worktreeId } : {}),
+    worktreePath: fixture.worktreePath,
+    branchName: fixture.branchName,
+    baselineHeadCommit: fixture.beforeHeadCommit,
+    afterHeadCommit,
+    afterWorktreeState: options.afterWorktreeState ?? "clean",
+    changeset: {
+      evidence: emptyChangeset ? {
+        changesetId: "changeset-lane-commit",
+        source: "git",
+        status: "empty",
+        files: [],
+        diffStat: { added: 0, changed: 0, deleted: 0 },
+        patchPreviewTruncated: false,
+      } : {
+        changesetId: "changeset-lane-commit",
+        source: "git",
+        status: "available",
+        files: ["src/index.ts"],
+        diffStat: { added: 1, changed: 1, deleted: 0 },
+        patchPreviewTruncated: false,
+        fullPatchSha256: "4".repeat(64),
+        fullPatchByteLength: 16,
+        fileManifestSha256: "5".repeat(64),
+      },
+      collectedAt: "2026-08-16T00:00:07.500Z",
+    },
+    ancestryProof: JSON.stringify({
+      protocolVersion: 1,
+      method: "git-merge-base-is-ancestor",
+      beforeHeadCommit: fixture.beforeHeadCommit,
+      afterHeadCommit,
+      repositoryIdentity: "1".repeat(64),
+      worktreeIdentity: "2".repeat(64),
+    }),
+    ancestryProofContext,
+    now: evidenceTime,
+  };
+}
+
+function succeededCommitEvidence(runId) {
+  return {
+    runId,
+    status: "succeeded",
+    exitCode: 0,
+    changesetId: null,
+    checks: [{ kind: "run-exit", name: "Codex CLI exit", status: "passed" }],
+    artifacts: [],
+    review: null,
+    errorReason: null,
+    cancelReason: null,
+    completedAt: evidenceTime,
+  };
+}
+
+function commitRunResult(segment, evidence) {
+  return {
+    sessionId: segment.sessionId,
+    laneId: segment.laneId,
+    segmentId: segment.segmentId,
+    runId: segment.runId,
+    agentKind: segment.agentKind,
+    outputSummary: "Commit process completed.",
+    evidence,
+    now: evidenceTime,
+  };
+}
+
+function manifestFreezeInput(fixture) {
+  return {
+    sessionId: fixture.segment.sessionId,
+    nodeId: fixture.segment.laneId,
+    laneId: fixture.segment.laneId,
+    segmentId: fixture.segment.segmentId,
+    runId: fixture.segment.runId,
+    now: evidenceTime,
+  };
+}
+
+function commitFactsIdentity(fixture) {
+  const { now: _now, ...identity } = manifestFreezeInput(fixture);
+  return identity;
+}
+
 function seedRunningStore(projectRoot) {
   const store = createWorkflowStore({ projectRoot });
   const session = store.createWorkflowSession({
@@ -2476,7 +3002,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     getWorkflowStoreSource,
     extractSourceRange(main, "async function enrichTerminalWorkflowRun", "async function workflowStoreIdentity"),
     "function closeWorkflowStores() { for (const store of workflowStores.values()) store.close(); workflowStores.clear(); workflowStoreInitializations.clear(); workflowSessionAdvanceFlights.clear(); workflowProjectAdvanceTails.clear(); }",
-    "module.exports = { getWorkflowStore, closeWorkflowStores, hasPublishedStore: (root) => workflowStores.get(root) ?? false, resolverReceivedKnownStore: () => resolverReceivedKnownStore, reconciledBaselines: () => reconciledBaselines, launchedRuns: () => launchedRuns };",
+    "module.exports = { getWorkflowStore, reconcileTerminalWorkflowRun, closeWorkflowStores, hasPublishedStore: (root) => workflowStores.get(root) ?? false, resolverReceivedKnownStore: () => resolverReceivedKnownStore, reconciledBaselines: () => reconciledBaselines, launchedRuns: () => launchedRuns };",
   ].join("\n");
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
@@ -2515,6 +3041,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
     module,
     exports: module.exports,
     persistenceModule,
+    completeWorkflowRun,
     createAfterCheckpointAncestryProof: checkpointRuntimeModule.createAfterCheckpointAncestryProof,
     workflowGitAncestryProofAuthority: async () => ({
       createProof: gitWorktreeNodeModule.createWorkflowGitAncestryProof,
