@@ -33,6 +33,31 @@ export interface WorkflowRunCompletionResult {
   commitFacts: CommitLaneCompletionFacts | null;
 }
 
+interface CommitChangesetBindingInput {
+  runId: string;
+  changeset: {
+    evidence: Record<string, unknown>;
+    collectedAt: string;
+  };
+  [key: string]: unknown;
+}
+
+export function bindCommitChangesetEvidence(
+  input: CommitChangesetBindingInput,
+): CommitChangesetBindingInput {
+  return {
+    ...input,
+    changeset: {
+      ...input.changeset,
+      evidence: {
+        ...input.changeset.evidence,
+        evidenceId: `changeset-evidence:${input.runId}:after`,
+        collectedAt: input.changeset.collectedAt,
+      },
+    },
+  };
+}
+
 export async function completeWorkflowRun(
   scope: WorkflowRunCompletionScope,
   rawEvidence: RunEvidence,

@@ -65,6 +65,7 @@ import {
   recoverTerminalWorkflowRuns,
 } from "./workflowRunRecovery";
 import {
+  bindCommitChangesetEvidence,
   completeWorkflowRun,
   type WorkflowRunCompletionScope,
 } from "./workflowCommitCompletion";
@@ -3218,7 +3219,7 @@ async function captureCommitLaneCompletionFacts(
     repositoryPath: await fs.realpath(projectRoot),
   }, await workflowGitAncestryProofAuthority());
   const finalIdentity = await verifyRunGitIdentityAtCheckpoint(stableIdentity);
-  return store.recordCommitLaneCompletionFacts({
+  return store.recordCommitLaneCompletionFacts(bindCommitChangesetEvidence({
     sessionId: finalIdentity.sessionId,
     nodeId: finalIdentity.nodeId,
     laneId: finalIdentity.laneId,
@@ -3234,7 +3235,7 @@ async function captureCommitLaneCompletionFacts(
     changeset,
     ...ancestry,
     now,
-  });
+  }));
 }
 
 async function reconcilePendingPlannerWorkflowIntent(
