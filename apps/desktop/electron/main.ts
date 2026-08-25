@@ -8261,7 +8261,6 @@ function closeWorkflowStores(): Promise<void> {
   if (workflowStoresClosePromise) return workflowStoresClosePromise;
   closeWorkflowAdvanceAdmission();
   agentBridgeAdmissionOpen = false;
-  scheduledBrowserScreenshotCaptures.clear();
   const closing = (async () => {
     workspaceSaveWriter.closeAdmission();
     try {
@@ -8272,7 +8271,11 @@ function closeWorkflowStores(): Promise<void> {
       if (planRuntime === closingPlanRuntime) planRuntime = null;
       await drainWorkflowTasks();
       const closingAgentBridge = agentBridge ?? (agentBridgeInitialization ? await agentBridgeInitialization : null);
-      await closingAgentBridge?.close("SkyTurn is shutting down.");
+      try {
+        await closingAgentBridge?.close("SkyTurn is shutting down.");
+      } finally {
+        scheduledBrowserScreenshotCaptures.clear();
+      }
       if (agentBridge === closingAgentBridge) agentBridge = null;
       await drainWorkflowTasks();
       if (workflowTerminalReconciliationFailures.length > 0) {

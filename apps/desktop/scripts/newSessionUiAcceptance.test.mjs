@@ -370,6 +370,7 @@ test("New Session UI acceptance disables PTY and scopes the dialog override to i
   const source = await readFile(new URL("newSessionUiAcceptance.mjs", import.meta.url), "utf8");
 
   assert.match(source, /SKYTURN_ENABLE_PTY_INTERACTIVE: "0"/);
+  assert.match(source, /SKYTURN_NEW_SESSION_UI_WAIT_TIMEOUT_MS \?\? 35 \* 60 \* 1_000/);
   assert.match(source, /Math\.min\(12 \* 60 \* 1_000, waitTimeoutMs - 60_000\)/);
   assert.match(source, /SKYTURN_AGENT_WATCHDOG_TIMEOUT_MS: String\(agentWatchdogTimeoutMs\)/);
   assert.match(source, /SKYTURN_NEW_SESSION_UI_ACCEPTANCE:\s*"1"/);
