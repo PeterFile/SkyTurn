@@ -1834,6 +1834,7 @@ test("public run:start rejects a forged planner root before launch side effects 
         runId: `run-${nodeId}`,
         worktreePath: projectRoot,
         agentKind,
+        ...(agentKind === "hermes" ? { sandbox: "read-only" } : {}),
         prompt: `Run ${nodeId}`,
       }));
     }
@@ -7290,6 +7291,18 @@ async function loadMainModule(windows, options = {}) {
   const workflowCommitCompletion = await import(
     "../dist-electron/electron/workflowCommitCompletion.js"
   );
+  const productionRunStartHandler = await import(
+    "../dist-electron/electron/runStartHandler.js"
+  );
+  const runStartHandler = {
+    ...productionRunStartHandler,
+    createRunStartHandler: options.createRunStartHandler ?? ((config) => async (input) => {
+      const identity = plannerStartIdentity(input);
+      const store = await config.acquireStore(identity);
+      await config.claimUnscheduledStart(input, store, identity);
+      return { id: input.runId, status: "running" };
+    }),
+  };
   const source = `${await readFile(join(root, "electron", "main.ts"), "utf8")}
 export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getAgentBridge, getWorkflowStore, isWorkflowAdvanceAdmissionOpen, observeWorkflowTerminalReconciliation, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, registerWorkflowTerminalReconciliation, workflowStoreOperationTasks, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowProjectAdvanceTails, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workflowTerminalReconciliationTasks, workspaceSaveWriter };`;
   const ts = require("typescript");
@@ -7372,14 +7385,6 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
   const genericModule = new Proxy({}, {
     get: (_target, property) => {
       if (property === "createTerminalRuntime") return () => terminalRuntime;
-      if (property === "createRunStartHandler") {
-        return options.createRunStartHandler ?? ((config) => async (input) => {
-          const identity = plannerStartIdentity(input);
-          const store = await config.acquireStore(identity);
-          await config.claimUnscheduledStart(input, store, identity);
-          return { id: input.runId, status: "running" };
-        });
-      }
       if (property === "createPlanProjectIdentityRegistry") {
         return () => options.projectIdentityRegistry ?? {
           canonicalize: async (value) => value,
@@ -7440,6 +7445,7 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
         if (specifier === "./planIpcContracts") return contracts;
         if (specifier === "./workflowIpcContracts") return workflowContracts;
         if (specifier === "./workflowCheckpointRuntime") return workflowCheckpointRuntime;
+        if (specifier === "./runStartHandler") return runStartHandler;
         if (specifier === "./browserScreenshotHostCapture") {
           return {
             ...browserScreenshotHostCapture,
