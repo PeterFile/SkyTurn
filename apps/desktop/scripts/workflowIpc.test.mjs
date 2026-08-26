@@ -263,6 +263,11 @@ test("Electron main tracks every top-level workflow store operation, not only wo
     projectionHandler,
     /advanceWorkflowSession\(projectRoot,\s*store,\s*workflowSessionId,\s*false,\s*"projection-query"\)/,
   );
+  assert.equal((projectionHandler.match(/materializeWorkflowView/g) ?? []).length, 1);
+  assert.doesNotMatch(
+    projectionHandler,
+    /store\.materializeFlowProjection|store\.materializeCanvasSession|store\.getLoopEngineeringState/,
+  );
   const workflowBroadcast = main.slice(
     main.indexOf("function terminalWorkflowBroadcastCause"),
     main.indexOf("function broadcastTerminalEvent"),
@@ -1952,14 +1957,20 @@ test("ordinary workflow creation never forwards renderer opaque handles to plann
 
 test("workflow projection responses keep the Hermes planner terminal binding", async () => {
   const helpers = await loadMainRendererCanvasSessionHelpers();
+  let legacyMaterializationCount = 0;
   const store = {
     materializeCanvasSession(sessionId) {
+      legacyMaterializationCount += 1;
       return { kind: "canvas", id: sessionId, nodes: [] };
     },
   };
 
   assert.deepEqual(
-    toPlain(helpers.materializeRendererCanvasSession(store, "session-1")),
+    toPlain(helpers.materializeRendererCanvasSession(
+      store,
+      "session-1",
+      { kind: "canvas", id: "session-1", nodes: [] },
+    )),
     {
       kind: "canvas",
       id: "session-1",
@@ -1967,10 +1978,12 @@ test("workflow projection responses keep the Hermes planner terminal binding", a
       hermesPlannerTerminalSessionId: "hermes-planner-session-1",
     },
   );
+  assert.equal(legacyMaterializationCount, 0);
   assert.deepEqual(
     toPlain(helpers.materializeRendererCanvasSession(store, "session-without-terminal")),
     { kind: "canvas", id: "session-without-terminal", nodes: [] },
   );
+  assert.equal(legacyMaterializationCount, 1);
 });
 
 test("workflow projection query materializes one authoritative snapshot under the session mutation lock", async () => {
@@ -1987,9 +2000,9 @@ test("workflow projection query materializes one authoritative snapshot under th
   );
   const storeIndex = projectionHandler.indexOf("const store = await getWorkflowStore(projectRoot)");
   const advanceIndex = projectionHandler.indexOf("await advanceWorkflowSession(");
-  const projectionIndex = projectionHandler.indexOf("projection: store.materializeFlowProjection(workflowSessionId)");
+  const viewIndex = projectionHandler.indexOf("const view = store.materializeWorkflowView(workflowSessionId)");
   const canvasIndex = projectionHandler.indexOf(
-    "canvasSession: materializeRendererCanvasSession(store, workflowSessionId)",
+    "canvasSession: materializeRendererCanvasSession(store, workflowSessionId, view.canvasSession)",
   );
   const lockCloseIndex = projectionHandler.lastIndexOf("  });");
 
@@ -1997,16 +2010,16 @@ test("workflow projection query materializes one authoritative snapshot under th
   assert.ok(lockIndex > workflowStoreIdentityIndex, "projection query must acquire the canonical session mutation lock");
   assert.ok(storeIndex > lockIndex, "projection query must get the store again inside the lock");
   assert.ok(advanceIndex > storeIndex, "projection query must advance the session inside the lock");
-  assert.ok(projectionIndex > advanceIndex, "projection query must materialize the projection after advancing");
-  assert.ok(canvasIndex > projectionIndex, "projection query must materialize CanvasSession from the same locked snapshot");
+  assert.ok(viewIndex > advanceIndex, "projection query must materialize the authoritative view after advancing");
+  assert.ok(canvasIndex > viewIndex, "projection query must augment CanvasSession from the same locked snapshot");
   assert.ok(lockCloseIndex > canvasIndex, "the session mutation lock must cover the authoritative return boundary");
   assert.doesNotMatch(
     projectionHandler.slice(0, lockIndex),
-    /getWorkflowStore|advanceWorkflowSession|materializeFlowProjection|materializeRendererCanvasSession/,
+    /getWorkflowStore|advanceWorkflowSession|materializeWorkflowView|materializeRendererCanvasSession/,
   );
   assert.doesNotMatch(
     projectionHandler.slice(lockCloseIndex + "  });".length),
-    /getWorkflowStore|advanceWorkflowSession|materializeFlowProjection|materializeRendererCanvasSession/,
+    /getWorkflowStore|advanceWorkflowSession|materializeWorkflowView|materializeRendererCanvasSession/,
   );
 });
 
@@ -2021,8 +2034,14 @@ test("workflow renderer canvas session responses use the terminal-aware material
     main.indexOf("function broadcastTerminalEvent"),
   );
 
-  assert.match(projectionHandler, /canvasSession:\s*materializeRendererCanvasSession\(store,\s*workflowSessionId\)/);
-  assert.match(broadcaster, /const canvasSession = materializeRendererCanvasSession\(store,\s*sessionId\)/);
+  assert.match(
+    projectionHandler,
+    /canvasSession:\s*materializeRendererCanvasSession\(store,\s*workflowSessionId,\s*view\.canvasSession\)/,
+  );
+  assert.match(
+    broadcaster,
+    /const canvasSession = materializeRendererCanvasSession\(store,\s*sessionId,\s*view\.canvasSession\)/,
+  );
   assert.doesNotMatch(main, /canvasSession:\s*store\.materializeCanvasSession\(/);
 });
 
@@ -3543,6 +3562,8 @@ test("workflow broadcasts use the unique published store identity and never call
 
   runtime.broadcastWorkflowProjection("/alias/first", "session-shared", firstStore);
   runtime.broadcastWorkflowProjection("/alias/second", "session-shared", secondStore, "projection-query");
+  assert.deepEqual(firstStore.calls, { view: 1, projection: 0, canvas: 0, loop: 0 });
+  assert.deepEqual(secondStore.calls, { view: 1, projection: 0, canvas: 0, loop: 0 });
   assert.deepEqual(sent.map(({ channel, value }) => ({
     channel,
     projectRoot: value.projectRoot,
@@ -3851,8 +3872,8 @@ async function loadMainWorkflowTransportRuntime({
     isRecord(value) {
       return !!value && typeof value === "object" && !Array.isArray(value);
     },
-    materializeRendererCanvasSession(store, sessionId) {
-      return store.materializeCanvasSession(sessionId);
+    materializeRendererCanvasSession(store, sessionId, canvasSession) {
+      return canvasSession === undefined ? store.materializeCanvasSession(sessionId) : canvasSession;
     },
     module,
     exports: module.exports,
@@ -3945,13 +3966,29 @@ function workflowCanvasSession(id) {
 }
 
 function workflowBroadcastStore(sessionId, marker) {
+  const calls = { view: 0, projection: 0, canvas: 0, loop: 0 };
   return {
+    calls,
+    materializeWorkflowView(receivedSessionId) {
+      assert.equal(receivedSessionId, sessionId);
+      calls.view += 1;
+      return {
+        projection: { sessionId, events: [{ sessionId, seq: 7 }], marker },
+        canvasSession: workflowCanvasSession(sessionId),
+      };
+    },
     materializeFlowProjection() {
-      return { marker };
+      calls.projection += 1;
+      throw new Error("broadcast must not call materializeFlowProjection");
     },
     materializeCanvasSession(receivedSessionId) {
       assert.equal(receivedSessionId, sessionId);
-      return workflowCanvasSession(sessionId);
+      calls.canvas += 1;
+      throw new Error("broadcast must not call materializeCanvasSession");
+    },
+    getLoopEngineeringState() {
+      calls.loop += 1;
+      throw new Error("broadcast must not call getLoopEngineeringState");
     },
   };
 }

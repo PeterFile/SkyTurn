@@ -18,6 +18,7 @@ import type {
   CommitLaneCompletionFacts,
   PlannerIntentDisposition,
   PlannerIntentOperationSummary,
+  WorkflowMaterializedView,
 } from "@skyturn/persistence/workflow-store" with { "resolution-mode": "import" };
 import type {
   AgentDescriptor,
@@ -801,6 +802,7 @@ interface WorkflowStoreHost {
   getCandidateReviewAllowed(identity: unknown): unknown;
   appendPreparedCandidatePublication(input: unknown): unknown;
   getPreparedCandidatePublication(identity: unknown): unknown;
+  materializeWorkflowView(sessionId: string): WorkflowMaterializedView;
   materializeFlowProjection(sessionId: string): unknown;
   materializeCanvasSession(sessionId: string): unknown;
   listEvents(sessionId: string): unknown[];
@@ -1446,10 +1448,11 @@ ipcMain.handle("workflow:projection", workflowHandler(async (projectRoot: string
   return await withWorkflowSessionMutationLock(workflowProjectRoot, workflowSessionId, async () => {
     const store = await getWorkflowStore(projectRoot);
     await advanceWorkflowSession(projectRoot, store, workflowSessionId, false, "projection-query");
+    const view = store.materializeWorkflowView(workflowSessionId);
     return {
       protocolVersion: RUN_PROTOCOL_VERSION,
-      projection: store.materializeFlowProjection(workflowSessionId),
-      canvasSession: materializeRendererCanvasSession(store, workflowSessionId),
+      projection: view.projection,
+      canvasSession: materializeRendererCanvasSession(store, workflowSessionId, view.canvasSession),
     };
   });
 }));
@@ -4210,14 +4213,14 @@ function broadcastWorkflowProjection(
 ): void {
   const projectRoot = publishedWorkflowStoreIdentity(store);
   if (!projectRoot) return;
-  const projection = store.materializeFlowProjection(sessionId);
-  const canvasSession = materializeRendererCanvasSession(store, sessionId);
+  const view = store.materializeWorkflowView(sessionId);
+  const canvasSession = materializeRendererCanvasSession(store, sessionId, view.canvasSession);
   const envelope = parseWorkflowBroadcastEnvelope({
     protocolVersion: WORKFLOW_IPC_PROTOCOL_VERSION,
     projectRoot,
     sessionId,
     cause,
-    projection,
+    projection: view.projection,
     canvasSession,
   });
   for (const window of BrowserWindow.getAllWindows()) {
@@ -4255,9 +4258,13 @@ function augmentCanvasSessionWithHermesTerminal(canvasSession: unknown, terminal
   };
 }
 
-function materializeRendererCanvasSession(store: WorkflowStoreHost, sessionId: string): unknown {
+function materializeRendererCanvasSession(
+  store: WorkflowStoreHost,
+  sessionId: string,
+  canvasSession?: unknown,
+): unknown {
   return augmentCanvasSessionWithHermesTerminal(
-    store.materializeCanvasSession(sessionId),
+    canvasSession === undefined ? store.materializeCanvasSession(sessionId) : canvasSession,
     terminalRuntime.hermesPlannerTerminalSessionId(sessionId),
   );
 }
