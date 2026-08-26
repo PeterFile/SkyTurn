@@ -200,6 +200,7 @@ export interface WorkflowStoreOptions {
     afterCandidateBindingBeforeSegment?: () => void;
     afterCheckpointCandidateEvents?: () => void;
     afterCommitChangesetBeforeCheckpoint?: () => void;
+    afterWorkflowViewEventRowsRead?: () => void;
   };
 }
 
@@ -291,6 +292,12 @@ export interface WorkflowEventRecord {
   idempotencyKey: string | null;
   payload: Record<string, unknown>;
   createdAt: string;
+}
+
+export interface WorkflowMaterializedView {
+  projection: FlowProjection;
+  canvasSession: CanvasSession | null;
+  loopState: WorkflowLoopEngineeringState;
 }
 
 export interface WorkflowLaneRecord {
@@ -827,6 +834,11 @@ interface EventRow {
 interface ValidatedEventRow {
   row: EventRow;
   event: WorkflowEventRecord;
+}
+
+interface WorkflowEventSnapshot {
+  validatedEvents: ValidatedEventRow[];
+  projection: FlowProjection;
 }
 
 interface LaneRow {
@@ -2380,7 +2392,40 @@ export class WorkflowStore {
   }
 
   materializeFlowProjection(sessionId: string): FlowProjection {
+    return this.materializeWorkflowEventSnapshot(sessionId).projection;
+  }
+
+  materializeWorkflowView(
+    sessionId: string,
+    input: WorkflowLoopEngineeringProjectionInput = {},
+  ): WorkflowMaterializedView {
+    const readView = this.db.transaction(() => {
+      const session = this.getWorkflowSession(sessionId);
+      const snapshot = this.materializeWorkflowEventSnapshot(sessionId);
+      this.faultInjection?.afterWorkflowViewEventRowsRead?.();
+      return {
+        projection: snapshot.projection,
+        canvasSession: session
+          ? this.materializeCanvasSessionFromSnapshot(session, snapshot.projection, snapshot.validatedEvents)
+          : null,
+        loopState: projectLoopEngineeringState(snapshot.projection, input),
+      };
+    });
+    return readView();
+  }
+
+  private materializeWorkflowEventSnapshot(sessionId: string): WorkflowEventSnapshot {
     const validatedEvents = this.readValidatedEventRows(sessionId);
+    return {
+      validatedEvents,
+      projection: this.materializeFlowProjectionFromValidatedEvents(sessionId, validatedEvents),
+    };
+  }
+
+  private materializeFlowProjectionFromValidatedEvents(
+    sessionId: string,
+    validatedEvents: ValidatedEventRow[],
+  ): FlowProjection {
     const flowEvents = validatedEvents
       .filter(({ row }) => isFlowEventKind(row.kind))
       .map(({ row, event }) => mapEventRowToFlowEvent(row, event));
@@ -2409,7 +2454,7 @@ export class WorkflowStore {
     input: WorkflowLoopEngineeringProjectionInput = {},
   ): WorkflowLoopEngineeringState {
     this.requireKnownSession(sessionId);
-    return projectLoopEngineeringState(this.materializeFlowProjection(sessionId), input);
+    return projectLoopEngineeringState(this.materializeWorkflowEventSnapshot(sessionId).projection, input);
   }
 
   listEvents(sessionId: string): WorkflowEventRecord[] {
@@ -3563,24 +3608,39 @@ export class WorkflowStore {
   materializeCanvasSession(sessionId: string): CanvasSession | null {
     const session = this.getWorkflowSession(sessionId);
     if (!session) return null;
-    const flowProjection = this.materializeFlowProjection(sessionId);
+    const snapshot = this.materializeWorkflowEventSnapshot(sessionId);
+    return this.materializeCanvasSessionFromSnapshot(session, snapshot.projection, snapshot.validatedEvents);
+  }
+
+  private materializeCanvasSessionFromSnapshot(
+    session: WorkflowSessionRecord,
+    flowProjection: FlowProjection,
+    validatedEvents: ValidatedEventRow[],
+  ): CanvasSession {
+    const events = validatedEvents.map(({ event }) => event);
     if (flowProjection.lanes.length > 0 || flowProjection.userDecisions.length > 0) {
       return this.applyPersistedCanvasNodePositions(
-        sessionId,
-        this.materializeFlowCanvasSession(session, flowProjection),
+        this.materializeFlowCanvasSession(session, flowProjection, events),
+        events,
       );
     }
-    const lanes = this.listLanes(sessionId).filter((lane) => !lane.archived);
-    const edges = (this.statements.listEdges.all(sessionId) as EdgeRow[]).map((row) => ({
+    const lanes = this.listLanes(session.id).filter((lane) => !lane.archived);
+    const edges = (this.statements.listEdges.all(session.id) as EdgeRow[]).map((row) => ({
       id: row.id,
       source: row.source_lane_id,
       target: row.target_lane_id,
     }));
     const worktreesByLaneId = worktreesByParentLaneId(flowProjection.worktrees);
     const nodes = lanes.map((lane, index) =>
-      this.materializeNode(session, lane, index, worktreesByLaneId.get(lane.id) ?? worktreesByLaneId.get(lane.nodeId)),
+      this.materializeNode(
+        session,
+        lane,
+        index,
+        events,
+        worktreesByLaneId.get(lane.id) ?? worktreesByLaneId.get(lane.nodeId),
+      ),
     );
-    return this.applyPersistedCanvasNodePositions(sessionId, {
+    return this.applyPersistedCanvasNodePositions({
       id: session.id,
       projectId: session.projectId,
       title: session.title,
@@ -3595,11 +3655,14 @@ export class WorkflowStore {
       nodes,
       edges,
       activeNodeId: nodes.find((node) => node.status === "running" || node.status === "retrying")?.id ?? null,
-    });
+    }, events);
   }
 
-  private applyPersistedCanvasNodePositions(sessionId: string, canvasSession: CanvasSession): CanvasSession {
-    const positions = latestCanvasNodePositions(this.listEvents(sessionId));
+  private applyPersistedCanvasNodePositions(
+    canvasSession: CanvasSession,
+    events: WorkflowEventRecord[],
+  ): CanvasSession {
+    const positions = latestCanvasNodePositions(events);
     if (positions.size === 0) return canvasSession;
     return {
       ...canvasSession,
@@ -3610,12 +3673,16 @@ export class WorkflowStore {
     };
   }
 
-  private materializeFlowCanvasSession(session: WorkflowSessionRecord, projection: FlowProjection): CanvasSession {
+  private materializeFlowCanvasSession(
+    session: WorkflowSessionRecord,
+    projection: FlowProjection,
+    events: WorkflowEventRecord[],
+  ): CanvasSession {
     const plannerLane = this.getLane(session.id, session.plannerLaneId);
     if (!plannerLane) throw new Error("Workflow planner lane is unavailable.");
-    const plannerNode = this.materializeNode(session, plannerLane, 0);
+    const plannerNode = this.materializeNode(session, plannerLane, 0, events);
     const dependenciesByLaneId = dependenciesFromFlowProjection(projection);
-    const changesetsByLaneId = changesetsFromFlowEvents(this.listEvents(session.id));
+    const changesetsByLaneId = changesetsFromFlowEvents(events);
     const flowNodes = projection.lanes.map((lane, index) =>
       flowLaneToCanvasNode(session, projection, lane, index + 1, dependenciesByLaneId.get(lane.id) ?? [], changesetsByLaneId.get(lane.id)),
     );
@@ -4099,6 +4166,7 @@ export class WorkflowStore {
     session: WorkflowSessionRecord,
     lane: WorkflowLaneRecord,
     index: number,
+    events: WorkflowEventRecord[],
     createdWorktree?: WorkflowWorktreeIdentity | null,
   ): CanvasNode {
     const segments = this.listSegments(session.id, lane.id);
@@ -4109,7 +4177,6 @@ export class WorkflowStore {
     }
     const evidence = latestSegment?.evidence ?? null;
     const changesetId = isRecord(evidence) && typeof evidence.changesetId === "string" ? evidence.changesetId : `changeset-${session.id}-${lane.nodeId}`;
-    const events = this.listEvents(session.id);
     const latestPlannerInput = lane.laneKind === "planner" ? latestDeliveredWorkflowUserInput(events) : null;
     const outputEvents = events
       .filter((event) => event.laneId === lane.id && event.kind === "segment_output_delta");

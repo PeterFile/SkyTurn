@@ -38,6 +38,144 @@ afterEach(async () => {
 });
 
 describe("SQLite workflow store", () => {
+  it("materializes one coherent WAL snapshot across events and relational canvas rows", async () => {
+    const projectRoot = await makeTempRoot();
+    let mutationArmed = false;
+    let mutationCommitted = false;
+    let writer: Database.Database | null = null;
+    let plannerLaneId = "";
+    const options: Parameters<typeof createWorkflowStore>[0] & {
+      faultInjection: {
+        afterWorkflowViewEventRowsRead: () => void;
+      };
+    } = {
+      projectRoot,
+      faultInjection: {
+        afterWorkflowViewEventRowsRead: () => {
+          if (!mutationArmed || mutationCommitted || !writer) return;
+          writer.transaction(() => {
+            writer?.prepare(
+              "UPDATE workflow_lanes SET status = 'failed', phase = 'Failed', updated_at = ? WHERE session_id = ? AND id = ?",
+            ).run("2026-08-26T00:00:03.000Z", "session-1", plannerLaneId);
+          }).immediate();
+          mutationCommitted = true;
+        },
+      },
+    };
+    const store = createWorkflowStore(options);
+    seedStore(store);
+    const session = store.getWorkflowSession("session-1");
+    expect(session).not.toBeNull();
+    plannerLaneId = session?.plannerLaneId ?? "";
+    expect(store.getLane("session-1", plannerLaneId)?.status).toBe("completed");
+
+    writer = new Database(store.databasePath);
+    writer.pragma("journal_mode = WAL");
+    mutationArmed = true;
+    const inFlight = store.materializeWorkflowView("session-1");
+    const afterCommit = store.materializeWorkflowView("session-1");
+
+    expect(mutationCommitted).toBe(true);
+    expect(inFlight.canvasSession?.nodes.find((node) => node.id === plannerLaneId)?.status).toBe("completed");
+    expect(afterCommit.canvasSession?.nodes.find((node) => node.id === plannerLaneId)?.status).toBe("failed");
+    writer.close();
+    store.close();
+  });
+
+  it("keeps the legacy unknown-session materialized view behavior", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+
+    const view = store.materializeWorkflowView("unknown-session");
+
+    expect(view.projection.sessionId).toBe("unknown-session");
+    expect(view.canvasSession).toBeNull();
+    expect(view.loopState.sessionId).toBe("unknown-session");
+    store.close();
+  });
+
+  it("materializes one authoritative workflow view from one validated event snapshot", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    appendTestLane(store, "lane-authoritative", "completed");
+    store.recordCanvasNodePosition({
+      sessionId: "session-1",
+      updateId: "position-authoritative",
+      nodeId: "lane-authoritative",
+      position: { x: 321, y: 654 },
+      now: "2026-08-26T00:00:01.000Z",
+    });
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.evidence.recorded",
+      source: "test",
+      laneId: "lane-authoritative",
+      segmentId: "segment-authoritative",
+      idempotencyKey: "evidence:authoritative",
+      payload: {
+        laneId: "lane-authoritative",
+        segmentId: "segment-authoritative",
+        evidence: {
+          id: "evidence-authoritative",
+          kind: "run-exit",
+          status: "passed",
+          changesetId: "changeset-authoritative",
+          checks: ["test:authoritative-view:passed"],
+          artifacts: [],
+        },
+      },
+      now: "2026-08-26T00:00:02.000Z",
+    });
+
+    const originalRead = Reflect.get(store, "readValidatedEventRows") as (sessionId: string) => unknown;
+    let validatedReadCount = 0;
+    Reflect.set(store, "readValidatedEventRows", (sessionId: string) => {
+      validatedReadCount += 1;
+      return originalRead.call(store, sessionId);
+    });
+    const view = store.materializeWorkflowView("session-1");
+    Reflect.deleteProperty(store, "readValidatedEventRows");
+
+    const throughSeq = view.projection.events.at(-1)?.seq ?? 0;
+    const node = view.canvasSession?.nodes.find((candidate) => candidate.id === "lane-authoritative");
+    expect(validatedReadCount).toBe(1);
+    expect(view.projection.sessionId).toBe("session-1");
+    expect(view.projection.events.every((event) => event.sessionId === "session-1")).toBe(true);
+    expect(view.canvasSession?.id).toBe("session-1");
+    expect(view.loopState.sessionId).toBe("session-1");
+    expect(view.loopState.throughSeq).toBe(throughSeq);
+    expect(node).toMatchObject({
+      changesetId: "changeset-authoritative",
+      position: { x: 321, y: 654 },
+    });
+    expect(store.materializeFlowProjection("session-1")).toEqual(view.projection);
+    expect(store.materializeCanvasSession("session-1")).toEqual(view.canvasSession);
+    expect(store.getLoopEngineeringState("session-1")).toEqual(view.loopState);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeWorkflowView("session-1")).toEqual(view);
+    reopened.close();
+  });
+
+  it("keeps authoritative workflow view replay fail-closed after reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    appendTestLane(store, "lane-corrupt-view");
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    const tamper = new Database(reopened.databasePath);
+    tamper.prepare("UPDATE workflow_events SET payload_json = ? WHERE idempotency_key = ?")
+      .run("{", "test-lane:lane-corrupt-view");
+    tamper.close();
+
+    expect(() => reopened.materializeWorkflowView("session-1")).toThrow();
+    reopened.close();
+  });
+
   it("materializes a reopened legacy pending planner without fabricating a run", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
