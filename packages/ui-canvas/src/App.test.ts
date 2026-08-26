@@ -43,11 +43,13 @@ import {
   isPlanSourceEditable,
   isPlanNextEnabled,
   isPlanFinishEnabled,
+  upsertWorkflowNextAction,
   UserDecisionPanel,
+  workflowNextActionForScope,
 } from "./App.js";
 import * as AppModule from "./App.js";
 import { parsePlanBootstrapSession } from "@skyturn/project-core";
-import type { CanvasNode, CanvasSession, Changeset, FinalChangesetReconciliation, PlanSession, RunEvidence } from "@skyturn/project-core";
+import type { CanvasNode, CanvasSession, Changeset, FinalChangesetReconciliation, PlanSession, RunEvidence, WorkflowLoopNextAction } from "@skyturn/project-core";
 import type { DeliveryCommitSummary } from "./deliveryPanel.js";
 import type { SelectedNodeActionState } from "./nodeActionState.js";
 import { acceptPlanStage, canFinishPlan, editPlanStage } from "./planRuntime.js";
@@ -1773,6 +1775,50 @@ describe("UI source validation", () => {
     expect(workflowEventEffect).toContain("projectId: envelope.canvasSession.projectId");
     expect(workflowEventEffect).toContain("canonicalRoot: envelope.projectRoot");
     expect(workflowEventEffect).toContain("sessionId: envelope.sessionId");
+  });
+
+  it("keeps canonical next actions isolated by project and session", () => {
+    const first: WorkflowLoopNextAction = {
+      kind: "execute_lane",
+      reason: "Run first.",
+      laneId: "lane-first",
+    };
+    const second: WorkflowLoopNextAction = {
+      kind: "blocked",
+      reason: "Second is blocked.",
+    };
+    let actions: ReadonlyMap<string, WorkflowLoopNextAction> = new Map();
+    actions = upsertWorkflowNextAction(actions, "project-1", "session-1", first);
+    actions = upsertWorkflowNextAction(actions, "project-1", "session-2", second);
+
+    expect(workflowNextActionForScope(actions, "project-1", "session-1")).toBe(first);
+    expect(workflowNextActionForScope(actions, "project-1", "session-2")).toBe(second);
+    expect(workflowNextActionForScope(actions, "project-2", "session-1")).toBeNull();
+    expect(workflowNextActionForScope(actions, null, "session-1")).toBeNull();
+  });
+
+  it("keeps the next safe action hint compact and navigation-only", async () => {
+    const appSource = await readSource("./App.tsx");
+    const styles = await readSource("./styles.css");
+    const navigationStart = appSource.indexOf("nextActionHint={nextAction ?");
+    const navigationEnd = appSource.indexOf("onComposerChange=", navigationStart);
+    const navigation = appSource.slice(navigationStart, navigationEnd);
+
+    expect(navigationStart).toBeGreaterThan(-1);
+    expect(navigation).toContain("setSelectedNodeId");
+    expect(navigation).toContain("setModalTab");
+    for (const mutation of [
+      "pushDeliveryBranch",
+      "mergePullRequest",
+      "applyRollback",
+      "requestRepair",
+      "requestVariant",
+    ]) {
+      expect(navigation).not.toContain(mutation);
+    }
+    expect(appSource).toContain("Next safe action ·");
+    expect(styles).toContain(".next-action-hint");
+    expect(styles).not.toContain("var(--color-");
   });
 
   it("renders compact agent readiness near canvas composer but not on start page", async () => {
@@ -3723,8 +3769,18 @@ describe("Terminal Inspector Source Code Analysis", () => {
 
   it("selecting node does not auto-open terminal", async () => {
     const appSource = await readSource("./App.tsx");
-    // Expect no effect that sets terminal open on node select unconditionally
-    expect(appSource).not.toMatch(/setSelectedNodeId\([^)]+\)[\s\S]*?setTerminalOpen\(true\)/);
+    const selectionStart = appSource.indexOf("onSelectNode={(nodeId)");
+    const selection = appSource.slice(selectionStart, appSource.indexOf("onInspectNode=", selectionStart));
+    const nextActionStart = appSource.indexOf("onNavigateNextAction={(navigation)");
+    const nextActionNavigation = appSource.slice(
+      nextActionStart,
+      appSource.indexOf("onComposerChange=", nextActionStart),
+    );
+
+    expect(selectionStart).toBeGreaterThan(-1);
+    expect(nextActionStart).toBeGreaterThan(-1);
+    expect(selection).not.toContain("setTerminalOpen(true)");
+    expect(nextActionNavigation).not.toContain("setTerminalOpen(true)");
   });
 
   it("renderer does not call terminal.start / terminal.write; read-only only", async () => {

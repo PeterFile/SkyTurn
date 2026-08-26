@@ -1,4 +1,9 @@
-import type { CanvasSession } from "@skyturn/project-core" with { "resolution-mode": "import" };
+import type {
+  CanvasSession,
+  WorkflowEngineeringLoopKind,
+  WorkflowLoopNextAction,
+  WorkflowLoopNextActionKind,
+} from "@skyturn/project-core" with { "resolution-mode": "import" };
 
 export const WORKFLOW_IPC_PROTOCOL_VERSION = 1 as const;
 export const WORKFLOW_EVENT_CHANNEL = "workflow:event" as const;
@@ -16,11 +21,16 @@ export interface WorkflowSessionEnvelope {
   projectRoot: string;
   sessionId: string;
   canvasSession: CanvasSession;
+  nextAction?: WorkflowLoopNextAction;
 }
 
-export interface WorkflowBroadcastEnvelope extends WorkflowSessionEnvelope {
-  cause: WorkflowBroadcastCause;
+export interface WorkflowProjectionResponseEnvelope extends WorkflowSessionEnvelope {
   projection: unknown;
+  nextAction: WorkflowLoopNextAction;
+}
+
+export interface WorkflowBroadcastEnvelope extends WorkflowProjectionResponseEnvelope {
+  cause: WorkflowBroadcastCause;
 }
 
 const workflowBroadcastCauses: readonly WorkflowBroadcastCause[] = [
@@ -87,17 +97,82 @@ export function parseWorkflowResponseEnvelope<T>(
   if (value.canvasSession.id !== value.sessionId) {
     throw workflowIpcError("INVALID_INPUT", "Workflow response session identity is inconsistent.");
   }
+  const record = value as Record<string, unknown>;
+  if (Object.hasOwn(record, "nextAction") && record.nextAction !== undefined) {
+    assertWorkflowLoopNextAction(record.nextAction);
+  }
   return value as T & WorkflowSessionEnvelope;
 }
 
-export function parseWorkflowBroadcastEnvelope(value: unknown): WorkflowBroadcastEnvelope {
-  const envelope = parseWorkflowResponseEnvelope(value);
+export function parseWorkflowProjectionResponseEnvelope<T>(
+  value: T,
+  expectedSessionId?: string,
+): T & WorkflowProjectionResponseEnvelope {
+  const envelope = parseWorkflowResponseEnvelope(value, expectedSessionId);
   const record = envelope as WorkflowSessionEnvelope & Record<string, unknown>;
+  if (!Object.hasOwn(record, "projection") || record.projection === undefined) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow projection response is missing.");
+  }
+  if (!Object.hasOwn(record, "nextAction") || record.nextAction === undefined) {
+    throw workflowIpcError("INVALID_INPUT", "Workflow projection next action is missing.");
+  }
+  assertWorkflowLoopNextAction(record.nextAction);
+  return record as T & WorkflowProjectionResponseEnvelope;
+}
+
+function assertWorkflowLoopNextAction(value: unknown): asserts value is WorkflowLoopNextAction {
+  if (!isRecord(value) || !hasOwnFields(value, ["kind", "reason"])) {
+    throw workflowIpcError("INVALID_INPUT", "Next action must be an object.");
+  }
+  const validKinds: readonly WorkflowLoopNextActionKind[] = [
+    "execute_lane", "wait_for_checks", "fix_failed_checks", "merge_pull_request",
+    "rollback_node", "request_repair", "request_variant", "blocked", "none",
+  ];
+  if (typeof value.kind !== "string" || !validKinds.includes(value.kind as WorkflowLoopNextActionKind)) {
+    throw workflowIpcError("INVALID_INPUT", "Next action kind is invalid.");
+  }
+  if (typeof value.reason !== "string" || value.reason.length === 0) {
+    throw workflowIpcError("INVALID_INPUT", "Next action reason is invalid.");
+  }
+  if (Object.hasOwn(value, "loop") && value.loop !== undefined) {
+    const validLoops: readonly WorkflowEngineeringLoopKind[] = [
+      "execution",
+      "delivery",
+      "rollback",
+      "repair",
+      "variant",
+    ];
+    if (typeof value.loop !== "string" || !validLoops.includes(value.loop as WorkflowEngineeringLoopKind)) {
+      throw workflowIpcError("INVALID_INPUT", "Next action loop is invalid.");
+    }
+  }
+  if (Object.hasOwn(value, "laneId") && value.laneId !== undefined) {
+    if (typeof value.laneId !== "string" || value.laneId.length === 0) {
+      throw workflowIpcError("INVALID_INPUT", "Next action laneId is invalid.");
+    }
+  }
+  if (Object.hasOwn(value, "prNumber") && value.prNumber !== undefined) {
+    if (!Number.isSafeInteger(value.prNumber) || Number(value.prNumber) <= 0) {
+      throw workflowIpcError("INVALID_INPUT", "Next action prNumber is invalid.");
+    }
+  }
+  if (Object.hasOwn(value, "headSha") && value.headSha !== undefined) {
+    if (typeof value.headSha !== "string" || value.headSha.length === 0) {
+      throw workflowIpcError("INVALID_INPUT", "Next action headSha is invalid.");
+    }
+  }
+  if (Object.hasOwn(value, "checkpointId") && value.checkpointId !== undefined) {
+    if (typeof value.checkpointId !== "string" || value.checkpointId.length === 0) {
+      throw workflowIpcError("INVALID_INPUT", "Next action checkpointId is invalid.");
+    }
+  }
+}
+
+export function parseWorkflowBroadcastEnvelope(value: unknown): WorkflowBroadcastEnvelope {
+  const envelope = parseWorkflowProjectionResponseEnvelope(value);
+  const record = envelope as WorkflowProjectionResponseEnvelope & Record<string, unknown>;
   if (!workflowBroadcastCauses.includes(record.cause as WorkflowBroadcastCause)) {
     throw workflowIpcError("INVALID_INPUT", "Workflow broadcast cause is invalid.");
-  }
-  if (!Object.hasOwn(record, "projection") || record.projection === undefined) {
-    throw workflowIpcError("INVALID_INPUT", "Workflow broadcast projection is missing.");
   }
   return record as unknown as WorkflowBroadcastEnvelope;
 }

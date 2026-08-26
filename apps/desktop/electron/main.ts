@@ -1453,6 +1453,7 @@ ipcMain.handle("workflow:projection", workflowHandler(async (projectRoot: string
       protocolVersion: RUN_PROTOCOL_VERSION,
       projection: view.projection,
       canvasSession: materializeRendererCanvasSession(store, workflowSessionId, view.canvasSession),
+      nextAction: view.loopState.nextAction,
     };
   });
 }));
@@ -4222,6 +4223,7 @@ function broadcastWorkflowProjection(
     cause,
     projection: view.projection,
     canvasSession,
+    nextAction: view.loopState.nextAction,
   });
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send(WORKFLOW_EVENT_CHANNEL, envelope);
