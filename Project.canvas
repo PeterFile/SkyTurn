@@ -36,7 +36,7 @@
       "x": 0,
       "y": 900,
       "width": 820,
-      "height": 860,
+      "height": 1140,
       "label": "④ Evidence",
       "color": "4"
     },
@@ -157,8 +157,8 @@
       "y": 500,
       "width": 360,
       "height": 210,
-      "color": "6",
-      "text": "Task: Harden explicit delivery gates\nState: Proposed\nOwner: Hermes/Codex\nDepends: git evidence, PR exact-head checks\nEvidence: README delivery surfaces\nRisk: remote side effects need explicit user gates"
+      "color": "4",
+      "text": "Task: Harden explicit delivery gates\nState: Done\nDepends: git evidence, PR exact-head checks\nEvidence: Explicit delivery gates implementation and recovery\nLevel: Implemented and heavily hardened across separate delivery actions\nGate: user confirmed this implemented capability is not product backlog\nBoundary: real GitHub acceptance was not rerun in this documentation-only lane\nRisk: remote side effects still require explicit user gates"
     },
     {
       "id": "1000000000000012",
@@ -249,6 +249,16 @@
       "height": 220,
       "color": "4",
       "text": "Evidence: Trusted checkpoint ancestry\ncommit: c587e522e77a519bab3d6efa851555c5a741cc97 (PR #130) and edd660be7015c972b8b645b6d25e949c1c24210b (PR #131)\nbuild: both PRs have exact-head Build and test SUCCESS and Windows AgentBridge (exact head) SUCCESS\nmain: edd660be7015c972b8b645b6d25e949c1c24210b\nAuthority: Electron/backend validates checkpoint-context proof against live Git; stored claims and renderer state are not proof\nBoundary: legacy checkpoints without proof remain readable, while ancestry-dependent actions fail closed"
+    },
+    {
+      "id": "e7a9c1d3f5b70824",
+      "type": "text",
+      "x": 40,
+      "y": 1780,
+      "width": 750,
+      "height": 220,
+      "color": "4",
+      "text": "Evidence: Explicit delivery gates implementation and recovery\ncommit: 1178cc5 guarded lifecycle; 1fc533c explicit UI gates; 0050a80 and bbd7ed6 Git-backed commit completion\ntest: 88991ba candidate delivery lifecycle; 6c08070 delivery recovery after restart\nbuild: not rerun in this documentation-only lane\nmanual: README and live git history confirm separate commit, push, PR, exact-head checks, merge, main sync, and cleanup gates\nartifact: apps/desktop/scripts/candidateDeliveryPrAcceptance.mjs"
     }
   ],
   "edges": [
@@ -398,6 +408,14 @@
       "id": "b2d4f6081a3c5e7f",
       "fromNode": "a1c3e5f7092b4d6f",
       "toNode": "c3e5a7092b4d6f81",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "f8b0d2e4a6c91357",
+      "fromNode": "1000000000000011",
+      "toNode": "e7a9c1d3f5b70824",
       "toEnd": "arrow",
       "label": "evidence",
       "color": "4"
