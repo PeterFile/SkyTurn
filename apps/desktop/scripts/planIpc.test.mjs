@@ -355,7 +355,7 @@ test("workspace load hydrates every legacy pending durable canvas and preserves 
 
     assert.equal(hydratedIds.includes("session-durable-old"), true);
     assert.equal(hydratedIds.includes("session-durable"), true);
-    assert.equal(hydratedIds.includes("session-unrelated"), true);
+    assert.equal(hydratedIds.includes("session-unrelated"), false);
     assert.equal(hydrated.projects.some((project) => project.id === "project-2"), true);
     for (const sessionId of ["session-durable-old", "session-durable"]) {
       const planner = hydrated.sessions
@@ -367,6 +367,185 @@ test("workspace load hydrates every legacy pending durable canvas and preserves 
     assert.equal(hydrated.activeSessionId, "session-durable");
   } finally {
     await loaded?.exports.closeWorkflowStores();
+    await rm(userDataPath, { recursive: true, force: true });
+  }
+});
+
+test("workspace save persists only shell and Plan state before SQLite restores the active Canvas", async () => {
+  const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-workspace-shell-only-"));
+  const projectRoot = join(userDataPath, "project");
+  const canvasSessionId = "session-sqlite-active";
+  const mirroredRunId = "run-workspace-mirror-only";
+  const mirroredNodeId = "node-workspace-mirror-only";
+  const planSessionId = "plan-shell-retained";
+  let first;
+  let reopened;
+  try {
+    await mkdir(projectRoot);
+    const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+    const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: canvasSessionId,
+      projectId: "project-1",
+      title: "SQLite authoritative canvas",
+      goal: "Restore this Canvas from SQLite",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Test setup has no live Hermes session.",
+      now: "2026-08-26T00:00:00.000Z",
+    });
+    const rendererCanvas = toPlain(store.materializeCanvasSession(canvasSessionId));
+    rendererCanvas.nodes.push({
+      id: mirroredNodeId,
+      kind: "task",
+      title: "Renderer-only mirror node",
+      status: "succeeded",
+      runId: mirroredRunId,
+    });
+    store.close();
+
+    const workspace = currentPlanWorkspace(projectRoot, planSessionId);
+    workspace.sessions = [rendererCanvas, workspace.sessions[0]];
+    workspace.activeSessionId = canvasSessionId;
+    workspace.sidebarCollapsed = true;
+    workspace.collapsedProjectIds = ["project-1"];
+    workspace.changesets = {
+      "changeset-workspace-mirror-only": { id: "changeset-workspace-mirror-only", files: [] },
+    };
+    workspace.agents = [{ id: "agent-workspace-mirror-only", kind: "codex" }];
+    workspace.runs = {
+      [mirroredRunId]: { id: mirroredRunId, status: "succeeded" },
+    };
+    workspace.runEvents = {
+      [mirroredRunId]: [{ id: "event-workspace-mirror-only", runId: mirroredRunId, kind: "output" }],
+    };
+    workspace.runEvidence = {
+      [mirroredRunId]: { runId: mirroredRunId, status: "succeeded" },
+    };
+
+    first = await loadMainModule([], { userDataPath });
+    first.exports.openedProjectRoots.add(projectRoot);
+    await first.ipcHandlers.get("workspace:save")({}, workspace);
+
+    const rawText = await readFile(join(userDataPath, "workspace.json"), "utf8");
+    const raw = JSON.parse(rawText);
+    assert.deepEqual(Object.keys(raw).sort(), [
+      "activeProjectId",
+      "activeSessionId",
+      "collapsedProjectIds",
+      "projects",
+      "sessions",
+      "sidebarCollapsed",
+    ]);
+    assert.deepEqual(raw.sessions, [workspace.sessions[1]]);
+    assert.equal(raw.activeProjectId, "project-1");
+    assert.equal(raw.activeSessionId, canvasSessionId);
+    assert.equal(raw.sidebarCollapsed, true);
+    assert.deepEqual(raw.collapsedProjectIds, ["project-1"]);
+    for (const omitted of [
+      mirroredNodeId,
+      mirroredRunId,
+      "event-workspace-mirror-only",
+      "changeset-workspace-mirror-only",
+      "agent-workspace-mirror-only",
+    ]) {
+      assert.equal(rawText.includes(omitted), false, omitted);
+    }
+
+    await first.exports.closeWorkflowStores();
+    first = null;
+    reopened = await loadMainModule([], {
+      userDataPath,
+      createPlanRuntime: () => ({
+        getState: async () => ({ protocolVersion: 1, needsBootstrap: false, active: null, terminal: null }),
+        close: async () => undefined,
+      }),
+    });
+    const loaded = toPlain(await reopened.ipcHandlers.get("workspace:load")());
+    const restoredCanvas = loaded.sessions.find((session) => session.id === canvasSessionId);
+
+    assert.equal(restoredCanvas.title, "SQLite authoritative canvas");
+    assert.equal(restoredCanvas.nodes.some((node) => node.id === mirroredNodeId), false);
+    assert.equal(loaded.sessions.some((session) => session.id === planSessionId && session.kind === "plan"), true);
+    assert.equal(loaded.activeSessionId, canvasSessionId);
+  } finally {
+    await first?.exports.closeWorkflowStores();
+    await reopened?.exports.closeWorkflowStores();
+    await rm(userDataPath, { recursive: true, force: true });
+  }
+});
+
+test("workspace load accepts a legacy full file but never treats its Canvas mirrors as authority", async () => {
+  const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-workspace-legacy-full-"));
+  const projectRoot = join(userDataPath, "project");
+  const canvasSessionId = "session-legacy-durable";
+  const missingCanvasSessionId = "session-legacy-mirror-only";
+  const planSessionId = "plan-legacy-retained";
+  let loadedMain;
+  try {
+    await mkdir(projectRoot);
+    const { createWorkflowStore } = await import("@skyturn/persistence/workflow-store");
+    const store = createWorkflowStore({ projectRoot });
+    store.createWorkflowSession({
+      id: canvasSessionId,
+      projectId: "project-1",
+      title: "SQLite wins over legacy JSON",
+      goal: "Use durable workflow facts",
+      mode: "fast",
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "Test setup has no live Hermes session.",
+      now: "2026-08-26T00:00:00.000Z",
+    });
+    store.close();
+
+    const workspace = currentPlanWorkspace(projectRoot, planSessionId);
+    const legacyCanvas = {
+      id: canvasSessionId,
+      projectId: "project-1",
+      title: "Stale legacy Canvas mirror",
+      goal: "Must be replaced",
+      mode: "fast",
+      kind: "canvas",
+      target: { executionTarget: "current_branch", selectedBranch: "main" },
+      createdAt: "2026-08-26T00:00:00.000Z",
+      updatedAt: "2026-08-26T00:00:00.000Z",
+      hermesPlannerSessionId: "hermes-stale-legacy",
+      plannerNodeId: "planner-stale-legacy",
+      nodes: [{ id: "node-stale-legacy", runId: "run-stale-legacy" }],
+      edges: [],
+      activeNodeId: "node-stale-legacy",
+    };
+    workspace.sessions = [
+      legacyCanvas,
+      { ...legacyCanvas, id: missingCanvasSessionId, title: "Mirror without SQLite" },
+      workspace.sessions[0],
+    ];
+    workspace.activeSessionId = canvasSessionId;
+    workspace.changesets = { legacy: { id: "legacy" } };
+    workspace.runs = { "run-stale-legacy": { id: "run-stale-legacy" } };
+    workspace.runEvents = { "run-stale-legacy": [] };
+    workspace.runEvidence = { "run-stale-legacy": { runId: "run-stale-legacy" } };
+    await writeFile(join(userDataPath, "workspace.json"), JSON.stringify(workspace, null, 2), "utf8");
+
+    loadedMain = await loadMainModule([], {
+      userDataPath,
+      createPlanRuntime: () => ({
+        getState: async () => ({ protocolVersion: 1, needsBootstrap: false, active: null, terminal: null }),
+        close: async () => undefined,
+      }),
+    });
+    const loaded = toPlain(await loadedMain.ipcHandlers.get("workspace:load")());
+    const restoredCanvas = loaded.sessions.find((session) => session.id === canvasSessionId);
+
+    assert.equal(restoredCanvas.title, "SQLite wins over legacy JSON");
+    assert.equal(restoredCanvas.nodes.some((node) => node.id === "node-stale-legacy"), false);
+    assert.equal(loaded.sessions.some((session) => session.id === missingCanvasSessionId), false);
+    assert.equal(loaded.sessions.some((session) => session.id === planSessionId && session.kind === "plan"), true);
+    assert.equal(loaded.activeSessionId, canvasSessionId);
+  } finally {
+    await loadedMain?.exports.closeWorkflowStores();
     await rm(userDataPath, { recursive: true, force: true });
   }
 });
@@ -455,7 +634,7 @@ test("workspace load isolates an inconsistent durable session and never revives 
     const hydratedIds = hydrated.sessions.map((session) => session.id);
 
     assert.equal(hydratedIds.includes("session-valid"), true);
-    assert.equal(hydratedIds.includes("session-unrelated"), true);
+    assert.equal(hydratedIds.includes("session-unrelated"), false);
     assert.equal(hydratedIds.includes(inconsistent.id), false);
     assert.equal(hydrated.activeSessionId, "session-valid");
   } finally {
@@ -1161,13 +1340,20 @@ test("workspace persistence preserves unavailable projects without trusting them
       }),
     });
 
-    const loaded = await ipcHandlers.get("workspace:load")();
-    assert.deepEqual(toPlain(loaded), workspace);
+    const loaded = toPlain(await ipcHandlers.get("workspace:load")());
+    assert.deepEqual(loaded.projects, workspace.projects);
+    assert.deepEqual(loaded.sessions, [workspace.sessions[1]]);
+    assert.equal(loaded.activeProjectId, "project-unavailable");
+    assert.equal(loaded.activeSessionId, null);
+    assert.deepEqual(loaded.collapsedProjectIds, ["project-unavailable"]);
     assert.equal(exports.openedProjectRoots.has(reachableRoot), true);
     assert.equal(exports.openedProjectRoots.has(unavailableRoot), false);
 
     await ipcHandlers.get("workspace:save")({}, loaded);
-    assert.equal(await readFile(join(userDataPath, "workspace.json"), "utf8"), serialized);
+    assert.deepEqual(
+      JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")),
+      workspaceShellSnapshot(loaded),
+    );
     assert.equal(exports.openedProjectRoots.has(unavailableRoot), false);
 
     await assert.rejects(
@@ -1557,7 +1743,10 @@ test("workspace save accepts a converted Plan Canvas without treating it as a Pl
 
     await loaded.ipcHandlers.get("workspace:save")({}, workspace);
 
-    assert.deepEqual(toPlain(JSON.parse(await readFile(target, "utf8"))), workspace);
+    assert.deepEqual(
+      toPlain(JSON.parse(await readFile(target, "utf8"))),
+      workspaceShellSnapshot(workspace),
+    );
   } finally {
     await rm(userDataPath, { recursive: true, force: true });
   }
@@ -1591,7 +1780,7 @@ test("Open Project roots can be added to the trusted workspace", async () => {
     await assert.doesNotReject(ipcHandlers.get("workspace:save")({}, workspace));
     assert.deepEqual(
       JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")),
-      workspace,
+      workspaceShellSnapshot(workspace),
     );
   } finally {
     await rm(userDataPath, { recursive: true, force: true });
@@ -5678,7 +5867,7 @@ test("scheduler grants one exact canonical browser capture capability and reject
   const producerGate = deferred();
   const workspaceSaveGate = deferred();
   const fsPromises = instrumentWorkspaceWrites({
-    blockPayload: '"label": "browser-shutdown-boundary"',
+    blockPayload: '"name": "browser-shutdown-boundary"',
     onBlocked: workspaceSaveGate.started,
     release: workspaceSaveGate.release,
   });
@@ -6218,10 +6407,10 @@ test("workspace saves are generation ordered so an older deferred save cannot fi
   const gate = deferred();
   const newerObserved = deferred();
   const fsPromises = instrumentWorkspaceWrites({
-    blockPayload: '"label": "older"',
+    blockPayload: '"name": "older"',
     onBlocked: gate.started,
     onPayload: (payload) => {
-      if (payload.includes('"label": "newer"')) newerObserved.started.resolve();
+      if (payload.includes('"name": "newer"')) newerObserved.started.resolve();
     },
     release: gate.release,
   });
@@ -6239,7 +6428,7 @@ test("workspace saves are generation ordered so an older deferred save cannot fi
     gate.release.resolve();
     await Promise.all([older, newer]);
 
-    assert.equal(JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")).label, "newer");
+    assert.equal(JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")).projects[0].name, "newer");
   } finally {
     gate.release.resolve();
     await rm(userDataPath, { recursive: true, force: true });
@@ -6262,7 +6451,7 @@ test("workspace save burst coalesces to the latest final bytes", async () => {
     ]);
 
     assert.equal(writes.length, 1);
-    assert.equal(JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")).label, "three");
+    assert.equal(JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")).projects[0].name, "three");
   } finally {
     await rm(userDataPath, { recursive: true, force: true });
   }
@@ -6294,7 +6483,7 @@ test("win32 workspace save skips directory sync and drains before quit", async (
     loaded.exports.openedProjectRoots.add(projectRoot);
 
     await loaded.ipcHandlers.get("workspace:save")({}, workspace);
-    assert.equal(await readFile(target, "utf8"), JSON.stringify(workspace, null, 2));
+    assert.equal(await readFile(target, "utf8"), JSON.stringify(workspaceShellSnapshot(workspace), null, 2));
     await loaded.exports.workspaceSaveWriter.drain();
 
     let prevented = 0;
@@ -6320,7 +6509,7 @@ test("workspace atomic save failure preserves prior JSON and removes private tem
   const projectRoot = join(userDataPath, "project");
   const target = join(userDataPath, "workspace.json");
   const prior = workspaceSnapshot(projectRoot, "prior-valid");
-  const fsPromises = instrumentWorkspaceWrites({ failPayload: '"label": "broken-new"' });
+  const fsPromises = instrumentWorkspaceWrites({ failPayload: '"name": "broken-new"' });
   try {
     await mkdir(projectRoot);
     await writeFile(target, JSON.stringify(prior, null, 2), { mode: 0o600 });
@@ -6338,14 +6527,14 @@ test("workspace atomic save failure preserves prior JSON and removes private tem
   }
 });
 
-test("workspace drain retries the retained latest snapshot and persists its exact state", async () => {
+test("workspace drain retries the retained latest snapshot and persists its exact shell state", async () => {
   const userDataPath = await mkdtemp(join(tmpdir(), "skyturn-workspace-save-retry-"));
   const projectRoot = join(userDataPath, "project");
   const target = join(userDataPath, "workspace.json");
   const prior = workspaceSnapshot(projectRoot, "prior-valid");
   const latest = workspaceSnapshot(projectRoot, "latest-retry");
   const fsPromises = instrumentWorkspaceWrites({
-    failPayload: '"label": "latest-retry"',
+    failPayload: '"name": "latest-retry"',
     failTimes: 1,
   });
   try {
@@ -6360,7 +6549,7 @@ test("workspace drain retries the retained latest snapshot and persists its exac
     );
     assert.deepEqual(JSON.parse(await readFile(target, "utf8")), prior);
     await loaded.exports.workspaceSaveWriter.drain();
-    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), latest);
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), workspaceShellSnapshot(latest));
   } finally {
     await rm(userDataPath, { recursive: true, force: true });
   }
@@ -6375,8 +6564,8 @@ test("workspace quit drain waits for its bounded retained-snapshot retry", async
   const latest = workspaceSnapshot(projectRoot, "quit-retry");
   const fsPromises = instrumentWorkspaceWrites({
     blockAttempt: 2,
-    blockPayload: '"label": "quit-retry"',
-    failPayload: '"label": "quit-retry"',
+    blockPayload: '"name": "quit-retry"',
+    failPayload: '"name": "quit-retry"',
     failTimes: 1,
     onBlocked: gate.started,
     release: gate.release,
@@ -6395,7 +6584,7 @@ test("workspace quit drain waits for its bounded retained-snapshot retry", async
     gate.release.resolve();
     await cleanup;
     assert.equal(loaded.appState.quitCalls, 1);
-    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), latest);
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), workspaceShellSnapshot(latest));
   } finally {
     gate.release.resolve();
     await rm(userDataPath, { recursive: true, force: true });
@@ -6410,7 +6599,7 @@ test("workspace shutdown rejects saves after admission closes and never writes t
   const accepted = workspaceSnapshot(projectRoot, "accepted-before-shutdown");
   const rejected = workspaceSnapshot(projectRoot, "rejected-after-shutdown");
   const fsPromises = instrumentWorkspaceWrites({
-    blockPayload: '"label": "accepted-before-shutdown"',
+    blockPayload: '"name": "accepted-before-shutdown"',
     onBlocked: gate.started,
     release: gate.release,
   });
@@ -6433,7 +6622,7 @@ test("workspace shutdown rejects saves after admission closes and never writes t
     await cleanup;
     await rejectedAssertion;
 
-    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), accepted);
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), workspaceShellSnapshot(accepted));
     assert.doesNotMatch(await readFile(target, "utf8"), /rejected-after-shutdown/);
   } finally {
     gate.release.resolve();
@@ -6447,7 +6636,7 @@ test("workspace drain rejects while the retained latest snapshot still cannot pe
   const target = join(userDataPath, "workspace.json");
   const prior = workspaceSnapshot(projectRoot, "prior-valid");
   const latest = workspaceSnapshot(projectRoot, "permanent-failure");
-  const fsPromises = instrumentWorkspaceWrites({ failPayload: '"label": "permanent-failure"' });
+  const fsPromises = instrumentWorkspaceWrites({ failPayload: '"name": "permanent-failure"' });
   try {
     await mkdir(projectRoot);
     await writeFile(target, JSON.stringify(prior, null, 2), { mode: 0o600 });
@@ -6473,7 +6662,7 @@ test("before-quit keeps a failed workspace drain retryable without detaching the
   let runtimeStateCalls = 0;
   let runtimeCloseCalls = 0;
   const fsPromises = instrumentWorkspaceWrites({
-    failPayload: '"label": "quit-failure-retry"',
+    failPayload: '"name": "quit-failure-retry"',
     failTimes: 2,
     onPayload: () => { writeAttempts += 1; },
   });
@@ -6529,7 +6718,7 @@ test("before-quit keeps a failed workspace drain retryable without detaching the
     assert.equal(runtimeCloseCalls, 1);
     assert.deepEqual(
       JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")),
-      latest,
+      workspaceShellSnapshot(latest),
     );
   } finally {
     await rm(userDataPath, { recursive: true, force: true });
@@ -6578,7 +6767,7 @@ test("window-all-closed never quits after a workspace drain rejection", async ()
   const projectRoot = join(userDataPath, "project");
   let writeAttempts = 0;
   const fsPromises = instrumentWorkspaceWrites({
-    failPayload: '"label": "window-close-failure"',
+    failPayload: '"name": "window-close-failure"',
     onPayload: () => { writeAttempts += 1; },
   });
   try {
@@ -6621,8 +6810,8 @@ test("activate and second-instance share one failed window-close recovery before
   };
   const fsPromises = instrumentWorkspaceWrites({
     blockAttempt: 3,
-    blockPayload: '"label": "retained-latest"',
-    failPayload: '"label": "retained-latest"',
+    blockPayload: '"name": "retained-latest"',
+    failPayload: '"name": "retained-latest"',
     failTimes: 2,
     onBlocked: gate.started,
     onPayload: () => { writeAttempts += 1; },
@@ -6670,7 +6859,7 @@ test("activate and second-instance share one failed window-close recovery before
     assert.equal(writeAttempts, 3);
     assert.equal(runtimeFactoryCalls, 1);
     assert.equal(runtimeCloseCalls, 1);
-    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), latest);
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), workspaceShellSnapshot(latest));
 
     await loaded.ipcHandlers.get("workspace:load")();
     await loaded.ipcHandlers.get("plan:getState")({}, { planSessionId: "plan-1", projectRoot });
@@ -6747,7 +6936,7 @@ test("macOS activate cannot reopen stale workspace while retained latest drain f
   let runtimeFactoryCalls = 0;
   let writeAttempts = 0;
   const fsPromises = instrumentWorkspaceWrites({
-    failPayload: '"label": "retained-latest"',
+    failPayload: '"name": "retained-latest"',
     onPayload: () => { writeAttempts += 1; },
   });
   const onUnhandledRejection = (error) => { unhandledRejections.push(error); };
@@ -6799,7 +6988,7 @@ test("a newer authorized workspace generation supersedes a retained failed snaps
   const prior = workspaceSnapshot(projectRoot, "prior-valid");
   const failed = workspaceSnapshot(projectRoot, "failed-old");
   const newer = workspaceSnapshot(projectRoot, "newer-success");
-  const fsPromises = instrumentWorkspaceWrites({ failPayload: '"label": "failed-old"' });
+  const fsPromises = instrumentWorkspaceWrites({ failPayload: '"name": "failed-old"' });
   try {
     await mkdir(projectRoot);
     await writeFile(target, JSON.stringify(prior, null, 2), { mode: 0o600 });
@@ -6808,7 +6997,7 @@ test("a newer authorized workspace generation supersedes a retained failed snaps
     await assert.rejects(loaded.ipcHandlers.get("workspace:save")({}, failed));
     await loaded.ipcHandlers.get("workspace:save")({}, newer);
     await loaded.exports.workspaceSaveWriter.drain();
-    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), newer);
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), workspaceShellSnapshot(newer));
   } finally {
     await rm(userDataPath, { recursive: true, force: true });
   }
@@ -6819,7 +7008,7 @@ test("direct quit waits for a pending workspace save to drain", async () => {
   const projectRoot = join(userDataPath, "project");
   const gate = deferred();
   const fsPromises = instrumentWorkspaceWrites({
-    blockPayload: '"label": "pending"',
+    blockPayload: '"name": "pending"',
     onBlocked: gate.started,
     release: gate.release,
   });
@@ -7003,7 +7192,7 @@ test("macOS activate creates one replacement runtime only after the shared close
   await ipcHandlers.get("workspace:save")({}, restoredWorkspace);
   assert.deepEqual(
     JSON.parse(await readFile(join(userDataPath, "workspace.json"), "utf8")),
-    restoredWorkspace,
+    workspaceShellSnapshot(restoredWorkspace),
   );
 });
 
@@ -7652,10 +7841,9 @@ function genericWorkflowCreateInput(overrides = {}) {
 
 function workspaceSnapshot(projectRoot, label) {
   return {
-    label,
     projects: [{
       id: "project-1",
-      name: "Project",
+      name: label,
       rootPath: projectRoot,
       canonicalRootPath: projectRoot,
       devflowPath: join(projectRoot, ".devflow"),
@@ -7671,6 +7859,17 @@ function workspaceSnapshot(projectRoot, label) {
     activeSessionId: null,
     sidebarCollapsed: false,
     collapsedProjectIds: [],
+  };
+}
+
+function workspaceShellSnapshot(workspace) {
+  return {
+    projects: workspace.projects,
+    sessions: workspace.sessions.filter((session) => session.kind === "plan"),
+    activeProjectId: workspace.activeProjectId,
+    activeSessionId: workspace.activeSessionId,
+    sidebarCollapsed: workspace.sidebarCollapsed,
+    collapsedProjectIds: workspace.collapsedProjectIds,
   };
 }
 

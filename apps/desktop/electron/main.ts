@@ -6079,7 +6079,7 @@ async function reconcileWorkspaceWorkflowSessions(
   storedActiveSessionId: string | null,
 ): Promise<unknown> {
   if (!isRecord(state) || !Array.isArray(state.sessions)) return state;
-  const sessions = [...state.sessions];
+  const sessions = state.sessions.filter((session) => isRecord(session) && session.kind === "plan");
   const durableSessionIdsByProject = new Map<string, string[]>();
 
   for (const { project } of projectRoots) {
@@ -6143,7 +6143,13 @@ async function authorizeWorkspaceStateForSave(state: unknown): Promise<unknown> 
     throw new Error(workspaceSaveError);
   }
   const safeState = sanitizeWorkspaceStateForPersistence(state);
-  if (!isRecord(safeState) || !Array.isArray(safeState.projects)) throw new Error(workspaceSaveError);
+  if (
+    !isRecord(safeState) ||
+    !Array.isArray(safeState.projects) ||
+    !Array.isArray(safeState.sessions)
+  ) {
+    throw new Error(workspaceSaveError);
+  }
   const trustedIdentities = await trustedWorkspaceProjectIdentities();
   const projects = [];
   for (const project of safeState.projects) {
@@ -6166,7 +6172,14 @@ async function authorizeWorkspaceStateForSave(state: unknown): Promise<unknown> 
     }
     projects.push(project);
   }
-  return { ...safeState, projects };
+  return {
+    projects,
+    sessions: safeState.sessions.filter((session) => isRecord(session) && session.kind === "plan"),
+    activeProjectId: safeState.activeProjectId,
+    activeSessionId: safeState.activeSessionId,
+    sidebarCollapsed: safeState.sidebarCollapsed,
+    collapsedProjectIds: safeState.collapsedProjectIds,
+  };
 }
 
 async function validateWorkspaceCollections(
