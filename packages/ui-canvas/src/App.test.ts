@@ -2125,9 +2125,11 @@ describe("UI source validation", () => {
     const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
     expect(worktreeActions).toContain("const missingMetadata =");
     expect(worktreeActions).toContain("!node.worktree.worktreeId");
-    expect(worktreeActions).toContain("const canAdopt = devflowAvailable && !missingMetadata;");
+    expect(worktreeActions).toContain("const comparisonMatchesNode =");
+    expect(worktreeActions).toContain("const canAdopt = devflowAvailable && !missingMetadata && comparisonMatchesNode;");
     expect(worktreeActions).toContain("disabled={!canAdopt || adopting || !adoptConfirmed}");
     expect(worktreeActions).toContain("Missing required metadata for adoption.");
+    expect(worktreeActions).toContain("Compare this worktree with another current variant before adoption.");
   });
 
   it("WorktreeActions adopt does not fallback to HEAD and main", async () => {
@@ -2141,7 +2143,9 @@ describe("UI source validation", () => {
     const appSource = await readSource("./App.tsx");
     const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
     expect(worktreeActions).not.toContain("Date.now()");
-    expect(worktreeActions).toContain("adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}`");
+    expect(worktreeActions).toContain("const comparisonToken = compareResult.comparisonId.replace(/[^A-Za-z0-9._-]/g, \"-\").slice(0, 224)");
+    expect(worktreeActions).toContain("comparisonId: compareResult.comparisonId");
+    expect(worktreeActions).toContain("adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}-${comparisonToken}`");
   });
 
   it("WorktreeActions adopt stays merge strategy without cherry-pick UI", async () => {

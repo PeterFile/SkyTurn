@@ -6561,7 +6561,10 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
     !node.worktree.baseCommit ||
     !node.worktree.headCommit ||
     !node.worktree.selectedBranch;
-  const canAdopt = devflowAvailable && !missingMetadata;
+  const comparisonMatchesNode = compareResult?.variants.some((variant) =>
+    variant.worktreeId === node.worktree.worktreeId && variant.variantId === node.worktree.variantId
+  ) ?? false;
+  const canAdopt = devflowAvailable && !missingMetadata && comparisonMatchesNode;
 
   const missingCleanMetadata =
     !node.worktree.worktreeId ||
@@ -6596,7 +6599,7 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
   };
 
   const handleAdopt = async () => {
-    if (!devflow?.workflow?.adoptWorktree || missingMetadata) return;
+    if (!devflow?.workflow?.adoptWorktree || missingMetadata || !compareResult || !comparisonMatchesNode) return;
     if (!adoptConfirmed) {
       setAdoptError("Confirm merge adoption before continuing.");
       return;
@@ -6605,10 +6608,12 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
     setAdoptError(null);
     setAdoptStatus(null);
     try {
+      const comparisonToken = compareResult.comparisonId.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 224);
       const result = await devflow.workflow.adoptWorktree(projectRoot, {
         sessionId: session.id,
+        comparisonId: compareResult.comparisonId,
         adoption: {
-          adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}`,
+          adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}-${comparisonToken}`,
           variantId: node.worktree.variantId!,
           worktreeId: node.worktree.worktreeId!,
           strategy: "merge",
@@ -6673,6 +6678,9 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
       <h3>Worktree Lifecycle</h3>
       {!devflowAvailable && <p className="eyebrow notice error">Desktop backend unavailable</p>}
       {missingMetadata && devflowAvailable && <p className="eyebrow notice error">Missing required metadata for adoption.</p>}
+      {!missingMetadata && devflowAvailable && !comparisonMatchesNode && (
+        <p className="eyebrow notice">Compare this worktree with another current variant before adoption.</p>
+      )}
 
       <div className="worktree-confirmations">
         <label className="delivery-check">

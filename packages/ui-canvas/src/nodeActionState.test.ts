@@ -535,6 +535,20 @@ describe("hydrateSelectedNodeActionStateFromEvents", () => {
     expect(state).toMatchObject({ canCreateVariant: true, composerMode: "variant-from-before-checkpoint" });
   });
 
+  it("keeps checkpoint hydration valid when comparison evidence is present", () => {
+    const state = hydrateSelectedNodeActionStateFromEvents({
+      sessionId,
+      selectedNode,
+      events: [
+        ...workflowEvents(checkpoint("checkpoint-before-implementation", "lane-implementation", "before", "base-sha")),
+        event("workflow.variant.comparison_recorded", { recording: variantComparisonRecording() }),
+      ],
+      composerMode: "variant-from-before-checkpoint",
+    });
+
+    expect(state).toMatchObject({ canCreateVariant: true, composerMode: "variant-from-before-checkpoint" });
+  });
+
   it("hydrates checkpoint actions after a durable insert-before event", () => {
     const beforeInsert = workflowEvents();
     const inserted = compileInsertClarificationBefore(reduceWorkflowEvents(beforeInsert), {
@@ -1020,6 +1034,48 @@ function eventForSession(
 
 function rawEvent(kind: string, payload: Record<string, unknown>): FlowEvent {
   return event(kind as FlowEvent["kind"], payload);
+}
+
+function variantComparisonRecording() {
+  const collectedAt = "2026-06-23T00:00:00.000Z";
+  const changeset = (side: "left" | "right") => ({
+    evidenceId: `evidence-${side}`,
+    changesetId: `changeset-${side}`,
+    source: "git" as const,
+    status: "available" as const,
+    files: [`src/${side}.ts`],
+    diffStat: { added: 1, changed: 0, deleted: 0 },
+    patchPreviewTruncated: false,
+    worktreeId: `worktree-${side}`,
+    collectedAt,
+  });
+  return {
+    sessionId,
+    comparison: {
+      comparisonId: "comparison-left-right",
+      collectedAt,
+      variants: [
+        { variantId: "variant-left", worktreeId: "worktree-left", changeset: changeset("left"), metrics: [] },
+        { variantId: "variant-right", worktreeId: "worktree-right", changeset: changeset("right"), metrics: [] },
+      ],
+    },
+    left: {
+      laneId: "lane-left",
+      variantId: "variant-left",
+      worktreeId: "worktree-left",
+      branchName: "skyturn/session-1/variant-left",
+      baseCommit: "a".repeat(40),
+      headCommit: "b".repeat(40),
+    },
+    right: {
+      laneId: "lane-right",
+      variantId: "variant-right",
+      worktreeId: "worktree-right",
+      branchName: "skyturn/session-1/variant-right",
+      baseCommit: "a".repeat(40),
+      headCommit: "c".repeat(40),
+    },
+  };
 }
 
 function insertBeforeLanePayload(event: FlowEvent): Record<string, unknown> {

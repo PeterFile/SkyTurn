@@ -117,6 +117,7 @@ const knownFlowEventKinds = new Set<string>([
   "workflow.worktree.clean_requested",
   "workflow.worktree.cleaned",
   "workflow.worktree.clean_failed",
+  "workflow.variant.comparison_recorded",
   "workflow.variant.adopt_requested",
   "workflow.variant.adopted",
   "workflow.variant.adopt_failed",

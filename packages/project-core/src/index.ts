@@ -2354,6 +2354,261 @@ export interface WorkflowVariantAdoption {
   failureReason?: string;
 }
 
+export type WorkflowVariantComparisonMetricKind =
+  | "test"
+  | "build"
+  | "typecheck"
+  | "artifact"
+  | "changed-file-count"
+  | "diff-summary"
+  | "performance-output"
+  | "conflict-check";
+
+export type WorkflowVariantComparisonMetricStatus = EvidenceCheckStatus | "recorded" | "unknown" | "equivalent";
+
+export interface WorkflowVariantComparisonMetric {
+  kind: WorkflowVariantComparisonMetricKind;
+  label: string;
+  status: WorkflowVariantComparisonMetricStatus;
+  source: "recorded";
+  value?: number | string;
+  detail?: string;
+  artifactPaths?: string[];
+}
+
+export interface WorkflowVariantComparisonEvidence {
+  comparisonId: string;
+  variants: Array<{
+    variantId: string;
+    worktreeId: string;
+    changeset: ChangesetEvidence;
+    metrics: WorkflowVariantComparisonMetric[];
+  }>;
+  collectedAt: string;
+}
+
+export interface WorkflowVariantComparisonSideIdentity {
+  laneId: string;
+  variantId: string;
+  worktreeId: string;
+  branchName: string;
+  baseCommit: string;
+  headCommit: string;
+}
+
+export interface WorkflowVariantComparisonRecordedEvidence {
+  sessionId: string;
+  comparison: WorkflowVariantComparisonEvidence;
+  left: WorkflowVariantComparisonSideIdentity;
+  right: WorkflowVariantComparisonSideIdentity;
+}
+
+const workflowVariantComparisonMetricKinds = new Set<WorkflowVariantComparisonMetricKind>([
+  "test",
+  "build",
+  "typecheck",
+  "artifact",
+  "changed-file-count",
+  "diff-summary",
+  "performance-output",
+  "conflict-check",
+]);
+const workflowVariantComparisonMetricStatuses = new Set<WorkflowVariantComparisonMetricStatus>([
+  "passed",
+  "failed",
+  "skipped",
+  "recorded",
+  "unknown",
+  "equivalent",
+]);
+const workflowVariantComparisonRecordError = "Invalid workflow variant comparison record.";
+
+export function parseWorkflowVariantComparisonRecordedEvidence(
+  value: unknown,
+): WorkflowVariantComparisonRecordedEvidence {
+  try {
+    if (!isRecord(value)) throw new Error();
+    requireExactObjectKeys(value, ["sessionId", "comparison", "left", "right"]);
+    const sessionId = variantComparisonIdentifier(value.sessionId);
+    const comparison = parseStrictWorkflowVariantComparisonEvidence(value.comparison);
+    const left = parseWorkflowVariantComparisonSideIdentity(value.left);
+    const right = parseWorkflowVariantComparisonSideIdentity(value.right);
+    const [leftVariant, rightVariant] = comparison.variants;
+    if (
+      left.worktreeId === right.worktreeId ||
+      left.variantId === right.variantId ||
+      leftVariant?.variantId !== left.variantId ||
+      leftVariant.worktreeId !== left.worktreeId ||
+      rightVariant?.variantId !== right.variantId ||
+      rightVariant.worktreeId !== right.worktreeId
+    ) throw new Error();
+    return { sessionId, comparison, left, right };
+  } catch {
+    throw new Error(workflowVariantComparisonRecordError);
+  }
+}
+
+function parseStrictWorkflowVariantComparisonEvidence(value: unknown): WorkflowVariantComparisonEvidence {
+  if (!isRecord(value)) throw new Error();
+  requireExactObjectKeys(value, ["comparisonId", "variants", "collectedAt"]);
+  const comparisonId = boundedExactText(value.comparisonId, 512);
+  const collectedAt = canonicalIsoTimestamp(value.collectedAt);
+  if (!Array.isArray(value.variants) || value.variants.length !== 2) throw new Error();
+  return {
+    comparisonId,
+    collectedAt,
+    variants: value.variants.map(parseWorkflowVariantComparisonEntry),
+  };
+}
+
+function parseWorkflowVariantComparisonEntry(
+  value: unknown,
+): WorkflowVariantComparisonEvidence["variants"][number] {
+  if (!isRecord(value)) throw new Error();
+  requireExactObjectKeys(value, ["variantId", "worktreeId", "changeset", "metrics"]);
+  const variantId = variantComparisonIdentifier(value.variantId);
+  const worktreeId = variantComparisonIdentifier(value.worktreeId);
+  if (!isRecord(value.changeset)) throw new Error();
+  requireExactObjectKeys(value.changeset, [
+    "evidenceId",
+    "changesetId",
+    "source",
+    "status",
+    "files",
+    "diffStat",
+    "patchPreviewTruncated",
+    "worktreeId",
+    "collectedAt",
+    "artifactPaths",
+    "errorReason",
+    "fullPatchSha256",
+    "fullPatchByteLength",
+    "fileManifestSha256",
+  ]);
+  if (!isRecord(value.changeset.diffStat)) throw new Error();
+  requireExactObjectKeys(value.changeset.diffStat, ["added", "changed", "deleted"]);
+  const changeset = parseChangesetEvidence(value.changeset);
+  if (!changeset || changeset.worktreeId !== worktreeId) throw new Error();
+  boundedEvidenceText(changeset.evidenceId, 512);
+  boundedEvidenceText(changeset.changesetId, 512);
+  if (changeset.collectedAt !== undefined) canonicalIsoTimestamp(changeset.collectedAt);
+  if (changeset.errorReason !== undefined) boundedEvidenceText(changeset.errorReason, 1000);
+  requireSafeEvidencePaths(changeset.files, 4096);
+  if (changeset.artifactPaths !== undefined) requireSafeEvidencePaths(changeset.artifactPaths, 256);
+  if (!Array.isArray(value.metrics) || value.metrics.length > 64) throw new Error();
+  return {
+    variantId,
+    worktreeId,
+    changeset,
+    metrics: value.metrics.map(parseWorkflowVariantComparisonMetric),
+  };
+}
+
+function parseWorkflowVariantComparisonMetric(value: unknown): WorkflowVariantComparisonMetric {
+  if (!isRecord(value)) throw new Error();
+  requireExactObjectKeys(value, ["kind", "label", "status", "source", "value", "detail", "artifactPaths"]);
+  if (
+    typeof value.kind !== "string" ||
+    !workflowVariantComparisonMetricKinds.has(value.kind as WorkflowVariantComparisonMetricKind) ||
+    typeof value.status !== "string" ||
+    !workflowVariantComparisonMetricStatuses.has(value.status as WorkflowVariantComparisonMetricStatus) ||
+    value.source !== "recorded"
+  ) throw new Error();
+  const label = boundedExactText(value.label, 240);
+  const metricValue = value.value;
+  if (
+    metricValue !== undefined &&
+    !((typeof metricValue === "number" && Number.isFinite(metricValue)) || typeof metricValue === "string")
+  ) throw new Error();
+  if (typeof metricValue === "string") boundedEvidenceText(metricValue, 1000);
+  const detail = value.detail === undefined ? undefined : boundedEvidenceText(value.detail, 1000);
+  const artifactPaths = value.artifactPaths === undefined
+    ? undefined
+    : requireSafeEvidencePaths(value.artifactPaths, 256);
+  return {
+    kind: value.kind as WorkflowVariantComparisonMetricKind,
+    label,
+    status: value.status as WorkflowVariantComparisonMetricStatus,
+    source: "recorded",
+    ...(metricValue !== undefined ? { value: metricValue } : {}),
+    ...(detail !== undefined ? { detail } : {}),
+    ...(artifactPaths !== undefined ? { artifactPaths } : {}),
+  };
+}
+
+function parseWorkflowVariantComparisonSideIdentity(value: unknown): WorkflowVariantComparisonSideIdentity {
+  if (!isRecord(value)) throw new Error();
+  requireExactObjectKeys(value, ["laneId", "variantId", "worktreeId", "branchName", "baseCommit", "headCommit"]);
+  return {
+    laneId: variantComparisonIdentifier(value.laneId),
+    variantId: variantComparisonIdentifier(value.variantId),
+    worktreeId: variantComparisonIdentifier(value.worktreeId),
+    branchName: boundedExactText(value.branchName, 1024),
+    baseCommit: canonicalFullGitCommit(value.baseCommit),
+    headCommit: canonicalFullGitCommit(value.headCommit),
+  };
+}
+
+function requireExactObjectKeys(value: Record<string, unknown>, allowed: readonly string[]): void {
+  const actual = Object.keys(value);
+  if (actual.some((key) => !allowed.includes(key))) throw new Error();
+  for (const key of allowed) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) {
+      const optional = key === "value" || key === "detail" || key === "artifactPaths" || key === "worktreeId" ||
+        key === "collectedAt" || key === "errorReason" || key === "fullPatchSha256" ||
+        key === "fullPatchByteLength" || key === "fileManifestSha256";
+      if (!optional) throw new Error();
+    }
+  }
+}
+
+function variantComparisonIdentifier(value: unknown): string {
+  const text = boundedExactText(value, 240);
+  if (!/^[A-Za-z0-9._-]+$/.test(text)) throw new Error();
+  return text;
+}
+
+function boundedExactText(value: unknown, maxLength: number): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > maxLength ||
+    value.trim() !== value ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) throw new Error();
+  return value;
+}
+
+function boundedEvidenceText(value: unknown, maxLength: number): string {
+  if (typeof value !== "string" || value.length > maxLength || /\u0000/.test(value)) throw new Error();
+  return value;
+}
+
+function canonicalIsoTimestamp(value: unknown): string {
+  const timestamp = boundedExactText(value, 64);
+  if (new Date(timestamp).toISOString() !== timestamp) throw new Error();
+  return timestamp;
+}
+
+function canonicalFullGitCommit(value: unknown): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{40}$/.test(value)) throw new Error();
+  return value;
+}
+
+function requireSafeEvidencePaths(value: unknown, maxItems: number): string[] {
+  if (!Array.isArray(value) || value.length > maxItems) throw new Error();
+  return value.map((candidate) => {
+    const path = boundedExactText(candidate, 4096);
+    if (
+      path.startsWith("/") ||
+      path.startsWith("\\") ||
+      /^[A-Za-z]:[\\/]/.test(path) ||
+      path.split(/[\\/]/).some((part) => part === "..")
+    ) throw new Error();
+    return path;
+  });
+}
+
 export interface WorkflowCheckpointEvidenceRef {
   kind: WorkflowCheckpointEvidenceRefKind;
   id: string;

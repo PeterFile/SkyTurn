@@ -653,6 +653,56 @@ describe("node git worktree service", () => {
     expect(events.map((event) => event.kind)).toContain("workflow.worktree.cleaned");
   });
 
+  it("rejects adoption when the non-adopted comparison worktree advances after the outer check", async () => {
+    const repo = await createTestRepo("skyturn-worktree-fresh-peer-");
+    tempRoots.push(repo.tempRoot);
+    const events: ManagedWorktreeWorkflowEvent[] = [];
+    const service = createNodeGitWorktreeService({
+      eventSink: { append: async (event) => { events.push(event); } },
+      now: () => "2026-08-26T00:00:00.000Z",
+    });
+    const left = await service.createManagedWorktree({
+      sessionId: "session-fresh-peer",
+      variantId: "left",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-fresh-peer/left",
+      parentLaneId: "lane-left",
+    });
+    const right = await service.createManagedWorktree({
+      sessionId: "session-fresh-peer",
+      variantId: "right",
+      repoRoot: repo.repoRoot,
+      baseCommit: repo.baseCommit,
+      branchName: "skyturn/session-fresh-peer/right",
+      parentLaneId: "lane-right",
+    });
+    const leftHead = commitVariant(left.realPath, "fresh-left");
+    const rightHead = commitVariant(right.realPath, "fresh-right");
+    const comparedLeft = await service.reconcileManagedWorktree(left, { expectedHeadCommit: leftHead });
+    const comparedRight = await service.reconcileManagedWorktree(right, { expectedHeadCommit: rightHead });
+    commitVariant(right.realPath, "peer-drift-after-compare");
+
+    await expect(service.adoptVariant({
+      adoptionId: "adopt-stale-peer",
+      variantId: comparedLeft.variantId,
+      worktreeId: comparedLeft.worktreeId,
+      strategy: "merge",
+      status: "requested",
+      baseCommit: comparedLeft.baseCommit,
+      headCommit: comparedLeft.headCommit,
+      targetBranchName: "main",
+    }, {
+      requiredFreshWorktrees: [comparedLeft, comparedRight],
+    })).resolves.toMatchObject({
+      status: "failed",
+      failureReason: expect.stringMatching(/HEAD mismatch/i),
+    });
+    expect(git(repo.repoRoot, ["rev-parse", "HEAD"])).toBe(repo.baseCommit);
+    expect(existsSync(join(repo.repoRoot, "fresh-left.txt"))).toBe(false);
+    expect(events.map((event) => event.kind)).not.toContain("workflow.variant.adopted");
+  });
+
   it("blocks rollback reset when the managed worktree has dirty or untracked files", async () => {
     const { repo, worktree, headCommit } = await createRollbackWorktreeFixture(tempRoots);
     writeFileSync(join(worktree.realPath, "untracked.txt"), "dirty\n");

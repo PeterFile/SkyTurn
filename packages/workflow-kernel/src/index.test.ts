@@ -3396,6 +3396,22 @@ describe("Flow Kernel gate engine and scheduler", () => {
     expect(projection.variantAdoptions).toMatchObject([{ adoptionId: "adoption-1", strategy: "merge", status: "requested" }]);
   });
 
+  it("retains only strict canonical variant comparison records", () => {
+    const recording = variantComparisonRecording();
+    const recorded = event("workflow.variant.comparison_recorded", { recording });
+    const projection = reduceWorkflowEvents([recorded]);
+
+    expect(projection.events).toContainEqual(recorded);
+    expect(() => reduceWorkflowEvents([{
+      ...recorded,
+      payload: { recording: { ...recording, projectRoot: "/secret/project" } },
+    }])).toThrow(/variant comparison record/i);
+    expect(() => reduceWorkflowEvents([{
+      ...recorded,
+      sessionId: "session-other",
+    }])).toThrow(/variant comparison.*session/i);
+  });
+
   it("normalizes lane semantics and trusted runtime policy in the projection", () => {
     const projection = reduceWorkflowEvents([
       event("workflow.lane.declared", {
@@ -7274,6 +7290,47 @@ function candidateBinding(
 
 function checkpointSource(id: string, sha: string) {
   return { sourceCheckpointId: `checkpoint-${id}`, sourceHeadCommit: sha.repeat(40) };
+}
+
+function variantComparisonRecording() {
+  const changeset = (side: "left" | "right") => ({
+    evidenceId: `evidence-${side}`,
+    changesetId: `changeset-${side}`,
+    source: "git" as const,
+    status: "available" as const,
+    files: [`src/${side}.ts`],
+    diffStat: { added: 1, changed: 0, deleted: 0 },
+    patchPreviewTruncated: false,
+    worktreeId: `worktree-${side}`,
+    collectedAt: now,
+  });
+  return {
+    sessionId: "session-1",
+    comparison: {
+      comparisonId: "comparison-left-right",
+      collectedAt: now,
+      variants: [
+        { variantId: "variant-left", worktreeId: "worktree-left", changeset: changeset("left"), metrics: [] },
+        { variantId: "variant-right", worktreeId: "worktree-right", changeset: changeset("right"), metrics: [] },
+      ],
+    },
+    left: {
+      laneId: "lane-left",
+      variantId: "variant-left",
+      worktreeId: "worktree-left",
+      branchName: "skyturn/session-1/variant-left",
+      baseCommit: "a".repeat(40),
+      headCommit: "b".repeat(40),
+    },
+    right: {
+      laneId: "lane-right",
+      variantId: "variant-right",
+      worktreeId: "worktree-right",
+      branchName: "skyturn/session-1/variant-right",
+      baseCommit: "a".repeat(40),
+      headCommit: "c".repeat(40),
+    },
+  };
 }
 
 function candidateBindingBlock(

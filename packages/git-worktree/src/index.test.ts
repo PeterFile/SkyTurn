@@ -12,6 +12,7 @@ import {
   createMockChangeset,
   mockWorktreeService,
   parseVariantComparisonEvidence,
+  parseWorktreeAdoptionRequest,
   parseWorktreeComparisonRequest,
 } from "./index";
 import type {
@@ -41,6 +42,34 @@ describe("git worktree services", () => {
       { sessionId: "session-1", leftWorktreeId: "worktree-left", rightWorktreeId: "worktree-right", repoRoot: "/forged" },
     ]) {
       expect(() => parseWorktreeComparisonRequest(malformed)).toThrow("Invalid worktree comparison request.");
+    }
+  });
+
+  it("strictly parses backward-safe adoption requests with optional comparison identity", () => {
+    const adoption = {
+      adoptionId: "adopt-left",
+      variantId: "variant-left",
+      worktreeId: "worktree-left",
+      strategy: "merge",
+      status: "requested",
+      baseCommit: "a".repeat(40),
+      headCommit: "b".repeat(40),
+      targetBranchName: "main",
+    };
+    const legacy = { sessionId: "session-1", adoption };
+    const current = { ...legacy, comparisonId: "comparison-left-right-2026-08-26T00:00:00.000Z" };
+
+    expect(parseWorktreeAdoptionRequest(legacy)).toEqual(legacy);
+    expect(parseWorktreeAdoptionRequest(current)).toEqual(current);
+    for (const malformed of [
+      { ...current, projectRoot: "/secret/project" },
+      { ...current, sessionId: "../session" },
+      { ...current, comparisonId: "" },
+      { ...current, adoption: { ...adoption, path: "/secret/worktree" } },
+      { ...current, adoption: { ...adoption, headCommit: "short" } },
+      { ...current, adoption: { ...adoption, status: "adopted" } },
+    ]) {
+      expect(() => parseWorktreeAdoptionRequest(malformed)).toThrow(/adoption request/i);
     }
   });
 

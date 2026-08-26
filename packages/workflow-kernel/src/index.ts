@@ -46,6 +46,7 @@ import {
   parseChangesetEvidence,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
+  parseWorkflowVariantComparisonRecordedEvidence,
   parseRunEvent,
   parseRunEvidence,
   sanitizePublicEvidenceText,
@@ -300,6 +301,7 @@ export type FlowEventKind =
   | "workflow.worktree.clean_requested"
   | "workflow.worktree.cleaned"
   | "workflow.worktree.clean_failed"
+  | "workflow.variant.comparison_recorded"
   | "workflow.variant.adopt_requested"
   | "workflow.variant.adopted"
   | "workflow.variant.adopt_failed"
@@ -1773,6 +1775,21 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
       upsertWorktree(projection, event.payload.worktree as unknown as WorkflowWorktreeIdentity);
     }
     if (event.kind === "workflow.worktree.clean_failed") continue;
+    if (event.kind === "workflow.variant.comparison_recorded") {
+      if (
+        Object.keys(event.payload).length !== 1 ||
+        !Object.prototype.hasOwnProperty.call(event.payload, "recording")
+      ) {
+        throw new Error("Invalid workflow variant comparison record payload.");
+      }
+      const recording = parseWorkflowVariantComparisonRecordedEvidence(event.payload.recording);
+      if (recording.sessionId !== event.sessionId) {
+        throw new Error("Workflow variant comparison record session conflict.");
+      }
+      projection.events = projection.events.map((recorded) =>
+        recorded.id === event.id ? { ...recorded, payload: { recording } } : recorded
+      );
+    }
     if (
       (event.kind === "workflow.variant.adopt_requested" ||
         event.kind === "workflow.variant.adopted" ||

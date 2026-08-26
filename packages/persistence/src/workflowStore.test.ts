@@ -1590,6 +1590,74 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
+  it("persists strict variant comparison evidence across SQLite reopen", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const recording = variantComparisonRecording();
+
+    const event = store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.variant.comparison_recorded",
+      source: "electron-main",
+      idempotencyKey: `variant-comparison:${"d".repeat(64)}`,
+      payload: { recording },
+      now: recording.comparison.collectedAt,
+    });
+
+    expect(event.payload).toEqual({ recording });
+    expect(store.listEvents("session-1")).toContainEqual(expect.objectContaining({
+      kind: "workflow.variant.comparison_recorded",
+      payload: { recording },
+    }));
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.listEvents("session-1")).toContainEqual(expect.objectContaining({
+      kind: "workflow.variant.comparison_recorded",
+      payload: { recording },
+    }));
+    reopened.close();
+  });
+
+  it("rejects extra comparison fields on append and malformed comparison bytes on replay", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    const recording = variantComparisonRecording();
+
+    expect(() => store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.variant.comparison_recorded",
+      source: "electron-main",
+      idempotencyKey: `variant-comparison:${"e".repeat(64)}`,
+      payload: { recording: { ...recording, projectRoot: "/secret/project" } },
+      now: recording.comparison.collectedAt,
+    })).toThrow(/variant comparison record/i);
+    store.appendWorkflowEvent({
+      sessionId: "session-1",
+      kind: "workflow.variant.comparison_recorded",
+      source: "electron-main",
+      idempotencyKey: `variant-comparison:${"f".repeat(64)}`,
+      payload: { recording },
+      now: recording.comparison.collectedAt,
+    });
+    store.close();
+
+    const db = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+    db.prepare("UPDATE workflow_events SET payload_json = ? WHERE session_id = ? AND kind = ?").run(
+      JSON.stringify({ recording: { ...recording, prompt: "secret" } }),
+      "session-1",
+      "workflow.variant.comparison_recorded",
+    );
+    db.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(() => reopened.listEvents("session-1")).toThrow(/variant comparison record/i);
+    expect(() => reopened.materializeFlowProjection("session-1")).toThrow(/variant comparison record/i);
+    reopened.close();
+  });
+
   it("persists planner intent causation on accepted and declared-lane facts across reopen", async () => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
@@ -10906,6 +10974,48 @@ function candidateWorktree(
     baseCommit: "a".repeat(40),
     headCommit: "a".repeat(40),
     parentLaneId,
+  };
+}
+
+function variantComparisonRecording() {
+  const collectedAt = "2026-08-26T00:00:00.000Z";
+  const changeset = (side: "left" | "right") => ({
+    evidenceId: `evidence-${side}`,
+    changesetId: `changeset-${side}`,
+    source: "git" as const,
+    status: "available" as const,
+    files: [`src/${side}.ts`],
+    diffStat: { added: 1, changed: 0, deleted: 0 },
+    patchPreviewTruncated: false,
+    worktreeId: `worktree-${side}`,
+    collectedAt,
+  });
+  return {
+    sessionId: "session-1",
+    comparison: {
+      comparisonId: "comparison-left-right",
+      collectedAt,
+      variants: [
+        { variantId: "variant-left", worktreeId: "worktree-left", changeset: changeset("left"), metrics: [] },
+        { variantId: "variant-right", worktreeId: "worktree-right", changeset: changeset("right"), metrics: [] },
+      ],
+    },
+    left: {
+      laneId: "lane-left",
+      variantId: "variant-left",
+      worktreeId: "worktree-left",
+      branchName: "skyturn/session-1/variant-left",
+      baseCommit: "a".repeat(40),
+      headCommit: "b".repeat(40),
+    },
+    right: {
+      laneId: "lane-right",
+      variantId: "variant-right",
+      worktreeId: "worktree-right",
+      branchName: "skyturn/session-1/variant-right",
+      baseCommit: "a".repeat(40),
+      headCommit: "c".repeat(40),
+    },
   };
 }
 
