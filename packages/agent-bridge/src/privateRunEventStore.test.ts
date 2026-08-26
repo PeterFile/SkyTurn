@@ -8,6 +8,7 @@ import {
   readFile,
   rm,
   symlink,
+  truncate,
   writeFile,
   type FileHandle,
 } from "node:fs/promises";
@@ -55,6 +56,210 @@ it("stores one exact private event replay under framed project and run hashes", 
   );
 });
 
+it("appends sequential events and preserves exact duplicate and conflict behavior", async () => {
+  const projectRoot = await tempRoot("project-sequential-events");
+  const privateRoot = await tempRoot("private-sequential-events");
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore: createDurableRunClaimStore({ root: privateRoot }),
+  });
+  const events = [
+    runEvent("run-sequential-events", 1, { text: "one" }),
+    runEvent("run-sequential-events", 2, { text: "two" }),
+    runEvent("run-sequential-events", 3, { text: "three" }),
+  ];
+
+  await store.prepare(projectRoot, projectRoot);
+  await expect(store.append(projectRoot, events[0]!)).resolves.toBe("appended");
+  await expect(store.append(projectRoot, events[1]!)).resolves.toBe("appended");
+  await expect(store.append(projectRoot, events[2]!)).resolves.toBe("appended");
+  await expect(store.append(projectRoot, events[0]!)).resolves.toBe("exists");
+  await expect(store.append(projectRoot, runEvent(events[0]!.runId, 2, { text: "conflict" })))
+    .rejects.toThrow(/event.*conflict/i);
+  await expect(store.read(projectRoot, events[0]!.runId)).resolves.toEqual({ kind: "valid", events });
+});
+
+it("validates current bytes for latest retries and fully inspects older sequences", async () => {
+  const projectRoot = await tempRoot("project-retry-validation");
+  const privateRoot = await tempRoot("private-retry-validation");
+  const instrumented = readCountingFileSystem();
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore: createDurableRunClaimStore({ root: privateRoot }),
+    fileSystem: instrumented.fileSystem,
+  });
+  const events = [
+    runEvent("run-retry-validation", 1, { text: "one" }),
+    runEvent("run-retry-validation", 2, { text: "two" }),
+    runEvent("run-retry-validation", 3, { text: "three" }),
+  ];
+  await store.prepare(projectRoot, projectRoot);
+  for (const event of events) await store.append(projectRoot, event);
+
+  await expect(store.append(projectRoot, events[2]!)).resolves.toBe("exists");
+  expect(instrumented.readFileCalls).toBe(0);
+  expect(instrumented.readCalls).toBeGreaterThan(0);
+  expect(instrumented.readBytes).toBe(Buffer.byteLength(`${JSON.stringify(events[2])}\n`));
+
+  instrumented.readBytes = 0;
+  instrumented.readCalls = 0;
+  await expect(store.append(projectRoot, events[0]!)).resolves.toBe("exists");
+  expect(instrumented.readFileCalls).toBe(1);
+  expect(instrumented.readBytes).toBe(Buffer.byteLength(`${events.map(JSON.stringify).join("\n")}\n`));
+
+  instrumented.readBytes = 0;
+  instrumented.readFileCalls = 0;
+  await expect(store.append(projectRoot, runEvent(events[0]!.runId, 2, { text: "conflict" })))
+    .rejects.toThrow(/event.*conflict/i);
+  expect(instrumented.readFileCalls).toBe(1);
+  expect(instrumented.readBytes).toBe(Buffer.byteLength(`${events.map(JSON.stringify).join("\n")}\n`));
+});
+
+it("validates a reopened log once without rereading growing history on steady-state appends", async () => {
+  const projectRoot = await tempRoot("project-incremental-events");
+  const privateRoot = await tempRoot("private-incremental-events");
+  const claimStore = createDurableRunClaimStore({ root: privateRoot });
+  const initial = createPrivateRunEventStore({ durableRunClaimStore: claimStore });
+  const runId = "run-incremental-events";
+  await initial.prepare(projectRoot, projectRoot);
+  for (let seq = 1; seq <= 12; seq += 1) {
+    await initial.append(projectRoot, runEvent(runId, seq, { text: `initial-${seq}` }));
+  }
+
+  const instrumented = readCountingFileSystem();
+  const reopened = createPrivateRunEventStore({
+    durableRunClaimStore: claimStore,
+    fileSystem: instrumented.fileSystem,
+  });
+  await expect(reopened.append(projectRoot, runEvent(runId, 13, { text: "first validated append" })))
+    .resolves.toBe("appended");
+  const validationBytes = instrumented.readBytes;
+  expect(validationBytes).toBeGreaterThan(0);
+  expect(instrumented.readFileCalls).toBe(1);
+  expect(instrumented.readCalls).toBe(0);
+
+  for (let seq = 14; seq <= 24; seq += 1) {
+    await reopened.append(projectRoot, runEvent(runId, seq, { text: `steady-${seq}` }));
+  }
+
+  expect(instrumented.readFileCalls).toBe(1);
+  expect(instrumented.readCalls).toBe(0);
+  expect(instrumented.readBytes).toBe(validationBytes);
+});
+
+it("evicts least-recently-used append cursors while retaining active runs", async () => {
+  const projectRoot = await tempRoot("project-cursor-eviction");
+  const privateRoot = await tempRoot("private-cursor-eviction");
+  const instrumented = readCountingFileSystem();
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore: createDurableRunClaimStore({ root: privateRoot }),
+    fileSystem: instrumented.fileSystem,
+  });
+  const runIds = Array.from({ length: 65 }, (_, index) => `run-cursor-${index + 1}`);
+  await store.prepare(projectRoot, projectRoot);
+  for (const runId of runIds.slice(0, 64)) {
+    await store.append(projectRoot, runEvent(runId, 1, { text: runId }));
+  }
+  await store.append(projectRoot, runEvent(runIds[0]!, 2, { text: "recently used" }));
+
+  instrumented.readBytes = 0;
+  instrumented.readCalls = 0;
+  instrumented.readFileCalls = 0;
+  await store.append(projectRoot, runEvent(runIds[64]!, 1, { text: "force eviction" }));
+  await store.append(projectRoot, runEvent(runIds[1]!, 2, { text: "evicted" }));
+  expect(instrumented.readFileCalls).toBe(1);
+  expect(instrumented.readBytes).toBeGreaterThan(0);
+  const bytesAfterEvictedRun = instrumented.readBytes;
+
+  await store.append(projectRoot, runEvent(runIds[0]!, 3, { text: "still cached" }));
+  expect(instrumented.readFileCalls).toBe(1);
+  expect(instrumented.readBytes).toBe(bytesAfterEvictedRun);
+});
+
+it("invalidates the append cursor after an external same-size mutation", async () => {
+  const projectRoot = await tempRoot("project-mutated-events");
+  const privateRoot = await tempRoot("private-mutated-events");
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore: createDurableRunClaimStore({ root: privateRoot }),
+  });
+  const runId = "run-mutated-events";
+  const original = runEvent(runId, 1, { text: "original" });
+  const mutated = runEvent(runId, 1, { text: "tampered" });
+  await store.prepare(projectRoot, projectRoot);
+  await store.append(projectRoot, original);
+  const eventPath = await store.eventPath(projectRoot, runId);
+  const originalBytes = `${JSON.stringify(original)}\n`;
+  const mutatedBytes = `${JSON.stringify(mutated)}\n`;
+  expect(Buffer.byteLength(mutatedBytes)).toBe(Buffer.byteLength(originalBytes));
+  await writeFile(eventPath, mutatedBytes, { mode: 0o600 });
+
+  await expect(store.append(projectRoot, original)).rejects.toThrow(/event.*conflict/i);
+  await expect(store.read(projectRoot, runId)).resolves.toEqual({ kind: "valid", events: [mutated] });
+});
+
+it("does not cache stale history rewritten at the pre-write race boundary", async () => {
+  const projectRoot = await tempRoot("project-pre-write-mutation");
+  const privateRoot = await tempRoot("private-pre-write-mutation");
+  const claimStore = createDurableRunClaimStore({ root: privateRoot });
+  const runId = "run-pre-write-mutation";
+  const original = runEvent(runId, 1, { text: "original" });
+  const mutated = runEvent(runId, 1, { text: "tampered" });
+  const second = runEvent(runId, 2, { text: "second" });
+  const eventPath = await claimStore.runStatePath(projectRoot, runId, "events");
+  const originalBytes = `${JSON.stringify(original)}\n`;
+  const mutatedBytes = `${JSON.stringify(mutated)}\n`;
+  expect(Buffer.byteLength(mutatedBytes)).toBe(Buffer.byteLength(originalBytes));
+  const mutation = preWriteMutationFileSystem(eventPath, mutatedBytes, 2);
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore: claimStore,
+    fileSystem: mutation.fileSystem,
+  });
+  await store.prepare(projectRoot, projectRoot);
+  await store.append(projectRoot, original);
+
+  await expect(store.append(projectRoot, second)).resolves.toBe("appended");
+  expect(mutation.mutations).toBe(1);
+  await expect(store.append(projectRoot, original)).rejects.toThrow(/event.*conflict/i);
+  await expect(store.read(projectRoot, runId)).resolves.toEqual({
+    kind: "valid",
+    events: [mutated, second],
+  });
+});
+
+it("invalidates the append cursor after external truncation", async () => {
+  const projectRoot = await tempRoot("project-truncated-events");
+  const privateRoot = await tempRoot("private-truncated-events");
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore: createDurableRunClaimStore({ root: privateRoot }),
+  });
+  const runId = "run-truncated-events";
+  await store.prepare(projectRoot, projectRoot);
+  await store.append(projectRoot, runEvent(runId, 1, { text: "complete" }));
+  const eventPath = await store.eventPath(projectRoot, runId);
+  const bytes = await readFile(eventPath);
+  await truncate(eventPath, bytes.byteLength - 1);
+
+  await expect(store.append(projectRoot, runEvent(runId, 2, { text: "must fail" }))).rejects.toThrow(
+    /private run event state is invalid/i,
+  );
+});
+
+it("reopens, validates, and continues the next sequence", async () => {
+  const projectRoot = await tempRoot("project-reopen-sequence");
+  const privateRoot = await tempRoot("private-reopen-sequence");
+  const claimStore = createDurableRunClaimStore({ root: privateRoot });
+  const first = runEvent("run-reopen-sequence", 1, { text: "first" });
+  const second = runEvent(first.runId, 2, { text: "second" });
+  const initial = createPrivateRunEventStore({ durableRunClaimStore: claimStore });
+  await initial.prepare(projectRoot, projectRoot);
+  await initial.append(projectRoot, first);
+
+  const reopened = createPrivateRunEventStore({ durableRunClaimStore: claimStore });
+  await expect(reopened.append(projectRoot, second)).resolves.toBe("appended");
+  await expect(reopened.read(projectRoot, first.runId)).resolves.toEqual({
+    kind: "valid",
+    events: [first, second],
+  });
+});
+
 it("syncs the shared project directory hierarchy before the first private event file", async () => {
   const projectRoot = await tempRoot("project-event-hierarchy");
   const privateRoot = await tempRoot("private-event-hierarchy");
@@ -73,6 +278,31 @@ it("syncs the shared project directory hierarchy before the first private event 
     `sync:directory:${dirname(dirname(eventPath))}`,
     `sync:file:${eventPath}`,
     `sync:directory:${dirname(eventPath)}`,
+  ]);
+});
+
+it("re-syncs the file and parent directory before a steady-state append", async () => {
+  const projectRoot = await tempRoot("project-steady-sync");
+  const privateRoot = await tempRoot("private-steady-sync");
+  const operations: string[] = [];
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore: createDurableRunClaimStore({ root: privateRoot }),
+    platform: "linux",
+    fileSystem: pathRecordingFileSystem(operations),
+  });
+  const first = runEvent("run-steady-sync", 1, { text: "first" });
+  const eventPath = await store.eventPath(projectRoot, first.runId);
+  await store.append(projectRoot, first);
+  operations.length = 0;
+
+  await expect(store.append(projectRoot, runEvent(first.runId, 2, { text: "second" })))
+    .resolves.toBe("appended");
+
+  expect(operations.filter((operation) => operation.startsWith("sync:"))).toEqual([
+    `sync:file:${eventPath}`,
+    `sync:directory:${dirname(eventPath)}`,
+    `sync:directory:${dirname(dirname(eventPath))}`,
+    `sync:file:${eventPath}`,
   ]);
 });
 
@@ -248,6 +478,28 @@ it("re-syncs one readable final record after a one-shot file sync failure", asyn
   expect((await readFile(await store.eventPath(projectRoot, event.runId), "utf8")).split("\n").filter(Boolean)).toHaveLength(1);
 });
 
+it("invalidates the cursor when pre-append re-sync fails and retries without writing early", async () => {
+  const projectRoot = await tempRoot("project-cursor-sync-retry");
+  const privateRoot = await tempRoot("private-cursor-sync-retry");
+  const claimStore = createDurableRunClaimStore({ root: privateRoot });
+  const eventPath = await claimStore.runStatePath(projectRoot, "run-cursor-sync-retry", "events");
+  const fault = syncFaultFileSystem(({ target, path, attempt }) =>
+    target === "file" && path === eventPath && attempt === 2 ? "EIO" : null);
+  const store = createPrivateRunEventStore({
+    durableRunClaimStore: claimStore,
+    fileSystem: fault.fileSystem,
+  });
+  const first = runEvent("run-cursor-sync-retry", 1, { text: "first" });
+  const second = runEvent(first.runId, 2, { text: "second" });
+  await store.prepare(projectRoot, projectRoot);
+  await store.append(projectRoot, first);
+
+  await expect(store.append(projectRoot, second)).rejects.toThrow(/private run event state is invalid/i);
+  expect((await readFile(eventPath, "utf8")).split("\n").filter(Boolean)).toHaveLength(1);
+  await expect(store.append(projectRoot, second)).resolves.toBe("appended");
+  expect((await readFile(eventPath, "utf8")).split("\n").filter(Boolean)).toHaveLength(2);
+});
+
 it("retries parent-directory durability after file creation without duplicating the record", async () => {
   const projectRoot = await tempRoot("project-directory-sync");
   const privateRoot = await tempRoot("private-directory-sync");
@@ -336,10 +588,87 @@ function runEvent(runId: string, seq: number, payload: Record<string, unknown>):
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
     runId,
     seq,
-    timestamp: `2026-07-15T00:00:0${seq}.000Z`,
+    timestamp: new Date(Date.UTC(2026, 6, 15, 0, 0, seq)).toISOString(),
     kind: "output",
     payload,
   };
+}
+
+function readCountingFileSystem() {
+  const metrics = {
+    readBytes: 0,
+    readCalls: 0,
+    readFileCalls: 0,
+    fileSystem: {
+      chmod,
+      lstat,
+      mkdir,
+      async open(path: string, flags: string | number, mode?: number): Promise<FileHandle> {
+        const handle = await open(path, flags, mode);
+        return new Proxy(handle, {
+          get(value, property) {
+            if (property === "readFile") {
+              return async (...args: Parameters<FileHandle["readFile"]>) => {
+                const bytes = await value.readFile(...args);
+                metrics.readFileCalls += 1;
+                metrics.readBytes += Buffer.byteLength(bytes);
+                return bytes;
+              };
+            }
+            if (property === "read") {
+              return async (...args: Parameters<FileHandle["read"]>) => {
+                const result = await value.read(...args);
+                metrics.readCalls += 1;
+                metrics.readBytes += result.bytesRead;
+                return result;
+              };
+            }
+            const member = Reflect.get(value, property, value) as unknown;
+            return typeof member === "function" ? member.bind(value) : member;
+          },
+        });
+      },
+    },
+  };
+  return metrics;
+}
+
+function preWriteMutationFileSystem(
+  targetPath: string,
+  replacement: string,
+  targetWrite: number,
+) {
+  const state = {
+    fileSystem: {
+      chmod,
+      lstat,
+      mkdir,
+      async open(path: string, flags: string | number, mode?: number): Promise<FileHandle> {
+        const handle = await open(path, flags, mode);
+        return new Proxy(handle, {
+          get(value, property) {
+            if (property === "write") {
+              return async (bytes: Uint8Array) => {
+                if (path === targetPath) {
+                  state.writes += 1;
+                  if (state.writes === targetWrite) {
+                    await writeFile(targetPath, replacement, { mode: 0o600 });
+                    state.mutations += 1;
+                  }
+                }
+                return value.write(bytes);
+              };
+            }
+            const member = Reflect.get(value, property, value) as unknown;
+            return typeof member === "function" ? member.bind(value) : member;
+          },
+        });
+      },
+    },
+    mutations: 0,
+    writes: 0,
+  };
+  return state;
 }
 
 function terminalRunEvent(runId: string): RunEvent {
