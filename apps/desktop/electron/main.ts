@@ -70,6 +70,8 @@ import {
   type WorkflowRunCompletionScope,
 } from "./workflowCommitCompletion";
 import {
+  TRUSTED_HERMES_PLANNER_SANDBOX,
+  authorizeEffectiveRunStartSandbox,
   assertPublicRunStartIsNotScheduled,
   createRunStartHandler,
   type RunStartDependencies,
@@ -1052,11 +1054,11 @@ async function authorizeWorkflowRunStartInput(
     }
     assertPublicRunStartIsNotScheduled(input, store);
   }
-  if (input.sandbox === "danger-full-access") {
-    const identity = await trustedRunStartIdentity(input, false);
+  const sandboxAuthorized = await authorizeEffectiveRunStartSandbox(input, async (effectiveInput) => {
+    const identity = await trustedRunStartIdentity(effectiveInput, false);
     assertDangerousRunAuthorization(store, identity);
-  }
-  const authorized = await authorizeRunStartExpectedArtifacts(input, store);
+  });
+  const authorized = await authorizeRunStartExpectedArtifacts(sandboxAuthorized, store);
   const { assertExpectedArtifactVerifierCapability } = await import("@skyturn/agent-bridge");
   await assertExpectedArtifactVerifierCapability(authorized.expectedArtifacts);
   return authorized;
@@ -1315,6 +1317,7 @@ ipcMain.handle("workflow:finishPlan", workflowHandler(async (projectRoot: string
           worktreePath: projectRoot,
           agentKind: "hermes",
           transport: "exec-json",
+          sandbox: TRUSTED_HERMES_PLANNER_SANDBOX,
           hermesSessionHandle: approvedPlan.hermesSessionHandle,
           prompt,
         });
@@ -4426,6 +4429,7 @@ async function deliverWorkflowUserInputToPlanner(input: {
       worktreePath: input.projectRoot,
       agentKind: "hermes",
       transport: "exec-json",
+      sandbox: TRUSTED_HERMES_PLANNER_SANDBOX,
       prompt,
     });
   }

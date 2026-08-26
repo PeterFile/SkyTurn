@@ -12,6 +12,24 @@ export interface TrustedRunStartIdentity {
   transport?: string;
 }
 
+type RunStartSandbox = "read-only" | "workspace-write" | "danger-full-access";
+
+export const TRUSTED_HERMES_PLANNER_SANDBOX = "read-only" as const;
+
+export async function authorizeEffectiveRunStartSandbox<Input extends Record<string, unknown>>(
+  input: Input,
+  authorizeDangerous: (input: Input & { sandbox: "danger-full-access" }) => void | Promise<void>,
+): Promise<Input> {
+  assertValidExplicitHermesSandbox(input);
+  const effectiveInput = input.agentKind === "hermes" && input.sandbox === undefined
+    ? { ...input, sandbox: "danger-full-access" as const }
+    : input;
+  if (effectiveInput.sandbox === "danger-full-access") {
+    await authorizeDangerous(effectiveInput as Input & { sandbox: "danger-full-access" });
+  }
+  return effectiveInput;
+}
+
 export interface ScheduledRunSegment {
   sessionId: string;
   laneId: string;
@@ -94,6 +112,7 @@ export function createRunStartHandler<Input, Run, Store extends RunStartStore>(
     let authorizedInput: Input;
     let identity: TrustedRunStartIdentity;
     try {
+      assertValidExplicitHermesSandbox(input);
       await dependencies.preAuthorizeStart?.(input);
       authorizedInput = dependencies.authorizeStartInput
         ? await dependencies.authorizeStartInput(input, ownership?.store)
@@ -120,6 +139,22 @@ export function createRunStartHandler<Input, Run, Store extends RunStartStore>(
     );
     return promise;
   };
+}
+
+function isRunStartSandbox(value: unknown): value is RunStartSandbox {
+  return value === "read-only" || value === "workspace-write" || value === "danger-full-access";
+}
+
+function assertValidExplicitHermesSandbox(input: unknown): void {
+  if (typeof input !== "object" || input === null) return;
+  const candidate = input as Record<string, unknown>;
+  if (
+    candidate.agentKind === "hermes" &&
+    candidate.sandbox !== undefined &&
+    !isRunStartSandbox(candidate.sandbox)
+  ) {
+    throw new Error("Hermes run start sandbox is invalid.");
+  }
 }
 
 async function runStartOnce<Input, Run, Store extends RunStartStore>(
