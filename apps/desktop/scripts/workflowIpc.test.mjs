@@ -3436,12 +3436,43 @@ test("workflow transport parsers accept only exact self-consistent session envel
   const broadcast = {
     ...response,
     cause: "workflow-mutation",
+    nextAction: { kind: "none", reason: "No safe action is available." },
   };
 
   assert.equal(contracts.WORKFLOW_IPC_PROTOCOL_VERSION, 1);
   assert.equal(contracts.WORKFLOW_EVENT_CHANNEL, "workflow:event");
   assert.equal(contracts.parseWorkflowResponseEnvelope(response, "session-1"), response);
   assert.equal(contracts.parseWorkflowBroadcastEnvelope(broadcast), broadcast);
+
+  const longLaneId = "lane-" + "a".repeat(250);
+  const nextActionEnvelope = {
+    ...response,
+    nextAction: { kind: "execute_lane", reason: "Run", laneId: longLaneId }
+  };
+  assert.equal(contracts.parseWorkflowResponseEnvelope(nextActionEnvelope, "session-1"), nextActionEnvelope);
+  assert.equal(contracts.parseWorkflowProjectionResponseEnvelope(nextActionEnvelope, "session-1"), nextActionEnvelope);
+  assert.throws(
+    () => contracts.parseWorkflowProjectionResponseEnvelope(response, "session-1"),
+    /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT/,
+  );
+
+  for (const invalid of [
+    { ...response, nextAction: "none" },
+    { ...response, nextAction: { kind: "none" } },
+    { ...response, nextAction: { kind: "invalid", reason: "reason" } },
+    { ...response, nextAction: { kind: "none", reason: "" } },
+    { ...response, nextAction: { kind: "execute_lane", reason: "Run", laneId: 123 } },
+    { ...response, nextAction: { kind: "wait_for_checks", reason: "Wait", loop: "invalid" } },
+    { ...response, nextAction: { kind: "merge_pull_request", reason: "Merge", prNumber: 0 } },
+    { ...response, nextAction: { kind: "merge_pull_request", reason: "Merge", prNumber: 1.5 } },
+    { ...response, nextAction: Object.create({ kind: "none", reason: "Inherited" }) },
+  ]) {
+    assert.throws(
+      () => contracts.parseWorkflowResponseEnvelope(invalid, "session-1"),
+      /SKYTURN_WORKFLOW_IPC_ERROR:INVALID_INPUT/
+    );
+  }
+
 
   for (const invalid of [
     { ...response, protocolVersion: undefined },
@@ -3469,6 +3500,7 @@ test("workflow transport parsers accept only exact self-consistent session envel
     { ...broadcast, cause: "renderer-refresh" },
     { ...broadcast, cause: undefined },
     { ...broadcast, projection: undefined },
+    { ...broadcast, nextAction: undefined },
   ]) {
     assert.throws(
       () => contracts.parseWorkflowBroadcastEnvelope(invalid),
@@ -3570,6 +3602,7 @@ test("workflow broadcasts use the unique published store identity and never call
     sessionId: value.sessionId,
     canvasSessionId: value.canvasSession.id,
     cause: value.cause,
+    nextActionKind: value.nextAction.kind,
   })), [
     {
       channel: "workflow:event",
@@ -3577,6 +3610,7 @@ test("workflow broadcasts use the unique published store identity and never call
       sessionId: "session-shared",
       canvasSessionId: "session-shared",
       cause: "workflow-mutation",
+      nextActionKind: "execute_lane",
     },
     {
       channel: "workflow:event",
@@ -3584,6 +3618,7 @@ test("workflow broadcasts use the unique published store identity and never call
       sessionId: "session-shared",
       canvasSessionId: "session-shared",
       cause: "projection-query",
+      nextActionKind: "execute_lane",
     },
   ]);
 
@@ -3602,6 +3637,7 @@ test("mocked preload rejects invalid workflow responses and drops invalid broadc
     sessionId: "session-1",
     projection: { lanes: [] },
     canvasSession: workflowCanvasSession("session-1"),
+    nextAction: { kind: "execute_lane", reason: "Run next lane.", laneId: "lane-1" },
   };
   const runtime = await loadPreloadRuntime(contracts);
   runtime.setInvoke(async (channel, projectRoot, sessionId) => {
@@ -3624,6 +3660,8 @@ test("mocked preload rejects invalid workflow responses and drops invalid broadc
     { ...exactResponse, projectRoot: "/canonical/../project" },
     { ...exactResponse, sessionId: "session-2" },
     { ...exactResponse, canvasSession: { ...exactResponse.canvasSession, id: "session-2" } },
+    { ...exactResponse, nextAction: undefined },
+    { ...exactResponse, nextAction: { kind: "unknown", reason: "No." } },
   ]) {
     runtime.setInvoke(async () => invalid);
     await assert.rejects(
@@ -3658,6 +3696,7 @@ test("mocked preload rejects invalid workflow responses and drops invalid broadc
   const received = [];
   const unsubscribe = runtime.api.onWorkflowEvent((event) => received.push(event));
   runtime.emit("workflow:event", { ...exactResponse, cause: "unexpected" });
+  runtime.emit("workflow:event", { ...exactResponse, cause: "workflow-mutation", nextAction: undefined });
   runtime.emit("workflow:event", { ...exactResponse, cause: "workflow-mutation" });
   assert.deepEqual(received, [{ ...exactResponse, cause: "workflow-mutation" }]);
   unsubscribe();
@@ -3975,6 +4014,13 @@ function workflowBroadcastStore(sessionId, marker) {
       return {
         projection: { sessionId, events: [{ sessionId, seq: 7 }], marker },
         canvasSession: workflowCanvasSession(sessionId),
+        loopState: {
+          nextAction: {
+            kind: "execute_lane",
+            reason: `Run ${marker}.`,
+            laneId: `${marker}-lane`,
+          },
+        },
       };
     },
     materializeFlowProjection() {

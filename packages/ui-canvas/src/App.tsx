@@ -119,6 +119,7 @@ import {
   type RunEvidence,
   type SessionTarget,
   type UserDecisionAction,
+  type WorkflowLoopNextAction,
   type WorkflowMode,
 } from "@skyturn/project-core";
 
@@ -204,6 +205,11 @@ import {
   buildSelectedNodeActionState,
   type SelectedNodeActionState,
 } from "./nodeActionState.js";
+import {
+  buildNextSafeActionHint,
+  type NextActionNavigation,
+  type NextSafeActionHint,
+} from "./nextSafeAction.js";
 
 export const INSERT_BEFORE_UNAVAILABLE_ERROR = "Insert before is unavailable because the desktop workflow backend is not connected.";
 export const DESKTOP_RETRY_UNAVAILABLE_REASON =
@@ -515,6 +521,34 @@ interface WorkflowSessionEnvelopeValue {
   projectRoot: string;
   sessionId: string;
   canvasSession: CanvasSession;
+  nextAction?: WorkflowLoopNextAction;
+}
+
+export function workflowNextActionScopeKey(projectId: string, sessionId: string): string {
+  return `${projectId}\u0000${sessionId}`;
+}
+
+export function upsertWorkflowNextAction(
+  current: ReadonlyMap<string, WorkflowLoopNextAction>,
+  projectId: string,
+  sessionId: string,
+  action: WorkflowLoopNextAction,
+): ReadonlyMap<string, WorkflowLoopNextAction> {
+  const key = workflowNextActionScopeKey(projectId, sessionId);
+  if (current.get(key) === action) return current;
+  const next = new Map(current);
+  next.set(key, action);
+  return next;
+}
+
+export function workflowNextActionForScope(
+  current: ReadonlyMap<string, WorkflowLoopNextAction>,
+  projectId: string | null,
+  sessionId: string | null,
+): WorkflowLoopNextAction | null {
+  return projectId && sessionId
+    ? current.get(workflowNextActionScopeKey(projectId, sessionId)) ?? null
+    : null;
 }
 
 type WorkflowGenerationAuthority = Pick<
@@ -531,6 +565,7 @@ function workflowSessionEnvelope(value: unknown): WorkflowSessionEnvelopeValue |
     projectRoot: value.projectRoot,
     sessionId: value.sessionId,
     canvasSession: value.canvasSession,
+    nextAction: value.nextAction as WorkflowLoopNextAction | undefined,
   };
 }
 
@@ -898,6 +933,9 @@ export default function App() {
     initialPlanRuntimeRecovery,
   );
   const [finishingPlanSessionIds, setFinishingPlanSessionIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [nextActionsBySession, setNextActionsBySession] = useState<ReadonlyMap<string, WorkflowLoopNextAction>>(
+    () => new Map(),
+  );
   const [planFinishError, setPlanFinishError] = useState<{ sessionId: string; message: string } | null>(null);
   const [workspaceSaveError, setWorkspaceSaveError] = useState<string | null>(null);
   const insertBeforeIntentRequests = useRef(createInsertBeforeIntentRequestTracker(() => globalThis.crypto.randomUUID()));
@@ -964,6 +1002,11 @@ export default function App() {
     workspace.sessions.find(
       (session) => session.id === workspace.activeSessionId && session.projectId === activeProject?.id,
     ) ?? null;
+  const nextAction = workflowNextActionForScope(
+    nextActionsBySession,
+    activeProject?.id ?? null,
+    activeSession?.id ?? null,
+  );
   const activePlanRunId = activeSession?.kind === "plan"
     ? Object.values(activeSession.stages).find((stage) => stage.runId)?.runId ?? null
     : null;
@@ -1051,6 +1094,15 @@ export default function App() {
     if (guarded === current) return;
     const authoritative = canvasSessionForWorkflowAuthority(response, guard);
     if (!authoritative) return;
+    const envelope = workflowSessionEnvelope(response);
+    if (envelope?.nextAction) {
+      setNextActionsBySession((actions) => upsertWorkflowNextAction(
+        actions,
+        authoritative.projectId,
+        authoritative.id,
+        envelope.nextAction!,
+      ));
+    }
     installAuthoritativeCanvasSession(
       current,
       decorate ? decorate(guarded, authoritative) : guarded,
@@ -1163,6 +1215,14 @@ export default function App() {
       ));
       const authority = project ? workflowRequestAuthority(project, envelope.sessionId) : null;
       if (!authority) return;
+      if (envelope.nextAction) {
+        setNextActionsBySession((actions) => upsertWorkflowNextAction(
+          actions,
+          envelope.canvasSession.projectId,
+          envelope.sessionId,
+          envelope.nextAction!,
+        ));
+      }
       const generation = advanceWorkflowGeneration(workflowProjectionGenerationRef.current, {
         projectId: envelope.canvasSession.projectId,
         canonicalRoot: envelope.projectRoot,
@@ -2299,6 +2359,14 @@ export default function App() {
               nodeActionStatus={nodeActionStatus}
               plannerTerminalSessionId={plannerTerminalSessionId(activeSession)}
               workflowBackendAvailable={!!window.devflow?.workflow}
+              nextActionHint={nextAction ? buildNextSafeActionHint(nextAction, activeSession.nodes) : null}
+              onNavigateNextAction={(navigation) => {
+                setSelectedNodeId(navigation.targetNodeId);
+                if (navigation.modalTab) {
+                  setInspectedNodeId(navigation.targetNodeId);
+                  setModalTab(navigation.modalTab);
+                }
+              }}
               onComposerChange={selectedNode ? setNodeActionText : setBottomGoal}
               onComposerSubmit={appendRequirementNode}
               onComposerStop={stopActiveRun}
@@ -3521,6 +3589,8 @@ function CanvasView({
   nodeActionStatus,
   plannerTerminalSessionId,
   workflowBackendAvailable,
+  nextActionHint,
+  onNavigateNextAction,
   onComposerChange,
   onComposerSubmit,
   onComposerStop,
@@ -3543,6 +3613,8 @@ function CanvasView({
   nodeActionStatus: string | null;
   plannerTerminalSessionId: string | null;
   workflowBackendAvailable: boolean;
+  nextActionHint: NextSafeActionHint | null;
+  onNavigateNextAction: (navigation: NextActionNavigation) => void;
   onComposerChange: (value: string) => void;
   onComposerSubmit: (action?: ComposerAction) => void;
   onComposerStop: () => void;
@@ -3675,6 +3747,8 @@ function CanvasView({
         nodeActionError={nodeActionError}
         nodeActionStatus={nodeActionStatus}
         workflowBackendAvailable={workflowBackendAvailable}
+        nextActionHint={nextActionHint}
+        onNavigateNextAction={onNavigateNextAction}
         onChange={onComposerChange}
         onSubmit={onComposerSubmit}
         onStop={onComposerStop}
@@ -6737,6 +6811,8 @@ function CanvasComposer({
   nodeActionError,
   nodeActionStatus,
   workflowBackendAvailable,
+  nextActionHint,
+  onNavigateNextAction,
   onChange,
   onSubmit,
   onStop,
@@ -6752,6 +6828,8 @@ function CanvasComposer({
   nodeActionError: string | null;
   nodeActionStatus: string | null;
   workflowBackendAvailable: boolean;
+  nextActionHint: NextSafeActionHint | null;
+  onNavigateNextAction: (navigation: NextActionNavigation) => void;
   onChange: (value: string) => void;
   onSubmit: (action?: ComposerAction) => void;
   onStop: () => void;
@@ -6944,6 +7022,25 @@ function CanvasComposer({
       ) : !selectedNode && bottomComposerState?.busy ? (
         <p className="composer-action-message" role="status">Submitting requirement…</p>
       ) : null}
+      {nextActionHint && (
+        nextActionHint.navigation ? (
+          <button
+            type="button"
+            className="next-action-hint clickable"
+            onClick={() => onNavigateNextAction(nextActionHint.navigation!)}
+          >
+            <span className="next-action-label">Next safe action · {nextActionHint.label}</span>
+            <span className="next-action-reason" title={nextActionHint.reason}>{nextActionHint.reason}</span>
+            <span className="next-action-go">Go to node &rarr;</span>
+          </button>
+        ) : (
+          <div className="next-action-hint">
+            <span className="next-action-label">Next safe action · {nextActionHint.label}</span>
+            <span className="next-action-reason" title={nextActionHint.reason}>{nextActionHint.reason}</span>
+          </div>
+        )
+      )}
+
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
         <input
           className="canvas-composer-input"

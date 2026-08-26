@@ -28,6 +28,7 @@ import type {
 import {
   WORKFLOW_EVENT_CHANNEL,
   parseWorkflowBroadcastEnvelope,
+  parseWorkflowProjectionResponseEnvelope,
   parseWorkflowResponseEnvelope,
 } from "./workflowIpcContracts";
 
@@ -55,7 +56,7 @@ const plan = {
   getState: (input) => ipcRenderer.invoke("plan:getState", input),
 } satisfies PlanApi;
 
-type WorkflowEnvelopeExpectation = "none" | "optional" | "required";
+type WorkflowEnvelopeExpectation = "none" | "optional" | "required" | "projection";
 
 async function invokeWorkflow<T>(
   channel: string,
@@ -66,6 +67,9 @@ async function invokeWorkflow<T>(
   const expectedSessionId = workflowRequestSessionId(requestArgs[0]);
   const result: unknown = await ipcRenderer.invoke(channel, projectRoot, ...requestArgs);
   if (envelopeExpectation === "none") return result as T;
+  if (envelopeExpectation === "projection") {
+    return parseWorkflowProjectionResponseEnvelope(result, expectedSessionId) as T;
+  }
   if (
     envelopeExpectation === "optional" &&
     isRecord(result) &&
@@ -110,7 +114,7 @@ const workflow = {
   updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) =>
     invokeWorkflow("workflow:nodePosition:update", projectRoot, [input], "required"),
   getProjection: (projectRoot: string, sessionId: string) =>
-    invokeWorkflow("workflow:projection", projectRoot, [sessionId], "required"),
+    invokeWorkflow("workflow:projection", projectRoot, [sessionId], "projection"),
   getEvents: (projectRoot: string, sessionId: string) => invokeWorkflow("workflow:events", projectRoot, [sessionId]),
   reassignLane,
   getCheckpoints: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:checkpoints", projectRoot, [input]),

@@ -1,3 +1,4 @@
+import type { WorkflowLoopNextAction } from "@skyturn/project-core";
 import type {
   DeliveryCommitEvidence,
   DeliveryMainSyncEvidence,
@@ -82,11 +83,13 @@ export interface WorkflowSessionEnvelope {
   projectRoot: string;
   sessionId: string;
   canvasSession: CanvasSession;
+  nextAction?: WorkflowLoopNextAction;
 }
 
 export interface WorkflowBroadcastEnvelope extends WorkflowSessionEnvelope {
   cause: WorkflowBroadcastCause;
   projection: unknown;
+  nextAction: WorkflowLoopNextAction;
 }
 
 export type WorkflowSessionResult<T extends object> = T & WorkflowSessionEnvelope;
@@ -299,7 +302,10 @@ export interface WorkflowApi {
   appendUserInput: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ event: unknown; ledger: unknown; projection: unknown }>>;
   getLedger: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; ledger: WorkflowLedgerSummary }>;
   updateNodePosition: (projectRoot: string, input: WorkflowNodePositionUpdateRequest) => Promise<WorkflowSessionResult<{ event: unknown; projection: unknown }>>;
-  getProjection: (projectRoot: string, sessionId: string) => Promise<WorkflowSessionResult<{ projection: unknown }>>;
+  getProjection: (projectRoot: string, sessionId: string) => Promise<WorkflowSessionResult<{
+    projection: unknown;
+    nextAction: WorkflowLoopNextAction;
+  }>>;
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   reassignLane: (projectRoot: string, input: WorkflowLaneReassignRequest) => Promise<WorkflowLaneReassignResult>;
   getCheckpoints: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; checkpoints: WorkflowNodeCheckpoint[] }>;
