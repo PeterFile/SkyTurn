@@ -5,6 +5,10 @@ import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { RUN_EVENT_PROTOCOL_VERSION } from "@skyturn/agent-bridge";
+import { createFastCanvasSession } from "@skyturn/planner";
+import { buildPromptForNodeRun } from "@skyturn/ui-canvas/workflow-runtime";
+
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
 test("MVP demo fails fast on blocked readiness before starting agent runs", async () => {
@@ -124,6 +128,72 @@ test("MVP demo passes canonical expected artifacts into every direct bridge run"
     /concrete expected artifact declaration/i,
   );
   assert.match(source, /\.\.\.demoExpectedArtifactsInputForNode\(node\)/);
+});
+
+test("MVP demo passes only restricted Hermes sandboxes to the direct bridge", async () => {
+  const demo = await import("./mvpWorkflowDemo.mjs");
+  assert.equal(typeof demo.startNodeRun, "function");
+
+  const session = createFastCanvasSession({
+    projectId: "project-local-planner",
+    goal: "Plan the local demo workflow.",
+    createdAt: "2026-08-26T08:00:00.000Z",
+  }, { randomUUID: () => "local-planner" });
+  const planner = session.nodes.find((node) => node.id === session.plannerNodeId);
+  assert.ok(planner);
+
+  const trustedPolicy = (sandbox) => ({
+    source: "workflow_projection",
+    trusted: true,
+    executable: true,
+    sandbox,
+    sideEffects: sandbox === "danger-full-access" ? ["git"] : ["filesystem"],
+    reason: "Policy is projected by workflow kernel.",
+  });
+  const nodes = [
+    planner,
+    {
+      ...planner,
+      id: "hermes-workspace-write",
+      runId: "run-hermes-workspace-write",
+      runtimePolicy: trustedPolicy("workspace-write"),
+    },
+    {
+      ...planner,
+      id: "hermes-danger",
+      runId: "run-hermes-danger",
+      runtimePolicy: trustedPolicy("danger-full-access"),
+    },
+  ];
+  const startRunInputs = [];
+  const bridge = {
+    async startRun(input) {
+      startRunInputs.push(input);
+      return { id: input.runId };
+    },
+  };
+  const projectRoot = "/tmp/skyturn-local-demo";
+
+  for (const node of nodes) {
+    await demo.startNodeRun(bridge, projectRoot, session, node);
+  }
+
+  assert.deepEqual(
+    startRunInputs,
+    nodes.map((node, index) => ({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      runId: node.runId,
+      nodeId: node.id,
+      sessionId: session.id,
+      plannerSessionId: session.hermesPlannerSessionId,
+      plannerInputId: node.runId,
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "hermes",
+      sandbox: ["read-only", "workspace-write", "read-only"][index],
+      prompt: buildPromptForNodeRun(session, node),
+    })),
+  );
 });
 
 test("MVP demo verification script checks renderable Vite output", async () => {
