@@ -524,8 +524,12 @@ function canvasSession(workspace, sessionId) {
   return session;
 }
 
-function startNodeRun(bridge, projectRoot, session, node) {
-  const sandbox = sandboxForNodeRun(node);
+export function startNodeRun(bridge, projectRoot, session, node) {
+  const projectedSandbox = sandboxForNodeRun(node);
+  const sandbox =
+    node.agent === "hermes" && (!projectedSandbox || projectedSandbox === "danger-full-access")
+      ? "read-only"
+      : projectedSandbox;
   return bridge.startRun({
     protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
     runId: node.runId,
