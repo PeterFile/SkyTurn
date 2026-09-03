@@ -1,8 +1,9 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 
 import type {
@@ -19,12 +20,14 @@ import type {
 import {
   createWorkflowGitAncestryProofContext,
   parseWorkflowGitAncestryProof,
+  parseWorkflowVariantComparisonRecordedEvidence,
 } from "@skyturn/project-core";
 
 import {
   buildAdjudicationMetrics,
   parseCandidateDeliveryCommitPreparation,
   parseVariantComparisonEvidence,
+  parseWorktreeAdoptionRequest,
   parseWorktreeComparisonRequest,
   type ChangesetEvidenceInput,
   type ChangesetEvidenceService,
@@ -65,6 +68,7 @@ import {
   type RollbackWorktreeState,
   type VariantComparisonEvidence,
   type VariantComparisonInput,
+  type VariantAdoptionOptions,
   type VariantAdoptionService,
 } from "./index.js";
 import {
@@ -84,6 +88,8 @@ import {
 export {
   parseCandidateDeliveryCommitPreparation,
   parseVariantComparisonEvidence,
+  parseWorkflowVariantComparisonRecordedEvidence,
+  parseWorktreeAdoptionRequest,
   parseWorktreeComparisonRequest,
 };
 export { SKYTURN_VOLATILE_GIT_PATHS };
@@ -723,34 +729,47 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
     };
   }
 
-  async adoptVariant(input: WorkflowVariantAdoption): Promise<WorkflowVariantAdoption> {
+  async adoptVariant(
+    input: WorkflowVariantAdoption,
+    options: VariantAdoptionOptions = {},
+  ): Promise<WorkflowVariantAdoption> {
     const requested: WorkflowVariantAdoption = { ...input, status: "requested" };
     await this.record("workflow.variant.adopt_requested", {
       adoption: requested,
     }, `variant:${input.adoptionId}:adopt-requested`);
 
     const eventWorktree = this.findCreatedWorktree(input.worktreeId);
-    let repoRoot: string | null = eventWorktree?.repoRoot ?? null;
     try {
       if (!eventWorktree) throw new Error(`No created worktree event for ${input.worktreeId}.`);
       verifyAdoptionRecord(input, eventWorktree);
       const worktree = await this.reconcileManagedWorktree(eventWorktree, { expectedHeadCommit: input.headCommit });
-      repoRoot = worktree.repoRoot;
       await assertCleanWorktree(worktree.realPath, "variant worktree");
       await validateTargetBranch(worktree.repoRoot, input.targetBranchName);
       await checkoutTargetBranch(worktree.repoRoot, input.targetBranchName);
       await assertCleanWorktree(worktree.repoRoot, "target worktree");
       await assertTargetHeadMatchesBase(worktree.repoRoot, input);
-      await previewAdoption(worktree.repoRoot, input);
-      await applyAdoption(worktree.repoRoot, input);
-      const adoptedCommit = await currentHead(worktree.repoRoot);
-      const adopted: WorkflowVariantAdoption = { ...input, status: "adopted", adoptedCommit };
+      const candidateCommit = await prepareAdoptionCandidate(worktree.repoRoot, input);
+      const requiredFreshWorktrees = options.requiredFreshWorktrees ?? [worktree];
+      const reconciledFreshWorktrees = await Promise.all(requiredFreshWorktrees.map((required) => (
+        this.reconcileManagedWorktree(required, { expectedHeadCommit: required.headCommit })
+      )));
+      if (reconciledFreshWorktrees.some((required) => required.branchName === input.targetBranchName)) {
+        throw new Error("Adoption target branch must not be a compared worktree branch.");
+      }
+      await withLockedFreshWorktreeHeads(worktree.repoRoot, reconciledFreshWorktrees, () => (
+        publishPreparedCandidateRef(worktree.repoRoot, {
+          branchRef: `refs/heads/${input.targetBranchName}`,
+          candidateCommit,
+          expectedHeadCommit: input.baseCommit,
+        })
+      ));
+      await runGit(worktree.repoRoot, ["read-tree", "--reset", "-u", candidateCommit]);
+      const adopted: WorkflowVariantAdoption = { ...input, status: "adopted", adoptedCommit: candidateCommit };
       await this.record("workflow.variant.adopted", {
         adoption: adopted,
       }, `variant:${input.adoptionId}:adopted`);
       return adopted;
     } catch (error) {
-      if (repoRoot) await abortAdoption(repoRoot);
       const failed: WorkflowVariantAdoption = {
         ...input,
         status: "failed",
@@ -3053,25 +3072,25 @@ async function checkoutTargetBranch(repoRoot: string, branchName: string): Promi
   await runGit(repoRoot, ["switch", "--", branchName]);
 }
 
-async function previewAdoption(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
-  const previewHead = await currentHead(repoRoot);
-  await assertCleanWorktree(repoRoot, "target worktree");
-  let previewFailed = false;
+async function prepareAdoptionCandidate(
+  repoRoot: string,
+  adoption: WorkflowVariantAdoption,
+): Promise<string> {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "skyturn-adoption-candidate-"));
+  const candidatePath = join(temporaryRoot, "worktree");
+  let added = false;
   try {
-    if (adoption.strategy === "merge") {
-      await runGit(repoRoot, ["merge", "--no-commit", "--no-ff", adoption.headCommit]);
-      return;
-    }
-    await runGit(repoRoot, ["cherry-pick", "--no-commit", adoption.headCommit]);
-  } catch (error) {
-    previewFailed = true;
-    throw error;
+    await chmod(temporaryRoot, 0o700);
+    await runGit(repoRoot, ["worktree", "add", "--detach", candidatePath, adoption.baseCommit]);
+    added = true;
+    await applyAdoption(candidatePath, adoption);
+    return currentHead(candidatePath);
   } finally {
-    try {
-      await restoreAdoptionPreview(repoRoot, previewHead);
-    } catch (error) {
-      if (!previewFailed) throw error;
+    if (added) {
+      await abortAdoption(candidatePath);
+      await runGit(repoRoot, ["worktree", "remove", "--force", "--", candidatePath]);
     }
+    await rm(temporaryRoot, { recursive: true, force: true });
   }
 }
 
@@ -3083,16 +3102,89 @@ async function applyAdoption(repoRoot: string, adoption: WorkflowVariantAdoption
   await runGit(repoRoot, ["cherry-pick", adoption.headCommit]);
 }
 
+async function withLockedFreshWorktreeHeads<T>(
+  repoRoot: string,
+  worktrees: readonly WorkflowWorktreeIdentity[],
+  operation: () => Promise<T>,
+): Promise<T> {
+  const expectedRefs = new Map<string, string>();
+  for (const worktree of worktrees) {
+    const ref = `refs/heads/${worktree.branchName}`;
+    const existing = expectedRefs.get(ref);
+    if (existing && existing !== worktree.headCommit) {
+      throw new Error("Conflicting expected worktree HEADs.");
+    }
+    expectedRefs.set(ref, worktree.headCommit);
+  }
+  if (expectedRefs.size === 0) throw new Error("At least one fresh worktree is required for adoption.");
+
+  const child = spawn("git", ["-C", repoRoot, "update-ref", "--stdin"], {
+    env: sanitizedGitEnvironment(),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stdout.setEncoding("utf8");
+  child.stderr.resume();
+  child.stdin.on("error", () => undefined);
+  const lines = createInterface({ input: child.stdout, crlfDelay: Number.POSITIVE_INFINITY });
+  const iterator = lines[Symbol.asyncIterator]();
+  const closePromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  let prepared = false;
+  let operationCompleted = false;
+  let operationError: unknown;
+  try {
+    child.stdin.write("start\n");
+    for (const [ref, headCommit] of expectedRefs) {
+      child.stdin.write(`verify ${ref} ${headCommit}\n`);
+    }
+    child.stdin.write("prepare\n");
+    await expectUpdateRefResponse(iterator, "start: ok");
+    await expectUpdateRefResponse(iterator, "prepare: ok");
+    prepared = true;
+    const result = await operation();
+    operationCompleted = true;
+    return result;
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    try {
+      if (prepared) {
+        child.stdin.write("abort\n");
+        await expectUpdateRefResponse(iterator, "abort: ok");
+      }
+      child.stdin.end();
+      const closed = await closePromise;
+      if (closed.code !== 0 || closed.signal !== null) {
+        throw new Error("Git worktree freshness lock failed.");
+      }
+    } catch (error) {
+      child.kill("SIGKILL");
+      await closePromise.catch(() => undefined);
+      if (!operationCompleted && operationError === undefined) throw error;
+    } finally {
+      lines.close();
+    }
+  }
+}
+
+async function expectUpdateRefResponse(
+  iterator: AsyncIterator<string>,
+  expected: string,
+): Promise<void> {
+  const next = await iterator.next();
+  if (next.done || next.value !== expected) {
+    throw new Error("Git worktree freshness lock failed.");
+  }
+}
+
 async function assertTargetHeadMatchesBase(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
   const targetHead = await currentHead(repoRoot);
   if (targetHead !== adoption.baseCommit) {
     throw new AdoptionTargetBaseMismatchError(adoption.targetBranchName, adoption.baseCommit, targetHead);
   }
-}
-
-async function restoreAdoptionPreview(repoRoot: string, headCommit: string): Promise<void> {
-  await abortAdoption(repoRoot);
-  await runGit(repoRoot, ["reset", "--hard", headCommit]);
 }
 
 async function abortAdoption(repoRoot: string): Promise<void> {

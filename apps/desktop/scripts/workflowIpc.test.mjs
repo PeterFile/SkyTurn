@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path, { dirname, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import vm from "node:vm";
 
@@ -383,19 +383,10 @@ test("Electron main tracks every top-level workflow store operation, not only wo
     main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
     main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
   );
-  assert.match(worktreeAdoptHandler, /createNodeGitWorktreeService/);
-  assert.match(worktreeAdoptHandler, /eventSink/);
-  assert.match(worktreeAdoptHandler, /appendWorkflowEvent/);
-  const adoptBoundaryIndex = worktreeAdoptHandler.indexOf("assertAdoptedWorktreeBelongsToProject");
-  const adoptVariantIndex = worktreeAdoptHandler.indexOf("service.adoptVariant");
-  assert.ok(adoptBoundaryIndex >= 0, "adopt IPC must validate the created worktree project boundary");
-  assert.ok(adoptBoundaryIndex < adoptVariantIndex, "adopt IPC must validate the boundary before adoptVariant");
-  assert.match(worktreeAdoptHandler, /findCreatedWorktreeIdentity\(existingEvents,\s*adoption\.worktreeId\)/);
-  assert.match(worktreeAdoptHandler, /recordVariantAdoptFailure/);
-  assert.match(worktreeAdoptHandler, /adoptVariant/);
-  assert.match(worktreeAdoptHandler, /findVariantAdoptionEvent/);
-  assert.match(worktreeAdoptHandler, /catch\s*\(error\)\s*\{[\s\S]*broadcastWorkflowProjection\(projectRoot,\s*sessionId,\s*store\);[\s\S]*throw error;[\s\S]*\}/);
-  assert.doesNotMatch(worktreeAdoptHandler, /normalizeWorkflowIpcError/);
+  assert.match(worktreeAdoptHandler, /adoptWorkflowWorktree/);
+  assert.match(worktreeAdoptHandler, /workflowStoreIdentity/);
+  assert.match(worktreeAdoptHandler, /withSessionMutationLock:\s*withWorkflowSessionMutationLock/);
+  assert.match(worktreeAdoptHandler, /broadcastWorkflowProjection/);
   assert.doesNotMatch(worktreeAdoptHandler, /status:\s*"requested"/);
 
   const worktreeCleanHandler = main.slice(
@@ -2201,10 +2192,16 @@ test("workflow compareWorktrees uses IDs only and resolves durable session ident
 
   assert.match(compareContract, /input:\s*WorktreeComparisonRequest/);
   assert.match(compareContract, /comparison:\s*VariantComparisonEvidence/);
+  assert.match(compareContract, /recording:\s*WorkflowVariantComparisonRecordedEvidence/);
   assert.doesNotMatch(compareContract, /comparison:\s*unknown/);
   assert.match(compareHandler, /compareWorkflowWorktrees/);
   assert.match(preload, /parseWorktreeComparisonRequest\(input\)/);
   assert.match(preload, /parseVariantComparisonEvidence/);
+  assert.match(preload, /parseWorkflowVariantComparisonRecordedEvidence/);
+  assert.match(preload, /const recording = parseWorkflowVariantComparisonRecordedEvidence\(result\.recording\)/);
+  assert.match(preload, /recording\.sessionId !== request\.sessionId/);
+  assert.match(preload, /JSON\.stringify\(recording\.comparison\) !== JSON\.stringify\(comparison\)/);
+  assert.doesNotMatch(compareContract.slice(compareContract.indexOf("Promise<")), /projectRoot|realPath|gitdir|repoRoot/);
 
   const renderer = await readFile(join(root, "..", "..", "packages", "ui-canvas", "src", "App.tsx"), "utf8");
   const handleCompare = renderer.slice(renderer.indexOf("const handleCompare"), renderer.indexOf("const handleAdopt"));
@@ -2250,7 +2247,7 @@ test("workflow compare runtime rejects untrusted identities and sanitizes unknow
   });
 });
 
-test("workflow compare runtime performs a valid side-effect-free comparison and rejects malformed results", async () => {
+test("workflow compare runtime persists a valid comparison and rejects malformed results", async () => {
   const runtime = await loadWorktreeComparisonRuntime();
   const events = [createdWorktreeEvent("session-1", "worktree-left", "variant-left"), createdWorktreeEvent("session-1", "worktree-right", "variant-right")];
   const input = { sessionId: "session-1", leftWorktreeId: "worktree-left", rightWorktreeId: "worktree-right" };
@@ -2258,9 +2255,16 @@ test("workflow compare runtime performs a valid side-effect-free comparison and 
 
   const result = await runtime.compareWorkflowWorktrees(harness.dependencies, "/project", input);
   assert.equal(result.comparison.comparisonId, "comparison-left-right");
+  assert.equal(result.recording.left.headCommit, "b".repeat(40));
+  assert.equal(result.recording.right.headCommit, "c".repeat(40));
+  assert.doesNotMatch(JSON.stringify(result), /\/project|\.worktrees|realPath|gitdir|repoRoot/);
   assert.equal(harness.compareCalls.length, 1);
   assert.equal(harness.serviceOptions.length, 1);
   assert.equal(harness.serviceOptions[0], undefined);
+  const recorded = harness.events.find((event) => event.kind === "workflow.variant.comparison_recorded");
+  assert.ok(recorded);
+  assert.equal(recorded.payload.recording.comparison.comparisonId, "comparison-left-right");
+  assert.doesNotMatch(JSON.stringify(recorded), /\/project|\.worktrees/);
 
   const malformed = comparisonHarness(events, null, { comparisonId: 42, variants: [] });
   await assert.rejects(runtime.compareWorkflowWorktrees(malformed.dependencies, "/project", input), {
@@ -3304,61 +3308,29 @@ test("workflow kernel knows delivery checks, merge, and main sync event names", 
   assert.match(eventKinds, /"workflow\.remote_side_effect\.completed"/);
 });
 
-test("workflow adopt IPC records a failed adoption before rejecting boundary violations", async () => {
+test("workflow adopt IPC delegates stale-comparison checks and failure audit to the locked runtime", async () => {
   const main = await readFile(join(root, "electron", "main.ts"), "utf8");
+  const runtime = await readFile(join(root, "electron", "worktreeComparisonRuntime.ts"), "utf8");
   const worktreeAdoptHandler = main.slice(
     main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
     main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
   );
-  const helperSource = main.slice(
-    main.indexOf("async function assertAdoptedWorktreeBelongsToProject"),
-    main.indexOf("function findVariantAdoptionEvent"),
-  );
-
-  assert.match(helperSource, /await fs\.realpath\(projectRoot\)/);
-  assert.match(helperSource, /await fs\.realpath\(worktree\.repoRoot\)/);
-  assert.match(helperSource, /repoRoot !== realProjectRoot/);
-  assert.match(helperSource, /await fs\.realpath\(`\$\{realProjectRoot\}\.worktrees`\)/);
-  assert.match(helperSource, /await fs\.realpath\(worktree\.realPath \|\| worktree\.path\)/);
-  assert.match(helperSource, /isInsidePath\(realManagedRoot,\s*realWorktreePath\)/);
-  assert.match(helperSource, /workflow\.variant\.adopt_failed/);
-
-  const failureIndex = worktreeAdoptHandler.indexOf("recordVariantAdoptFailure");
-  const throwIndex = worktreeAdoptHandler.indexOf("throw error");
-  assert.ok(failureIndex >= 0, "boundary rejection must append workflow.variant.adopt_failed");
-  assert.ok(failureIndex < throwIndex, "adopt_failed must be recorded before the normalized IPC error is thrown");
-});
-
-test("workflow adopt IPC audits missing created worktree identity before rejecting", async () => {
-  const main = await readFile(join(root, "electron", "main.ts"), "utf8");
-  const worktreeAdoptHandler = main.slice(
-    main.indexOf('ipcMain.handle("workflow:worktree:adopt"'),
-    main.indexOf('ipcMain.handle("workflow:worktree:clean"'),
-  );
-  const preService = worktreeAdoptHandler.slice(
-    worktreeAdoptHandler.indexOf("const existingEvents"),
-    worktreeAdoptHandler.indexOf("const appendedEvents"),
-  );
-
-  const tryIndex = preService.indexOf("try {");
-  const lookupIndex = preService.indexOf("findCreatedWorktreeIdentity");
-  const boundaryIndex = preService.indexOf("assertAdoptedWorktreeBelongsToProject");
-  const catchIndex = preService.indexOf("catch (error)");
-  const failureIndex = preService.indexOf("recordVariantAdoptFailure");
-  const broadcastIndex = preService.indexOf("broadcastWorkflowProjection");
-  const throwIndex = preService.indexOf("throw error");
-
-  assert.ok(tryIndex >= 0, "adopt identity lookup must be inside an audited try/catch");
-  assert.ok(lookupIndex > tryIndex, "missing/non-created worktree identity must be caught and audited");
-  assert.ok(lookupIndex < boundaryIndex, "identity lookup must happen before boundary validation");
-  assert.ok(boundaryIndex < catchIndex, "boundary validation must share the audited catch path");
-  assert.ok(failureIndex > catchIndex, "adopt_failed must be recorded in the preflight catch path");
-  assert.ok(failureIndex < broadcastIndex, "adopt_failed must be appended before broadcast");
-  assert.ok(broadcastIndex < throwIndex, "projection must be broadcast before rejecting");
-  assert.ok(
-    worktreeAdoptHandler.indexOf("findCreatedWorktreeIdentity") < worktreeAdoptHandler.indexOf("service.adoptVariant"),
-    "unknown worktree identity must reject before checkout or merge adoption",
-  );
+  assert.match(worktreeAdoptHandler, /adoptWorkflowWorktree/);
+  assert.match(worktreeAdoptHandler, /workflowStoreIdentity/);
+  assert.match(worktreeAdoptHandler, /withSessionMutationLock:\s*withWorkflowSessionMutationLock/);
+  assert.match(worktreeAdoptHandler, /broadcastWorkflowProjection/);
+  const adoptRuntime = runtime.slice(runtime.indexOf("export async function adoptWorkflowWorktree"), runtime.indexOf("function sanitizeComparisonEvidence"));
+  const comparisonIndex = adoptRuntime.indexOf("findRequiredComparisonRecording");
+  const identityIndex = adoptRuntime.indexOf("resolveDurableWorktreeIdentity");
+  const reconcileIndex = adoptRuntime.indexOf("reconcileCurrentWorktree");
+  const adoptIndex = adoptRuntime.indexOf("service.adoptVariant");
+  const catchIndex = adoptRuntime.indexOf("catch (error)");
+  const failureIndex = adoptRuntime.indexOf("recordVariantAdoptFailure", catchIndex);
+  const broadcastIndex = adoptRuntime.indexOf("broadcastWorkflowProjection", catchIndex);
+  assert.ok(comparisonIndex >= 0 && comparisonIndex < identityIndex, "durable comparison must precede identity resolution");
+  assert.ok(identityIndex < reconcileIndex && reconcileIndex < adoptIndex, "both live identities and HEADs must be reconciled before adoption");
+  assert.ok(catchIndex >= 0 && failureIndex > catchIndex, "preflight and stale failures must append workflow.variant.adopt_failed");
+  assert.ok(failureIndex < broadcastIndex, "adopt_failed must be durable before the projection broadcast");
 });
 
 test("workflow clean IPC audits boundary rejection before service removal", async () => {
@@ -3702,6 +3674,66 @@ test("mocked preload rejects invalid workflow responses and drops invalid broadc
   unsubscribe();
 });
 
+test("mocked preload strictly validates the public worktree comparison receipt", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const modules = {
+    gitWorktree: await import(pathToFileURL(join(root, "..", "..", "packages", "git-worktree", "dist", "index.js")).href),
+    projectCore: await import(pathToFileURL(join(root, "..", "..", "packages", "project-core", "dist", "index.js")).href),
+  };
+  const runtime = await loadPreloadRuntime(contracts, modules);
+  const recording = strictComparisonRecording();
+  const exactResponse = { protocolVersion: 1, comparison: recording.comparison, recording };
+  runtime.setInvoke(async () => exactResponse);
+
+  assert.deepEqual(
+    toPlain(await runtime.api.workflow.compareWorktrees("/opened/project-alias", {
+      sessionId: "session-1",
+      leftWorktreeId: "worktree-left",
+      rightWorktreeId: "worktree-right",
+    })),
+    exactResponse,
+  );
+
+  for (const invalid of [
+    { ...exactResponse, projectRoot: "/secret/project" },
+    { ...exactResponse, recording: { ...recording, sessionId: "session-other" } },
+    { ...exactResponse, recording: { ...recording, left: { ...recording.left, realPath: "/secret/worktree" } } },
+    { ...exactResponse, comparison: { ...recording.comparison, comparisonId: "comparison-conflict" } },
+  ]) {
+    runtime.setInvoke(async () => invalid);
+    await assert.rejects(
+      runtime.api.workflow.compareWorktrees("/opened/project-alias", {
+        sessionId: "session-1",
+        leftWorktreeId: "worktree-left",
+        rightWorktreeId: "worktree-right",
+      }),
+      (error) => {
+        assert.doesNotMatch(error.message, /secret|projectRoot|realPath/);
+        return true;
+      },
+    );
+  }
+
+  for (const mismatchedRecording of [
+    strictComparisonRecording("worktree-other", "worktree-right"),
+    strictComparisonRecording("worktree-left", "worktree-other"),
+    strictComparisonRecording("worktree-right", "worktree-left"),
+  ]) {
+    runtime.setInvoke(async () => comparisonResponse(mismatchedRecording));
+    await assert.rejects(
+      runtime.api.workflow.compareWorktrees("/opened/project-alias", {
+        sessionId: "session-1",
+        leftWorktreeId: "worktree-left",
+        rightWorktreeId: "worktree-right",
+      }),
+      (error) => {
+        assert.equal(error.message, modules.gitWorktree.INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
+        return true;
+      },
+    );
+  }
+});
+
 test("workflow IPC contract errors are recognizable and block decision nodes", async () => {
   const contracts = await loadWorkflowIpcContracts();
 
@@ -3928,7 +3960,7 @@ async function loadMainWorkflowTransportRuntime({
   return module.exports;
 }
 
-async function loadPreloadRuntime(contracts) {
+async function loadPreloadRuntime(contracts, modules = {}) {
   const source = await readFile(join(root, "electron", "preload.ts"), "utf8");
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
@@ -3970,6 +4002,8 @@ async function loadPreloadRuntime(contracts) {
         };
       }
       if (specifier === "./workflowIpcContracts") return contracts;
+      if (specifier === "@skyturn/git-worktree" && modules.gitWorktree) return modules.gitWorktree;
+      if (specifier === "@skyturn/project-core" && modules.projectCore) return modules.projectCore;
       return require(specifier);
     },
   }, { filename: "preload.ts" });
@@ -4081,8 +4115,8 @@ function createdWorktreeEvent(sessionId, worktreeId, variantId, repoRoot = "/pro
         gitdir: `${repoRoot}/.git/worktrees/${worktreeId}`,
         repoRoot,
         branchName: `skyturn/${sessionId}/${variantId}`,
-        baseCommit: "base-commit",
-        headCommit: "head-commit",
+        baseCommit: "a".repeat(40),
+        headCommit: worktreeId === "worktree-left" ? "b".repeat(40) : "c".repeat(40),
         parentLaneId: `lane-${variantId}`,
       },
     },
@@ -4090,6 +4124,7 @@ function createdWorktreeEvent(sessionId, worktreeId, variantId, repoRoot = "/pro
 }
 
 function comparisonHarness(events, failure = null, comparison = validComparisonEvidence()) {
+  const durableEvents = structuredClone(events);
   const compareCalls = [];
   const serviceOptions = [];
   const dependencies = {
@@ -4100,7 +4135,23 @@ function comparisonHarness(events, failure = null, comparison = validComparisonE
           return sessionId === "session-1" ? { id: sessionId } : null;
         },
         listEvents() {
-          return events;
+          return durableEvents;
+        },
+        appendWorkflowEvent(input) {
+          const existing = durableEvents.find((event) => event.idempotencyKey === input.idempotencyKey);
+          if (existing) return existing;
+          const event = {
+            id: `event-${durableEvents.length + 1}`,
+            seq: durableEvents.length + 1,
+            sessionId: input.sessionId,
+            kind: input.kind,
+            source: input.source,
+            payload: input.payload,
+            idempotencyKey: input.idempotencyKey,
+            createdAt: input.now,
+          };
+          durableEvents.push(event);
+          return event;
         },
       };
     },
@@ -4114,10 +4165,16 @@ function comparisonHarness(events, failure = null, comparison = validComparisonE
           if (typeof value?.comparisonId !== "string") throw new Error("invalid result at /secret/result");
           return value;
         },
+        parseWorkflowVariantComparisonRecordedEvidence(value) {
+          return value;
+        },
         createNodeGitWorktreeService(options) {
           serviceOptions.push(options);
           if (failure && !failure.message.startsWith("import")) throw failure;
           return {
+            async reconcileManagedWorktree(worktree) {
+              return worktree;
+            },
             async compareVariants(value) {
               compareCalls.push(value);
               return comparison;
@@ -4129,8 +4186,14 @@ function comparisonHarness(events, failure = null, comparison = validComparisonE
     async canonicalPath(value) {
       return value;
     },
+    async workflowStoreIdentity(value) {
+      return value;
+    },
+    async withSessionMutationLock(_projectRoot, _sessionId, action) {
+      return await action();
+    },
   };
-  return { dependencies, compareCalls, serviceOptions };
+  return { dependencies, compareCalls, serviceOptions, events: durableEvents };
 }
 
 function validComparisonEvidence() {
@@ -4138,6 +4201,52 @@ function validComparisonEvidence() {
     comparisonId: "comparison-left-right",
     collectedAt: "2026-07-12T00:00:00.000Z",
     variants: [],
+  };
+}
+
+function comparisonResponse(recording) {
+  return { protocolVersion: 1, comparison: recording.comparison, recording };
+}
+
+function strictComparisonRecording(
+  leftWorktreeId = "worktree-left",
+  rightWorktreeId = "worktree-right",
+) {
+  const collectedAt = "2026-09-03T00:00:00.000Z";
+  const worktreeIds = { left: leftWorktreeId, right: rightWorktreeId };
+  const comparison = {
+    comparisonId: "comparison-left-right",
+    collectedAt,
+    variants: ["left", "right"].map((side) => ({
+      variantId: `variant-${side}`,
+      worktreeId: worktreeIds[side],
+      changeset: {
+        evidenceId: `evidence-${side}`,
+        changesetId: `changeset-${side}`,
+        source: "git",
+        status: "available",
+        files: [`src/${side}.ts`],
+        diffStat: { added: 1, changed: 0, deleted: 0 },
+        patchPreviewTruncated: false,
+        worktreeId: worktreeIds[side],
+        collectedAt,
+      },
+      metrics: [],
+    })),
+  };
+  const side = (name, head) => ({
+    laneId: `lane-${name}`,
+    variantId: `variant-${name}`,
+    worktreeId: worktreeIds[name],
+    branchName: `skyturn/session-1/${name}`,
+    baseCommit: "a".repeat(40),
+    headCommit: head.repeat(40),
+  });
+  return {
+    sessionId: "session-1",
+    comparison,
+    left: side("left", "b"),
+    right: side("right", "c"),
   };
 }
 

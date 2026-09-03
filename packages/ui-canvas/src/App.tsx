@@ -121,6 +121,7 @@ import {
   type UserDecisionAction,
   type WorkflowLoopNextAction,
   type WorkflowMode,
+  type WorkflowVariantComparisonRecordedEvidence,
 } from "@skyturn/project-core";
 
 import {
@@ -6530,8 +6531,10 @@ function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasN
 }
 
 function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; session: CanvasSession; projectRoot: string }) {
+  const compareRequestGenerationRef = useRef(0);
+  const compareRequestScopeRef = useRef({ projectRoot, sessionId: session.id, nodeId: node.id });
   const [comparing, setComparing] = useState(false);
-  const [compareResult, setCompareResult] = useState<VariantComparisonEvidence | null>(null);
+  const [compareRecording, setCompareRecording] = useState<WorkflowVariantComparisonRecordedEvidence | null>(null);
   const [compareError, setCompareError] = useState<string | null>(null);
 
   const [adopting, setAdopting] = useState(false);
@@ -6549,6 +6552,18 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
   const devflow = window.devflow;
   const devflowAvailable = !!devflow?.workflow?.compareWorktrees;
 
+  useLayoutEffect(() => {
+    compareRequestGenerationRef.current += 1;
+    compareRequestScopeRef.current = { projectRoot, sessionId: session.id, nodeId: node.id };
+    setComparing(false);
+    setCompareRecording(null);
+    setCompareError(null);
+    setAdopting(false);
+    setAdoptStatus(null);
+    setAdoptError(null);
+    setAdoptConfirmed(false);
+  }, [projectRoot, session.id, node.id]);
+
   const isNewWorktree = node.worktree.executionTarget === "new_worktree" && !!node.worktree.worktreeId;
 
   if (!isNewWorktree) {
@@ -6558,10 +6573,14 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
   const missingMetadata =
     !node.worktree.worktreeId ||
     !node.worktree.variantId ||
-    !node.worktree.baseCommit ||
-    !node.worktree.headCommit ||
     !node.worktree.selectedBranch;
-  const canAdopt = devflowAvailable && !missingMetadata;
+  const comparisonSide = compareRecording
+    ? [compareRecording.left, compareRecording.right].find((side) =>
+        side.worktreeId === node.worktree.worktreeId && side.variantId === node.worktree.variantId
+      )
+    : undefined;
+  const comparisonMatchesNode = comparisonSide !== undefined;
+  const canAdopt = devflowAvailable && !missingMetadata && comparisonMatchesNode;
 
   const missingCleanMetadata =
     !node.worktree.worktreeId ||
@@ -6575,10 +6594,21 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
   const canClean = devflowAvailable && !missingCleanMetadata;
 
   const candidateNodes = session.nodes.filter((n) => !!n.worktree.worktreeId && n.id !== node.id);
-  const comparisonSummary = compareResult ? summarizeWorktreeComparisonEvidence(compareResult) : null;
+  const comparisonSummary = compareRecording
+    ? summarizeWorktreeComparisonEvidence(compareRecording.comparison)
+    : null;
 
   const handleCompare = async (otherNode: CanvasNode) => {
     if (!devflow?.workflow?.compareWorktrees) return;
+    const compareScope = { projectRoot, sessionId: session.id, nodeId: node.id };
+    const compareGeneration = ++compareRequestGenerationRef.current;
+    const compareStillCurrent = () => {
+      const currentScope = compareRequestScopeRef.current;
+      return compareRequestGenerationRef.current === compareGeneration &&
+        currentScope.projectRoot === compareScope.projectRoot &&
+        currentScope.sessionId === compareScope.sessionId &&
+        currentScope.nodeId === compareScope.nodeId;
+    };
     setComparing(true);
     setCompareError(null);
     try {
@@ -6587,16 +6617,17 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
         leftWorktreeId: node.worktree.worktreeId!,
         rightWorktreeId: otherNode.worktree.worktreeId!,
       });
-      setCompareResult(result.comparison);
+      if (!compareStillCurrent()) return;
+      setCompareRecording(result.recording);
     } catch (e: any) {
-      setCompareError(e.message || "Failed to compare");
+      if (compareStillCurrent()) setCompareError(e.message || "Failed to compare");
     } finally {
-      setComparing(false);
+      if (compareStillCurrent()) setComparing(false);
     }
   };
 
   const handleAdopt = async () => {
-    if (!devflow?.workflow?.adoptWorktree || missingMetadata) return;
+    if (!devflow?.workflow?.adoptWorktree || missingMetadata || !compareRecording || !comparisonSide) return;
     if (!adoptConfirmed) {
       setAdoptError("Confirm merge adoption before continuing.");
       return;
@@ -6605,16 +6636,18 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
     setAdoptError(null);
     setAdoptStatus(null);
     try {
+      const comparisonToken = compareRecording.comparison.comparisonId.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 224);
       const result = await devflow.workflow.adoptWorktree(projectRoot, {
         sessionId: session.id,
+        comparisonId: compareRecording.comparison.comparisonId,
         adoption: {
-          adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}`,
-          variantId: node.worktree.variantId!,
-          worktreeId: node.worktree.worktreeId!,
+          adoptionId: `adopt-${comparisonSide.worktreeId}-${comparisonSide.headCommit}-${comparisonToken}`,
+          variantId: comparisonSide.variantId,
+          worktreeId: comparisonSide.worktreeId,
           strategy: "merge",
           status: "requested",
-          baseCommit: node.worktree.baseCommit!,
-          headCommit: node.worktree.headCommit!,
+          baseCommit: comparisonSide.baseCommit,
+          headCommit: comparisonSide.headCommit,
           targetBranchName: node.worktree.selectedBranch!,
         },
       });
@@ -6673,6 +6706,9 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
       <h3>Worktree Lifecycle</h3>
       {!devflowAvailable && <p className="eyebrow notice error">Desktop backend unavailable</p>}
       {missingMetadata && devflowAvailable && <p className="eyebrow notice error">Missing required metadata for adoption.</p>}
+      {!missingMetadata && devflowAvailable && !comparisonMatchesNode && (
+        <p className="eyebrow notice">Compare this worktree with another current variant before adoption.</p>
+      )}
 
       <div className="worktree-confirmations">
         <label className="delivery-check">

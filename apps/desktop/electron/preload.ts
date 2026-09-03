@@ -136,19 +136,36 @@ const workflow = {
     invokeWorkflow("workflow:userDecision:answer", projectRoot, [input], "required"),
   createWorktree: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:worktree:create", projectRoot, [input]),
   compareWorktrees: async (projectRoot: string, input: WorktreeComparisonRequest) => {
-    const {
+    const [{
       INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR,
       parseVariantComparisonEvidence,
       parseWorktreeComparisonRequest,
-    } = await import("@skyturn/git-worktree");
+    }, { parseWorkflowVariantComparisonRecordedEvidence }] = await Promise.all([
+      import("@skyturn/git-worktree"),
+      import("@skyturn/project-core"),
+    ]);
     const request = parseWorktreeComparisonRequest(input);
     const result: unknown = await invokeWorkflow("workflow:worktree:compare", projectRoot, [request]);
-    if (!isRecord(result) || typeof result.protocolVersion !== "number") {
+    if (
+      !isRecord(result) ||
+      !hasExactKeys(result, ["protocolVersion", "comparison", "recording"]) ||
+      !Number.isSafeInteger(result.protocolVersion) ||
+      (result.protocolVersion as number) < 1
+    ) {
       throw new Error(INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
     }
+    const comparison = parseVariantComparisonEvidence(result.comparison);
+    const recording = parseWorkflowVariantComparisonRecordedEvidence(result.recording);
+    if (
+      recording.sessionId !== request.sessionId ||
+      recording.left.worktreeId !== request.leftWorktreeId ||
+      recording.right.worktreeId !== request.rightWorktreeId ||
+      JSON.stringify(recording.comparison) !== JSON.stringify(comparison)
+    ) throw new Error(INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
     return {
-      protocolVersion: result.protocolVersion,
-      comparison: parseVariantComparisonEvidence(result.comparison),
+      protocolVersion: result.protocolVersion as number,
+      comparison,
+      recording,
     };
   },
   adoptWorktree: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:worktree:adopt", projectRoot, [input]),
@@ -172,6 +189,11 @@ const workflow = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value);
+  return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
 contextBridge.exposeInMainWorld("devflow", {

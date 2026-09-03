@@ -328,11 +328,30 @@ export interface WorktreeComparisonRequest {
   rightWorktreeId: string;
 }
 
+export interface WorktreeAdoptionRequest {
+  sessionId: string;
+  comparisonId?: string;
+  adoption: WorkflowVariantAdoption & { status: "requested" };
+}
+
 export const INVALID_WORKTREE_COMPARISON_REQUEST_ERROR = "Invalid worktree comparison request.";
 export const INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR = "Invalid worktree comparison evidence.";
 
 const WORKTREE_COMPARISON_REQUEST_KEYS = ["leftWorktreeId", "rightWorktreeId", "sessionId"] as const;
+const WORKTREE_ADOPTION_REQUEST_KEYS = ["adoption", "comparisonId", "sessionId"] as const;
+const WORKTREE_ADOPTION_KEYS = [
+  "adoptionId",
+  "variantId",
+  "worktreeId",
+  "strategy",
+  "status",
+  "baseCommit",
+  "headCommit",
+  "targetBranchName",
+] as const;
 const WORKTREE_COMPARISON_TOKEN = /^[A-Za-z0-9._-]+$/;
+const FULL_GIT_COMMIT = /^[0-9a-f]{40}$/;
+const INVALID_WORKTREE_ADOPTION_REQUEST_ERROR = "Invalid worktree adoption request.";
 
 export function parseWorktreeComparisonRequest(value: unknown): WorktreeComparisonRequest {
   if (!isRuntimeRecord(value)) throw new Error(INVALID_WORKTREE_COMPARISON_REQUEST_ERROR);
@@ -351,6 +370,58 @@ export function parseWorktreeComparisonRequest(value: unknown): WorktreeComparis
     leftWorktreeId: value.leftWorktreeId,
     rightWorktreeId: value.rightWorktreeId,
   };
+}
+
+export function parseWorktreeAdoptionRequest(value: unknown): WorktreeAdoptionRequest {
+  if (!isRuntimeRecord(value)) throw new Error(INVALID_WORKTREE_ADOPTION_REQUEST_ERROR);
+  const keys = Object.keys(value).sort();
+  const allowedKeys = WORKTREE_ADOPTION_REQUEST_KEYS;
+  if (
+    keys.some((key) => !allowedKeys.some((allowed) => allowed === key)) ||
+    !keys.includes("adoption") ||
+    !keys.includes("sessionId") ||
+    !isBoundedComparisonToken(value.sessionId, 240) ||
+    (value.comparisonId !== undefined && !isBoundedComparisonText(value.comparisonId, 512)) ||
+    !isRuntimeRecord(value.adoption)
+  ) throw new Error(INVALID_WORKTREE_ADOPTION_REQUEST_ERROR);
+  const adoptionKeys = Object.keys(value.adoption).sort();
+  if (
+    adoptionKeys.length !== WORKTREE_ADOPTION_KEYS.length ||
+    adoptionKeys.some((key, index) => key !== [...WORKTREE_ADOPTION_KEYS].sort()[index]) ||
+    !isBoundedComparisonToken(value.adoption.adoptionId, 512) ||
+    !isBoundedComparisonToken(value.adoption.variantId, 240) ||
+    !isBoundedComparisonToken(value.adoption.worktreeId, 240) ||
+    (value.adoption.strategy !== "merge" && value.adoption.strategy !== "cherry-pick") ||
+    value.adoption.status !== "requested" ||
+    typeof value.adoption.baseCommit !== "string" ||
+    !FULL_GIT_COMMIT.test(value.adoption.baseCommit) ||
+    typeof value.adoption.headCommit !== "string" ||
+    !FULL_GIT_COMMIT.test(value.adoption.headCommit) ||
+    !isBoundedComparisonText(value.adoption.targetBranchName, 1024)
+  ) throw new Error(INVALID_WORKTREE_ADOPTION_REQUEST_ERROR);
+  return {
+    sessionId: value.sessionId,
+    ...(value.comparisonId !== undefined ? { comparisonId: value.comparisonId } : {}),
+    adoption: {
+      adoptionId: value.adoption.adoptionId,
+      variantId: value.adoption.variantId,
+      worktreeId: value.adoption.worktreeId,
+      strategy: value.adoption.strategy,
+      status: "requested",
+      baseCommit: value.adoption.baseCommit,
+      headCommit: value.adoption.headCommit,
+      targetBranchName: value.adoption.targetBranchName,
+    },
+  };
+}
+
+function isBoundedComparisonToken(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length <= maxLength && WORKTREE_COMPARISON_TOKEN.test(value);
+}
+
+function isBoundedComparisonText(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLength &&
+    value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 export interface VariantComparisonEvidence {
@@ -386,8 +457,12 @@ export interface ManagedWorktreeService {
   cleanManagedWorktree(input: ManagedWorktreeCleanupInput): Promise<ManagedWorktreeCleanupResult>;
 }
 
+export interface VariantAdoptionOptions {
+  requiredFreshWorktrees?: readonly WorkflowWorktreeIdentity[];
+}
+
 export interface VariantAdoptionService {
-  adoptVariant(input: WorkflowVariantAdoption): Promise<WorkflowVariantAdoption>;
+  adoptVariant(input: WorkflowVariantAdoption, options?: VariantAdoptionOptions): Promise<WorkflowVariantAdoption>;
 }
 
 export interface ChangesetEvidenceInput {

@@ -57,7 +57,7 @@ import {
   type WorkflowBroadcastCause,
   type WorkflowIpcErrorCode,
 } from "./workflowIpcContracts";
-import { compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
+import { adoptWorkflowWorktree, compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
 import { createTerminalRuntime } from "./terminalRuntime";
 import {
   compensateFailedWorkflowRun,
@@ -1952,51 +1952,23 @@ ipcMain.handle("workflow:worktree:compare", workflowHandler(async (projectRoot: 
     getWorkflowStore,
     loadGitWorktreeModule: () => import("@skyturn/git-worktree/node"),
     canonicalPath: (value) => fs.realpath(value),
+    workflowStoreIdentity,
+    withSessionMutationLock: withWorkflowSessionMutationLock,
     protocolVersion: RUN_PROTOCOL_VERSION,
   }, projectRoot, input);
 }));
 
 ipcMain.handle("workflow:worktree:adopt", workflowHandler(async (projectRoot: string, input: unknown) => {
-  assertKnownProjectRoot(projectRoot);
-  const sessionId = requireWorktreeToken(readField(input, "sessionId"), "workflow session id");
-  const adoption = workflowVariantAdoptionFromRecord(requireRecord(readField(input, "adoption"), "variant adoption"));
-  const store = await getWorkflowStore(projectRoot);
-  const existingEvents = store.listEvents(sessionId);
-  try {
-    const createdWorktree = findCreatedWorktreeIdentity(existingEvents, adoption.worktreeId);
-    await assertAdoptedWorktreeBelongsToProject(projectRoot, createdWorktree);
-  } catch (error) {
-    recordVariantAdoptFailure(store, sessionId, adoption, error);
-    broadcastWorkflowProjection(projectRoot, sessionId, store);
-    throw error;
-  }
-  const appendedEvents: unknown[] = [];
-  const { createNodeGitWorktreeService } = await import("@skyturn/git-worktree/node");
-  const service = createNodeGitWorktreeService({
-    initialEvents: managedWorktreeEventsFromStore(existingEvents),
-    eventSink: {
-      append: async (event) => {
-        appendedEvents.push(store.appendWorkflowEvent({
-          sessionId: event.sessionId ?? sessionId,
-          kind: event.kind,
-          source: event.source,
-          idempotencyKey: event.idempotencyKey,
-          payload: event.payload,
-          now: event.createdAt,
-        }));
-      },
-    },
-  });
-  try {
-    const result = await service.adoptVariant(adoption);
-    const event = findVariantAdoptionEvent(appendedEvents, result.adoptionId, result.status)
-      ?? findVariantAdoptionEvent(store.listEvents(sessionId), result.adoptionId, result.status);
-    broadcastWorkflowProjection(projectRoot, sessionId, store);
-    return { protocolVersion: RUN_PROTOCOL_VERSION, status: result.status, event, adoption: result };
-  } catch (error) {
-    broadcastWorkflowProjection(projectRoot, sessionId, store);
-    throw error;
-  }
+  return adoptWorkflowWorktree({
+    assertKnownProjectRoot,
+    getWorkflowStore,
+    loadGitWorktreeModule: () => import("@skyturn/git-worktree/node"),
+    canonicalPath: (value) => fs.realpath(value),
+    workflowStoreIdentity,
+    withSessionMutationLock: withWorkflowSessionMutationLock,
+    broadcastWorkflowProjection,
+    protocolVersion: RUN_PROTOCOL_VERSION,
+  }, projectRoot, input);
 }));
 
 ipcMain.handle("workflow:worktree:clean", workflowHandler(async (projectRoot: string, input: unknown) => {

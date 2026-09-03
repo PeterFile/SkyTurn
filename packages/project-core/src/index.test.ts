@@ -25,6 +25,7 @@ import {
   resolveWorkflowDeliveryCandidateIdentity,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
+  parseWorkflowVariantComparisonRecordedEvidence,
   parseWorkflowGitAncestryProof,
   parseWorkflowCandidateManifest,
   parseRunEvent,
@@ -2051,6 +2052,76 @@ describe("agent run contracts", () => {
       worktreeId: `worktree-${longSessionId}-${longVariantId}`,
     };
     expect(parseWorkflowLaneCandidateBinding(longBinding)).toEqual(longBinding);
+  });
+
+  it("strictly parses bounded path-free variant comparison records", () => {
+    const changeset = {
+      evidenceId: "evidence-left",
+      changesetId: "changeset-left",
+      source: "git" as const,
+      status: "available" as const,
+      files: ["src/index.ts"],
+      diffStat: { added: 1, changed: 0, deleted: 0 },
+      patchPreviewTruncated: false,
+      worktreeId: "worktree-left",
+      collectedAt: "2026-08-26T00:00:00.000Z",
+    };
+    const comparison = {
+      comparisonId: "comparison-left-right-2026-08-26T00:00:00.000Z",
+      collectedAt: "2026-08-26T00:00:00.000Z",
+      variants: [
+        { variantId: "variant-left", worktreeId: "worktree-left", changeset, metrics: [] },
+        {
+          variantId: "variant-right",
+          worktreeId: "worktree-right",
+          changeset: {
+            ...changeset,
+            evidenceId: "evidence-right",
+            changesetId: "changeset-right",
+            worktreeId: "worktree-right",
+          },
+          metrics: [],
+        },
+      ],
+    };
+    const recording = {
+      sessionId: "session-1",
+      comparison,
+      left: {
+        laneId: "lane-left",
+        variantId: "variant-left",
+        worktreeId: "worktree-left",
+        branchName: "skyturn/session-1/variant-left",
+        baseCommit: "a".repeat(40),
+        headCommit: "b".repeat(40),
+      },
+      right: {
+        laneId: "lane-right",
+        variantId: "variant-right",
+        worktreeId: "worktree-right",
+        branchName: "skyturn/session-1/variant-right",
+        baseCommit: "a".repeat(40),
+        headCommit: "c".repeat(40),
+      },
+    };
+
+    expect(parseWorkflowVariantComparisonRecordedEvidence(recording)).toEqual(recording);
+    for (const malformed of [
+      { ...recording, projectRoot: "/secret/project" },
+      { ...recording, left: { ...recording.left, path: "/secret/worktree" } },
+      { ...recording, right: { ...recording.right, headCommit: "short" } },
+      { ...recording, comparison: { ...comparison, prompt: "secret" } },
+      {
+        ...recording,
+        comparison: {
+          ...comparison,
+          variants: [{ ...comparison.variants[0], changeset: { ...changeset, files: ["/secret/file.ts"] } }, comparison.variants[1]],
+        },
+      },
+      { ...recording, sessionId: "s".repeat(241) },
+    ]) {
+      expect(() => parseWorkflowVariantComparisonRecordedEvidence(malformed)).toThrow(/variant comparison record/i);
+    }
   });
 
   it.each([

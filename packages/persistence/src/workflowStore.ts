@@ -17,6 +17,7 @@ import {
   parseWorkflowGitAncestryProof,
   parseWorkflowLaneCandidateBinding,
   parseWorkflowLaneCandidateBindingBlock,
+  parseWorkflowVariantComparisonRecordedEvidence,
   sanitizePublicEvidenceText,
   WORKFLOW_CANDIDATE_MANIFEST_VERSION,
 } from "@skyturn/project-core";
@@ -1095,6 +1096,7 @@ export class WorkflowStore {
     if (input.kind === "workflow.candidate.review_allowed") {
       throw new Error("Workflow candidate review attestation is internal and cannot be forged through generic append.");
     }
+    assertVariantComparisonEventEnvelope(input);
     assertGenericCheckpointEventHasNoRestrictedFields(input);
     const laneId = laneIdFromPayload(input.payload);
     const projection = this.materializeFlowProjection(input.sessionId);
@@ -3042,6 +3044,7 @@ export class WorkflowStore {
       event: mapEvent(row),
     }));
     validatePersistedCheckpointAncestryProofs(events);
+    validatePersistedVariantComparisonRecords(events);
     return events;
   }
 
@@ -6517,6 +6520,17 @@ function canonicalFlowEventPayload(
   event: Pick<FlowEvent, "kind" | "payload">,
   expectedArtifactContract: boolean,
 ): Record<string, unknown> {
+  if (event.kind === "workflow.variant.comparison_recorded") {
+    if (
+      Object.keys(event.payload).length !== 1 ||
+      !Object.prototype.hasOwnProperty.call(event.payload, "recording")
+    ) {
+      throw new Error("Invalid workflow variant comparison record payload.");
+    }
+    return {
+      recording: parseWorkflowVariantComparisonRecordedEvidence(event.payload.recording),
+    };
+  }
   if (event.kind === "workflow.lane.declared" && isRecord(event.payload.lane)) {
     return {
       ...event.payload,
@@ -6583,6 +6597,50 @@ function canonicalFlowEventPayload(
       runEvidence,
     },
   };
+}
+
+function assertVariantComparisonEventEnvelope(input: AppendWorkflowEventInput): void {
+  if (input.kind !== "workflow.variant.comparison_recorded") return;
+  const payload = canonicalFlowEventPayload({ kind: input.kind, payload: input.payload }, false);
+  const recording = parseWorkflowVariantComparisonRecordedEvidence(payload.recording);
+  if (
+    input.source !== "electron-main" ||
+    input.sessionId !== recording.sessionId ||
+    input.now !== recording.comparison.collectedAt ||
+    input.laneId != null ||
+    input.segmentId != null ||
+    input.causationId != null ||
+    input.correlationId != null ||
+    typeof input.idempotencyKey !== "string" ||
+    !/^variant-comparison:[0-9a-f]{64}$/.test(input.idempotencyKey)
+  ) {
+    throw new Error("Invalid workflow variant comparison record envelope.");
+  }
+}
+
+function validatePersistedVariantComparisonRecords(events: ValidatedEventRow[]): void {
+  for (const { row, event } of events) {
+    if (event.kind !== "workflow.variant.comparison_recorded") continue;
+    const payload = canonicalFlowEventPayload({
+      kind: "workflow.variant.comparison_recorded",
+      payload: event.payload,
+    }, false);
+    const recording = parseWorkflowVariantComparisonRecordedEvidence(payload.recording);
+    if (
+      event.source !== "electron-main" ||
+      event.sessionId !== recording.sessionId ||
+      event.createdAt !== recording.comparison.collectedAt ||
+      event.laneId !== null ||
+      event.segmentId !== null ||
+      event.causationId !== null ||
+      event.correlationId !== null ||
+      typeof event.idempotencyKey !== "string" ||
+      !/^variant-comparison:[0-9a-f]{64}$/.test(event.idempotencyKey) ||
+      stableJson(payload) !== row.payload_json
+    ) {
+      throw new Error("Invalid persisted workflow variant comparison record.");
+    }
+  }
 }
 
 function isWorkflowOutputDelta(event: RunEvent): boolean {

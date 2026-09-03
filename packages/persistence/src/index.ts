@@ -58,6 +58,7 @@ import {
   type WorkflowNodeCheckpoint,
   type WorkflowRollbackEligibility,
   type WorkflowVariantAdoption,
+  type WorkflowVariantComparisonRecordedEvidence,
   type WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
 
@@ -341,7 +342,11 @@ export interface WorkflowApi {
   }>>;
   answerUserDecision: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ event: unknown; projection: unknown }>>;
   createWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "created"; event: unknown; worktree: WorkflowWorktreeIdentity }>;
-  compareWorktrees: (projectRoot: string, input: WorktreeComparisonRequest) => Promise<{ protocolVersion: number; comparison: VariantComparisonEvidence }>;
+  compareWorktrees: (projectRoot: string, input: WorktreeComparisonRequest) => Promise<{
+    protocolVersion: number;
+    comparison: VariantComparisonEvidence;
+    recording: WorkflowVariantComparisonRecordedEvidence;
+  }>;
   adoptWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "adopted" | "failed"; event: unknown | null; adoption: WorkflowVariantAdoption & { status: "adopted" | "failed" } }>;
   cleanWorktree: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "cleaned"; event: unknown | null; result: ManagedWorktreeCleanupResult }>;
   createDeliveryCommit: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; status: "committed"; event: unknown | null; evidence: DeliveryCommitEvidence }>;

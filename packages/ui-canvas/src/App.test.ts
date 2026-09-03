@@ -2125,9 +2125,12 @@ describe("UI source validation", () => {
     const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
     expect(worktreeActions).toContain("const missingMetadata =");
     expect(worktreeActions).toContain("!node.worktree.worktreeId");
-    expect(worktreeActions).toContain("const canAdopt = devflowAvailable && !missingMetadata;");
+    expect(worktreeActions).toContain("const comparisonMatchesNode =");
+    expect(worktreeActions).toContain("const comparisonSide =");
+    expect(worktreeActions).toContain("const canAdopt = devflowAvailable && !missingMetadata && comparisonMatchesNode;");
     expect(worktreeActions).toContain("disabled={!canAdopt || adopting || !adoptConfirmed}");
     expect(worktreeActions).toContain("Missing required metadata for adoption.");
+    expect(worktreeActions).toContain("Compare this worktree with another current variant before adoption.");
   });
 
   it("WorktreeActions adopt does not fallback to HEAD and main", async () => {
@@ -2141,7 +2144,68 @@ describe("UI source validation", () => {
     const appSource = await readSource("./App.tsx");
     const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
     expect(worktreeActions).not.toContain("Date.now()");
-    expect(worktreeActions).toContain("adoptionId: `adopt-${node.worktree.worktreeId}-${node.worktree.headCommit}`");
+    expect(worktreeActions).toContain("const comparisonToken = compareRecording.comparison.comparisonId.replace(/[^A-Za-z0-9._-]/g, \"-\").slice(0, 224)");
+    expect(worktreeActions).toContain("comparisonId: compareRecording.comparison.comparisonId");
+    expect(worktreeActions).toContain("adoptionId: `adopt-${comparisonSide.worktreeId}-${comparisonSide.headCommit}-${comparisonToken}`");
+    expect(worktreeActions).toContain("baseCommit: comparisonSide.baseCommit");
+    expect(worktreeActions).toContain("headCommit: comparisonSide.headCommit");
+  });
+
+  it("WorktreeActions adopts from the strict comparison receipt instead of stale node commits", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    const handleAdopt = worktreeActions.slice(
+      worktreeActions.indexOf("const handleAdopt"),
+      worktreeActions.indexOf("const handleClean"),
+    );
+
+    expect(worktreeActions).toContain("setCompareRecording(result.recording)");
+    expect(handleAdopt).toContain("variantId: comparisonSide.variantId");
+    expect(handleAdopt).toContain("worktreeId: comparisonSide.worktreeId");
+    expect(handleAdopt).toContain("baseCommit: comparisonSide.baseCommit");
+    expect(handleAdopt).toContain("headCommit: comparisonSide.headCommit");
+    expect(handleAdopt).not.toContain("node.worktree.baseCommit");
+    expect(handleAdopt).not.toContain("node.worktree.headCommit");
+  });
+
+  it("WorktreeActions invalidates pending compares and resets comparison adoption state when scope changes", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    const scopeReset = worktreeActions.slice(
+      worktreeActions.indexOf("useLayoutEffect(() => {"),
+      worktreeActions.indexOf("const isNewWorktree"),
+    );
+
+    expect(worktreeActions).toContain("const compareRequestGenerationRef = useRef(0);");
+    expect(worktreeActions).toContain("const compareRequestScopeRef = useRef({ projectRoot, sessionId: session.id, nodeId: node.id });");
+    expect(scopeReset).toContain("compareRequestGenerationRef.current += 1;");
+    expect(scopeReset).toContain("compareRequestScopeRef.current = { projectRoot, sessionId: session.id, nodeId: node.id };");
+    expect(scopeReset).toContain("setComparing(false);");
+    expect(scopeReset).toContain("setCompareRecording(null);");
+    expect(scopeReset).toContain("setCompareError(null);");
+    expect(scopeReset).toContain("setAdopting(false);");
+    expect(scopeReset).toContain("setAdoptStatus(null);");
+    expect(scopeReset).toContain("setAdoptError(null);");
+    expect(scopeReset).toContain("setAdoptConfirmed(false);");
+    expect(scopeReset).toContain("}, [projectRoot, session.id, node.id]);");
+  });
+
+  it("WorktreeActions accepts only the latest compare success error and cleanup", async () => {
+    const appSource = await readSource("./App.tsx");
+    const worktreeActions = appSource.slice(appSource.indexOf("function WorktreeActions"));
+    const handleCompare = worktreeActions.slice(
+      worktreeActions.indexOf("const handleCompare"),
+      worktreeActions.indexOf("const handleAdopt"),
+    );
+
+    expect(handleCompare).toContain("const compareGeneration = ++compareRequestGenerationRef.current;");
+    expect(handleCompare).toContain("compareRequestGenerationRef.current === compareGeneration");
+    expect(handleCompare).toContain("currentScope.projectRoot === compareScope.projectRoot");
+    expect(handleCompare).toContain("currentScope.sessionId === compareScope.sessionId");
+    expect(handleCompare).toContain("currentScope.nodeId === compareScope.nodeId");
+    expect(handleCompare).toContain("if (!compareStillCurrent()) return;\n      setCompareRecording(result.recording);");
+    expect(handleCompare).toContain('if (compareStillCurrent()) setCompareError(e.message || "Failed to compare");');
+    expect(handleCompare).toContain("if (compareStillCurrent()) setComparing(false);");
   });
 
   it("WorktreeActions adopt stays merge strategy without cherry-pick UI", async () => {
