@@ -97,7 +97,11 @@ export async function compareWorkflowWorktrees(
   dependencies: WorktreeComparisonRuntimeDependencies,
   projectRoot: string,
   input: unknown,
-): Promise<{ protocolVersion: number; comparison: VariantComparisonEvidence }> {
+): Promise<{
+  protocolVersion: number;
+  comparison: VariantComparisonEvidence;
+  recording: WorkflowVariantComparisonRecordedEvidence;
+}> {
   try {
     dependencies.assertKnownProjectRoot(projectRoot);
     const gitWorktree = await dependencies.loadGitWorktreeModule();
@@ -126,7 +130,11 @@ export async function compareWorkflowWorktrees(
         rightIdentity,
       );
       if (existing) {
-        return { protocolVersion: dependencies.protocolVersion ?? 1, comparison: existing.comparison };
+        return {
+          protocolVersion: dependencies.protocolVersion ?? 1,
+          comparison: existing.comparison,
+          recording: existing,
+        };
       }
 
       const comparison = sanitizeComparisonEvidence(gitWorktree.parseVariantComparisonEvidence(
@@ -151,7 +159,11 @@ export async function compareWorkflowWorktrees(
       if (!sameRecording(persisted, recording)) {
         throw new WorktreeMutationError("INVALID_INPUT", "Persisted worktree comparison conflicts with the live comparison.");
       }
-      return { protocolVersion: dependencies.protocolVersion ?? 1, comparison: persisted.comparison };
+      return {
+        protocolVersion: dependencies.protocolVersion ?? 1,
+        comparison: persisted.comparison,
+        recording: persisted,
+      };
     });
   } catch (error) {
     throw normalizeRuntimeError(error, "Worktree comparison failed.");

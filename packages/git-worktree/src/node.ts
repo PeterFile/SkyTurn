@@ -739,18 +739,16 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
     }, `variant:${input.adoptionId}:adopt-requested`);
 
     const eventWorktree = this.findCreatedWorktree(input.worktreeId);
-    let repoRoot: string | null = eventWorktree?.repoRoot ?? null;
     try {
       if (!eventWorktree) throw new Error(`No created worktree event for ${input.worktreeId}.`);
       verifyAdoptionRecord(input, eventWorktree);
       const worktree = await this.reconcileManagedWorktree(eventWorktree, { expectedHeadCommit: input.headCommit });
-      repoRoot = worktree.repoRoot;
       await assertCleanWorktree(worktree.realPath, "variant worktree");
       await validateTargetBranch(worktree.repoRoot, input.targetBranchName);
       await checkoutTargetBranch(worktree.repoRoot, input.targetBranchName);
       await assertCleanWorktree(worktree.repoRoot, "target worktree");
       await assertTargetHeadMatchesBase(worktree.repoRoot, input);
-      await previewAdoption(worktree.repoRoot, input);
+      const candidateCommit = await prepareAdoptionCandidate(worktree.repoRoot, input);
       const requiredFreshWorktrees = options.requiredFreshWorktrees ?? [worktree];
       const reconciledFreshWorktrees = await Promise.all(requiredFreshWorktrees.map((required) => (
         this.reconcileManagedWorktree(required, { expectedHeadCommit: required.headCommit })
@@ -759,16 +757,19 @@ export class NodeGitWorktreeService implements ManagedWorktreeService, VariantAd
         throw new Error("Adoption target branch must not be a compared worktree branch.");
       }
       await withLockedFreshWorktreeHeads(worktree.repoRoot, reconciledFreshWorktrees, () => (
-        applyAdoption(worktree.repoRoot, input)
+        publishPreparedCandidateRef(worktree.repoRoot, {
+          branchRef: `refs/heads/${input.targetBranchName}`,
+          candidateCommit,
+          expectedHeadCommit: input.baseCommit,
+        })
       ));
-      const adoptedCommit = await currentHead(worktree.repoRoot);
-      const adopted: WorkflowVariantAdoption = { ...input, status: "adopted", adoptedCommit };
+      await runGit(worktree.repoRoot, ["read-tree", "--reset", "-u", candidateCommit]);
+      const adopted: WorkflowVariantAdoption = { ...input, status: "adopted", adoptedCommit: candidateCommit };
       await this.record("workflow.variant.adopted", {
         adoption: adopted,
       }, `variant:${input.adoptionId}:adopted`);
       return adopted;
     } catch (error) {
-      if (repoRoot) await abortAdoption(repoRoot);
       const failed: WorkflowVariantAdoption = {
         ...input,
         status: "failed",
@@ -3071,25 +3072,25 @@ async function checkoutTargetBranch(repoRoot: string, branchName: string): Promi
   await runGit(repoRoot, ["switch", "--", branchName]);
 }
 
-async function previewAdoption(repoRoot: string, adoption: WorkflowVariantAdoption): Promise<void> {
-  const previewHead = await currentHead(repoRoot);
-  await assertCleanWorktree(repoRoot, "target worktree");
-  let previewFailed = false;
+async function prepareAdoptionCandidate(
+  repoRoot: string,
+  adoption: WorkflowVariantAdoption,
+): Promise<string> {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "skyturn-adoption-candidate-"));
+  const candidatePath = join(temporaryRoot, "worktree");
+  let added = false;
   try {
-    if (adoption.strategy === "merge") {
-      await runGit(repoRoot, ["merge", "--no-commit", "--no-ff", adoption.headCommit]);
-      return;
-    }
-    await runGit(repoRoot, ["cherry-pick", "--no-commit", adoption.headCommit]);
-  } catch (error) {
-    previewFailed = true;
-    throw error;
+    await chmod(temporaryRoot, 0o700);
+    await runGit(repoRoot, ["worktree", "add", "--detach", candidatePath, adoption.baseCommit]);
+    added = true;
+    await applyAdoption(candidatePath, adoption);
+    return currentHead(candidatePath);
   } finally {
-    try {
-      await restoreAdoptionPreview(repoRoot, previewHead);
-    } catch (error) {
-      if (!previewFailed) throw error;
+    if (added) {
+      await abortAdoption(candidatePath);
+      await runGit(repoRoot, ["worktree", "remove", "--force", "--", candidatePath]);
     }
+    await rm(temporaryRoot, { recursive: true, force: true });
   }
 }
 
@@ -3184,11 +3185,6 @@ async function assertTargetHeadMatchesBase(repoRoot: string, adoption: WorkflowV
   if (targetHead !== adoption.baseCommit) {
     throw new AdoptionTargetBaseMismatchError(adoption.targetBranchName, adoption.baseCommit, targetHead);
   }
-}
-
-async function restoreAdoptionPreview(repoRoot: string, headCommit: string): Promise<void> {
-  await abortAdoption(repoRoot);
-  await runGit(repoRoot, ["reset", "--hard", headCommit]);
 }
 
 async function abortAdoption(repoRoot: string): Promise<void> {

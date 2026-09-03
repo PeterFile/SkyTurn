@@ -14,23 +14,44 @@ const persistenceRoot = join(root, "..", "..", "packages", "persistence");
 const { createWorkflowStore } = await import(pathToFileURL(join(persistenceRoot, "dist", "workflowStore.js")).href);
 const Database = createRequire(join(persistenceRoot, "package.json"))("better-sqlite3");
 
-test("variant runtime persists compare evidence and adopts only from both live heads", async () => {
+test("variant runtime returns the persisted reconciled receipt and adopts the advanced head", async () => {
   const runtime = await loadRuntime();
-  const harness = runtimeHarness();
+  const durableEvents = createdEvents();
+  durableEvents[0].payload.worktree.headCommit = "a".repeat(40);
+  const harness = runtimeHarness({ events: durableEvents });
   const input = comparisonInput();
 
   const compared = await runtime.compareWorkflowWorktrees(harness.dependencies, "/project", input);
   const recorded = harness.events.find((event) => event.kind === "workflow.variant.comparison_recorded");
   assert.equal(compared.comparison.comparisonId, "comparison-left-right");
   assert.ok(recorded);
+  assert.deepEqual(compared.recording, recorded.payload.recording);
+  assert.equal(compared.recording.left.baseCommit, "a".repeat(40));
+  assert.equal(compared.recording.left.headCommit, "b".repeat(40));
+  assert.doesNotMatch(JSON.stringify(compared), /\/project|\.worktrees|realPath|gitdir|repoRoot/);
   assert.equal(recorded.payload.recording.left.headCommit, "b".repeat(40));
   assert.equal(recorded.payload.recording.right.headCommit, "c".repeat(40));
   assert.doesNotMatch(JSON.stringify(recorded), /\/project|\.worktrees|prompt|handle/);
 
+  const adoptedSide = compared.recording.left;
+  const adoptionRequest = {
+    sessionId: "session-1",
+    comparisonId: compared.comparison.comparisonId,
+    adoption: {
+      adoptionId: `adopt-${adoptedSide.worktreeId}-${adoptedSide.headCommit}-comparison-left-right`,
+      variantId: adoptedSide.variantId,
+      worktreeId: adoptedSide.worktreeId,
+      strategy: "merge",
+      status: "requested",
+      baseCommit: adoptedSide.baseCommit,
+      headCommit: adoptedSide.headCommit,
+      targetBranchName: "main",
+    },
+  };
   const adopted = await runtime.adoptWorkflowWorktree(
     harness.dependencies,
     "/project",
-    adoptionInput(compared.comparison.comparisonId),
+    adoptionRequest,
   );
   assert.equal(adopted.status, "adopted");
   assert.equal(harness.adoptCalls.length, 1);
@@ -41,12 +62,7 @@ test("variant runtime persists compare evidence and adopts only from both live h
     { worktreeId: "worktree-left", headCommit: "b".repeat(40) },
     { worktreeId: "worktree-right", headCommit: "c".repeat(40) },
   ]);
-  assert.deepEqual(harness.adoptCalls[0], {
-    ...adoptionInput(compared.comparison.comparisonId).adoption,
-    baseCommit: "a".repeat(40),
-    headCommit: "b".repeat(40),
-    targetBranchName: "main",
-  });
+  assert.deepEqual(harness.adoptCalls[0], adoptionRequest.adoption);
 });
 
 test("comparison append failure blocks a successful compare response", async () => {

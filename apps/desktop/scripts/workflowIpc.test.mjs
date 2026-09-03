@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path, { dirname, join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import vm from "node:vm";
 
@@ -2192,10 +2192,16 @@ test("workflow compareWorktrees uses IDs only and resolves durable session ident
 
   assert.match(compareContract, /input:\s*WorktreeComparisonRequest/);
   assert.match(compareContract, /comparison:\s*VariantComparisonEvidence/);
+  assert.match(compareContract, /recording:\s*WorkflowVariantComparisonRecordedEvidence/);
   assert.doesNotMatch(compareContract, /comparison:\s*unknown/);
   assert.match(compareHandler, /compareWorkflowWorktrees/);
   assert.match(preload, /parseWorktreeComparisonRequest\(input\)/);
   assert.match(preload, /parseVariantComparisonEvidence/);
+  assert.match(preload, /parseWorkflowVariantComparisonRecordedEvidence/);
+  assert.match(preload, /const recording = parseWorkflowVariantComparisonRecordedEvidence\(result\.recording\)/);
+  assert.match(preload, /recording\.sessionId !== request\.sessionId/);
+  assert.match(preload, /JSON\.stringify\(recording\.comparison\) !== JSON\.stringify\(comparison\)/);
+  assert.doesNotMatch(compareContract.slice(compareContract.indexOf("Promise<")), /projectRoot|realPath|gitdir|repoRoot/);
 
   const renderer = await readFile(join(root, "..", "..", "packages", "ui-canvas", "src", "App.tsx"), "utf8");
   const handleCompare = renderer.slice(renderer.indexOf("const handleCompare"), renderer.indexOf("const handleAdopt"));
@@ -2249,6 +2255,9 @@ test("workflow compare runtime persists a valid comparison and rejects malformed
 
   const result = await runtime.compareWorkflowWorktrees(harness.dependencies, "/project", input);
   assert.equal(result.comparison.comparisonId, "comparison-left-right");
+  assert.equal(result.recording.left.headCommit, "b".repeat(40));
+  assert.equal(result.recording.right.headCommit, "c".repeat(40));
+  assert.doesNotMatch(JSON.stringify(result), /\/project|\.worktrees|realPath|gitdir|repoRoot/);
   assert.equal(harness.compareCalls.length, 1);
   assert.equal(harness.serviceOptions.length, 1);
   assert.equal(harness.serviceOptions[0], undefined);
@@ -3665,6 +3674,66 @@ test("mocked preload rejects invalid workflow responses and drops invalid broadc
   unsubscribe();
 });
 
+test("mocked preload strictly validates the public worktree comparison receipt", async () => {
+  const contracts = await loadWorkflowIpcContracts();
+  const modules = {
+    gitWorktree: await import(pathToFileURL(join(root, "..", "..", "packages", "git-worktree", "dist", "index.js")).href),
+    projectCore: await import(pathToFileURL(join(root, "..", "..", "packages", "project-core", "dist", "index.js")).href),
+  };
+  const runtime = await loadPreloadRuntime(contracts, modules);
+  const recording = strictComparisonRecording();
+  const exactResponse = { protocolVersion: 1, comparison: recording.comparison, recording };
+  runtime.setInvoke(async () => exactResponse);
+
+  assert.deepEqual(
+    toPlain(await runtime.api.workflow.compareWorktrees("/opened/project-alias", {
+      sessionId: "session-1",
+      leftWorktreeId: "worktree-left",
+      rightWorktreeId: "worktree-right",
+    })),
+    exactResponse,
+  );
+
+  for (const invalid of [
+    { ...exactResponse, projectRoot: "/secret/project" },
+    { ...exactResponse, recording: { ...recording, sessionId: "session-other" } },
+    { ...exactResponse, recording: { ...recording, left: { ...recording.left, realPath: "/secret/worktree" } } },
+    { ...exactResponse, comparison: { ...recording.comparison, comparisonId: "comparison-conflict" } },
+  ]) {
+    runtime.setInvoke(async () => invalid);
+    await assert.rejects(
+      runtime.api.workflow.compareWorktrees("/opened/project-alias", {
+        sessionId: "session-1",
+        leftWorktreeId: "worktree-left",
+        rightWorktreeId: "worktree-right",
+      }),
+      (error) => {
+        assert.doesNotMatch(error.message, /secret|projectRoot|realPath/);
+        return true;
+      },
+    );
+  }
+
+  for (const mismatchedRecording of [
+    strictComparisonRecording("worktree-other", "worktree-right"),
+    strictComparisonRecording("worktree-left", "worktree-other"),
+    strictComparisonRecording("worktree-right", "worktree-left"),
+  ]) {
+    runtime.setInvoke(async () => comparisonResponse(mismatchedRecording));
+    await assert.rejects(
+      runtime.api.workflow.compareWorktrees("/opened/project-alias", {
+        sessionId: "session-1",
+        leftWorktreeId: "worktree-left",
+        rightWorktreeId: "worktree-right",
+      }),
+      (error) => {
+        assert.equal(error.message, modules.gitWorktree.INVALID_VARIANT_COMPARISON_EVIDENCE_ERROR);
+        return true;
+      },
+    );
+  }
+});
+
 test("workflow IPC contract errors are recognizable and block decision nodes", async () => {
   const contracts = await loadWorkflowIpcContracts();
 
@@ -3891,7 +3960,7 @@ async function loadMainWorkflowTransportRuntime({
   return module.exports;
 }
 
-async function loadPreloadRuntime(contracts) {
+async function loadPreloadRuntime(contracts, modules = {}) {
   const source = await readFile(join(root, "electron", "preload.ts"), "utf8");
   const ts = require("typescript");
   const output = ts.transpileModule(source, {
@@ -3933,6 +4002,8 @@ async function loadPreloadRuntime(contracts) {
         };
       }
       if (specifier === "./workflowIpcContracts") return contracts;
+      if (specifier === "@skyturn/git-worktree" && modules.gitWorktree) return modules.gitWorktree;
+      if (specifier === "@skyturn/project-core" && modules.projectCore) return modules.projectCore;
       return require(specifier);
     },
   }, { filename: "preload.ts" });
@@ -4130,6 +4201,52 @@ function validComparisonEvidence() {
     comparisonId: "comparison-left-right",
     collectedAt: "2026-07-12T00:00:00.000Z",
     variants: [],
+  };
+}
+
+function comparisonResponse(recording) {
+  return { protocolVersion: 1, comparison: recording.comparison, recording };
+}
+
+function strictComparisonRecording(
+  leftWorktreeId = "worktree-left",
+  rightWorktreeId = "worktree-right",
+) {
+  const collectedAt = "2026-09-03T00:00:00.000Z";
+  const worktreeIds = { left: leftWorktreeId, right: rightWorktreeId };
+  const comparison = {
+    comparisonId: "comparison-left-right",
+    collectedAt,
+    variants: ["left", "right"].map((side) => ({
+      variantId: `variant-${side}`,
+      worktreeId: worktreeIds[side],
+      changeset: {
+        evidenceId: `evidence-${side}`,
+        changesetId: `changeset-${side}`,
+        source: "git",
+        status: "available",
+        files: [`src/${side}.ts`],
+        diffStat: { added: 1, changed: 0, deleted: 0 },
+        patchPreviewTruncated: false,
+        worktreeId: worktreeIds[side],
+        collectedAt,
+      },
+      metrics: [],
+    })),
+  };
+  const side = (name, head) => ({
+    laneId: `lane-${name}`,
+    variantId: `variant-${name}`,
+    worktreeId: worktreeIds[name],
+    branchName: `skyturn/session-1/${name}`,
+    baseCommit: "a".repeat(40),
+    headCommit: head.repeat(40),
+  });
+  return {
+    sessionId: "session-1",
+    comparison,
+    left: side("left", "b"),
+    right: side("right", "c"),
   };
 }
 

@@ -703,6 +703,63 @@ describe("node git worktree service", () => {
     expect(events.map((event) => event.kind)).not.toContain("workflow.variant.adopted");
   });
 
+  it.each(["cherry-pick", "merge"] as const)(
+    "atomically rejects %s adoption when the target branch advances before publication",
+    async (strategy) => {
+      const repo = await createTestRepo(`skyturn-worktree-target-cas-${strategy}-`);
+      tempRoots.push(repo.tempRoot);
+      const events: ManagedWorktreeWorkflowEvent[] = [];
+      const service = createNodeGitWorktreeService({
+        eventSink: { append: async (event) => { events.push(event); } },
+        now: () => "2026-09-03T00:00:00.000Z",
+      });
+      const left = await service.createManagedWorktree({
+        sessionId: `session-target-cas-${strategy}`,
+        variantId: "left",
+        repoRoot: repo.repoRoot,
+        baseCommit: repo.baseCommit,
+        branchName: `skyturn/session-target-cas-${strategy}/left`,
+        parentLaneId: "lane-left",
+      });
+      const right = await service.createManagedWorktree({
+        sessionId: `session-target-cas-${strategy}`,
+        variantId: "right",
+        repoRoot: repo.repoRoot,
+        baseCommit: repo.baseCommit,
+        branchName: `skyturn/session-target-cas-${strategy}/right`,
+        parentLaneId: "lane-right",
+      });
+      const leftHead = commitVariant(left.realPath, "target-cas-left");
+      const competingCommit = commitVariant(right.realPath, "target-cas-competing");
+      const comparedLeft = await service.reconcileManagedWorktree(left, { expectedHeadCommit: leftHead });
+      const comparedRight = await service.reconcileManagedWorktree(right, { expectedHeadCommit: competingCommit });
+      git(repo.repoRoot, ["checkout", "-b", `scratch-${strategy}`]);
+      const wrapper = await installCandidateCasWrapper(
+        repo.repoRoot,
+        "refs/heads/main",
+        repo.baseCommit,
+        competingCommit,
+      );
+
+      const result = await withFakeGit(wrapper.binDir, () => service.adoptVariant({
+        adoptionId: `adopt-target-cas-${strategy}`,
+        variantId: comparedLeft.variantId,
+        worktreeId: comparedLeft.worktreeId,
+        strategy,
+        status: "requested",
+        baseCommit: comparedLeft.baseCommit,
+        headCommit: comparedLeft.headCommit,
+        targetBranchName: "main",
+      }, {
+        requiredFreshWorktrees: [comparedLeft, comparedRight],
+      }));
+
+      expect(result).toMatchObject({ status: "failed" });
+      expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(competingCommit);
+      expect(events.map((event) => event.kind)).not.toContain("workflow.variant.adopted");
+    },
+  );
+
   it("blocks rollback reset when the managed worktree has dirty or untracked files", async () => {
     const { repo, worktree, headCommit } = await createRollbackWorktreeFixture(tempRoots);
     writeFileSync(join(worktree.realPath, "untracked.txt"), "dirty\n");
