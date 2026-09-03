@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -9,6 +10,9 @@ import vm from "node:vm";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
 const projectCore = await import(pathToFileURL(join(root, "..", "..", "packages", "project-core", "dist", "index.js")).href);
+const persistenceRoot = join(root, "..", "..", "packages", "persistence");
+const { createWorkflowStore } = await import(pathToFileURL(join(persistenceRoot, "dist", "workflowStore.js")).href);
+const Database = createRequire(join(persistenceRoot, "package.json"))("better-sqlite3");
 
 test("variant runtime persists compare evidence and adopts only from both live heads", async () => {
   const runtime = await loadRuntime();
@@ -57,34 +61,119 @@ test("comparison append failure blocks a successful compare response", async () 
   assert.equal(harness.events.some((event) => event.kind === "workflow.variant.comparison_recorded"), false);
 });
 
-test("failed comparison evidence sanitizes every persisted metric detail", async () => {
+test("failed comparison evidence sanitizes every metric in the raw SQLite payload", async () => {
   const runtime = await loadRuntime();
-  const sensitive = "/private/project/secret-worktree";
-  const comparison = comparisonEvidence();
-  comparison.variants[0] = {
-    ...comparison.variants[0],
-    changeset: {
-      ...comparison.variants[0].changeset,
-      status: "failed",
-      files: [],
-      diffStat: { added: 0, changed: 0, deleted: 0 },
-      errorReason: sensitive,
-    },
-    metrics: [
-      { kind: "changed-file-count", label: "Changed files", status: "unknown", source: "recorded", detail: sensitive },
-      { kind: "diff-summary", label: "Diff summary", status: "unknown", source: "recorded", detail: sensitive },
-    ],
-  };
-  const harness = runtimeHarness({ comparisonEvidence: comparison });
+  const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-variant-runtime-"));
+  const sensitivePath = join(projectRoot, "secret-worktree", "credential.txt");
+  const sensitiveFragment = "TOKEN_super-sensitive-fragment_42";
+  const sensitive = `${sensitivePath}?api_key=${sensitiveFragment}`;
+  const safeText = "Git changeset collection failed.";
+  let store = createWorkflowStore({ projectRoot });
+  try {
+    store.createWorkflowSession({
+      id: "session-1",
+      projectId: "project-1",
+      title: "Variant comparison persistence regression",
+      goal: "Persist only safe failed comparison evidence.",
+      mode: "fast",
+      target: { executionTarget: "new_worktree", selectedBranch: "main", baseRef: "main" },
+      plannerProfile: "default",
+      transport: "hermes_replay_recovery",
+      recoveryReason: "The regression fixture seeds deterministic workflow state.",
+      now: "2026-08-26T00:00:00.000Z",
+    });
+    for (const event of createdEvents("session-1", projectRoot)) {
+      store.appendWorkflowEvent({
+        sessionId: event.sessionId,
+        kind: event.kind,
+        source: event.source,
+        idempotencyKey: event.idempotencyKey,
+        payload: event.payload,
+        now: event.createdAt,
+      });
+    }
 
-  await runtime.compareWorkflowWorktrees(harness.dependencies, "/project", comparisonInput());
-  const recorded = harness.events.find((event) => event.kind === "workflow.variant.comparison_recorded");
-  assert.ok(recorded);
-  assert.doesNotMatch(JSON.stringify(recorded), /private|secret-worktree/);
-  assert.deepEqual(
-    recorded.payload.recording.comparison.variants[0].metrics.map((metric) => metric.detail),
-    ["Git changeset collection failed.", "Git changeset collection failed."],
-  );
+    const comparison = comparisonEvidence();
+    comparison.variants[0] = {
+      ...comparison.variants[0],
+      changeset: {
+        ...comparison.variants[0].changeset,
+        status: "failed",
+        files: [],
+        diffStat: { added: 0, changed: 0, deleted: 0 },
+        artifactPaths: ["artifacts/safe-changeset.json"],
+        errorReason: sensitive,
+      },
+      metrics: [
+        {
+          kind: "changed-file-count",
+          label: `Changed files from ${sensitive}`,
+          status: "unknown",
+          source: "recorded",
+          value: `unreadable ${sensitive}`,
+          detail: `collector failed at ${sensitive}`,
+          artifactPaths: ["artifacts/safe-count.json"],
+        },
+        {
+          kind: "diff-summary",
+          label: `Diff summary for ${sensitive}`,
+          status: "unknown",
+          source: "recorded",
+          value: 7,
+          detail: `summary failed at ${sensitive}`,
+          artifactPaths: ["artifacts/safe-summary.json"],
+        },
+      ],
+    };
+    const harness = runtimeHarness({ comparisonEvidence: comparison, projectRoot });
+    harness.dependencies.getWorkflowStore = async () => store;
+
+    await runtime.compareWorkflowWorktrees(harness.dependencies, projectRoot, comparisonInput());
+    store.close();
+    store = null;
+
+    const database = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"), {
+      readonly: true,
+      fileMustExist: true,
+    });
+    let rawPayload;
+    try {
+      const row = database.prepare([
+        "SELECT payload_json FROM workflow_events",
+        "WHERE session_id = ? AND kind = ?",
+      ].join(" ")).get("session-1", "workflow.variant.comparison_recorded");
+      assert.ok(row);
+      rawPayload = row.payload_json;
+    } finally {
+      database.close();
+    }
+
+    assert.equal(rawPayload.includes(sensitivePath), false);
+    assert.equal(rawPayload.includes(sensitiveFragment), false);
+    const persisted = JSON.parse(rawPayload).recording.comparison.variants[0];
+    assert.equal(persisted.changeset.errorReason, safeText);
+    assert.deepEqual(persisted.changeset.artifactPaths, ["artifacts/safe-changeset.json"]);
+    assert.deepEqual(
+      persisted.metrics.map(({ label, value, detail, artifactPaths }) => ({ label, value, detail, artifactPaths })),
+      [
+        {
+          label: safeText,
+          value: safeText,
+          detail: safeText,
+          artifactPaths: ["artifacts/safe-count.json"],
+        },
+        {
+          label: safeText,
+          value: 7,
+          detail: safeText,
+          artifactPaths: ["artifacts/safe-summary.json"],
+        },
+      ],
+    );
+  } finally {
+    store?.close();
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });
 
 test("adoption rejects missing, wrong, cross-session, and malformed comparisons before service mutation", async () => {
@@ -220,10 +309,11 @@ async function loadRuntime() {
 }
 
 function runtimeHarness(options = {}) {
-  const events = options.events ? structuredClone(options.events) : createdEvents();
+  const projectRoot = options.projectRoot ?? "/project";
+  const events = options.events ? structuredClone(options.events) : createdEvents("session-1", projectRoot);
   const currentById = new Map([
-    ["worktree-left", identity("left")],
-    ["worktree-right", identity("right")],
+    ["worktree-left", identity("left", projectRoot)],
+    ["worktree-right", identity("right", projectRoot)],
   ]);
   const compareCalls = [];
   const adoptCalls = [];
@@ -345,15 +435,15 @@ function adoptionInput(comparisonId = undefined) {
   };
 }
 
-function identity(side) {
+function identity(side, projectRoot = "/project") {
   const headCommit = side === "left" ? "b".repeat(40) : "c".repeat(40);
   return {
     worktreeId: `worktree-${side}`,
     variantId: `variant-${side}`,
-    path: `/project.worktrees/worktree-${side}`,
-    realPath: `/project.worktrees/worktree-${side}`,
-    gitdir: `/project/.git/worktrees/worktree-${side}`,
-    repoRoot: "/project",
+    path: `${projectRoot}.worktrees/worktree-${side}`,
+    realPath: `${projectRoot}.worktrees/worktree-${side}`,
+    gitdir: `${projectRoot}/.git/worktrees/worktree-${side}`,
+    repoRoot: projectRoot,
     branchName: `skyturn/session-1/variant-${side}`,
     baseCommit: "a".repeat(40),
     headCommit,
@@ -361,14 +451,14 @@ function identity(side) {
   };
 }
 
-function createdEvents(sessionId = "session-1") {
+function createdEvents(sessionId = "session-1", projectRoot = "/project") {
   return ["left", "right"].map((side, index) => ({
     id: `created-${side}`,
     seq: index + 1,
     sessionId,
     kind: "workflow.worktree.created",
     source: "git-worktree",
-    payload: { worktree: identity(side) },
+    payload: { worktree: identity(side, projectRoot) },
     idempotencyKey: `worktree:worktree-${side}:created`,
     createdAt: "2026-08-26T00:00:00.000Z",
   }));

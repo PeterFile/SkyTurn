@@ -270,6 +270,8 @@ function sanitizeComparisonEvidence(comparison: VariantComparisonEvidence): Vari
         },
         metrics: variant.metrics.map((metric) => ({
           ...metric,
+          label: "Git changeset collection failed.",
+          ...(typeof metric.value === "string" ? { value: "Git changeset collection failed." } : {}),
           detail: "Git changeset collection failed.",
         })),
       };
