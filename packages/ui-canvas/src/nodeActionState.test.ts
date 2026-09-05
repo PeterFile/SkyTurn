@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CanvasNode } from "@skyturn/project-core";
 import {
+  compilePauseWorkflowScheduling,
   compileInsertClarificationBefore,
   reduceWorkflowEvents,
   type FlowEvent,
@@ -574,6 +575,28 @@ describe("hydrateSelectedNodeActionStateFromEvents", () => {
       laneId: "lane-implementation",
       checkpointId: "checkpoint-before-implementation",
     });
+  });
+
+  it("accepts durable scheduling control events when hydrating node actions", () => {
+    const beforePause = workflowEvents(
+      checkpoint("checkpoint-before-implementation", "lane-implementation", "before", "base-sha"),
+    );
+    const pause = compilePauseWorkflowScheduling(reduceWorkflowEvents(beforePause), {
+      sessionId,
+      requestId: "pause-node-actions",
+      expectedStatus: "active",
+      expectedRevision: 0,
+    }, "2026-06-23T00:00:00.000Z");
+    const state = hydrateSelectedNodeActionStateFromEvents({
+      sessionId,
+      selectedNode,
+      events: [...beforePause, pause.event],
+      composerMode: "variant-from-before-checkpoint",
+    });
+
+    expect(state.composerMode).toBe("variant-from-before-checkpoint");
+    expect(state.canCreateVariant).toBe(true);
+    expect(state.blockedReasons).not.toContain("Workflow events are stale or malformed.");
   });
 
   it.each([

@@ -126,6 +126,16 @@ Hermes 提示词已经能读取 workflow ledger summary。账本摘要是短摘�
 - `workflow:recordRunResult`：agent 运行结束后，Electron main 把运行事件和证据写回工作流事件流，再广播投影。
 - `workflow:projection`：刷新 UI 或切换会话时，渲染进程只从 Electron main 读取投影。
 
+Flow Kernel 和 SQLite WorkflowEventStore 支持会话级调度暂停。`workflow.scheduling.paused` 与
+`workflow.scheduling.resumed` 以 `requestId`、`expectedStatus` 和 `expectedRevision` 做事务性比较交换；旧事件流默认
+`active@0`，恢复必须由独立显式请求完成。暂停时，纯 scheduler、SQLite preview 和持久化 schedule 都不产生新
+segment，loop `nextAction` 明确返回带 `schedulingState.status = paused` 的 `blocked`，不能继续给出执行、交付或回滚动作。
+
+暂停只约束未来调度，不是取消或回滚。暂停前已经持久化的 segment 保留其运行状态、run ownership、输出和
+`RunEvidence`，终态仍可正常对账，但下游 lane 在显式恢复前不会释放。若 segment 已持久化而 adapter 尚未启动，
+本层不会因暂停而启动、删除或重放它；现有恢复路径仍按失败且不重启策略处理。Electron 后续集成必须在串行化的
+adapter launch 边界调用该控制 API；当前纯内核和 Node 存储实现本身不声称能停止已经发生的 CLI 启动竞争。
+
 `buildHermesWorkflowPrompt` 增加 `sessionLedger` 输入。账本摘要包含：
 
 ```ts

@@ -82,6 +82,8 @@ const knownFlowEventKinds = new Set<string>([
   "workflow.profile",
   "workflow.intent.accepted",
   "workflow.intent.rejected",
+  "workflow.scheduling.paused",
+  "workflow.scheduling.resumed",
   "workflow.lane.declared",
   "workflow.lane.inserted_before",
   "workflow.lane.candidate_bound",
