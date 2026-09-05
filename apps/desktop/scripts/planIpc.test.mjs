@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import vm from "node:vm";
 
+import { createSourceModuleLoader } from "./sourceModuleLoader.mjs";
+
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -7492,13 +7494,10 @@ async function loadMainModule(windows, options = {}) {
       return { id: input.runId, status: "running" };
     }),
   };
-  const source = `${await readFile(join(root, "electron", "main.ts"), "utf8")}
-export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getAgentBridge, getWorkflowStore, isWorkflowAdvanceAdmissionOpen, observeWorkflowTerminalReconciliation, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, registerWorkflowTerminalReconciliation, workflowStoreOperationTasks, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowProjectAdvanceTails, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workflowTerminalReconciliationTasks, workspaceSaveWriter };`;
   const ts = require("typescript");
-  const output = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
-  }).outputText;
-  const module = { exports: {} };
+  const mainSourcePath = join(root, "electron", "main.ts");
+  const mainSourceSuffix = `
+export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, createBeforeQuitHandler, createMainWindow, getAgentBridge, getWorkflowStore, isWorkflowAdvanceAdmissionOpen, observeWorkflowTerminalReconciliation, openedProjectRoots, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, registerWorkflowTerminalReconciliation, workflowStoreOperationTasks, workflowPlannerProjectIdentity, workflowPlannerTurnRunId, workflowProjectAdvanceTails, workflowSessionAdvanceFlights, workflowSessionMutationLocks, workflowStoreIdentity, workflowStoreInitializations, workflowStores, workflowTerminalReconciliationTasks, workspaceSaveWriter };`;
   const appListeners = new Map();
   const ipcHandlers = new Map();
   const appState = { quitCalls: 0, whenReadyCalls: 0 };
@@ -7571,19 +7570,7 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
           ? { assertExpectedArtifactVerifierCapability: options.assertExpectedArtifactVerifierCapability }
           : {}),
       };
-  const genericModule = new Proxy({}, {
-    get: (_target, property) => {
-      if (property === "createTerminalRuntime") return () => terminalRuntime;
-      if (property === "createPlanProjectIdentityRegistry") {
-        return () => options.projectIdentityRegistry ?? {
-          canonicalize: async (value) => value,
-          remember: async (value) => value,
-        };
-      }
-      if (property === "DEVFLOW_DIRECTORIES" || property === "DEVFLOW_FILES") return [];
-      return () => undefined;
-    },
-  });
+  const explicitNoOpModule = new Proxy({}, { get: () => () => undefined });
   const electron = {
     app: {
       getPath: () => options.userDataPath ?? "/tmp",
@@ -7622,41 +7609,49 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
     ipcMain: { handle: (channel, handler) => ipcHandlers.set(channel, handler) },
     shell: {},
   };
-  vm.runInNewContext(
-    output,
-    {
-      module,
-      exports: module.exports,
-      require: (specifier) => {
-        if (specifier === "electron") return electron;
-        if (specifier === "node:fs/promises" && options.fsPromises) return options.fsPromises;
-        if (specifier.startsWith("node:")) return require(specifier);
-        if (specifier === "./planIpcContracts") return contracts;
-        if (specifier === "./workflowIpcContracts") return workflowContracts;
-        if (specifier === "./workflowCheckpointRuntime") return workflowCheckpointRuntime;
-        if (specifier === "./runStartHandler") return runStartHandler;
-        if (specifier === "./browserScreenshotHostCapture") {
-          return {
-            ...browserScreenshotHostCapture,
-            createBrowserScreenshotHostProducer: () => options.hostCaptureProducer ?? (async () => undefined),
-          };
-        }
-        if (specifier === "./workflowCommitCompletion") return workflowCommitCompletion;
-        if (specifier === "./workflowRunRecovery" && options.workflowRunRecoveryModule) {
-          return options.workflowRunRecoveryModule;
-        }
-        if (specifier === "./planRuntime" && options.createPlanRuntime) {
-          return { createPlanRuntime: options.createPlanRuntime };
-        }
-        if (specifier === "@skyturn/persistence") return persistence;
-        if (specifier === "@skyturn/persistence/workflow-store") return selectedWorkflowStore;
-        if (specifier === "@skyturn/project-core") return projectCore;
-        if (specifier === "@skyturn/git-worktree/node" && options.useRealGitWorktree) return gitWorktreeNode;
-        if (specifier === "@skyturn/orchestrator") return orchestrator;
-        if (specifier === "@skyturn/ui-canvas/workflow-runtime") return uiCanvasWorkflowRuntime;
-        if (specifier === "@skyturn/agent-bridge") return agentBridgeModule;
-        return genericModule;
+  const electronSource = (name) => join(root, "electron", `${name}.ts`);
+  const mocks = new Map([
+    ["electron", electron],
+    ["@skyturn/project-memory", {
+      DEVFLOW_DIRECTORIES: [],
+      DEVFLOW_FILES: [],
+      defaultDevflowFileContent: () => undefined,
+    }],
+    ["@skyturn/persistence", persistence],
+    ["@skyturn/persistence/workflow-store", selectedWorkflowStore],
+    ["@skyturn/project-core", projectCore],
+    ["@skyturn/git-worktree/node", options.useRealGitWorktree ? gitWorktreeNode : explicitNoOpModule],
+    ["@skyturn/orchestrator", orchestrator],
+    ["@skyturn/ui-canvas/workflow-runtime", uiCanvasWorkflowRuntime],
+    ["@skyturn/agent-bridge", agentBridgeModule],
+    [electronSource("planIpcContracts"), contracts],
+    [electronSource("workflowIpcContracts"), workflowContracts],
+    [electronSource("workflowCheckpointRuntime"), workflowCheckpointRuntime],
+    [electronSource("runStartHandler"), runStartHandler],
+    [electronSource("browserScreenshotHostCapture"), {
+      ...browserScreenshotHostCapture,
+      createBrowserScreenshotHostProducer: () => options.hostCaptureProducer ?? (async () => undefined),
+    }],
+    [electronSource("workflowCommitCompletion"), workflowCommitCompletion],
+    [electronSource("workflowRunRecovery"), options.workflowRunRecoveryModule ?? explicitNoOpModule],
+    [electronSource("planRuntime"), options.createPlanRuntime
+      ? { createPlanRuntime: options.createPlanRuntime }
+      : explicitNoOpModule],
+    [electronSource("planProjectIdentity"), {
+      createPlanProjectIdentityRegistry: () => options.projectIdentityRegistry ?? {
+        canonicalize: async (value) => value,
+        remember: async (value) => value,
       },
+    }],
+    [electronSource("terminalRuntime"), { createTerminalRuntime: () => terminalRuntime }],
+    [electronSource("terminalIpcContracts"), explicitNoOpModule],
+    [electronSource("worktreeComparisonRuntime"), explicitNoOpModule],
+  ]);
+  if (options.fsPromises) mocks.set("node:fs/promises", options.fsPromises);
+  const loader = createSourceModuleLoader({
+    typescript: ts,
+    mocks,
+    globals: {
       process: vmProcess,
       console: options.console ?? console,
       Buffer,
@@ -7665,12 +7660,10 @@ export { advanceWorkflowSession, broadcastPlanEvent, closeWorkflowStores, create
       setTimeout,
       clearTimeout,
       setImmediate,
-      __dirname: join(root, "electron"),
-      __filename: join(root, "electron", "main.ts"),
     },
-    { filename: "main.ts" },
-  );
-  return { appListeners, appState, exports: module.exports, ipcHandlers };
+  });
+  const mainExports = loader.load(mainSourcePath, { sourceSuffix: mainSourceSuffix });
+  return { appListeners, appState, exports: mainExports, ipcHandlers };
 }
 
 async function loadWorkflowContracts() {
