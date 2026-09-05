@@ -100,10 +100,17 @@ Completion evidence should include at least one concrete source:
 
 ## Editor Adapters
 
-Required editor launch targets:
+`@skyturn/git-worktree/node` exports the real Node-only `NodeEditorAdapter`. The browser-safe package root continues to expose only the `EditorAdapter` contract.
 
-- VSCode
-- Cursor
-- Zed
+```ts
+import { NodeEditorAdapter } from "@skyturn/git-worktree/node";
 
-The UI exposes buttons and adapter calls. Electron main owns external launches; renderer code must not launch editors directly.
+const editors = new NodeEditorAdapter();
+const result = await editors.openWorktree("vscode", authorizedWorktreePath);
+```
+
+The adapter supports only `vscode`, `cursor`, and `zed` on macOS. It invokes the fixed trusted `/usr/bin/open` executable with the fixed application name and the canonical worktree path as separate argv values; it never uses a shell or falls back to another editor. Other editor kinds and platforms return an explicit unsupported result. Missing applications or launchers, nonzero exits, signals, timeouts, and oversized launcher output return `ok: false`; launcher failures advise checking system open, while nonzero app requests advise checking the named application in Applications before retrying. `ok: true` means the launcher completed successfully and accepted the request, not that the GUI was observed opening.
+
+The caller must resolve the registered project/worktree authoritatively in the backend and pass an authorized absolute local directory. Renderer-provided URIs, paths, or commands are not trusted launch targets. The adapter rejects relative, URI, NUL-containing, missing, and non-directory targets, resolves symlinks with `realpath`, and passes the exact canonical path as one argv element without trimming, rewriting, or shell quoting. Constructor injection exists only for trusted backend tests and must never become a renderer command API.
+
+Desktop main IPC remains mocked pending a later integration PR; this backend capability alone does not make the editor buttons feature-complete.
