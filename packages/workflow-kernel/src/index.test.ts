@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  compilePauseWorkflowScheduling,
+  compileResumeWorkflowScheduling,
   compileInsertClarificationBefore,
   compileWorkflowIntent,
   createDefaultFlowPolicy,
@@ -30,6 +32,100 @@ const stableFlowLaneStatusContract: Record<FlowLaneStatus, true> = {
   failed: true,
   blocked: true,
 };
+
+describe("Flow Kernel scheduling control", () => {
+  it("keeps terminal evidence authoritative while paused and releases downstream work only after resume", () => {
+    const running = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: lane("lane-implementation", "implementation") }),
+      event("workflow.lane.declared", { lane: lane("lane-validation", "validation") }),
+      event("workflow.edge.declared", {
+        edge: { id: "edge-implementation-validation", sourceLaneId: "lane-implementation", targetLaneId: "lane-validation" },
+      }),
+      event("workflow.segment.started", {
+        segment: { id: "segment-implementation", laneId: "lane-implementation", runId: "run-implementation", status: "running" },
+      }),
+    ]);
+    expect(running.schedulingState).toEqual({ status: "active", revision: 0, requestId: null, changedAt: null });
+
+    const pause = compilePauseWorkflowScheduling(running, {
+      sessionId: "session-1",
+      requestId: "pause-1",
+      expectedStatus: "active",
+      expectedRevision: 0,
+    }, now);
+    const paused = reduceWorkflowEvents([...running.events, pause.event]);
+    expect(paused.schedulingState).toEqual({ status: "paused", revision: 1, requestId: "pause-1", changedAt: now });
+    expect(paused.lanes.find((item) => item.id === "lane-implementation")?.status).toBe("running");
+    expect(paused.segments).toEqual(running.segments);
+    expect(scheduleReadyLanes(paused, { allowedParallelism: 2 })).toEqual([]);
+    expect(projectLoopEngineeringState(paused).nextAction).toMatchObject({
+      kind: "blocked", schedulingState: { status: "paused", revision: 1 },
+    });
+
+    const runEvidence = terminalEvidence("run-implementation", "succeeded", 0, [
+      { kind: "run-exit", name: "Focused tests", status: "passed" },
+    ], []);
+    const terminal = reduceWorkflowEvents([
+      ...paused.events,
+      event("workflow.evidence.recorded", {
+        laneId: "lane-implementation",
+        segmentId: "segment-implementation",
+        evidence: {
+          id: "evidence-implementation",
+          kind: "run-exit",
+          status: "passed",
+          checks: [],
+          artifacts: [],
+          runEvidence,
+        },
+      }),
+      event("workflow.segment.finished", {
+        laneId: "lane-implementation",
+        segmentId: "segment-implementation",
+        status: "succeeded",
+        exitCode: 0,
+      }),
+    ]);
+    expect(terminal.schedulingState.status).toBe("paused");
+    expect(terminal.lanes.find((item) => item.id === "lane-implementation")?.status).toBe("completed");
+    expect(terminal.lanes.find((item) => item.id === "lane-validation")?.status).toBe("pending");
+    expect(terminal.evidence.at(-1)?.runEvidence).toEqual(runEvidence);
+    expect(terminal.segments.at(-1)?.status).toBe("succeeded");
+    expect(scheduleReadyLanes(terminal, { allowedParallelism: 2 })).toEqual([]);
+
+    const resume = compileResumeWorkflowScheduling(terminal, {
+      sessionId: "session-1",
+      requestId: "resume-1",
+      expectedStatus: "paused",
+      expectedRevision: 1,
+    }, now);
+    const resumed = reduceWorkflowEvents([...terminal.events, resume.event]);
+    expect(resumed.schedulingState).toEqual({ status: "active", revision: 2, requestId: "resume-1", changedAt: now });
+    expect(scheduleReadyLanes(resumed, { allowedParallelism: 2 }).map((item) => item.id)).toEqual(["lane-validation"]);
+  });
+
+  it("projects pause ahead of an otherwise merge-ready delivery action", () => {
+    const mergeReady = reduceWorkflowEvents([
+      event("workflow.lane.declared", { lane: { ...lane("lane-ci", "ci_check"), status: "running" } }),
+      event("workflow.pull_request.created", { laneId: "lane-ci", prNumber: 19, url: "https://example.test/pr/19", headSha: "sha-current" }),
+      event("workflow.pull_request.checks_recorded", {
+        laneId: "lane-ci", prNumber: 19, url: "https://example.test/pr/19/checks", headSha: "sha-current",
+        status: "passed", review: { status: "approved" }, checks: [{ name: "Build", status: "passed" }],
+      }),
+    ]);
+    expect(projectLoopEngineeringState(mergeReady).nextAction.kind).toBe("merge_pull_request");
+    const pause = compilePauseWorkflowScheduling(mergeReady, {
+      sessionId: "session-1", requestId: "pause-delivery", expectedStatus: "active", expectedRevision: 0,
+    }, now);
+    const paused = reduceWorkflowEvents([...mergeReady.events, pause.event]);
+
+    expect(projectLoopEngineeringState(paused)).toMatchObject({
+      schedulingState: { status: "paused", revision: 1 },
+      delivery: { phase: "merge_ready" },
+      nextAction: { kind: "blocked", schedulingState: { status: "paused", revision: 1 } },
+    });
+  });
+});
 
 describe("Flow Kernel intent compiler", () => {
   it("rejects current empty null-exit success through stale outer and segment success", () => {

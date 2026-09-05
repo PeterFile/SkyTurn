@@ -2826,6 +2826,15 @@ export interface WorkflowRollbackEligibility {
 }
 
 export type WorkflowEngineeringLoopKind = "execution" | "delivery" | "rollback" | "repair" | "variant";
+export type WorkflowSchedulingStatus = "active" | "paused";
+
+export interface WorkflowSchedulingState {
+  status: WorkflowSchedulingStatus;
+  revision: number;
+  requestId: string | null;
+  changedAt: string | null;
+}
+
 export type WorkflowDeliveryLoopPhase =
   | "not_started"
   | "pushed"
@@ -2887,6 +2896,7 @@ export interface WorkflowLoopBlockedReason {
 
 export interface WorkflowLoopNextAction {
   kind: WorkflowLoopNextActionKind;
+  schedulingState?: WorkflowSchedulingState;
   loop?: WorkflowEngineeringLoopKind;
   laneId?: string;
   reason: string;
@@ -2945,6 +2955,7 @@ export interface WorkflowLoopEngineeringProjectionInput {
 export interface WorkflowLoopEngineeringState {
   sessionId: string;
   throughSeq: number;
+  schedulingState: WorkflowSchedulingState;
   nextAction: WorkflowLoopNextAction;
   blockedReason?: WorkflowLoopBlockedReason;
   evidenceStale: boolean;
@@ -3239,6 +3250,7 @@ export interface CanvasSession extends SessionBase {
   kind: "canvas";
   hermesPlannerSessionId: string;
   plannerNodeId: string;
+  schedulingState?: WorkflowSchedulingState;
   nodes: CanvasNode[];
   edges: CanvasEdge[];
   activeNodeId: string | null;

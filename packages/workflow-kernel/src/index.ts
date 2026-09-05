@@ -33,6 +33,8 @@ import type {
   WorkflowProjectionNodeKind,
   WorkflowRollbackLoopState,
   WorkflowRuntimePolicy,
+  WorkflowSchedulingState,
+  WorkflowSchedulingStatus,
   WorkflowSideEffectKind,
   WorkflowSuccessorLoopState,
   WorkflowVariantAdoption,
@@ -64,6 +66,8 @@ export type {
   WorkflowLoopEngineeringProjectionInput,
   WorkflowLoopEngineeringState,
   WorkflowRuntimePolicy,
+  WorkflowSchedulingState,
+  WorkflowSchedulingStatus,
   WorkflowVariantAdoption,
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
@@ -265,6 +269,8 @@ export type FlowEventKind =
   | "workflow.profile"
   | "workflow.intent.accepted"
   | "workflow.intent.rejected"
+  | "workflow.scheduling.paused"
+  | "workflow.scheduling.resumed"
   | "workflow.lane.declared"
   | "workflow.lane.reassigned"
   | "workflow.edge.declared"
@@ -331,6 +337,7 @@ export interface InsertClarificationBeforeResult {
 
 export interface FlowProjection {
   sessionId: string;
+  schedulingState: WorkflowSchedulingState;
   events: FlowEvent[];
   lanes: FlowLane[];
   laneRollbackStatuses: Record<string, FlowLaneRollbackStatus>;
@@ -372,6 +379,25 @@ export interface GateResult {
 export interface ScheduleReadyLanesInput {
   allowedParallelism: number;
   runningScopes?: Array<{ fileScopes: string[]; packageScopes: string[] }>;
+}
+
+export interface WorkflowSchedulingControlRequest {
+  sessionId: string;
+  requestId: string;
+  expectedStatus: WorkflowSchedulingStatus;
+  expectedRevision: number;
+}
+
+export interface WorkflowSchedulingControlPayload {
+  requestId: string;
+  expectedStatus: WorkflowSchedulingStatus;
+  expectedRevision: number;
+  status: WorkflowSchedulingStatus;
+  revision: number;
+}
+
+export interface CompileWorkflowSchedulingControlResult {
+  event: FlowEvent;
 }
 
 export interface FlowKernelAcceptanceSummary {
@@ -858,7 +884,70 @@ export function compileInsertClarificationBefore(
   return { event, lane };
 }
 
+export function compilePauseWorkflowScheduling(
+  projection: FlowProjection,
+  request: WorkflowSchedulingControlRequest,
+  now: string,
+): CompileWorkflowSchedulingControlResult {
+  return compileWorkflowSchedulingControl(projection, request, "paused", now);
+}
+
+export function compileResumeWorkflowScheduling(
+  projection: FlowProjection,
+  request: WorkflowSchedulingControlRequest,
+  now: string,
+): CompileWorkflowSchedulingControlResult {
+  return compileWorkflowSchedulingControl(projection, request, "active", now);
+}
+
+function compileWorkflowSchedulingControl(
+  projection: FlowProjection,
+  request: WorkflowSchedulingControlRequest,
+  status: WorkflowSchedulingStatus,
+  now: string,
+): CompileWorkflowSchedulingControlResult {
+  const sessionId = requireSchedulingIdentifier(request.sessionId, "sessionId");
+  const requestId = requireSchedulingIdentifier(request.requestId, "requestId");
+  if (sessionId !== projection.sessionId) throw new Error("Workflow scheduling sessionId conflicts with its projection.");
+  const expectedStatus: WorkflowSchedulingStatus = status === "paused" ? "active" : "paused";
+  if (request.expectedStatus !== expectedStatus) throw new Error("Workflow scheduling expectedStatus is invalid.");
+  if (!Number.isSafeInteger(request.expectedRevision) || request.expectedRevision < 0 || request.expectedRevision >= Number.MAX_SAFE_INTEGER) {
+    throw new Error("Workflow scheduling expectedRevision is invalid.");
+  }
+  const idempotencyKey = `scheduling-control:${requestId}`;
+  const payload: WorkflowSchedulingControlPayload = {
+    requestId,
+    expectedStatus,
+    expectedRevision: request.expectedRevision,
+    status,
+    revision: request.expectedRevision + 1,
+  };
+  const existing = projection.events.find((event) => event.idempotencyKey === idempotencyKey);
+  if (existing) {
+    if (!matchesSchedulingControlEvent(existing, status, payload)) {
+      throw new Error("Workflow scheduling requestId conflicts with an existing transition.");
+    }
+    return { event: existing };
+  }
+  if (
+    projection.schedulingState.status !== expectedStatus ||
+    projection.schedulingState.revision !== request.expectedRevision
+  ) {
+    throw new Error("Workflow scheduling request is stale.");
+  }
+  return {
+    event: makeEvent(projection, {
+      kind: status === "paused" ? "workflow.scheduling.paused" : "workflow.scheduling.resumed",
+      source: "workflow-kernel",
+      payload: { ...payload },
+      now,
+      idempotencyKey,
+    }),
+  };
+}
+
 export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleReadyLanesInput): FlowLane[] {
+  if (projection.schedulingState.status === "paused") return [];
   const selected: FlowLane[] = [];
   const occupied = [...(input.runningScopes ?? [])];
   const completed = completedLaneIdsForScheduling(projection);
@@ -1058,6 +1147,7 @@ export function projectLoopEngineeringState(
   return {
     sessionId: projection.sessionId,
     throughSeq: projection.events.at(-1)?.seq ?? 0,
+    schedulingState: projection.schedulingState,
     nextAction,
     ...(blockedReason ? { blockedReason } : {}),
     evidenceStale: delivery.evidenceStale,
@@ -1074,6 +1164,13 @@ function projectNextLoopAction(
   rollback: WorkflowRollbackLoopState,
   input: WorkflowLoopEngineeringProjectionInput,
 ): WorkflowLoopNextAction {
+  if (projection.schedulingState.status === "paused") {
+    return {
+      kind: "blocked",
+      schedulingState: projection.schedulingState,
+      reason: "Workflow scheduling is explicitly paused.",
+    };
+  }
   if (rollback.phase === "blocked" && rollback.blockedReason) {
     return {
       kind: "blocked",
@@ -1579,6 +1676,9 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
   const declaredLaneStatuses = new Map<string, FlowLaneStatus>();
 
   for (const event of unique) {
+    if (event.kind === "workflow.scheduling.paused" || event.kind === "workflow.scheduling.resumed") {
+      projection.schedulingState = applyWorkflowSchedulingControl(projection.schedulingState, event);
+    }
     if (event.kind === "workflow.profile") {
       if (isRecord(event.payload.projectProfile)) {
         projection.projectProfile = normalizeProjectProfile(event.payload.projectProfile);
@@ -2561,6 +2661,7 @@ function makeEvent(
 function emptyFlowProjection(sessionId: string): FlowProjection {
   return {
     sessionId,
+    schedulingState: { status: "active", revision: 0, requestId: null, changedAt: null },
     events: [],
     lanes: [],
     laneRollbackStatuses: {},
@@ -2592,6 +2693,16 @@ function dedupeEvents(events: FlowEvent[]): FlowEvent[] {
     const key = event.idempotencyKey ?? event.id;
     const existing = seen.get(key);
     if (existing) {
+      if (isSchedulingControlEvent(existing) || isSchedulingControlEvent(event)) {
+        if (
+          existing.kind !== event.kind ||
+          existing.source !== event.source ||
+          existing.sessionId !== event.sessionId ||
+          !exactJsonEqual(existing.payload, event.payload)
+        ) {
+          throw new Error("Workflow scheduling requestId conflicts with an idempotent replay.");
+        }
+      }
       const existingCandidate = canonicalCandidateEventPayload(existing);
       const candidate = canonicalCandidateEventPayload(event);
       if (existingCandidate || candidate) {
@@ -4510,6 +4621,74 @@ function isEligibleInsertBeforeTarget(target: FlowLane | undefined): target is F
 
 function isValidInsertRequestId(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
+}
+
+function requireSchedulingIdentifier(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length > 200 || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)) {
+    throw new Error(`Workflow scheduling ${field} is invalid.`);
+  }
+  return value;
+}
+
+function isSchedulingControlEvent(event: FlowEvent): boolean {
+  return event.kind === "workflow.scheduling.paused" || event.kind === "workflow.scheduling.resumed";
+}
+
+function matchesSchedulingControlEvent(
+  event: FlowEvent,
+  status: WorkflowSchedulingStatus,
+  payload: WorkflowSchedulingControlPayload,
+): boolean {
+  try {
+    return schedulingControlPayload(event).status === status && exactJsonEqual(event.payload, payload);
+  } catch {
+    return false;
+  }
+}
+
+function schedulingControlPayload(event: FlowEvent): WorkflowSchedulingControlPayload {
+  if (!isSchedulingControlEvent(event) || event.source !== "workflow-kernel") {
+    throw new Error("Invalid workflow scheduling control event envelope.");
+  }
+  const keys = Object.keys(event.payload).sort();
+  if (keys.join("\0") !== ["expectedRevision", "expectedStatus", "requestId", "revision", "status"].join("\0")) {
+    throw new Error("Invalid workflow scheduling control event payload.");
+  }
+  const requestId = requireSchedulingIdentifier(event.payload.requestId, "requestId");
+  const status = event.kind === "workflow.scheduling.paused" ? "paused" : "active";
+  const expectedStatus = status === "paused" ? "active" : "paused";
+  const expectedRevision = event.payload.expectedRevision;
+  const revision = event.payload.revision;
+  if (
+    event.idempotencyKey !== `scheduling-control:${requestId}` ||
+    event.payload.status !== status ||
+    event.payload.expectedStatus !== expectedStatus ||
+    typeof expectedRevision !== "number" ||
+    typeof revision !== "number" ||
+    !Number.isSafeInteger(expectedRevision) ||
+    !Number.isSafeInteger(revision) ||
+    expectedRevision < 0 ||
+    revision !== expectedRevision + 1
+  ) {
+    throw new Error("Invalid workflow scheduling control event payload.");
+  }
+  return { requestId, expectedStatus, expectedRevision, status, revision };
+}
+
+function applyWorkflowSchedulingControl(
+  current: WorkflowSchedulingState,
+  event: FlowEvent,
+): WorkflowSchedulingState {
+  const payload = schedulingControlPayload(event);
+  if (current.status !== payload.expectedStatus || current.revision !== payload.expectedRevision) {
+    throw new Error("Workflow scheduling control replay is stale.");
+  }
+  return {
+    status: payload.status,
+    revision: payload.revision,
+    requestId: payload.requestId,
+    changedAt: event.createdAt,
+  };
 }
 
 function stableIdentifier(value: string): string {

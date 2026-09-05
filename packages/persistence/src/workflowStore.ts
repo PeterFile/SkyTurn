@@ -47,6 +47,8 @@ import type {
   WorkflowLoopEngineeringProjectionInput,
   WorkflowLoopEngineeringState,
   WorkflowMode,
+  WorkflowSchedulingState,
+  WorkflowSchedulingStatus,
   WorkflowGitAncestryProofContext,
   WorkflowCandidateManifest,
   WorkflowCandidateRunEvidenceBinding,
@@ -57,6 +59,8 @@ import type {
 import type { WorkflowNodePositionUpdateRequest } from "./index.js";
 import {
   canonicalRequiredEvidenceForLane,
+  compilePauseWorkflowScheduling,
+  compileResumeWorkflowScheduling,
   compileInsertClarificationBefore,
   compileWorkflowIntent,
   createDefaultFlowPolicy,
@@ -74,6 +78,7 @@ import {
   type FlowLane,
   type FlowProjection,
   type InsertClarificationBeforeRequest,
+  type WorkflowSchedulingControlRequest,
   type WorkflowIntentOperationType,
 } from "@skyturn/workflow-kernel";
 
@@ -296,9 +301,20 @@ export interface WorkflowEventRecord {
 }
 
 export interface WorkflowMaterializedView {
+  schedulingState: WorkflowSchedulingState;
   projection: FlowProjection;
   canvasSession: CanvasSession | null;
   loopState: WorkflowLoopEngineeringState;
+}
+
+export interface WorkflowSchedulingControlInput extends WorkflowSchedulingControlRequest {
+  now: string;
+}
+
+export interface WorkflowSchedulingControlResult {
+  event: WorkflowEventRecord;
+  created: boolean;
+  view: WorkflowMaterializedView;
 }
 
 export interface WorkflowLaneRecord {
@@ -1087,6 +1103,9 @@ export class WorkflowStore {
   }
 
   appendWorkflowEvent(input: AppendWorkflowEventInput): WorkflowEventRecord {
+    if (input.kind === "workflow.scheduling.paused" || input.kind === "workflow.scheduling.resumed") {
+      throw new Error("Workflow scheduling control must use its transactional API.");
+    }
     if (input.kind === "workflow.candidate.manifest_recorded") {
       throw new Error("Workflow candidate manifest is internal and cannot be forged through generic append.");
     }
@@ -1377,6 +1396,64 @@ export class WorkflowStore {
       projection: committed.projection,
       canvasSession: committed.canvasSession,
     };
+  }
+
+  pauseWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult {
+    return this.controlWorkflowScheduling(input, "paused");
+  }
+
+  resumeWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult {
+    return this.controlWorkflowScheduling(input, "active");
+  }
+
+  private controlWorkflowScheduling(
+    input: WorkflowSchedulingControlInput,
+    status: WorkflowSchedulingStatus,
+  ): WorkflowSchedulingControlResult {
+    const request: WorkflowSchedulingControlRequest = {
+      sessionId: requireExactSchedulingIdentifier(input.sessionId, "sessionId"),
+      requestId: requireExactSchedulingIdentifier(input.requestId, "requestId"),
+      expectedStatus: input.expectedStatus,
+      expectedRevision: input.expectedRevision,
+    };
+    const compile = status === "paused" ? compilePauseWorkflowScheduling : compileResumeWorkflowScheduling;
+    const idempotencyKey = `scheduling-control:${request.requestId}`;
+    const tx = this.db.transaction(() => {
+      const session = this.requireKnownSession(request.sessionId);
+      const projection = this.materializeFlowProjection(request.sessionId);
+      const compiled = compile(projection, request, input.now);
+      const existing = this.getEventByIdempotencyKey(request.sessionId, idempotencyKey);
+      if (
+        existing &&
+        (
+          existing.kind !== compiled.event.kind ||
+          existing.source !== compiled.event.source ||
+          existing.laneId !== null ||
+          existing.segmentId !== null ||
+          stableJson(existing.payload) !== stableJson(compiled.event.payload)
+        )
+      ) {
+        throw new Error("Workflow scheduling requestId conflicts with an existing mutation.");
+      }
+      const event = existing ?? this.insertFlowEventInTransaction(compiled.event, input.now);
+      const snapshot = this.materializeWorkflowEventSnapshot(request.sessionId);
+      const canvasSession = this.materializeCanvasSessionFromSnapshot(
+        session,
+        snapshot.projection,
+        snapshot.validatedEvents,
+      );
+      return {
+        event,
+        created: existing === null,
+        view: {
+          schedulingState: snapshot.projection.schedulingState,
+          projection: snapshot.projection,
+          canvasSession,
+          loopState: projectLoopEngineeringState(snapshot.projection),
+        },
+      };
+    });
+    return tx.immediate();
   }
 
   scheduleReadyLanes(
@@ -2406,6 +2483,7 @@ export class WorkflowStore {
       const snapshot = this.materializeWorkflowEventSnapshot(sessionId);
       this.faultInjection?.afterWorkflowViewEventRowsRead?.();
       return {
+        schedulingState: snapshot.projection.schedulingState,
         projection: snapshot.projection,
         canvasSession: session
           ? this.materializeCanvasSessionFromSnapshot(session, snapshot.projection, snapshot.validatedEvents)
@@ -3653,6 +3731,7 @@ export class WorkflowStore {
       target: session.target,
       hermesPlannerSessionId: session.hermesSessionId,
       plannerNodeId: session.plannerLaneId,
+      schedulingState: flowProjection.schedulingState,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       nodes,
@@ -3703,6 +3782,7 @@ export class WorkflowStore {
       target: session.target,
       hermesPlannerSessionId: session.hermesSessionId,
       plannerNodeId: session.plannerLaneId,
+      schedulingState: projection.schedulingState,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       nodes,
@@ -8483,6 +8563,13 @@ function requireWorkflowIdentifier(value: unknown, field: string): string {
     throw new Error(`Workflow reassignment ${field} is invalid.`);
   }
   return identifier;
+}
+
+function requireExactSchedulingIdentifier(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length > 200 || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)) {
+    throw new Error(`Workflow scheduling ${field} is invalid.`);
+  }
+  return value;
 }
 
 function cleanId(value: unknown): string | null {
