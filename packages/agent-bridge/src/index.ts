@@ -202,6 +202,7 @@ export interface DiscoveryService {
 export interface AgentBridgeOptions {
   adapters?: LocalAgentAdapterContract[];
   pathValue?: string;
+  discoveryEnv?: NodeJS.ProcessEnv;
   codexConfigRoot?: string | null;
   codexAuthFilePath?: string | null;
   appendEvent?: (projectRoot: string, event: RunEvent) => Promise<void>;
@@ -590,6 +591,7 @@ export class AgentBridge {
     this.adapters = new Map((options.adapters ?? [createMockAgentAdapter()]).map((adapter) => [adapter.kind, adapter]));
     this.discovery = createDiscoveryService({
       pathValue: options.pathValue,
+      env: options.discoveryEnv,
       codexConfigRoot: options.codexConfigRoot,
       codexAuthFilePath: options.codexAuthFilePath,
     });
@@ -1128,6 +1130,21 @@ export class AgentBridge {
     if (stored.kind === "invalid") throw new Error("Run durable state is invalid.");
     return stored.events;
   }
+}
+
+export function createConfiguredCliAdapter(
+  contract: LocalAgentAdapterContract,
+  resolveAdapter: () => Promise<LocalAgentAdapterContract>,
+): LocalAgentAdapterContract {
+  return {
+    ...contract,
+    async detect() {
+      return (await resolveAdapter()).detect();
+    },
+    async startRun(input, sink, context) {
+      return (await resolveAdapter()).startRun(input, sink, context);
+    },
+  };
 }
 
 function createDeferredAgentRunStartOwner(closeReason: string | null): DeferredAgentRunStartOwner {

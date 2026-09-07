@@ -67,12 +67,19 @@ Rollback is a cascade. The selected node and every downstream node are marked ro
 
 ## Persistence
 
-SkyTurn currently has two persistence layers with different jobs:
+SkyTurn currently has three persistence layers with different jobs:
 
 - Workspace shell state: a typed store in `packages/persistence` persists opened projects, tabs, and renderer workspace state. Electron writes JSON under Electron `userData`; browser-only verification falls back to `localStorage`.
+- Settings state: Electron atomically writes validated app settings and canonical-project-keyed settings to `<userData>/settings.json`. App settings never modify native Agent configuration; project command strings are inert preferences on import, `settings:get`, and `settings:save`.
 - Workflow facts: `@skyturn/persistence/workflow-store` is Node-only and stores workflow sessions, events, lanes, segments, evidence, and projections in `.devflow/skyturn-workflow.sqlite`.
 
 The SQLite workflow store is already used by Electron workflow IPC and by the real Hermes-to-Codex path. The renderer still has legacy/browser fallback paths for local canvas behavior, so SQLite is the workflow fact source for the real desktop path but not the only state object in the application.
+
+The backend settings surface is `window.devflow.settings.get(projectRoot)` and `window.devflow.settings.save(projectRoot, settings)`, backed by `settings:get` and `settings:save`. Both calls require a currently registered canonical project identity and return Git branch facts plus sanitized Hermes/Codex CLI, auth, and runnable-adapter prerequisites. Auth remains `unknown` unless a supported non-secret probe supplies a fact; settings code never reads or returns credential material. Saved executable overrides are resolved for every AgentBridge discovery and new launch without replacing the bridge, its running handles, or its durable claim/event authority. Invalid configured executables do not fall back to `PATH`.
+
+`defaultExecutor` accepts only the supported adapter kinds `hermes` and `codex`; it is a preference, not a save-time readiness gate. Missing, invalid, or version-unknown CLIs remain saveable while prerequisites report `defaultExecutorRunnable: false`, and actual launches fail through AgentBridge evidence instead of mock or detection-only fallback. A new-worktree target validates `selectedBranch` and `baseRef` independently, so a development branch such as `main` may use `origin/main` as its base. External-editor and notification values are preferences only in this backend slice. Renderer controls and applying project command/default-target preferences to new-session UI are intentionally left to the later UI integration lane.
+
+The settings document is bounded to 1 MiB of serialized UTF-8 and 1,024 canonical projects. Capacity is checked before temporary-file creation or rename; rejected growth leaves the previous durable document readable, and updates to existing projects remain allowed at project capacity when the byte limit is respected.
 
 ## Security Boundary
 

@@ -21,6 +21,11 @@ import type {
   WorkflowMaterializedView,
 } from "@skyturn/persistence/workflow-store" with { "resolution-mode": "import" };
 import type {
+  SettingsGitPrerequisites,
+  SettingsSnapshot,
+  SkyTurnSettings,
+} from "@skyturn/persistence" with { "resolution-mode": "import" };
+import type {
   AgentDescriptor,
   CanvasSession,
   PlanBootstrapRequest,
@@ -100,6 +105,8 @@ import {
 } from "./planIpcContracts";
 import { createPlanRuntime } from "./planRuntime";
 import { createPlanProjectIdentityRegistry } from "./planProjectIdentity";
+import { createSettingsRuntime, createSettingsSnapshot } from "./settingsRuntime";
+import { SETTINGS_IPC_CHANNELS, normalizeSettingsIpcError } from "./settingsIpcContracts";
 import {
   BrowserScreenshotCaptureStageError,
   createBrowserScreenshotHostProducer,
@@ -685,6 +692,8 @@ const planProjectIdentities = createPlanProjectIdentityRegistry();
 let agentBridge: AgentBridgeHost | null = null;
 let agentBridgeInitialization: Promise<AgentBridgeHost> | null = null;
 let agentBridgeAdmissionOpen = true;
+let settingsRuntime: ReturnType<typeof createSettingsRuntime> | null = null;
+let settingsRuntimeInitialization: Promise<ReturnType<typeof createSettingsRuntime>> | null = null;
 let appShutdownRequested = false;
 let windowCloseRecoveryState: "idle" | "failed" = "idle";
 let windowCloseRecoveryPromise: Promise<void> | null = null;
@@ -965,6 +974,14 @@ ipcMain.handle("agent:health", async () => {
     agents,
     readiness: summarizeAgentReadiness(agents),
   };
+});
+
+ipcMain.handle(SETTINGS_IPC_CHANNELS.get, async (_event, projectRoot: string) => {
+  return settingsIpcHandler(async () => settingsSnapshot(await (await getSettingsRuntime()).get(projectRoot)));
+});
+
+ipcMain.handle(SETTINGS_IPC_CHANNELS.save, async (_event, projectRoot: string, value: unknown) => {
+  return settingsIpcHandler(async () => settingsSnapshot(await (await getSettingsRuntime()).save(projectRoot, value)));
 });
 
 function workflowRunStartDependencies(): Omit<
@@ -2842,6 +2859,7 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
     const {
       AgentBridge,
       createCodexCliAdapter,
+      createConfiguredCliAdapter,
       createDurableRunClaimStore,
       createHermesCliAdapter,
       createPrivateRunEventStore,
@@ -2852,17 +2870,39 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
       : {};
     const codexOptions = {
       ...watchdogOptions,
+      env: settingsDiscoveryEnv(),
+      codexAuthFilePath: null,
       ...(process.env.SKYTURN_CODEX_SANDBOX === "workspace-write" ? { sandbox: "workspace-write" as const } : {}),
       ...(process.env.SKYTURN_CODEX_IGNORE_USER_CONFIG === "1" ? { extraArgs: ["--ignore-user-config"] } : {}),
       postCloseArtifactProducer: produceScheduledBrowserScreenshotArtifact,
     };
+    const configuredExecutable = async (kind: "hermes" | "codex") =>
+      (await (await getSettingsRuntime()).getAppSettings()).executableOverrides[kind] ?? undefined;
+    const hermesAdapter = createConfiguredCliAdapter(
+      createHermesCliAdapter({ ...watchdogOptions, env: settingsDiscoveryEnv() }),
+      async () => createHermesCliAdapter({
+        ...watchdogOptions,
+        env: settingsDiscoveryEnv(),
+        executablePath: await configuredExecutable("hermes"),
+      }),
+    );
+    const codexAdapter = createConfiguredCliAdapter(
+      createCodexCliAdapter(codexOptions),
+      async () => createCodexCliAdapter({
+        ...codexOptions,
+        executablePath: await configuredExecutable("codex"),
+      }),
+    );
     const durableRunClaimStore = createDurableRunClaimStore({
       root: path.join(app.getPath("userData"), "run-claims"),
     });
     await durableRunClaimStore.initialize();
     const privateRunEventStore = createPrivateRunEventStore({ durableRunClaimStore });
     const bridge = new AgentBridge({
-      adapters: [createHermesCliAdapter(watchdogOptions), createCodexCliAdapter(codexOptions)],
+      adapters: [hermesAdapter, codexAdapter],
+      pathValue: process.env.PATH ?? "",
+      discoveryEnv: settingsDiscoveryEnv(),
+      codexAuthFilePath: null,
       durableRunClaimStore,
       privateRunEventStore,
       onTerminalPersistenceFailure: (failure: TerminalPersistenceFailureLike) =>
@@ -2890,6 +2930,73 @@ async function getAgentBridge(): Promise<AgentBridgeHost> {
     }).catch(() => undefined);
   }
   return agentBridgeInitialization;
+}
+
+async function getSettingsRuntime(): Promise<ReturnType<typeof createSettingsRuntime>> {
+  if (settingsRuntime) return settingsRuntime;
+  if (!settingsRuntimeInitialization) {
+    const initialization = import("@skyturn/persistence").then(({ createDefaultSkyTurnSettings, parseSkyTurnSettings }) =>
+      createSettingsRuntime({
+        filePath: path.join(app.getPath("userData"), "settings.json"),
+        canonicalizeProjectRoot: (projectRoot) => planProjectIdentities.canonicalize(projectRoot),
+        defaultProjectBranch: async (projectRoot) =>
+          (await settingsGitPrerequisites(projectRoot)).currentBranch ?? "HEAD",
+        createDefaultSettings: createDefaultSkyTurnSettings,
+        parseSettings: parseSkyTurnSettings,
+      })
+    );
+    settingsRuntimeInitialization = initialization;
+    void initialization.then((runtime) => {
+      settingsRuntime = runtime;
+    }).finally(() => {
+      if (settingsRuntimeInitialization === initialization) settingsRuntimeInitialization = null;
+    }).catch(() => undefined);
+  }
+  return settingsRuntimeInitialization!;
+}
+
+async function settingsSnapshot(
+  record: { projectRoot: string; settings: SkyTurnSettings },
+): Promise<SettingsSnapshot> {
+  const [git, agents] = await Promise.all([
+    settingsGitPrerequisites(record.projectRoot),
+    getAgentBridge().then((bridge) => bridge.discoverAgents()),
+  ]);
+  return createSettingsSnapshot(record, git, agents);
+}
+
+async function settingsIpcHandler<T>(action: () => Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    throw normalizeSettingsIpcError(error);
+  }
+}
+
+async function settingsGitPrerequisites(projectRoot: string): Promise<SettingsGitPrerequisites> {
+  const options = { cwd: projectRoot, timeout: 3_000, maxBuffer: 1024 * 1024 };
+  try {
+    const repository = await execFileAsync("git", ["rev-parse", "--is-inside-work-tree"], options);
+    if (repository.stdout.trim() !== "true") return { status: "not_repository", currentBranch: null, branches: [] };
+    const [branch, refs] = await Promise.all([
+      execFileAsync("git", ["branch", "--show-current"], options),
+      execFileAsync("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], options),
+    ]);
+    const currentBranch = branch.stdout.trim() || "HEAD";
+    const branches = [...new Set([currentBranch, ...refs.stdout.split(/\r?\n/).filter(Boolean)])].sort();
+    return { status: "ready", currentBranch, branches };
+  } catch (error) {
+    const stderr = isRecord(error) && typeof error.stderr === "string" ? error.stderr : "";
+    return {
+      status: /not a git repository/i.test(stderr) ? "not_repository" : "unknown",
+      currentBranch: null,
+      branches: [],
+    };
+  }
+}
+
+function settingsDiscoveryEnv(): NodeJS.ProcessEnv {
+  return process.env.PATH === undefined ? {} : { PATH: process.env.PATH };
 }
 
 async function compensateTerminalPersistenceFailure(failure: TerminalPersistenceFailureLike): Promise<void> {
