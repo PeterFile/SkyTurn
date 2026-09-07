@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { WorktreeComparisonRequest } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
 import type {
   PlanApi,
+  SettingsApi,
   WorkflowApi,
   WorkflowLaneReassignRequest,
   WorkflowLaneReassignResult,
@@ -55,6 +56,11 @@ const plan = {
   bootstrap: (input) => ipcRenderer.invoke("plan:bootstrap", input),
   getState: (input) => ipcRenderer.invoke("plan:getState", input),
 } satisfies PlanApi;
+
+const settings = {
+  get: (projectRoot: string) => ipcRenderer.invoke("settings:get", projectRoot),
+  save: (projectRoot: string, value) => ipcRenderer.invoke("settings:save", projectRoot, value),
+} satisfies SettingsApi;
 
 type WorkflowEnvelopeExpectation = "none" | "optional" | "required" | "projection";
 
@@ -206,6 +212,7 @@ contextBridge.exposeInMainWorld("devflow", {
     ipcRenderer.invoke("editor:openWorktree", editor, worktreePath),
   discoverAgents: () => ipcRenderer.invoke("agent:discover"),
   getAgentHealth: () => ipcRenderer.invoke("agent:health"),
+  settings,
   startAgentRun: (input: unknown) => ipcRenderer.invoke("run:start", input),
   sendRunMessage: (runId: string, message: string) => ipcRenderer.invoke("run:send", runId, message),
   cancelAgentRun: (runId: string, reason: string) => ipcRenderer.invoke("run:cancel", runId, reason),

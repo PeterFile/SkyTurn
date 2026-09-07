@@ -1,4 +1,6 @@
 import type { WorkflowLoopNextAction } from "@skyturn/project-core";
+import type { SettingsApi } from "./settings.js";
+export * from "./settings.js";
 import type {
   DeliveryCommitEvidence,
   DeliveryMainSyncEvidence,
@@ -368,6 +370,7 @@ export interface DevflowApi {
   openEditor: (editor: EditorKind, worktreePath: string) => Promise<{ ok: boolean; message: string }>;
   discoverAgents: () => Promise<{ protocolVersion: number; agents: AgentDescriptor[] }>;
   getAgentHealth: () => Promise<{ protocolVersion: number; agents: AgentDescriptor[]; readiness: AgentWorkflowReadinessSummary }>;
+  settings: SettingsApi;
   startAgentRun: (input: StartAgentRunInput) => Promise<{ protocolVersion: number; run: AgentRun }>;
   sendRunMessage: (runId: string, message: string) => Promise<{ protocolVersion: number; ok: boolean }>;
   cancelAgentRun: (runId: string, reason: string) => Promise<{ protocolVersion: number; evidence: RunEvidence }>;
