@@ -1,17 +1,22 @@
 {
   "name": "@skyturn/desktop",
   "version": "0.1.0",
+  "productName": "SkyTurn",
+  "description": "Canvas-first desktop development workflow platform.",
   "private": true,
   "main": "dist-electron/electron/main.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "dev:renderer": "vite --host 127.0.0.1",
     "dev:electron": "pnpm run build:electron && VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron dist-electron/electron/main.js",
-    "build": "pnpm run typecheck && vite build && pnpm run build:electron",
+    "build": "pnpm run typecheck && vite build --base ./ && pnpm run build:electron",
     "build:electron": "tsc -b tsconfig.electron.json --force && vite build --config vite.preload.config.ts",
     "rebuild:native": "electron-rebuild -f -w better-sqlite3 --version 41.5.1 --module-dir ../../packages/persistence",
     "typecheck": "tsc --noEmit -p tsconfig.app.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "node --test scripts/*.test.mjs",
+    "test:package": "node --test scripts/packageDesktop.test.mjs",
+    "package:mac": "node scripts/packageDesktop.mjs",
+    "smoke:package": "node scripts/packageDesktopSmoke.mjs",
     "demo:mvp": "node scripts/mvpWorkflowDemo.mjs",
     "acceptance:new-session": "pnpm run acceptance:new-session-ui",
     "acceptance:new-session-ui": "node scripts/newSessionUiAcceptance.mjs",
@@ -33,16 +38,17 @@
     "@skyturn/workflow-kernel": "workspace:*",
     "@xyflow/react": "^12.11.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "vite": "^8.0.16"
   },
   "devDependencies": {
+    "@electron/packager": "18.3.6",
     "@electron/rebuild": "^3.7.2",
     "@types/node": "^25.0.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.2",
     "electron": "41.5.1",
-    "typescript": "^6.0.3",
-    "vite": "^8.0.16"
+    "typescript": "^6.0.3"
   }
 }
