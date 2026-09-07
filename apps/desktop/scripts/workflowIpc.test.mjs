@@ -11,6 +11,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import vm from "node:vm";
 
+import { createSourceModuleLoader } from "./sourceModuleLoader.mjs";
+
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const require = createRequire(import.meta.url);
 
@@ -4968,63 +4970,18 @@ async function createRealScheduledWorktreeHarness(t) {
 async function loadProductionGitWorktreeModule() {
   productionGitWorktreeModulePromise ??= (async () => {
     const ts = require("typescript");
-    const projectCore = transpileCommonJsModule(
-      await readFile(join(root, "..", "..", "packages", "project-core", "src", "index.ts"), "utf8"),
-      "project-core.index.ts",
-      require,
-      ts,
-    );
-    const indexModule = transpileCommonJsModule(
-      await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "index.ts"), "utf8"),
-      "git-worktree.index.ts",
-      (specifier) => specifier === "@skyturn/project-core" ? projectCore : require(specifier),
-      ts,
-    );
-    const gitCommandModule = transpileCommonJsModule(
-      await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "internal", "gitCommand.ts"), "utf8"),
-      "git-worktree.gitCommand.ts",
-      require,
-      ts,
-      { Buffer, process },
-    );
-    const gitChangesetSnapshotModule = transpileCommonJsModule(
-      await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "internal", "gitChangesetSnapshot.ts"), "utf8"),
-      "git-worktree.gitChangesetSnapshot.ts",
-      (specifier) => specifier === "./gitCommand.js" ? gitCommandModule : require(specifier),
-      ts,
-      { Buffer, process },
-    );
-    return transpileCommonJsModule(
-      await readFile(join(root, "..", "..", "packages", "git-worktree", "src", "node.ts"), "utf8"),
-      "git-worktree.node.ts",
-      (specifier) => {
-        if (specifier === "./index.js") return indexModule;
-        if (specifier === "./internal/gitCommand.js") return gitCommandModule;
-        if (specifier === "./internal/gitChangesetSnapshot.js") return gitChangesetSnapshotModule;
-        return require(specifier);
-      },
-      ts,
-      { Buffer, process },
-    );
+    const packageRoot = join(root, "..", "..", "packages");
+    const mocks = new Map();
+    const loader = createSourceModuleLoader({
+      typescript: ts,
+      globals: { Buffer, process },
+      mocks,
+    });
+    const projectCore = loader.load(join(packageRoot, "project-core", "src", "index.ts"));
+    mocks.set("@skyturn/project-core", projectCore);
+    return loader.load(join(packageRoot, "git-worktree", "src", "node.ts"));
   })();
   return productionGitWorktreeModulePromise;
-}
-
-function transpileCommonJsModule(source, filename, load, ts, globals = {}) {
-  const output = ts.transpileModule(source, {
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2022,
-    },
-  }).outputText;
-  const module = { exports: {} };
-  vm.runInNewContext(output, {
-    module,
-    exports: module.exports,
-    require: load,
-    ...globals,
-  }, { filename });
-  return module.exports;
 }
 
 async function loadScheduledWorkflowWorktreeRuntime(createNodeGitWorktreeService) {
