@@ -86,6 +86,14 @@ import {
 } from "./internal/gitCommand.js";
 
 export {
+  NodeEditorAdapter,
+  type NodeEditorAdapterOptions,
+  type TrustedEditorLauncher,
+  type TrustedEditorLauncherError,
+  type TrustedEditorLauncherResult,
+} from "./editor.js";
+
+export {
   parseCandidateDeliveryCommitPreparation,
   parseVariantComparisonEvidence,
   parseWorkflowVariantComparisonRecordedEvidence,
