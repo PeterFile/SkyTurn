@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { Script, runInNewContext } from "node:vm";
 
 const scriptPath = join(dirname(fileURLToPath(import.meta.url)), "packageDesktop.mjs");
 const smokeScriptPath = join(dirname(fileURLToPath(import.meta.url)), "packageDesktopSmoke.mjs");
@@ -383,6 +384,22 @@ test("smoke proves Vite host transforms and a visible mounted SkyTurn shell", as
   assert.match(source, /rendererErrors/);
   assert.match(source, /assertContainedSymlinks\(appSource\)/);
   assert.match(source, /assertContainedSymlinks\(installedApp\)/);
+});
+
+test("embedded runtime probe compiles and preserves the probe file newline", async () => {
+  const source = await readFile(smokeScriptPath, "utf8");
+  const template = /const script = (`[^\n]+`);/u.exec(source)?.[1];
+  assert.ok(template, "The production runtime probe template must be present.");
+  // Expand the actual template without importing the CLI or executing Electron.
+  const generated = runInNewContext(template, {
+    join,
+    payload: '/isolated/SkyTurn "test".app/Contents/Resources/app',
+    cwd: "/isolated/probe run",
+  }, { timeout: 1000 });
+  assert.doesNotThrow(() => new Script(generated));
+  const probeLiteral = /fs\.writeFileSync\(path\.join\(probeRoot,"main\.ts"\),("(?:[^"\\]|\\.)*")\);/u.exec(generated)?.[1];
+  assert.ok(probeLiteral, "The generated script must write the TypeScript probe.");
+  assert.equal(runInNewContext(probeLiteral, {}, { timeout: 1000 }), "export const answer: number = 42;\n");
 });
 
 test("documented root smoke command uses package-relative arguments", async () => {
