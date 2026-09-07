@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { createElement } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -3221,6 +3222,7 @@ describe("Slice C UI behavior", () => {
 
   it("catches a failed bottom submission and reuses its input id on retry", async () => {
     const submitBottomComposerAttempt = submitBottomComposerAttemptForTest();
+    const text = "\n  Keep this requirement\n    with indentation\n\n";
     const states = new Map<string, BottomComposerSubmissionStateForTest>();
     const createInputId = vi.fn(() => "input-retry-1");
     let rejectRequest: ((reason: Error) => void) | null = null;
@@ -3232,7 +3234,7 @@ describe("Slice C UI behavior", () => {
     const first = submitBottomComposerAttempt({
       states,
       scope: "project-1:session-1",
-      text: "Keep this requirement",
+      text,
       createInputId,
       submit,
     });
@@ -3240,7 +3242,7 @@ describe("Slice C UI behavior", () => {
     await expect(submitBottomComposerAttempt({
       states,
       scope: "project-1:session-1",
-      text: "Keep this requirement",
+      text,
       createInputId,
       submit,
     })).resolves.toBeNull();
@@ -3250,7 +3252,7 @@ describe("Slice C UI behavior", () => {
     await expect(first).resolves.toBeNull();
     expect(states.get("project-1:session-1")).toEqual({
       inputId: "input-retry-1",
-      text: "Keep this requirement",
+      text,
       busy: false,
       error: "Couldn’t submit requirement. Retry with the same text.",
     });
@@ -3258,7 +3260,7 @@ describe("Slice C UI behavior", () => {
     await expect(submitBottomComposerAttempt({
       states,
       scope: "project-1:session-1",
-      text: "Keep this requirement",
+      text,
       createInputId,
       submit: async (inputId) => inputId,
     })).resolves.toBe("input-retry-1");
@@ -3267,6 +3269,68 @@ describe("Slice C UI behavior", () => {
     const appSource = await readSource("./App.tsx");
     expect(appSource).toContain('role="alert"');
     expect(appSource).toContain("bottomComposerState.error");
+  });
+
+  it("rejects whitespace-only bottom submissions without creating an attempt", async () => {
+    const states = new Map<string, BottomComposerSubmissionStateForTest>();
+    const createInputId = vi.fn(() => "unexpected");
+    const submit = vi.fn(async () => "unexpected");
+    const onStateChange = vi.fn();
+
+    await expect(submitBottomComposerAttemptForTest()({
+      states,
+      scope: "project-1:session-1",
+      text: "\n \t\n  ",
+      createInputId,
+      submit,
+      onStateChange,
+    })).resolves.toBeNull();
+    expect(states.size).toBe(0);
+    expect(createInputId).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(onStateChange).not.toHaveBeenCalled();
+  });
+
+  it("gives edited boundary whitespace a fresh bottom submission id", async () => {
+    const states = new Map<string, BottomComposerSubmissionStateForTest>();
+    const createInputId = vi.fn()
+      .mockReturnValueOnce("original-input")
+      .mockReturnValueOnce("edited-input");
+    const submit = vi.fn(async () => { throw new Error("UNAVAILABLE"); });
+    const text = "\n  first line\n    second line\n";
+
+    for (const value of [text, `${text}\n`]) {
+      await submitBottomComposerAttemptForTest()({
+        states,
+        scope: "project-1:session-1",
+        text: value,
+        createInputId,
+        submit,
+      });
+    }
+    expect(submit.mock.calls).toHaveLength(2);
+    expect(createInputId).toHaveBeenCalledTimes(2);
+    expect(states.get("project-1:session-1")).toMatchObject({
+      inputId: "edited-input",
+      text: `${text}\n`,
+      busy: false,
+    });
+  });
+
+  it("wires raw bottom text to node and session submissions and clears only an exact match", async () => {
+    const appSource = await readSource("./App.tsx");
+    const appendRequirement = appSource.slice(appSource.indexOf("async function appendRequirementNode"), appSource.indexOf("async function submitSelectedNodeAction"));
+    const nodeAction = appSource.slice(appSource.indexOf("async function submitSelectedNodeAction"), appSource.indexOf("function applyWorkflowActionResult"));
+
+    expect(appendRequirement).toContain("const text = selectedNode ? nodeActionText : bottomGoal;");
+    expect(appendRequirement).toContain("if (!text.trim()) return;");
+    expect(appendRequirement).toContain("await submitSelectedNodeAction(action, text);");
+    expect(appendRequirement).toMatch(/submitBottomComposerAttempt\(\{[^]*?scope: bottomComposerScope,\s*text,/);
+    expect(appendRequirement).toMatch(/appendWorkflowUserInput\(responseGuard.queryRoot, \{\s*sessionId,\s*inputId,\s*text,/);
+    expect(appendRequirement).toContain('setBottomGoal((current) => current === text ? "" : current);');
+    expect(nodeAction.match(/instruction: requestText/g)).toHaveLength(2);
+    expect(nodeAction).toContain("text: requestText,");
+    expect(nodeAction).not.toContain("requestText.trim()");
   });
 
   it("clears a successful bottom attempt so identical later text gets a fresh input id", async () => {
@@ -3921,5 +3985,133 @@ describe("Terminal Inspector Source Code Analysis", () => {
     expect(appSource).toContain("planner-session-status");
     expect(appSource).toContain("onOpenPlannerInspector");
     expect(appSource).toContain("setTerminalOpen(true)");
+  });
+});
+
+describe("handleComposerKeyDown", () => {
+  const { handleComposerKeyDown } = AppModule;
+
+  function createComposerKeyDownEvent({
+    key = "Enter",
+    metaKey = false,
+    ctrlKey = false,
+    shiftKey = false,
+    isComposing = false,
+    keyCode = 0,
+  }: {
+    key?: string;
+    metaKey?: boolean;
+    ctrlKey?: boolean;
+    shiftKey?: boolean;
+    isComposing?: boolean;
+    keyCode?: number;
+  } = {}): ReactKeyboardEvent<HTMLTextAreaElement> {
+    return {
+      key,
+      metaKey,
+      ctrlKey,
+      shiftKey,
+      nativeEvent: { isComposing, keyCode },
+      preventDefault: vi.fn(),
+    } as ReactKeyboardEvent<HTMLTextAreaElement>;
+  }
+
+  it("leaves default newline insertion for plain Enter", () => {
+    const onSubmit = vi.fn();
+    const event = createComposerKeyDownEvent();
+
+    handleComposerKeyDown(event, true, onSubmit);
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("leaves default newline insertion for Shift+Enter", () => {
+    const onSubmit = vi.fn();
+    const event = createComposerKeyDownEvent({ shiftKey: true });
+
+    handleComposerKeyDown(event, true, onSubmit);
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("submits and prevents default on Cmd+Enter", () => {
+    const onSubmit = vi.fn();
+    const event = createComposerKeyDownEvent({ metaKey: true });
+
+    handleComposerKeyDown(event, true, onSubmit);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(onSubmit).toHaveBeenCalled();
+  });
+
+  it("submits and prevents default on Ctrl+Enter", () => {
+    const onSubmit = vi.fn();
+    const event = createComposerKeyDownEvent({ ctrlKey: true });
+
+    handleComposerKeyDown(event, true, onSubmit);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(onSubmit).toHaveBeenCalled();
+  });
+
+  it("does not submit if canSubmit is false", () => {
+    const onSubmit = vi.fn();
+    const event = createComposerKeyDownEvent({ metaKey: true });
+
+    handleComposerKeyDown(event, false, onSubmit);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("ignores Enter during IME composition via isComposing", () => {
+    const onSubmit = vi.fn();
+    const event = createComposerKeyDownEvent({ metaKey: true, isComposing: true });
+
+    handleComposerKeyDown(event, true, onSubmit);
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("ignores Enter during IME composition via nativeEvent.keyCode === 229", () => {
+    const onSubmit = vi.fn();
+    const event = createComposerKeyDownEvent({ metaKey: true, keyCode: 229 });
+
+    handleComposerKeyDown(event, true, onSubmit);
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("wires the bottom composer as a raw multiline textarea with valid shortcuts", async () => {
+    const appSource = await readSource("./App.tsx");
+    const composer = appSource.slice(
+      appSource.indexOf("function CanvasComposer("),
+      appSource.indexOf("function CustomSelect"),
+    );
+    const toolbar = composer.slice(composer.indexOf('className="canvas-composer-toolbar"'));
+
+    expect(composer).toContain("<textarea");
+    expect(composer).toContain("value={displayedValue}");
+    expect(composer).toContain("onChange(event.target.value)");
+    expect(composer).toContain('aria-keyshortcuts="Meta+Enter Control+Enter"');
+    expect(composer).toContain("rows={2}");
+    expect(toolbar).toContain('className="composer-keyboard-hint"');
+    expect(composer.match(/className="composer-keyboard-hint"/g)).toHaveLength(1);
+  });
+
+  it("keeps at least two visible text lines with bounded vertical scrolling", async () => {
+    const styleSource = await readSource("./styles.css");
+    const textareaStyles = styleSource.slice(styleSource.indexOf("textarea.canvas-composer-input"));
+
+    expect(styleSource).not.toContain(".canvas-composer input");
+    expect(textareaStyles).toMatch(/min-height:\s*64px;/);
+    expect(textareaStyles).toMatch(/max-height:\s*112px;/);
+    expect(textareaStyles).toMatch(/line-height:\s*20px;/);
+    expect(textareaStyles).toMatch(/padding:\s*8px 4px;/);
+    expect(textareaStyles).toMatch(/overflow-y:\s*auto;/);
+  });
+
+  it("sizes the selected-node composer text row to its multiline textarea", async () => {
+    const styleSource = await readSource("./styles.css");
+    const selectedComposer = styleSource.match(/\.canvas-stage\.has-selected-node \.canvas-composer\s*\{([^}]+)\}/)?.[1];
+
+    expect(selectedComposer).toMatch(/grid-template-rows:\s*auto 32px;/);
   });
 });
