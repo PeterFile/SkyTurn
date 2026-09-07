@@ -3104,10 +3104,9 @@ h2 {
   transform: translateX(-50%);
 }
 
-.canvas-composer input {
+.canvas-composer .canvas-composer-input {
   min-width: 0;
   width: 100%;
-  height: 36px;
   border: 1px solid var(--sk-border);
   border-radius: 6px;
   background: var(--sk-surface);
@@ -3116,7 +3115,7 @@ h2 {
   outline: none;
 }
 
-.canvas-composer input:focus {
+.canvas-composer .canvas-composer-input:focus {
   border-color: var(--sk-accent);
   box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.14);
 }
@@ -3618,8 +3617,7 @@ h2 {
   border-radius: 999px;
 }
 
-.canvas-composer input {
-  height: 28px;
+.canvas-composer .canvas-composer-input {
   border-color: transparent;
   border-radius: 0;
   background: transparent;
@@ -3627,7 +3625,7 @@ h2 {
   padding: 0 4px;
 }
 
-.canvas-composer input:focus {
+.canvas-composer .canvas-composer-input:focus {
   border-color: transparent;
   box-shadow: none;
 }
@@ -3678,7 +3676,7 @@ h2 {
   line-height: 1;
 }
 
-.composer-toolbar-spacer {
+.composer-keyboard-hint {
   min-width: 0;
 }
 
@@ -4120,7 +4118,7 @@ select:focus-visible,
 .session-project-picker,
 .topbar-field,
 .title-edit-input,
-.canvas-composer input {
+.canvas-composer .canvas-composer-input {
   border: 0;
   border-radius: 4px;
   background-color: rgba(252, 251, 245, 0.86);
@@ -5452,9 +5450,7 @@ select:focus-visible,
   opacity: 0.92;
 }
 
-.canvas-composer input,
-.canvas-composer-input {
-  height: 30px;
+.canvas-composer .canvas-composer-input {
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -5463,8 +5459,8 @@ select:focus-visible,
   padding: 0 3px;
 }
 
-.canvas-composer input:focus,
-.canvas-composer-input:focus-visible {
+.canvas-composer .canvas-composer-input:focus,
+.canvas-composer .canvas-composer-input:focus-visible {
   border: 0;
   outline: none;
   box-shadow: none;
@@ -6336,7 +6332,7 @@ select:focus-visible,
 }
 
 .canvas-stage.has-selected-node .canvas-composer {
-  grid-template-rows: 28px 32px;
+  grid-template-rows: auto 32px;
   gap: 5px;
   min-height: 0;
   padding: 10px 14px 8px;
@@ -7729,4 +7725,31 @@ button.next-action-hint.clickable:hover {
   flex-shrink: 0;
   color: var(--sk-accent);
   font-weight: 600;
+}
+
+textarea.canvas-composer-input {
+  height: auto;
+  min-height: 64px;
+  max-height: 112px;
+  resize: none;
+  overflow-y: auto;
+  line-height: 20px;
+  padding: 8px 4px;
+  font-family: inherit;
+}
+
+textarea.canvas-composer-input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.composer-keyboard-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--sk-text-muted);
+  text-align: right;
+  opacity: 0.7;
 }

@@ -286,6 +286,7 @@ export async function submitBottomComposerAttempt<T>({
   submit: (inputId: string) => Promise<T>;
   onStateChange?: () => void;
 }): Promise<T | null> {
+  if (!text.trim()) return null;
   const current = states.get(scope);
   if (current?.busy) return null;
   const inputId = current?.text === text ? current.inputId : createInputId();
@@ -1901,8 +1902,8 @@ export default function App() {
 
   async function appendRequirementNode(action?: ComposerAction) {
     if (!activeSession || activeSession.kind !== "canvas") return;
-    const text = selectedNode ? nodeActionText.trim() : bottomGoal.trim();
-    if (!text) return;
+    const text = selectedNode ? nodeActionText : bottomGoal;
+    if (!text.trim()) return;
     if (selectedNode) {
       await submitSelectedNodeAction(action, text);
       return;
@@ -1937,7 +1938,7 @@ export default function App() {
       if (!response || !responseGuard) return;
       applyGuardedWorkflowSessionResponse(response, responseGuard);
       if (activeBottomComposerScopeRef.current === bottomComposerScope) {
-        setBottomGoal((current) => current.trim() === text ? "" : current);
+        setBottomGoal((current) => current === text ? "" : current);
       }
       return;
     }
@@ -6835,6 +6836,25 @@ function WorktreeActions({ node, session, projectRoot }: { node: CanvasNode; ses
   );
 }
 
+export function handleComposerKeyDown(
+  event: React.KeyboardEvent<HTMLTextAreaElement>,
+  canSubmit: boolean,
+  onSubmit: () => void,
+): void {
+  const isComposing = event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229;
+
+  if (isComposing) {
+    return;
+  }
+
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+    event.preventDefault();
+    if (canSubmit) {
+      onSubmit();
+    }
+  }
+}
+
 function CanvasComposer({
   value,
   disabled,
@@ -6904,7 +6924,7 @@ function CanvasComposer({
     ? selectedActionAvailability?.reason ?? "Submit node action"
     : "Submit";
 
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
 
   const handleSubmit = useCallback(() => {
@@ -7078,7 +7098,7 @@ function CanvasComposer({
       )}
 
       <div className={hasValue ? "canvas-composer has-content" : "canvas-composer"}>
-        <input
+        <textarea
           className="canvas-composer-input"
           ref={inputRef}
           value={displayedValue}
@@ -7088,11 +7108,10 @@ function CanvasComposer({
           }}
           placeholder={placeholder}
           aria-label={placeholder}
+          aria-keyshortcuts="Meta+Enter Control+Enter"
+          rows={2}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && canSubmit) {
-              event.preventDefault();
-              handleSubmit();
-            }
+            handleComposerKeyDown(event, canSubmit, handleSubmit);
           }}
         />
         <div className="canvas-composer-toolbar">
@@ -7106,7 +7125,7 @@ function CanvasComposer({
             <Plus size={17} />
           </button>
           <span className="composer-slash" aria-hidden="true">/</span>
-          <span className="composer-toolbar-spacer" />
+          <span className="composer-keyboard-hint" aria-hidden="true">⌘/Ctrl+Enter to send</span>
           <button
             className="icon-button composer-tool"
             title="Stop active run"
