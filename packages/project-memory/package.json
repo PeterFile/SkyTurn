@@ -9,6 +9,10 @@
       "types": "./src/index.ts",
       "require": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./src/node.ts",
+      "node": "./dist/node.js"
     }
   },
   "scripts": {
@@ -18,6 +22,7 @@
     "test": "vitest run src"
   },
   "devDependencies": {
+    "@types/node": "^25.9.3",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"
   }
