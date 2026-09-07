@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fstatSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -193,5 +194,32 @@ it("does not recover malformed reviewer authority or revision lineage as approva
     await fs.writeFile(p.history, malformed);
     await expect(p.service().list("decisions.md")).rejects.toThrow();
     expect(await fs.readFile(p.file, "utf8")).toBe("Original\r\n");
+  }
+});
+
+it.each([[true, false], [true, true], [false, false], [false, true]])("validates queued proposal recovery: future=%s rejected=%s", async (future, rejected) => {
+  const p = await project();
+  const first = await p.proposal();
+  await p.service().propose(first);
+  await p.service().propose({ ...first, id: "p2" });
+  if (rejected) await p.service().decide("decisions.md", "p2", decision("d2", "reject"));
+  await fs.mkdir(`${p.file}.memory-next`);
+  await expect(p.service().decide("decisions.md", "p1", decision())).rejects.toThrow();
+  await fs.rmdir(`${p.file}.memory-next`);
+  const state = JSON.parse(await fs.readFile(p.history, "utf8"));
+  if (future) {
+    const hash = createHash("sha256").update(JSON.stringify(first.body)).digest("hex");
+    state.entries[1].proposal.baseRevision = `${state.lineage}:1:${hash}`;
+    await fs.writeFile(p.history, `${JSON.stringify(state)}\n`);
+    const history = await fs.readFile(p.history);
+    await expect(p.service().list("decisions.md")).rejects.toThrow();
+    expect(await fs.readFile(p.file, "utf8")).toBe("Original\r\n");
+    expect(await fs.readFile(p.history)).toEqual(history);
+  } else {
+    const entries = await p.service().list("decisions.md");
+    expect(entries).toEqual(state.entries);
+    expect(await fs.readFile(p.file, "utf8")).toBe(first.body);
+    expect(JSON.parse(await fs.readFile(p.history, "utf8")).pending).toBeNull();
+    expect(await p.service().list("decisions.md")).toEqual(entries);
   }
 });

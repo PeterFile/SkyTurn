@@ -82,7 +82,8 @@ function replay(s: State) {
     before = body;
     body = e.proposal.body;
     generation++;
-    revisions.set(revision(s, generation, body), s.entries.indexOf(e));
+    // A pending approval's after revision cannot yet be a proposal base.
+    if (e.proposal.id !== s.pending) revisions.set(revision(s, generation, body), s.entries.indexOf(e));
   }
   s.entries.forEach((e, index) => check(revisions.has(e.proposal.baseRevision) && revisions.get(e.proposal.baseRevision)! < index));
   check(s.pending === null || s.pending === approved.at(-1)?.proposal.id);
