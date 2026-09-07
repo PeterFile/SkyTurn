@@ -1085,7 +1085,7 @@ async function ensureRunWorktreePath(project: ImportedProject, session: CanvasSe
   return absolutePathFromWorktree(result.worktree);
 }
 
-function resolveRunWorktreePath(project: ImportedProject, session: CanvasSession, node: CanvasNode): string | null {
+export function resolveRunWorktreePath(project: ImportedProject, session: CanvasSession, node: CanvasNode): string | null {
   if (isPlannerRootNode(session, node)) return project.rootPath;
   const executionTarget = node.worktree.executionTarget ?? session.target.executionTarget;
   if (executionTarget === "current_branch") return project.rootPath;

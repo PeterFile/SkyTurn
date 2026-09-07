@@ -199,6 +199,7 @@ import {
   applyRunEventToWorkspace,
   loadExactTerminalRunEvidence,
   mergeRunEventsIntoWorkspace,
+  resolveRunWorktreePath,
   retryCanvasNode,
 } from "./workflowRuntime.js";
 import { addRequirementPlanningNode } from "./composer.js";
@@ -217,6 +218,14 @@ export const DESKTOP_RETRY_UNAVAILABLE_REASON =
   "Desktop workflow Retry is unavailable. Use checkpoint-driven Repair in the bottom composer when available.";
 
 gsap.registerPlugin(useGSAP);
+
+export async function openNodeEditor(project: ImportedProject, session: CanvasSession, node: CanvasNode, editor: EditorKind) {
+  const path = resolveRunWorktreePath(project, session, node);
+  if (!path) {
+    return { ok: false, message: "Editor target is unavailable because the managed worktree has no absolute path." };
+  }
+  return browserEditorAdapter.openWorktree(editor, path);
+}
 
 type AgentFlowNode = FlowNode<{
   node: CanvasNode;
@@ -2216,7 +2225,8 @@ export default function App() {
   }
 
   async function openEditor(editor: EditorKind, node: CanvasNode) {
-    const result = await browserEditorAdapter.openWorktree(editor, node.worktree.path);
+    if (!activeProject || activeSession?.kind !== "canvas") return;
+    const result = await openNodeEditor(activeProject, activeSession, node, editor);
     updateNode(node.id, (current) => ({
       ...current,
       output: [...current.output, result.message],
