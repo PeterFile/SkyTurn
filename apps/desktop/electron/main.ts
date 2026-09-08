@@ -19,11 +19,14 @@ import type {
   PlannerIntentDisposition,
   PlannerIntentOperationSummary,
   WorkflowMaterializedView,
+  WorkflowSchedulingControlInput,
+  WorkflowSchedulingControlResult,
 } from "@skyturn/persistence/workflow-store" with { "resolution-mode": "import" };
 import type {
   SettingsGitPrerequisites,
   SettingsSnapshot,
   SkyTurnSettings,
+  WorkflowSchedulingControlRequest,
 } from "@skyturn/persistence" with { "resolution-mode": "import" };
 import type {
   AgentDescriptor,
@@ -702,7 +705,7 @@ let workflowStoresClosePromise: Promise<void> | null = null;
 const workflowStores = new Map<string, WorkflowStoreHost>();
 const workflowStoreInitializations = new Map<string, Promise<WorkflowStoreHost>>();
 const workflowSessionAdvanceFlights = new Map<string, Promise<void>>();
-const workflowProjectAdvanceTails = new Map<string, Promise<void>>();
+const workflowProjectAdvanceTails = new Map<string, Promise<unknown>>();
 const workflowStoreOperationTasks = new Set<Promise<unknown>>();
 const workflowTerminalReconciliationTasks = new Set<Promise<void>>();
 const workflowTerminalReconciliationFailures: unknown[] = [];
@@ -770,6 +773,8 @@ interface WorkflowSegmentRendererFacts {
 }
 
 interface WorkflowStoreHost {
+  pauseWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult;
+  resumeWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult;
   listWorkflowSessionIds(): string[];
   createWorkflowSession(input: unknown): unknown;
   getPlannerStartAuthorization(sessionId: string): unknown;
@@ -1034,7 +1039,7 @@ function workflowRunStartDependencies(): Omit<
   };
 }
 
-const plannerRunStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
+const plannerRunStartHandler = serializeWorkflowRunStarts(createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
   ...workflowRunStartDependencies(),
   authorizeStartInput: (input, knownStore) => authorizeWorkflowRunStartInput(input, "planner", knownStore),
   claimUnscheduledStart: (input, store, identity) => {
@@ -1046,7 +1051,7 @@ const plannerRunStartHandler = createRunStartHandler<StartAgentRunInput, unknown
       now: new Date().toISOString(),
     });
   },
-});
+}));
 
 const scheduledWorkflowRunStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
   ...workflowRunStartDependencies(),
@@ -1054,11 +1059,11 @@ const scheduledWorkflowRunStartHandler = createRunStartHandler<StartAgentRunInpu
   scheduledStartsRequireOwnership: true,
 });
 
-const publicRunStartHandler = createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
+const publicRunStartHandler = serializeWorkflowRunStarts(createRunStartHandler<StartAgentRunInput, unknown, WorkflowStoreHost>({
   ...workflowRunStartDependencies(),
   authorizeStartInput: (input, knownStore) => authorizeWorkflowRunStartInput(input, "renderer", knownStore),
   scheduledStartsRequireOwnership: true,
-});
+}));
 
 async function authorizeWorkflowRunStartInput(
   input: StartAgentRunInput,
@@ -1067,6 +1072,9 @@ async function authorizeWorkflowRunStartInput(
 ): Promise<StartAgentRunInput> {
   if (!knownStore) assertKnownProjectRoot(input.projectRoot);
   const store = knownStore ?? await getWorkflowStore(input.projectRoot);
+  if (input.sessionId && store.materializeWorkflowView(input.sessionId).schedulingState.status === "paused") {
+    throw workflowIpcError("UNAVAILABLE", "Workflow scheduling is paused.");
+  }
   if (authority === "renderer") {
     if (isWorkflowPlannerRootStartTarget(input, store)) {
       throw workflowIpcError("DELIVERY_REJECTED", "The renderer cannot start the workflow planner root.");
@@ -2604,6 +2612,41 @@ ipcMain.handle("workspace:save", async (_event, state: unknown) => {
   return workspaceSaveWriter.save(state);
 });
 
+for (const [channel, status] of [
+  ["workflow:scheduling:pause", "paused"],
+  ["workflow:scheduling:resume", "active"],
+] as const) {
+  ipcMain.handle(channel, workflowHandler(async (projectRoot: string, input: WorkflowSchedulingControlRequest) => {
+    if (!isRecord(input)) throw workflowIpcError("INVALID_INPUT", "Workflow scheduling request must be an object.");
+    const projectIdentity = await planProjectIdentities.canonicalize(projectRoot);
+    // Initialization can advance; finish it before entering the project queue.
+    const store = await getWorkflowStore(projectIdentity);
+    return enqueueWorkflowProjectAdvance(projectIdentity, async () => {
+      // Store transactions validate the strict control contract and own retry semantics.
+      const request = { sessionId: input.sessionId, requestId: input.requestId,
+        expectedStatus: input.expectedStatus, expectedRevision: input.expectedRevision, now: new Date().toISOString() };
+      const result = status === "paused"
+        ? store.pauseWorkflowScheduling(request)
+        : store.resumeWorkflowScheduling(request);
+      if (status === "active" && result.created) {
+        // Already inside the launch queue: do not recursively enqueue an advance.
+        await advanceOneWorkflowSession(projectIdentity, store, input.sessionId, "workflow-mutation");
+      }
+      const view = store.materializeWorkflowView(input.sessionId);
+      broadcastWorkflowProjection(projectIdentity, input.sessionId, store);
+      return {
+        protocolVersion: RUN_PROTOCOL_VERSION,
+        projection: view.projection,
+        canvasSession: materializeRendererCanvasSession(store, input.sessionId, view.canvasSession),
+        schedulingState: view.schedulingState,
+        nextAction: view.loopState.nextAction,
+        mutation: { eventId: result.event.id, requestId: request.requestId, created: result.created,
+          status, revision: request.expectedRevision + 1 },
+      };
+    });
+  }));
+}
+
 function workspaceStorePath(): string {
   return path.join(app.getPath("userData"), "workspace.json");
 }
@@ -3048,8 +3091,11 @@ async function compensateTerminalPersistenceFailure(failure: TerminalPersistence
     }
     if (!workflowAdvanceAdmissionOpen) return;
     const cause = terminalWorkflowBroadcastCause(store, segment);
-    await advanceWorkflowSession(projectRoot, store, segment.sessionId, false, cause);
-    broadcastWorkflowProjection(projectRoot, segment.sessionId, store, cause);
+    // Start may be awaiting this durable compensation while holding the launch queue.
+    void observeWorkflowTerminalReconciliation(async () => {
+      await advanceWorkflowSession(projectRoot, store, segment.sessionId, false, cause);
+      broadcastWorkflowProjection(projectRoot, segment.sessionId, store, cause);
+    });
   } catch {
     console.error("terminal-persistence-failed");
     throw new Error("terminal-persistence-failed");
@@ -3452,7 +3498,19 @@ async function advanceWorkflowSession(
   }
 }
 
-function enqueueWorkflowProjectAdvance(projectRoot: string, task: () => Promise<void>): Promise<void> {
+function serializeWorkflowRunStarts(
+  start: (input: StartAgentRunInput) => Promise<unknown>,
+): (input: StartAgentRunInput) => Promise<unknown> {
+  return async (input) => {
+    assertKnownProjectRoot(input.projectRoot);
+    const projectIdentity = await planProjectIdentities.canonicalize(input.projectRoot);
+    await getWorkflowStore(projectIdentity);
+    // Callers may hold the session lock; this queue must never acquire it.
+    return enqueueWorkflowProjectAdvance(projectIdentity, () => start({ ...input, projectRoot: projectIdentity }));
+  };
+}
+
+function enqueueWorkflowProjectAdvance<T>(projectRoot: string, task: () => Promise<T>): Promise<T> {
   const previous = workflowProjectAdvanceTails.get(projectRoot) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(task);
   workflowProjectAdvanceTails.set(projectRoot, next);
