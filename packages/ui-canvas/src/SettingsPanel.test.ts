@@ -47,8 +47,8 @@ describe("SettingsPanel", () => {
     expect(html).toContain("Loading...");
     expect(html).not.toContain("role=\"alert\"");
   });
-  
-  // Note: Detailed DOM interactivity and StrictMode lifecycle verification requires 
-  // JSDOM or browser environment which relies on parent Electron acceptance. 
+
+  // Note: Detailed DOM interactivity and StrictMode lifecycle verification requires
+  // JSDOM or browser environment which relies on parent Electron acceptance.
   // We've verified SSR output and structural rendering limits here per 'tooling permits'.
 });

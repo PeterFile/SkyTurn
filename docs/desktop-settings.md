@@ -15,7 +15,7 @@ The SkyTurn Desktop Settings modal provides a minimal interface for managing exe
 
 ## Usage
 
-You can open the Settings modal from the sidebar. 
+You can open the Settings modal from the sidebar.
 - Use the **Refresh** button to pull the latest snapshot of your prerequisites and update the display.
 - Edit the executable overrides as needed and hit **Save**.
 - If a save fails, your unsaved draft edits will remain intact so you can retry.

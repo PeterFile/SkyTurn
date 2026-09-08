@@ -10,14 +10,14 @@ export function SettingsPanel({
   onClose: () => void;
 }) {
   const [snapshot, setSnapshot] = useState<SettingsSnapshot | null>(null);
-  const [error, setError] = useState<string | null>(() => 
+  const [error, setError] = useState<string | null>(() =>
     (typeof window === "undefined" || !window?.devflow?.settings) ? "Desktop settings API is missing. Settings are unavailable." : null
   );
   const [saveStatus, setSaveStatus] = useState<{ type: 'error' | 'success', message: string } | null>(null);
-  
+
   const [hermesOverride, setHermesOverride] = useState<string | undefined>(undefined);
   const [codexOverride, setCodexOverride] = useState<string | undefined>(undefined);
-  
+
   const [isPending, setIsPending] = useState(() => (typeof window !== "undefined" && !!window?.devflow?.settings));
   const generationRef = useRef(0);
   const initialFocusRef = useRef<HTMLButtonElement>(null);
@@ -33,7 +33,7 @@ export function SettingsPanel({
     setIsPending(true);
     setError(null);
     setSaveStatus(null);
-    
+
     window.devflow.settings.get(projectRoot)
       .then(res => {
         if (gen === generationRef.current) {
@@ -73,7 +73,7 @@ export function SettingsPanel({
         if (focusables.length === 0) return;
         const first = focusables[0];
         const last = focusables[focusables.length - 1];
-        
+
         if (e.shiftKey && document.activeElement === first) {
           e.preventDefault();
           last?.focus();
@@ -94,17 +94,17 @@ export function SettingsPanel({
   const handleSave = useCallback((e: React.FormEvent) => {
     e.preventDefault();
     if (!snapshot || typeof window === "undefined" || !window.devflow?.settings) return;
-    
+
     const gen = ++generationRef.current;
     setIsPending(true);
     setSaveStatus(null);
-    
+
     const hRaw = hermesOverride !== undefined ? hermesOverride : snapshot.settings.app.executableOverrides.hermes;
     const h = hRaw === "" ? null : hRaw;
-    
+
     const cRaw = codexOverride !== undefined ? codexOverride : snapshot.settings.app.executableOverrides.codex;
     const c = cRaw === "" ? null : cRaw;
-    
+
     const nextSettings: SkyTurnSettings = {
       ...snapshot.settings,
       app: {
@@ -116,7 +116,7 @@ export function SettingsPanel({
         }
       }
     };
-    
+
     window.devflow.settings.save(projectRoot, nextSettings)
       .then(res => {
         if (gen === generationRef.current) {
@@ -207,7 +207,7 @@ export function SettingsPanel({
                 <div><strong>Project Root:</strong> <span className="settings-path-wrap">{snapshot.projectRoot}</span></div>
                 <div><strong>Current Branch:</strong> {snapshot.prerequisites.project.git.currentBranch ?? "unknown"}</div>
               </div>
-              
+
               <div className="settings-agent-list">
                 {snapshot.prerequisites.agents.map(agent => (
                   <div key={agent.kind} className="settings-status-box">
