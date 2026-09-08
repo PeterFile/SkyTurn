@@ -69,6 +69,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
+import { ResultOutput } from "./ResultOutput.js";
 
 import type { EditorKind, VariantComparisonEvidence } from "@skyturn/git-worktree";
 import {
@@ -4528,7 +4529,7 @@ function runtimeMatchesStatus(runtime: NodeRuntimeState, status: NodeStatus): bo
   );
 }
 
-function NodeModal({
+export function NodeModal({
   node,
   projectRoot,
   session,
@@ -4774,7 +4775,7 @@ function EditorLaunchIcon({ option }: { option: EditorLaunchOption }) {
   );
 }
 
-function OutputTab({
+export function OutputTab({
   node,
   onDecisionAnswer,
 }: {
@@ -4782,15 +4783,12 @@ function OutputTab({
   onDecisionAnswer: (option: string) => void;
 }) {
   return (
-    <div className="output-lines">
+    <>
       {node.userDecision && (
         <UserDecisionPanel node={node} onDecisionAnswer={onDecisionAnswer} />
       )}
-      {node.output.map((line, index) => (
-        <p key={`${node.id}-${index}`}>{line}</p>
-      ))}
-      {node.output.length === 0 && <p>No node output yet.</p>}
-    </div>
+      <ResultOutput key={JSON.stringify([node.id, node.runId])} node={node} />
+    </>
   );
 }
 
