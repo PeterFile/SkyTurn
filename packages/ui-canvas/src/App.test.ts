@@ -10,6 +10,7 @@ import {
   plannerSessionStatusForSnapshot,
 } from "./terminalInspector.js";
 import {
+  browserEditorAdapter,
   emptyWorkspace,
   normalizeWorkspaceState,
   type TerminalSnapshotResult,
@@ -964,6 +965,57 @@ describe("changes logic", () => {
 async function readSource(path: string): Promise<string> {
   return readFile(new URL(path, import.meta.url), "utf8");
 }
+
+describe("node editor action", () => {
+  it.each([
+    ["current_branch '.'", "current_branch", "codex", { path: "." }, "/imported/project"],
+    ["planner current_branch '.'", "current_branch", "hermes", { path: "." }, "/imported/project"],
+    ["planner new_worktree '.'", "new_worktree", "hermes", { path: "." }, "/imported/project"],
+    ["managed realPath", "new_worktree", "codex", { path: "relative", realPath: "/managed/real" }, "/managed/real"],
+    ["absent managed path", "new_worktree", "codex", { path: "" }, null],
+    ["relative managed path", "new_worktree", "codex", { path: "." }, null],
+    ["relative managed realPath", "new_worktree", "codex", { path: "/managed/path", realPath: "relative" }, null],
+  ] as const)("resolves %s for editor without creating worktrees or runs", async (_label, executionTarget, agent, worktree, target) => {
+    const project = workflowProjectForTest("project-1", "/imported/project", "/canonical/project");
+    const session = canvasSessionForTest("editor-session");
+    session.target.executionTarget = executionTarget;
+    const node = mockNode(agent);
+    if (agent === "hermes") node.id = session.plannerNodeId;
+    node.worktree = { ...node.worktree, ...worktree };
+    session.nodes = [node];
+    const nativeResult = { ok: false, message: "Native editor launch failed." };
+    const openEditor = vi.fn().mockResolvedValue(nativeResult);
+    const createWorktree = vi.fn();
+    const startAgentRun = vi.fn();
+    const adapter = vi.spyOn(browserEditorAdapter, "openWorktree");
+    vi.stubGlobal("window", { devflow: { openEditor, workflow: { createWorktree }, startAgentRun } });
+    try {
+      const open = Reflect.get(AppModule, "openNodeEditor") as typeof AppModule.openNodeEditor;
+      expect(open).toBeTypeOf("function");
+      const result = await open(project, session, node, "vscode");
+      if (target) {
+        expect(openEditor).toHaveBeenCalledExactlyOnceWith("vscode", target);
+        expect(result).toBe(nativeResult);
+      } else {
+        expect(result).toEqual({ ok: false, message: "Editor target is unavailable because the managed worktree has no absolute path." });
+        expect(adapter).not.toHaveBeenCalled();
+        expect(openEditor).not.toHaveBeenCalled();
+      }
+      expect(createWorktree).not.toHaveBeenCalled();
+      expect(startAgentRun).not.toHaveBeenCalled();
+    } finally {
+      adapter.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("writes editor failure and native launch messages to visible node Output", async () => {
+    const source = await readSource("./App.tsx");
+    const action = source.slice(source.indexOf("  async function openEditor("), source.indexOf("  if (!activeProject) {"));
+    expect(action).toContain("await openNodeEditor(activeProject, activeSession, node, editor)");
+    expect(action).toContain("output: [...current.output, result.message]");
+  });
+});
 
 describe("UI source validation", () => {
   it("does not use inline styles in Session controls and ChangesTab", async () => {

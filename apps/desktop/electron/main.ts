@@ -64,6 +64,7 @@ import {
 } from "./workflowIpcContracts";
 import { adoptWorkflowWorktree, compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
 import { createTerminalRuntime } from "./terminalRuntime";
+import { createEditorRuntime } from "./editorRuntime";
 import {
   compensateFailedWorkflowRun,
   recoverPendingCandidateManifestFreezes,
@@ -946,16 +947,26 @@ ipcMain.handle("project:branchFacts", async (_event, projectRoot: string) => {
   return { protocolVersion: RUN_PROTOCOL_VERSION, ...facts };
 });
 
-ipcMain.handle("editor:openWorktree", async (_event, editor: string, worktreePath: string) => {
-  if (editor === "finder") {
-    const error = await shell.openPath(worktreePath);
-    return { ok: !error, message: error || "Opened worktree path." };
-  }
-  return {
-    ok: true,
-    message: `${editor} launch is mocked in the MVP; target: ${worktreePath}`,
-  };
+const editorRuntime = createEditorRuntime({
+  openedProjectRoots,
+  canonicalizeProjectRoot: (root) => planProjectIdentities.canonicalize(root),
+  listWorktreeEvents: async (root) => {
+    const store = await getWorkflowStore(root);
+    return store.listWorkflowSessionIds().flatMap((sessionId) => managedWorktreeEventsFromStore(store.listEvents(sessionId)));
+  },
+  reconcileWorktree: async (identity) => {
+    const { NodeGitWorktreeService } = await import("@skyturn/git-worktree/node");
+    return new NodeGitWorktreeService().reconcileManagedWorktree(identity, { allowHeadAdvance: true });
+  },
+  openEditor: async (editor, target) => {
+    const { NodeEditorAdapter } = await import("@skyturn/git-worktree/node");
+    return new NodeEditorAdapter().openWorktree(editor, target);
+  },
+  openPath: (target) => shell.openPath(target),
 });
+
+ipcMain.handle("editor:openWorktree", async (_event, editor: unknown, worktreePath: unknown) =>
+  editorRuntime.open(editor, worktreePath));
 
 ipcMain.handle("agent:discover", async () => {
   const bridge = await getAgentBridge();
