@@ -1747,6 +1747,10 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
   const declaredLaneStatuses = new Map<string, FlowLaneStatus>();
 
   for (const event of unique) {
+    if (invalidRetryLifecycleEvent(projection, event)) {
+      projection.events = projection.events.filter((recorded) => recorded.id !== event.id);
+      continue;
+    }
     if (event.kind === "workflow.scheduling.paused" || event.kind === "workflow.scheduling.resumed") {
       projection.schedulingState = applyWorkflowSchedulingControl(projection.schedulingState, event);
     }
@@ -1862,6 +1866,9 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
       );
       projection.evidence.push(evidence);
       if (evidence.status === "passed" && isCurrentRetrySegment(projection, laneId, segmentId)) setLaneStatus(projection, evidence.laneId, "completed");
+      if (lane?.retryAttempt && evidence.status === "passed" && evidence.runEvidence?.status === "succeeded") {
+        updateSegment(projection, segmentId, "succeeded", evidence.runEvidence.exitCode);
+      }
       const evidenceTerminalStatus = terminalSegmentStatusFromEvidence(evidence);
       if (evidenceTerminalStatus) {
         const segmentStatus = isBlockingTerminalSegmentStatus(recordedSegment?.status)
@@ -4668,6 +4675,63 @@ function latestSegmentForLane(projection: FlowProjection, laneId: string): FlowS
 function isCurrentRetrySegment(projection: FlowProjection, laneId: string, segmentId: string | null): boolean {
   const retry = projection.lanes.find((lane) => lane.id === laneId)?.retryAttempt;
   return !retry || retry.segmentId === segmentId;
+}
+
+// Retry reservations are created by the backend. Replay validates that lifecycle;
+// persistence separately prevents caller-supplied events from claiming scheduler ownership.
+function invalidRetryLifecycleEvent(projection: FlowProjection, event: FlowEvent): boolean {
+  if (![
+    "workflow.lane.declared", "workflow.lane.status_changed", "workflow.join.completed", "workflow.commit.created",
+    "workflow.segment.started", "workflow.segment.output_delta", "workflow.segment.finished", "workflow.evidence.recorded",
+  ].includes(event.kind)) return false;
+  const payload = event.payload;
+  const segment = isRecord(payload.segment) ? payload.segment : {};
+  const declared = isRecord(payload.lane) ? payload.lane : {};
+  const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+  const runEvidence = isRecord(evidence.runEvidence) ? evidence.runEvidence : {};
+  const delta = isRecord(payload.delta) ? payload.delta : {};
+  const laneIds = [payload.laneId, segment.laneId, evidence.laneId, declared.id].filter((id) => id !== undefined);
+  const segmentIds = [payload.segmentId, segment.id, evidence.segmentId].filter((id) => id !== undefined);
+  const runIds = [payload.runId, segment.runId, runEvidence.runId, delta.runId].filter((id) => id !== undefined);
+  const refersTo = (ids: unknown[], id: string) => ids.some((value) => typeof value === "string" && value.trim() === id);
+  const related = projection.lanes.filter((lane) => lane.retryAttempt && (
+    refersTo(laneIds, lane.id) || refersTo([declared.semanticKey], lane.semanticKey) ||
+    refersTo(segmentIds, lane.retryAttempt.segmentId) || refersTo(runIds, lane.retryAttempt.runId) ||
+    projection.segments.some((item) => item.laneId === lane.id && (refersTo(segmentIds, item.id) || refersTo(runIds, item.runId)))
+  ));
+  if (related.length === 0) return false;
+  const lane = related[0]!;
+  if (related.length !== 1 || event.sessionId !== projection.sessionId ||
+    (payload.sessionId !== undefined && payload.sessionId !== projection.sessionId) ||
+    laneIds.some((id) => id !== lane.id)) return true;
+  if (event.kind === "workflow.segment.started") {
+    const retry = lane.retryAttempt!;
+    return segment.id !== retry.segmentId || segment.runId !== retry.runId || segment.laneId !== lane.id ||
+      segmentIds.some((id) => id !== retry.segmentId) || runIds.some((id) => id !== retry.runId) ||
+      segment.status !== "running" || event.source !== "workflow-scheduler" ||
+      event.idempotencyKey !== `schedule:${retry.segmentId}:started` ||
+      projection.schedulingState.status === "paused" || (lane.status !== "pending" && lane.status !== "ready");
+  }
+  const recorded = projection.segments.find((item) => item.id === payload.segmentId && item.laneId === lane.id);
+  if (!recorded || payload.laneId !== lane.id || segmentIds.some((id) => id !== recorded.id) ||
+    runIds.some((id) => id !== recorded.runId)) return true;
+  if (recorded.id === lane.retryAttempt!.segmentId && recorded.runId !== lane.retryAttempt!.runId) return true;
+  if (event.kind === "workflow.segment.output_delta") {
+    return delta.runId !== recorded.runId || recorded.status !== "running";
+  }
+  if (event.kind === "workflow.evidence.recorded") {
+    const parsed = parseRunEvidence(evidence.runEvidence);
+    if (!parsed || parsed.runId !== recorded.runId || !isTerminalAgentRunStatus(parsed.status)) return true;
+    const normalized = normalizeEvidence(evidence, lane.id, recorded.id, lane);
+    const status = terminalSegmentStatusFromEvidence(normalized) ?? (normalized.status === "passed" ? "succeeded" : null);
+    return conflictsWithFirstTerminalRunEvidence(projection, normalized) ||
+      (recorded.status !== "running" && (recorded.status !== status || recorded.exitCode !== parsed.exitCode));
+  }
+  if (event.kind === "workflow.segment.finished") {
+    if (!["succeeded", "failed", "cancelled", "timed-out"].includes(String(payload.status))) return true;
+    return recorded.status !== "running" && (payload.status !== recorded.status || numberOrNull(payload.exitCode) !== recorded.exitCode);
+  }
+  return true;
 }
 
 function hasScopeConflict(lane: FlowLane, occupied: Array<{ fileScopes: string[]; packageScopes: string[] }>): boolean {
