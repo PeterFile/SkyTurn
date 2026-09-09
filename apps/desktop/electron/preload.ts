@@ -4,6 +4,8 @@ import type {
   PlanApi,
   SettingsApi,
   WorkflowApi,
+  WorkflowSchedulingControlRequest,
+  WorkflowSchedulingResult,
   WorkflowLaneReassignRequest,
   WorkflowLaneReassignResult,
   WorkflowNodePositionUpdateRequest,
@@ -110,6 +112,10 @@ const reassignWorkflowLane = (
 const reassignLane: WorkflowApi["reassignLane"] = reassignWorkflowLane;
 
 const workflow = {
+  pauseScheduling: (projectRoot: string, input: WorkflowSchedulingControlRequest): Promise<WorkflowSchedulingResult> =>
+    invokeWorkflow("workflow:scheduling:pause", projectRoot, [input], "projection"),
+  resumeScheduling: (projectRoot: string, input: WorkflowSchedulingControlRequest): Promise<WorkflowSchedulingResult> =>
+    invokeWorkflow("workflow:scheduling:resume", projectRoot, [input], "projection"),
   createSession: (projectRoot: string, input: unknown) =>
     invokeWorkflow("workflow:createSession", projectRoot, [input], "required"),
   finishPlan: (projectRoot: string, input: unknown) =>
