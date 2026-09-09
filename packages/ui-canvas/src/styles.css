@@ -7803,7 +7803,7 @@ textarea.canvas-composer-input:disabled {
   padding: 8px 10px;
   border: 1px solid var(--sk-border);
   border-radius: var(--sk-radius-sm);
-  background: var(--sk-surface-hover);
+  background: var(--sk-surface);
   color: var(--sk-text);
   font-size: 13px;
 }

@@ -29,6 +29,35 @@ function exactCssBlockCount(styles: string, selector: string): number {
 }
 
 describe("SkyTurn UI style tokens", () => {
+  it("keeps executable override text readable on the neutral dark Settings input", async () => {
+    const styles = await readSource("./styles.css");
+    const input = lastCssRuleForSelector(styles, ".settings-input");
+    // Later root declarations override earlier theme values.
+    const rootTokens = new Map<string, string>();
+    for (const root of styles.matchAll(/^:root \{([^}]+)\}/gm)) {
+      for (const token of root[1].matchAll(/(--sk-[\w-]+):\s*([^;]+);/g)) {
+        rootTokens.set(token[1], token[2].trim());
+      }
+    }
+
+    const luminances = ["color", "background"].map((property) => {
+      const token = input.match(new RegExp(`\\n\\s*${property}:\\s*var\\((--sk-[\\w-]+)\\);`))?.[1];
+      expect(token, `Settings input ${property} token`).toBeDefined();
+      const color = rootTokens.get(token ?? "") ?? "";
+      expect(color, `Final root value for ${token}`).toMatch(/^#[0-9a-f]{6}$/i);
+      const channels = [1, 3, 5].map((offset) => {
+        const channel = Number.parseInt(color.slice(offset, offset + 2), 16) / 255;
+        return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+      });
+      return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+    });
+    const contrast = (Math.max(...luminances) + 0.05) / (Math.min(...luminances) + 0.05);
+
+    expect(contrast).toBeGreaterThan(4.5);
+    expect(input).toContain("color: var(--sk-text);");
+    expect(input).toContain("background: var(--sk-surface);");
+  });
+
   it("keeps one authoritative flat Plan cascade", async () => {
     const styles = await readSource("./styles.css");
     expect(styles.match(/Plan mode — flat single-column document surface/g) ?? []).toHaveLength(1);
