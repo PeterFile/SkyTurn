@@ -1,3 +1,4 @@
+@import "./ResultOutput.css";
 @import "diff2html/bundles/css/diff2html.min.css";
 
 :root {
@@ -6117,6 +6118,10 @@ select:focus-visible,
   rotate: 0deg;
 }
 
+.node-modal:has(> .node-failure-summary) {
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+}
+
 .node-modal .modal-body {
   overflow: auto;
 }
@@ -7752,4 +7757,112 @@ textarea.canvas-composer-input:disabled {
   color: var(--sk-text-muted);
   text-align: right;
   opacity: 0.7;
+}
+
+/* Settings Modal */
+.settings-modal-backdrop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: fixed;
+  inset: 0;
+  background: var(--sk-backdrop-strong);
+  z-index: 1000;
+  pointer-events: auto;
+}
+
+.settings-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(600px, calc(100vw - 64px));
+  max-height: calc(100vh - 64px);
+  min-height: 400px;
+  margin: 0;
+  background: var(--sk-surface);
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-md);
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.settings-modal-body {
+  padding: 24px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.settings-form-group {
+  margin-bottom: 16px;
+}
+
+.settings-form-group label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--sk-text);
+}
+
+.settings-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-surface);
+  color: var(--sk-text);
+  font-size: 13px;
+}
+
+.settings-section-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 24px 0 12px;
+  border-bottom: 1px solid var(--sk-border-muted);
+  padding-bottom: 6px;
+  color: var(--sk-text-strong);
+}
+
+.settings-status-box {
+  background: var(--sk-surface-warm);
+  border: 1px solid var(--sk-border-muted);
+  border-radius: var(--sk-radius-sm);
+  padding: 12px;
+  font-size: 12px;
+  color: var(--sk-text-subtle);
+  margin-bottom: 12px;
+}
+
+.settings-status-box strong {
+  color: var(--sk-text);
+}
+
+.settings-path-wrap {
+  word-break: break-all;
+}
+
+.settings-agent-kind {
+  text-transform: capitalize;
+  font-weight: bold;
+  margin-bottom: 4px;
+  color: var(--sk-text-strong);
+}
+
+.settings-agent-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+.settings-agent-details > div {
+  flex: 1 1 45%;
+}
+
+.settings-form-footer {
+  margin-top: 24px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.settings-save-button {
+  background: var(--sk-accent);
+  color: var(--sk-text-inverse-warm);
 }

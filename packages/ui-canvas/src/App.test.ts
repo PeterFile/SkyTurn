@@ -47,6 +47,8 @@ import {
   isPlanFinishEnabled,
   upsertWorkflowNextAction,
   UserDecisionPanel,
+  NodeModal,
+  OutputTab,
   workflowNextActionForScope,
 } from "./App.js";
 import * as AppModule from "./App.js";
@@ -310,6 +312,57 @@ function mockNode(agent: "hermes" | "codex" = "codex"): CanvasNode {
     },
   };
 }
+
+describe("readable node Output integration", () => {
+  it("renders exact split output after the existing decision panel", () => {
+    const node = mockNode();
+    node.output = ["# Re", "sult\n\n`", "``text\n  exact\t\n\n", "same", "same\n```"];
+    node.userDecision = {
+      decisionId: "decision-output",
+      prompt: "Choose the next step",
+      reason: "Input is required.",
+      options: ["Continue"],
+      status: "waiting_input",
+    };
+    const html = renderToStaticMarkup(createElement(OutputTab, { node, onDecisionAnswer: vi.fn() }));
+    expect(html).toContain("<h1>Result</h1>");
+    expect(html).toContain('class="language-text">  exact\t\n\nsamesame\n</code>');
+    expect(html).toContain(">Continue</span>");
+    expect(html.indexOf('class="decision-panel"')).toBeLessThan(html.indexOf('class="result-output"'));
+    expect(html).not.toContain('class="output-lines"');
+  });
+
+  it("reaches readable Output through the real node modal with exactly three content tabs", () => {
+    const node = mockNode();
+    node.output = ["# Modal re", "sult\n\n![Diagram](https://example.com/image.png)\n\n", "[unsafe](https://user:secret@example.com) [safe](https://example.com)"];
+    const html = renderToStaticMarkup(createElement(NodeModal, {
+      node,
+      projectRoot: "/project",
+      session: canvasSessionForTest("session-output", "project-output"),
+      runEvents: [],
+      runEvidence: null,
+      tab: "Output",
+      onTab: vi.fn(),
+      onClose: vi.fn(),
+      onStop: vi.fn(),
+      onRetry: vi.fn(),
+      retryUnavailableReason: null,
+      onReassign: vi.fn(),
+      onInsertBefore: vi.fn(),
+      onOpenEditor: vi.fn(),
+      onDecisionAnswer: vi.fn(),
+    }));
+    expect(html).toContain('role="dialog"');
+    const tabs = html.match(/<nav class="modal-tabs"[^>]*>([\s\S]*?)<\/nav>/)?.[1] ?? "";
+    expect([...tabs.matchAll(/<button[^>]*>(.*?)<\/button>/g)].map((match) => match[1]))
+      .toEqual(["Output", "Changes", "Context"]);
+    expect(html).toContain("<h1>Modal result</h1>");
+    for (const control of ["Preview", "Raw text", "Copy"]) expect(html).toContain(`>${control}</button>`);
+    expect(html).toContain('href="https://example.com"');
+    expect(html).not.toContain("user:secret");
+    expect(html).not.toMatch(/<(img|link)\b/);
+  });
+});
 
 function mockRunEvidence(overrides: Partial<RunEvidence> = {}): RunEvidence {
   return {
@@ -4165,5 +4218,21 @@ describe("handleComposerKeyDown", () => {
     const selectedComposer = styleSource.match(/\.canvas-stage\.has-selected-node \.canvas-composer\s*\{([^}]+)\}/)?.[1];
 
     expect(selectedComposer).toMatch(/grid-template-rows:\s*auto 32px;/);
+  });
+});
+
+
+describe("App scheduling response freshness", () => {
+  it("preserves newer scheduling authority when an older response arrives", () => {
+    const requested = canvasSessionForTest("session-1");
+    requested.schedulingState = { status: "active", revision: 4, requestId: null, changedAt: null };
+    const latest = { ...requested, schedulingState: { ...requested.schedulingState, revision: 8 } };
+    const stale = { ...requested, schedulingState: { ...requested.schedulingState, status: "paused" as const, revision: 5 } };
+    const workspace = workflowWorkspaceForTest([
+      workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1"),
+    ], [latest]);
+    const result = applyWorkflowResponseForTest()(workspace, workflowEnvelopeForTest(stale), workflowGuardForTest(requested), 1);
+    expect(result).toBe(workspace);
+    expect((result.sessions[0] as CanvasSession).schedulingState).toEqual(latest.schedulingState);
   });
 });
