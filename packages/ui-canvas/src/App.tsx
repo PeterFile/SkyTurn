@@ -173,6 +173,7 @@ import {
   resolveSessionProjectId,
   toggleCollapsedProjectId,
 } from "./sessionState.js";
+import { SettingsPanel } from "./SettingsPanel.js";
 import {
   DEFAULT_EDITOR_LAUNCH_OPTION,
   EDITOR_LAUNCH_OPTIONS,
@@ -932,6 +933,8 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsBtnRef = useRef<HTMLButtonElement>(null);
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [selectedNodeActionState, setSelectedNodeActionState] = useState<SelectedNodeActionState | null>(null);
   const [agentReadiness, setAgentReadiness] = useState<AgentWorkflowReadinessSummary | null>(null);
@@ -2263,6 +2266,7 @@ export default function App() {
             collapsedProjectIds={workspace.collapsedProjectIds}
             onNewSession={() => openProjectStartPage()}
             onOpenProject={() => void importProject()}
+            onOpenSettings={() => setSettingsOpen(true)}
             onSelectProject={(projectId) =>
               setWorkspace((current) => {
                 const activeSessionId = chooseActiveSessionIdForProject(
@@ -2282,6 +2286,7 @@ export default function App() {
                 collapsedProjectIds: toggleCollapsedProjectId(current.collapsedProjectIds, projectId),
               }))
             }
+            settingsButtonRef={settingsBtnRef}
           />
         )}
       </aside>
@@ -2411,6 +2416,17 @@ export default function App() {
           )}
         </main>
       </div>
+
+      {settingsOpen && (
+        <SettingsPanel
+          key={activeProject?.rootPath ?? "empty"}
+          projectRoot={activeProject?.rootPath ?? ""}
+          onClose={() => {
+            setSettingsOpen(false);
+            settingsBtnRef.current?.focus();
+          }}
+        />
+      )}
 
       {inspectedNode && activeSession?.kind === "canvas" && (
         <NodeModal
@@ -2553,9 +2569,11 @@ function Sidebar({
   collapsedProjectIds,
   onNewSession,
   onOpenProject,
+  onOpenSettings,
   onSelectProject,
   onSelectSession,
   onToggleProjectSessions,
+  settingsButtonRef,
 }: {
   projects: ImportedProject[];
   sessions: CanvasSessionTab[];
@@ -2564,9 +2582,11 @@ function Sidebar({
   collapsedProjectIds: string[];
   onNewSession: () => void;
   onOpenProject: () => void;
+  onOpenSettings: () => void;
   onSelectProject: (projectId: string) => void;
   onSelectSession: (sessionId: string, projectId: string) => void;
   onToggleProjectSessions: (projectId: string) => void;
+  settingsButtonRef?: React.RefObject<HTMLButtonElement | null>;
 }) {
   const collapsedProjects = useMemo(() => new Set(collapsedProjectIds), [collapsedProjectIds]);
 
@@ -2637,7 +2657,7 @@ function Sidebar({
           );
         })}
       </div>
-      <button className="sidebar-settings" type="button" title="Settings" aria-label="Settings">
+      <button ref={settingsButtonRef} className="sidebar-settings" type="button" title="Settings" aria-label="Settings" onClick={onOpenSettings}>
         <Settings size={15} />
         <span>Settings</span>
       </button>
