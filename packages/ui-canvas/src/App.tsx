@@ -98,6 +98,7 @@ import {
   parseRunEvidence,
   summarizeRunEvidence,
   type AgentKind,
+  type AgentDescriptor,
   type AgentWorkflowReadinessSummary,
   type CanvasNode,
   type CanvasSession,
@@ -195,6 +196,7 @@ import {
   type DeliveryPushSummary,
 } from "./deliveryPanel.js";
 import { streamingLogLineForNode, type StreamingLogLine } from "./streamingLog.js";
+import { ReassignAgentPicker, reassignmentEligibility } from "./ReassignAgentPicker.js";
 import { agentIdentityForNode, canUseAgentNodeActions, nodeFooterForNode } from "./nodeDisplay.js";
 import {
   applyRunEventToWorkspace,
@@ -915,6 +917,48 @@ function isConcreteRunId(value: unknown): value is string {
 
 function isTerminalRunEvidenceStatus(status: RunEvidence["status"]): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled" || status === "timed-out";
+}
+
+export function reassignmentUnavailableReason(session: CanvasSession, node: CanvasNode): string | null {
+  if (node.id === session.plannerNodeId) return "Planner root cannot be reassigned.";
+  if (node.rollbackStatus === "rolled_back" || node.rollbackStatus === "inactive") return "Rolled-back or inactive lanes cannot be reassigned.";
+  if (node.nodeKind !== "agent_task" || node.executable !== true || node.runtimePolicy?.executable === false) return "Only executable agent tasks can be reassigned.";
+  // The authoritative canvas maps both pending and ready lanes to pending nodes.
+  if (node.status !== "pending") return "Only pending or ready lanes can be reassigned.";
+  return null;
+}
+
+export async function submitNodeReassignment(options: {
+  nodeId: string;
+  isCurrent: () => boolean;
+  getSession: () => CanvasSession | null;
+  discover: () => Promise<AgentDescriptor[]>;
+  capture: (session: CanvasSession) => WorkflowSessionResponseGuard | null;
+  reassign: NonNullable<Window["devflow"]>["workflow"]["reassignLane"];
+  apply: (response: unknown, guard: WorkflowSessionResponseGuard) => void;
+}, selectedAgent: AgentKind): Promise<void> {
+  const current = () => {
+    if (!options.isCurrent()) throw new Error("Workflow scope changed.");
+    const session = options.getSession();
+    const node = session?.nodes.find((item) => item.id === options.nodeId);
+    if (!session || !node) throw new Error("Workflow lane unavailable.");
+    const reason = reassignmentUnavailableReason(session, node);
+    if (reason !== null) throw new Error(reason);
+    return { session, node };
+  };
+  current();
+  const agents = await options.discover();
+  const { session, node } = current();
+  const eligibility = reassignmentEligibility(agents.find((agent) => agent.kind === selectedAgent), node.agent);
+  if (eligibility.disabled) throw new Error(eligibility.reason);
+  const guard = options.capture(session);
+  if (!guard || !options.isCurrent()) throw new Error("Workflow scope changed.");
+  const result = await options.reassign(guard.queryRoot, {
+    requestId: crypto.randomUUID(), sessionId: session.id, laneId: node.id, agentKind: selectedAgent,
+  });
+  if (!options.isCurrent()) return;
+  if (!canvasSessionForWorkflowAuthority(result, guard)) throw new Error("Authoritative canvas session was not returned.");
+  options.apply(result, guard);
 }
 
 export default function App() {
@@ -2146,32 +2190,22 @@ export default function App() {
     }));
   }
 
-  function reassignNode(nodeId: string) {
-    const order: AgentKind[] = ["hermes", "codex", "gemini", "claude-code", "openclaw"];
-    if (!activeSession || activeSession.kind !== "canvas") return;
-    const node = activeSession.nodes.find((item) => item.id === nodeId);
-    if (!node) return;
-    const nextAgent = order[(order.indexOf(node.agent) + 1) % order.length];
-
-    if (!window.devflow || !activeProject) {
-      setNodeActionError("Workflow backend unavailable.");
-      return;
-    }
-
-    setNodeActionError(null);
-    const requestId = crypto.randomUUID();
-    const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
-    if (!responseGuard) return;
-    void window.devflow.workflow.reassignLane(responseGuard.queryRoot, {
-      requestId,
-      sessionId: activeSession.id,
-      laneId: nodeId,
-      agentKind: nextAgent,
-    }).then((result) => {
-      applyGuardedWorkflowSessionResponse(result, responseGuard);
-    }).catch((error) => {
-      setNodeActionError(error instanceof Error ? error.message : "Failed to reassign workflow lane.");
-    });
+  async function reassignNode(nodeId: string, selectedAgent: AgentKind, isPickerCurrent: () => boolean) {
+    if (!activeProject || activeSession?.kind !== "canvas") throw new Error("Workflow scope unavailable.");
+    const backend = window.devflow;
+    if (!backend?.workflow?.reassignLane || !backend.discoverAgents) throw new Error("Workflow backend unavailable.");
+    await submitNodeReassignment({
+      nodeId,
+      isCurrent: () => isPickerCurrent() && workspaceRef.current.activeProjectId === activeProject.id && workspaceRef.current.activeSessionId === activeSession.id,
+      getSession: () => {
+        const session = workspaceRef.current.sessions.find((item) => item.id === activeSession.id && item.projectId === activeProject.id);
+        return session?.kind === "canvas" ? session : null;
+      },
+      discover: async () => (await backend.discoverAgents()).agents,
+      capture: (session) => captureWorkflowSessionResponseGuard(activeProject, session.id, session),
+      reassign: (root, input) => backend.workflow.reassignLane(root, input),
+      apply: applyGuardedWorkflowSessionResponse,
+    }, selectedAgent);
   }
 
   async function insertBefore(nodeId: string) {
@@ -2429,6 +2463,9 @@ export default function App() {
 
       {inspectedNode && activeSession?.kind === "canvas" && (
         <NodeModal
+          key={JSON.stringify([activeProject.id, activeSession.id, inspectedNode.id])}
+          isCurrentScope={() => workspaceRef.current.activeProjectId === activeProject.id && workspaceRef.current.activeSessionId === activeSession.id}
+          reassignBlockedReason={window.devflow?.workflow?.reassignLane ? reassignmentUnavailableReason(activeSession, inspectedNode) : "Workflow backend unavailable."}
           node={inspectedNode}
           projectRoot={activeProject.rootPath}
           session={activeSession}
@@ -2440,7 +2477,7 @@ export default function App() {
           onStop={() => stopNodeRun(inspectedNode)}
           onRetry={() => retryNode(inspectedNode.id)}
           retryUnavailableReason={window.devflow ? DESKTOP_RETRY_UNAVAILABLE_REASON : null}
-          onReassign={() => reassignNode(inspectedNode.id)}
+          onReassign={(selected, isCurrent) => reassignNode(inspectedNode.id, selected, isCurrent)}
           onInsertBefore={() => insertBefore(inspectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
           onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
@@ -4550,6 +4587,8 @@ function runtimeMatchesStatus(runtime: NodeRuntimeState, status: NodeStatus): bo
 
 function NodeModal({
   node,
+  isCurrentScope,
+  reassignBlockedReason,
   projectRoot,
   session,
   runEvents,
@@ -4566,6 +4605,8 @@ function NodeModal({
   onDecisionAnswer,
 }: {
   node: CanvasNode;
+  isCurrentScope: () => boolean;
+  reassignBlockedReason: string | null;
   projectRoot: string;
   session: CanvasSession;
   runEvents: RunEvent[];
@@ -4576,7 +4617,7 @@ function NodeModal({
   onStop: () => void;
   onRetry: () => void;
   retryUnavailableReason: string | null;
-  onReassign: () => void;
+  onReassign: (selected: AgentKind, isCurrent: () => boolean) => Promise<void>;
   onInsertBefore: () => void;
   onOpenEditor: (editor: EditorKind) => void;
   onDecisionAnswer: (option: string) => void;
@@ -4584,6 +4625,18 @@ function NodeModal({
   const backdropRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
   const closingRef = useRef(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const reassignButtonRef = useRef<HTMLButtonElement>(null);
+  const pickerWasOpen = useRef(false);
+  useLayoutEffect(() => {
+    if (!pickerOpen && pickerWasOpen.current) reassignButtonRef.current?.focus();
+    pickerWasOpen.current = pickerOpen;
+  }, [pickerOpen]);
+  const isPickerCurrent = () => !closingRef.current && isCurrentScope();
+  const closePicker = () => {
+    if (!isPickerCurrent()) return;
+    setPickerOpen(false);
+  };
   const { contextSafe } = useGSAP({ scope: backdropRef });
   const nodeFailureSummary = failureSummaryForNode(node, runEvidence);
   const nodeLatestFailedCheck = latestFailedCheckForDisplay(runEvidence);
@@ -4614,12 +4667,13 @@ function NodeModal({
   const closeWithMotion = contextSafe(() => {
     const backdrop = backdropRef.current;
     const panel = panelRef.current;
-    if (closingRef.current || !backdrop || !panel || userPrefersReducedMotion()) {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    if (!backdrop || !panel || userPrefersReducedMotion()) {
       onClose();
       return;
     }
 
-    closingRef.current = true;
     gsap.killTweensOf([backdrop, panel]);
     gsap.timeline({ onComplete: onClose })
       .to(panel, { autoAlpha: 0, x: 28, duration: 0.18, ease: "power2.in" }, 0)
@@ -4658,7 +4712,8 @@ function NodeModal({
               {retryUnavailableReason}
             </span>
           )}
-          <button onClick={onReassign} disabled={!canExecute}>
+          <button ref={reassignButtonRef} onClick={() => setPickerOpen(true)} disabled={pickerOpen || reassignBlockedReason !== null}
+            title={reassignBlockedReason ?? undefined} aria-expanded={pickerOpen}>
             <Users size={15} />
             Reassign
           </button>
@@ -4668,6 +4723,17 @@ function NodeModal({
           </button>
           <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} />
         </div>
+        {reassignBlockedReason && <p role="status">{reassignBlockedReason}</p>}
+        {pickerOpen && <ReassignAgentPicker
+          scopeId={JSON.stringify([session.projectId, session.id, node.id])}
+          currentAgent={node.agent}
+          agents={undefined}
+          discoverAgents={async () => (await window.devflow!.discoverAgents()).agents}
+          isCurrent={isPickerCurrent}
+          blockedReason={reassignBlockedReason}
+          onSubmit={onReassign}
+          onClose={closePicker}
+        />}
         <nav className="modal-tabs" aria-label="Node details">
           {NODE_MODAL_TABS.map((item) => (
             <button

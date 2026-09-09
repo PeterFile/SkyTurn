@@ -1,4 +1,5 @@
 @import "diff2html/bundles/css/diff2html.min.css";
+@import "./ReassignAgentPicker.css";
 
 :root {
   color: var(--sk-text-legacy);
