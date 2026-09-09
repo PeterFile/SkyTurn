@@ -84,6 +84,7 @@ const knownFlowEventKinds = new Set<string>([
   "workflow.intent.rejected",
   "workflow.scheduling.paused",
   "workflow.scheduling.resumed",
+  "workflow.lane.retry_requested",
   "workflow.lane.declared",
   "workflow.lane.inserted_before",
   "workflow.lane.candidate_bound",

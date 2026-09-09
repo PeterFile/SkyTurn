@@ -61,12 +61,14 @@ import {
   canonicalRequiredEvidenceForLane,
   compilePauseWorkflowScheduling,
   compileResumeWorkflowScheduling,
+  compileWorkflowRetry,
   compileInsertClarificationBefore,
   compileWorkflowIntent,
   createDefaultFlowPolicy,
   evaluateRollbackEligibility,
   nodeStatusProjectionForFlowLane,
   parseWorkflowIntent,
+  parseWorkflowRetryRequest,
   projectLoopEngineeringState,
   reduceWorkflowEvents,
   resolveLaneCandidateBinding,
@@ -79,6 +81,7 @@ import {
   type FlowProjection,
   type InsertClarificationBeforeRequest,
   type WorkflowSchedulingControlRequest,
+  type WorkflowRetryRequest,
   type WorkflowIntentOperationType,
 } from "@skyturn/workflow-kernel";
 
@@ -312,6 +315,12 @@ export interface WorkflowSchedulingControlInput extends WorkflowSchedulingContro
 }
 
 export interface WorkflowSchedulingControlResult {
+  event: WorkflowEventRecord;
+  created: boolean;
+  view: WorkflowMaterializedView;
+}
+
+export interface WorkflowRetryResult {
   event: WorkflowEventRecord;
   created: boolean;
   view: WorkflowMaterializedView;
@@ -1103,6 +1112,7 @@ export class WorkflowStore {
   }
 
   appendWorkflowEvent(input: AppendWorkflowEventInput): WorkflowEventRecord {
+    if (input.kind === "workflow.lane.retry_requested") throw new Error("Retry must use its transactional API.");
     if (input.kind === "workflow.scheduling.paused" || input.kind === "workflow.scheduling.resumed") {
       throw new Error("Workflow scheduling control must use its transactional API.");
     }
@@ -1119,6 +1129,8 @@ export class WorkflowStore {
     assertGenericCheckpointEventHasNoRestrictedFields(input);
     const laneId = laneIdFromPayload(input.payload);
     const projection = this.materializeFlowProjection(input.sessionId);
+    const retryReplay = this.genericRetryLifecycleReplay(input, projection);
+    if (retryReplay) return retryReplay;
     const lane = laneId ? projection.lanes.find((item) => item.id === laneId) : undefined;
     const safeInput = isFlowEventKind(input.kind)
       ? {
@@ -1140,6 +1152,53 @@ export class WorkflowStore {
       return event;
     });
     return tx();
+  }
+
+  private genericRetryLifecycleReplay(input: AppendWorkflowEventInput, projection: FlowProjection): WorkflowEventRecord | null {
+    const lifecycleKind = [
+      "workflow.lane.declared", "workflow.lane.status_changed", "workflow.join.completed", "workflow.commit.created",
+      "workflow.segment.started", "workflow.segment.output_delta", "workflow.segment.finished", "workflow.evidence.recorded",
+      "node_declared", "node_patched", "lane_status_changed", "segment_started", "segment_output_delta", "segment_evidence", "segment_finished",
+    ].includes(input.kind);
+    if (!lifecycleKind && !input.idempotencyKey) return null;
+    const payload = input.payload;
+    const segment = isRecord(payload.segment) ? payload.segment : {};
+    const declared = isRecord(payload.lane) ? payload.lane : {};
+    const evidence = isRecord(payload.evidence) ? payload.evidence : {};
+    const runEvidence = isRecord(evidence.runEvidence) ? evidence.runEvidence : {};
+    const delta = isRecord(payload.delta) ? payload.delta : {};
+    const laneIds = [input.laneId, payload.laneId, segment.laneId, evidence.laneId, declared.id, payload.id];
+    const segmentIds = [input.segmentId, payload.segmentId, segment.id, evidence.segmentId];
+    const runIds = [payload.runId, segment.runId, evidence.runId, runEvidence.runId, delta.runId];
+    const refersTo = (ids: unknown[], id: unknown) => ids.some((value) => typeof value === "string" && value.trim() === id);
+    const retries = this.db.prepare("SELECT session_id, payload_json FROM workflow_events WHERE kind = 'workflow.lane.retry_requested'").all() as Array<{ session_id: string; payload_json: string }>;
+    const touchesRetry = retries.some((row) => {
+      const retry = JSON.parse(row.payload_json) as Record<string, unknown>;
+      const retrySegments = [retry.nextSegmentId, retry.terminalSegmentId];
+      const retryRuns = [retry.nextRunId, retry.terminalRunId];
+      const ownsKey = retrySegments.some((id) => input.idempotencyKey === `schedule:${id}:started` ||
+        input.idempotencyKey?.startsWith(`segment:${id}:`));
+      if (ownsKey) return true;
+      if (!lifecycleKind) return false;
+      const lane = row.session_id === input.sessionId ? projection.lanes.find((item) => item.id === retry.laneId) : undefined;
+      return (row.session_id === input.sessionId && (refersTo(laneIds, retry.laneId) ||
+        (lane && refersTo([declared.semanticKey], lane.semanticKey)))) ||
+        retrySegments.some((id) => refersTo(segmentIds, id)) || retryRuns.some((id) => refersTo(runIds, id));
+    });
+    if (!touchesRetry) return null;
+
+    // Only the private scheduler/result transactions may add Retry lifecycle facts.
+    // Source is caller-controlled; even a perfectly shaped scheduler event is not authority.
+    const existing = input.idempotencyKey
+      ? this.getEventByIdempotencyKey(input.sessionId, input.idempotencyKey)
+      : this.listEvents(input.sessionId).find((event) => event.kind === input.kind && event.source === input.source &&
+        stableJson(event.payload) === stableJson(input.payload));
+    if (existing && existing.kind === input.kind && existing.source === input.source &&
+      stableJson(existing.payload) === stableJson(input.payload) &&
+      (input.laneId == null || input.laneId === (existing.laneId ?? laneIdFromPayload(existing.payload))) &&
+      (input.segmentId == null || input.segmentId === (existing.segmentId ?? existing.payload.segmentId ??
+        (isRecord(existing.payload.segment) ? existing.payload.segment.id : undefined)))) return existing;
+    throw new Error("Retry lifecycle events require the scheduler or run-result API.");
   }
 
   appendUserInput(input: AppendUserInput): WorkflowEventRecord {
@@ -1402,6 +1461,47 @@ export class WorkflowStore {
     return this.controlWorkflowScheduling(input, "paused");
   }
 
+  retryWorkflowLane(input: WorkflowRetryRequest, now: string): WorkflowRetryResult {
+    const request = parseWorkflowRetryRequest(input);
+    const tx = this.db.transaction(() => {
+      const session = this.requireKnownSession(request.sessionId);
+      const projection = this.materializeFlowProjection(request.sessionId);
+      const idempotencyKey = `retry:${request.requestId}`;
+      const collisions = this.db.prepare("SELECT session_id FROM workflow_events WHERE idempotency_key = ?").all(idempotencyKey) as Array<{ session_id: string }>;
+      if (collisions.some((row) => row.session_id !== request.sessionId)) throw new Error("Retry requestId identity conflict.");
+      const digest = createHash("sha256").update(JSON.stringify(request)).digest("hex");
+      const event = compileWorkflowRetry(projection, request, { runId: `run-retry-${digest}`, segmentId: `segment-retry-${digest}` }, now);
+      const existing = this.getEventByIdempotencyKey(request.sessionId, idempotencyKey);
+      if (existing && (existing.source !== event.source || existing.kind !== event.kind || !hasExactObjectKeys(existing.payload, Object.keys(event.payload)) ||
+        stableJson(existing.payload) !== stableJson(event.payload))) throw new Error("Retry requestId identity conflict.");
+      if (!existing) {
+        if (this.listRunningSegments().length > 0) throw new Error("Retry conflicts with active project work.");
+        const before = projection.checkpoints.filter((checkpoint) => checkpoint.phase === "before" &&
+          checkpoint.laneId === request.laneId && checkpoint.segmentId === request.terminalSegmentId && checkpoint.runId === request.terminalRunId);
+        const anchor = before.length === 1 ? before[0] : undefined;
+        const checkpointId = `checkpoint:${request.terminalRunId}:before`;
+        const checkpointEvent = this.getEventByIdempotencyKey(request.sessionId, checkpointId);
+        const node = this.materializeCanvasSession(request.sessionId)?.nodes.find((item) => item.id === request.laneId);
+        const binding = projection.candidateBindings.find((item) => item.laneId === request.laneId);
+        const worktree = node?.worktree;
+        if (!anchor || anchor.id !== checkpointId || anchor.source !== "backend" ||
+          checkpointEvent?.source !== "backend" || checkpointEvent.kind !== "workflow.node.checkpoint_recorded" ||
+          checkpointEvent.laneId !== request.laneId || checkpointEvent.segmentId !== request.terminalSegmentId ||
+          anchor.nodeId !== request.laneId || anchor.executionTarget !== session.target.executionTarget ||
+          !anchor.headCommit || !/^[0-9a-f]{40}$/i.test(anchor.headCommit) || !anchor.worktreePath ||
+          (session.target.executionTarget === "current_branch"
+            ? canonicalPath(anchor.worktreePath) !== this.projectRoot || anchor.branchName !== session.target.selectedBranch || session.target.selectedBranch === "HEAD" || !!anchor.worktreeId
+            : !binding || binding.worktreeId !== anchor.worktreeId || worktree?.worktreeId !== anchor.worktreeId ||
+              !worktree.realPath || canonicalPath(worktree.realPath) !== canonicalPath(anchor.worktreePath) || worktree.branchName !== anchor.branchName)) {
+          throw new Error("Retry requires the original backend checkpoint and trusted worktree binding.");
+        }
+      }
+      const recorded = existing ?? this.insertFlowEventInTransaction(event, now);
+      return { event: recorded, created: !existing, view: this.materializeWorkflowView(request.sessionId) };
+    });
+    return tx.immediate();
+  }
+
   resumeWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult {
     return this.controlWorkflowScheduling(input, "active");
   }
@@ -1573,8 +1673,8 @@ export class WorkflowStore {
     });
     const scheduled = ready.map((lane) => ({
       ...lane,
-      runId: runIdForLane(sessionId, lane.id),
-      segmentId: segmentIdForLane(sessionId, lane.id),
+      runId: lane.retryAttempt?.runId ?? runIdForLane(sessionId, lane.id),
+      segmentId: lane.retryAttempt?.segmentId ?? segmentIdForLane(sessionId, lane.id),
     }));
     return { readyLanes: scheduled, projection };
   }
@@ -1622,8 +1722,8 @@ export class WorkflowStore {
 
     return selected.map((lane) => ({
       ...lane,
-      runId: runIdForLane(sessionId, lane.id),
-      segmentId: segmentIdForLane(sessionId, lane.id),
+      runId: lane.retryAttempt?.runId ?? runIdForLane(sessionId, lane.id),
+      segmentId: lane.retryAttempt?.segmentId ?? segmentIdForLane(sessionId, lane.id),
     }));
   }
 
@@ -1769,7 +1869,7 @@ export class WorkflowStore {
       return false;
     }
     this.insertFlowEventInTransaction({
-      id: `${sessionId}:flow-schedule:${lane.id}`,
+      id: `${sessionId}:flow-schedule:${lane.retryAttempt ? lane.segmentId : lane.id}`,
       sessionId,
       seq: 0,
       kind: "workflow.segment.started",
@@ -1890,6 +1990,14 @@ export class WorkflowStore {
       }
     } else if (!segment || segment.laneId !== input.laneId || segment.runId !== input.runId) {
       throw new Error("Run result segment identity mismatch.");
+    }
+    if ("retryAttempt" in lane && lane.retryAttempt?.segmentId === input.segmentId) {
+      const started = this.getEventByIdempotencyKey(input.sessionId, `schedule:${input.segmentId}:started`);
+      const scheduled = started && isRecord(started.payload.segment) ? started.payload.segment : null;
+      if (lane.retryAttempt.runId !== input.runId || started?.kind !== "workflow.segment.started" ||
+        started.source !== "workflow-scheduler" || started.payload.laneId !== input.laneId ||
+        scheduled?.id !== input.segmentId || scheduled.laneId !== input.laneId || scheduled.runId !== input.runId ||
+        scheduled.status !== "running") throw new Error("Retry result requires its reserved scheduler start.");
     }
     const safeEvidence = parseRunEvidence(input.evidence);
     if (!safeEvidence) throw new Error("Invalid RunEvidence.");
@@ -2194,6 +2302,13 @@ export class WorkflowStore {
     const segment = projection.segments.find((item) => item.id === input.segmentId);
     if (!segment || segment.laneId !== input.laneId || segment.runId !== input.runId) {
       throw new Error("Run checkpoint segment identity mismatch.");
+    }
+    if (input.phase === "before" && lane.retryAttempt?.runId === input.runId) {
+      const original = projection.checkpoints.find((checkpoint) => checkpoint.phase === "before" &&
+        checkpoint.laneId === lane.id && checkpoint.segmentId === lane.retryAttempt?.terminalSegmentId && checkpoint.runId === lane.retryAttempt?.terminalRunId);
+      if (!original || original.worktreePath !== canonicalWorktreePath || original.branchName !== input.branchName || original.worktreeId !== input.worktreeId) {
+        throw new Error("Retry checkpoint must preserve the original worktree and branch binding.");
+      }
     }
     if (input.phase === "before" && segment.status !== "running") {
       throw new Error("Before run checkpoint requires a running scheduled segment.");
@@ -5786,7 +5901,7 @@ function flowLaneToCanvasNode(
     status,
     ...(statusProjection.rollbackStatus ? { rollbackStatus: statusProjection.rollbackStatus } : {}),
     position: { x: 460 + ((index - 1) % 3) * 340, y: 140 + Math.floor((index - 1) / 3) * 220 },
-    runId: latestSegment?.runId ?? runIdForLane(session.id, lane.id),
+    runId: lane.retryAttempt?.runId ?? latestSegment?.runId ?? runIdForLane(session.id, lane.id),
     changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
     output: lane.output,
     ...(lane.outputDeltas && lane.outputDeltas.length > 0 ? { outputDeltas: lane.outputDeltas } : {}),
