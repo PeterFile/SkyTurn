@@ -6118,6 +6118,10 @@ select:focus-visible,
   rotate: 0deg;
 }
 
+.node-modal:has(> .node-failure-summary) {
+  grid-template-rows: auto auto auto auto minmax(0, 1fr);
+}
+
 .node-modal .modal-body {
   overflow: auto;
 }

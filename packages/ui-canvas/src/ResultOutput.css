@@ -8,7 +8,7 @@
 }
 .result-output .result-output-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
 .result-output .result-output-toolbar button { border: 1px solid var(--sk-border); border-radius: var(--sk-radius-sm); background: var(--sk-surface-warm); color: var(--sk-text); padding: 6px 10px; font: inherit; cursor: pointer; }
-.result-output .result-output-toolbar button[aria-pressed="true"] { background: var(--sk-yellow); color: var(--sk-ink); }
+.result-output .result-output-toolbar button[aria-pressed="true"] { background: var(--sk-yellow); color: var(--sk-text-inverse-warm); }
 .result-output .result-output-toolbar button:disabled { opacity: 0.5; cursor: default; }
 .result-output :focus-visible { outline: 2px solid var(--sk-accent); outline-offset: 3px; }
 .result-output .result-output-feedback, .result-output .result-output-status { color: var(--sk-text-subtle); font-size: 12px; }
