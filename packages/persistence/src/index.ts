@@ -1,4 +1,6 @@
-import type { WorkflowLoopNextAction } from "@skyturn/project-core";
+import type { WorkflowLoopNextAction, WorkflowSchedulingState, WorkflowSchedulingStatus } from "@skyturn/project-core";
+import type { WorkflowSchedulingControlRequest } from "@skyturn/workflow-kernel";
+export type { WorkflowSchedulingControlRequest } from "@skyturn/workflow-kernel";
 import type { SettingsApi } from "./settings.js";
 export * from "./settings.js";
 import type {
@@ -96,6 +98,19 @@ export interface WorkflowBroadcastEnvelope extends WorkflowSessionEnvelope {
 }
 
 export type WorkflowSessionResult<T extends object> = T & WorkflowSessionEnvelope;
+
+export interface WorkflowSchedulingResult extends WorkflowSessionEnvelope {
+  projection: unknown;
+  schedulingState: WorkflowSchedulingState;
+  nextAction: WorkflowLoopNextAction;
+  mutation: {
+    eventId: string;
+    requestId: string;
+    created: boolean;
+    status: WorkflowSchedulingStatus;
+    revision: number;
+  };
+}
 
 export interface WorkflowInsertBeforeRequest {
   sessionId: string;
@@ -300,6 +315,8 @@ export interface PlanApi {
 }
 
 export interface WorkflowApi {
+  pauseScheduling: (projectRoot: string, input: WorkflowSchedulingControlRequest) => Promise<WorkflowSchedulingResult>;
+  resumeScheduling: (projectRoot: string, input: WorkflowSchedulingControlRequest) => Promise<WorkflowSchedulingResult>;
   createSession: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ session: unknown; projection: unknown }>>;
   finishPlan: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ event: unknown; ledger: unknown; projection: unknown }>>;
   appendUserInput: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ event: unknown; ledger: unknown; projection: unknown }>>;
