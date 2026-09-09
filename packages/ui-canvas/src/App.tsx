@@ -1,3 +1,4 @@
+import { WorkflowSchedulingControl, type SchedulingAttempt } from "./WorkflowSchedulingControl.js";
 import {
   BaseEdge,
   Controls,
@@ -69,6 +70,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import remarkGfm from "remark-gfm";
+import { ResultOutput } from "./ResultOutput.js";
 
 import type { EditorKind, VariantComparisonEvidence } from "@skyturn/git-worktree";
 import {
@@ -1003,6 +1005,8 @@ export default function App() {
   const bottomComposerSubmissionsRef = useRef(new Map<string, BottomComposerSubmissionState>());
   const activeBottomComposerScopeRef = useRef<string | null>(null);
   const newSessionSubmissionsRef = useRef(new Map<string, NewSessionSubmissionState>());
+  const schedulingAttemptsRef = useRef(new Map<string, SchedulingAttempt>());
+  const [, refreshScheduling] = useReducer((revision: number) => revision + 1, 0);
   const workflowProjectionGenerationRef = useRef(new Map<string, number>());
   const authoritativeRunEvidenceHydratorRef = useRef<AuthoritativeRunEvidenceHydrator | null>(null);
   const planRuntimeRecoveryGeneration = useRef(0);
@@ -1065,6 +1069,18 @@ export default function App() {
     activeProject?.id ?? null,
     activeSession?.id ?? null,
   );
+  const schedulingScope = activeProject && activeSession?.kind === "canvas"
+    ? JSON.stringify([activeProject.id, activeProject.rootPath, activeProject.canonicalRootPath, activeSession.id])
+    : null;
+  const schedulingAttempt = schedulingScope ? schedulingAttemptsRef.current.get(schedulingScope) : undefined;
+  const schedulingUnavailable = activeSession?.kind !== "canvas" || !activeSession.schedulingState
+    ? "Scheduling state unavailable."
+    : !activeProject || !workflowRequestAuthority(activeProject, activeSession.id)
+      ? "Scheduling project authority unavailable."
+      : typeof window.devflow?.workflow?.pauseScheduling !== "function" ||
+        typeof window.devflow?.workflow?.resumeScheduling !== "function" ||
+        (schedulingAttempt && typeof window.devflow?.workflow?.getProjection !== "function")
+        ? "Scheduling backend unavailable." : null;
   const activePlanRunId = activeSession?.kind === "plan"
     ? Object.values(activeSession.stages).find((stage) => stage.runId)?.runId ?? null
     : null;
@@ -1141,7 +1157,7 @@ export default function App() {
     response: unknown,
     guard: WorkflowSessionResponseGuard,
     decorate?: (workspace: WorkspaceState, authoritative: CanvasSession) => WorkspaceState,
-  ): void {
+  ): boolean {
     const current = workspaceRef.current;
     const guarded = applyAuthoritativeWorkflowSessionResponse(
       current,
@@ -1149,9 +1165,9 @@ export default function App() {
       guard,
       currentWorkflowGeneration(workflowProjectionGenerationRef.current, guard),
     );
-    if (guarded === current) return;
+    if (guarded === current) return false;
     const authoritative = canvasSessionForWorkflowAuthority(response, guard);
-    if (!authoritative) return;
+    if (!authoritative) return false;
     const envelope = workflowSessionEnvelope(response);
     if (envelope?.nextAction) {
       setNextActionsBySession((actions) => upsertWorkflowNextAction(
@@ -1167,6 +1183,67 @@ export default function App() {
       authoritative,
       guard,
     );
+    return true;
+  }
+
+  async function toggleWorkflowScheduling(): Promise<void> {
+    if (!schedulingScope || !activeProject || activeSession?.kind !== "canvas" || schedulingUnavailable) return;
+    const attempts = schedulingAttemptsRef.current;
+    const previous = attempts.get(schedulingScope);
+    if (previous?.busy) return;
+    const requestSession = workspaceRef.current.sessions.find((session) => (
+      session.id === activeSession.id && session.projectId === activeProject.id
+    ));
+    if (requestSession?.kind !== "canvas" || !requestSession.schedulingState) return;
+    let guard = captureWorkflowSessionResponseGuard(activeProject, requestSession.id, requestSession);
+    if (!guard) return;
+    const state = requestSession.schedulingState;
+    // Keep the original action and CAS tuple until its outcome is known.
+    const attempt: SchedulingAttempt = { ...(previous ?? {
+      action: state.status === "paused" ? "resume" : "pause",
+      request: { sessionId: requestSession.id, requestId: globalThis.crypto.randomUUID(),
+        expectedStatus: state.status, expectedRevision: state.revision },
+      reload: false,
+    }), busy: true, error: null };
+    attempts.set(schedulingScope, attempt);
+    refreshScheduling();
+    try {
+      const workflow = window.devflow!.workflow;
+      if (previous?.error && !attempt.reload) {
+        // Resume may commit before advance fails; projection recovery advances, exact replay does not.
+        const projection = await workflow.getProjection(guard.queryRoot, guard.sessionId);
+        if (!canvasSessionForWorkflowAuthority(projection, guard)?.schedulingState ||
+            !applyGuardedWorkflowSessionResponse(projection, guard)) {
+          throw new Error("Scheduling recovery response is no longer current.");
+        }
+        const refreshed = workspaceRef.current.sessions.find((session) => (
+          session.id === requestSession.id && session.projectId === activeProject.id
+        ));
+        guard = refreshed?.kind === "canvas"
+          ? captureWorkflowSessionResponseGuard(activeProject, refreshed.id, refreshed) : null;
+        if (!guard) throw new Error("Scheduling recovery authority unavailable.");
+      }
+      const result = attempt.reload
+        ? await workflow.getProjection(guard.queryRoot, guard.sessionId)
+        : await workflow[attempt.action === "pause" ? "pauseScheduling" : "resumeScheduling"](
+            guard.queryRoot, attempt.request,
+          );
+      if (!canvasSessionForWorkflowAuthority(result, guard)?.schedulingState ||
+          !applyGuardedWorkflowSessionResponse(result, guard)) {
+        attempts.set(schedulingScope, { ...attempt, busy: false, reload: true,
+          error: "Scheduling response is no longer current. Reload scheduling before retrying." });
+      } else {
+        attempts.delete(schedulingScope);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // L1 currently wraps these exact store/kernel conflicts in an IPC error message.
+      const conflict = /Workflow scheduling (?:request is stale|requestId conflicts)/.test(message);
+      attempts.set(schedulingScope, { ...attempt, busy: false, reload: attempt.reload || conflict,
+        error: `${message} ${attempt.reload || conflict ? "Reload scheduling before retrying." : "Retry the same request."}` });
+    } finally {
+      refreshScheduling();
+    }
   }
 
   function installAuthoritativeCanvasSession(
@@ -2333,7 +2410,16 @@ export default function App() {
             }))
           }
           onToggleNewTask={() => openProjectStartPage()}
-        />
+        >
+          {activeSession?.kind === "canvas" && (
+            <WorkflowSchedulingControl
+              state={activeSession.schedulingState}
+              attempt={schedulingAttempt}
+              unavailable={schedulingUnavailable}
+              onClick={toggleWorkflowScheduling}
+            />
+          )}
+        </TopBar>
 
         <main className="stage">
           {workspaceLoadError && (
@@ -2515,10 +2601,12 @@ function Home({ onOpenProject }: { onOpenProject: () => void }) {
 }
 
 function TopBar({
+  children,
   activeSession,
   onRenameSession,
   onToggleNewTask,
 }: {
+  children?: ReactNode;
   activeSession: CanvasSessionTab | null;
   onRenameSession: (sessionId: string, title: string) => void;
   onToggleNewTask: () => void;
@@ -2583,6 +2671,7 @@ function TopBar({
         )}
       </div>
       <div className="topbar-actions">
+        {children}
         <button
           className="new-tab-button icon-only"
           type="button"
@@ -4585,7 +4674,7 @@ function runtimeMatchesStatus(runtime: NodeRuntimeState, status: NodeStatus): bo
   );
 }
 
-function NodeModal({
+export function NodeModal({
   node,
   isCurrentScope,
   reassignBlockedReason,
@@ -4860,7 +4949,7 @@ function EditorLaunchIcon({ option }: { option: EditorLaunchOption }) {
   );
 }
 
-function OutputTab({
+export function OutputTab({
   node,
   onDecisionAnswer,
 }: {
@@ -4868,15 +4957,12 @@ function OutputTab({
   onDecisionAnswer: (option: string) => void;
 }) {
   return (
-    <div className="output-lines">
+    <>
       {node.userDecision && (
         <UserDecisionPanel node={node} onDecisionAnswer={onDecisionAnswer} />
       )}
-      {node.output.map((line, index) => (
-        <p key={`${node.id}-${index}`}>{line}</p>
-      ))}
-      {node.output.length === 0 && <p>No node output yet.</p>}
-    </div>
+      <ResultOutput key={JSON.stringify([node.id, node.runId])} node={node} />
+    </>
   );
 }
 
