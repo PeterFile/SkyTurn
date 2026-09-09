@@ -2,6 +2,8 @@
 
 SkyTurn is a desktop development workflow platform for canvas-first task orchestration.
 
+Use **Pause** in the active Canvas header to stop new work from being scheduled; active runs continue. **Resume** allows scheduling again. The button reflects saved session state and is unavailable without authoritative state or the desktop backend. If an outcome is unknown, **Retry** first refreshes the saved state to recover scheduling, then repeats the same request. After a conflict, **Reload scheduling** refreshes the saved state before you choose Pause or Resume again.
+
 ## Project State
 
 - Human entrypoints: `README.md` and `Project.canvas`.

@@ -4167,3 +4167,19 @@ describe("handleComposerKeyDown", () => {
     expect(selectedComposer).toMatch(/grid-template-rows:\s*auto 32px;/);
   });
 });
+
+
+describe("App scheduling response freshness", () => {
+  it("preserves newer scheduling authority when an older response arrives", () => {
+    const requested = canvasSessionForTest("session-1");
+    requested.schedulingState = { status: "active", revision: 4, requestId: null, changedAt: null };
+    const latest = { ...requested, schedulingState: { ...requested.schedulingState, revision: 8 } };
+    const stale = { ...requested, schedulingState: { ...requested.schedulingState, status: "paused" as const, revision: 5 } };
+    const workspace = workflowWorkspaceForTest([
+      workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1"),
+    ], [latest]);
+    const result = applyWorkflowResponseForTest()(workspace, workflowEnvelopeForTest(stale), workflowGuardForTest(requested), 1);
+    expect(result).toBe(workspace);
+    expect((result.sessions[0] as CanvasSession).schedulingState).toEqual(latest.schedulingState);
+  });
+});
