@@ -1,7 +1,7 @@
 import ts from "typescript";
 import { createComposerDraftStore, draftScopeKey } from "./composerDrafts.js";
 import { readFile } from "node:fs/promises";
-import { createElement } from "react";
+import { createElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
@@ -3529,7 +3529,7 @@ describe("Slice C UI behavior", () => {
     expect(composer).toContain("selectedNodeActionScopeKey: string | null");
     expect(composer).toContain("onActionChange");
     expect(composer).toContain("const actionAvailability = selectedNodeActionAvailability");
-    expect(composer).toContain("disabled={disabled || !actionAvailability.repair.enabled}");
+    expect(composer).toContain("disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}");
   });
 
   it("installs only backend-authoritative canvas sessions for Electron creation and bottom input", async () => {
@@ -4193,6 +4193,7 @@ async function composerAppFunctions(names: string[], context: Record<string, unk
   const declarations = new Map<string, string>();
   function visit(node: ts.Node) {
     if (ts.isFunctionDeclaration(node) && node.name) declarations.set(node.name.text, node.getText(ast).replace(/^export /, ""));
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) declarations.set(node.name.text, `const ${node.getText(ast)};`);
     ts.forEachChild(node, visit);
   }
   visit(ast);
@@ -4200,7 +4201,7 @@ async function composerAppFunctions(names: string[], context: Record<string, unk
     expect(declarations.has(name), `App must implement ${name}`).toBe(true);
     return declarations.get(name);
   }).join("\n");
-  const javascript = ts.transpileModule(selected, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
+  const javascript = ts.transpileModule(selected, { fileName: "App.tsx", compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None, jsx: ts.JsxEmit.React } }).outputText;
   const entries = Object.entries(context).filter(([key]) => key !== "default");
   return new Function(...entries.map(([key]) => key), `${javascript}; return { ${names.join(",")} };`)(...entries.map(([, value]) => value));
 }
@@ -4309,7 +4310,7 @@ describe("App composer draft wiring", () => {
 
 describe("App node draft acknowledgements", () => {
   it.each(["repair", "variant", "rollback"] as const)("clears only acknowledged %s versions and preserves selection/generation gates", async (action) => {
-    for (const outcome of ["success", "edited", "switched", "switch-back", "broadcast", "invalid", "blocked", "failed", "removed-project", "unavailable"]) {
+    for (const outcome of ["success", "edited", "pending-action-switch", "switched", "switch-back", "broadcast", "invalid", "blocked", "failed", "removed-project", "unavailable"]) {
       const store = createComposerDraftStore(() => undefined);
       const session = canvasSessionForTest("session-1");
       const project = workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1");
@@ -4360,6 +4361,45 @@ describe("App node draft acknowledgements", () => {
         expect(request).toHaveBeenCalledTimes(1);
         expect(request.mock.calls[0][1][action === "rollback" ? "text" : "instruction"]).toBe(text);
         if (outcome === "edited") { store.edit(key, "away"); store.edit(key, text); }
+        if (outcome === "pending-action-switch") {
+          const { CanvasComposer } = await composerAppFunctions(["CanvasComposer", "NODE_ACTION_IMPACT_COPY"], {
+            ...AppModule, React: { createElement }, useRef: (current: unknown) => ({ current }),
+            useCallback: (callback: unknown) => callback, useGSAP: () => {},
+            Check: "span", AlertTriangle: "span", Plus: "span", Square: "span", ArrowUp: "span",
+          });
+          function elements(tree: ReactNode): ReactElement<Record<string, unknown>>[] {
+            if (Array.isArray(tree)) return tree.flatMap(elements);
+            if (!isValidElement<Record<string, unknown>>(tree)) return [];
+            return [tree, ...elements(tree.props.children as ReactNode)];
+          }
+          const onActionChange = vi.fn((next: string) => {
+            // App's selection effect advances this generation when the action changes.
+            if (next !== action) selectedNodeActionGenerationRef.current++;
+          });
+          const tree = CanvasComposer({
+            value: text, disabled: false, selectedNode: node, selectedRunEvidence: null,
+            selectedNodeActionScopeKey: context.selectedNodeActionScopeKey, action, onActionChange,
+            selectedNodeActionState: { ...context.selectedNodeActionState,
+              checkpoints: { hasBefore: true, hasAfter: true }, remoteSideEffects: [], rollbackEligibility: null },
+            nodeActionBusy: pendingNodeActionsRef.current.get(context.selectedNodeActionScopeKey),
+            nodeActionError: null, nodeActionStatus: null, workflowBackendAvailable: true,
+            bottomComposerState: null, nextActionHint: null,
+            onChange: (value: string) => store.edit(key, value), onSubmit: vi.fn(), onStop: vi.fn(),
+          });
+          const controls = elements(tree);
+          const chips = controls.filter(element => element.type === "button" && String(element.props.className).startsWith("action-chip"));
+          expect(chips.map(chip => chip.props.children)).toEqual(["Repair", "Variant", "Rollback"]);
+          expect.soft(chips.map(chip => chip.props.disabled)).toEqual([true, true, true]);
+          // Native disabled buttons do not dispatch clicks; exercise the opposite branch before the fix.
+          for (const chip of chips) if (!chip.props.disabled) (chip.props.onClick as () => void)();
+          const input = controls.find(element => element.type === "textarea")!;
+          expect(input.props.disabled).toBe(false);
+          (input.props.onChange as (event: unknown) => void)({ target: { value: `${text}\nnew draft` } });
+          expect(store.read(key).text).toBe(`${text}\nnew draft`);
+          expect(workspaceRef.current.sessions[0]).toBe(session);
+          expect(apply).not.toHaveBeenCalled();
+          expect(status.mock.calls.filter(([value]) => value !== null)).toHaveLength(0);
+        }
         if (outcome === "switched" || outcome === "switch-back") {
           selectedNodeActionScopeRef.current = { sessionId: session.id, nodeId: "node-2" };
           selectedNodeActionGenerationRef.current++;
@@ -4374,12 +4414,19 @@ describe("App node draft acknowledgements", () => {
         if (outcome === "broadcast") workspaceRef.current = { ...workspaceRef.current, sessions: [{ ...session, title: "broadcast" }] };
         if (outcome === "removed-project") workspaceRef.current = { ...workspaceRef.current, projects: [] };
         if (outcome === "failed") reject(new Error("UNAVAILABLE"));
-        else resolve(outcome === "invalid" ? null : { ...workflowEnvelopeForTest(session), ...(outcome === "blocked" ? { status: "blocked" } : {}) });
+        else resolve(outcome === "invalid" ? null : { ...workflowEnvelopeForTest(outcome === "pending-action-switch" ? { ...session, title: "Accepted node action" } : session), ...(outcome === "blocked" ? { status: "blocked" } : {}) });
         await pending;
         const acknowledged = ["success", "edited", "switched", "switch-back", "broadcast"].includes(outcome);
-        expect(store.read(key).text, outcome).toBe(acknowledged && outcome !== "edited" ? "" : text);
+        expect(store.read(key).text, outcome).toBe(outcome === "pending-action-switch" ? `${text}\nnew draft` : acknowledged && outcome !== "edited" ? "" : text);
         expect(pendingNodeActionsRef.current.size).toBe(0);
-        expect(status.mock.calls.filter(([value]) => value !== null).length, outcome).toBe(["success", "edited"].includes(outcome) ? 1 : 0);
+        expect(status.mock.calls.filter(([value]) => value !== null).length, outcome).toBe(["success", "edited", "pending-action-switch"].includes(outcome) ? 1 : 0);
+        if (outcome === "pending-action-switch") {
+          expect(apply).toHaveBeenCalledTimes(1);
+          expect(workspaceRef.current.sessions[0].title).toBe("Accepted node action");
+          expect(status).toHaveBeenLastCalledWith(action === "rollback"
+            ? "Rollback affects selected and downstream workflow state, not evidence/history."
+            : `${action === "repair" ? "Repair" : "Variant"} lane requested.`);
+        }
         if (outcome === "broadcast") expect(workspaceRef.current.sessions[0].title).toBe("broadcast");
         if (outcome === "switched") expect(store.read(draftScopeKey(["node", project.id, session.id, "node-2", action])).text).toBe("other node");
       } finally { vi.unstubAllGlobals(); }

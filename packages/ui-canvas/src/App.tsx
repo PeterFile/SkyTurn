@@ -7197,7 +7197,7 @@ function CanvasComposer({
                 className={`action-chip ${action === "repair" ? "selected" : ""}`}
                 onClick={() => onActionChange("repair")}
                 aria-pressed={action === "repair"}
-                disabled={disabled || !actionAvailability.repair.enabled}
+                disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
                 title={actionAvailability.repair.reason ?? NODE_ACTION_IMPACT_COPY.repair}
               >
                 Repair
@@ -7207,7 +7207,7 @@ function CanvasComposer({
                 className={`action-chip ${action === "variant" ? "selected" : ""}`}
                 onClick={() => onActionChange("variant")}
                 aria-pressed={action === "variant"}
-                disabled={disabled || !actionAvailability.variant.enabled}
+                disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
                 title={actionAvailability.variant.reason ?? NODE_ACTION_IMPACT_COPY.variant}
               >
                 Variant
@@ -7217,7 +7217,7 @@ function CanvasComposer({
                 className={`action-chip ${action === "rollback" ? "selected" : ""}`}
                 onClick={() => onActionChange("rollback")}
                 aria-pressed={action === "rollback"}
-                disabled={disabled || !actionAvailability.rollback.enabled}
+                disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
                 title={actionAvailability.rollback.reason ?? NODE_ACTION_IMPACT_COPY.rollback}
               >
                 Rollback
