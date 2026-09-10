@@ -28,10 +28,16 @@ export function buildNextSafeActionHint(
   nodes: readonly CanvasNode[],
 ): NextSafeActionHint | null {
   if (action.kind === "none") return null;
+  const navigation = resolveNextActionNavigation(action, nodes);
+  let label = labels[action.kind];
+  if (navigation) {
+    if (action.kind === "blocked") label = "Locate blocked task";
+    if (action.kind === "wait_for_checks") label = "Review pending checks";
+  }
   return {
-    label: labels[action.kind],
+    label,
     reason: action.reason,
-    navigation: resolveNextActionNavigation(action, nodes),
+    navigation,
   };
 }
 
@@ -39,13 +45,13 @@ export function resolveNextActionNavigation(
   action: WorkflowLoopNextAction,
   nodes: readonly CanvasNode[],
 ): NextActionNavigation | null {
-  if (!action.laneId || action.kind === "wait_for_checks" || action.kind === "blocked" || action.kind === "none") {
+  if (!action.laneId || action.kind === "none") {
     return null;
   }
   const node = nodes.find((candidate) => candidate.id === action.laneId);
   if (!node || node.rollbackStatus === "inactive" || node.rollbackStatus === "rolled_back") return null;
   return {
     targetNodeId: node.id,
-    modalTab: action.kind === "fix_failed_checks" || action.kind === "merge_pull_request" ? "Changes" : null,
+    modalTab: action.kind === "wait_for_checks" || action.kind === "fix_failed_checks" || action.kind === "merge_pull_request" ? "Changes" : null,
   };
 }
