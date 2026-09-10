@@ -51,9 +51,10 @@ import {
   OutputTab,
   workflowNextActionForScope,
 } from "./App.js";
+import { createReassignmentController } from "./ReassignAgentPicker.js";
 import * as AppModule from "./App.js";
 import { parsePlanBootstrapSession } from "@skyturn/project-core";
-import type { CanvasNode, CanvasSession, Changeset, FinalChangesetReconciliation, PlanSession, RunEvidence, WorkflowLoopNextAction } from "@skyturn/project-core";
+import type { AgentDescriptor, CanvasNode, CanvasSession, Changeset, FinalChangesetReconciliation, PlanSession, RunEvidence, WorkflowLoopNextAction } from "@skyturn/project-core";
 import type { DeliveryCommitSummary } from "./deliveryPanel.js";
 import type { SelectedNodeActionState } from "./nodeActionState.js";
 import { acceptPlanStage, canFinishPlan, editPlanStage } from "./planRuntime.js";
@@ -2006,26 +2007,6 @@ describe("UI source validation", () => {
     expect(html).toContain("Authorize full host access for Commit verified changes?");
     expect(html).toContain("This run can modify host state outside the project.");
     expect(html).toContain("Authorize this run");
-  });
-
-  it("implements reassignNode with desktop write-through and authoritative session replacement", async () => {
-    const appSource = await readSource("./App.tsx");
-    const fnBody = appSource.slice(appSource.indexOf("function reassignNode"), appSource.indexOf("function insertBefore"));
-
-    expect(fnBody).toContain("window.devflow.workflow.reassignLane(");
-    expect(fnBody).toContain("const requestId = crypto.randomUUID()");
-    expect(fnBody).toContain("requestId,");
-    expect(fnBody).toContain("sessionId: activeSession.id");
-    expect(fnBody).toContain("laneId: nodeId");
-    expect(fnBody).toContain("agentKind: nextAgent");
-    expect(fnBody).toContain("captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession)");
-    expect(fnBody).toContain("reassignLane(responseGuard.queryRoot");
-    expect(fnBody).toContain("applyGuardedWorkflowSessionResponse(result, responseGuard)");
-
-    expect(fnBody).toContain('setNodeActionError("Workflow backend unavailable.")');
-    expect(fnBody).toContain(".catch((error)");
-    expect(fnBody).not.toContain("updateNode(nodeId");
-    expect(fnBody).not.toContain("Task reassigned to");
   });
 
   it("ChangesTab calls createDeliveryCommit without renderer shell imports", async () => {
@@ -4221,6 +4202,126 @@ describe("handleComposerKeyDown", () => {
   });
 });
 
+
+describe("explicit node reassignment integration", () => {
+  function setup() {
+    const session = canvasSessionForTest("session-1");
+    session.nodes = [{ ...mockNode(), nodeKind: "agent_task", executable: true, status: "pending" }];
+    const node = session.nodes[0];
+    const agent: AgentDescriptor = { kind: "gemini", label: "Gemini", status: "available", supportLevel: "experimental-run", executablePath: "/cli", version: null, capabilities: [], configFiles: [] };
+    const guard = { projectId: session.projectId, queryRoot: "/project", canonicalRoot: "/project", sessionId: session.id, requestSession: session, generation: 1 };
+    const authoritative = { ...session, nodes: [{ ...node, agent: "gemini" as const }] };
+    const response = { protocolVersion: 1 as const, projectRoot: "/project", sessionId: session.id, canvasSession: authoritative, event: {}, projection: {} };
+    const options = { nodeId: node.id, isCurrent: vi.fn(() => true), getSession: () => session, discover: vi.fn(async () => [agent]), capture: vi.fn(() => guard), reassign: vi.fn(async () => response), apply: vi.fn() };
+    const submit = Reflect.get(AppModule, "submitNodeReassignment");
+    expect(submit).toBeTypeOf("function");
+    return { session, node, agent, guard, response, options, submit: (selected = "gemini") => submit(options, selected) };
+  }
+  it("discovers again and sends the explicit selection, applying only the backend response", async () => {
+    const { options, response, guard, submit, node } = setup();
+    await submit();
+    expect(options.discover).toHaveBeenCalledOnce();
+    expect(options.reassign).toHaveBeenCalledWith("/project", { sessionId: "session-1", laneId: node.id, agentKind: "gemini", requestId: expect.any(String) });
+    expect(options.apply).toHaveBeenCalledExactlyOnceWith(response, guard);
+    expect(node.agent).toBe("codex");
+  });
+  it.each(["missing", "unhealthy", "auth", "current", "running", "planner", "inactive", "non-executable"])("rejects %s selection or lane before mutation", async (reason) => {
+    const { options, node, session, agent, submit } = setup();
+    if (reason === "missing") options.discover.mockResolvedValue([]);
+    if (reason === "unhealthy") options.discover.mockResolvedValue([{ ...agent, status: "unhealthy" }]);
+    if (reason === "auth") options.discover.mockResolvedValue([{ ...agent, status: "needs-auth" }]);
+    if (reason === "current") node.agent = "gemini";
+    if (reason === "running") node.status = "running";
+    if (reason === "planner") session.plannerNodeId = node.id;
+    if (reason === "inactive") node.rollbackStatus = "inactive";
+    if (reason === "non-executable") node.executable = false;
+    await expect(submit()).rejects.toThrow();
+    expect(options.reassign).not.toHaveBeenCalled();
+    expect(options.apply).not.toHaveBeenCalled();
+  });
+  it("checks scope before discovery and again before dispatch", async () => {
+    const { options, submit } = setup();
+    options.isCurrent.mockReturnValue(false);
+    await expect(submit()).rejects.toThrow();
+    expect(options.discover).not.toHaveBeenCalled();
+    options.isCurrent.mockReturnValue(true);
+    options.discover.mockImplementation(async () => { options.isCurrent.mockReturnValue(false); return []; });
+    await expect(submit()).rejects.toThrow();
+    expect(options.reassign).not.toHaveBeenCalled();
+  });
+  it("rechecks lane legality after discovery", async () => {
+    const { options, submit, node, agent } = setup();
+    options.discover.mockImplementation(async () => { node.status = "running"; return [agent]; });
+    await expect(submit()).rejects.toThrow(/pending or ready/);
+    expect(options.reassign).not.toHaveBeenCalled();
+  });
+  it("preserves endpoint rejection and rejects a missing authoritative result", async () => {
+    const { options, submit } = setup();
+    options.reassign.mockRejectedValueOnce(new Error("Backend rejected lane."));
+    await expect(submit()).rejects.toThrow("Backend rejected lane.");
+    options.reassign.mockResolvedValueOnce({ protocolVersion: 1 } as never);
+    await expect(submit()).rejects.toThrow(/Authoritative/);
+    expect(options.apply).not.toHaveBeenCalled();
+  });
+  it("ignores late success after scope invalidation", async () => {
+    const { options, submit, response } = setup();
+    options.reassign.mockImplementation(async () => { options.isCurrent.mockReturnValue(false); return response; });
+    await submit();
+    expect(options.apply).not.toHaveBeenCalled();
+  });
+  it.each([false, true])("applies the existing authoritative generation guard (stale %s)", async (stale) => {
+    const { options, submit, session, response } = setup();
+    let workspace = workflowWorkspaceForTest([workflowProjectForTest(session.projectId, "/project", "/project")], [session]);
+    options.apply.mockImplementation((result, guard) => {
+      workspace = AppModule.applyAuthoritativeWorkflowSessionResponse(workspace, result, guard, stale ? 2 : 1);
+    });
+    await submit();
+    expect(workspace.sessions[0]).toBe(stale ? session : response.canvasSession);
+  });
+  it("combines picker discovery, cancel, single-flight and the actual submission helper", async () => {
+    const { options, agent } = setup();
+    const onClose = vi.fn();
+    const controller = createReassignmentController(() => ({
+      scopeId: "session:node", currentAgent: "codex", agents: undefined,
+      discoverAgents: options.discover, onClose,
+      onSubmit: (selected, isCurrent) => AppModule.submitNodeReassignment({ ...options, isCurrent }, selected),
+    }), () => {});
+    const unmount = controller.mount(); await Promise.resolve();
+    controller.choose("gemini"); controller.cancel(); await controller.confirm();
+    expect(options.reassign).not.toHaveBeenCalled();
+    unmount(); controller.mount(); await Promise.resolve(); controller.choose("gemini");
+    const discovery = deferred<AgentDescriptor[]>(); options.discover.mockReturnValueOnce(discovery.promise);
+    const pending = controller.confirm(); await controller.confirm();
+    expect(options.reassign).not.toHaveBeenCalled();
+    discovery.resolve([agent]); await pending;
+    expect(options.discover).toHaveBeenCalledTimes(3);
+    expect(options.reassign).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledTimes(2);
+  });
+  it.each([false, true])("invalidates pending submission across unmount and same-scope replay (rejection %s)", async (reject) => {
+    const { options, response } = setup();
+    const work = deferred<typeof response>();
+    options.reassign.mockReturnValueOnce(work.promise.then((value) => {
+      if (reject) throw new Error("Old endpoint error.");
+      return value;
+    }));
+    const onClose = vi.fn(); const changed = vi.fn();
+    const controller = createReassignmentController(() => ({
+      scopeId: "same-session:same-node", currentAgent: "codex", agents: undefined,
+      discoverAgents: options.discover, onClose,
+      onSubmit: (selected, isCurrent) => AppModule.submitNodeReassignment({ ...options, isCurrent }, selected),
+    }), changed);
+    const unmount = controller.mount(); await Promise.resolve(); controller.choose("gemini");
+    const pending = controller.confirm(); await Promise.resolve();
+    expect(options.reassign).toHaveBeenCalledOnce();
+    unmount(); controller.mount(); await Promise.resolve(); changed.mockClear();
+    work.resolve(response);
+    await pending;
+    expect(options.apply).not.toHaveBeenCalled(); expect(onClose).not.toHaveBeenCalled(); expect(changed).not.toHaveBeenCalled();
+    expect(controller.state).toEqual({ selected: null, busy: false, error: null });
+  });
+
+});
 
 describe("App scheduling response freshness", () => {
   it("preserves newer scheduling authority when an older response arrives", () => {

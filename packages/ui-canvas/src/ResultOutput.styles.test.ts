@@ -57,17 +57,30 @@ describe("ResultOutput product styles", () => {
     const styles = await readSource("./styles.css");
     const app = await readSource("./App.tsx");
     expect(app).toMatch(/\{\(nodeFailureSummary \|\| nodeLatestFailedCheck \|\| nodeLastEvidence\) && \([\s\S]*?className="node-failure-summary"[\s\S]*?\)\}\s*<div className="modal-body">/);
-    expect(declarations(styles, ".node-modal").get("grid-template-rows"))
-      .toBe("auto auto auto minmax(0, 1fr)");
-    expect(declarations(styles, ".node-modal:has(> .node-failure-summary)").get("grid-template-rows"))
-      .toBe("auto auto auto auto minmax(0, 1fr)");
-    expect(declarations(styles, ".modal-body").get("min-height")).toBe("0");
-    expect(declarations(styles, ".node-modal .modal-body").get("overflow")).toBe("auto");
-    // Auto placement must select row four without a summary and row five with it.
-    for (const selector of [".modal-body", ".node-modal .modal-body", ".node-modal > .modal-body"]) {
-      const body = declarations(styles, selector);
-      for (const property of ["grid-row", "grid-row-start", "grid-area"]) {
-        expect(body.get(property), `${selector} ${property}`).toBeUndefined();
+    for (const hasSummary of [false, true]) {
+      const modal = new Map([
+        ...declarations(styles, ".node-modal"),
+        ...(hasSummary ? declarations(styles, ".node-modal:has(> .node-failure-summary)") : []),
+      ]);
+      expect(modal.get("display")).toBe("flex");
+      expect(modal.get("flex-direction")).toBe("column");
+      expect(modal.get("height")).toMatch(/^calc\(100vh - \d+px\)$/);
+      expect(modal.get("overflow")).toBe("hidden");
+    }
+    for (const className of ["modal-header", "modal-actions", "modal-tabs", "node-failure-summary", "modal-body"]) {
+      const child = new Map([
+        ...declarations(styles, `.${className}`),
+        ...declarations(styles, `.node-modal .${className}`),
+        ...declarations(styles, `.node-modal > .${className}`),
+      ]);
+      expect(child.get("order") ?? "0", `${className} keeps DOM order`).toBe("0");
+      expect(child.get("flex-grow"), `${className} does not override flex growth`).toBeUndefined();
+      if (className === "modal-body") {
+        expect(child.get("flex")).toBe("1");
+        expect(child.get("min-height")).toBe("0");
+        expect(child.get("overflow")).toBe("auto");
+      } else {
+        expect(child.get("flex"), `${className} does not grow`).toBeUndefined();
       }
     }
   });
