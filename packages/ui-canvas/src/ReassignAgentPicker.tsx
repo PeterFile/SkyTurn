@@ -20,6 +20,7 @@ export function reassignmentEligibility(agent: AgentDescriptor | undefined, curr
   const readiness = agent?.readiness;
   if (!agent) reason = "Not discovered.";
   else if (agent.kind === currentAgent) reason = "Current agent.";
+  else if (agent.kind === "agy") reason = "Antigravity is not reassignable under current backend contract.";
   else if (agent.status !== "available") reason = { missing: "CLI missing.", unhealthy: "Agent unhealthy.", "needs-auth": "Authentication required." }[agent.status];
   else if (agent.supportLevel === "mock-only") reason = "Mock only; real execution unavailable.";
   else if (agent.supportLevel !== "experimental-run" && agent.supportLevel !== "supported-run") reason = "Detected only; no runnable adapter.";

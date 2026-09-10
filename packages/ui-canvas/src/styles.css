@@ -641,8 +641,8 @@ h2 {
 }
 
 .node-modal {
-  display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   width: min(920px, 100%);
   max-height: min(720px, 92vh);
   border: 1px solid var(--sk-border-node);
@@ -778,6 +778,7 @@ h2 {
 }
 
 .modal-body {
+  flex: 1;
   min-height: 0;
   overflow: auto;
 }

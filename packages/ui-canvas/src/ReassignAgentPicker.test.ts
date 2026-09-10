@@ -34,6 +34,10 @@ describe("reassignment eligibility", () => {
   it("reports a missing CLI instead of claiming a missing agent was detected", () => {
     expect(reassignmentEligibility(descriptor({ status: "missing", supportLevel: "detected-only" }), "hermes").reason).toBe("CLI missing.");
   });
+  it("blocks Antigravity explicitly even if supplied a runnable descriptor", () => {
+    const agent = descriptor({ kind: "agy", status: "available", supportLevel: "supported-run", readiness: { level: "supported-run", cli: { available: true, path: "/cli", version: null }, auth: { status: "available" }, categories: [] } });
+    expect(reassignmentEligibility(agent, "hermes")).toEqual({ disabled: true, reason: "Antigravity is not reassignable under current backend contract." });
+  });
   it("uses descriptor support, excludes current, and fails closed on readiness facts", () => {
     const agent = descriptor();
     expect(reassignmentEligibility(agent, "codex")).toEqual({ disabled: true, reason: "Current agent." });
@@ -45,7 +49,7 @@ describe("reassignment eligibility", () => {
       { ...agent.readiness!, auth: { status: "missing" as const } },
       ...(["auth-missing", "cli-missing", "version-probe-failed"] as const).map((category) => ({ ...agent.readiness!, categories: [category] })),
     ]) expect(reassignmentEligibility(descriptor({ readiness }), "hermes").disabled).toBe(true);
-    for (const kind of ["hermes", "codex", "agy", "gemini", "claude-code", "openclaw"] as const) {
+    for (const kind of ["hermes", "codex", "gemini", "claude-code", "openclaw"] as const) {
       expect(reassignmentEligibility(descriptor({ kind, supportLevel: "supported-run" }), kind === "hermes" ? "codex" : "hermes").disabled).toBe(false);
     }
     expect(reassignmentEligibility(descriptor({ readiness: undefined, executablePath: null }), "hermes").disabled).toBe(true);
