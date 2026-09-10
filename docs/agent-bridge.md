@@ -72,10 +72,14 @@ The Codex adapter follows the Hermes `skills/autonomous-ai-agents/codex` boundar
 SkyTurn uses the non-interactive JSONL path:
 
 ```text
-codex exec --json --ephemeral --color never --sandbox read-only -c approval_policy=never -C <workdir> <prompt>
+codex exec --json --ephemeral --color never --sandbox read-only -c approval_policy=never -c sandbox_workspace_write.writable_roots=[] <prompt>
 ```
 
 The adapter does not invoke a shell string and does not use `--yolo` or `--dangerously-bypass-approvals-and-sandbox`. The default sandbox is `read-only`; `workspace-write` must be configured explicitly by the caller.
+
+For `read-only` and `workspace-write` runs, the adapter clears `sandbox_workspace_write.writable_roots` for that invocation. This prevents inherited extra native writable roots, including symlinked roots that cause `symlinked writable roots are not supported`, from blocking tool startup. Codex still loads its native model, configuration, skills, and MCP settings; the adapter does not use `--ignore-user-config`. The existing fd-anchored launch selects the run worktree as cwd without a pathname-based `-C` override.
+
+Adapter `extraArgs` are backend-trusted flags, not a user-facing API. The roots reset appears after `extraArgs` and takes precedence over repeated overrides of this key only. Other trusted flags remain unchanged, including explicit `--add-dir` or sandbox-changing flags under the caller's control; this reset does not confine `extraArgs`. Explicit trusted `danger-full-access` runs receive no roots reset.
 
 Flow Kernel implementation lanes may pass a per-run `sandbox: "workspace-write"` so Codex can edit source and test files. Commit lanes may pass `sandbox: "danger-full-access"` so Codex can write git metadata for `git add` and `git commit`. Those permissions are lane-scoped and still use `approval_policy=never`; they must not become the adapter default or apply to validation lanes.
 
