@@ -23,13 +23,19 @@ describe("Windows process-tree integration support", () => {
   const resumeHandle = "resume \"capability\" with slash\\ and Unicode 水";
   const argumentMarker = "marker \"argument\" with slash\\ and Unicode 火";
 
-  it("places the explicit Codex fixture at the adapter extra-argument boundary", () => {
+  it.each([
+    [undefined, "read-only", ["-c", "sandbox_workspace_write.writable_roots=[]"]],
+    ["read-only", "read-only", ["-c", "sandbox_workspace_write.writable_roots=[]"]],
+    ["workspace-write", "workspace-write", ["-c", "sandbox_workspace_write.writable_roots=[]"]],
+    ["danger-full-access", "danger-full-access", []],
+  ] as const)("places the Codex fixture arguments exactly for sandbox %s", (sandbox, expectedSandbox, writableRootArgs) => {
     expect(buildWindowsFixtureInvocation({
       agentKind: "codex",
       argumentMarker,
       canonicalWorkdir,
       prompt,
       resumeHandle,
+      ...(sandbox === undefined ? {} : { sandbox }),
     })).toEqual({
       entryPoint: "exec",
       extraArgs: [argumentMarker],
@@ -39,10 +45,11 @@ describe("Windows process-tree integration support", () => {
         "--color",
         "never",
         "--sandbox",
-        "read-only",
+        expectedSandbox,
         "-c",
         "approval_policy=never",
         argumentMarker,
+        ...writableRootArgs,
         prompt,
       ],
       pathArgumentIndexes: [],
@@ -73,9 +80,17 @@ describe("Windows process-tree integration support", () => {
     });
   });
 
-  it.each(["codex", "hermes"] as const)(
-    "matches the generated %s fixture argv to the real adapter ordering",
-    async (agentKind) => {
+  it.each(([
+    ["codex", undefined],
+    ["codex", "read-only"],
+    ["codex", "workspace-write"],
+    ["codex", "danger-full-access"],
+    ["hermes", undefined],
+  ] as const).filter(([agentKind, sandbox]) => (
+    process.platform !== "win32" || agentKind === "hermes" || sandbox === "danger-full-access"
+  )))(
+    "matches the generated %s fixture argv to the real adapter ordering with sandbox %s",
+    async (agentKind, sandbox) => {
       const projectRoot = await mkdtemp(join(tmpdir(), "skyturn-windows-fixture-argv-"));
       const binRoot = await mkdtemp(join(tmpdir(), "skyturn-windows-fixture-bin-"));
       try {
@@ -89,9 +104,7 @@ describe("Windows process-tree integration support", () => {
           canonicalWorkdir: canonicalRoot,
           prompt,
           resumeHandle,
-          ...(agentKind === "codex" && process.platform === "win32"
-            ? { sandbox: "danger-full-access" }
-            : {}),
+          ...(sandbox === undefined ? {} : { sandbox }),
         });
         await writeFile(executablePath, [
           "#!/usr/bin/env node",
@@ -104,9 +117,7 @@ describe("Windows process-tree integration support", () => {
           extraArgs: invocation.extraArgs,
           env: { SKYTURN_ARGS_PATH: argsPath },
           stallTelemetryMs: 0,
-          ...(agentKind === "codex" && process.platform === "win32"
-            ? { sandbox: "danger-full-access" as const }
-            : {}),
+          ...(sandbox === undefined ? {} : { sandbox }),
         };
         const adapter = agentKind === "codex"
           ? createCodexCliAdapter(adapterOptions)
@@ -137,16 +148,18 @@ describe("Windows process-tree integration support", () => {
           projectRoot,
           worktreePath: projectRoot,
           agentKind,
-          ...(process.platform === "win32" ? { sandbox: "danger-full-access" as const } : {}),
+          ...(process.platform === "win32"
+            ? { sandbox: "danger-full-access" as const }
+            : sandbox === undefined ? {} : { sandbox }),
           prompt,
           ...(agentKind === "hermes" ? { hermesSessionHandle: resumeHandle } : {}),
         }, sink);
         await terminal.promise;
 
         const actualArgs = JSON.parse(await readFile(argsPath, "utf8")) as string[];
-        expect(actualArgs.shift()).toBe(invocation.entryPoint);
+        expect(actualArgs).toEqual([invocation.entryPoint, ...invocation.expectedFixtureArgv]);
         expect(() => validateWindowsFixtureArgv({
-          actualArgs,
+          actualArgs: actualArgs.slice(1),
           expectedArgs: invocation.expectedFixtureArgv,
           pathArgumentIndexes: invocation.pathArgumentIndexes,
         })).not.toThrow();

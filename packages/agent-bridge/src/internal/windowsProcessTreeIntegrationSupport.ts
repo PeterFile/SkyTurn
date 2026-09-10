@@ -58,6 +58,7 @@ export function buildWindowsFixtureInvocation(
         "-c",
         "approval_policy=never",
         input.argumentMarker,
+        ...(input.sandbox === "danger-full-access" ? [] : ["-c", "sandbox_workspace_write.writable_roots=[]"]),
         input.prompt,
       ],
       pathArgumentIndexes: [],
