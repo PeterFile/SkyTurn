@@ -1845,18 +1845,45 @@ describe("UI source validation", () => {
     });
   });
 
-  it("disables Node Modal Retry with an explicit accessible desktop-backend reason", async () => {
-    const appSource = await readSource("./App.tsx");
-    const retryHandler = appSource.slice(appSource.indexOf("function retryNode("), appSource.indexOf("function answerUserDecision("));
-    const nodeModal = appSource.slice(appSource.indexOf("function NodeModal("), appSource.indexOf("function OutputTab("));
+  it("renders accessible Retry reasons and explicit workspace-preserving confirmation", () => {
+    const node = { ...mockNode(), status: "failed" as const };
+    const props = { node, session: canvasSessionForTest("retry-ui"), projectRoot: "/project", runEvents: [],
+      runEvidence: null, tab: "Output" as const, onTab: vi.fn(), onClose: vi.fn(), onStop: vi.fn(),
+      onRetry: vi.fn(), onReassign: vi.fn(), onInsertBefore: vi.fn(), onOpenEditor: vi.fn(), onDecisionAnswer: vi.fn() };
+    const disabled = renderToStaticMarkup(createElement(NodeModal, { ...props,
+      retryUnavailableReason: "A new attempt is already reserved." }));
+    expect(disabled).toMatch(/<button[^>]*disabled[^>]*aria-describedby="node-retry-unavailable-/);
+    expect(disabled).toContain('role="status">A new attempt is already reserved.');
+    const confirmation = renderToStaticMarkup(createElement(NodeModal, { ...props, retryUnavailableReason: null,
+      retryState: { busy: false, confirming: true, reason: null, error: "Connection lost", history: [] },
+      onRetryConfirm: vi.fn(), onRetryCancel: vi.fn() }));
+    expect(confirmation).toContain('aria-label="Retry confirmation"');
+    expect(confirmation).toContain("CURRENT workspace");
+    expect(confirmation).toContain("does not reset Git");
+    expect(confirmation).toContain("Start new attempt</button>");
+    expect(confirmation).toContain("Cancel Retry</button>");
+    expect(confirmation).toContain('role="alert">Connection lost');
+  });
 
-    expect(retryHandler).toContain("if (window.devflow) return;");
-    expect(appSource).toContain("retryUnavailableReason={window.devflow ? DESKTOP_RETRY_UNAVAILABLE_REASON : null}");
-    expect(nodeModal).toContain("disabled={!canExecute || retryUnavailableReason !== null}");
-    expect(nodeModal).toContain("title={retryUnavailableReason ?? undefined}");
-    expect(nodeModal).toContain("aria-describedby={retryUnavailableReason ? retryUnavailableReasonId : undefined}");
-    expect(nodeModal).toContain('className="sr-only"');
-    expect(appSource).toContain("Use checkpoint-driven Repair in the bottom composer when available.");
+  it("shows current attempt identity and retained terminal facts in the existing Context tab", () => {
+    vi.stubGlobal("window", { devflow: undefined });
+    try {
+      const node = { ...mockNode(), runId: "backend-new-run", status: "pending" as const };
+      const html = renderToStaticMarkup(createElement(NodeModal, {
+        node, session: canvasSessionForTest("retry-context"), projectRoot: "/project", runEvents: [], runEvidence: null,
+        tab: "Context", onTab: vi.fn(), onClose: vi.fn(), onStop: vi.fn(), onRetry: vi.fn(), onReassign: vi.fn(),
+        onInsertBefore: vi.fn(), onOpenEditor: vi.fn(), onDecisionAnswer: vi.fn(), retryUnavailableReason: "Already reserved",
+        retryState: { busy: false, confirming: false, reason: "Already reserved", error: null, history: [{
+          id: "original-segment", laneId: node.id, runId: "original-run", status: "failed", exitCode: 1,
+          evidence: { ...mockRunEvidence(), runId: "original-run", status: "failed", errorReason: "Original failure" },
+        }] },
+      }));
+      expect(html).toContain("Current attempt</dt><dd>backend-new-run · pending");
+      expect(html).toContain("Previous attempt</dt><dd>original-run · original-segment · failed · exit 1");
+      expect(html).toContain("Original failure");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("keeps workflow broadcasts authoritative and removes renderer terminal persistence", async () => {

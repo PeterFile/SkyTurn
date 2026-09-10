@@ -1,5 +1,9 @@
 import { WorkflowSchedulingControl, type SchedulingAttempt } from "./WorkflowSchedulingControl.js";
 import {
+  createNodeRetryController, NODE_RETRY_CONFIRMATION,
+  type NodeRetryScope, type NodeRetryState, type NodeRetryHistory,
+} from "./nodeRetry.js";
+import {
   BaseEdge,
   Controls,
   Handle,
@@ -218,7 +222,7 @@ import {
 
 export const INSERT_BEFORE_UNAVAILABLE_ERROR = "Insert before is unavailable because the desktop workflow backend is not connected.";
 export const DESKTOP_RETRY_UNAVAILABLE_REASON =
-  "Desktop workflow Retry is unavailable. Use checkpoint-driven Repair in the bottom composer when available.";
+  "Retry requires the desktop workflow backend and authoritative attempt history.";
 
 gsap.registerPlugin(useGSAP);
 
@@ -965,6 +969,28 @@ export default function App() {
   const [, refreshScheduling] = useReducer((revision: number) => revision + 1, 0);
   const workflowProjectionGenerationRef = useRef(new Map<string, number>());
   const authoritativeRunEvidenceHydratorRef = useRef<AuthoritativeRunEvidenceHydrator | null>(null);
+  const nodeRetryScopeRef = useRef<(NodeRetryScope & WorkflowSessionResponseGuard) | null>(null);
+  const nodeRetryControllerRef = useRef<ReturnType<typeof createNodeRetryController> | null>(null);
+  const [, refreshNodeRetry] = useReducer((revision: number) => revision + 1, 0);
+  if (!nodeRetryControllerRef.current) {
+    nodeRetryControllerRef.current = createNodeRetryController({
+      getProjection: (root, sessionId) => window.devflow!.workflow.getProjection(root, sessionId),
+      retryLane: (root, request) => window.devflow!.workflow.retryLane(root, request),
+      createRequestId: () => globalThis.crypto.randomUUID(),
+      isCurrent: (scope) => {
+        const guard = nodeRetryScopeRef.current;
+        const current = workspaceRef.current;
+        return guard === scope && current.activeProjectId === scope.projectId && current.activeSessionId === scope.sessionId &&
+          workspaceMatchesWorkflowAuthority(current, scope) &&
+          current.sessions.find((session) => session.id === scope.sessionId && session.projectId === scope.projectId) === guard.requestSession &&
+          currentWorkflowGeneration(workflowProjectionGenerationRef.current, scope) === scope.generation;
+      },
+      canvas: canvasSessionForWorkflowAuthority,
+      apply: (response, scope) => nodeRetryScopeRef.current === scope &&
+        applyGuardedWorkflowSessionResponse(response, nodeRetryScopeRef.current),
+      changed: refreshNodeRetry,
+    });
+  }
   const planRuntimeRecoveryGeneration = useRef(0);
   const planAdapterRef = useRef<ReturnType<typeof createPlanAdapter> | null>(null);
   const planMutationQueueRef = useRef<ReturnType<typeof createPlanMutationQueue> | null>(null);
@@ -1061,6 +1087,13 @@ export default function App() {
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === inspectedNodeId) ?? null
       : null;
+  const nodeRetryBackendAvailable = typeof window.devflow?.workflow?.retryLane === "function" &&
+    typeof window.devflow?.workflow?.getProjection === "function";
+  const nodeRetryGeneration = activeProject && activeSession?.kind === "canvas"
+    ? currentWorkflowGeneration(workflowProjectionGenerationRef.current, {
+        projectId: activeProject.id, canonicalRoot: activeProject.canonicalRootPath ?? "", sessionId: activeSession.id,
+      }) : 0;
+  const nodeRetryState = nodeRetryControllerRef.current.state;
   const resolvedNewTaskProjectId = resolveSessionProjectId(
     workspace.projects,
     newTaskProjectId,
@@ -1244,6 +1277,22 @@ export default function App() {
     if (!workspaceLoaded) return;
     workspaceSaveDispatcherRef.current?.dispatch(workspace);
   }, [workspace, workspaceLoaded]);
+
+  useLayoutEffect(() => {
+    const authority = activeProject && activeSession?.kind === "canvas" && inspectedNode && nodeRetryBackendAvailable
+      ? workflowRequestAuthority(activeProject, activeSession.id) : null;
+    const scope = authority && activeSession?.kind === "canvas" && inspectedNode
+      ? { ...authority, requestSession: activeSession, generation: nodeRetryGeneration,
+          nodeId: inspectedNode.id, runId: inspectedNode.runId } : null;
+    nodeRetryScopeRef.current = scope;
+    void nodeRetryControllerRef.current!.activate(scope);
+    return () => {
+      nodeRetryScopeRef.current = null;
+      void nodeRetryControllerRef.current!.activate(null);
+    };
+  }, [activeProject?.id, activeProject?.rootPath, activeProject?.canonicalRootPath,
+    activeSession?.id, activeSession?.kind, inspectedNode?.id, inspectedNode?.runId, inspectedNode?.status,
+    nodeRetryGeneration, nodeRetryBackendAvailable]);
 
   useEffect(() => {
     if (window.devflow) return;
@@ -2177,7 +2226,10 @@ export default function App() {
 
   function retryNode(nodeId: string) {
     if (!activeSession || activeSession.kind !== "canvas") return;
-    if (window.devflow) return;
+    if (window.devflow) {
+      if (nodeRetryScopeRef.current?.nodeId === nodeId) nodeRetryControllerRef.current!.begin();
+      return;
+    }
     updateCanvasSession(activeSession.id, (session) =>
       retryCanvasNodeForRuntime(session, nodeId, new Date().toISOString(), false),
     );
@@ -2525,7 +2577,13 @@ export default function App() {
           onClose={() => setInspectedNodeId(null)}
           onStop={() => stopNodeRun(inspectedNode)}
           onRetry={() => retryNode(inspectedNode.id)}
-          retryUnavailableReason={window.devflow ? DESKTOP_RETRY_UNAVAILABLE_REASON : null}
+          retryUnavailableReason={window.devflow
+            ? !nodeRetryBackendAvailable ? DESKTOP_RETRY_UNAVAILABLE_REASON
+              : nodeRetryState.busy ? "Creating a new attempt…" : nodeRetryState.reason
+            : null}
+          retryState={window.devflow ? nodeRetryState : undefined}
+          onRetryConfirm={() => void nodeRetryControllerRef.current!.confirm()}
+          onRetryCancel={() => nodeRetryControllerRef.current!.cancel()}
           onReassign={() => reassignNode(inspectedNode.id)}
           onInsertBefore={() => insertBefore(inspectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
@@ -4649,6 +4707,9 @@ export function NodeModal({
   onStop,
   onRetry,
   retryUnavailableReason,
+  retryState,
+  onRetryConfirm,
+  onRetryCancel,
   onReassign,
   onInsertBefore,
   onOpenEditor,
@@ -4665,6 +4726,9 @@ export function NodeModal({
   onStop: () => void;
   onRetry: () => void;
   retryUnavailableReason: string | null;
+  retryState?: NodeRetryState;
+  onRetryConfirm?: () => void;
+  onRetryCancel?: () => void;
   onReassign: () => void;
   onInsertBefore: () => void;
   onOpenEditor: (editor: EditorKind) => void;
@@ -4742,11 +4806,6 @@ export function NodeModal({
             <RefreshCw size={15} />
             Retry
           </button>
-          {retryUnavailableReason && (
-            <span id={retryUnavailableReasonId} className="sr-only">
-              {retryUnavailableReason}
-            </span>
-          )}
           <button onClick={onReassign} disabled={!canExecute}>
             <Users size={15} />
             Reassign
@@ -4757,6 +4816,15 @@ export function NodeModal({
           </button>
           <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} />
         </div>
+        {retryUnavailableReason && <p id={retryUnavailableReasonId} role="status">{retryUnavailableReason}</p>}
+        {retryState?.error && <p role="alert">{retryState.error}</p>}
+        {retryState?.confirming && (
+          <section className="node-failure-summary" aria-label="Retry confirmation">
+            <p>{NODE_RETRY_CONFIRMATION}</p>
+            <button type="button" onClick={onRetryConfirm} disabled={retryState.busy}>Start new attempt</button>
+            <button type="button" onClick={onRetryCancel} disabled={retryState.busy}>Cancel Retry</button>
+          </section>
+        )}
         <nav className="modal-tabs" aria-label="Node details">
           {NODE_MODAL_TABS.map((item) => (
             <button
@@ -4793,7 +4861,7 @@ export function NodeModal({
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
-          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} />}
+          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} retryHistory={retryState?.history} />}
         </div>
       </section>
     </div>
@@ -6593,12 +6661,24 @@ function RunEvidenceFacts({ runEvidence }: { runEvidence: RunEvidence }) {
   );
 }
 
-function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasNode; session: CanvasSession; projectRoot: string; runEvidence?: RunEvidence | null }) {
+function ContextTab({ node, session, projectRoot, runEvidence, retryHistory }: { node: CanvasNode; session: CanvasSession; projectRoot: string; runEvidence?: RunEvidence | null; retryHistory?: NodeRetryHistory[] }) {
   const isNewWorktree = node.worktree.executionTarget === "new_worktree" || !!node.worktree.worktreeId;
 
   return (
     <div className="context-tab">
       <dl className="context-grid">
+        <dt>Current attempt</dt>
+        <dd>{node.runId} · {node.status}</dd>
+        {retryHistory?.map((attempt) => (
+          <Fragment key={attempt.id}>
+            <dt>{attempt.runId === node.runId ? "Attempt evidence" : "Previous attempt"}</dt>
+            <dd>{attempt.runId} · {attempt.id} · {attempt.status} · exit {attempt.exitCode ?? "unknown"}
+              {attempt.evidence?.completedAt && ` · ${attempt.evidence.completedAt}`}
+              {attempt.evidence?.errorReason && ` · ${attempt.evidence.errorReason}`}
+              {attempt.evidence?.cancelReason && ` · ${attempt.evidence.cancelReason}`}
+            </dd>
+          </Fragment>
+        ))}
         <dt>Brief</dt>
         <dd>{node.context.brief}</dd>
         <dt>Session goal</dt>
