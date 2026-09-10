@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { createElement } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import {
   formatTerminalTitle,
   formatTerminalBadge,
@@ -1062,11 +1062,139 @@ describe("node editor action", () => {
     }
   });
 
-  it("writes editor failure and native launch messages to visible node Output", async () => {
-    const source = await readSource("./App.tsx");
-    const action = source.slice(source.indexOf("  async function openEditor("), source.indexOf("  if (!activeProject) {"));
-    expect(action).toContain("await openNodeEditor(activeProject, activeSession, node, editor)");
-    expect(action).toContain("output: [...current.output, result.message]");
+  describe("EditorLaunchController async settings behavior", () => {
+    let controller: ReturnType<typeof Reflect.get>;
+    let getSettings: any;
+    let openEditor: any;
+    let onBusyChange: any;
+    let onOutput: any;
+    let settingsResolve: (v: any) => void;
+    let editorResolve: (v: any) => void;
+    const isScopeCurrent = vi.fn();
+    const tick = () => new Promise(r => setTimeout(r, 0));
+
+    beforeEach(() => {
+      const createController = Reflect.get(AppModule, "createEditorLaunchController") as Function;
+      onBusyChange = vi.fn();
+      onOutput = vi.fn();
+      settingsResolve = () => {};
+      editorResolve = () => {};
+      getSettings = vi.fn().mockImplementation(() => new Promise(r => { settingsResolve = r; }));
+      openEditor = vi.fn().mockImplementation(() => new Promise(r => { editorResolve = r; }));
+      vi.stubGlobal("window", { devflow: { settings: {} } });
+      controller = createController({ getSettings, openEditor, onBusyChange, onOutput });
+      isScopeCurrent.mockReturnValue(true);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("duplicate request blocked", async () => {
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: null, worktreePath: null, generation: 1 };
+      const promise1 = controller.execute(scope, "/root", undefined, isScopeCurrent);
+      const promise2 = controller.execute(scope, "/root", undefined, isScopeCurrent);
+      settingsResolve({ settings: { app: { externalEditor: "cursor" } } });
+      await tick();
+      editorResolve({ ok: true, message: "OK" });
+      await Promise.all([promise1, promise2]);
+      expect(getSettings).toHaveBeenCalledOnce();
+      expect(openEditor).toHaveBeenCalledOnce();
+    });
+
+    it("saved vscode default actually dispatches vscode via openNodeEditor", async () => {
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: null, worktreePath: null, generation: 1 };
+      const promise = controller.execute(scope, "/root", undefined, isScopeCurrent);
+      settingsResolve({ settings: { app: { externalEditor: "vscode" } } });
+      await tick();
+      editorResolve({ ok: true, message: "OK" });
+      await promise;
+      expect(openEditor).toHaveBeenCalledWith("vscode", scope);
+      expect(onOutput).toHaveBeenCalledWith(scope, "OK");
+    });
+
+    it("explicit already-stale causes zero dispatch", async () => {
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: null, worktreePath: null, generation: 1 };
+      isScopeCurrent.mockReturnValue(false);
+      await controller.execute(scope, "/root", "vscode", isScopeCurrent);
+      expect(openEditor).not.toHaveBeenCalled();
+      expect(onOutput).not.toHaveBeenCalled();
+    });
+
+    it("pending default read stale/no dispatch", async () => {
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: null, worktreePath: null, generation: 1 };
+      const promise = controller.execute(scope, "/root", undefined, isScopeCurrent);
+      expect(getSettings).toHaveBeenCalledOnce();
+      isScopeCurrent.mockReturnValue(false); // becomes stale while fetching settings
+      settingsResolve({ settings: { app: { externalEditor: "vscode" } } });
+      await promise;
+      expect(openEditor).not.toHaveBeenCalled();
+      expect(onOutput).not.toHaveBeenCalled();
+    });
+
+    it("post-native stale/no output", async () => {
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: null, worktreePath: null, generation: 1 };
+      const promise = controller.execute(scope, "/root", "cursor", isScopeCurrent);
+      expect(openEditor).toHaveBeenCalledWith("cursor", scope);
+      expect(onBusyChange).toHaveBeenCalledWith("p1:s1:n1:1");
+      isScopeCurrent.mockReturnValue(false); // becomes stale while opening editor
+      editorResolve({ ok: true, message: "OK" });
+      await promise;
+      expect(onOutput).not.toHaveBeenCalled();
+      expect(onBusyChange).not.toHaveBeenCalledWith(null);
+    });
+
+    it("backend thrown failures use stage-aware error", async () => {
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: null, worktreePath: null, generation: 1 };
+      getSettings.mockRejectedValue(new Error("API missing"));
+      await controller.execute(scope, "/root", undefined, isScopeCurrent);
+      expect(onOutput).toHaveBeenCalledWith(scope, "Failed to read settings: API missing");
+
+      onOutput.mockClear();
+      getSettings.mockResolvedValue({});
+      openEditor.mockRejectedValue(new Error("Spawn EACCES"));
+      await controller.execute(scope, "/root", undefined, isScopeCurrent);
+      expect(onOutput).toHaveBeenCalledWith(scope, "Failed to launch editor: Spawn EACCES");
+    });
+
+    it("actual scoped output callback uses precise scope parameter", async () => {
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: null, worktreePath: null, generation: 1 };
+      const promise = controller.execute(scope, "/root", "vscode", isScopeCurrent);
+      await tick();
+      editorResolve({ ok: true, message: "Success" });
+      await promise;
+      expect(onOutput).toHaveBeenCalledWith(scope, "Success");
+    });
+
+    it("full consumer chain integrates controller and openNodeEditor with retained path authority", async () => {
+      const targetProject = { id: "p1", rootPath: "/root" };
+      const targetSession = { id: "s1", kind: "canvas" as const, target: { executionTarget: "new_worktree" }, nodes: [{ id: "n1", runId: "run1", worktree: { path: "/root/some/path" } }] };
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: "run1", worktreePath: "/root/some/path", generation: 1 };
+
+      const nativeResult = { ok: true, message: "Native OK" };
+      const nativeOpenEditor = vi.fn().mockResolvedValue(nativeResult);
+      const adapter = vi.spyOn(browserEditorAdapter, "openWorktree");
+      vi.stubGlobal("window", { devflow: { openEditor: nativeOpenEditor, settings: {} } });
+
+      const realOpenNodeEditor = Reflect.get(AppModule, "openNodeEditor") as Function;
+
+      const localController = (Reflect.get(AppModule, "createEditorLaunchController") as Function)({
+        getSettings: vi.fn().mockResolvedValue({ settings: { app: { externalEditor: "vscode" } } }),
+        openEditor: async (editor: any) => {
+          return realOpenNodeEditor(targetProject, targetSession, targetSession.nodes[0], editor);
+        },
+        onBusyChange: vi.fn(),
+        onOutput: onOutput
+      });
+
+      await localController.execute(scope, "/root", undefined, () => true);
+
+      expect(adapter).toHaveBeenCalledWith("vscode", "/root/some/path");
+      expect(nativeOpenEditor).toHaveBeenCalledExactlyOnceWith("vscode", "/root/some/path");
+      expect(onOutput).toHaveBeenCalledWith(scope, "Native OK");
+
+      adapter.mockRestore();
+    });
   });
 });
 

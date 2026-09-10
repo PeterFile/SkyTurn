@@ -1,11 +1,12 @@
 # SkyTurn Desktop Settings
 
-The SkyTurn Desktop Settings modal provides a minimal interface for managing execution paths and verifying prerequisites.
+The SkyTurn Desktop Settings modal provides a minimal interface for managing execution paths, editing preferences, and verifying prerequisites.
 
 ## Scope
 
-- **Overrides Only**: The interface currently only supports configuring custom executable paths for the **Hermes** and **Codex** agents.
-- **Omitted Settings Unchanged**: Any settings left empty will map to their application defaults. All other configuration options (such as default executor, external editor, and notification preferences) are preserved exactly as they are without being modified by this modal.
+- **External Editor**: Save a preference for VS Code, Cursor, Zed, or Finder. Unsupported legacy values are displayed with a warning and preserved until you select a supported choice. The default-selection helper uses Zed for missing or unsupported preferences. The canvas node **More -> Open worktree -> Open (Default)** action reads the saved preference to launch the chosen editor. Explicit editor choices in the same menu override the saved default for that action only. Missing or rejected settings result in a visible failure with no editor launch.
+- **Agent Executables**: Configure custom executable overrides for the **Hermes** and **Codex** agents. Saving an empty executable override clears it to `null`, restoring default discovery.
+- **Unexposed Settings Unchanged**: Default executor, notification preferences, project commands, and project execution targets are preserved exactly. This panel does not implement those settings' behavior.
 
 ## Prerequisites Snapshot
 
@@ -17,5 +18,5 @@ The SkyTurn Desktop Settings modal provides a minimal interface for managing exe
 
 You can open the Settings modal from the sidebar.
 - Use the **Refresh** button to pull the latest snapshot of your prerequisites and update the display.
-- Edit the executable overrides as needed and hit **Save**.
+- Edit the external editor preference or executable overrides as needed and hit **Save**. Saving does not launch an editor or run project commands.
 - If a save fails, your unsaved draft edits will remain intact so you can retry.

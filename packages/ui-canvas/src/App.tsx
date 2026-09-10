@@ -1,4 +1,6 @@
 import { WorkflowSchedulingControl, type SchedulingAttempt } from "./WorkflowSchedulingControl.js";
+import { resolveEditorSelection } from "./editorLaunchOptions.js";
+import type { SettingsSnapshot } from "@skyturn/persistence";
 import {
   BaseEdge,
   Controls,
@@ -942,6 +944,7 @@ export default function App() {
   const [nodeActionBusy, setNodeActionBusy] = useState<Exclude<ComposerAction, null> | null>(null);
   const [nodeActionError, setNodeActionError] = useState<string | null>(null);
   const [nodeActionStatus, setNodeActionStatus] = useState<string | null>(null);
+  const [editorLaunchBusy, setEditorLaunchBusy] = useState<string | null>(null);
   const [, refreshBottomComposerState] = useReducer((revision: number) => revision + 1, 0);
   const [, refreshNewSessionState] = useReducer((revision: number) => revision + 1, 0);
   const [planRuntimeRecovery, dispatchPlanRuntimeRecovery] = useReducer(
@@ -2304,13 +2307,124 @@ export default function App() {
     setNodeActionError(INSERT_BEFORE_UNAVAILABLE_ERROR);
   }
 
-  async function openEditor(editor: EditorKind, node: CanvasNode) {
+  const editorLaunchControllerRef = useRef<ReturnType<typeof createEditorLaunchController> | null>(null);
+  const editorLaunchGenerationRef = useRef(0);
+  const inspectedNodeForScope = activeSession?.kind === "canvas" ? activeSession.nodes.find((n) => n.id === inspectedNodeId) : undefined;
+  const currentLaunchScope = {
+    projectId: workspace.activeProjectId,
+    projectRoot: activeProject?.rootPath ?? null,
+    sessionId: workspace.activeSessionId,
+    nodeId: inspectedNodeId,
+    runId: inspectedNodeForScope?.runId ?? null,
+    worktreePath: (activeProject && activeSession?.kind === "canvas" && inspectedNodeForScope) ? resolveRunWorktreePath(activeProject, activeSession, inspectedNodeForScope) : null,
+  };
+
+  const prevLaunchScope = useRef(currentLaunchScope);
+  if (
+    prevLaunchScope.current.projectId !== currentLaunchScope.projectId ||
+    prevLaunchScope.current.projectRoot !== currentLaunchScope.projectRoot ||
+    prevLaunchScope.current.sessionId !== currentLaunchScope.sessionId ||
+    prevLaunchScope.current.nodeId !== currentLaunchScope.nodeId ||
+    prevLaunchScope.current.runId !== currentLaunchScope.runId ||
+    prevLaunchScope.current.worktreePath !== currentLaunchScope.worktreePath
+  ) {
+    editorLaunchGenerationRef.current++;
+    prevLaunchScope.current = currentLaunchScope;
+  }
+
+  const liveScopeRef = useRef(currentLaunchScope);
+  liveScopeRef.current = currentLaunchScope;
+
+  useEffect(() => {
+    return () => { editorLaunchGenerationRef.current++; };
+  }, []);
+
+  if (!editorLaunchControllerRef.current) {
+    editorLaunchControllerRef.current = createEditorLaunchController({
+      getSettings: async (rootPath) => {
+        if (!window.devflow?.settings) {
+          throw new Error("Desktop settings API is missing. Settings are unavailable.");
+        }
+        return window.devflow.settings.get(rootPath);
+      },
+      openEditor: async (editor, scope) => {
+        const project = workspaceRef.current.projects.find(p => p.id === scope.projectId);
+        const session = workspaceRef.current.sessions.find(s => s.id === scope.sessionId);
+        const node = session?.kind === "canvas" ? session.nodes.find(n => n.id === scope.nodeId) : undefined;
+        if (!project || !session || session.kind !== "canvas" || !node) {
+          throw new Error("Invalid session state");
+        }
+        if (session.projectId !== project.id) {
+          throw new Error("Invalid session state: project mismatch");
+        }
+        if (project.rootPath !== scope.projectRoot) {
+          throw new Error("Invalid session state: root path changed");
+        }
+        if ((node.runId ?? null) !== scope.runId) {
+          throw new Error("Invalid session state: run identity changed");
+        }
+        const worktreePath = resolveRunWorktreePath(project, session, node);
+        if ((worktreePath ?? null) !== scope.worktreePath) {
+          throw new Error("Invalid session state: worktree path changed");
+        }
+        return openNodeEditor(project, session, node, editor);
+      },
+      onBusyChange: setEditorLaunchBusy,
+      onOutput: (scope, message) => {
+        setWorkspace((current) => {
+          if (scope.generation !== editorLaunchGenerationRef.current) return current;
+
+          if (current.activeProjectId !== scope.projectId || current.activeSessionId !== scope.sessionId) return current;
+          const project = current.projects.find(p => p.id === scope.projectId);
+          if (!project || project.rootPath !== scope.projectRoot) return current;
+          const session = current.sessions.find(s => s.id === scope.sessionId);
+          if (!session || session.kind !== "canvas") return current;
+          const node = session.nodes.find(n => n.id === scope.nodeId);
+          if (!node || (node.runId ?? null) !== scope.runId) return current;
+          const worktreePath = resolveRunWorktreePath(project, session, node);
+          if ((worktreePath ?? null) !== scope.worktreePath) return current;
+
+          const nextNodes = session.nodes.map(n =>
+            n.id === scope.nodeId ? { ...n, output: [...n.output, message] } : n
+          );
+          return {
+            ...current,
+            sessions: current.sessions.map(s => {
+              if (s.id === scope.sessionId && s.kind === "canvas") {
+                return { ...s, nodes: nextNodes };
+              }
+              return s;
+            })
+          };
+        });
+      }
+    });
+  }
+
+  async function openEditor(editor: EditorKind | undefined, node: CanvasNode) {
     if (!activeProject || activeSession?.kind !== "canvas") return;
-    const result = await openNodeEditor(activeProject, activeSession, node, editor);
-    updateNode(node.id, (current) => ({
-      ...current,
-      output: [...current.output, result.message],
-    }));
+    const scope: EditorLaunchScope = {
+      projectId: activeProject.id,
+      projectRoot: activeProject.rootPath,
+      sessionId: activeSession.id,
+      nodeId: node.id,
+      runId: node.runId ?? null,
+      worktreePath: resolveRunWorktreePath(activeProject, activeSession, node) ?? null,
+      generation: editorLaunchGenerationRef.current,
+    };
+    await editorLaunchControllerRef.current!.execute(
+      scope,
+      activeProject.rootPath,
+      editor,
+      (s) =>
+        s.generation === editorLaunchGenerationRef.current &&
+        liveScopeRef.current.projectId === s.projectId &&
+        liveScopeRef.current.projectRoot === s.projectRoot &&
+        liveScopeRef.current.sessionId === s.sessionId &&
+        liveScopeRef.current.nodeId === s.nodeId &&
+        liveScopeRef.current.runId === s.runId &&
+        liveScopeRef.current.worktreePath === s.worktreePath
+    );
   }
 
   if (!activeProject) {
@@ -2529,6 +2643,7 @@ export default function App() {
           onReassign={() => reassignNode(inspectedNode.id)}
           onInsertBefore={() => insertBefore(inspectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
+          editorLaunchBusy={editorLaunchBusy === `${activeProject.id}:${activeSession.id}:${inspectedNode.id}`}
           onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
         />
       )}
@@ -4652,6 +4767,7 @@ export function NodeModal({
   onReassign,
   onInsertBefore,
   onOpenEditor,
+  editorLaunchBusy,
   onDecisionAnswer,
 }: {
   node: CanvasNode;
@@ -4667,7 +4783,8 @@ export function NodeModal({
   retryUnavailableReason: string | null;
   onReassign: () => void;
   onInsertBefore: () => void;
-  onOpenEditor: (editor: EditorKind) => void;
+  onOpenEditor: (editor?: EditorKind) => void;
+  editorLaunchBusy?: boolean;
   onDecisionAnswer: (option: string) => void;
 }) {
   const backdropRef = useRef<HTMLDivElement | null>(null);
@@ -4755,7 +4872,7 @@ export function NodeModal({
             <Plus size={15} />
             Insert Before
           </button>
-          <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} />
+          <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} busy={editorLaunchBusy} />
         </div>
         <nav className="modal-tabs" aria-label="Node details">
           {NODE_MODAL_TABS.map((item) => (
@@ -4802,15 +4919,16 @@ export function NodeModal({
 
 function EditorLaunchMenu({
   disabled = false,
+  busy = false,
   onOpenEditor,
 }: {
   disabled?: boolean;
-  onOpenEditor: (editor: EditorKind) => void;
+  busy?: boolean;
+  onOpenEditor: (editor?: EditorKind) => void;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const menuId = useId();
-  const triggerOption = DEFAULT_EDITOR_LAUNCH_OPTION;
 
   useEffect(() => {
     if (!open) return;
@@ -4833,10 +4951,10 @@ function EditorLaunchMenu({
     };
   }, [open]);
 
-  function openEditor(option: EditorLaunchOption) {
-    if (disabled) return;
+  function openEditor(option?: EditorLaunchOption) {
+    if (disabled || busy) return;
     setOpen(false);
-    onOpenEditor(option.editor);
+    onOpenEditor(option?.editor);
   }
 
   return (
@@ -4849,14 +4967,24 @@ function EditorLaunchMenu({
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        disabled={disabled}
+        disabled={disabled || busy}
         onClick={() => setOpen((current) => !current)}
       >
-        <EditorLaunchIcon option={triggerOption} />
+        <FolderOpen size={15} />
+        {busy ? "Opening..." : "Open"}
         <ChevronDown size={14} aria-hidden="true" />
       </button>
       {open && (
         <div id={menuId} className="editor-menu-list" role="menu" aria-label="Open worktree with">
+          <button
+            className="editor-menu-item"
+            type="button"
+            role="menuitem"
+            onClick={() => openEditor(undefined)}
+          >
+            <FolderOpen size={14} aria-hidden="true" style={{ width: 16, textAlign: 'center' }} />
+            <span>Open (Default)</span>
+          </button>
           {EDITOR_LAUNCH_OPTIONS.map((option) => (
             <button
               key={option.editor}
@@ -7607,6 +7735,74 @@ export function createPlanFinishController() {
     release(planSessionId: string): void {
       inFlight.delete(planSessionId);
     },
+  };
+}
+
+export interface EditorLaunchScope {
+  projectId: string;
+  projectRoot: string | null;
+  sessionId: string;
+  nodeId: string;
+  runId: string | null;
+  worktreePath: string | null;
+  generation: number;
+}
+
+export function createEditorLaunchController(options: {
+  getSettings: (rootPath: string) => Promise<SettingsSnapshot>;
+  openEditor: (editor: EditorKind, scope: EditorLaunchScope) => Promise<{ok: boolean, message: string}>;
+  onBusyChange: (busyScopeKey: string | null) => void;
+  onOutput: (scope: EditorLaunchScope, message: string) => void;
+}) {
+  let activeRequest: { scopeKey: string; generation: number } | null = null;
+
+  return {
+    async execute(scope: EditorLaunchScope, rootPath: string, overrideEditor: EditorKind | undefined, isScopeCurrent: (scope: EditorLaunchScope) => boolean) {
+      const scopeKey = `${scope.projectId}:${scope.sessionId}:${scope.nodeId}:${scope.generation}`;
+      if (activeRequest && activeRequest.scopeKey === scopeKey) {
+        return;
+      }
+      activeRequest = { scopeKey, generation: scope.generation };
+      options.onBusyChange(scopeKey);
+
+      let targetEditor: EditorKind;
+      try {
+        if (!isScopeCurrent(scope) || activeRequest.scopeKey !== scopeKey) return;
+
+        if (overrideEditor) {
+          targetEditor = overrideEditor;
+        } else {
+          try {
+            const snapshot = await options.getSettings(rootPath);
+            if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+            const persisted = snapshot?.settings?.app?.externalEditor;
+            targetEditor = resolveEditorSelection(persisted, undefined);
+          } catch (e: any) {
+            if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+            options.onOutput(scope, `Failed to read settings: ${e.message}`);
+            return;
+          }
+        }
+
+        if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+
+        try {
+          const result = await options.openEditor(targetEditor, scope);
+          if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+          options.onOutput(scope, result.ok ? result.message : `Failed to open worktree: ${result.message}`);
+        } catch (e: any) {
+          if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+          options.onOutput(scope, `Failed to launch editor: ${e.message}`);
+        }
+      } finally {
+        if (activeRequest?.scopeKey === scopeKey) {
+          activeRequest = null;
+          if (isScopeCurrent(scope)) {
+            options.onBusyChange(null);
+          }
+        }
+      }
+    }
   };
 }
 
