@@ -2680,7 +2680,7 @@ export default function App() {
           onReassign={(selected, isCurrent) => reassignNode(inspectedNode.id, selected, isCurrent)}
           onInsertBefore={() => insertBefore(inspectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
-          editorLaunchBusy={editorLaunchBusy === `${activeProject.id}:${activeSession.id}:${inspectedNode.id}`}
+          editorLaunchBusy={editorLaunchBusy === `${activeProject.id}:${activeSession.id}:${inspectedNode.id}:${editorLaunchGenerationRef.current}`}
           onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
         />
       )}

@@ -1196,6 +1196,41 @@ describe("node editor action", () => {
 
       adapter.mockRestore();
     });
+
+    it("exercises the actual App busy binding against controller-produced pending identity", async () => {
+      const scope = { projectId: "p1", projectRoot: "/root", sessionId: "s1", nodeId: "n1", runId: null, worktreePath: null, generation: 42 };
+      const promise = controller.execute(scope, "/root", "vscode", isScopeCurrent);
+
+      const appSource = await readSource("./App.tsx");
+      const bindingMatch = appSource.match(/editorLaunchBusy=\{(editorLaunchBusy === `.+?`)\}/);
+      expect(bindingMatch).toBeTruthy();
+      const bindingExpression = bindingMatch![1];
+
+      const isNodeEditorLaunchBusy = (editorLaunchBusy: string | null, activeProject: any, activeSession: any, inspectedNode: any, editorLaunchGenerationRef: any) => {
+        return new Function("editorLaunchBusy", "activeProject", "activeSession", "inspectedNode", "editorLaunchGenerationRef", `return ${bindingExpression};`)(editorLaunchBusy, activeProject, activeSession, inspectedNode, editorLaunchGenerationRef);
+      };
+
+      const activeProject = { id: scope.projectId };
+      const activeSession = { id: scope.sessionId };
+      const inspectedNode = { id: scope.nodeId };
+      const editorLaunchGenerationRef = { current: scope.generation };
+
+      // Verify pending state resolves to true.
+      expect(onBusyChange).toHaveBeenCalledWith("p1:s1:n1:42");
+      const pendingIdentity = onBusyChange.mock.calls[0][0];
+      expect(isNodeEditorLaunchBusy(pendingIdentity, activeProject, activeSession, inspectedNode, editorLaunchGenerationRef)).toBe(true);
+
+      // Verify completion state resolves to false.
+      editorResolve({ ok: true, message: "OK" });
+      await promise;
+      expect(onBusyChange).toHaveBeenCalledWith(null);
+      const completedIdentity = onBusyChange.mock.calls[1][0];
+      expect(isNodeEditorLaunchBusy(completedIdentity, activeProject, activeSession, inspectedNode, editorLaunchGenerationRef)).toBe(false);
+
+      // Verify stale generation state resolves to false.
+      editorLaunchGenerationRef.current = 43;
+      expect(isNodeEditorLaunchBusy(pendingIdentity, activeProject, activeSession, inspectedNode, editorLaunchGenerationRef)).toBe(false);
+    });
   });
 });
 
