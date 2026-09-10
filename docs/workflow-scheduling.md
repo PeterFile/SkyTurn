@@ -22,3 +22,10 @@ A newly applied resume advances that session once inside the queue and returns a
 Duplicate controls do not advance. SQLite preserves control revisions across reopen; recovery
 retains existing run ownership and does not relaunch historical runs. Other sessions keep their
 own scheduling state. These controls do not cancel runs or change rollback semantics.
+
+When a next-action hint points to an active task on the current canvas, **Locate blocked task**
+selects that exact task and binds the composer without opening its details. **Review pending checks**
+selects the task and opens its existing **Changes** tab to inspect checks. These shortcuts only
+navigate; they do not refresh checks, repair, resume, merge, or execute work. If the referenced task
+is missing, inactive, or rolled back, the hint remains a passive **Workflow blocked** or
+**Wait for checks** status and never selects a different task. The original reason stays unchanged.

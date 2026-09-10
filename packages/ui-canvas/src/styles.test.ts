@@ -513,4 +513,20 @@ describe("SkyTurn UI style tokens", () => {
       expect(block).toContain("display: none");
     }
   });
+
+  it("preserves flexible node modal scrolling layout for variable chooser/blocked rows", async () => {
+    const styles = await readSource("./styles.css");
+    const modalBlockMatch = styles.match(/\.node-modal\s*\{[^}]*display:[^}]*\}/);
+    const modalBlock = modalBlockMatch ? modalBlockMatch[0] : "";
+    const bodyBlockMatch = styles.match(/\.modal-body\s*\{[^}]*flex:[^}]*\}/);
+    const bodyBlock = bodyBlockMatch ? bodyBlockMatch[0] : "";
+
+    expect(modalBlock).toContain("display: flex");
+    expect(modalBlock).toContain("flex-direction: column");
+    expect(modalBlock).not.toContain("display: grid");
+    expect(modalBlock).not.toContain("grid-template-rows");
+
+    expect(bodyBlock).toContain("flex: 1");
+    expect(bodyBlock).toContain("overflow: auto");
+  });
 });

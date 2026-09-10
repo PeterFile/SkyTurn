@@ -17,16 +17,68 @@ function action(input: Partial<WorkflowLoopNextAction> = {}): WorkflowLoopNextAc
 describe("next safe action hint", () => {
   it("hides a none action", () => {
     expect(buildNextSafeActionHint(action({ kind: "none" }), nodes)).toBeNull();
+    expect(resolveNextActionNavigation(action({ kind: "none" }), nodes)).toBeNull();
+  });
+
+  describe.each([
+    ["blocked", "Locate blocked task", "Workflow blocked", null],
+    ["wait_for_checks", "Review pending checks", "Wait for checks", "Changes"],
+  ] as const)("%s navigation", (kind, label, passiveLabel, modalTab) => {
+    const reason = "  Waiting on this exact task.\nKeep the original reason.  ";
+
+    it.each(["node-1", longLaneId])("navigates only to the exact live target %s", (laneId) => {
+      const nextAction = action({ kind, laneId, reason });
+      const navigation = { targetNodeId: laneId, modalTab };
+
+      expect(buildNextSafeActionHint(nextAction, nodes)).toEqual({ label, reason, navigation });
+      expect(resolveNextActionNavigation(nextAction, nodes)).toEqual(navigation);
+    });
+
+    it("keeps an absent lane ID passive without choosing another node", () => {
+      const nextAction: WorkflowLoopNextAction = { kind, reason };
+
+      expect(buildNextSafeActionHint(nextAction, nodes)).toEqual({
+        label: passiveLabel,
+        reason,
+        navigation: null,
+      });
+      expect(resolveNextActionNavigation(nextAction, nodes)).toBeNull();
+    });
+
+    it.each([undefined, "", "missing-node"])("keeps lane ID %s passive without a fallback", (laneId) => {
+      const nextAction = action({ kind, laneId, reason });
+
+      expect(buildNextSafeActionHint(nextAction, nodes)).toEqual({
+        label: passiveLabel,
+        reason,
+        navigation: null,
+      });
+      expect(resolveNextActionNavigation(nextAction, nodes)).toBeNull();
+    });
+
+    it.each(["inactive", "rolled_back"] as const)("keeps a %s target passive without a fallback", (rollbackStatus) => {
+      const nextAction = action({ kind, laneId: longLaneId, reason });
+      const unavailableNodes = [nodes[0]!, { id: longLaneId, rollbackStatus } as CanvasNode];
+
+      expect(buildNextSafeActionHint(nextAction, unavailableNodes)).toEqual({
+        label: passiveLabel,
+        reason,
+        navigation: null,
+      });
+      expect(resolveNextActionNavigation(nextAction, unavailableNodes)).toBeNull();
+    });
   });
 
   it.each([
-    ["wait_for_checks", "Wait for checks"],
-    ["blocked", "Workflow blocked"],
-  ] as const)("shows %s without navigation", (kind, label) => {
-    expect(buildNextSafeActionHint(action({ kind }), nodes)).toEqual({
+    ["execute_lane", "Open next task"],
+    ["request_repair", "Review repair target"],
+    ["request_variant", "Review variant target"],
+    ["rollback_node", "Review rollback target"],
+  ] as const)("preserves selection-only navigation for %s", (kind, label) => {
+    expect(buildNextSafeActionHint(action({ kind, laneId: longLaneId }), nodes)).toEqual({
       label,
       reason: "Run the next lane.",
-      navigation: null,
+      navigation: { targetNodeId: longLaneId, modalTab: null },
     });
   });
 
@@ -58,10 +110,10 @@ describe("next safe action hint", () => {
   it.each(["fix_failed_checks", "merge_pull_request"] as const)(
     "opens existing Changes for %s without executing the action",
     (kind) => {
-      expect(buildNextSafeActionHint(action({ kind }), nodes)).toEqual({
+      expect(buildNextSafeActionHint(action({ kind, laneId: longLaneId }), nodes)).toEqual({
         label: kind === "fix_failed_checks" ? "Review failed checks" : "Review merge-ready changes",
         reason: "Run the next lane.",
-        navigation: { targetNodeId: "node-1", modalTab: "Changes" },
+        navigation: { targetNodeId: longLaneId, modalTab: "Changes" },
       });
     },
   );
