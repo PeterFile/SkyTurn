@@ -1,8 +1,45 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { X, RefreshCw, CheckCircle2, AlertTriangle } from "lucide-react";
-import type { SettingsSnapshot, SkyTurnSettings } from "@skyturn/persistence";
+import type { SettingsSnapshot, SkyTurnSettings, SettingsEditorKind } from "@skyturn/persistence";
+import { EDITOR_LAUNCH_OPTIONS, isSupportedEditor } from "./editorLaunchOptions.js";
+
+export function computeSettingsSavePayload(
+  snapshot: SettingsSnapshot,
+  drafts: { hermesOverride?: string; codexOverride?: string; externalEditor?: SettingsEditorKind }
+): SkyTurnSettings {
+  const hRaw = drafts.hermesOverride !== undefined ? drafts.hermesOverride : snapshot.settings.app.executableOverrides.hermes;
+  const h = hRaw === "" ? null : hRaw;
+
+  const cRaw = drafts.codexOverride !== undefined ? drafts.codexOverride : snapshot.settings.app.executableOverrides.codex;
+  const c = cRaw === "" ? null : cRaw;
+
+  const eRaw = drafts.externalEditor !== undefined ? drafts.externalEditor : snapshot.settings.app.externalEditor;
+
+  return {
+    ...snapshot.settings,
+    app: {
+      ...snapshot.settings.app,
+      externalEditor: eRaw,
+      executableOverrides: {
+        ...snapshot.settings.app.executableOverrides,
+        hermes: h,
+        codex: c,
+      },
+    },
+  };
+}
 
 export function SettingsPanel({
+  projectRoot,
+  onClose,
+}: {
+  projectRoot: string;
+  onClose: () => void;
+}) {
+  return <SettingsPanelInner key={projectRoot} projectRoot={projectRoot} onClose={onClose} />;
+}
+
+function SettingsPanelInner({
   projectRoot,
   onClose,
 }: {
@@ -17,6 +54,7 @@ export function SettingsPanel({
 
   const [hermesOverride, setHermesOverride] = useState<string | undefined>(undefined);
   const [codexOverride, setCodexOverride] = useState<string | undefined>(undefined);
+  const [externalEditorDraft, setExternalEditorDraft] = useState<SettingsEditorKind | undefined>(undefined);
 
   const [isPending, setIsPending] = useState(() => (typeof window !== "undefined" && !!window?.devflow?.settings));
   const generationRef = useRef(0);
@@ -99,23 +137,11 @@ export function SettingsPanel({
     setIsPending(true);
     setSaveStatus(null);
 
-    const hRaw = hermesOverride !== undefined ? hermesOverride : snapshot.settings.app.executableOverrides.hermes;
-    const h = hRaw === "" ? null : hRaw;
-
-    const cRaw = codexOverride !== undefined ? codexOverride : snapshot.settings.app.executableOverrides.codex;
-    const c = cRaw === "" ? null : cRaw;
-
-    const nextSettings: SkyTurnSettings = {
-      ...snapshot.settings,
-      app: {
-        ...snapshot.settings.app,
-        executableOverrides: {
-          ...snapshot.settings.app.executableOverrides,
-          hermes: h,
-          codex: c,
-        }
-      }
-    };
+    const nextSettings = computeSettingsSavePayload(snapshot, {
+      hermesOverride,
+      codexOverride,
+      externalEditor: externalEditorDraft
+    });
 
     window.devflow.settings.save(projectRoot, nextSettings)
       .then(res => {
@@ -124,6 +150,7 @@ export function SettingsPanel({
           setSaveStatus({ type: 'success', message: 'Settings saved.' });
           setHermesOverride(undefined);
           setCodexOverride(undefined);
+          setExternalEditorDraft(undefined);
           setIsPending(false);
         }
       })
@@ -133,7 +160,11 @@ export function SettingsPanel({
           setIsPending(false);
         }
       });
-  }, [snapshot, projectRoot, hermesOverride, codexOverride]);
+  }, [snapshot, projectRoot, hermesOverride, codexOverride, externalEditorDraft]);
+
+  const persistedEditor = snapshot?.settings.app.externalEditor;
+  const isSupportedEditorValue = isSupportedEditor(persistedEditor);
+  const currentEditorDraft = externalEditorDraft !== undefined ? externalEditorDraft : (persistedEditor ?? "zed");
 
   return (
     <div className="modal-backdrop settings-modal-backdrop" role="presentation">
@@ -176,6 +207,36 @@ export function SettingsPanel({
              </div>
           ) : (
             <form onSubmit={handleSave} className="settings-form">
+              <h3 className="settings-section-title">Application Defaults</h3>
+              <div className="settings-form-group">
+                <label htmlFor="externalEditor">External Editor</label>
+                <select
+                  id="externalEditor"
+                  className="settings-input"
+                  value={currentEditorDraft}
+                  onChange={e => {
+                    if (isSupportedEditor(e.target.value)) {
+                      setExternalEditorDraft(e.target.value);
+                    }
+                  }}
+                  disabled={isPending}
+                >
+                  {!isSupportedEditorValue && currentEditorDraft === persistedEditor && persistedEditor !== undefined && (
+                    <option value={persistedEditor} disabled>
+                      {persistedEditor} (Unsupported - will launch Zed)
+                    </option>
+                  )}
+                  {EDITOR_LAUNCH_OPTIONS.map(opt => (
+                    <option key={opt.editor} value={opt.editor}>{opt.label}</option>
+                  ))}
+                </select>
+                {!isSupportedEditorValue && persistedEditor !== undefined && externalEditorDraft === undefined && (
+                  <div className="plan-error-banner">
+                    Current editor "{persistedEditor}" is unsupported and falls back to Zed. Please select a supported editor.
+                  </div>
+                )}
+              </div>
+
               <h3 className="settings-section-title">Agent Executables</h3>
               <div className="settings-form-group">
                 <label htmlFor="hermesOverride">Hermes Executable Override</label>
@@ -223,7 +284,7 @@ export function SettingsPanel({
               </div>
 
               <div className="settings-form-footer">
-                <button type="submit" disabled={isPending || (hermesOverride === undefined && codexOverride === undefined && snapshot === null)} className="plan-finish-button settings-save-button">
+                <button type="submit" disabled={isPending || (hermesOverride === undefined && codexOverride === undefined && externalEditorDraft === undefined && snapshot === null)} className="plan-finish-button settings-save-button">
                   {isPending ? "Saving..." : "Save Settings"}
                 </button>
               </div>
