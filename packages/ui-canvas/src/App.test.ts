@@ -1,5 +1,7 @@
+import ts from "typescript";
+import { createComposerDraftStore, draftScopeKey } from "./composerDrafts.js";
 import { readFile } from "node:fs/promises";
-import { createElement } from "react";
+import { createElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
@@ -3408,12 +3410,12 @@ describe("Slice C UI behavior", () => {
     const appendRequirement = appSource.slice(appSource.indexOf("async function appendRequirementNode"), appSource.indexOf("async function submitSelectedNodeAction"));
     const nodeAction = appSource.slice(appSource.indexOf("async function submitSelectedNodeAction"), appSource.indexOf("function applyWorkflowActionResult"));
 
-    expect(appendRequirement).toContain("const text = selectedNode ? nodeActionText : bottomGoal;");
+    expect(appendRequirement).toContain("const text = submitted.text;");
     expect(appendRequirement).toContain("if (!text.trim()) return;");
     expect(appendRequirement).toContain("await submitSelectedNodeAction(action, text);");
     expect(appendRequirement).toMatch(/submitBottomComposerAttempt\(\{[^]*?scope: bottomComposerScope,\s*text,/);
     expect(appendRequirement).toMatch(/appendWorkflowUserInput\(responseGuard.queryRoot, \{\s*sessionId,\s*inputId,\s*text,/);
-    expect(appendRequirement).toContain('setBottomGoal((current) => current === text ? "" : current);');
+    expect(appendRequirement).toContain('draftAttempt.complete();');
     expect(nodeAction.match(/instruction: requestText/g)).toHaveLength(2);
     expect(nodeAction).toContain("text: requestText,");
     expect(nodeAction).not.toContain("requestText.trim()");
@@ -3554,12 +3556,12 @@ describe("Slice C UI behavior", () => {
     expect(submitHandler).toContain("applyWorkflowActionResult(result, responseGuard, actionStillCurrent)");
     expect(submitHandler).toContain("await refreshWorkflowProjection(actionStillCurrent)");
     expect(submitHandler).toContain("if (actionStillCurrent()) setNodeActionError");
-    expect(submitHandler).toContain("if (actionStillCurrent()) setNodeActionBusy(null)");
+    expect(submitHandler).toContain("pendingNodeActionsRef.current.delete(pendingScope)");
     expect(submitHandler).toContain("Selected node action is stale. Reselect the node and try again.");
     expect(appSource).toContain("const selectedNodeActionScopeKey = activeSession?.kind === \"canvas\" && selectedNode");
-    expect(appSource).toContain("}, [selectedNodeActionScopeKey]);");
+    expect(appSource).toContain("}, [selectedNodeActionScopeKey, composerAction]);");
     expect(composer).toContain("selectedNodeActionScopeKey: string | null");
-    expect(composer).toContain("}, [selectedNodeActionScopeKey]);");
+    expect(composer).toContain("onActionChange");
     expect(composer).toContain("const actionAvailability = selectedNodeActionAvailability");
     expect(composer).toContain("disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}");
   });
@@ -3589,7 +3591,7 @@ describe("Slice C UI behavior", () => {
     expect(persistSession).toContain("inputId");
     expect(persistSession).not.toContain("appendWorkflowUserInput");
     expect(persistSession).not.toContain("onCreated");
-    expect(appendRequirement).toContain("canvasSessionForWorkflowAuthority(result, responseGuard)");
+    expect(appendRequirement).toContain("workflowRequestAcknowledged(result, responseGuard)");
     expect(persistSession).not.toContain("requireAuthoritativeCanvas");
   });
 
@@ -3621,7 +3623,7 @@ describe("Slice C UI behavior", () => {
     const appSource = await readSource("./App.tsx");
     const composer = appSource.slice(appSource.indexOf('function CanvasComposer('));
     expect(composer).toContain('className={`action-chip ${action === "repair" ? "selected" : ""}`}');
-    expect(composer).toContain('onClick={() => setAction("repair")}');
+    expect(composer).toContain('onClick={() => onActionChange("repair")}');
     expect(composer).toContain('if (action === "repair") placeholder =');
     expect(composer).toContain('else if (action === "variant") placeholder =');
   });
@@ -3819,8 +3821,8 @@ describe("Slice E node rollback/repair/variant UI wiring", () => {
     expect(appSource).toContain("const selectedNodeActionScopeKey = activeSession?.kind === \"canvas\" && selectedNode");
     expect(appSource).not.toContain("}, [selectedNode?.id]);");
     expect(appSource).toContain("selectedNodeActionGenerationRef.current += 1;");
-    expect(appSource).toContain("setNodeActionBusy(null);");
-    expect(appSource).toContain("}, [selectedNodeActionScopeKey]);");
+    expect(appSource).toContain("refreshNodeActionBusy();");
+    expect(appSource).toContain("}, [selectedNodeActionScopeKey, composerAction]);");
     expect(useEffectSource).toContain("setSelectedNodeActionState(null);");
   });
 
@@ -4335,5 +4337,341 @@ describe("App scheduling response freshness", () => {
     const result = applyWorkflowResponseForTest()(workspace, workflowEnvelopeForTest(stale), workflowGuardForTest(requested), 1);
     expect(result).toBe(workspace);
     expect((result.sessions[0] as CanvasSession).schedulingState).toEqual(latest.schedulingState);
+  });
+});
+
+// Execute current App handlers with controlled IPC, retaining real authority and draft logic.
+async function composerAppFunctions(names: string[], context: Record<string, unknown>) {
+  const source = await readSource("./App.tsx");
+  const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const declarations = new Map<string, string>();
+  function visit(node: ts.Node) {
+    if (ts.isFunctionDeclaration(node) && node.name) declarations.set(node.name.text, node.getText(ast).replace(/^export /, ""));
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) declarations.set(node.name.text, `const ${node.getText(ast)};`);
+    ts.forEachChild(node, visit);
+  }
+  visit(ast);
+  const selected = names.map(name => {
+    expect(declarations.has(name), `App must implement ${name}`).toBe(true);
+    return declarations.get(name);
+  }).join("\n");
+  const javascript = ts.transpileModule(selected, { fileName: "App.tsx", compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None, jsx: ts.JsxEmit.React } }).outputText;
+  const entries = Object.entries(context).filter(([key]) => key !== "default");
+  return new Function(...entries.map(([key]) => key), `${javascript}; return { ${names.join(",")} };`)(...entries.map(([, value]) => value));
+}
+const composerAuthorityFunctions = ["workflowRequestAcknowledged", "canvasSessionForWorkflowAuthority",
+  "workspaceMatchesWorkflowAuthority", "workflowSessionEnvelope", "isCanvasSession", "isCanonicalWorkflowProjectRoot",
+  "isRecord", "rollbackBlockedMessage", "optionalText", "hasCanonicalWorkflowPathSegments"];
+describe("App composer draft acknowledgement", () => {
+  it.each([false, true])("retires acknowledged create/append identity without replacing broadcast or newer edits (%s)", async (editAgain) => {
+    const bytes = new Map();
+    const composerDraftStore = createComposerDraftStore(() => ({ getItem: key => bytes.get(key) ?? null, setItem: (key, value) => bytes.set(key, value) }));
+    const key = draftScopeKey(["new", "project-1", "fast"]);
+    const text = "exact goal\n ";
+    composerDraftStore.edit(key, text);
+    const newTaskDraft = { capture: () => composerDraftStore.read(key) };
+    const resolvedNewTaskProjectId = "project-1";
+    const newTaskMode = "fast";
+    const project = workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1");
+    const workspaceRef = { current: workflowWorkspaceForTest([project], []) };
+    const newSessionSubmissionsRef = { current: new Map() };
+    const bottomComposerSubmissionsRef = { current: new Map() };
+    const refreshNewSessionState = () => {};
+    const refreshBottomComposerState = () => {};
+    const changesetsForSession = () => ({});
+    const setWorkspace = update => { workspaceRef.current = update(workspaceRef.current); };
+    const captureWorkflowSessionResponseGuard = (_project, sessionId, requestSession) => workflowGuardForTest(requestSession, { sessionId, generation: 1 });
+    const applyGuardedWorkflowSessionResponse = (result, guard) => {
+      workspaceRef.current = applyWorkflowResponseForTest()(workspaceRef.current, result, guard, 2);
+    };
+    const mutateDraftDuringReply = draftKey => {
+      composerDraftStore.edit(draftScopeKey(["followup", "project-2", "elsewhere"]), "unrelated");
+      if (editAgain) { composerDraftStore.edit(draftKey, "away"); composerDraftStore.edit(draftKey, text); }
+    };
+    const persistCanvasWorkflowSession = async (_root, seed) => {
+      workspaceRef.current = applyWorkflowBroadcastForTest()(workspaceRef.current,
+        { ...workflowEnvelopeForTest({ ...seed, title: "create broadcast" }), cause: "workflow-mutation", projection: {} },
+        newSessionSubmissionsRef.current);
+      mutateDraftDuringReply(key);
+      return workflowEnvelopeForTest({ ...seed, title: "stale create response" });
+    };
+    const context = { ...AppModule, composerDraftStore, newTaskDraft, resolvedNewTaskProjectId, newTaskMode,
+      workspaceRef, newSessionSubmissionsRef, bottomComposerSubmissionsRef, refreshNewSessionState,
+      refreshBottomComposerState, changesetsForSession, setWorkspace, captureWorkflowSessionResponseGuard,
+      applyGuardedWorkflowSessionResponse, persistCanvasWorkflowSession };
+    const { addSessionFromComposer, workflowRequestAcknowledged } = await composerAppFunctions(
+      [...composerAuthorityFunctions, "addSessionFromComposer"], context);
+    vi.stubGlobal("window", { devflow: {} });
+    try {
+      const target = { executionTarget: "current_branch", selectedBranch: "main" };
+      await addSessionFromComposer(target);
+      expect(newSessionSubmissionsRef.current.size).toBe(0);
+      expect(workspaceRef.current.sessions[0].title).toBe("create broadcast");
+      expect(composerDraftStore.read(key).text).toBe(editAgain ? text : "");
+      composerDraftStore.edit(key, text);
+      expect(composerDraftStore.sessionAttempt(composerDraftStore.read(key), target, () => ({ uuid: "fresh", createdAt: "2026-09-09T00:00:00.000Z" })).uuid).toBe("fresh");
+
+      const activeProject = project;
+      const activeSession = workspaceRef.current.sessions[0];
+      const selectedNode = null;
+      const followupKey = draftScopeKey(["followup", project.id, activeSession.id]);
+      const bottomDraft = { capture: () => composerDraftStore.read(followupKey) };
+      const bottomComposerScope = JSON.stringify([project.id, activeSession.id]);
+      composerDraftStore.edit(followupKey, text);
+      window.devflow.appendWorkflowUserInput = async () => {
+        workspaceRef.current = applyWorkflowBroadcastForTest()(workspaceRef.current,
+          { ...workflowEnvelopeForTest({ ...activeSession, title: "append broadcast" }), cause: "workflow-mutation", projection: {} },
+          newSessionSubmissionsRef.current);
+        mutateDraftDuringReply(followupKey);
+        return workflowEnvelopeForTest({ ...activeSession, title: "stale append response" });
+      };
+      const { appendRequirementNode } = await composerAppFunctions(
+        [...composerAuthorityFunctions, "appendRequirementNode"],
+        { ...context, activeProject, activeSession, selectedNode, bottomDraft, bottomComposerScope });
+      await appendRequirementNode();
+      expect(bottomComposerSubmissionsRef.current.size).toBe(0);
+      expect(workspaceRef.current.sessions[0].title).toBe("append broadcast");
+      expect(composerDraftStore.read(followupKey).text).toBe(editAgain ? text : "");
+      composerDraftStore.edit(followupKey, text);
+      expect(composerDraftStore.inputAttempt(composerDraftStore.read(followupKey), () => "fresh-input").inputId).toBe("fresh-input");
+
+      const guard = workflowGuardForTest(activeSession, { sessionId: activeSession.id });
+      const exact = workflowEnvelopeForTest(activeSession);
+      for (const rejected of [false, null, {}, ...["blocked", "failed", "unavailable", "invalid"].map(status => ({ ...exact, status })),
+        { ...exact, sessionId: "wrong" }, { ...exact, projectRoot: "/other" }]) {
+        expect(workflowRequestAcknowledged(rejected, guard)).toBe(false);
+      }
+      workspaceRef.current = { ...workspaceRef.current, projects: [] };
+      expect(workflowRequestAcknowledged(exact, guard)).toBe(false);
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
+
+describe("App composer draft wiring", () => {
+  it("uses synchronous scoped hooks, visible storage warning, and editable busy inputs", async () => {
+    const source = await readSource("./App.tsx");
+    expect(source).toContain('from "./composerDrafts.js"');
+    expect(source).toContain('["new", resolvedNewTaskProjectId, newTaskMode]');
+    expect(source).toContain('["followup", activeProject.id, activeSession.id]');
+    expect(source).toContain('["node", activeProject.id, activeSession.id, selectedNode.id, composerAction]');
+    expect(source).toMatch(/role="alert">\{newTaskDraft.warning\}/);
+    expect(source).toContain("composerDisabled={false}");
+    expect(source).not.toContain("disabled={disabled || nodeActionBusy !== null}");
+    expect(source).not.toContain('setNodeActionText("")');
+    expect(source).not.toContain('onComplete: () => { void onCreate(activeTarget); }');
+  });
+});
+
+describe("App node draft acknowledgements", () => {
+  it.each(["repair", "variant", "rollback"] as const)("clears only acknowledged %s versions and preserves selection/generation gates", async (action) => {
+    for (const outcome of ["success", "edited", "pending-action-switch", "switched", "switch-back", "broadcast", "invalid", "blocked", "failed", "removed-project", "unavailable"]) {
+      const store = createComposerDraftStore(() => undefined);
+      const session = canvasSessionForTest("session-1");
+      const project = workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1");
+      const workspaceRef = { current: workflowWorkspaceForTest([project], [session]) };
+      const node = { id: "node-1" };
+      const key = draftScopeKey(["node", project.id, session.id, node.id, action]);
+      const text = "  exact\n\n\tnode text ";
+      store.edit(key, text);
+      const pendingNodeActionsRef = { current: new Map() };
+      const selectedNodeActionScopeRef = { current: { sessionId: session.id, nodeId: node.id } };
+      const selectedNodeActionGenerationRef = { current: 0 };
+      const generations = { current: new Map() };
+      const payload = { sessionId: session.id, nodeId: node.id };
+      const status = vi.fn();
+      const errors = vi.fn();
+      const apply = vi.fn();
+      let resolve!: (value: unknown) => void;
+      let reject!: (error: Error) => void;
+      const request = vi.fn(() => new Promise((yes, no) => { resolve = yes; reject = no; }));
+      const guard = workflowGuardForTest(session, { sessionId: session.id, generation: 0 });
+      const context = { ...AppModule, composerDraftStore: store, workspaceRef, activeProject: project, activeSession: session,
+        selectedNode: node, composerAction: action, selectedNodeActionScopeKey: JSON.stringify([project.id, session.id, node.id]),
+        nodeDraft: { capture: () => store.read(key) }, pendingNodeActionsRef, selectedNodeActionScopeRef,
+        selectedNodeActionGenerationRef, workflowProjectionGenerationRef: generations,
+        selectedNodeActionState: { canCreateRepair: true, canCreateVariant: true, canRollback: true,
+          repairPayload: payload, variantPayload: payload, rollbackPayload: payload },
+        setNodeActionFeedbackScope: vi.fn(), setNodeActionError: errors, setNodeActionStatus: status,
+        refreshNodeActionBusy: vi.fn(), refreshWorkflowProjection: vi.fn(),
+        captureWorkflowSessionResponseGuard: () => guard,
+        applyGuardedWorkflowSessionResponse: (response, captured) => {
+          const next = applyWorkflowResponseForTest()(workspaceRef.current, response, captured, outcome === "broadcast" ? 1 : 0);
+          if (next === workspaceRef.current) return false;
+          workspaceRef.current = next; apply(); return true;
+        },
+      };
+      const handlers = await composerAppFunctions([...composerAuthorityFunctions, "submitSelectedNodeAction",
+        "nodeActionPayloadMatchesSelection", "actionFailureMessage", "applyWorkflowActionResult",
+        "currentCanvasSessionForWorkflowResponse", "currentWorkflowGeneration", "workflowAuthorityGenerationKey"], context);
+      vi.stubGlobal("window", { devflow: outcome === "unavailable" ? {} : {
+        workflow: { requestRepair: request, requestVariant: request, applyRollback: request },
+      } });
+      try {
+        const pending = handlers.submitSelectedNodeAction(action, text);
+        if (outcome === "unavailable") {
+          await pending; expect(request).not.toHaveBeenCalled(); expect(store.read(key).text).toBe(text); continue;
+        }
+        await handlers.submitSelectedNodeAction(action, text);
+        expect(request).toHaveBeenCalledTimes(1);
+        expect(request.mock.calls[0][1][action === "rollback" ? "text" : "instruction"]).toBe(text);
+        if (outcome === "edited") { store.edit(key, "away"); store.edit(key, text); }
+        if (outcome === "pending-action-switch") {
+          const { CanvasComposer } = await composerAppFunctions(["CanvasComposer", "NODE_ACTION_IMPACT_COPY"], {
+            ...AppModule, React: { createElement }, useRef: (current: unknown) => ({ current }),
+            useCallback: (callback: unknown) => callback, useGSAP: () => {},
+            Check: "span", AlertTriangle: "span", Plus: "span", Square: "span", ArrowUp: "span",
+          });
+          function elements(tree: ReactNode): ReactElement<Record<string, unknown>>[] {
+            if (Array.isArray(tree)) return tree.flatMap(elements);
+            if (!isValidElement<Record<string, unknown>>(tree)) return [];
+            return [tree, ...elements(tree.props.children as ReactNode)];
+          }
+          const onActionChange = vi.fn((next: string) => {
+            // App's selection effect advances this generation when the action changes.
+            if (next !== action) selectedNodeActionGenerationRef.current++;
+          });
+          const tree = CanvasComposer({
+            value: text, disabled: false, selectedNode: node, selectedRunEvidence: null,
+            selectedNodeActionScopeKey: context.selectedNodeActionScopeKey, action, onActionChange,
+            selectedNodeActionState: { ...context.selectedNodeActionState,
+              checkpoints: { hasBefore: true, hasAfter: true }, remoteSideEffects: [], rollbackEligibility: null },
+            nodeActionBusy: pendingNodeActionsRef.current.get(context.selectedNodeActionScopeKey),
+            nodeActionError: null, nodeActionStatus: null, workflowBackendAvailable: true,
+            bottomComposerState: null, nextActionHint: null,
+            onChange: (value: string) => store.edit(key, value), onSubmit: vi.fn(), onStop: vi.fn(),
+          });
+          const controls = elements(tree);
+          const chips = controls.filter(element => element.type === "button" && String(element.props.className).startsWith("action-chip"));
+          expect(chips.map(chip => chip.props.children)).toEqual(["Repair", "Variant", "Rollback"]);
+          expect.soft(chips.map(chip => chip.props.disabled)).toEqual([true, true, true]);
+          // Native disabled buttons do not dispatch clicks; exercise the opposite branch before the fix.
+          for (const chip of chips) if (!chip.props.disabled) (chip.props.onClick as () => void)();
+          const input = controls.find(element => element.type === "textarea")!;
+          expect(input.props.disabled).toBe(false);
+          (input.props.onChange as (event: unknown) => void)({ target: { value: `${text}\nnew draft` } });
+          expect(store.read(key).text).toBe(`${text}\nnew draft`);
+          expect(workspaceRef.current.sessions[0]).toBe(session);
+          expect(apply).not.toHaveBeenCalled();
+          expect(status.mock.calls.filter(([value]) => value !== null)).toHaveLength(0);
+        }
+        if (outcome === "switched" || outcome === "switch-back") {
+          selectedNodeActionScopeRef.current = { sessionId: session.id, nodeId: "node-2" };
+          selectedNodeActionGenerationRef.current++;
+          store.edit(draftScopeKey(["node", project.id, session.id, "node-2", action]), "other node");
+        }
+        if (outcome === "switch-back") {
+          selectedNodeActionScopeRef.current = { sessionId: session.id, nodeId: node.id };
+          selectedNodeActionGenerationRef.current++;
+          await handlers.submitSelectedNodeAction(action, text);
+          expect(request).toHaveBeenCalledTimes(1);
+        }
+        if (outcome === "broadcast") workspaceRef.current = { ...workspaceRef.current, sessions: [{ ...session, title: "broadcast" }] };
+        if (outcome === "removed-project") workspaceRef.current = { ...workspaceRef.current, projects: [] };
+        if (outcome === "failed") reject(new Error("UNAVAILABLE"));
+        else resolve(outcome === "invalid" ? null : { ...workflowEnvelopeForTest(outcome === "pending-action-switch" ? { ...session, title: "Accepted node action" } : session), ...(outcome === "blocked" ? { status: "blocked" } : {}) });
+        await pending;
+        const acknowledged = ["success", "edited", "switched", "switch-back", "broadcast"].includes(outcome);
+        expect(store.read(key).text, outcome).toBe(outcome === "pending-action-switch" ? `${text}\nnew draft` : acknowledged && outcome !== "edited" ? "" : text);
+        expect(pendingNodeActionsRef.current.size).toBe(0);
+        expect(status.mock.calls.filter(([value]) => value !== null).length, outcome).toBe(["success", "edited", "pending-action-switch"].includes(outcome) ? 1 : 0);
+        if (outcome === "pending-action-switch") {
+          expect(apply).toHaveBeenCalledTimes(1);
+          expect(workspaceRef.current.sessions[0].title).toBe("Accepted node action");
+          expect(status).toHaveBeenLastCalledWith(action === "rollback"
+            ? "Rollback affects selected and downstream workflow state, not evidence/history."
+            : `${action === "repair" ? "Repair" : "Variant"} lane requested.`);
+        }
+        if (outcome === "broadcast") expect(workspaceRef.current.sessions[0].title).toBe("broadcast");
+        if (outcome === "switched") expect(store.read(draftScopeKey(["node", project.id, session.id, "node-2", action])).text).toBe("other node");
+      } finally { vi.unstubAllGlobals(); }
+    }
+  });
+});
+
+describe("App draft scope and restart", () => {
+  it("resolves hooks and remembered actions for the current node on the first render", async () => {
+    const source = await readSource("./App.tsx");
+    const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    const app = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "App") as ts.FunctionDeclaration;
+    const names = ["selectedNodeActionScopeKey", "composerAction", "newTaskDraft", "bottomDraft", "nodeDraft"];
+    const declarations = app.body!.statements.filter(node => ts.isVariableStatement(node) &&
+      node.declarationList.declarations.some(item => names.includes(item.name.getText(ast))));
+    expect(declarations).toHaveLength(names.length);
+    const javascript = ts.transpileModule(declarations.map(node => node.getText(ast)).join("\n"), {
+      compilerOptions: { target: ts.ScriptTarget.ES2022 },
+    }).outputText;
+    const store = createComposerDraftStore(() => undefined);
+    const actions = new Map<string, string>();
+    const render = (projectId: string, sessionId: string, nodeId: string | null, mode = "fast") => new Function(
+      "activeProject", "activeSession", "selectedNode", "resolvedNewTaskProjectId", "newTaskMode", "composerActions", "draftScopeKey", "useComposerDraft",
+      `${javascript}; return { composerAction, newTaskDraft, bottomDraft, nodeDraft };`,
+    )({ id: projectId }, { id: sessionId, kind: "canvas" }, nodeId ? { id: nodeId } : null, projectId, mode, actions,
+      draftScopeKey, (key: string) => ({ ...store.read(key), setText: (text: string) => store.edit(key, text) }));
+    actions.set(JSON.stringify(["p", "s", "a"]), "repair");
+    const original = render("p", "s", "a");
+    for (const draft of [original.newTaskDraft, original.bottomDraft, original.nodeDraft]) draft.setText(" \n\tfirst\n\nlast ");
+    expect(render("p", "s", "b").composerAction).toBeNull();
+    expect(render("p", "s", "b").nodeDraft.text).toBe("");
+    actions.set(JSON.stringify(["p", "s", "b"]), "variant");
+    render("p", "s", "b").nodeDraft.setText("second node");
+    expect(render("p", "s", "a").composerAction).toBe("repair");
+    expect(render("p", "s", "a").nodeDraft.text).toBe(" \n\tfirst\n\nlast ");
+    expect(render("p", "s", "a", "plan").newTaskDraft.text).toBe("");
+    expect(render("p", "other", "a").bottomDraft.text).toBe("");
+    expect(render("other", "s", "a").nodeDraft.text).toBe("");
+    expect(render("p", "s", null).nodeDraft.text).toBe("");
+    expect(source.includes("new Map(current).set(selectedNodeActionScopeKey, action)")).toBe(true);
+  });
+
+  it.each(["new", "followup"] as const)("retains failed %s input and retry identity across restart without replay", async (kind) => {
+    for (const failure of ["throw", "invalid", "wrong-project", "blocked", "unavailable"]) {
+      const bytes = new Map<string, string>();
+      const storage = { getItem: (key: string) => bytes.get(key) ?? null, setItem: (key: string, value: string) => { bytes.set(key, value); } };
+      const key = kind === "new" ? draftScopeKey(["new", "project-1", "fast"]) : draftScopeKey(["followup", "project-1", "session-1"]);
+      const text = "  exact\n\n\trequirement \n";
+      const target = { executionTarget: "current_branch", selectedBranch: "main" };
+      const requests: unknown[][] = [];
+      let store = createComposerDraftStore(() => storage);
+      store.edit(key, text);
+      for (const restart of [false, true]) {
+        if (restart) store = createComposerDraftStore(() => storage);
+        expect(store.read(key).text).toBe(text);
+        const activeProject = workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1");
+        const activeSession = canvasSessionForTest("session-1");
+        const workspaceRef = { current: workflowWorkspaceForTest([activeProject], kind === "new" ? [] : [activeSession]) };
+        const reply = async (session: CanvasSession) => {
+          await Promise.resolve();
+          if (!restart && failure === "throw") throw new Error("UNAVAILABLE");
+          if (!restart && failure === "invalid") return false;
+          return workflowEnvelopeForTest(session, !restart ? failure === "wrong-project" ? { projectRoot: "/other" } : { status: failure } : {});
+        };
+        const context = { ...AppModule, composerDraftStore: store, workspaceRef, activeProject, activeSession, selectedNode: null,
+          resolvedNewTaskProjectId: activeProject.id, newTaskMode: "fast", bottomComposerScope: "bottom-scope",
+          newTaskDraft: { capture: () => store.read(key) }, bottomDraft: { capture: () => store.read(key) },
+          newSessionSubmissionsRef: { current: new Map() }, bottomComposerSubmissionsRef: { current: new Map() },
+          refreshNewSessionState: vi.fn(), refreshBottomComposerState: vi.fn(),
+          captureWorkflowSessionResponseGuard: (_project, sessionId, session) => workflowGuardForTest(session, { sessionId }),
+          applyGuardedWorkflowSessionResponse: vi.fn(() => false),
+          persistCanvasWorkflowSession: async (_root, seed, inputId) => {
+            requests.push([seed.id, seed.createdAt, inputId, seed.goal]); return reply(seed);
+          },
+        };
+        const handlers = await composerAppFunctions([...composerAuthorityFunctions, "addSessionFromComposer", "appendRequirementNode"], context);
+        vi.stubGlobal("window", { devflow: { appendWorkflowUserInput: async (_root, input) => {
+          requests.push([input.inputId, input.text]); return reply(activeSession);
+        } } });
+        try {
+          expect(requests).toHaveLength(restart ? 1 : 0);
+          const submit = () => kind === "new" ? handlers.addSessionFromComposer(target) : handlers.appendRequirementNode();
+          const pending = submit();
+          await submit();
+          await pending;
+          expect(requests).toHaveLength(restart ? 2 : 1);
+          expect(store.read(key).text).toBe(restart ? "" : text);
+        } finally { vi.unstubAllGlobals(); }
+      }
+      expect(requests[1], failure).toEqual(requests[0]);
+      expect(requests[0].at(-1)).toBe(kind === "new" ? text.trim() : text);
+    }
   });
 });
