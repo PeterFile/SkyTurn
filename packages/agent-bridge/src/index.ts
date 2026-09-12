@@ -360,6 +360,7 @@ export interface CodexCliAdapterOptions {
   killTimeoutMs?: number;
   stallTelemetryMs?: number;
   env?: NodeJS.ProcessEnv;
+  // Backend-trusted flags; restricted runs override only writable_roots after these arguments.
   extraArgs?: string[];
   pathValue?: string;
   codexConfigRoot?: string | null;
@@ -4096,6 +4097,7 @@ function makeCodexExecArgs(input: {
     "-c",
     "approval_policy=never",
     ...(input.extraArgs ?? []),
+    ...(input.sandbox === "danger-full-access" ? [] : ["-c", "sandbox_workspace_write.writable_roots=[]"]),
     input.prompt,
   ];
 }

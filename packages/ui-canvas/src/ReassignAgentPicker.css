@@ -1,0 +1,15 @@
+.reassign-picker { margin: 0 16px 12px; padding: 12px; border: 1px solid var(--sk-border-muted); border-radius: 8px; background: var(--sk-surface-warm); font-size: 12px; }
+.reassign-picker fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.reassign-picker legend { margin-bottom: 8px; font-weight: 600; }
+.reassign-picker-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr)); gap: 6px; }
+.reassign-picker-option { display: flex; align-items: start; gap: 8px; padding: 8px; border: 1px solid var(--sk-border-muted); border-radius: 6px; }
+.reassign-picker-option:has(input:checked) { border-color: var(--sk-accent); }
+.reassign-picker-option:has(input:disabled) { color: var(--sk-text-legacy-muted); }
+.reassign-picker input { margin: 2px 0 0; accent-color: var(--sk-accent); }
+.reassign-picker small { display: block; margin-top: 3px; line-height: 1.4; }
+.reassign-picker p { margin: 8px 0; overflow-wrap: anywhere; }
+.reassign-picker [role="alert"] { color: var(--sk-status-warning-legacy); }
+.reassign-picker-actions { display: flex; justify-content: end; flex-wrap: wrap; gap: 8px; }
+.reassign-picker button { padding: 6px 10px; border: 1px solid var(--sk-border-legacy); border-radius: 6px; background: var(--sk-surface-warm); color: var(--sk-text-legacy); }
+.reassign-picker button:last-child { background: var(--sk-accent); color: var(--sk-text-inverse-warm); }
+.reassign-picker :is(input, button):focus-visible { outline: 2px solid var(--sk-accent); outline-offset: 3px; }

@@ -2694,6 +2694,8 @@ describe("agent bridge", () => {
       "read-only",
       "-c",
       "approval_policy=never",
+      "-c",
+      "sandbox_workspace_write.writable_roots=[]",
       "Implement the task",
     ]);
     expect(events.map((event) => event.seq)).toEqual(events.map((_, index) => index + 1));
@@ -7640,6 +7642,103 @@ describe("agent bridge", () => {
     expect(replacementAttempted).toBe(false);
     await expect(stat(startedPath)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(replacementWritePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    ["read-only", false],
+    ["read-only", true],
+    ["workspace-write", false],
+    ["workspace-write", true],
+    ["danger-full-access", false],
+    ["danger-full-access", true],
+  ] as const)("handles Codex inherited writable roots in %s with conflicting extraArgs=%s", async (sandbox, conflictingArgs) => {
+    const projectRoot = await makeTempRoot();
+    await mkdir(join(projectRoot, ".git"));
+    const binRoot = await makeTempRoot();
+    const linkedRoot = join(binRoot, "linked-root");
+    await symlink(projectRoot, linkedRoot, "dir");
+    const rootsKey = "sandbox_workspace_write.writable_roots";
+    const inheritedConfig = {
+      [rootsKey]: [linkedRoot],
+      model: "fixture-native-model",
+      "skills.config": [{ path: "fixture-skill", enabled: true }],
+      "mcp_servers.fixture.command": "fixture-mcp",
+    };
+    const configPath = join(binRoot, "inherited-config.json");
+    const argsPath = join(binRoot, "args.json");
+    const codexPath = join(binRoot, "codex");
+    await writeFile(configPath, JSON.stringify(inheritedConfig));
+    // Simulate only fixture config inheritance and ordered overrides, not Codex's TOML parser.
+    await writeFile(codexPath, [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      "const argv = process.argv.slice(2);",
+      "const config = JSON.parse(fs.readFileSync(process.env.SKYTURN_CODEX_CONFIG_FIXTURE, 'utf8'));",
+      "for (let i = 0; i < argv.length; i++) {",
+      "  if (argv[i] !== '-c' && argv[i] !== '--config') continue;",
+      "  const override = argv[++i];",
+      "  const separator = override.indexOf('=');",
+      "  const key = override.slice(0, separator);",
+      "  const value = override.slice(separator + 1);",
+      "  try { config[key] = JSON.parse(value); } catch { config[key] = value; }",
+      "}",
+      "fs.writeFileSync(process.env.SKYTURN_CODEX_ARGS_PATH, JSON.stringify({ argv, config, cwd: process.cwd() }));",
+      "const sandbox = argv[argv.indexOf('--sandbox') + 1];",
+      "if (sandbox !== 'danger-full-access' && config['sandbox_workspace_write.writable_roots'].some(root => fs.lstatSync(root).isSymbolicLink())) {",
+      "  process.stderr.write('symlinked writable roots are not supported\\n');",
+      "  process.exit(1);",
+      "}",
+      "process.stdout.write('{\"type\":\"turn.completed\"}\\n');",
+    ].join("\n"), { mode: 0o755 });
+    const extraArgs = [
+      "--model", "fixture-selected-model",
+      "-c", "model_reasoning_effort=high",
+      ...(conflictingArgs ? [
+        "-c", `${rootsKey}=[]`,
+        "--config", `${rootsKey}=${JSON.stringify([linkedRoot])}`,
+      ] : []),
+      "-c", "sandbox_workspace_write.network_access=true",
+    ];
+    const bridge = new AgentBridge({
+      adapters: [createCodexCliAdapter({
+        executablePath: codexPath,
+        extraArgs,
+        env: { SKYTURN_CODEX_CONFIG_FIXTURE: configPath, SKYTURN_CODEX_ARGS_PATH: argsPath },
+      })],
+    });
+    const completed = waitForEvent(bridge, (event) =>
+      event.kind === "status" && ["succeeded", "failed"].includes(event.payload.status));
+    await bridge.startRun({
+      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+      nodeId: "node-codex-roots",
+      sessionId: "session-1",
+      projectRoot,
+      worktreePath: projectRoot,
+      agentKind: "codex",
+      sandbox,
+      prompt: "Check fixture config",
+    });
+    const terminal = await completed;
+    const args = JSON.parse(await readFile(argsPath, "utf8")) as {
+      argv: string[]; config: Record<string, unknown>; cwd: string;
+    };
+    const restricted = sandbox !== "danger-full-access";
+    expect(args.config).toEqual({
+      ...inheritedConfig,
+      [rootsKey]: restricted ? [] : [linkedRoot],
+      approval_policy: "never",
+      model_reasoning_effort: "high",
+      "sandbox_workspace_write.network_access": true,
+    });
+    expect(args.argv).toEqual([
+      "exec", "--json", "--ephemeral", "--color", "never",
+      "--sandbox", sandbox, "-c", "approval_policy=never",
+      ...extraArgs,
+      ...(restricted ? ["-c", `${rootsKey}=[]`] : []),
+      "Check fixture config",
+    ]);
+    expect(args.cwd).toBe(await realpath(projectRoot));
+    expect(terminal).toMatchObject({ kind: "status", payload: { status: "succeeded" } });
   });
 
   it("lets a single Codex run override the adapter sandbox", async () => {
