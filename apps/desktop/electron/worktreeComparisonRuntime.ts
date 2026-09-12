@@ -2,11 +2,13 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 
 import type {
+  VariantComparisonInput,
   VariantComparisonEvidence,
   WorktreeAdoptionRequest,
   WorktreeComparisonRequest,
 } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
 import type {
+  RunEvidence,
   WorkflowVariantAdoption,
   WorkflowVariantComparisonRecordedEvidence,
   WorkflowVariantComparisonSideIdentity,
@@ -71,10 +73,7 @@ interface GitWorktreeRuntimeModule {
       worktree: WorkflowWorktreeIdentity,
       options?: { expectedHeadCommit?: string; allowHeadAdvance?: boolean },
     ): Promise<WorkflowWorktreeIdentity>;
-    compareVariants(input: {
-      left: WorkflowWorktreeIdentity;
-      right: WorkflowWorktreeIdentity;
-    }): Promise<VariantComparisonEvidence>;
+    compareVariants(input: VariantComparisonInput): Promise<VariantComparisonEvidence>;
     adoptVariant(
       input: WorkflowVariantAdoption,
       options?: { requiredFreshWorktrees?: readonly WorkflowWorktreeIdentity[] },
@@ -122,12 +121,19 @@ export async function compareWorkflowWorktrees(
       ]);
       const leftIdentity = comparisonSideIdentity(left);
       const rightIdentity = comparisonSideIdentity(right);
+      const { parseRunEvidence } = await import("@skyturn/project-core");
+      const leftEvidence = comparisonRunEvidence(events, request.sessionId, left, parseRunEvidence);
+      const rightEvidence = comparisonRunEvidence(events, request.sessionId, right, parseRunEvidence);
+      const idempotencyKey = comparisonIdempotencyKey(
+        request.sessionId, leftIdentity, rightIdentity, [leftEvidence, rightEvidence],
+      );
       const existing = findExactComparisonRecording(
         gitWorktree,
         events,
         request.sessionId,
         leftIdentity,
         rightIdentity,
+        idempotencyKey,
       );
       if (existing) {
         return {
@@ -138,7 +144,10 @@ export async function compareWorkflowWorktrees(
       }
 
       const comparison = sanitizeComparisonEvidence(gitWorktree.parseVariantComparisonEvidence(
-        await service.compareVariants({ left, right }),
+        await service.compareVariants({ left, right, recordedEvidence: {
+          [left.variantId]: { runEvidence: leftEvidence?.runEvidence },
+          [right.variantId]: { runEvidence: rightEvidence?.runEvidence },
+        } }),
       ));
       const recording = gitWorktree.parseWorkflowVariantComparisonRecordedEvidence({
         sessionId: request.sessionId,
@@ -146,7 +155,6 @@ export async function compareWorkflowWorktrees(
         left: leftIdentity,
         right: rightIdentity,
       });
-      const idempotencyKey = comparisonIdempotencyKey(recording);
       const appended = store.appendWorkflowEvent({
         sessionId: request.sessionId,
         kind: "workflow.variant.comparison_recorded",
@@ -320,18 +328,125 @@ function comparisonSideIdentity(worktree: WorkflowWorktreeIdentity): WorkflowVar
   };
 }
 
+interface ComparisonRunEvidence {
+  laneId: string;
+  segmentId: string;
+  checkpointId: string;
+  runEvidence: RunEvidence;
+}
+
+function comparisonRunEvidence(
+  events: unknown[],
+  sessionId: string,
+  worktree: WorkflowWorktreeIdentity,
+  parseRunEvidence: (value: unknown) => RunEvidence | null,
+): ComparisonRunEvidence | null {
+  const records = events.filter(isRecord);
+  const checkpoints = records.filter((event) => event.kind === "workflow.node.checkpoint_recorded");
+  const checkpointLanes = new Set<unknown>([worktree.parentLaneId]);
+  for (const event of checkpoints) {
+    const checkpoint = isRecord(event.payload) ? event.payload.checkpoint : null;
+    if (isRecord(checkpoint) && (checkpoint.worktreeId === worktree.worktreeId || checkpoint.worktreePath === worktree.realPath)) {
+      checkpointLanes.add(event.laneId);
+    }
+  }
+  // Select the latest boundary before checking suitability. A newer before/dirty/bad
+  // checkpoint must never expose an older run's metrics at the same Git HEAD.
+  const boundary = checkpoints.filter((event) => {
+    const checkpoint = isRecord(event.payload) ? event.payload.checkpoint : null;
+    return isRecord(checkpoint)
+      ? checkpoint.worktreeId === worktree.worktreeId || checkpoint.worktreePath === worktree.realPath ||
+        ((typeof checkpoint.worktreeId !== "string" || typeof checkpoint.worktreePath !== "string") && checkpointLanes.has(event.laneId))
+      : checkpointLanes.has(event.laneId);
+  }).at(-1);
+  const checkpoint = boundary && isRecord(boundary.payload) ? boundary.payload.checkpoint : null;
+  if (!boundary || !isRecord(checkpoint)) return null;
+  const { laneId, segmentId, runId } = checkpoint;
+  if (typeof laneId !== "string" || !laneId || typeof segmentId !== "string" || !segmentId || typeof runId !== "string" || !runId) return null;
+  const evidenceId = `evidence-${segmentId}`;
+  const hasRef = (kind: string, id: string) => Array.isArray(checkpoint.evidenceRefs) &&
+    checkpoint.evidenceRefs.filter((ref) => isRecord(ref) && ref.kind === kind).length === 1 &&
+    checkpoint.evidenceRefs.some((ref) => isRecord(ref) && ref.kind === kind && ref.id === id);
+  if (
+    boundary.sessionId !== sessionId || checkpoint.sessionId !== sessionId ||
+    boundary.source !== "backend" || checkpoint.source !== "backend" ||
+    boundary.laneId !== laneId || boundary.segmentId !== segmentId || checkpoint.nodeId !== laneId ||
+    boundary.idempotencyKey !== `checkpoint:${runId}:after` || checkpoint.id !== `checkpoint:${runId}:after` ||
+    checkpoint.phase !== "after" || checkpoint.executionTarget !== "new_worktree" ||
+    checkpoint.worktreeId !== worktree.worktreeId || checkpoint.worktreePath !== worktree.realPath ||
+    checkpoint.branchName !== worktree.branchName || checkpoint.headCommit !== worktree.headCommit ||
+    !/^[0-9a-f]{40}$/.test(worktree.headCommit) || checkpoint.worktreeState !== "clean" ||
+    // Only the backend checkpoint API can write proof-bearing events. listEvents
+    // validates the canonical proof and its immutable before/after identity pair.
+    typeof checkpoint.ancestryProof !== "string" || !checkpoint.ancestryProof ||
+    !hasRef("run", runId) || !hasRef("segment", segmentId) || !hasRef("evidence", evidenceId)
+  ) return null;
+
+  const laneEvents = records.filter((event) => event.laneId === laneId ||
+    (isRecord(event.payload) && (event.payload.laneId === laneId || event.payload.segmentId === segmentId ||
+      (isRecord(event.payload.evidence) && event.payload.evidence.id === evidenceId))));
+  const started = laneEvents.filter((event) => event.kind === "workflow.segment.started").at(-1);
+  const segment = started && isRecord(started.payload) ? started.payload.segment : null;
+  if (
+    !started || !isRecord(segment) || started.source !== "workflow-scheduler" || started.sessionId !== sessionId ||
+    started.idempotencyKey !== `schedule:${segmentId}:started` ||
+    segment.id !== segmentId || segment.laneId !== laneId || segment.runId !== runId
+  ) return null;
+  let agentKind: unknown;
+  for (const event of records) {
+    if (event === started) break;
+    const payload = event.payload;
+    if (!isRecord(payload)) continue;
+    if (event.kind === "workflow.lane.declared" && isRecord(payload.lane) && payload.lane.id === laneId) {
+      agentKind = payload.lane.agentKind;
+    } else if (event.kind === "workflow.lane.reassigned" && payload.laneId === laneId) {
+      agentKind = payload.agentKind;
+    }
+  }
+  const evidenceEvents = laneEvents.filter((event) => event.kind === "workflow.evidence.recorded");
+  const readEvidence = (event: Record<string, unknown>): RunEvidence | null => {
+    const payload = event.payload;
+    if (!isRecord(payload) || !isRecord(payload.evidence)) return null;
+    if (
+      event.sessionId !== sessionId || event.laneId !== laneId || event.segmentId !== null ||
+      payload.laneId !== laneId || payload.segmentId !== segmentId ||
+      payload.evidence.id !== evidenceId || payload.evidence.kind !== "run-exit" ||
+      event.source !== agentKind ||
+      !["codex", "agy", "gemini", "claude-code", "openclaw", "hermes"].includes(String(event.source))
+    ) return null;
+    const evidence = parseRunEvidence(payload.evidence.runEvidence);
+    return evidence && evidence.runId === runId && evidence.completedAt &&
+      ["succeeded", "failed", "cancelled", "timed-out"].includes(evidence.status) ? evidence : null;
+  };
+  const latest = evidenceEvents.at(-1);
+  const runEvidence = latest ? readEvidence(latest) : null;
+  if (!runEvidence) return null;
+  if (["test", "build", "typecheck"].some((kind) => new Set(
+    runEvidence.checks.filter((check) => check.kind === kind).map((check) => check.status),
+  ).size > 1)) return null;
+  // Identical terminal duplicates are harmless; conflicting facts fail closed.
+  for (const event of evidenceEvents) {
+    const payload = event.payload;
+    if (!isRecord(payload) || (payload.segmentId !== segmentId &&
+      !(isRecord(payload.evidence) && payload.evidence.id === evidenceId))) continue;
+    if (JSON.stringify(readEvidence(event)) !== JSON.stringify(runEvidence)) return null;
+  }
+  return { laneId, segmentId, checkpointId: checkpoint.id as string, runEvidence };
+}
+
 function findExactComparisonRecording(
   gitWorktree: GitWorktreeRuntimeModule,
   events: unknown[],
   sessionId: string,
   left: WorkflowVariantComparisonSideIdentity,
   right: WorkflowVariantComparisonSideIdentity,
+  idempotencyKey: string,
 ): WorkflowVariantComparisonRecordedEvidence | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
     if (!isRecord(event) || event.kind !== "workflow.variant.comparison_recorded") continue;
     const recording = parseComparisonRecordingEvent(gitWorktree, event, sessionId);
-    if (sameSide(recording.left, left) && sameSide(recording.right, right)) return recording;
+    if (event.idempotencyKey === idempotencyKey && sameSide(recording.left, left) && sameSide(recording.right, right)) return recording;
   }
   return null;
 }
@@ -380,11 +495,18 @@ function parseComparisonRecordingEvent(
   return recording;
 }
 
-function comparisonIdempotencyKey(recording: WorkflowVariantComparisonRecordedEvidence): string {
+function comparisonIdempotencyKey(
+  sessionId: string,
+  left: WorkflowVariantComparisonSideIdentity,
+  right: WorkflowVariantComparisonSideIdentity,
+  evidence: Array<ComparisonRunEvidence | null>,
+): string {
   const authority = JSON.stringify({
-    sessionId: recording.sessionId,
-    left: recording.left,
-    right: recording.right,
+    version: 1,
+    sessionId,
+    left,
+    right,
+    evidence,
   });
   return `variant-comparison:${createHash("sha256").update(authority, "utf8").digest("hex")}`;
 }

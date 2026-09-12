@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,6 +14,225 @@ const projectCore = await import(pathToFileURL(join(root, "..", "..", "packages"
 const persistenceRoot = join(root, "..", "..", "packages", "persistence");
 const { createWorkflowStore } = await import(pathToFileURL(join(persistenceRoot, "dist", "workflowStore.js")).href);
 const Database = createRequire(join(persistenceRoot, "package.json"))("better-sqlite3");
+const gitWorktree = await import(pathToFileURL(join(root, "..", "..", "packages", "git-worktree", "dist", "node.js")).href);
+
+test("real Git comparison refreshes same-HEAD run metrics and reuses receipts after SQLite reopen", async () => {
+  const fixture = await realComparisonFixture();
+  try {
+    const unknown = await fixture.compare();
+    assertRunMetrics(unknown, 0, ["unknown", "unknown", "unknown", "unknown"]);
+    assert.deepEqual(await fixture.compare(), unknown);
+    await fixture.finish("left");
+    const leftRecorded = await fixture.compare();
+    assertRunMetrics(leftRecorded, 0, ["passed", "passed", "passed", "recorded"]);
+    assert.notEqual(leftRecorded.recording.comparison.comparisonId, unknown.comparison.comparisonId);
+    assert.equal(leftRecorded.recording.left.headCommit, unknown.recording.left.headCommit);
+    assert.doesNotMatch(JSON.stringify(leftRecorded), /TOKEN_private|\/private\/sensitive|all tests passed in prose/);
+    assert.ok(JSON.stringify(leftRecorded).includes(".devflow/acceptance/left.txt"));
+    await fixture.finish("right", "failed");
+    const bothRecorded = await fixture.compare();
+    assertRunMetrics(bothRecorded, 1, ["passed", "failed", "passed", "recorded"]);
+    assert.equal(bothRecorded.recording.right.headCommit, unknown.recording.right.headCommit);
+    // Cache identity must include canonical content even when every binding is unchanged.
+    const updatedDetail = "Updated recorded test detail api_key=TOKEN_private /private/sensitive/result.txt";
+    fixture.rewriteTestDetail(updatedDetail);
+    const updated = await fixture.compare();
+    assert.notEqual(updated.comparison.comparisonId, bothRecorded.comparison.comparisonId);
+    assert.equal(updated.comparison.variants[0].metrics.find((metric) => metric.kind === "test").detail, projectCore.sanitizePublicEvidenceText(updatedDetail));
+    assert.doesNotMatch(JSON.stringify(updated), /TOKEN_private|\/private\/sensitive/);
+    fixture.rewriteTestDetail(updatedDetail.replace("TOKEN_private", "TOKEN_other"));
+    assert.deepEqual(await fixture.compare(), updated);
+    fixture.append({ kind: "workflow.user_input", source: "user", payload: { text: "Unrelated traffic" } });
+    fixture.reopen();
+    assert.deepEqual(await fixture.compare(), updated);
+    assert.deepEqual(await fixture.compare(), updated);
+    assert.equal(fixture.events().filter((event) => event.kind === "workflow.variant.comparison_recorded").length, 4);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("real Git comparison rejects unsuitable latest facts without borrowing older run evidence", async () => {
+  const fixture = await realComparisonFixture();
+  try {
+    await fixture.finish("left");
+    const recorded = await fixture.compare();
+    assertRunMetrics(recorded, 0, ["passed", "passed", "passed", "recorded"]);
+    const original = fixture.events();
+    const evidenceIndex = original.findIndex((event) => event.kind === "workflow.evidence.recorded" && event.laneId === "lane-left");
+    const checkpointIndex = original.findIndex((event) => event.kind === "workflow.node.checkpoint_recorded" && event.payload.checkpoint.phase === "after");
+    const mutations = [
+      (events) => { events[evidenceIndex].payload.evidence.runEvidence.runId = "another-run"; },
+      (events) => { events[evidenceIndex].payload.segmentId = "another-segment"; },
+      (events) => { events[evidenceIndex].laneId = "another-lane"; },
+      (events) => { events[evidenceIndex].sessionId = "another-session"; },
+      (events) => { events[evidenceIndex].source = "human"; },
+      (events) => { events[evidenceIndex].payload.evidence.runEvidence.checks[0].status = "success"; },
+      (events) => { events[evidenceIndex].payload.evidence.runEvidence.artifacts = [".env"]; },
+      (events) => { delete events[evidenceIndex].payload.evidence.runEvidence; },
+      (events) => { events[checkpointIndex].payload.checkpoint.headCommit = "f".repeat(40); },
+      (events) => { events[checkpointIndex].payload.checkpoint.headCommit = recorded.recording.left.headCommit.slice(0, 8); },
+      (events) => { events[checkpointIndex].payload.checkpoint.worktreeId = "another-worktree"; },
+      (events) => { events[checkpointIndex].payload.checkpoint.worktreePath += "-other"; },
+      (events) => { events[checkpointIndex].payload.checkpoint.branchName = "another-branch"; },
+      (events) => { events[checkpointIndex].payload.checkpoint.worktreeState = "dirty"; },
+      (events) => { delete events[checkpointIndex].payload.checkpoint.ancestryProof; },
+      (events) => { events[checkpointIndex].payload.checkpoint.evidenceRefs = []; },
+      (events) => { events.splice(checkpointIndex, 1); },
+      (events) => {
+        const latest = structuredClone(events[evidenceIndex]);
+        latest.payload.evidence.runEvidence.checks[0].status = "failed";
+        events.push(latest);
+      },
+      (events) => { events[evidenceIndex].source = "gemini"; },
+      (events) => { events[evidenceIndex].payload.evidence.runEvidence.checks.push({ kind: "test", name: "Other tests", status: "failed" }); },
+      (events) => { events[evidenceIndex].payload.evidence.runEvidence.completedAt = null; },
+      (events) => { events.push({ ...events[evidenceIndex], payload: null }); },
+      (events) => { events.push({ ...events[checkpointIndex], payload: { checkpoint: { phase: "after" } } }); },
+      (events) => {
+        const started = structuredClone(events.find((event) => event.kind === "workflow.segment.started" && event.laneId === "lane-left"));
+        started.payload.segment.runId = "newer-run";
+        events.push(started);
+      },
+      (events) => {
+        const latest = structuredClone(events[evidenceIndex]);
+        latest.payload.segmentId = "newer-segment";
+        latest.payload.evidence.runEvidence = null;
+        events.push(latest);
+      },
+    ];
+    for (const [index, mutate] of mutations.entries()) {
+      // Corrupt only the read boundary; valid baseline facts come from real producers below.
+      const events = structuredClone(original);
+      mutate(events);
+      if (index === 3) {
+        await assert.rejects(fixture.compare(events), /another session/);
+        continue;
+      }
+      const result = await fixture.compare(events);
+      assertRunMetrics(result, 0, ["unknown", "unknown", "unknown", "unknown"], `mutation ${index}`);
+    }
+    const duplicate = structuredClone(original);
+    duplicate.push(structuredClone(duplicate[evidenceIndex]));
+    assert.deepEqual(await fixture.compare(duplicate), recorded);
+  } finally {
+    await fixture.close();
+  }
+});
+
+function assertRunMetrics(result, side, statuses, message) {
+  const metrics = result.comparison.variants[side].metrics;
+  assert.deepEqual(["test", "build", "typecheck", "artifact"].map((kind) => metrics.find((metric) => metric.kind === kind).status), statuses, message);
+}
+
+async function realComparisonFixture() {
+  const temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "skyturn-comparison-git-")));
+  const projectRoot = join(temporaryRoot, "project");
+  await mkdir(projectRoot);
+  const git = (...args) => execFileSync("git", ["-C", projectRoot, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git("init", "-b", "main");
+  await mkdir(join(projectRoot, ".devflow", "acceptance"), { recursive: true });
+  for (const side of ["left", "right"]) await writeFile(join(projectRoot, ".devflow", "acceptance", `${side}.txt`), "Fixture artifact\n");
+  git("add", ".devflow/acceptance");
+  git("-c", "user.name=SkyTurn Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false", "commit", "-m", "fixture");
+  let store = createWorkflowStore({ projectRoot });
+  const now = "2026-09-01T00:00:00.000Z";
+  let sequence = 0;
+  const append = (event) => store.appendWorkflowEvent({ sessionId: "session-1", idempotencyKey: `fixture:${sequence++}`, now, ...event });
+  const session = store.createWorkflowSession({
+    id: "session-1", projectId: "project-1", title: "Compare", goal: "Compare runs", mode: "fast",
+    target: { executionTarget: "new_worktree", selectedBranch: "main", baseRef: "main" },
+    plannerProfile: "default", transport: "hermes_replay_recovery", recoveryReason: "fixture", now,
+  });
+  const evidence = (runId, checks = [], artifacts = []) => ({
+    runId, status: checks.some((check) => check.status === "failed") ? "failed" : "succeeded",
+    exitCode: 0, changesetId: null, checks, artifacts, review: null, errorReason: null, cancelReason: null, completedAt: now,
+  });
+  const { segment: planner } = store.claimPlannerRunStart({
+    sessionId: session.id, laneId: session.plannerLaneId, runId: "planner-run", agentKind: "hermes", worktreePath: projectRoot, now,
+  });
+  store.recordRunResult({ ...planner, evidence: evidence(planner.runId), now });
+  store.recordPlannerIntentReconciled(planner, now);
+  const worktrees = {};
+  const service = gitWorktree.createNodeGitWorktreeService({ eventSink: { append: async (event) => append({ ...event, now: event.createdAt }) } });
+  for (const side of ["left", "right"]) {
+    append({ kind: "workflow.lane.declared", source: "test", payload: { lane: {
+      id: `lane-${side}`, semanticKey: `lane-${side}`, kind: "implementation", title: `Implement ${side}`, agentKind: "codex", status: "pending",
+    } } });
+    worktrees[side] = await service.createManagedWorktree({
+      sessionId: session.id, variantId: side, repoRoot: projectRoot, baseCommit: git("rev-parse", "HEAD"),
+      branchName: `skyturn/session-1/${side}`, parentLaneId: `lane-${side}`,
+    });
+    const mirror = join(worktrees[side].realPath, ".devflow", "runs", "mirror-run");
+    await mkdir(mirror, { recursive: true });
+    await writeFile(join(mirror, "events.ndjson"), JSON.stringify({ kind: "evidence", runId: "mirror-run", payload: {
+      evidence: evidence("mirror-run", [{ kind: "test", name: "Mirror claims success", status: "passed" }]),
+    } }) + "\n");
+    append({ kind: "workflow.lane.candidate_bound", source: "workflow-scheduler", payload: {
+      binding: projectCore.parseWorkflowLaneCandidateBinding({
+        sessionId: session.id, laneId: `lane-${side}`, variantId: side, worktreeId: worktrees[side].worktreeId,
+        lineageId: `lineage-${side}`, reason: "default", predecessorLaneIds: [],
+      }),
+    } });
+  }
+  const runtime = await loadRuntime();
+  const harness = runtimeHarness({ projectRoot });
+  harness.dependencies.canonicalPath = realpath;
+  harness.dependencies.loadGitWorktreeModule = async () => gitWorktree;
+  return {
+    append,
+    events: () => store.listEvents(session.id),
+    reopen() { store.close(); store = createWorkflowStore({ projectRoot }); },
+    rewriteTestDetail(detail) {
+      // Exercise the persisted untrusted-content boundary without inventing a new HEAD join.
+      const event = store.listEvents(session.id).find((event) => event.kind === "workflow.evidence.recorded" && event.laneId === "lane-left");
+      event.payload.evidence.runEvidence.checks[0].detail = detail;
+      const database = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+      try {
+        database.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ?").run(JSON.stringify(event.payload), event.id);
+      } finally {
+        database.close();
+      }
+    },
+    async finish(side, buildStatus = "passed") {
+      const scheduled = store.scheduleReadyLanes(session.id, { allowedParallelism: 1, now });
+      const lane = scheduled.readyLanes.find((lane) => lane.id === `lane-${side}`);
+      assert.ok(lane);
+      const worktree = worktrees[side];
+      const input = {
+        sessionId: session.id, nodeId: lane.id, laneId: lane.id, segmentId: lane.segmentId, runId: lane.runId,
+        executionTarget: "new_worktree", worktreeId: worktree.worktreeId, worktreePath: worktree.realPath,
+        ...await gitWorktree.getGitCheckpointSnapshot(worktree.realPath),
+        evidenceRefs: [{ kind: "run", id: lane.runId }, { kind: "segment", id: lane.segmentId }], now,
+      };
+      store.recordRunCheckpoint({ ...input, phase: "before" });
+      const checks = ["test", "build", "typecheck"].map((kind) => ({
+        kind, name: kind, status: kind === "build" ? buildStatus : "passed",
+        detail: "Checked /private/sensitive/result.txt api_key=TOKEN_private",
+      }));
+      store.recordRunResult({ ...input, agentKind: "codex", evidence: evidence(input.runId, checks, [`.devflow/acceptance/${side}.txt`]), outputSummary: "all tests passed in prose", now });
+      const proofInput = { repositoryPath: projectRoot, worktreePath: input.worktreePath, beforeHeadCommit: input.headCommit, afterHeadCommit: input.headCommit };
+      store.recordRunCheckpoint({
+        ...input, phase: "after", evidenceRefs: [...input.evidenceRefs, { kind: "evidence", id: `evidence-${input.segmentId}` }],
+        ancestryProof: await gitWorktree.createWorkflowGitAncestryProof(proofInput),
+        ancestryProofContext: await gitWorktree.createLiveWorkflowGitAncestryProofContext(proofInput),
+      });
+    },
+    async compare(events) {
+      harness.dependencies.getWorkflowStore = async () => ({
+        materializeCanvasSession: (id) => store.materializeCanvasSession(id),
+        listEvents: (id) => events ? [...events, ...store.listEvents(id).filter((event) =>
+          event.kind === "workflow.variant.comparison_recorded" && !events.some((existing) => existing.id === event.id)
+        )] : store.listEvents(id),
+        appendWorkflowEvent: (input) => store.appendWorkflowEvent(input),
+      });
+      return runtime.compareWorkflowWorktrees(harness.dependencies, projectRoot, {
+        sessionId: session.id, leftWorktreeId: worktrees.left.worktreeId, rightWorktreeId: worktrees.right.worktreeId,
+      });
+    },
+    async close() { store.close(); await rm(temporaryRoot, { recursive: true, force: true }); },
+  };
+}
 
 test("variant runtime returns the persisted reconciled receipt and adopts the advanced head", async () => {
   const runtime = await loadRuntime();
@@ -311,6 +531,7 @@ async function loadRuntime() {
     module,
     exports: module.exports,
     require(specifier) {
+      if (specifier === "@skyturn/project-core") return projectCore;
       if (specifier === "./workflowIpcContracts") {
         return {
           workflowIpcError(code, message) {
