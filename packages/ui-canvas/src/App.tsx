@@ -1,4 +1,6 @@
 import { WorkflowSchedulingControl, type SchedulingAttempt } from "./WorkflowSchedulingControl.js";
+import { resolveEditorSelection } from "./editorLaunchOptions.js";
+import type { SettingsSnapshot } from "@skyturn/persistence";
 import {
   createNodeRetryController, NODE_RETRY_CONFIRMATION,
   type NodeRetryScope, type NodeRetryState, type NodeRetryHistory,
@@ -21,6 +23,7 @@ import {
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
+import { composerDraftStore, draftScopeKey, useComposerDraft } from "./composerDrafts.js";
 import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
 import {
@@ -974,11 +977,11 @@ export default function App() {
   const [workspaceLoaded, setWorkspaceLoaded] = useState(false);
   const [workspaceLoadAttempt, setWorkspaceLoadAttempt] = useState(0);
   const [workspaceLoadError, setWorkspaceLoadError] = useState<string | null>(null);
-  const [newTaskGoal, setNewTaskGoal] = useState("");
   const [newTaskMode, setNewTaskMode] = useState<WorkflowMode>("fast");
   const [newTaskProjectId, setNewTaskProjectId] = useState<string | null>(null);
-  const [bottomGoal, setBottomGoal] = useState("");
-  const [nodeActionText, setNodeActionText] = useState("");
+  const [composerActions, setComposerActions] = useState<ReadonlyMap<string, ComposerAction>>(() => new Map());
+  const pendingNodeActionsRef = useRef(new Map<string, Exclude<ComposerAction, null>>());
+  const [nodeActionFeedbackScope, setNodeActionFeedbackScope] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
@@ -987,9 +990,10 @@ export default function App() {
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [selectedNodeActionState, setSelectedNodeActionState] = useState<SelectedNodeActionState | null>(null);
   const [agentReadiness, setAgentReadiness] = useState<AgentWorkflowReadinessSummary | null>(null);
-  const [nodeActionBusy, setNodeActionBusy] = useState<Exclude<ComposerAction, null> | null>(null);
+  const [, refreshNodeActionBusy] = useReducer((revision: number) => revision + 1, 0);
   const [nodeActionError, setNodeActionError] = useState<string | null>(null);
   const [nodeActionStatus, setNodeActionStatus] = useState<string | null>(null);
+  const [editorLaunchBusy, setEditorLaunchBusy] = useState<string | null>(null);
   const [, refreshBottomComposerState] = useReducer((revision: number) => revision + 1, 0);
   const [, refreshNewSessionState] = useReducer((revision: number) => revision + 1, 0);
   const [planRuntimeRecovery, dispatchPlanRuntimeRecovery] = useReducer(
@@ -1007,7 +1011,6 @@ export default function App() {
   const selectedNodeActionScopeRef = useRef<{ sessionId: string; nodeId: string } | null>(null);
   const selectedNodeActionGenerationRef = useRef(0);
   const bottomComposerSubmissionsRef = useRef(new Map<string, BottomComposerSubmissionState>());
-  const activeBottomComposerScopeRef = useRef<string | null>(null);
   const newSessionSubmissionsRef = useRef(new Map<string, NewSessionSubmissionState>());
   const schedulingAttemptsRef = useRef(new Map<string, SchedulingAttempt>());
   const [, refreshScheduling] = useReducer((revision: number) => revision + 1, 0);
@@ -1116,7 +1119,6 @@ export default function App() {
   const bottomComposerScope = activeProject && activeSession?.kind === "canvas"
     ? bottomComposerSubmissionScope(activeProject.id, activeSession.id)
     : null;
-  activeBottomComposerScopeRef.current = bottomComposerScope;
   const bottomComposerState = bottomComposerScope
     ? bottomComposerSubmissionsRef.current.get(bottomComposerScope) ?? null
     : null;
@@ -1125,7 +1127,7 @@ export default function App() {
       ? activeSession.nodes.find((node: CanvasNode) => node.id === selectedNodeId) ?? null
       : null;
   const selectedNodeActionScopeKey = activeSession?.kind === "canvas" && selectedNode
-    ? `${activeSession.id}:${selectedNode.id}`
+    ? JSON.stringify([activeProject?.id, activeSession.id, selectedNode.id])
     : null;
   const inspectedNode =
     activeSession?.kind === "canvas"
@@ -1143,6 +1145,15 @@ export default function App() {
     newTaskProjectId,
     workspace.activeProjectId,
   );
+  const composerAction = selectedNodeActionScopeKey ? composerActions.get(selectedNodeActionScopeKey) ?? null : null;
+  const newTaskDraft = useComposerDraft(draftScopeKey(resolvedNewTaskProjectId ? ["new", resolvedNewTaskProjectId, newTaskMode] : null));
+  const bottomDraft = useComposerDraft(draftScopeKey(activeProject && activeSession?.kind === "canvas"
+    ? ["followup", activeProject.id, activeSession.id] : null));
+  const nodeDraft = useComposerDraft(draftScopeKey(activeProject && activeSession?.kind === "canvas" && selectedNode && composerAction
+    ? ["node", activeProject.id, activeSession.id, selectedNode.id, composerAction] : null));
+  const { text: newTaskGoal, setText: setNewTaskGoal } = newTaskDraft;
+  const { text: bottomGoal, setText: setBottomGoal } = bottomDraft;
+  const { text: nodeActionText, setText: setNodeActionText } = nodeDraft;
   const activeNewSessionFailure = activeSession?.kind === "canvas"
     ? [...newSessionSubmissionsRef.current.values()].find((attempt) => (
         attempt.session.id === activeSession.id && attempt.error !== null
@@ -1184,6 +1195,13 @@ export default function App() {
       requestSession,
       generation: advanceWorkflowGeneration(workflowProjectionGenerationRef.current, authority),
     };
+  }
+
+  function workflowRequestAcknowledged(result: unknown, guard: WorkflowSessionResponseGuard): boolean {
+    return isRecord(result) &&
+      (result.status === undefined || result.status === "requested" || result.status === "applied") &&
+      !!canvasSessionForWorkflowAuthority(result, guard) &&
+      workspaceMatchesWorkflowAuthority(workspaceRef.current, guard);
   }
 
   function applyGuardedWorkflowSessionResponse(
@@ -1533,14 +1551,12 @@ export default function App() {
     selectedNodeActionScopeRef.current = activeSession?.kind === "canvas" && selectedNode
       ? { sessionId: activeSession.id, nodeId: selectedNode.id }
       : null;
-  }, [selectedNodeActionScopeKey]);
+  }, [selectedNodeActionScopeKey, composerAction]);
 
   useEffect(() => {
-    setNodeActionText("");
     setNodeActionError(null);
     setNodeActionStatus(null);
-    setNodeActionBusy(null);
-  }, [selectedNodeActionScopeKey]);
+  }, [selectedNodeActionScopeKey, composerAction]);
 
   useEffect(() => {
     if (!activeProject || activeSession?.kind !== "canvas" || !selectedNode) {
@@ -1740,7 +1756,6 @@ export default function App() {
     if (!resolvedProjectId) return;
 
     setNewTaskProjectId(resolvedProjectId);
-    setNewTaskGoal("");
     setNewTaskMode("fast");
     setWorkspace((current) => ({
       ...current,
@@ -1750,14 +1765,21 @@ export default function App() {
   }
 
   async function addSessionFromComposer(target: SessionTarget) {
-    const goal = newTaskGoal.trim();
+    const submitted = newTaskDraft.capture();
+    const goal = submitted.text.trim();
     if (!resolvedNewTaskProjectId || !goal) return;
     const projectId = resolvedNewTaskProjectId;
     const project = workspaceRef.current.projects.find((item) => item.id === projectId);
     if (!project) return;
     const scope = newSessionSubmissionScope(projectId, goal, newTaskMode, target);
+    if (newSessionSubmissionsRef.current.get(scope)?.busy) return;
+    const draftAttempt = composerDraftStore.sessionAttempt(submitted, target, () => ({
+      uuid: globalThis.crypto.randomUUID(), createdAt: new Date().toISOString(),
+    }));
     const seed = newSessionSubmissionsRef.current.get(scope)?.session ??
-      createSession(projectId, goal, newTaskMode, target);
+      createSession(projectId, goal, newTaskMode, target, {
+        createdAt: draftAttempt.createdAt, randomUUID: () => draftAttempt.uuid,
+      });
     if (seed.kind !== "canvas") {
       setWorkspace((current) => ({
         ...current,
@@ -1766,7 +1788,7 @@ export default function App() {
         activeProjectId: projectId,
         activeSessionId: seed.id,
       }));
-      setNewTaskGoal("");
+      draftAttempt.complete();
       return;
     }
     let createResponseGuard: WorkflowSessionResponseGuard | null = null;
@@ -1793,7 +1815,7 @@ export default function App() {
           attempt.inputId,
         ).then((result) => {
           const authoritative = canvasSessionForWorkflowAuthority(result, guard);
-          if (!authoritative) {
+          if (!authoritative || !workflowRequestAcknowledged(result, guard)) {
             throw new Error("Authoritative canvas session was not returned.");
           }
           createWorkflowResponse = result;
@@ -1804,7 +1826,7 @@ export default function App() {
     });
     if (!session) return;
     if (window.devflow) {
-      if (!createResponseGuard || !createWorkflowResponse) return;
+      if (!createResponseGuard || !workflowRequestAcknowledged(createWorkflowResponse, createResponseGuard)) return;
       applyGuardedWorkflowSessionResponse(createWorkflowResponse, createResponseGuard, decorateNewSessionInstallation);
     } else {
       setWorkspace((current) => {
@@ -1819,7 +1841,7 @@ export default function App() {
         return next;
       });
     }
-    setNewTaskGoal("");
+    draftAttempt.complete();
   }
 
   function updatePlanSection(sessionId: string, section: PlanSectionKey, value: string) {
@@ -2084,7 +2106,8 @@ export default function App() {
 
   async function appendRequirementNode(action?: ComposerAction) {
     if (!activeSession || activeSession.kind !== "canvas") return;
-    const text = selectedNode ? nodeActionText : bottomGoal;
+    const submitted = (selectedNode ? nodeDraft : bottomDraft).capture();
+    const text = submitted.text;
     if (!text.trim()) return;
     if (selectedNode) {
       await submitSelectedNodeAction(action, text);
@@ -2093,6 +2116,11 @@ export default function App() {
     if (window.devflow) {
       const devflow = window.devflow;
       if (!activeProject || !bottomComposerScope) return;
+      if (bottomComposerSubmissionsRef.current.get(bottomComposerScope)?.busy) return;
+      const draftAttempt = composerDraftStore.inputAttempt(submitted, () => {
+        const pending = bottomComposerSubmissionsRef.current.get(bottomComposerScope);
+        return pending?.text === text ? pending.inputId : `bottom-${globalThis.crypto.randomUUID()}`;
+      });
       const project = activeProject;
       const sessionId = activeSession.id;
       let responseGuard: WorkflowSessionResponseGuard | null = null;
@@ -2100,7 +2128,7 @@ export default function App() {
         states: bottomComposerSubmissionsRef.current,
         scope: bottomComposerScope,
         text,
-        createInputId: () => `bottom-${globalThis.crypto.randomUUID()}`,
+        createInputId: () => draftAttempt.inputId,
         submit: async (inputId) => {
           responseGuard = captureWorkflowSessionResponseGuard(project, sessionId, activeSession);
           if (!responseGuard) throw new Error("Workflow project authority is unavailable.");
@@ -2110,18 +2138,16 @@ export default function App() {
             text,
             now: new Date().toISOString(),
           });
-          if (!canvasSessionForWorkflowAuthority(result, responseGuard)) {
+          if (!workflowRequestAcknowledged(result, responseGuard)) {
             throw new Error("Authoritative canvas session was not returned.");
           }
           return result;
         },
         onStateChange: refreshBottomComposerState,
       });
-      if (!response || !responseGuard) return;
+      if (!responseGuard || !workflowRequestAcknowledged(response, responseGuard)) return;
       applyGuardedWorkflowSessionResponse(response, responseGuard);
-      if (activeBottomComposerScopeRef.current === bottomComposerScope) {
-        setBottomGoal((current) => current === text ? "" : current);
-      }
+      draftAttempt.complete();
       return;
     }
     const result = addRequirementPlanningNode(activeSession, text, {
@@ -2129,12 +2155,13 @@ export default function App() {
       projectName: activeProject?.name ?? "project",
     });
     updateCanvasSession(activeSession.id, () => result.session);
-    setBottomGoal("");
+    composerDraftStore.clear(submitted);
   }
 
   async function submitSelectedNodeAction(action: ComposerAction | undefined, requestText: string) {
     if (!activeProject || activeSession?.kind !== "canvas" || !selectedNode) return;
-    if (!action) {
+    setNodeActionFeedbackScope(selectedNodeActionScopeKey);
+    if (!action || action !== composerAction) {
       setNodeActionError("Choose a node action before submitting.");
       return;
     }
@@ -2145,14 +2172,21 @@ export default function App() {
       return;
     }
 
+    const pendingScope = selectedNodeActionScopeKey;
+    if (!pendingScope || pendingNodeActionsRef.current.has(pendingScope)) return;
     const actionState = selectedNodeActionState;
+    const availability = selectedNodeActionAvailability(actionState, true)[action];
+    if (!availability.enabled) { setNodeActionError(availability.reason); return; }
+    const submitted = nodeDraft.capture();
+    if (submitted.text !== requestText) return;
+    pendingNodeActionsRef.current.set(pendingScope, action);
     const actionScope = { sessionId: activeSession.id, nodeId: selectedNode.id };
     const actionGeneration = selectedNodeActionGenerationRef.current + 1;
     selectedNodeActionGenerationRef.current = actionGeneration;
     const actionStillCurrent = () =>
       nodeActionPayloadMatchesSelection(selectedNodeActionScopeRef.current, actionScope.sessionId, actionScope.nodeId) &&
       selectedNodeActionGenerationRef.current === actionGeneration;
-    setNodeActionBusy(action);
+    refreshNodeActionBusy();
     setNodeActionError(null);
     setNodeActionStatus(null);
 
@@ -2173,10 +2207,11 @@ export default function App() {
           ...repairPayload,
           instruction: requestText,
         });
+        if (!workflowRequestAcknowledged(result, responseGuard)) return;
+        composerDraftStore.clear(submitted);
         if (!actionStillCurrent()) return;
-        applyWorkflowActionResult(result, responseGuard, actionStillCurrent);
+        if (!applyGuardedWorkflowSessionResponse(result, responseGuard)) return;
         setNodeActionStatus("Repair lane requested.");
-        setNodeActionText("");
         return;
       }
 
@@ -2196,10 +2231,11 @@ export default function App() {
           ...variantPayload,
           instruction: requestText,
         });
+        if (!workflowRequestAcknowledged(result, responseGuard)) return;
+        composerDraftStore.clear(submitted);
         if (!actionStillCurrent()) return;
-        applyWorkflowActionResult(result, responseGuard, actionStillCurrent);
+        if (!applyGuardedWorkflowSessionResponse(result, responseGuard)) return;
         setNodeActionStatus("Variant lane requested.");
-        setNodeActionText("");
         return;
       }
 
@@ -2218,6 +2254,8 @@ export default function App() {
         ...rollbackPayload,
         text: requestText,
       });
+      const acknowledged = workflowRequestAcknowledged(result, responseGuard);
+      if (acknowledged) composerDraftStore.clear(submitted);
       if (!actionStillCurrent()) return;
       if (!currentCanvasSessionForWorkflowResponse(
         workspaceRef.current,
@@ -2231,13 +2269,14 @@ export default function App() {
         await refreshWorkflowProjection(actionStillCurrent);
         return;
       }
+      if (!acknowledged) return;
       applyWorkflowActionResult(result, responseGuard, actionStillCurrent);
       setNodeActionStatus("Rollback affects selected and downstream workflow state, not evidence/history.");
-      setNodeActionText("");
     } catch (error) {
       if (actionStillCurrent()) setNodeActionError(actionFailureMessage(error, action));
     } finally {
-      if (actionStillCurrent()) setNodeActionBusy(null);
+      pendingNodeActionsRef.current.delete(pendingScope);
+      refreshNodeActionBusy();
     }
   }
 
@@ -2390,13 +2429,124 @@ export default function App() {
     setNodeActionError(INSERT_BEFORE_UNAVAILABLE_ERROR);
   }
 
-  async function openEditor(editor: EditorKind, node: CanvasNode) {
+  const editorLaunchControllerRef = useRef<ReturnType<typeof createEditorLaunchController> | null>(null);
+  const editorLaunchGenerationRef = useRef(0);
+  const inspectedNodeForScope = activeSession?.kind === "canvas" ? activeSession.nodes.find((n) => n.id === inspectedNodeId) : undefined;
+  const currentLaunchScope = {
+    projectId: workspace.activeProjectId,
+    projectRoot: activeProject?.rootPath ?? null,
+    sessionId: workspace.activeSessionId,
+    nodeId: inspectedNodeId,
+    runId: inspectedNodeForScope?.runId ?? null,
+    worktreePath: (activeProject && activeSession?.kind === "canvas" && inspectedNodeForScope) ? resolveRunWorktreePath(activeProject, activeSession, inspectedNodeForScope) : null,
+  };
+
+  const prevLaunchScope = useRef(currentLaunchScope);
+  if (
+    prevLaunchScope.current.projectId !== currentLaunchScope.projectId ||
+    prevLaunchScope.current.projectRoot !== currentLaunchScope.projectRoot ||
+    prevLaunchScope.current.sessionId !== currentLaunchScope.sessionId ||
+    prevLaunchScope.current.nodeId !== currentLaunchScope.nodeId ||
+    prevLaunchScope.current.runId !== currentLaunchScope.runId ||
+    prevLaunchScope.current.worktreePath !== currentLaunchScope.worktreePath
+  ) {
+    editorLaunchGenerationRef.current++;
+    prevLaunchScope.current = currentLaunchScope;
+  }
+
+  const liveScopeRef = useRef(currentLaunchScope);
+  liveScopeRef.current = currentLaunchScope;
+
+  useEffect(() => {
+    return () => { editorLaunchGenerationRef.current++; };
+  }, []);
+
+  if (!editorLaunchControllerRef.current) {
+    editorLaunchControllerRef.current = createEditorLaunchController({
+      getSettings: async (rootPath) => {
+        if (!window.devflow?.settings) {
+          throw new Error("Desktop settings API is missing. Settings are unavailable.");
+        }
+        return window.devflow.settings.get(rootPath);
+      },
+      openEditor: async (editor, scope) => {
+        const project = workspaceRef.current.projects.find(p => p.id === scope.projectId);
+        const session = workspaceRef.current.sessions.find(s => s.id === scope.sessionId);
+        const node = session?.kind === "canvas" ? session.nodes.find(n => n.id === scope.nodeId) : undefined;
+        if (!project || !session || session.kind !== "canvas" || !node) {
+          throw new Error("Invalid session state");
+        }
+        if (session.projectId !== project.id) {
+          throw new Error("Invalid session state: project mismatch");
+        }
+        if (project.rootPath !== scope.projectRoot) {
+          throw new Error("Invalid session state: root path changed");
+        }
+        if ((node.runId ?? null) !== scope.runId) {
+          throw new Error("Invalid session state: run identity changed");
+        }
+        const worktreePath = resolveRunWorktreePath(project, session, node);
+        if ((worktreePath ?? null) !== scope.worktreePath) {
+          throw new Error("Invalid session state: worktree path changed");
+        }
+        return openNodeEditor(project, session, node, editor);
+      },
+      onBusyChange: setEditorLaunchBusy,
+      onOutput: (scope, message) => {
+        setWorkspace((current) => {
+          if (scope.generation !== editorLaunchGenerationRef.current) return current;
+
+          if (current.activeProjectId !== scope.projectId || current.activeSessionId !== scope.sessionId) return current;
+          const project = current.projects.find(p => p.id === scope.projectId);
+          if (!project || project.rootPath !== scope.projectRoot) return current;
+          const session = current.sessions.find(s => s.id === scope.sessionId);
+          if (!session || session.kind !== "canvas") return current;
+          const node = session.nodes.find(n => n.id === scope.nodeId);
+          if (!node || (node.runId ?? null) !== scope.runId) return current;
+          const worktreePath = resolveRunWorktreePath(project, session, node);
+          if ((worktreePath ?? null) !== scope.worktreePath) return current;
+
+          const nextNodes = session.nodes.map(n =>
+            n.id === scope.nodeId ? { ...n, output: [...n.output, message] } : n
+          );
+          return {
+            ...current,
+            sessions: current.sessions.map(s => {
+              if (s.id === scope.sessionId && s.kind === "canvas") {
+                return { ...s, nodes: nextNodes };
+              }
+              return s;
+            })
+          };
+        });
+      }
+    });
+  }
+
+  async function openEditor(editor: EditorKind | undefined, node: CanvasNode) {
     if (!activeProject || activeSession?.kind !== "canvas") return;
-    const result = await openNodeEditor(activeProject, activeSession, node, editor);
-    updateNode(node.id, (current) => ({
-      ...current,
-      output: [...current.output, result.message],
-    }));
+    const scope: EditorLaunchScope = {
+      projectId: activeProject.id,
+      projectRoot: activeProject.rootPath,
+      sessionId: activeSession.id,
+      nodeId: node.id,
+      runId: node.runId ?? null,
+      worktreePath: resolveRunWorktreePath(activeProject, activeSession, node) ?? null,
+      generation: editorLaunchGenerationRef.current,
+    };
+    await editorLaunchControllerRef.current!.execute(
+      scope,
+      activeProject.rootPath,
+      editor,
+      (s) =>
+        s.generation === editorLaunchGenerationRef.current &&
+        liveScopeRef.current.projectId === s.projectId &&
+        liveScopeRef.current.projectRoot === s.projectRoot &&
+        liveScopeRef.current.sessionId === s.sessionId &&
+        liveScopeRef.current.nodeId === s.nodeId &&
+        liveScopeRef.current.runId === s.runId &&
+        liveScopeRef.current.worktreePath === s.worktreePath
+    );
   }
 
   if (!activeProject) {
@@ -2474,6 +2624,7 @@ export default function App() {
         </TopBar>
 
         <main className="stage">
+          {newTaskDraft.warning && <p className="composer-action-message error" role="alert">{newTaskDraft.warning}</p>}
           {workspaceLoadError && (
             <div className="notice error" role="alert">
               {workspaceLoadError}
@@ -2537,15 +2688,19 @@ export default function App() {
               session={activeSession}
               agentReadiness={agentReadiness}
               composerValue={selectedNode ? nodeActionText : bottomGoal}
-              composerDisabled={!selectedNode && bottomComposerState?.busy === true}
+              composerDisabled={false}
               bottomComposerState={bottomComposerState}
               selectedNode={selectedNode}
               selectedRunEvidence={activeNodeRunEvidence(selectedNode)}
               selectedNodeActionScopeKey={selectedNodeActionScopeKey}
               selectedNodeActionState={selectedNodeActionState}
-              nodeActionBusy={nodeActionBusy}
-              nodeActionError={nodeActionError}
-              nodeActionStatus={nodeActionStatus}
+              nodeActionBusy={selectedNodeActionScopeKey ? pendingNodeActionsRef.current.get(selectedNodeActionScopeKey) ?? null : null}
+              nodeActionError={nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionError : null}
+              nodeActionStatus={nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionStatus : null}
+              action={composerAction}
+              onActionChange={(action) => {
+                if (selectedNodeActionScopeKey) setComposerActions((current) => new Map(current).set(selectedNodeActionScopeKey, action));
+              }}
               plannerTerminalSessionId={plannerTerminalSessionId(activeSession)}
               workflowBackendAvailable={!!window.devflow?.workflow}
               nextActionHint={nextAction ? buildNextSafeActionHint(nextAction, activeSession.nodes) : null}
@@ -2624,6 +2779,7 @@ export default function App() {
           onReassign={(selected, isCurrent) => reassignNode(inspectedNode.id, selected, isCurrent)}
           onInsertBefore={() => insertBefore(inspectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
+          editorLaunchBusy={editorLaunchBusy === `${activeProject.id}:${activeSession.id}:${inspectedNode.id}:${editorLaunchGenerationRef.current}`}
           onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
         />
       )}
@@ -3117,6 +3273,7 @@ function SessionComposer({
   const handleSubmit = contextSafe((event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!canCreate) return;
+    void onCreate(activeTarget);
     if (!userPrefersReducedMotion() && formRef.current) {
       const sheet = formRef.current.querySelector<HTMLElement>(".intake-sheet");
       if (sheet) {
@@ -3126,12 +3283,9 @@ function SessionComposer({
           rotation: -0.8,
           duration: 0.18,
           ease: "power2.in",
-          onComplete: () => { void onCreate(activeTarget); },
         });
-        return;
       }
     }
-    void onCreate(activeTarget);
   });
 
   return (
@@ -3799,6 +3953,8 @@ function CanvasView({
   selectedNode,
   selectedRunEvidence,
   selectedNodeActionScopeKey,
+  action,
+  onActionChange,
   selectedNodeActionState,
   nodeActionBusy,
   nodeActionError,
@@ -3823,6 +3979,8 @@ function CanvasView({
   selectedNode: CanvasNode | null;
   selectedRunEvidence: RunEvidence | null;
   selectedNodeActionScopeKey: string | null;
+  action: ComposerAction;
+  onActionChange: (action: ComposerAction) => void;
   selectedNodeActionState: SelectedNodeActionState | null;
   nodeActionBusy: Exclude<ComposerAction, null> | null;
   nodeActionError: string | null;
@@ -3958,6 +4116,8 @@ function CanvasView({
         selectedNode={selectedNode}
         selectedRunEvidence={selectedRunEvidence}
         selectedNodeActionScopeKey={selectedNodeActionScopeKey}
+        action={action}
+        onActionChange={onActionChange}
         selectedNodeActionState={selectedNodeActionState}
         nodeActionBusy={nodeActionBusy}
         nodeActionError={nodeActionError}
@@ -4752,6 +4912,7 @@ export function NodeModal({
   onReassign,
   onInsertBefore,
   onOpenEditor,
+  editorLaunchBusy,
   onDecisionAnswer,
 }: {
   node: CanvasNode;
@@ -4772,7 +4933,8 @@ export function NodeModal({
   onRetryCancel?: () => void;
   onReassign: (selected: AgentKind, isCurrent: () => boolean) => Promise<void>;
   onInsertBefore: () => void;
-  onOpenEditor: (editor: EditorKind) => void;
+  onOpenEditor: (editor?: EditorKind) => void;
+  editorLaunchBusy?: boolean;
   onDecisionAnswer: (option: string) => void;
 }) {
   const backdropRef = useRef<HTMLDivElement | null>(null);
@@ -4869,7 +5031,7 @@ export function NodeModal({
             <Plus size={15} />
             Insert Before
           </button>
-          <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} />
+          <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} busy={editorLaunchBusy} />
         </div>
         {retryUnavailableReason && <p id={retryUnavailableReasonId} role="status">{retryUnavailableReason}</p>}
         {retryState?.error && <p role="alert">{retryState.error}</p>}
@@ -4936,15 +5098,16 @@ export function NodeModal({
 
 function EditorLaunchMenu({
   disabled = false,
+  busy = false,
   onOpenEditor,
 }: {
   disabled?: boolean;
-  onOpenEditor: (editor: EditorKind) => void;
+  busy?: boolean;
+  onOpenEditor: (editor?: EditorKind) => void;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const menuId = useId();
-  const triggerOption = DEFAULT_EDITOR_LAUNCH_OPTION;
 
   useEffect(() => {
     if (!open) return;
@@ -4967,10 +5130,10 @@ function EditorLaunchMenu({
     };
   }, [open]);
 
-  function openEditor(option: EditorLaunchOption) {
-    if (disabled) return;
+  function openEditor(option?: EditorLaunchOption) {
+    if (disabled || busy) return;
     setOpen(false);
-    onOpenEditor(option.editor);
+    onOpenEditor(option?.editor);
   }
 
   return (
@@ -4983,14 +5146,24 @@ function EditorLaunchMenu({
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
-        disabled={disabled}
+        disabled={disabled || busy}
         onClick={() => setOpen((current) => !current)}
       >
-        <EditorLaunchIcon option={triggerOption} />
+        <FolderOpen size={15} />
+        {busy ? "Opening..." : "Open"}
         <ChevronDown size={14} aria-hidden="true" />
       </button>
       {open && (
         <div id={menuId} className="editor-menu-list" role="menu" aria-label="Open worktree with">
+          <button
+            className="editor-menu-item"
+            type="button"
+            role="menuitem"
+            onClick={() => openEditor(undefined)}
+          >
+            <FolderOpen size={14} aria-hidden="true" style={{ width: 16, textAlign: 'center' }} />
+            <span>Open (Default)</span>
+          </button>
           {EDITOR_LAUNCH_OPTIONS.map((option) => (
             <button
               key={option.editor}
@@ -7124,6 +7297,8 @@ function CanvasComposer({
   selectedNode,
   selectedRunEvidence,
   selectedNodeActionScopeKey,
+  action,
+  onActionChange,
   selectedNodeActionState,
   nodeActionBusy,
   nodeActionError,
@@ -7141,6 +7316,8 @@ function CanvasComposer({
   selectedNode: CanvasNode | null;
   selectedRunEvidence: RunEvidence | null;
   selectedNodeActionScopeKey: string | null;
+  action: ComposerAction;
+  onActionChange: (action: ComposerAction) => void;
   selectedNodeActionState: SelectedNodeActionState | null;
   nodeActionBusy: Exclude<ComposerAction, null> | null;
   nodeActionError: string | null;
@@ -7152,12 +7329,6 @@ function CanvasComposer({
   onSubmit: (action?: ComposerAction) => void;
   onStop: () => void;
 }) {
-  const [action, setAction] = useState<ComposerAction>(null);
-
-  useEffect(() => {
-    setAction(null);
-  }, [selectedNodeActionScopeKey]);
-
   let placeholder = "Insert requirement or node";
   if (selectedNode) {
     if (action === "repair") placeholder = "Tell the agent how to fix this node result…";
@@ -7181,7 +7352,7 @@ function CanvasComposer({
   const selectedActionAvailability = action ? actionAvailability[action] : null;
   const canSubmit = selectedNode
     ? hasValue && !!action && selectedActionAvailability?.enabled === true && nodeActionBusy === null
-    : hasValue;
+    : hasValue && bottomComposerState?.busy !== true;
   const submitTitle = selectedNode
     ? selectedActionAvailability?.reason ?? "Submit node action"
     : "Submit";
@@ -7296,7 +7467,7 @@ function CanvasComposer({
               <button
                 type="button"
                 className={`action-chip ${action === "repair" ? "selected" : ""}`}
-                onClick={() => setAction("repair")}
+                onClick={() => onActionChange("repair")}
                 aria-pressed={action === "repair"}
                 disabled={disabled || nodeActionBusy !== null || !actionAvailability.repair.enabled}
                 title={actionAvailability.repair.reason ?? NODE_ACTION_IMPACT_COPY.repair}
@@ -7306,7 +7477,7 @@ function CanvasComposer({
               <button
                 type="button"
                 className={`action-chip ${action === "variant" ? "selected" : ""}`}
-                onClick={() => setAction("variant")}
+                onClick={() => onActionChange("variant")}
                 aria-pressed={action === "variant"}
                 disabled={disabled || nodeActionBusy !== null || !actionAvailability.variant.enabled}
                 title={actionAvailability.variant.reason ?? NODE_ACTION_IMPACT_COPY.variant}
@@ -7316,7 +7487,7 @@ function CanvasComposer({
               <button
                 type="button"
                 className={`action-chip ${action === "rollback" ? "selected" : ""}`}
-                onClick={() => setAction("rollback")}
+                onClick={() => onActionChange("rollback")}
                 aria-pressed={action === "rollback"}
                 disabled={disabled || nodeActionBusy !== null || !actionAvailability.rollback.enabled}
                 title={actionAvailability.rollback.reason ?? NODE_ACTION_IMPACT_COPY.rollback}
@@ -7364,7 +7535,7 @@ function CanvasComposer({
           className="canvas-composer-input"
           ref={inputRef}
           value={displayedValue}
-          disabled={disabled || nodeActionBusy !== null}
+          disabled={disabled || (!!selectedNode && !action)}
           onChange={(event) => {
             onChange(event.target.value);
           }}
@@ -7753,6 +7924,74 @@ export function createPlanFinishController() {
     release(planSessionId: string): void {
       inFlight.delete(planSessionId);
     },
+  };
+}
+
+export interface EditorLaunchScope {
+  projectId: string;
+  projectRoot: string | null;
+  sessionId: string;
+  nodeId: string;
+  runId: string | null;
+  worktreePath: string | null;
+  generation: number;
+}
+
+export function createEditorLaunchController(options: {
+  getSettings: (rootPath: string) => Promise<SettingsSnapshot>;
+  openEditor: (editor: EditorKind, scope: EditorLaunchScope) => Promise<{ok: boolean, message: string}>;
+  onBusyChange: (busyScopeKey: string | null) => void;
+  onOutput: (scope: EditorLaunchScope, message: string) => void;
+}) {
+  let activeRequest: { scopeKey: string; generation: number } | null = null;
+
+  return {
+    async execute(scope: EditorLaunchScope, rootPath: string, overrideEditor: EditorKind | undefined, isScopeCurrent: (scope: EditorLaunchScope) => boolean) {
+      const scopeKey = `${scope.projectId}:${scope.sessionId}:${scope.nodeId}:${scope.generation}`;
+      if (activeRequest && activeRequest.scopeKey === scopeKey) {
+        return;
+      }
+      activeRequest = { scopeKey, generation: scope.generation };
+      options.onBusyChange(scopeKey);
+
+      let targetEditor: EditorKind;
+      try {
+        if (!isScopeCurrent(scope) || activeRequest.scopeKey !== scopeKey) return;
+
+        if (overrideEditor) {
+          targetEditor = overrideEditor;
+        } else {
+          try {
+            const snapshot = await options.getSettings(rootPath);
+            if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+            const persisted = snapshot?.settings?.app?.externalEditor;
+            targetEditor = resolveEditorSelection(persisted, undefined);
+          } catch (e: any) {
+            if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+            options.onOutput(scope, `Failed to read settings: ${e.message}`);
+            return;
+          }
+        }
+
+        if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+
+        try {
+          const result = await options.openEditor(targetEditor, scope);
+          if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+          options.onOutput(scope, result.ok ? result.message : `Failed to open worktree: ${result.message}`);
+        } catch (e: any) {
+          if (!isScopeCurrent(scope) || activeRequest?.scopeKey !== scopeKey) return;
+          options.onOutput(scope, `Failed to launch editor: ${e.message}`);
+        }
+      } finally {
+        if (activeRequest?.scopeKey === scopeKey) {
+          activeRequest = null;
+          if (isScopeCurrent(scope)) {
+            options.onBusyChange(null);
+          }
+        }
+      }
+    }
   };
 }
 
