@@ -7,14 +7,30 @@ export interface EditorLaunchOption {
   tone: string;
 }
 
+export const DEFAULT_EDITOR_LAUNCH_OPTION: EditorLaunchOption = {
+  editor: "zed",
+  label: "Zed",
+  iconText: "Z",
+  tone: "zed",
+};
+
 export const EDITOR_LAUNCH_OPTIONS: EditorLaunchOption[] = [
   { editor: "vscode", label: "VS Code", iconText: "VS", tone: "vscode" },
-  { editor: "zed", label: "Zed", iconText: "Z", tone: "zed" },
-  { editor: "antigravity", label: "Antigravity", iconText: "A", tone: "antigravity" },
+  { editor: "cursor", label: "Cursor", iconText: "C", tone: "cursor" },
+  DEFAULT_EDITOR_LAUNCH_OPTION,
   { editor: "finder", label: "Finder", iconText: "F", tone: "finder" },
-  { editor: "terminal", label: "Terminal", iconText: ">", tone: "terminal" },
-  { editor: "iterm2", label: "iTerm2", iconText: "i2", tone: "iterm2" },
-  { editor: "xcode", label: "Xcode", iconText: "X", tone: "xcode" },
 ];
 
-export const DEFAULT_EDITOR_LAUNCH_OPTION = EDITOR_LAUNCH_OPTIONS[1] ?? EDITOR_LAUNCH_OPTIONS[0];
+export function isSupportedEditor(value: unknown): value is EditorKind {
+  return typeof value === "string" && EDITOR_LAUNCH_OPTIONS.some((opt) => opt.editor === value);
+}
+
+export function resolveEditorSelection(persistedEditor?: unknown, overrideEditor?: unknown): EditorKind {
+  if (isSupportedEditor(overrideEditor)) {
+    return overrideEditor;
+  }
+  if (isSupportedEditor(persistedEditor)) {
+    return persistedEditor;
+  }
+  return DEFAULT_EDITOR_LAUNCH_OPTION.editor;
+}
