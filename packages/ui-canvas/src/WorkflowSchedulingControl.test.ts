@@ -24,6 +24,7 @@ vi.mock("react", async (original) => {
       return [value, (action: unknown) => set((s: unknown) => reduce(s, action))];
     },
     useCallback: (callback: unknown) => callback,
+    useSyncExternalStore: (_subscribe: unknown, snapshot: () => unknown) => snapshot(),
     useEffect: () => {}, useLayoutEffect: (effect: () => void) => hooks.layouts.push(effect),
   };
 });
