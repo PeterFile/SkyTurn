@@ -16,6 +16,7 @@ import {
   canonicalWorkflowCandidateManifestJson,
   createWorkflowGitAncestryProofContext,
   type CandidateReviewRequest,
+  type CanvasNode,
   type RunEvent,
   type RunEvidence,
   type WorkflowGitAncestryProofContext,
@@ -2566,7 +2567,91 @@ describe("SQLite workflow store", () => {
     reopened.close();
   });
 
-  it("replays the latest persisted planner, lane, and decision node positions after restart", async () => {
+  it("spaces authoritative legacy cards across rows after SQLite reopen without position events", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    declareCompletedPlanningLane(store);
+    for (let index = 0; index < 6; index += 1) {
+      const result = store.applyWorkflowCardToolCall(
+        "session-1",
+        createCard(`tool-layout-${index}`, {
+          id: `node-layout-${index}`,
+          taskKey: `layout-${index}`,
+          title: `Implement task ${index}`,
+          agent: "codex",
+          brief: `Implement independent task ${index}.`,
+        }),
+        workflowContext("run-planner"),
+      );
+      expect(result.status).toBe("applied");
+    }
+    const events = store.listEvents("session-1");
+    const view = store.materializeWorkflowView("session-1");
+    expect(view.projection.lanes).toEqual([]);
+    expect(view.canvasSession?.nodes).toHaveLength(8);
+    expect(events.filter((event) => event.kind === "canvas_node_position_updated")).toEqual([]);
+    expectNonOverlappingCanvasCards(view.canvasSession!.nodes);
+    expect(view.canvasSession?.nodes[0]?.position).toEqual({ x: 72, y: 148 });
+    expect(new Set(view.canvasSession!.nodes.map((node) => node.position.y)).size).toBe(3);
+    expect(store.materializeWorkflowView("session-1")).toEqual(view);
+    expect(store.listEvents("session-1")).toEqual(events);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeWorkflowView("session-1")).toEqual(view);
+    expectNonOverlappingCanvasCards(reopened.materializeCanvasSession("session-1")!.nodes);
+    expect(reopened.listEvents("session-1")).toEqual(events);
+    reopened.close();
+  });
+
+  it.each([0, 2, 4, 7])("spaces %i executable lanes and wrapped decisions after SQLite reopen without position events", async (laneCount) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    for (let index = 0; index < laneCount; index += 1) {
+      appendTestLane(store, `lane-layout-${index}`);
+      if (index > 0) appendTestEdge(store, `lane-layout-${index - 1}`, `lane-layout-${index}`);
+    }
+    const result = store.applyWorkflowIntent({
+      intentId: "intent-layout-decisions",
+      sessionId: "session-1",
+      operations: Array.from({ length: 4 }, (_, index) => ({
+        type: "RequestUserDecision",
+        decisionId: `decision-layout-${index}`,
+        prompt: `Choose option for task ${index}.`,
+        options: ["Continue", "Stop"],
+        reason: "User input is required.",
+      })),
+    }, "2026-06-14T00:00:03.000Z");
+    expect(result.ok).toBe(true);
+    const events = store.listEvents("session-1");
+    const view = store.materializeWorkflowView("session-1");
+    const nodes = view.canvasSession!.nodes;
+    expect(nodes).toHaveLength(1 + laneCount + 4);
+    expect(nodes.filter((node) => node.executable)).toHaveLength(laneCount);
+    expect(nodes.filter((node) => node.nodeKind === "user_decision")).toHaveLength(4);
+    expect(events.filter((event) => event.kind === "canvas_node_position_updated")).toEqual([]);
+    expectNonOverlappingCanvasCards(nodes);
+    expect(nodes[0]?.position).toEqual({ x: 72, y: 148 });
+    expect(nodes[1]?.position).toEqual({ x: 640, y: 148 });
+    expect(new Set(nodes.map((node) => node.position.y)).size).toBe(Math.ceil((laneCount + 4) / 3));
+    expect(store.materializeWorkflowView("session-1")).toEqual(view);
+    expect(store.listEvents("session-1")).toEqual(events);
+    store.close();
+
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.materializeWorkflowView("session-1")).toEqual(view);
+    expectNonOverlappingCanvasCards(reopened.materializeCanvasSession("session-1")!.nodes);
+    expect(reopened.listEvents("session-1")).toEqual(events);
+    reopened.close();
+  });
+
+  it.each([
+    { planner: { x: 11, y: 22 }, lane: { x: 777, y: 888 }, decision: { x: 555, y: 666 } },
+    { planner: { x: -72.25, y: 148.125 }, lane: { x: 639.75, y: -280.5 }, decision: { x: -440.125, y: -148.75 } },
+    { planner: { x: 120, y: 120 }, lane: { x: 460, y: 140 }, decision: { x: 800, y: 140 } },
+  ])("replays exact persisted planner, lane, and decision positions after refresh and restart: %j", async (positions) => {
     const projectRoot = await makeTempRoot();
     const store = createWorkflowStore({ projectRoot });
     seedStore(store);
@@ -2589,10 +2674,10 @@ describe("SQLite workflow store", () => {
 
     const laneId = store.materializeFlowProjection("session-1").lanes[0]!.id;
     const updates = [
-      { updateId: "drag-planner", nodeId: "node-1", position: { x: 11, y: 22 } },
+      { updateId: "drag-planner", nodeId: "node-1", position: positions.planner },
       { updateId: "drag-lane", nodeId: laneId, position: { x: 333, y: 444 } },
-      { updateId: "drag-decision", nodeId: "decision-layout", position: { x: 555, y: 666 } },
-      { updateId: "drag-lane-latest", nodeId: laneId, position: { x: 777, y: 888 } },
+      { updateId: "drag-decision", nodeId: "decision-layout", position: positions.decision },
+      { updateId: "drag-lane-latest", nodeId: laneId, position: positions.lane },
     ] as const;
     for (const [index, update] of updates.entries()) {
       store.recordCanvasNodePosition({
@@ -2615,20 +2700,21 @@ describe("SQLite workflow store", () => {
       now: "2026-06-14T00:00:09.000Z",
     });
     const beforeRestart = store.materializeCanvasSession("session-1");
+    expect(store.materializeCanvasSession("session-1")).toEqual(beforeRestart);
     store.close();
 
     const reopened = createWorkflowStore({ projectRoot });
     const afterRestart = reopened.materializeCanvasSession("session-1");
-    const positions = Object.fromEntries(afterRestart!.nodes.map((node) => [node.id, node.position]));
+    const restoredPositions = Object.fromEntries(afterRestart!.nodes.map((node) => [node.id, node.position]));
     const positionEvents = reopened.listEvents("session-1").filter((event) => event.kind === "canvas_node_position_updated");
 
     expect(duplicate.id).toBe(positionEvents[3]?.id);
     expect(positionEvents).toHaveLength(5);
     expect(afterRestart).toEqual(beforeRestart);
-    expect(positions).toMatchObject({
-      "node-1": { x: 11, y: 22 },
-      [laneId]: { x: 777, y: 888 },
-      "decision-layout": { x: 555, y: 666 },
+    expect(restoredPositions).toMatchObject({
+      "node-1": positions.planner,
+      [laneId]: positions.lane,
+      "decision-layout": positions.decision,
     });
     expect(afterRestart?.nodes.find((node) => node.id === "node-1")?.context.dependencies).toEqual([]);
     expect(afterRestart?.edges.some((edge) => edge.target === "node-1")).toBe(false);
@@ -10705,6 +10791,21 @@ describe("SQLite workflow store", () => {
     });
   });
 });
+
+function expectNonOverlappingCanvasCards(nodes: CanvasNode[]): void {
+  // Reserve a 440 x 260 px envelope for compact cards and their controls.
+  const width = 440;
+  const height = 260;
+  for (const [index, node] of nodes.entries()) {
+    for (const other of nodes.slice(index + 1)) {
+      const intersects = node.position.x < other.position.x + width
+        && node.position.x + width > other.position.x
+        && node.position.y < other.position.y + height
+        && node.position.y + height > other.position.y;
+      expect(intersects, `${node.id} overlaps ${other.id}`).toBe(false);
+    }
+  }
+}
 
 function createCard(
   toolCallId: string,
