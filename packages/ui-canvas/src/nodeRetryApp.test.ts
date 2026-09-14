@@ -22,6 +22,8 @@ vi.mock("react", async (original) => {
     useReducer: (reducer: any, initial: any) => { const [value, set] = useState(initial); return [value, (action: any) => set((old: any) => reducer(old, action))]; },
     useRef: (initial: any) => useState(() => ({ current: initial }))[0],
     useMemo: (factory: any) => factory(), useCallback: (callback: any) => callback,
+    // Explicit renders read the latest real store snapshot without scheduling subscriptions.
+    useSyncExternalStore: <T>(_subscribe: unknown, getSnapshot: () => T) => getSnapshot(),
     useEffect: () => undefined,
     useLayoutEffect: (effect: any, dependencies: any[]) => {
       const host = runtime.host;
