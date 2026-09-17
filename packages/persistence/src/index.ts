@@ -1,6 +1,6 @@
 import type { WorkflowLoopNextAction, WorkflowSchedulingState, WorkflowSchedulingStatus } from "@skyturn/project-core";
-import type { WorkflowSchedulingControlRequest } from "@skyturn/workflow-kernel";
-export type { WorkflowSchedulingControlRequest } from "@skyturn/workflow-kernel";
+import type { WorkflowRetryRequest, WorkflowSchedulingControlRequest } from "@skyturn/workflow-kernel";
+export type { WorkflowRetryRequest, WorkflowSchedulingControlRequest } from "@skyturn/workflow-kernel";
 import type { SettingsApi } from "./settings.js";
 export * from "./settings.js";
 import type {
@@ -166,6 +166,13 @@ export interface WorkflowLaneReassignResult extends WorkflowSessionEnvelope {
   projection: unknown;
 }
 
+export interface WorkflowLaneRetryResult extends WorkflowSessionEnvelope {
+  event: unknown;
+  created: boolean;
+  projection: unknown;
+  nextAction: WorkflowLoopNextAction;
+}
+
 export type WorkflowRollbackBlockCode =
   | "remote_side_effect"
   | "in_flight_remote_side_effect"
@@ -328,6 +335,7 @@ export interface WorkflowApi {
   }>>;
   getEvents: (projectRoot: string, sessionId: string) => Promise<{ protocolVersion: number; events: unknown[] }>;
   reassignLane: (projectRoot: string, input: WorkflowLaneReassignRequest) => Promise<WorkflowLaneReassignResult>;
+  retryLane: (projectRoot: string, input: WorkflowRetryRequest) => Promise<WorkflowLaneRetryResult>;
   getCheckpoints: (projectRoot: string, input: unknown) => Promise<{ protocolVersion: number; checkpoints: WorkflowNodeCheckpoint[] }>;
   getPendingInsertBeforeRequest: (
     projectRoot: string,

@@ -8,6 +8,8 @@ import type {
   WorkflowSchedulingResult,
   WorkflowLaneReassignRequest,
   WorkflowLaneReassignResult,
+  WorkflowRetryRequest,
+  WorkflowLaneRetryResult,
   WorkflowNodePositionUpdateRequest,
 } from "@skyturn/persistence" with { "resolution-mode": "import" };
 import type { PlanEvent } from "@skyturn/project-core" with { "resolution-mode": "import" };
@@ -111,6 +113,14 @@ const reassignWorkflowLane = (
 
 const reassignLane: WorkflowApi["reassignLane"] = reassignWorkflowLane;
 
+const retryWorkflowLane = (
+  projectRoot: string,
+  input: WorkflowRetryRequest,
+): Promise<WorkflowLaneRetryResult> =>
+  invokeWorkflow("workflow:lane:retry", projectRoot, [input], "required");
+
+const retryLane: WorkflowApi["retryLane"] = retryWorkflowLane;
+
 const workflow = {
   pauseScheduling: (projectRoot: string, input: WorkflowSchedulingControlRequest): Promise<WorkflowSchedulingResult> =>
     invokeWorkflow("workflow:scheduling:pause", projectRoot, [input], "projection"),
@@ -129,6 +139,7 @@ const workflow = {
     invokeWorkflow("workflow:projection", projectRoot, [sessionId], "projection"),
   getEvents: (projectRoot: string, sessionId: string) => invokeWorkflow("workflow:events", projectRoot, [sessionId]),
   reassignLane,
+  retryLane,
   getCheckpoints: (projectRoot: string, input: unknown) => invokeWorkflow("workflow:checkpoints", projectRoot, [input]),
   getPendingInsertBeforeRequest: (
     projectRoot: string,
