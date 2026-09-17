@@ -180,8 +180,8 @@ export function createNodeRetryController(options: {
       return load(next);
     },
     refresh(next: NodeRetryScope) {
-      // Only a session-object replacement in the same navigation scope can continue recovery.
-      if (!scope || scopeKey(next) !== scopeKey(scope) || next.generation !== scope.generation) return;
+      // Newer authority in the same navigation scope can continue recovery, never older authority.
+      if (!scope || scopeKey(next) !== scopeKey(scope) || next.generation < scope.generation) return;
       return load(next);
     },
     begin() {

@@ -10,6 +10,6 @@ Paused scheduling stays paused. A Retry can be reserved while paused and will wa
 
 Retry stays disabled for planner and delivery tasks, running or successful attempts, inactive or rolled-back tasks, missing authority, and unsafe downstream or delivery progress. The reason appears beside the node actions. The backend performs the final eligibility check, including activity elsewhere in the project.
 
-When the same session refreshes while node details are open, Retry reloads eligibility automatically. A refresh dismisses an open confirmation; review the refreshed state before confirming again.
+When the same session refreshes while node details are open, including through backend broadcasts, Retry reloads eligibility automatically. A refresh dismisses an open confirmation; review the refreshed state before confirming again.
 
 While a request is pending, repeated clicks do not submit another attempt. Session refreshes retain that request identity and wait for the pending call to settle before checking its outcome. If the response is lost, Retry checks current backend state before sending again and reuses the same request identity within this app process. An already reserved attempt is not resubmitted. Errors appear inline. Reopen node details to reload unavailable authority; switching projects, sessions, nodes, or attempts invalidates old UI responses, including switching away and back. This does not cancel a request already admitted by the backend.

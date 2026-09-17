@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, createElement, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { emptyWorkspace } from "@skyturn/persistence";
+import { emptyWorkspace, type WorkflowBroadcastEnvelope } from "@skyturn/persistence";
 import { reduceWorkflowEvents } from "@skyturn/workflow-kernel";
 import App, { NodeModal } from "./App.js";
 
@@ -79,6 +79,11 @@ async function harness() {
       source: "workflow-kernel", idempotencyKey: `retry:${request.requestId}`,
       payload: { ...request, nextRunId: "new-run", nextSegmentId: "new-segment" } } };
   });
+  const workflowListeners = new Set<(event: WorkflowBroadcastEnvelope) => void>();
+  const onWorkflowEvent = vi.fn((listener: (event: WorkflowBroadcastEnvelope) => void) => {
+    workflowListeners.add(listener);
+    return () => { workflowListeners.delete(listener); };
+  });
   const getProjection = vi.fn(async () => projection);
   const getWorkflowProjection = vi.fn(() => refresh.promise);
   const document = { nodeType: 9, addEventListener() {}, removeEventListener() {}, activeElement: null,
@@ -89,7 +94,7 @@ async function harness() {
   vi.stubGlobal("window", { ...document.defaultView, devflow: {
     loadWorkspace: vi.fn(async () => f.workspace), saveWorkspace: vi.fn(async () => undefined),
     getAgentHealth: vi.fn(async () => ({ agents: [], readiness: null })),
-    onRunEvent: vi.fn(() => () => undefined), onWorkflowEvent: vi.fn(() => () => undefined),
+    onRunEvent: vi.fn(() => () => undefined), onWorkflowEvent,
     getRunEvents: vi.fn(async () => ({ events: [] })),
     getRunEvidence: vi.fn(async () => null), getWorkflowProjection,
     workflow: { getProjection, retryLane },
@@ -122,8 +127,18 @@ async function harness() {
     expect(modalProps().node.runId).toBe("old-run");
     expect(modalProps().node.status).toBe("failed");
   };
+  const broadcastRefresh = async () => {
+    const previous = modalProps().session;
+    const event = { ...structuredClone(f.response), cause: "workflow-mutation" } as unknown as WorkflowBroadcastEnvelope;
+    expect(onWorkflowEvent).toHaveBeenCalledOnce();
+    expect(workflowListeners.size).toBe(1);
+    await act(async () => { for (const listener of workflowListeners) listener(event); });
+    expect(modalProps().session).not.toBe(previous);
+    expect(modalProps().node.runId).toBe("old-run");
+    expect(modalProps().node.status).toBe("failed");
+  };
   expect(button(modalTree, "Retry").disabled).toBe(false);
-  return { ...f, refresh, retryLane, getProjection, modalProps, click, installRefresh,
+  return { ...f, refresh, retryLane, getProjection, modalProps, click, installRefresh, broadcastRefresh,
     modal: () => modalTree, tree: () => tree };
 }
 
@@ -145,7 +160,9 @@ describe("Retry with real asynchronous React effects", () => {
     expect(h.modalProps().retryState.history[0].runId).toBe("old-run");
   });
 
-  it.each(["uncommitted", "committed", "resolved"])("recovers a %s unknown outcome when projection refresh replaces the session during IPC", async (outcome) => {
+  it.each(["projection", "broadcast"].flatMap(refresh =>
+    ["uncommitted", "committed", "resolved"].map(outcome => ({ refresh, outcome })),
+  ))("recovers a $outcome unknown outcome when $refresh refresh replaces the session during IPC", async ({ refresh, outcome }) => {
     const h = await harness();
     const pending = deferred<any>();
     const launch = h.retryLane.getMockImplementation()!;
@@ -154,7 +171,7 @@ describe("Retry with real asynchronous React effects", () => {
     await h.click("Start new attempt");
     expect(h.retryLane).toHaveBeenCalledOnce();
     const request = h.retryLane.mock.calls[0][1];
-    await h.installRefresh();
+    await (refresh === "broadcast" ? h.broadcastRefresh() : h.installRefresh());
     expect(button(h.modal(), "Retry").disabled).toBe(true);
     await act(async () => {
       h.modalProps().onRetry();
@@ -199,6 +216,29 @@ describe("Retry with real asynchronous React effects", () => {
     expect(h.retryLane).not.toHaveBeenCalled();
   });
 
+  it("keeps newer broadcast authority when an older eligibility response or initial projection arrives", async () => {
+    const h = await harness();
+    const stale = deferred<any>();
+    h.getProjection.mockImplementationOnce(() => stale.promise);
+    await h.broadcastRefresh();
+    expect(button(h.modal(), "Retry").disabled).toBe(true);
+    await h.broadcastRefresh();
+    expect(button(h.modal(), "Retry").disabled).toBe(false);
+    const session = h.modalProps().session;
+    const state = structuredClone(h.modalProps().retryState);
+    await act(async () => {
+      stale.resolve({ ...h.response, projectRoot: "/foreign" });
+      h.refresh.resolve({ ...structuredClone(h.response),
+        canvasSession: { ...h.response.canvasSession, title: "Stale initial projection" } });
+    });
+    expect(h.modalProps().session).toBe(session);
+    expect(h.modalProps().retryState).toEqual(state);
+    await h.click("Retry");
+    await h.click("Start new attempt");
+    expect(h.retryLane).toHaveBeenCalledOnce();
+    expect(h.modalProps().node.runId).toBe("new-run");
+  });
+
   it("discards a stale confirmation preflight and permits a new confirmation after refresh", async () => {
     const h = await harness();
     const preflight = deferred<any>();
@@ -240,14 +280,16 @@ describe("Retry with real asynchronous React effects", () => {
     expect(h.modalProps().node.runId).toBe("new-run");
   });
 
-  it.each(["resolve", "reject"])("ignores stale IPC %s after refresh followed by navigation away and back", async (ending) => {
+  it.each(["projection", "broadcast"].flatMap(refresh =>
+    ["resolve", "reject"].map(ending => ({ refresh, ending })),
+  ))("ignores stale IPC $ending after $refresh refresh followed by navigation away and back", async ({ refresh, ending }) => {
     const h = await harness();
     const pending = deferred<any>();
     const launch = h.retryLane.getMockImplementation()!;
     h.retryLane.mockImplementationOnce(() => pending.promise);
     await h.click("Retry");
     await h.click("Start new attempt");
-    await h.installRefresh();
+    await (refresh === "broadcast" ? h.broadcastRefresh() : h.installRefresh());
     const navigate = (id: string) => act(async () => {
       find(h.tree(), (node) => typeof node.props?.onSelectSession === "function").props.onSelectSession(id, "project");
     });

@@ -1354,15 +1354,17 @@ export default function App() {
     };
   }, [activeProject?.id, activeProject?.rootPath, activeProject?.canonicalRootPath,
     activeSession?.id, activeSession?.kind, inspectedNode?.id, inspectedNode?.runId, inspectedNode?.status,
-    nodeRetryGeneration, nodeRetryBackendAvailable]);
+    nodeRetryBackendAvailable]);
 
   useLayoutEffect(() => {
     const previous = nodeRetryScopeRef.current;
-    if (!previous || activeSession?.kind !== "canvas" || previous.requestSession === activeSession) return;
-    const scope = { ...previous, requestSession: activeSession };
+    if (!previous || activeSession?.kind !== "canvas" ||
+      (previous.requestSession === activeSession && previous.generation === nodeRetryGeneration)) return;
+    // Authority revisions invalidate responses, but do not end this navigation's Retry recovery.
+    const scope = { ...previous, requestSession: activeSession, generation: nodeRetryGeneration };
     nodeRetryScopeRef.current = scope;
     void nodeRetryControllerRef.current!.refresh(scope);
-  }, [activeSession]);
+  }, [activeSession, nodeRetryGeneration]);
 
   useEffect(() => {
     if (window.devflow) return;

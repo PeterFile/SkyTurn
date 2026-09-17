@@ -67,6 +67,18 @@ describe("desktop Node Retry controller", () => {
     expect(facts.history[0].evidence).toEqual(f.evidence);
   });
 
+  it("rejects older authority and different scope identities at the refresh boundary", async () => {
+    const h = await harness();
+    const state = h.controller.state;
+    h.getProjection.mockClear();
+    await h.controller.refresh({ ...h.scope, generation: 0 });
+    await h.controller.refresh({ ...h.scope, sessionId: "foreign", generation: 2 });
+    expect(h.getProjection).not.toHaveBeenCalled();
+    expect(h.controller.state).toBe(state);
+    h.controller.begin();
+    expect(h.controller.state.confirming).toBe(true);
+  });
+
   it("opens confirmation, cancels with zero mutation IPC, then confirms once and retains old history", async () => {
     const h = await harness();
     const original = structuredClone(h.response);
