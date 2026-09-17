@@ -7,8 +7,10 @@ import type {
   WorktreeAdoptionRequest,
   WorktreeComparisonRequest,
 } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
+import type { WorkflowGitAncestryProofInput } from "@skyturn/git-worktree/node" with { "resolution-mode": "import" };
 import type {
   RunEvidence,
+  WorkflowGitAncestryProof,
   WorkflowVariantAdoption,
   WorkflowVariantComparisonRecordedEvidence,
   WorkflowVariantComparisonSideIdentity,
@@ -63,6 +65,7 @@ interface GitWorktreeRuntimeModule {
   parseWorktreeAdoptionRequest(value: unknown): WorktreeAdoptionRequest;
   parseVariantComparisonEvidence(value: unknown): VariantComparisonEvidence;
   parseWorkflowVariantComparisonRecordedEvidence(value: unknown): WorkflowVariantComparisonRecordedEvidence;
+  verifyWorkflowGitAncestryProof(serializedProof: unknown, input: WorkflowGitAncestryProofInput): Promise<WorkflowGitAncestryProof>;
   createNodeGitWorktreeService(options?: {
     initialEvents?: ManagedWorktreeWorkflowEventLike[];
     eventSink?: {
@@ -122,8 +125,10 @@ export async function compareWorkflowWorktrees(
       const leftIdentity = comparisonSideIdentity(left);
       const rightIdentity = comparisonSideIdentity(right);
       const { parseRunEvidence } = await import("@skyturn/project-core");
-      const leftEvidence = comparisonRunEvidence(events, request.sessionId, left, parseRunEvidence);
-      const rightEvidence = comparisonRunEvidence(events, request.sessionId, right, parseRunEvidence);
+      const [leftEvidence, rightEvidence] = await Promise.all([
+        comparisonRunEvidence(gitWorktree, events, request.sessionId, left, parseRunEvidence),
+        comparisonRunEvidence(gitWorktree, events, request.sessionId, right, parseRunEvidence),
+      ]);
       const idempotencyKey = comparisonIdempotencyKey(
         request.sessionId, leftIdentity, rightIdentity, [leftEvidence, rightEvidence],
       );
@@ -332,15 +337,17 @@ interface ComparisonRunEvidence {
   laneId: string;
   segmentId: string;
   checkpointId: string;
+  ancestryProof: WorkflowGitAncestryProof;
   runEvidence: RunEvidence;
 }
 
-function comparisonRunEvidence(
+async function comparisonRunEvidence(
+  gitWorktree: GitWorktreeRuntimeModule,
   events: unknown[],
   sessionId: string,
   worktree: WorkflowWorktreeIdentity,
   parseRunEvidence: (value: unknown) => RunEvidence | null,
-): ComparisonRunEvidence | null {
+): Promise<ComparisonRunEvidence | null> {
   const records = events.filter(isRecord);
   const checkpoints = records.filter((event) => event.kind === "workflow.node.checkpoint_recorded");
   const checkpointLanes = new Set<unknown>([worktree.parentLaneId]);
@@ -376,10 +383,26 @@ function comparisonRunEvidence(
     checkpoint.worktreeId !== worktree.worktreeId || checkpoint.worktreePath !== worktree.realPath ||
     checkpoint.branchName !== worktree.branchName || checkpoint.headCommit !== worktree.headCommit ||
     !/^[0-9a-f]{40}$/.test(worktree.headCommit) || checkpoint.worktreeState !== "clean" ||
-    // Only the backend checkpoint API can write proof-bearing events. listEvents
-    // validates the canonical proof and its immutable before/after identity pair.
     typeof checkpoint.ancestryProof !== "string" || !checkpoint.ancestryProof ||
     !hasRef("run", runId) || !hasRef("segment", segmentId) || !hasRef("evidence", evidenceId)
+  ) return null;
+
+  const beforeCandidates = checkpoints.filter((event) => {
+    const before = isRecord(event.payload) ? event.payload.checkpoint : null;
+    return isRecord(before) && before.phase === "before" && before.sessionId === sessionId &&
+      before.laneId === laneId && before.segmentId === segmentId && before.runId === runId;
+  });
+  const beforeEvent = beforeCandidates.length === 1 ? beforeCandidates[0] : null;
+  const before = beforeEvent && isRecord(beforeEvent.payload) ? beforeEvent.payload.checkpoint : null;
+  if (
+    !beforeEvent || !isRecord(before) ||
+    checkpoints.indexOf(beforeEvent) >= checkpoints.indexOf(boundary) ||
+    beforeEvent.source !== "backend" || before.source !== "backend" || beforeEvent.sessionId !== sessionId ||
+    beforeEvent.laneId !== laneId || beforeEvent.segmentId !== segmentId || before.nodeId !== laneId ||
+    beforeEvent.idempotencyKey !== `checkpoint:${runId}:before` || before.id !== `checkpoint:${runId}:before` ||
+    before.executionTarget !== checkpoint.executionTarget || before.worktreeId !== worktree.worktreeId ||
+    before.worktreePath !== worktree.realPath || before.branchName !== worktree.branchName ||
+    typeof before.headCommit !== "string" || !/^[0-9a-f]{40}$/.test(before.headCommit)
   ) return null;
 
   const laneEvents = records.filter((event) => event.laneId === laneId ||
@@ -431,7 +454,19 @@ function comparisonRunEvidence(
       !(isRecord(payload.evidence) && payload.evidence.id === evidenceId))) continue;
     if (JSON.stringify(readEvidence(event)) !== JSON.stringify(runEvidence)) return null;
   }
-  return { laneId, segmentId, checkpointId: checkpoint.id as string, runEvidence };
+  // Persisted proof parsing establishes syntax, not Git authority. Verify before
+  // consulting cached receipts, using checkpoint commits and live Git identities.
+  try {
+    const ancestryProof = await gitWorktree.verifyWorkflowGitAncestryProof(checkpoint.ancestryProof, {
+      repositoryPath: worktree.repoRoot,
+      worktreePath: worktree.realPath,
+      beforeHeadCommit: before.headCommit,
+      afterHeadCommit: worktree.headCommit,
+    });
+    return { laneId, segmentId, checkpointId: checkpoint.id as string, ancestryProof, runEvidence };
+  } catch {
+    return null;
+  }
 }
 
 function findExactComparisonRecording(

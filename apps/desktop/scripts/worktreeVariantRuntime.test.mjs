@@ -61,6 +61,7 @@ test("real Git comparison rejects unsuitable latest facts without borrowing olde
     const original = fixture.events();
     const evidenceIndex = original.findIndex((event) => event.kind === "workflow.evidence.recorded" && event.laneId === "lane-left");
     const checkpointIndex = original.findIndex((event) => event.kind === "workflow.node.checkpoint_recorded" && event.payload.checkpoint.phase === "after");
+    const beforeIndex = original.findIndex((event) => event.kind === "workflow.node.checkpoint_recorded" && event.payload.checkpoint.phase === "before");
     const mutations = [
       (events) => { events[evidenceIndex].payload.evidence.runEvidence.runId = "another-run"; },
       (events) => { events[evidenceIndex].payload.segmentId = "another-segment"; },
@@ -100,6 +101,12 @@ test("real Git comparison rejects unsuitable latest facts without borrowing olde
         latest.payload.evidence.runEvidence = null;
         events.push(latest);
       },
+      (events) => { events[checkpointIndex].payload.checkpoint.ancestryProof = "{}"; },
+      (events) => { events.splice(beforeIndex, 1); },
+      (events) => { events[beforeIndex].payload.checkpoint.headCommit = "d".repeat(40); },
+      (events) => { events[beforeIndex].payload.checkpoint.worktreePath += "-other"; },
+      (events) => { events[beforeIndex].source = "human"; },
+      (events) => { events.push(structuredClone(events[beforeIndex])); },
     ];
     for (const [index, mutate] of mutations.entries()) {
       // Corrupt only the read boundary; valid baseline facts come from real producers below.
@@ -115,6 +122,53 @@ test("real Git comparison rejects unsuitable latest facts without borrowing olde
     const duplicate = structuredClone(original);
     duplicate.push(structuredClone(duplicate[evidenceIndex]));
     assert.deepEqual(await fixture.compare(duplicate), recorded);
+  } finally {
+    await fixture.close();
+  }
+});
+
+for (const field of ["repositoryIdentity", "worktreeIdentity"]) {
+  test(`persisted ancestry identity ${field} is revalidated against live Git after SQLite reopen`, async () => {
+    const fixture = await realComparisonFixture();
+    try {
+      await fixture.finish("left");
+      const recorded = await fixture.compare();
+      assertRunMetrics(recorded, 0, ["passed", "passed", "passed", "recorded"]);
+      fixture.rewriteCheckpointProof("left", (serialized) => {
+        const proof = JSON.parse(serialized);
+        assert.notEqual(proof[field], "0".repeat(64));
+        proof[field] = "0".repeat(64);
+        return JSON.stringify(proof);
+      });
+      fixture.reopen();
+      const untrusted = await fixture.compare();
+      assertRunMetrics(untrusted, 0, ["unknown", "unknown", "unknown", "unknown"]);
+      assert.notEqual(untrusted.comparison.comparisonId, recorded.comparison.comparisonId);
+      assert.deepEqual(untrusted.recording.left, recorded.recording.left);
+      assert.deepEqual(await fixture.compare(), untrusted);
+      fixture.reopen();
+      assert.deepEqual(await fixture.compare(), untrusted);
+      assert.equal(fixture.events().filter((event) => event.kind === "workflow.variant.comparison_recorded").length, 2);
+    } finally {
+      await fixture.close();
+    }
+  });
+}
+
+test("live ancestry comparison uses the checkpoint pair commits and rejects a later worktree HEAD", async () => {
+  const fixture = await realComparisonFixture();
+  try {
+    fixture.advanceHead("left");
+    await fixture.finish("left");
+    const recorded = await fixture.compare();
+    assert.notEqual(recorded.recording.left.headCommit, recorded.recording.left.baseCommit);
+    assertRunMetrics(recorded, 0, ["passed", "passed", "passed", "recorded"]);
+    fixture.reopen();
+    assert.deepEqual(await fixture.compare(), recorded);
+    fixture.advanceHead("left");
+    const stale = await fixture.compare();
+    assert.notEqual(stale.recording.left.headCommit, recorded.recording.left.headCommit);
+    assertRunMetrics(stale, 0, ["unknown", "unknown", "unknown", "unknown"]);
   } finally {
     await fixture.close();
   }
@@ -182,7 +236,24 @@ async function realComparisonFixture() {
   return {
     append,
     events: () => store.listEvents(session.id),
+    advanceHead(side) {
+      execFileSync("git", ["-C", worktrees[side].realPath,
+        "-c", "user.name=SkyTurn Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false",
+        "commit", "--allow-empty", "-m", "fixture checkpoint advance"], { stdio: "pipe" });
+    },
     reopen() { store.close(); store = createWorkflowStore({ projectRoot }); },
+    rewriteCheckpointProof(side, rewrite) {
+      const event = store.listEvents(session.id).find((event) => event.kind === "workflow.node.checkpoint_recorded" &&
+        event.laneId === `lane-${side}` && event.payload.checkpoint.phase === "after");
+      assert.ok(event);
+      event.payload.checkpoint.ancestryProof = rewrite(event.payload.checkpoint.ancestryProof);
+      const database = new Database(join(projectRoot, ".devflow", "skyturn-workflow.sqlite"));
+      try {
+        database.prepare("UPDATE workflow_events SET payload_json = ? WHERE id = ?").run(JSON.stringify(event.payload), event.id);
+      } finally {
+        database.close();
+      }
+    },
     rewriteTestDetail(detail) {
       // Exercise the persisted untrusted-content boundary without inventing a new HEAD join.
       const event = store.listEvents(session.id).find((event) => event.kind === "workflow.evidence.recorded" && event.laneId === "lane-left");
