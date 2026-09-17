@@ -4406,7 +4406,7 @@ export class WorkflowStore {
               ...(lane.semanticKey ? { semanticKey: lane.semanticKey } : {}),
             },
       status: mapLaneStatusToNodeStatus(lane.status),
-      position: { x: 120 + (index % 3) * 340, y: 120 + Math.floor(index / 3) * 220 },
+      position: defaultCanvasNodePosition(index),
       ...(!pendingPlannerWithoutSegment
         ? { runId: latestSegment?.runId ?? `run-${session.id}-${lane.nodeId}` }
         : {}),
@@ -5861,6 +5861,15 @@ export function createWorkflowStore(options: WorkflowStoreOptions): WorkflowStor
   return new WorkflowStore(options);
 }
 
+function defaultCanvasNodePosition(index: number): CanvasNode["position"] {
+  // Match ui-canvas defaults; slot zero is the planner, followed by lanes and decisions.
+  if (index === 0) return { x: 72, y: 148 };
+  return {
+    x: 640 + ((index - 1) % 3) * 560,
+    y: 148 + Math.floor((index - 1) / 3) * 280,
+  };
+}
+
 function flowLaneToCanvasNode(
   session: WorkflowSessionRecord,
   projection: FlowProjection,
@@ -5900,7 +5909,7 @@ function flowLaneToCanvasNode(
     },
     status,
     ...(statusProjection.rollbackStatus ? { rollbackStatus: statusProjection.rollbackStatus } : {}),
-    position: { x: 460 + ((index - 1) % 3) * 340, y: 140 + Math.floor((index - 1) / 3) * 220 },
+    position: defaultCanvasNodePosition(index),
     runId: lane.retryAttempt?.runId ?? latestSegment?.runId ?? runIdForLane(session.id, lane.id),
     changesetId: changesetId ?? `changeset-${session.id}-${lane.id}`,
     output: lane.output,
@@ -5955,7 +5964,7 @@ function flowDecisionToCanvasNode(
       semanticKey: decision.decisionId,
     },
     status,
-    position: { x: 460 + ((index - 1) % 3) * 340, y: 140 + Math.floor((index - 1) / 3) * 220 },
+    position: defaultCanvasNodePosition(index),
     runId: runIdForLane(session.id, decision.decisionId),
     changesetId: `changeset-${session.id}-${decision.decisionId}`,
     output: [
