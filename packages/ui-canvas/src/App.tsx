@@ -1356,6 +1356,14 @@ export default function App() {
     activeSession?.id, activeSession?.kind, inspectedNode?.id, inspectedNode?.runId, inspectedNode?.status,
     nodeRetryGeneration, nodeRetryBackendAvailable]);
 
+  useLayoutEffect(() => {
+    const previous = nodeRetryScopeRef.current;
+    if (!previous || activeSession?.kind !== "canvas" || previous.requestSession === activeSession) return;
+    const scope = { ...previous, requestSession: activeSession };
+    nodeRetryScopeRef.current = scope;
+    void nodeRetryControllerRef.current!.refresh(scope);
+  }, [activeSession]);
+
   useEffect(() => {
     if (window.devflow) return;
     const timer = window.setInterval(() => {

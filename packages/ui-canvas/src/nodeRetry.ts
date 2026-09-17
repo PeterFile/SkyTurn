@@ -131,10 +131,11 @@ export function createNodeRetryController(options: {
 }) {
   let scope: NodeRetryScope | null = null;
   let epoch = 0;
+  let activation = 0;
   let facts: RetryFacts | null = null;
-  let baseline: { canvas: CanvasSession; history: NodeRetryHistory[] } | null = null;
   let state: NodeRetryState = { busy: false, confirming: false, reason: "Checking Retry eligibility…", error: null, history: [] };
   const requests = new Map<string, WorkflowRetryRequest>();
+  const requestBaselines = new Map<string, { canvas: CanvasSession; history: NodeRetryHistory[] }>();
   const inFlight = new Set<string>();
   const reserved = new Set<string>();
   const current = (captured: NodeRetryScope, token: number) => epoch === token && scope === captured && options.isCurrent(captured);
@@ -143,26 +144,45 @@ export function createNodeRetryController(options: {
     if (!options.canvas(response, captured)) throw new Error("Retry response authority is invalid or foreign.");
     return readNodeRetryFacts(response, captured);
   };
+  function recover(response: Awaited<ReturnType<WorkflowApi["getProjection"]>>, captured: NodeRetryScope): void {
+    const key = scopeKey(captured);
+    const request = requests.get(key);
+    const original = requestBaselines.get(key);
+    const projection = record(response.projection) ? response.projection : null;
+    const lane = projection && records(projection.lanes).find((item) => item.id === request?.laneId);
+    if (!request || !original || !lane || !record(lane.retryAttempt) || lane.retryAttempt.requestId !== request.requestId) return;
+    validateRetryProjection(response, options.canvas(response, captured)!, captured, request, original);
+    if (!options.apply(response, captured)) throw new Error("Retry recovery authority is no longer current.");
+    reserved.add(key);
+  }
+  async function load(next: NodeRetryScope | null) {
+    scope = next;
+    const token = ++epoch;
+    facts = null;
+    change({ busy: false, confirming: false, reason: "Checking Retry eligibility…", error: null, history: [] });
+    if (!next) return;
+    try {
+      const response = await options.getProjection(next.queryRoot, next.sessionId);
+      if (!current(next, token)) return;
+      facts = read(response, next);
+      if (!inFlight.has(scopeKey(next))) recover(response, next);
+      change({ history: facts.history, reason: inFlight.has(scopeKey(next))
+        ? "A previous Retry request is still in progress. Reopen node details after it settles."
+        : reserved.has(scopeKey(next)) ? "A new attempt is already reserved." : facts.reason });
+    } catch (error) {
+      if (current(next, token)) change({ reason: "Retry authority unavailable. Reopen node details to reload.", error: String(error) });
+    }
+  }
   return {
     get state(): NodeRetryState { return state; },
-    async activate(next: NodeRetryScope | null) {
-      scope = next;
-      const token = ++epoch;
-      facts = null;
-      baseline = null;
-      change({ busy: false, confirming: false, reason: "Checking Retry eligibility…", error: null, history: [] });
-      if (!next) return;
-      try {
-        const response = await options.getProjection(next.queryRoot, next.sessionId);
-        if (!current(next, token)) return;
-        facts = read(response, next);
-        baseline = { canvas: options.canvas(response, next)!, history: facts.history };
-        change({ history: facts.history, reason: inFlight.has(scopeKey(next))
-          ? "A previous Retry request is still in progress. Reopen node details after it settles."
-          : reserved.has(scopeKey(next)) ? "A new attempt is already reserved." : facts.reason });
-      } catch (error) {
-        if (current(next, token)) change({ reason: "Retry authority unavailable. Reopen node details to reload.", error: String(error) });
-      }
+    activate(next: NodeRetryScope | null) {
+      activation += 1;
+      return load(next);
+    },
+    refresh(next: NodeRetryScope) {
+      // Only a session-object replacement in the same navigation scope can continue recovery.
+      if (!scope || scopeKey(next) !== scopeKey(scope) || next.generation !== scope.generation) return;
+      return load(next);
     },
     begin() {
       if (!scope || !options.isCurrent(scope) || state.busy || state.reason || !facts?.terminal ||
@@ -174,6 +194,7 @@ export function createNodeRetryController(options: {
       if (!scope || !options.isCurrent(scope) || !state.confirming || state.busy || !facts?.terminal) return;
       const captured = scope;
       const token = epoch;
+      const capturedActivation = activation;
       const key = scopeKey(captured);
       if (inFlight.has(key) || reserved.has(key)) return;
       inFlight.add(key);
@@ -185,14 +206,7 @@ export function createNodeRetryController(options: {
         const fresh = read(projectionResponse, captured);
         facts = fresh;
         if (fresh.reason || !fresh.terminal) {
-          const known = requests.get(key);
-          const projection = record(projectionResponse.projection) ? projectionResponse.projection : null;
-          const lane = projection && records(projection.lanes).find((item) => item.id === known?.laneId);
-          if (known && baseline && lane && record(lane.retryAttempt) && lane.retryAttempt.requestId === known.requestId) {
-            validateRetryProjection(projectionResponse, options.canvas(projectionResponse, captured)!, captured, known, baseline);
-            if (!options.apply(projectionResponse, captured)) throw new Error("Retry recovery authority is no longer current.");
-            reserved.add(key);
-          }
+          recover(projectionResponse, captured);
           change({ reason: fresh.reason, history: fresh.history });
           return;
         }
@@ -201,6 +215,9 @@ export function createNodeRetryController(options: {
           throw new Error("Retry terminal authority changed. Reopen node details to reload.");
         }
         requests.set(key, request);
+        if (!requestBaselines.has(key)) requestBaselines.set(key, {
+          canvas: options.canvas(projectionResponse, captured)!, history: fresh.history,
+        });
         const result = await options.retryLane(captured.queryRoot, request);
         if (!current(captured, token)) return;
         const canvas = options.canvas(result, captured);
@@ -226,6 +243,10 @@ export function createNodeRetryController(options: {
       } finally {
         inFlight.delete(key);
         if (current(captured, token)) change({ busy: false });
+        else if (activation === capturedActivation && scope && current(scope, epoch)) {
+          // A refresh invalidates this response, but must not strand its request as busy/unknown.
+          await load(scope);
+        }
       }
     },
   };
