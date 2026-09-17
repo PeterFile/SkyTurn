@@ -1,6 +1,6 @@
 # 查看已登记的运行产物
 
-此切片提供 Electron 后端与 preload API，尚未接入 UI。后续 UI 在现有节点弹窗的 `Output` 中使用此接口；不新增标签页、编辑器或通用文件预览入口。
+此切片提供 Electron 后端与 preload API，现已接入 UI。UI 在现有节点弹窗的 `Context` 中使用此接口（而非原计划的 Output）；不新增标签页、编辑器或通用文件预览入口。
 
 ## 调用接口
 
