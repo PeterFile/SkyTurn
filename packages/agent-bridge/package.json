@@ -16,6 +16,11 @@
       "types": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./bounded-file-reader": {
+      "types": "./src/boundedFileReader.ts",
+      "import": "./dist/boundedFileReader.js",
+      "default": "./dist/boundedFileReader.js"
     }
   },
   "scripts": {
