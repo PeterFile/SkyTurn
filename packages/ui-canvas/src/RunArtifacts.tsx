@@ -2,7 +2,6 @@ import { Fragment, memo, useLayoutEffect, useReducer, useRef, useState } from "r
 import type { CanvasSession, CanvasNode, RunEvidence } from "@skyturn/project-core";
 import type { ArtifactViewResult } from "@skyturn/persistence";
 import { Eye, X, AlertTriangle } from "lucide-react";
-import "./RunArtifacts.css";
 
 export interface RunArtifactsProps {
   projectRoot: string;
@@ -32,7 +31,7 @@ export const RunArtifacts = memo(function RunArtifacts({
 
   const [active, setActive] = useState<{ scopeId: string; path: string } | null>(null);
 
-  const scopeId = `${projectRoot}:${session.id}:${node.id}:${runId}`;
+  const scopeId = JSON.stringify([projectRoot, session.id, node.id, runId]);
   const activePath = active?.scopeId === scopeId ? active.path : null;
 
   if (!artifacts.length || !runId) {
@@ -102,7 +101,7 @@ export type ArtifactViewState = {
 
 export function createArtifactViewController(read: () => ArtifactViewProps, changed: () => void) {
   let state: ArtifactViewState = { result: null, loading: true, imageError: false };
-  let active = false;
+  let mountToken = 0;
 
   return {
     get state() { return state; },
@@ -113,7 +112,7 @@ export function createArtifactViewController(read: () => ArtifactViewProps, chan
       }
     },
     mount() {
-      active = true;
+      const currentToken = ++mountToken;
       state = { result: null, loading: true, imageError: false };
       changed();
 
@@ -129,7 +128,7 @@ export function createArtifactViewController(read: () => ArtifactViewProps, chan
           imageError: false,
         };
         changed();
-        return () => { active = false; };
+        return () => { if (mountToken === currentToken) mountToken++; };
       }
 
       const props = read();
@@ -140,11 +139,11 @@ export function createArtifactViewController(read: () => ArtifactViewProps, chan
         runId: props.runId,
         artifactPath: props.artifactPath
       }).then(res => {
-        if (!active) return;
+        if (mountToken !== currentToken) return;
         state = { ...state, result: res, loading: false };
         changed();
       }).catch(err => {
-        if (!active) return;
+        if (mountToken !== currentToken) return;
         state = {
           ...state,
           result: {
@@ -158,7 +157,7 @@ export function createArtifactViewController(read: () => ArtifactViewProps, chan
         changed();
       });
 
-      return () => { active = false; };
+      return () => { if (mountToken === currentToken) mountToken++; };
     }
   };
 }

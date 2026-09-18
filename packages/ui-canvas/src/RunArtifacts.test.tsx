@@ -92,4 +92,35 @@ describe("RunArtifacts", () => {
     expect(changed).not.toHaveBeenCalled();
     expect(controller.state.result).toBe(null);
   });
+
+  it("ArtifactViewController prevents late response from StrictMode previous mount from overwriting current mount", async () => {
+    let resolveA: (val: any) => void;
+    let resolveB: (val: any) => void;
+    (globalThis as any).window.devflow.artifacts.read = vi.fn()
+      .mockReturnValueOnce(new Promise(r => resolveA = r))
+      .mockReturnValueOnce(new Promise(r => resolveB = r));
+
+    const { controller, unmount, changed } = setup(); // mount A
+    unmount(); // cleanup A
+    controller.mount(); // mount B
+
+    // B resolves first
+    resolveB!({ protocolVersion: 1, ok: true, artifact: {} as any, contentIdentity: "new-B", content: {} as any });
+    await Promise.resolve(); // flush
+
+    expect(controller.state.loading).toBe(false);
+    expect(controller.state.result?.ok).toBe(true);
+    if (controller.state.result?.ok) {
+      expect(controller.state.result.contentIdentity).toBe("new-B");
+    }
+
+    // A resolves later (late response from previous mount)
+    resolveA!({ protocolVersion: 1, ok: true, artifact: {} as any, contentIdentity: "old-A", content: {} as any });
+    await Promise.resolve(); // flush
+
+    // The late response must not overwrite the result of B
+    if (controller.state.result?.ok) {
+      expect(controller.state.result.contentIdentity).toBe("new-B");
+    }
+  });
 });
