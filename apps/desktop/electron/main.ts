@@ -68,6 +68,7 @@ import {
 import { adoptWorkflowWorktree, compareWorkflowWorktrees } from "./worktreeComparisonRuntime";
 import { createTerminalRuntime } from "./terminalRuntime";
 import { createEditorRuntime } from "./editorRuntime";
+import { createArtifactViewRuntime } from "./artifactViewRuntime";
 import {
   compensateFailedWorkflowRun,
   recoverPendingCandidateManifestFreezes,
@@ -972,6 +973,28 @@ const editorRuntime = createEditorRuntime({
 
 ipcMain.handle("editor:openWorktree", async (_event, editor: unknown, worktreePath: unknown) =>
   editorRuntime.open(editor, worktreePath));
+
+const artifactViewRuntime = createArtifactViewRuntime({
+  openedProjectRoots,
+  canonicalizeProjectRoot: (root) => planProjectIdentities.canonicalize(root),
+  getStore: async (root) => {
+    const identity = await workflowStoreIdentity(root);
+    // Reading artifacts must not initialize a workflow store and advance scheduling.
+    const store = await (workflowStoreInitializations.get(identity) ?? workflowStores.get(identity));
+    if (!store) throw new Error("Workflow authority is not ready.");
+    return store;
+  },
+  readRunAuthority: async (root, runId) => {
+    const { createDurableRunClaimStore, createPrivateRunEventStore } = await import("@skyturn/agent-bridge");
+    const claims = createDurableRunClaimStore({ root: path.join(app.getPath("userData"), "run-claims") });
+    const claim = await claims.read(root, runId);
+    if (claim.kind !== "valid") return { claim: null, events: [] };
+    const events = await createPrivateRunEventStore({ durableRunClaimStore: claims }).read(root, runId);
+    return { claim: claim.claim, events: events.kind === "valid" ? events.events : [] };
+  },
+});
+
+ipcMain.handle("artifact:read", async (_event, input: unknown) => artifactViewRuntime.read(input));
 
 ipcMain.handle("agent:discover", async () => {
   const bridge = await getAgentBridge();

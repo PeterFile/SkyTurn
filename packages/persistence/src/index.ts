@@ -378,7 +378,48 @@ export interface WorkflowApi {
   reconcileFinalChangeset: (projectRoot: string, input: FinalChangesetReconciliationRequest) => Promise<{ protocolVersion: number; reconciliation: FinalChangesetReconciliation }>;
 }
 
+export interface ArtifactViewRequest {
+  projectRoot: string;
+  sessionId: string;
+  nodeId: string;
+  runId: string;
+  /** Exact registered RunEvidence.artifacts entry, never an absolute filesystem path. */
+  artifactPath: string;
+}
+
+export type ArtifactViewErrorCode =
+  | "INVALID_INPUT" | "UNKNOWN_PROJECT" | "SCOPE_MISMATCH" | "EVIDENCE_UNAVAILABLE"
+  | "UNREGISTERED_ARTIFACT" | "BINDING_UNAVAILABLE" | "STALE_ARTIFACT" | "OUTSIDE_ROOT"
+  | "UNAVAILABLE" | "MISSING" | "UNSAFE_FILE" | "OVERSIZE" | "CHANGED"
+  | "UNSUPPORTED_CONTENT" | "UNSAFE_CONTENT";
+
+export type ArtifactViewContent =
+  | { encoding: "utf8"; mimeType: "text/plain"; text: string }
+  | { encoding: "base64"; mimeType: "image/png" | "image/jpeg"; base64: string; width: number; height: number };
+
+export type ArtifactViewResult =
+  | {
+      protocolVersion: 1;
+      ok: true;
+      artifact: {
+        artifactPath: string;
+        name: string;
+        type: "png" | "jpeg" | "txt" | "md" | "json";
+        runId: string;
+        status: "succeeded" | "failed" | "cancelled" | "timed-out";
+        byteLength: number;
+      };
+      contentIdentity: "current-file-unhashed";
+      content: ArtifactViewContent;
+    }
+  | { protocolVersion: 1; ok: false; code: ArtifactViewErrorCode; message: string };
+
+export interface ArtifactViewApi {
+  read(input: ArtifactViewRequest): Promise<ArtifactViewResult>;
+}
+
 export interface DevflowApi {
+  artifacts: ArtifactViewApi;
   openProject: () => Promise<OpenProjectResult>;
   initializeProjectMemory: (rootPath: string) => Promise<{ ok: boolean; devflowPath: string }>;
   getProjectBranchFacts: (projectRoot: string) => Promise<{ protocolVersion: number } & GitBranchFacts>;
