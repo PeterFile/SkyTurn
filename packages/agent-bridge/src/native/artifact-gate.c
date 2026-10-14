@@ -19,6 +19,7 @@
 #endif
 
 #define MAX_PUBLICATION_BYTES (32U * 1024U * 1024U)
+#define MAX_READ_BYTES (32U * 1024U * 1024U)
 
 static int valid_relative_path(const char *path) {
   if (path == NULL || path[0] == '\0' || path[0] == '/') return 0;
@@ -238,13 +239,106 @@ static int inspect_artifact(int worktree_fd, const char *artifact_path) {
   return 0;
 }
 
+static int same_read_file(const struct stat *before, const struct stat *after) {
+#ifdef __APPLE__
+  int same_times = before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+    before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec &&
+    before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
+    before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#else
+  int same_times = before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+    before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+    before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+    before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+  return same_times && S_ISREG(after->st_mode) && after->st_nlink == 1 &&
+    before->st_dev == after->st_dev && before->st_ino == after->st_ino &&
+    before->st_size == after->st_size;
+}
+
+static int read_artifact(int worktree_fd, const char *artifact_path, size_t limit) {
+  char *relative = strdup(artifact_path);
+  if (relative == NULL) return 70;
+  char *filename = strrchr(relative, '/');
+  int parent_fd;
+  if (filename == NULL) {
+    filename = relative;
+    parent_fd = dup(worktree_fd);
+  } else {
+    *filename++ = '\0';
+    parent_fd = open_directory_components(worktree_fd, relative, 0);
+  }
+  if (parent_fd < 0) {
+    print_error();
+    free(relative);
+    return 0;
+  }
+  puts("READY");
+  fflush(stdout);
+  if (getchar() != '\n') {
+    close(parent_fd);
+    free(relative);
+    return 74;
+  }
+  int fd = openat(parent_fd, filename, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
+  close(parent_fd);
+  free(relative);
+  if (fd < 0) {
+    print_error();
+    return 0;
+  }
+  struct stat before, after;
+  const char *error = "unsafe";
+  unsigned char *bytes = NULL;
+  size_t total = 0;
+  if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) || before.st_nlink != 1 || before.st_size < 0) goto failed;
+  if ((unsigned long long)before.st_size > limit) { error = "oversize"; goto failed; }
+  puts("OPENED");
+  fflush(stdout);
+  if (getchar() != '\n') { close(fd); return 74; }
+  bytes = malloc(limit + 1);
+  if (bytes == NULL) goto failed;
+  while (total <= limit) {
+    ssize_t count = read(fd, bytes + total, limit + 1 - total);
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0) goto failed;
+    if (count == 0) break;
+    total += (size_t)count;
+  }
+  if (total > limit) { error = "oversize"; goto failed; }
+  if (fstat(fd, &after) != 0 || !same_read_file(&before, &after) || (unsigned long long)after.st_size != total) {
+    error = "changed";
+    goto failed;
+  }
+  if (close(fd) != 0) { fd = -1; goto failed; }
+  /* Publish bytes only after the entire bounded read and identity check succeed. */
+  printf("RESULT ok %zu\n", total);
+  fflush(stdout);
+  int result = write_all(STDOUT_FILENO, bytes, total);
+  free(bytes);
+  return result == 0 ? 0 : 74;
+failed:
+  if (fd >= 0) close(fd);
+  free(bytes);
+  printf("RESULT %s\n", error);
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  int read_mode = argc == 4 && strcmp(argv[1], "read") == 0;
   int write_mode = argc == 3 && strcmp(argv[1], "write") == 0;
-  const char *artifact_path = write_mode ? argv[2] : argc == 2 ? argv[1] : NULL;
+  const char *artifact_path = read_mode || write_mode ? argv[2] : argc == 2 ? argv[1] : NULL;
   if (!valid_relative_path(artifact_path)) return 64;
 
   struct stat worktree;
   if (fstat(3, &worktree) != 0 || !S_ISDIR(worktree.st_mode)) return 70;
+  if (read_mode) {
+    if (strlen(artifact_path) > 4096 || strlen(argv[3]) == 0 || strlen(argv[3]) > 8) return 64;
+    for (const char *digit = argv[3]; *digit; digit++) if (*digit < '0' || *digit > '9') return 64;
+    unsigned long limit = strtoul(argv[3], NULL, 10);
+    if (limit == 0 || limit > MAX_READ_BYTES) return 64;
+    return read_artifact(3, artifact_path, (size_t)limit);
+  }
   return write_mode
     ? publish_artifact(3, artifact_path)
     : inspect_artifact(3, artifact_path);

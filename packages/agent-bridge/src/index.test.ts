@@ -6358,7 +6358,33 @@ describe("agent bridge", () => {
     expect(publicAdapterOptions).not.toContain("artifactVerificationHooks");
 
     const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-    expect(Object.keys(packageJson.exports)).toEqual(["."]);
+    expect(packageJson.exports).toEqual({
+      ".": {
+        types: "./src/index.ts",
+        import: "./dist/index.js",
+        default: "./dist/index.js",
+      },
+      "./bounded-file-reader": {
+        types: "./src/boundedFileReader.ts",
+        import: "./dist/boundedFileReader.js",
+        default: "./dist/boundedFileReader.js",
+      },
+    });
+
+    const publicApi = await import("@skyturn/agent-bridge");
+    const boundedFileReader = await import("@skyturn/agent-bridge/bounded-file-reader");
+    expect(Object.keys(boundedFileReader)).toEqual(["readBoundedFile"]);
+    for (const name of [
+      "createTestCodexCliAdapter",
+      "createTestHermesCliAdapter",
+      "artifactVerificationHooksCarrier",
+      "artifactVerificationHooksFrom",
+      "withArtifactVerificationHooks",
+      "StreamingSensitiveOutputRedactor",
+    ]) {
+      expect(publicApi).not.toHaveProperty(name);
+      expect(boundedFileReader).not.toHaveProperty(name);
+    }
   });
 
   it("rejects unsafe expected artifact paths before adapter start without exposing them", async () => {
