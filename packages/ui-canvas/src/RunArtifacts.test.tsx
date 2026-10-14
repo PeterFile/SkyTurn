@@ -41,7 +41,7 @@ describe("RunArtifacts", () => {
   it("ArtifactViewController handles missing API and returns UNAVAILABLE without throwing", async () => {
     (globalThis as any).window.devflow = {}; // Missing artifacts API
     const { controller, changed } = setup();
-    
+
     expect(changed).toHaveBeenCalled();
     expect(controller.state.result).toEqual(expect.objectContaining({
       ok: false,

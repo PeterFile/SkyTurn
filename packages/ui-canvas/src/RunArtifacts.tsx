@@ -58,7 +58,7 @@ export const RunArtifacts = memo(function RunArtifacts({
                     <span className="meta-badge">Run: {runId}</span>
                   </div>
                 </div>
-                <button 
+                <button
                   className="icon-button"
                   onClick={() => setActive(activePath === path ? null : { scopeId, path })}
                   aria-label={activePath === path ? "Close" : "View"}
@@ -68,7 +68,7 @@ export const RunArtifacts = memo(function RunArtifacts({
                 </button>
               </div>
               {activePath === path && (
-                <ArtifactView 
+                <ArtifactView
                   key={`${scopeId}:${path}`}
                   projectRoot={projectRoot}
                   sessionId={session.id}
@@ -206,8 +206,8 @@ export function ArtifactView(props: ArtifactViewProps) {
             {imageError ? (
               <div className="artifact-image-error">Image decode failure</div>
             ) : (
-              <img 
-                src={`data:${content.mimeType};base64,${content.base64}`} 
+              <img
+                src={`data:${content.mimeType};base64,${content.base64}`}
                 alt={artifact.name}
                 onError={() => controller.setImageError(true)}
               />
