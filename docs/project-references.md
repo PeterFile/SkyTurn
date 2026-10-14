@@ -27,6 +27,8 @@ Electron main authorizes the opened project and session, anchors the project dir
 
 The existing `workflow.user_input` event stores optional `references` and `resolvedReferences` in its payload. Each resolved entry contains `kind`, `path`, exact `text`, and UTF-8 `byteLength`. No table or schema migration is added.
 
+Resolved snapshots remain backend-owned. Electron main removes the entire `resolvedReferences` field from user-input events at the shared workflow response and broadcast boundary, including events inside public projections. Public append acknowledgements retain the original input text, ordered descriptors, event identity, and delivery metadata. Other events and exact typed run output are unchanged. The existing `workflow:events` API retains its metadata-only redaction. Projection never mutates authoritative events or their stored snapshots.
+
 A retry with the same session and `inputId` must match the exact input text and ordered descriptors. It looks up and validates the durable event before reading files, then reuses the original snapshot after file edits, deletion, or store reopen. A different text or descriptor list under the same identity fails. Existing planner segments and the durable delivered event prevent a delivered input from starting another planner turn.
 
 Main builds the planner goal from the durable event, JSON-quotes the file data, labels it as untrusted reference data rather than instructions, and passes it through the actual `buildHermesWorkflowPrompt` builder. File content does not become workflow policy or executable authority.

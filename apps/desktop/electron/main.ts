@@ -69,7 +69,7 @@ import { adoptWorkflowWorktree, compareWorkflowWorktrees } from "./worktreeCompa
 import { createTerminalRuntime } from "./terminalRuntime";
 import { createEditorRuntime } from "./editorRuntime";
 import { createArtifactViewRuntime } from "./artifactViewRuntime";
-import { createProjectReferenceRuntime, projectReferencePlannerGoal } from "./projectReferenceRuntime";
+import { createProjectReferenceRuntime, projectReferencePlannerGoal, projectReferenceResponseForRenderer } from "./projectReferenceRuntime";
 import {
   compensateFailedWorkflowRun,
   recoverPendingCandidateManifestFreezes,
@@ -4398,7 +4398,7 @@ function broadcastWorkflowProjection(
   if (!projectRoot) return;
   const view = store.materializeWorkflowView(sessionId);
   const canvasSession = materializeRendererCanvasSession(store, sessionId, view.canvasSession);
-  const envelope = parseWorkflowBroadcastEnvelope({
+  const envelope = parseWorkflowBroadcastEnvelope(projectReferenceResponseForRenderer({
     protocolVersion: WORKFLOW_IPC_PROTOCOL_VERSION,
     projectRoot,
     sessionId,
@@ -4406,7 +4406,7 @@ function broadcastWorkflowProjection(
     projection: view.projection,
     canvasSession,
     nextAction: view.loopState.nextAction,
-  });
+  }));
   for (const window of BrowserWindow.getAllWindows()) {
     window.webContents.send(WORKFLOW_EVENT_CHANNEL, envelope);
   }
@@ -6970,6 +6970,7 @@ function recordRunCheckpointFailure(
 }
 
 function decorateWorkflowResponseEnvelope<R>(result: R, projectRoot: string): R {
+  result = projectReferenceResponseForRenderer(result);
   if (!isRecord(result) || !Object.hasOwn(result, "canvasSession")) return result;
   const sessionId = isRecord(result.canvasSession) ? result.canvasSession.id : undefined;
   return parseWorkflowResponseEnvelope({
