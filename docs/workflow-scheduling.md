@@ -1,12 +1,27 @@
 # Pause and resume desktop scheduling
 
 Desktop integrations can call `devflow.workflow.pauseScheduling(projectRoot, request)` and
-`devflow.workflow.resumeScheduling(projectRoot, request)`. There are no scheduling controls in the UI yet.
+`devflow.workflow.resumeScheduling(projectRoot, request)`. The desktop canvas toolbar shows **Pause**
+for active scheduling and **Resume** for paused scheduling. Both leave existing runs running.
 
 Both methods take `{ sessionId, requestId, expectedStatus, expectedRevision }`. Read the session's
 current scheduling state before constructing a request. Pause expects `active`; resume expects
 `paused`. Use a new request ID for each transition and reuse the exact request when retrying.
 Invalid, stale, or conflicting requests reject through the existing workflow IPC error contract.
+
+The toolbar disables the control while a request is pending and never changes scheduling state
+optimistically. A successful control response must match the original request ID, desired status,
+and `expectedRevision + 1`. If a same-session broadcast or authoritative session refresh already
+installed that exact scheduling state, the response acknowledges the request without replacing
+the newer canvas, including its run state and output. Global response-generation guards still
+govern canvas installation.
+
+Responses from another project/root or session, backwards or conflicting scheduling revisions,
+and responses after navigating away and back do not acknowledge the request or replace the canvas.
+The toolbar offers **Reload scheduling** before a new transition. Unknown transport or advance
+outcomes instead retain the original action, request ID, and CAS tuple for **Retry Pause** or
+**Retry Resume**. Retry first recovers the authoritative projection, then replays that exact request;
+a failed recovery retains the same identity.
 
 The response contains the authoritative session envelope, projection, `schedulingState`, and
 `nextAction`. `mutation` identifies the applied event and reports `created`, its requested status,
