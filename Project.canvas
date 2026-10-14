@@ -263,12 +263,12 @@
     {
       "id": "6fc4bd3d6de770a9",
       "type": "text",
-      "x": 360,
-      "y": 500,
+      "x": 1320,
+      "y": 740,
       "width": 280,
       "height": 200,
-      "color": "5",
-      "text": "Task: Registered artifact viewing\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: none\nRisk: Final-head desktop and CI gates pending"
+      "color": "4",
+      "text": "Task: Registered artifact viewing\nState: Done\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: Registered artifact viewing verified and merged\nRisk: Current file bytes are not immutable historical snapshots; Windows preview is not verified\nGate: artifactViewAcceptance.mjs passed all four phases on frozen 59014cf; exact-head CI passed; PR 203 verified MERGED as e0065f33219ab413e8d75276561cfd6e342a3d27"
     },
     {
       "id": "9fce98f9c7a34c4e",
@@ -298,7 +298,7 @@
       "width": 280,
       "height": 200,
       "color": "1",
-      "text": "Task: Project file references\nState: Blocked\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: none\nRisk: Frozen inputs and late ACK isolation"
+      "text": "Task: Project file references\nState: Blocked\nOwner: Codex / Hermes acceptance\nDepends: Project file snapshot contract\nEvidence: none\nRisk: Follow-up UI only; retain newer drafts on late ACK; App integration follows scheduling"
     },
     {
       "id": "0a5c8685e8bb7f37",
@@ -339,6 +339,26 @@
       "height": 200,
       "color": "6",
       "text": "Task: Evaluate Jev advisory task routing\nState: Proposed\nOwner: Hermes\nDepends: none\nEvidence: none\nRisk: Requires data-transfer consent, credentials and measured Chinese quality"
+    },
+    {
+      "id": "b59af778e5ba7714",
+      "type": "text",
+      "x": 440,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Registered artifact viewing verified and merged\ncommit: none\ntest: Parent full suite: 3412 passed, 13 platform skips; lint/typecheck passed. Electron artifactViewAcceptance.mjs: mounted/reopen/stale/strict-dom passed on 59014cf2cebd8822f19db43b0ac919fc175ff8e7.\nbuild: none\nmanual: none\nartifact: https://github.com/PeterFile/SkyTurn/pull/203 ; /Volumes/HDD/MyStorage/Runtime/SkyTurn-agent-wave-20261015/artifacts/artifact-view-cd849M/result.json"
+    },
+    {
+      "id": "97ee38dd27709ea5",
+      "type": "text",
+      "x": 360,
+      "y": 740,
+      "width": 280,
+      "height": 200,
+      "color": "5",
+      "text": "Task: Project file snapshot contract\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: Registered artifact viewing\nEvidence: none\nRisk: Strict descriptor reads and immutable retry/reopen; no new composer UI in this slice"
     }
   ],
   "edges": [
@@ -520,6 +540,22 @@
       "id": "c8fa95894cc5cbdd",
       "fromNode": "2d937582041561b4",
       "toNode": "0a5c8685e8bb7f37",
+      "toEnd": "arrow",
+      "label": "depends",
+      "color": "6"
+    },
+    {
+      "id": "968925245012d44f",
+      "fromNode": "6fc4bd3d6de770a9",
+      "toNode": "b59af778e5ba7714",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "b511b1da33087927",
+      "fromNode": "6fc4bd3d6de770a9",
+      "toNode": "97ee38dd27709ea5",
       "toEnd": "arrow",
       "label": "depends",
       "color": "6"

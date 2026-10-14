@@ -89,18 +89,19 @@ Runtime failure events use stable categories where possible:
 
 ## Integration Direction
 
-SkyTurn prioritizes reliable task completion and useful context over adding agent names. The next independently verifiable slices are:
+SkyTurn prioritizes reliable task completion and useful context over adding agent names. Integration priorities and independently verifiable acceptance contracts are:
 
 | Slice | User outcome | Required acceptance |
 | --- | --- | --- |
 | Registered artifact viewing | Inspect registered text and PNG artifacts from node Context. | Mounted Electron preview, process reopen, denied unsafe/unregistered paths, stale run/HEAD rejection, and late-response isolation. Current file bytes must not be described as immutable historical bytes. |
 | Scheduling acknowledgement | Resume does not report an unknown outcome when its own authoritative broadcast arrives first. | Broadcast-before-response regression, duplicate-click/idempotency checks, foreign/stale authority rejection, and mounted desktop control. |
 | Desktop Retry | Retry an eligible failed/cancelled attempt without losing original evidence. | Cancel → Retry → pending reopen → Resume → real executor → downstream completion → terminal reopen. |
-| Project file references | Attach precise local context to a Canvas follow-up. | Freeze bytes before delivery; changing/deleting the source and retrying the same input must preserve the frozen content. A late ACK must not clear a newer draft. |
+| Project file snapshot contract | Reliably retain file context across a failed delivery and restart. | Freeze authorized bytes before delivery; changing/deleting the source and retrying the same input must preserve the frozen content. Invalid references must not claim an input. This backend slice does not expose a new UI control. |
+| Project file reference UI | Attach precise local context to a Canvas follow-up. | Consume the snapshot contract; scope chips to the project/session; a late ACK must not clear a newer draft. Other composer modes remain explicitly disabled. |
 | Exact run-result references | Reuse a selected historical run's output, not a changing aggregate. | Bind session/node/segment/run; compare exact private typed stdout; reject revoked/cross-project sources and preserve frozen retries. |
 | Independent verification evidence | Distinguish an agent's clean exit from passing project checks. | A failing verification command must fail the verification lane even if the executor reports success; downstream release remains blocked. |
 
-Reuse existing implementations before starting replacements. Integrate artifact viewing before file references, and file references before exact run-result references. Scheduling acknowledgement precedes Retry acceptance. Keep changes to shared renderer entrypoints serial at integration time. Each slice needs its own focused tests, current build, applicable desktop acceptance, and exact-head required CI; a blocked slice remains unshipped while independent work continues.
+Reuse existing implementations before starting replacements. Integrate artifact viewing before file snapshots, then the reference UI, then exact run-result references. The snapshot backend and composer UI are separate PRs; do not include unrelated stylesheet cleanup. Scheduling acknowledgement precedes Retry acceptance. Keep changes to shared renderer entrypoints serial at integration time. Each slice needs its own focused tests, current build, applicable desktop acceptance, and exact-head required CI; a blocked slice remains unshipped while independent work continues.
 
 ### Pi: Compatibility Before Execution
 
