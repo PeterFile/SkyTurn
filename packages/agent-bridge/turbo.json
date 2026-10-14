@@ -1,0 +1,13 @@
+{
+  "extends": ["//"],
+  "tasks": {
+    "build": {
+      "outputs": [
+        "$TURBO_EXTENDS$",
+        "src/native/artifact-gate",
+        "src/native/fd-launch",
+        "src/native/posix-process-owner"
+      ]
+    }
+  }
+}
