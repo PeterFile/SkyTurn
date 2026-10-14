@@ -259,6 +259,86 @@
       "height": 220,
       "color": "4",
       "text": "Evidence: Explicit delivery gates implementation and recovery\ncommit: 1178cc5 guarded lifecycle; 1fc533c explicit UI gates; 0050a80 and bbd7ed6 Git-backed commit completion\ntest: 88991ba candidate delivery lifecycle; 6c08070 delivery recovery after restart\nbuild: not rerun in this documentation-only lane\nmanual: README and live git history confirm separate commit, push, PR, exact-head checks, merge, main sync, and cleanup gates\nartifact: apps/desktop/scripts/candidateDeliveryPrAcceptance.mjs"
+    },
+    {
+      "id": "6fc4bd3d6de770a9",
+      "type": "text",
+      "x": 360,
+      "y": 500,
+      "width": 280,
+      "height": 200,
+      "color": "5",
+      "text": "Task: Registered artifact viewing\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: none\nRisk: Final-head desktop and CI gates pending"
+    },
+    {
+      "id": "9fce98f9c7a34c4e",
+      "type": "text",
+      "x": 360,
+      "y": 740,
+      "width": 280,
+      "height": 200,
+      "color": "5",
+      "text": "Task: Scheduling broadcast acknowledgement\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: none\nRisk: Preserve stale response and navigation guards"
+    },
+    {
+      "id": "095f758a51d5e011",
+      "type": "text",
+      "x": 1000,
+      "y": 500,
+      "width": 280,
+      "height": 200,
+      "color": "1",
+      "text": "Task: Desktop Retry\nState: Blocked\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: none\nRisk: Real executor and terminal reopen acceptance required"
+    },
+    {
+      "id": "2d937582041561b4",
+      "type": "text",
+      "x": 1000,
+      "y": 740,
+      "width": 280,
+      "height": 200,
+      "color": "1",
+      "text": "Task: Project file references\nState: Blocked\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: none\nRisk: Frozen inputs and late ACK isolation"
+    },
+    {
+      "id": "0a5c8685e8bb7f37",
+      "type": "text",
+      "x": 1000,
+      "y": 980,
+      "width": 280,
+      "height": 200,
+      "color": "1",
+      "text": "Task: Exact run-result references\nState: Blocked\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: none\nRisk: Exact private stdout identity, not latest or mirror output"
+    },
+    {
+      "id": "cf5a7d6e5e1216ce",
+      "type": "text",
+      "x": 40,
+      "y": 500,
+      "width": 280,
+      "height": 200,
+      "color": "6",
+      "text": "Task: Pi compatibility discovery\nState: Proposed\nOwner: Codex\nDepends: none\nEvidence: none\nRisk: Detected-only; no sandbox or runnable support claim"
+    },
+    {
+      "id": "ca7688ac85a42c3b",
+      "type": "text",
+      "x": 40,
+      "y": 740,
+      "width": 280,
+      "height": 200,
+      "color": "6",
+      "text": "Task: Independent project verification evidence\nState: Proposed\nOwner: Codex\nDepends: none\nEvidence: none\nRisk: Executor exit zero must not imply test success"
+    },
+    {
+      "id": "e511d66f86aadaaf",
+      "type": "text",
+      "x": 40,
+      "y": 980,
+      "width": 280,
+      "height": 200,
+      "color": "6",
+      "text": "Task: Evaluate Jev advisory task routing\nState: Proposed\nOwner: Hermes\nDepends: none\nEvidence: none\nRisk: Requires data-transfer consent, credentials and measured Chinese quality"
     }
   ],
   "edges": [
@@ -419,6 +499,30 @@
       "toEnd": "arrow",
       "label": "evidence",
       "color": "4"
+    },
+    {
+      "id": "ab59feffc7fa55d9",
+      "fromNode": "9fce98f9c7a34c4e",
+      "toNode": "095f758a51d5e011",
+      "toEnd": "arrow",
+      "label": "depends",
+      "color": "6"
+    },
+    {
+      "id": "ccfb6bad14082f6a",
+      "fromNode": "6fc4bd3d6de770a9",
+      "toNode": "2d937582041561b4",
+      "toEnd": "arrow",
+      "label": "depends",
+      "color": "6"
+    },
+    {
+      "id": "c8fa95894cc5cbdd",
+      "fromNode": "2d937582041561b4",
+      "toNode": "0a5c8685e8bb7f37",
+      "toEnd": "arrow",
+      "label": "depends",
+      "color": "6"
     }
   ]
 }
