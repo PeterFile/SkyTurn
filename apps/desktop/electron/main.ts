@@ -69,6 +69,7 @@ import { adoptWorkflowWorktree, compareWorkflowWorktrees } from "./worktreeCompa
 import { createTerminalRuntime } from "./terminalRuntime";
 import { createEditorRuntime } from "./editorRuntime";
 import { createArtifactViewRuntime } from "./artifactViewRuntime";
+import { createProjectReferenceRuntime, projectReferencePlannerGoal } from "./projectReferenceRuntime";
 import {
   compensateFailedWorkflowRun,
   recoverPendingCandidateManifestFreezes,
@@ -176,6 +177,8 @@ interface WorkflowAppendUserInput {
   sessionId?: unknown;
   inputId?: unknown;
   text?: unknown;
+  references?: unknown;
+  resolvedReferences?: unknown;
   idempotencyKey?: unknown;
   now?: unknown;
 }
@@ -694,6 +697,10 @@ const workspaceProjectAuthorizationError = "Workspace contains a project that is
 const workflowAdvanceShutdownError = "Workflow advancement is unavailable while SkyTurn is shutting down.";
 const openedProjectRoots = new Set<string>();
 const planProjectIdentities = createPlanProjectIdentityRegistry();
+const projectReferenceRuntime = createProjectReferenceRuntime({
+  openedProjectRoots,
+  canonicalizeProjectRoot: (root) => planProjectIdentities.canonicalize(root),
+});
 let agentBridge: AgentBridgeHost | null = null;
 let agentBridgeInitialization: Promise<AgentBridgeHost> | null = null;
 let agentBridgeAdmissionOpen = true;
@@ -784,6 +791,7 @@ interface WorkflowStoreHost {
   createPlanFinishWorkflowSession(input: unknown): unknown;
   appendUserInput(input: unknown): unknown;
   claimUserInput(input: unknown): { event: unknown; created: boolean; ownsDelivery: boolean };
+  getUserInput(input: unknown): unknown;
   recordUserInputDelivered(input: unknown): unknown;
   buildLedgerSummary(sessionId: string): WorkflowLedgerSummary;
   appendWorkflowEvent(input: unknown): unknown;
@@ -1405,7 +1413,9 @@ ipcMain.handle("workflow:finishPlan", workflowHandler(async (projectRoot: string
 ipcMain.handle("workflow:appendUserInput", workflowHandler(async (projectRoot: string, input: WorkflowAppendUserInput) => {
   assertKnownProjectRoot(projectRoot);
   const sessionId = assertWorkflowSessionId(input.sessionId);
-  const text = requireText(input.text, "workflow user input");
+  if (input.resolvedReferences !== undefined) throw workflowIpcError("INVALID_INPUT", "Project references accept descriptors only.");
+  const legacyText = requireText(input.text, "workflow user input");
+  const text = Array.isArray(input.references) && input.references.length ? input.text as string : legacyText;
   const inputId = optionalText(input.inputId) ?? optionalText(input.idempotencyKey) ?? `input-${Date.now()}`;
   const now = optionalText(input.now) ?? new Date().toISOString();
   const workflowProjectRoot = await workflowStoreIdentity(projectRoot);
@@ -1419,6 +1429,7 @@ ipcMain.handle("workflow:appendUserInput", workflowHandler(async (projectRoot: s
       sessionId,
       inputId,
       text,
+      ...(input.references !== undefined ? { references: input.references } : {}),
       now,
       plannerSessionId: requireText(canvasSession.hermesPlannerSessionId, "workflow planner session id"),
       plannerNodeId: requireText(canvasSession.plannerNodeId, "workflow planner node id"),
@@ -4554,6 +4565,7 @@ async function deliverWorkflowUserInputToPlanner(input: {
   sessionId: string;
   inputId: string;
   text: string;
+  references?: unknown;
   now: string;
   plannerSessionId: string;
   plannerNodeId: string;
@@ -4566,7 +4578,7 @@ async function deliverWorkflowUserInputToPlanner(input: {
     dependencies: string[];
   }>;
 }): Promise<{ event: unknown; created: boolean; ownsDelivery: boolean }> {
-  const claim = input.store.claimUserInput({
+  const claim = input.references !== undefined ? await projectReferenceRuntime.claimInput({ ...input, references: input.references }) : input.store.claimUserInput({
     sessionId: input.sessionId,
     inputId: input.inputId,
     text: input.text,
@@ -4591,7 +4603,7 @@ async function deliverWorkflowUserInputToPlanner(input: {
   if (!existingSegment) {
     const { buildHermesWorkflowPrompt } = await import("@skyturn/orchestrator");
     const prompt = buildHermesWorkflowPrompt({
-      goal: input.text,
+      goal: input.references !== undefined ? await projectReferencePlannerGoal(claim.event) : input.text,
       sessionId: input.sessionId,
       plannerSessionId: input.plannerSessionId,
       nodeId: input.plannerNodeId,

@@ -1,6 +1,60 @@
 import type { WorkflowLoopNextAction, WorkflowSchedulingState, WorkflowSchedulingStatus } from "@skyturn/project-core";
 import type { WorkflowSchedulingControlRequest } from "@skyturn/workflow-kernel";
 export type { WorkflowSchedulingControlRequest } from "@skyturn/workflow-kernel";
+
+export type ProjectFileReference = Readonly<{ kind: "file"; path: string }>;
+export type ResolvedProjectFileReference = Readonly<ProjectFileReference & { text: string; byteLength: number }>;
+export const PROJECT_REFERENCE_LIMITS = Object.freeze({ count: 8, pathLength: 1024, perFileBytes: 32 * 1024, totalBytes: 64 * 1024 });
+
+/** Descriptors contain no caller-provided content and are canonical without rewriting paths. */
+export function parseProjectFileReferences(value: unknown): readonly ProjectFileReference[] {
+  if (value === undefined) return Object.freeze([]);
+  if (!Array.isArray(value) || value.length > PROJECT_REFERENCE_LIMITS.count) throw new Error("Project references must be an array of at most 8 files.");
+  const seen = new Set<string>();
+  const result: ProjectFileReference[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item) || Object.keys(item).sort().join() !== "kind,path" ||
+      item.kind !== "file" || typeof item.path !== "string") throw new Error("Project reference descriptor is invalid.");
+    const name: string = item.path;
+    if (!name || name.length > PROJECT_REFERENCE_LIMITS.pathLength || name.trim() !== name ||
+      /[\\\x00-\x1f\x7f<>|:*?]/.test(name) || /[\ud800-\udfff]/u.test(name) ||
+      name.split("/").some((part) => !part || part === "." || part === ".." || part.endsWith(".") || part.trim() !== part)) {
+      throw new Error("Project reference requires a valid project-relative file path.");
+    }
+    const parts = name.split("/");
+    if (parts.some((part) => isSensitiveArtifactComponent(part) ||
+      /^(?:\.git|\.devflow|\.ssh|\.aws|\.azure|\.gcloud|\.gnupg|\.kube|\.docker|\.config|\.agents|\.codex|\.hermes|\.claude|\.gemini|\.openclaw)$/i.test(part.normalize("NFKC")))) {
+      throw new Error("Project reference names a sensitive file or private directory.");
+    }
+    if (seen.has(name)) throw new Error("Duplicate project reference path.");
+    seen.add(name);
+    result.push(Object.freeze({ kind: "file", path: name }));
+  }
+  return Object.freeze(result);
+}
+
+/** Used at the durable boundary as well as after descriptor-relative reads. Never truncates or normalizes text. */
+export function parseResolvedProjectFileReferences(value: unknown, references: readonly ProjectFileReference[]): readonly ResolvedProjectFileReference[] {
+  if (value === undefined && references.length === 0) return Object.freeze([]);
+  if (!Array.isArray(value) || value.length !== references.length) throw new Error("Project reference snapshot is missing or invalid.");
+  let total = 0;
+  return Object.freeze(references.map((ref, index) => {
+    const item = value[index];
+    if (!item || typeof item !== "object" || Array.isArray(item) || Object.keys(item).sort().join() !== "byteLength,kind,path,text" ||
+      item.kind !== ref.kind || item.path !== ref.path || typeof item.text !== "string" ||
+      item.text.length > PROJECT_REFERENCE_LIMITS.perFileBytes || /[\ud800-\udfff]/u.test(item.text) ||
+      /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(item.text)) throw new Error("Project reference must contain bounded, valid UTF-8 text, not binary data.");
+    const byteLength = new TextEncoder().encode(item.text).length;
+    total += byteLength;
+    if (item.byteLength !== byteLength || byteLength > PROJECT_REFERENCE_LIMITS.perFileBytes || total > PROJECT_REFERENCE_LIMITS.totalBytes) {
+      throw new Error("Project reference exceeds the 32 KiB per-file or 64 KiB total limit.");
+    }
+    if (sanitizePublicPayloadText(item.text) !== item.text || /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(item.text)) {
+      throw new Error("Project reference contains sensitive content.");
+    }
+    return Object.freeze({ ...ref, text: item.text, byteLength });
+  }));
+}
 import type { SettingsApi } from "./settings.js";
 export * from "./settings.js";
 import type {
@@ -18,6 +72,8 @@ import type {
   WorktreeComparisonRequest,
 } from "@skyturn/git-worktree";
 import {
+  isSensitiveArtifactComponent,
+  sanitizePublicPayloadText,
   makeHermesPlanConversationId,
   makeHermesPlannerSessionId,
   normalizeSessionTarget,
