@@ -210,6 +210,7 @@ import {
   resolveRunWorktreePath,
   retryCanvasNode,
 } from "./workflowRuntime.js";
+import { RunArtifacts } from "./RunArtifacts.js";
 import { addRequirementPlanningNode } from "./composer.js";
 import {
   buildSelectedNodeActionState,
@@ -6873,12 +6874,16 @@ function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasN
         <dt>Constraints</dt>
         <dd>{node.context.constraints.join("; ")}</dd>
         {runEvidence ? (
-          <RunEvidenceFacts runEvidence={runEvidence} />
+          <Fragment>
+            <RunEvidenceFacts runEvidence={runEvidence} />
+            <RunArtifacts projectRoot={projectRoot} session={session} node={node} runEvidence={runEvidence} />
+          </Fragment>
         ) : (
-          <>
+          <Fragment>
             <dt>Run evidence</dt>
             <dd>No run evidence yet</dd>
-          </>
+            <RunArtifacts projectRoot={projectRoot} session={session} node={node} runEvidence={null} />
+          </Fragment>
         )}
       </dl>
       <WorktreeActions node={node} session={session} projectRoot={projectRoot} />
