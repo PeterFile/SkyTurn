@@ -1009,6 +1009,7 @@ export default function App() {
   const bottomComposerSubmissionsRef = useRef(new Map<string, BottomComposerSubmissionState>());
   const newSessionSubmissionsRef = useRef(new Map<string, NewSessionSubmissionState>());
   const schedulingAttemptsRef = useRef(new Map<string, SchedulingAttempt>());
+  const schedulingNavigationGenerationRef = useRef(0);
   const [, refreshScheduling] = useReducer((revision: number) => revision + 1, 0);
   const workflowProjectionGenerationRef = useRef(new Map<string, number>());
   const authoritativeRunEvidenceHydratorRef = useRef<AuthoritativeRunEvidenceHydrator | null>(null);
@@ -1076,6 +1077,9 @@ export default function App() {
     ? JSON.stringify([activeProject.id, activeProject.rootPath, activeProject.canonicalRootPath, activeSession.id])
     : null;
   const schedulingAttempt = schedulingScope ? schedulingAttemptsRef.current.get(schedulingScope) : undefined;
+  useLayoutEffect(() => {
+    schedulingNavigationGenerationRef.current += 1;
+  }, [schedulingScope]);
   const schedulingUnavailable = activeSession?.kind !== "canvas" || !activeSession.schedulingState
     ? "Scheduling state unavailable."
     : !activeProject || !workflowRequestAuthority(activeProject, activeSession.id)
@@ -1225,13 +1229,42 @@ export default function App() {
     }), busy: true, error: null };
     attempts.set(schedulingScope, attempt);
     refreshScheduling();
+    const navigationGeneration = schedulingNavigationGenerationRef.current;
+    function applySchedulingResponse(response: unknown, acknowledgeRequest: boolean): boolean {
+      const current = workspaceRef.current;
+      const responseGuard = guard;
+      if (!responseGuard || !schedulingScope || navigationGeneration !== schedulingNavigationGenerationRef.current ||
+          attempts.get(schedulingScope) !== attempt ||
+          current.activeProjectId !== responseGuard.projectId || current.activeSessionId !== responseGuard.sessionId ||
+          !workspaceMatchesWorkflowAuthority(current, responseGuard)) return false;
+      const authoritative = canvasSessionForWorkflowAuthority(response, responseGuard);
+      const latest = current.sessions.find((session) => (
+        session.id === responseGuard.sessionId && session.projectId === responseGuard.projectId
+      ));
+      const returnedState = authoritative?.schedulingState;
+      const latestState = latest?.kind === "canvas" ? latest.schedulingState : undefined;
+      if (!returnedState || !latestState || returnedState.revision < latestState.revision ||
+          (returnedState.revision === latestState.revision && (
+            returnedState.status !== latestState.status || returnedState.requestId !== latestState.requestId
+          ))) return false;
+      if (acknowledgeRequest) {
+        const matchesRequest = (state: CanvasSession["schedulingState"]) => (
+          state?.status === (attempt.action === "resume" ? "active" : "paused") &&
+          state.revision === attempt.request.expectedRevision + 1 &&
+          state.requestId === attempt.request.requestId
+        );
+        if (!matchesRequest(returnedState)) return false;
+        // A broadcast can acknowledge this request while its newer graph stays installed.
+        if (matchesRequest(latestState)) return true;
+      }
+      return applyGuardedWorkflowSessionResponse(response, responseGuard);
+    }
     try {
       const workflow = window.devflow!.workflow;
       if (previous?.error && !attempt.reload) {
         // Resume may commit before advance fails; projection recovery advances, exact replay does not.
         const projection = await workflow.getProjection(guard.queryRoot, guard.sessionId);
-        if (!canvasSessionForWorkflowAuthority(projection, guard)?.schedulingState ||
-            !applyGuardedWorkflowSessionResponse(projection, guard)) {
+        if (!applySchedulingResponse(projection, false)) {
           throw new Error("Scheduling recovery response is no longer current.");
         }
         const refreshed = workspaceRef.current.sessions.find((session) => (
@@ -1246,8 +1279,7 @@ export default function App() {
         : await workflow[attempt.action === "pause" ? "pauseScheduling" : "resumeScheduling"](
             guard.queryRoot, attempt.request,
           );
-      if (!canvasSessionForWorkflowAuthority(result, guard)?.schedulingState ||
-          !applyGuardedWorkflowSessionResponse(result, guard)) {
+      if (!applySchedulingResponse(result, !attempt.reload)) {
         attempts.set(schedulingScope, { ...attempt, busy: false, reload: true,
           error: "Scheduling response is no longer current. Reload scheduling before retrying." });
       } else {
