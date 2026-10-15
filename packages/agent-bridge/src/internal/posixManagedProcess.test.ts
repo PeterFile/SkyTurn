@@ -122,8 +122,11 @@ describe("POSIX managed process ownership", () => {
 
   darwinIt("keeps the owner outside the restricted target sandbox and denies target descendants", async () => {
     const root = await makeRoot(true);
+    const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-state-"));
+    roots.push(stateRoot);
     const worktree = await openDirectory(root);
     let output = "";
+    let managed: Awaited<ReturnType<typeof spawnPosixManagedProcess>> | undefined;
     try {
       const script = [
         'const { spawnSync } = require("node:child_process");',
@@ -131,11 +134,11 @@ describe("POSIX managed process ownership", () => {
         'process.stdout.write(child.error?.code ?? "none");',
         'process.exit(child.error?.code === "EPERM" ? 0 : 82);',
       ].join("");
-      const managed = await spawnPosixManagedProcess({
+      managed = await spawnPosixManagedProcess({
         agentKind: "hermes",
         args: ["-e", script],
         cleanupTimeoutMs: 200,
-        env: {},
+        env: { HERMES_HOME: stateRoot, TMPDIR: process.env.TMPDIR },
         executablePath: process.execPath,
         platform: "darwin",
         preserveWorktreeFd: true,
@@ -153,7 +156,8 @@ describe("POSIX managed process ownership", () => {
       expect(output).toBe("EPERM");
       await expect(managed.terminateAndReap()).resolves.toBeUndefined();
     } finally {
-      await worktree.close();
+      try { await managed?.terminateAndReap(); }
+      finally { await worktree.close(); }
     }
   }, 15_000);
 
@@ -167,12 +171,13 @@ describe("POSIX managed process ownership", () => {
     ]);
     const worktree = await openDirectory(root);
     let output = "";
+    let managed: Awaited<ReturnType<typeof spawnPosixManagedProcess>> | undefined;
     try {
-      const managed = await spawnPosixManagedProcess({
+      managed = await spawnPosixManagedProcess({
         agentKind: "hermes",
         args: ["-e", boundedHermesStateScript()],
         cleanupTimeoutMs: 200,
-        env: { HERMES_HOME: stateRoot },
+        env: { HERMES_HOME: stateRoot, TMPDIR: process.env.TMPDIR },
         executablePath: process.execPath,
         platform: "darwin",
         preserveWorktreeFd: true,
@@ -196,7 +201,8 @@ describe("POSIX managed process ownership", () => {
       await expect(stat(join(stateRoot, "config.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
       await expect(managed.terminateAndReap()).resolves.toBeUndefined();
     } finally {
-      await worktree.close();
+      try { await managed?.terminateAndReap(); }
+      finally { await worktree.close(); }
     }
   }, 15_000);
 

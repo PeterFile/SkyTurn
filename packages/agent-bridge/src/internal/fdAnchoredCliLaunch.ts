@@ -7,6 +7,7 @@ import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type { AgentRunSandbox } from "@skyturn/project-core";
+import { hermesPmSandboxRules, type HermesPmState } from "./hermesPmState.js";
 
 const sandboxExecutablePath = "/usr/bin/sandbox-exec";
 const sandboxProbeTimeoutMs = 2_000;
@@ -40,6 +41,7 @@ export interface SpawnFdAnchoredCliInput extends FdAnchoredCliLaunchCapabilityIn
   env: NodeJS.ProcessEnv;
   executablePath: string;
   hermesStateRoot?: string;
+  hermesPmState?: HermesPmState;
   preserveWorktreeFd?: boolean;
   worktreeFd: number;
 }
@@ -110,9 +112,10 @@ export function buildFdAnchoredCliLaunchPlan(
     fdLaunchPath: helperPath,
     wrapper: sandboxedHermes
       ? {
-          args: ["-p", input.hermesStateRoot
+          args: ["-p", (input.hermesStateRoot
             ? hermesReadOnlyProfile(input.hermesStateRoot)
-            : readOnlyProfile],
+            : readOnlyProfile) + (input.platform === "darwin" && input.hermesPmState
+              ? ` ${hermesPmSandboxRules(input.hermesPmState)}` : "")],
           executablePath: sandboxExecutablePath,
         }
       : null,
