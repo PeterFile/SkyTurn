@@ -7568,6 +7568,7 @@ describe("agent bridge", () => {
 
   it.runIf(macOsSandboxExecAvailable)("denies all Hermes filesystem writes in macOS read-only mode", async () => {
     const projectRoot = await makeTempRoot();
+    const hermesHome = await makeTempRoot();
     const outsideRoot = await makeTempRoot();
     const outsidePath = join(outsideRoot, "outside.txt");
     const binRoot = await makeTempRoot();
@@ -7586,15 +7587,11 @@ describe("agent bridge", () => {
     const bridge = new AgentBridge({
       adapters: [createHermesCliAdapter({
         executablePath: hermesPath,
-        env: { SKYTURN_OUTSIDE_PATH: outsidePath },
+        env: { HERMES_HOME: hermesHome, SKYTURN_OUTSIDE_PATH: outsidePath },
       })],
     });
-    const completed = waitForEvent(
-      bridge,
-      (event) => event.kind === "status" && event.payload.status === "succeeded",
-    );
 
-    await bridge.startRun({
+    const run = await bridge.startRun({
       protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
       nodeId: "node-hermes-read-only-sandbox",
       sessionId: "session-1",
@@ -7604,8 +7601,14 @@ describe("agent bridge", () => {
       sandbox: "read-only",
       prompt: "Attempt writes",
     });
-    await completed;
+    const terminal = await waitForPersistedEvent(
+      projectRoot,
+      run.id,
+      (event) => event.kind === "status" &&
+        ["succeeded", "failed", "cancelled", "timed-out"].includes(String(event.payload.status)),
+    );
 
+    expect(terminal.payload.status).toBe("succeeded");
     await expect(stat(join(projectRoot, "inside.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(outsidePath)).rejects.toMatchObject({ code: "ENOENT" });
   });

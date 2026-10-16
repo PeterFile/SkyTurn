@@ -122,6 +122,8 @@ describe("POSIX managed process ownership", () => {
 
   darwinIt("keeps the owner outside the restricted target sandbox and denies target descendants", async () => {
     const root = await makeRoot(true);
+    const stateRoot = await mkdtemp(join(tmpdir(), "skyturn-hermes-state-"));
+    roots.push(stateRoot);
     const worktree = await openDirectory(root);
     let output = "";
     try {
@@ -135,7 +137,7 @@ describe("POSIX managed process ownership", () => {
         agentKind: "hermes",
         args: ["-e", script],
         cleanupTimeoutMs: 200,
-        env: {},
+        env: { HERMES_HOME: stateRoot },
         executablePath: process.execPath,
         platform: "darwin",
         preserveWorktreeFd: true,
