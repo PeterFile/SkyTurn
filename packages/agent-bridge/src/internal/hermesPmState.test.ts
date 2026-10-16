@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Script } from "node:vm";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -29,6 +30,78 @@ describe("Hermes PM startup state", () => {
   it.each([
     ["malformed JSON", "{"],
     ["null metadata", "null"],
+    ["missing inputs", '{"generation":"generations/' + "4".repeat(32) + '"}'],
+    ["outdated inputs", JSON.stringify({ inputs: "0".repeat(64), generation: "generations/" + "4".repeat(32) })],
+    ["duplicate inputs", '{"inputs":"x","inputs":"x"}'],
+    ["escaped duplicate generation", '{"generation":"x","gener\\u0061tion":"x"}'],
+    ["oversized metadata", " ".repeat(65_537)],
+    ["invalid UTF-8", Buffer.from([0xff])],
+    ["UTF-8 BOM", '\uFEFF{}'],
+  ])("rejects PM selected %s", async (_name, source) => {
+    const fixture = await makeInstallation();
+    await writeFile(fixture.pmSelected, source);
+    await expect(discover(fixture)).rejects.toThrow();
+  });
+
+  it.each(["../escape", "/tmp/escape", "generations/../" + "4".repeat(32), "generations/" + "4".repeat(32) + "/", "generations/" + "A".repeat(32)])(
+    "rejects noncanonical PM selection %s", async (generation) => {
+      const fixture = await makeInstallation();
+      await writeFile(fixture.pmSelected, JSON.stringify({ inputs: fixture.pmInputs, generation }));
+      await expect(discover(fixture)).rejects.toThrow();
+    },
+  );
+
+  it.each(["pmRoot", "pmLock", "pmSelected", "pmGeneration", "pmMarker", "pmManaged", "pmConfig", "pmPython", "pmProject", "pmLockfile"] as const)(
+    "rejects missing prepared PM state at %s without bootstrapping", async (field) => {
+      const fixture = await makeInstallation();
+      await rm(fixture[field], { recursive: true });
+      await expect(discover(fixture)).rejects.toThrow();
+      await expect(lstat(fixture[field])).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
+  it.each(["pmProject", "pmLockfile", "pmMarker"] as const)("rejects outdated PM state at %s", async (field) => {
+    const fixture = await makeInstallation();
+    await writeFile(fixture[field], field === "pmMarker" ? JSON.stringify({ inputs: "0".repeat(64) }) : "changed");
+    await expect(discover(fixture)).rejects.toThrow();
+  });
+
+  it("hashes PM input bytes including a BOM and accepts official marker metadata without a schema", async () => {
+    const fixture = await makeInstallation();
+    const source = "\uFEFF[project]\n";
+    await writeFile(fixture.pmProject, source);
+    const inputs = createHash("sha256").update(source).update("\0").update(await readFile(fixture.pmLockfile)).update("\0").update(fixture.python).digest("hex");
+    await writeFile(fixture.pmSelected, JSON.stringify({ inputs, generation: "generations/" + "4".repeat(32) }));
+    await writeFile(fixture.pmMarker, JSON.stringify({ inputs }));
+    await expect(discover(fixture)).resolves.toBeDefined();
+  });
+
+  it.each(["{", "null", '{"inputs":"x","inp\\u0075ts":"x"}'])("rejects malformed PM generation marker %s", async (source) => {
+    const fixture = await makeInstallation();
+    await writeFile(fixture.pmMarker, source);
+    await expect(discover(fixture)).rejects.toThrow();
+  });
+
+  it.each(["inputs", "generation", "escaped generation", "nested"])("rejects otherwise valid selected metadata with duplicate %s", async (kind) => {
+    const fixture = await makeInstallation();
+    const member = kind === "inputs" ? `"inputs":${JSON.stringify(fixture.pmInputs)}` :
+      kind === "nested" ? '"extra":{"key":1,"k\\u0065y":1}' :
+      `"${kind === "escaped generation" ? "gener\\u0061tion" : "generation"}":"generations/${"4".repeat(32)}"`;
+    const source = await readFile(fixture.pmSelected, "utf8");
+    await writeFile(fixture.pmSelected, source.slice(0, -1) + "," + member + "}");
+    await expect(discover(fixture)).rejects.toThrow();
+  });
+
+  it("preserves UTF-8-sig facts compatibility", async () => {
+    const fixture = await makeInstallation();
+    await writeFile(fixture.facts, "\uFEFF" + fixture.factsSource);
+    const state = (await discover(fixture))!;
+    await expect(revalidateHermesPmState(state)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    ["malformed JSON", "{"],
+    ["null metadata", "null"],
     ["wrong schema", '{"schema":2,"packages":{}}'],
     ["duplicate keys", '{"schema":1,"schema":1,"packages":{}}'],
     ["escaped duplicate keys", '{"schema":1,"packages":{},"pack\\u0061ges":{}}'],
@@ -49,7 +122,7 @@ describe("Hermes PM startup state", () => {
     },
   );
 
-  it.each(["lock", "facts", "leases", "generation"] as const)("rejects a symlink at %s", async (field) => {
+  it.each(["lock", "facts", "leases", "generation", "pmRoot", "pmLock", "pmSelected", "pmGeneration", "pmLeases", "pmMarker", "pmManaged", "pmConfig", "pmProject", "pmLockfile"] as const)("rejects a symlink at %s", async (field) => {
     const fixture = await makeInstallation();
     const path = fixture[field];
     const moved = join(fixture.root, `moved-${field}`);
@@ -58,7 +131,7 @@ describe("Hermes PM startup state", () => {
     await expect(discover(fixture)).rejects.toThrow();
   });
 
-  it.each(["lock", "facts"] as const)("rejects a hard-linked %s", async (field) => {
+  it.each(["lock", "facts", "pmLock", "pmSelected", "pmMarker", "pmManaged", "pmConfig", "pmProject", "pmLockfile"] as const)("rejects a hard-linked %s", async (field) => {
     const fixture = await makeInstallation();
     await link(fixture[field], join(fixture.root, "alias"));
     await expect(discover(fixture)).rejects.toThrow();
@@ -97,6 +170,23 @@ describe("Hermes PM startup state", () => {
   it("rejects symlinked UUID leases", async () => {
     const fixture = await makeInstallation();
     await symlink(fixture.facts, join(fixture.leases, "a".repeat(32)));
+    await expect(discover(fixture)).rejects.toThrow();
+  });
+
+  it.each(["symlink", "hardlink", "directory", "nonempty", "permissions", "unexpected name"])("rejects unsafe PM lease %s", async (kind) => {
+    const fixture = await makeInstallation();
+    const path = join(fixture.pmLeases, "c".repeat(32));
+    if (kind === "symlink") await symlink(fixture.pmSelected, path);
+    else if (kind === "hardlink") await link(fixture.pmLiveLease, path);
+    else if (kind === "directory") await mkdir(path);
+    else await writeFile(kind === "unexpected name" ? join(fixture.pmLeases, "config.yaml") : path,
+      kind === "nonempty" ? "x" : "", { mode: kind === "permissions" ? 0o644 : 0o600 });
+    await expect(discover(fixture)).rejects.toThrow();
+  });
+
+  it("rejects group-writable PM metadata", async () => {
+    const fixture = await makeInstallation();
+    await chmod(fixture.pmSelected, 0o660);
     await expect(discover(fixture)).rejects.toThrow();
   });
 
@@ -178,22 +268,32 @@ describe("Hermes PM startup state", () => {
     const state = (await discover(fixture))!;
     const rules = hermesPmSandboxRules(state);
     expect(rules).toContain(`(allow file-write-data (literal ${JSON.stringify(fixture.lock)}))`);
+    expect(rules).toContain(`(allow file-write-data (literal ${JSON.stringify(fixture.pmLock)}))`);
     expect(rules).toContain(`(allow file-write-create file-write-data (regex #"`);
     expect(rules).toContain(`(allow file-write-create (literal ${JSON.stringify(fixture.leases)}))`);
     expect(rules).toContain("[0-9a-f]".repeat(32) + '$"');
     expect(rules).not.toMatch(/file-write\*|file-write-unlink|file-link|\{32\}/);
     expect(rules).not.toContain("subpath");
-    const match = /\(regex #"([^"]*)"\)/.exec(rules)!;
     // Pattern-shape checks do not establish native filesystem case behavior.
-    const pattern = new RegExp(match[1]);
-    expect(pattern.test(join(fixture.leases, "a".repeat(32)))).toBe(true);
-    for (const path of [fixture.leases, fixture.lock, fixture.facts, join(fixture.leases, "a".repeat(32), "child"), join(fixture.leases, "a".repeat(32) + ".json"), join(fixture.leases, "A".repeat(32))]) {
-      expect(pattern.test(path)).toBe(false);
+    const patterns = [...rules.matchAll(/\(regex #"([^"]*)"\)/g)].map((match) => new RegExp(match[1]));
+    expect(patterns).toHaveLength(2);
+    for (const leases of [fixture.leases, fixture.pmLeases]) {
+      expect(rules).toContain(`(allow file-write-create (literal ${JSON.stringify(leases)}))`);
+      expect(patterns.some((pattern) => pattern.test(join(leases, "a".repeat(32))))).toBe(true);
+      for (const path of [leases, join(leases, "a".repeat(32), "child"), join(leases, "a".repeat(32) + ".json"), join(leases, "A".repeat(32))]) {
+        expect(patterns.some((pattern) => pattern.test(path))).toBe(false);
+      }
+    }
+    for (const path of [fixture.lock, fixture.facts, fixture.pmLock, fixture.pmSelected, fixture.pmMarker, fixture.pmProject, fixture.pmLockfile, join(fixture.pmRoot, "generations", "5".repeat(32), ".leases", "a".repeat(32))]) {
+      expect(patterns.some((pattern) => pattern.test(path))).toBe(false);
     }
     await expect(revalidateHermesPmState(state)).resolves.toBeUndefined();
     await rm(join(fixture.generation, ".lease-managed"));
     const legacyGeneration = (await discover(fixture))!;
-    expect(hermesPmSandboxRules(legacyGeneration)).toBe(`(allow file-write-data (literal ${JSON.stringify(fixture.lock)}))`);
+    const legacyRules = hermesPmSandboxRules(legacyGeneration);
+    expect(legacyRules).not.toContain(fixture.leases);
+    expect(legacyRules).toContain(`(allow file-write-data (literal ${JSON.stringify(fixture.lock)}))`);
+    expect(legacyRules).toContain(`(allow file-write-data (literal ${JSON.stringify(fixture.pmLock)}))`);
   });
 
   it("rejects forged state tokens", () => {
@@ -214,12 +314,12 @@ describe("Hermes PM startup state", () => {
     expect(plan.wrapper?.args[1]).toContain(`(literal ${JSON.stringify(join(fixture.home, "state.db"))})`);
   });
 
-  it.each(["wrapper", "launcher", "python", "lock", "facts", "generation", "leases"] as const)(
+  it.each(["wrapper", "launcher", "python", "lock", "facts", "generation", "leases", "pmRoot", "pmLock", "pmSelected", "pmGeneration", "pmLeases", "pmMarker", "pmManaged", "pmConfig", "pmPython", "pmProject", "pmLockfile"] as const)(
     "rejects replacement of %s between discovery and launch", async (field) => {
       const fixture = await makeInstallation();
       const state = (await discover(fixture))!;
       await rename(fixture[field], fixture[field] + ".moved");
-      if (field === "generation" || field === "leases") await mkdir(fixture[field]);
+      if (["generation", "leases", "pmRoot", "pmGeneration", "pmLeases"].includes(field)) await mkdir(fixture[field]);
       else await writeFile(fixture[field], "replacement", { mode: 0o600 });
       await expect(revalidateHermesPmState(state)).rejects.toThrow();
     },
@@ -231,6 +331,30 @@ describe("Hermes PM startup state", () => {
     const state = (await discover(fixture))!;
     await symlink(fixture.project, fixture.leases);
     await expect(revalidateHermesPmState(state)).rejects.toThrow();
+  });
+
+  it("permits an absent PM lease directory but rejects a later alias", async () => {
+    const fixture = await makeInstallation();
+    await rm(fixture.pmLeases, { recursive: true });
+    const state = (await discover(fixture))!;
+    expect(hermesPmSandboxRules(state)).toContain(`(allow file-write-create (literal ${JSON.stringify(fixture.pmLeases)}))`);
+    await expect(revalidateHermesPmState(state)).resolves.toBeUndefined();
+    await symlink(fixture.project, fixture.pmLeases);
+    await expect(revalidateHermesPmState(state)).rejects.toThrow();
+  });
+
+  it("rejects PM lease aliases inserted after discovery", async () => {
+    const fixture = await makeInstallation();
+    const state = (await discover(fixture))!;
+    await link(fixture.pmLiveLease, join(fixture.pmLeases, "c".repeat(32)));
+    await expect(revalidateHermesPmState(state)).rejects.toThrow();
+  });
+
+  it("rejects a PM interpreter alias escaping the pinned tool", async () => {
+    const fixture = await makeInstallation();
+    await rm(fixture.pmPython);
+    await symlink(fixture.wrapper, fixture.pmPython);
+    await expect(discover(fixture)).rejects.toThrow();
   });
 
   it("does not grant new lease writes if a legacy generation gains a marker before launch", async () => {
@@ -258,7 +382,10 @@ describe("Hermes PM startup state", () => {
 
   posixIt("holds fixture inodes with real fcntl locks until the observer closes", async () => {
     const fixture = await makeInstallation();
-    const holder = await holdFixtureLocks([fixture.lock, fixture.liveLease]);
+    // Native policy execution may be unavailable inside a nested sandbox.
+    // Still parse the generated probe without executing its unconfined writes.
+    new Script(await readFile(fixture.probe, "utf8"));
+    const holder = await holdFixtureLocks([fixture.lock, fixture.liveLease, fixture.pmLock, fixture.pmLiveLease]);
     try {
       await holder.verify();
     } finally {
@@ -269,14 +396,19 @@ describe("Hermes PM startup state", () => {
   for (const existing of [true, false]) {
     darwinIt(`preserves held PM inodes and confines new leases (lease directory exists: ${existing})`, async (context) => {
       const fixture = await makeInstallation();
-      if (!existing) await rm(fixture.leases, { recursive: true });
+      if (!existing) {
+        await rm(fixture.leases, { recursive: true });
+        await rm(fixture.pmLeases, { recursive: true });
+      }
       const worktree = await open(fixture.project, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
       let holder: Awaited<ReturnType<typeof holdFixtureLocks>> | undefined;
       let managed: Awaited<ReturnType<typeof spawnPosixManagedProcess>> | undefined;
       let output = "";
       let stderr = "";
       try {
-        holder = await holdFixtureLocks(existing ? [fixture.lock, fixture.liveLease] : [fixture.lock]);
+        holder = await holdFixtureLocks(existing
+          ? [fixture.lock, fixture.liveLease, fixture.pmLock, fixture.pmLiveLease]
+          : [fixture.lock, fixture.pmLock]);
         managed = await spawnPosixManagedProcess({
           agentKind: "hermes",
           args: ["acp"],
@@ -300,18 +432,26 @@ describe("Hermes PM startup state", () => {
         await holder.verify();
         expect({ closed, output }, stderr).toEqual({
           closed: { exitCode: 0, signalCode: null },
-          output: `directory,lock-open,lock-retained,lease-open,lease-retained,${existing ? "stale-retained,live-retained" : "no-stale,no-live"},denials,aliases,fork`,
+          output: Array(2).fill(`directory,lock-open,lock-retained,lease-open,lease-retained,${existing ? "stale-retained,live-retained" : "no-stale,no-live"},denials,aliases`).join(",") + ",fork",
         });
         expect((await stat(fixture.newLease)).size).toBe(0);
+        expect((await stat(fixture.pmNewLease)).size).toBe(0);
         if (existing) {
           expect((await stat(fixture.staleLease)).size).toBe(0);
           expect((await stat(fixture.liveLease)).size).toBe(0);
+          expect((await stat(fixture.pmStaleLease)).size).toBe(0);
+          expect((await stat(fixture.pmLiveLease)).size).toBe(0);
         }
-        expect((await lstat(join(fixture.leases, "c".repeat(32)))).isSymbolicLink()).toBe(true);
-        expect((await lstat(join(fixture.leases, "f".repeat(32)))).isDirectory()).toBe(true);
-        expect((await stat(fixture.protectedSibling)).nlink).toBe(1);
-        expect(await readFile(fixture.protectedSibling, "utf8")).toBe("protected-sibling");
+        for (const leases of [fixture.leases, fixture.pmLeases]) {
+          expect((await lstat(join(leases, "c".repeat(32)))).isSymbolicLink()).toBe(true);
+          expect((await lstat(join(leases, "f".repeat(32)))).isDirectory()).toBe(true);
+        }
+        for (const path of [fixture.protectedSibling, fixture.pmProtectedSibling]) {
+          expect((await stat(path)).nlink).toBe(1);
+          expect(await readFile(path, "utf8")).toBe("protected-sibling");
+        }
         expect(await readFile(fixture.facts, "utf8")).toBe(fixture.factsSource);
+        expect(await readFile(fixture.pmSelected, "utf8")).toBe(JSON.stringify({ inputs: fixture.pmInputs, generation: "generations/" + "4".repeat(32) }));
         // The create grant can make future aliases/directories. They cannot write
         // protected targets, and discovery must reject them on the next launch.
         await expect(discover(fixture)).rejects.toThrow();
@@ -357,10 +497,39 @@ async function makeInstallation(homeName = "home") {
   const lock = join(state, ".install.lock");
   const wrapper = join(root, "hermes");
   const probe = join(root, "probe.cjs");
+  const pmRoot = join(state, "pm-runtime");
+  const pmLock = join(pmRoot, ".prepare.lock");
+  const pmSelected = join(pmRoot, "selected.json");
+  const pmGeneration = join(pmRoot, "generations", "4".repeat(32));
+  const pmMarker = join(pmGeneration, "pm-runtime.json");
+  const pmManaged = join(pmGeneration, ".lease-managed");
+  const pmConfig = join(pmGeneration, "pyvenv.cfg");
+  const pmPython = join(pmGeneration, "bin/python");
+  const pmLeases = join(pmGeneration, ".leases");
+  const pmLiveLease = join(pmLeases, "b".repeat(32));
+  const pmStaleLease = join(pmLeases, "2".repeat(32));
+  const pmNewLease = join(pmLeases, "a".repeat(32));
+  const pmProtectedSibling = join(pmGeneration, "protected-sibling");
+  const pmProject = join(install, "pm/pyproject.toml");
+  const pmLockfile = join(install, "pm/uv.lock");
+  const pmProjectSource = '[project]\nname = "hermes-pm"\n';
+  const pmLockfileSource = 'version = 1\n';
+  const pmInputs = createHash("sha256").update(pmProjectSource).update("\0").update(pmLockfileSource).update("\0").update(python).digest("hex");
   const factsSource = JSON.stringify({ schema: 1, packages: { venv: { environment: join(generation, "venv") } } });
-  for (const directory of [project, join(install, ".hermes/bin"), join(home, "tools/python-test/bin"), leases, join(generation, "venv")]) {
+  for (const directory of [project, join(install, ".hermes/bin"), join(home, "tools/python-test/bin"), leases, join(generation, "venv"), join(install, "pm"), pmLeases, join(pmGeneration, "bin")]) {
     await mkdir(directory, { recursive: true });
   }
+  await writeFile(pmLock, "", { mode: 0o644 });
+  await writeFile(pmProject, pmProjectSource);
+  await writeFile(pmLockfile, pmLockfileSource);
+  await writeFile(pmSelected, JSON.stringify({ inputs: pmInputs, generation: "generations/" + "4".repeat(32) }));
+  await writeFile(pmMarker, JSON.stringify({ inputs: pmInputs }));
+  await writeFile(pmManaged, "");
+  await writeFile(pmConfig, "home = ignored\n");
+  await symlink(python, pmPython);
+  await writeFile(pmLiveLease, "", { mode: 0o600 });
+  await writeFile(pmStaleLease, "", { mode: 0o600 });
+  await writeFile(pmProtectedSibling, "protected-sibling", { mode: 0o600 });
   await writeFile(lock, "", { mode: 0o600 });
   await writeFile(facts, factsSource, { mode: 0o600 });
   await writeFile(join(generation, ".lease-managed"), "");
@@ -380,18 +549,22 @@ async function makeInstallation(homeName = "home") {
     join(leases, "a".repeat(32) + "\n"), join(leases, "a".repeat(32) + "\r"),
     join(leases, "a".repeat(33)), join(leases, "G".repeat(32)), protectedSibling,
     join(state, "environments", "3".repeat(32), ".leases", "4".repeat(32)),
+    pmSelected, pmMarker, pmManaged, pmConfig, pmProject, pmLockfile, pmProtectedSibling,
+    pmPython, join(pmGeneration, "code.py"), join(pmGeneration, "bin/code.py"),
+    join(pmRoot, "publication.json"), join(pmRoot, ".prepare.lock-other"),
+    join(pmRoot, "generations", "5".repeat(32), ".leases", "a".repeat(32)),
+    join(pmLeases, "config.yaml"), join(pmLeases, "a".repeat(32) + ".json"),
+    join(pmLeases, "a".repeat(32) + "\n"), join(pmLeases, "a".repeat(32) + "\r"),
+    join(pmLeases, "a".repeat(33)), join(pmLeases, "G".repeat(32)),
     join(project, "write"), join(root, "claims", "a".repeat(64)),
   ];
   await mkdir(join(root, "claims"));
   await mkdir(join(state, "environments", "3".repeat(32), ".leases"), { recursive: true });
+  await mkdir(join(pmRoot, "generations", "5".repeat(32), ".leases"), { recursive: true });
   await writeFile(probe, `
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const out = [];
-const lock = ${JSON.stringify(lock)};
-const lease = ${JSON.stringify(newLease)};
-const live = ${JSON.stringify(liveLease)};
-const stale = ${JSON.stringify(staleLease)};
 function denied(label, operation) {
   try { operation(); } catch (e) {
     if (e.code === 'EPERM') return;
@@ -400,62 +573,69 @@ function denied(label, operation) {
   throw new Error(label + ' unexpectedly allowed');
 }
 try {
-  try { fs.mkdirSync(${JSON.stringify(leases)}); } catch (e) { if (e.code !== 'EEXIST') throw e; }
-  out.push('directory');
-  fs.closeSync(fs.openSync(lock, fs.constants.O_CREAT | fs.constants.O_RDWR, 0o600));
-  out.push('lock-open');
-  denied('lock unlink', () => fs.unlinkSync(lock));
-  denied('lock delete', () => fs.rmSync(lock));
-  denied('lock rename', () => fs.renameSync(lock, ${JSON.stringify(join(state, "moved-lock"))}));
-  out.push('lock-retained');
-  fs.closeSync(fs.openSync(lease, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR, 0o600));
-  fs.closeSync(fs.openSync(lease, 'r+'));
-  out.push('lease-open');
-  // Exercise an existing uppercase alias only when this filesystem proves identity.
-  const uppercase = ${JSON.stringify(join(leases, "A".repeat(32)))};
-  if (fs.existsSync(uppercase)) {
-    const lowerIdentity = fs.statSync(lease, { bigint: true });
-    const upperIdentity = fs.statSync(uppercase, { bigint: true });
-    if (upperIdentity.dev === lowerIdentity.dev && upperIdentity.ino === lowerIdentity.ino) {
-      const fd = fs.openSync(uppercase, 'r+');
-      try {
-        const opened = fs.fstatSync(fd, { bigint: true });
-        if (opened.dev !== lowerIdentity.dev || opened.ino !== lowerIdentity.ino) throw new Error('uppercase alias identity changed');
-      } finally { fs.closeSync(fd); }
-      denied('uppercase alias unlink', () => fs.unlinkSync(uppercase));
+  // Both parents must exist before the cross-family denial checks below.
+  for (const leases of ${JSON.stringify([leases, pmLeases])}) {
+    try { fs.mkdirSync(leases); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+  }
+  for (const { lock, lease, live, stale, leases, state, protectedSibling } of ${JSON.stringify([
+    { lock, lease: newLease, live: liveLease, stale: staleLease, leases, state, protectedSibling },
+    { lock: pmLock, lease: pmNewLease, live: pmLiveLease, stale: pmStaleLease, leases: pmLeases, state: pmRoot, protectedSibling: pmProtectedSibling },
+  ])}) {
+    out.push('directory');
+    fs.closeSync(fs.openSync(lock, 'a+'));
+    out.push('lock-open');
+    denied('lock unlink', () => fs.unlinkSync(lock));
+    denied('lock delete', () => fs.rmSync(lock));
+    denied('lock rename', () => fs.renameSync(lock, state + '/moved-lock'));
+    out.push('lock-retained');
+    fs.closeSync(fs.openSync(lease, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR, 0o600));
+    fs.closeSync(fs.openSync(lease, 'r+'));
+    out.push('lease-open');
+    // Exercise an existing uppercase alias only when this filesystem proves identity.
+    const uppercase = leases + '/' + 'A'.repeat(32);
+    if (fs.existsSync(uppercase)) {
+      const lowerIdentity = fs.statSync(lease, { bigint: true });
+      const upperIdentity = fs.statSync(uppercase, { bigint: true });
+      if (upperIdentity.dev === lowerIdentity.dev && upperIdentity.ino === lowerIdentity.ino) {
+        const fd = fs.openSync(uppercase, 'r+');
+        try {
+          const opened = fs.fstatSync(fd, { bigint: true });
+          if (opened.dev !== lowerIdentity.dev || opened.ino !== lowerIdentity.ino) throw new Error('uppercase alias identity changed');
+        } finally { fs.closeSync(fd); }
+        denied('uppercase alias unlink', () => fs.unlinkSync(uppercase));
+      }
     }
+    denied('lease release', () => fs.unlinkSync(lease));
+    denied('lease rename', () => fs.renameSync(lease, leases + '/' + '0'.repeat(32)));
+    denied('lock replacement', () => fs.renameSync(lease, lock));
+    out.push('lease-retained');
+    if (fs.existsSync(stale)) {
+      fs.closeSync(fs.openSync(stale, 'r+'));
+      denied('stale prune', () => fs.unlinkSync(stale));
+      out.push('stale-retained');
+    } else out.push('no-stale');
+    if (fs.existsSync(live)) {
+      fs.closeSync(fs.openSync(live, 'r+'));
+      denied('live lease unlink', () => fs.unlinkSync(live));
+      denied('live lease delete', () => fs.rmSync(live));
+      denied('live lease rename', () => fs.renameSync(live, leases + '/' + '1'.repeat(32)));
+      denied('live lease replacement', () => fs.renameSync(lease, live));
+      out.push('live-retained');
+    } else out.push('no-live');
+    for (const [index, p] of ${JSON.stringify(denied)}.entries()) {
+      denied('protected write [' + index + ']', () => fs.closeSync(fs.openSync(p, 'a')));
+    }
+    out.push('denials');
+    const alias = leases + '/' + 'c'.repeat(32);
+    fs.symlinkSync(protectedSibling, alias);
+    denied('symlink target write', () => fs.closeSync(fs.openSync(alias, 'a')));
+    denied('hardlink', () => fs.linkSync(protectedSibling, leases + '/' + 'd'.repeat(32)));
+    denied('sibling rename', () => fs.renameSync(protectedSibling, leases + '/' + 'e'.repeat(32)));
+    const directory = leases + '/' + 'f'.repeat(32);
+    fs.mkdirSync(directory);
+    denied('UUID directory descendant', () => fs.closeSync(fs.openSync(directory + '/child', 'a')));
+    out.push('aliases');
   }
-  denied('lease release', () => fs.unlinkSync(lease));
-  denied('lease rename', () => fs.renameSync(lease, ${JSON.stringify(join(leases, "0".repeat(32)))}));
-  denied('lock replacement', () => fs.renameSync(lease, lock));
-  out.push('lease-retained');
-  if (fs.existsSync(stale)) {
-    fs.closeSync(fs.openSync(stale, 'r+'));
-    denied('stale prune', () => fs.unlinkSync(stale));
-    out.push('stale-retained');
-  } else out.push('no-stale');
-  if (fs.existsSync(live)) {
-    fs.closeSync(fs.openSync(live, 'r+'));
-    denied('live lease unlink', () => fs.unlinkSync(live));
-    denied('live lease delete', () => fs.rmSync(live));
-    denied('live lease rename', () => fs.renameSync(live, ${JSON.stringify(join(leases, "1".repeat(32)))}));
-    denied('live lease replacement', () => fs.renameSync(lease, live));
-    out.push('live-retained');
-  } else out.push('no-live');
-  for (const [index, p] of ${JSON.stringify(denied)}.entries()) {
-    denied('protected write [' + index + ']', () => fs.closeSync(fs.openSync(p, 'a')));
-  }
-  out.push('denials');
-  const protectedSibling = ${JSON.stringify(protectedSibling)};
-  const alias = ${JSON.stringify(join(leases, "c".repeat(32)))};
-  fs.symlinkSync(protectedSibling, alias);
-  denied('symlink target write', () => fs.closeSync(fs.openSync(alias, 'a')));
-  denied('hardlink', () => fs.linkSync(protectedSibling, ${JSON.stringify(join(leases, "d".repeat(32)))}));
-  denied('sibling rename', () => fs.renameSync(protectedSibling, ${JSON.stringify(join(leases, "e".repeat(32)))}));
-  const directory = ${JSON.stringify(join(leases, "f".repeat(32)))};
-  fs.mkdirSync(directory);
-  denied('UUID directory descendant', () => fs.closeSync(fs.openSync(directory + '/child', 'a')));
-  out.push('aliases');
   if (spawnSync('/usr/bin/true').error?.code !== 'EPERM') throw new Error('fork unexpectedly allowed');
   out.push('fork');
   process.stdout.write(out.join(','));
@@ -464,7 +644,8 @@ try {
   process.exitCode = 82;
 }
 `);
-  return { root, project, home, install, launcher, python, wrapper, state, generation, leases, facts, factsSource, lock, liveLease, staleLease, newLease, protectedSibling };
+  return { root, project, home, install, launcher, python, wrapper, probe, state, generation, leases, facts, factsSource, lock, liveLease, staleLease, newLease, protectedSibling,
+    pmRoot, pmLock, pmSelected, pmGeneration, pmMarker, pmManaged, pmConfig, pmPython, pmLeases, pmLiveLease, pmStaleLease, pmNewLease, pmProtectedSibling, pmProject, pmLockfile, pmInputs };
 }
 
 function shellQuote(value: string): string {

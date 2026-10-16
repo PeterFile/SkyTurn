@@ -12,7 +12,7 @@ const brand: unique symbol = Symbol("HermesPmState");
 // variables cannot supply additional writable paths.
 export interface HermesPmState { readonly [brand]: true }
 interface Snapshot { path: string; identity: string | null; digest?: string; target?: string }
-interface State { snapshots: Snapshot[]; leases?: string; rules: string }
+interface State { snapshots: Snapshot[]; leases: string[]; rules: string }
 const states = new WeakMap<HermesPmState, State>();
 
 export async function resolveHermesPmState(input: {
@@ -96,24 +96,60 @@ export async function resolveHermesPmState(input: {
       await capture(path, true, snapshots, project);
     }
     await capture(join(environment, "pyvenv.cfg"), false, snapshots, project, { readContents: false });
-    const managed = await capture(join(generation, ".lease-managed"), false, snapshots, project, { optional: true, readContents: false });
-    const leases = managed === undefined ? undefined : join(generation, ".leases");
-    if (leases) {
-      await capture(leases, true, snapshots, project, { optional: true });
-      await validateLeases(leases);
+
+    // Match pm.runtime._inputs: locked PM sources, each NUL-delimited, followed
+    // by the pinned interpreter's canonical directory and as-launched basename.
+    const pmSource = join(install, "pm");
+    await capture(pmSource, true, snapshots, project);
+    const inputs = createHash("sha256");
+    for (const name of ["pyproject.toml", "uv.lock"]) {
+      inputs.update((await capture(join(pmSource, name), false, snapshots, project))!).update("\0");
+    }
+    const expectedInputs = inputs.update(python).digest("hex");
+    const pmRoot = join(stateRoot, "pm-runtime");
+    await capture(pmRoot, true, snapshots, project);
+    const prepareLock = join(pmRoot, ".prepare.lock");
+    await capture(prepareLock, false, snapshots, project, { readContents: false });
+    const selected = parseMetadata(await capture(join(pmRoot, "selected.json"), false, snapshots, project));
+    if (selected?.inputs !== expectedInputs || typeof selected?.generation !== "string" ||
+      !/^generations\/[0-9a-f]{32}$/.test(selected.generation)) throw new Error(failure);
+    const pmGeneration = join(pmRoot, selected.generation);
+    for (const path of [dirname(pmGeneration), pmGeneration, join(pmGeneration, "bin")]) {
+      await capture(path, true, snapshots, project);
+    }
+    const marker = parseMetadata(await capture(join(pmGeneration, "pm-runtime.json"), false, snapshots, project));
+    if (marker?.inputs !== expectedInputs) throw new Error(failure);
+    await capture(join(pmGeneration, "pyvenv.cfg"), false, snapshots, project, { readContents: false });
+    const pmPython = join(pmGeneration, "bin/python");
+    if (await realpath(pmPython) !== canonicalPython) throw new Error(failure);
+    await captureAlias(pmPython, canonicalPython, snapshots, project);
+
+    const leases: string[] = [];
+    for (const directory of [generation, pmGeneration]) {
+      const managed = await capture(join(directory, ".lease-managed"), false, snapshots, project, {
+        optional: directory === generation, readContents: false,
+      });
+      if (managed !== undefined) {
+        const path = join(directory, ".leases");
+        await capture(path, true, snapshots, project, { optional: true });
+        await validateLeases(path);
+        leases.push(path);
+      }
     }
 
     // SBPL does not implement counted repetition. Keep this exact-width family
     // explicit; successful JavaScript RegExp matching is not native policy proof.
-    const leasePattern = leases ? `^${escapeRegex(leases)}/${"[0-9a-f]".repeat(32)}$` : undefined;
+    const leaseRules = leases.map((path) => {
+      const pattern = `^${escapeRegex(path)}/${"[0-9a-f]".repeat(32)}$`;
+      return ` (allow file-write-create file-write-data (regex #"${pattern}"))` +
+        ` (allow file-write-create (literal ${JSON.stringify(path)}))`;
+    }).join("");
     // SBPL #"..." is a regex literal, not a JSON/Scheme string: preserve regex
     // backslashes (as in macOS's shipped profiles). The install path above excludes
     // quotes, backslashes and controls, so this cannot terminate the literal.
     // Never authorize unlink/rename: removing a peer's held lock or live lease
     // would break PM lifetime protection. Upstream lease cleanup is best-effort.
-    const rules = `(allow file-write-data (literal ${JSON.stringify(lock)}))${leasePattern
-      ? ` (allow file-write-create file-write-data (regex #"${leasePattern}"))` : ""}${leases
-      ? ` (allow file-write-create (literal ${JSON.stringify(leases)}))` : ""}`;
+    const rules = [lock, prepareLock].map((path) => `(allow file-write-data (literal ${JSON.stringify(path)}))`).join(" ") + leaseRules;
     const token: HermesPmState = Object.freeze({ [brand]: true as const });
     states.set(token, { snapshots, leases, rules });
     return token;
@@ -151,7 +187,7 @@ export async function revalidateHermesPmState(state: HermesPmState): Promise<voi
         throw new Error(failure);
       }
     }
-    if (validated.leases) await validateLeases(validated.leases);
+    for (const path of validated.leases) await validateLeases(path);
   } catch { throw new Error(failure); }
 }
 
@@ -214,7 +250,8 @@ async function boundedRead(path: string): Promise<string> {
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     if (BigInt(bytesRead) !== before.size || identity(before) !== identity(await handle.stat({ bigint: true })) ||
       identity(before) !== identity(await lstat(path, { bigint: true }))) throw new Error(failure);
-    return new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, bytesRead));
+    // Preserve a BOM in hashes of PM input files; Python hashes their exact bytes.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, bytesRead));
   } finally { await handle.close(); }
 }
 
@@ -245,6 +282,13 @@ function execWords(source: string): string[] | undefined {
 }
 
 function parseFacts(source: string | undefined): { packages: { venv: { environment: string } } } {
+  // Facts use utf-8-sig upstream; PM selected/marker metadata use plain utf-8.
+  const result = parseMetadata(source?.replace(/^\uFEFF/, ""));
+  if (result?.schema !== 1 || typeof result?.packages?.venv?.environment !== "string") throw new Error(failure);
+  return result;
+}
+
+function parseMetadata(source: string | undefined) {
   if (!source) throw new Error(failure);
   const result = JSON.parse(source);
   // JSON.parse accepts duplicate members; reject them, including escaped aliases,
@@ -266,7 +310,6 @@ function parseFacts(source: string | undefined): { packages: { venv: { environme
       }
     }
   }
-  if (result?.schema !== 1 || typeof result?.packages?.venv?.environment !== "string") throw new Error(failure);
   return result;
 }
 
