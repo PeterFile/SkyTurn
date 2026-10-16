@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import type { AgentRunSandbox } from "@skyturn/project-core";
 import { buildFdAnchoredCliLaunchPlan } from "./fdAnchoredCliLaunch.js";
+import { resolveHermesPmState, revalidateHermesPmState } from "./hermesPmState.js";
 
 const capabilityError = "POSIX managed process owner is unavailable.";
 const maxProtocolChars = 4_096;
@@ -46,7 +47,10 @@ export async function spawnPosixManagedProcess(
   if (input.platform === "win32") throw new Error(capabilityError);
   const ownerPath = fileURLToPath(new URL("../native/posix-process-owner", import.meta.url));
   const hermesStateRoot = await resolveHermesStateRoot(input);
-  const launch = buildFdAnchoredCliLaunchPlan({ ...input, hermesStateRoot });
+  const hermesPmState = hermesStateRoot && input.sandbox === "read-only"
+    ? await resolveHermesPmState({ ...input, hermesStateRoot }) : undefined;
+  if (hermesPmState) await revalidateHermesPmState(hermesPmState);
+  const launch = buildFdAnchoredCliLaunchPlan({ ...input, hermesStateRoot, hermesPmState });
   const targetArgs = launch.wrapper
     ? [launch.wrapper.executablePath, ...launch.wrapper.args, launch.fdLaunchPath, ...launch.fdLaunchArgs]
     : [launch.fdLaunchPath, ...launch.fdLaunchArgs];
