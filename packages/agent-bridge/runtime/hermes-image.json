@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "image": "docker.io/nousresearch/hermes-agent@sha256:a11574b7fe8e1631d7d88d556677dac693bc058abf558cdeb899155688c1bf05",
+  "imageId": "sha256:02e7aa0e84123fa0e9b22686e7a2bfb7d85fd59821d4d28812a3e07f3061cf41",
+  "platform": { "os": "linux", "architecture": "amd64" },
+  "volumes": ["/opt/data"],
+  "entrypoint": ["/opt/hermes/docker/entrypoint-dispatch.sh"],
+  "labels": {},
+  "user": "root",
+  "workingDirectory": "/opt/hermes"
+}

@@ -29,7 +29,8 @@
     "native:copy": "node scripts/buildArtifactGate.mjs --copy-dist",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "pnpm run native:build && vitest run src && node --test scripts/boundedFileReader.test.mjs",
+    "test": "pnpm run native:build && vitest run src && node --test scripts/boundedFileReader.test.mjs scripts/prepareHermesRuntimeImage.test.mjs",
+    "hermes:image:prepare": "node scripts/prepareHermesRuntimeImage.mjs",
     "test:windows": "node scripts/windowsProcessTreeIntegration.mjs"
   },
   "dependencies": {
