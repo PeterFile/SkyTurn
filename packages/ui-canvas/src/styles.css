@@ -3,6 +3,7 @@
 @import "diff2html/bundles/css/diff2html.min.css";
 @import "./ReassignAgentPicker.css";
 @import "./RunArtifacts.css";
+@import "./RecentTaskReuse.css";
 
 :root {
   color: var(--sk-text-legacy);

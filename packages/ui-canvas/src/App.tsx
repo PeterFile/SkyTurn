@@ -20,6 +20,7 @@ import {
   type NodeTypes,
 } from "@xyflow/react";
 import { composerDraftStore, draftScopeKey, useComposerDraft } from "./composerDrafts.js";
+import { RecentTaskReuse, type RecentTaskReuseProps } from "./RecentTaskReuse.js";
 import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
 import {
@@ -399,6 +400,12 @@ export function newSessionSubmissionScope(
     target.selectedBranch,
     target.executionTarget === "new_worktree" ? target.baseRef : null,
   ]);
+}
+
+function hasPendingNewSessionSubmission(
+  states: ReadonlyMap<string, NewSessionSubmissionState>, projectId: string | null, mode: WorkflowMode,
+): boolean {
+  return [...states.values()].some((attempt) => attempt.busy && attempt.session.projectId === projectId && attempt.session.mode === mode);
 }
 
 export function upsertCanvasSession(
@@ -1133,6 +1140,12 @@ export default function App() {
   );
   const composerAction = selectedNodeActionScopeKey ? composerActions.get(selectedNodeActionScopeKey) ?? null : null;
   const newTaskDraft = useComposerDraft(draftScopeKey(resolvedNewTaskProjectId ? ["new", resolvedNewTaskProjectId, newTaskMode] : null));
+  const newTaskReuseDraft = { projectId: resolvedNewTaskProjectId, mode: newTaskMode, snapshot: newTaskDraft.capture() };
+  const newTaskReuseDraftRef = useRef<typeof newTaskReuseDraft | null>(null);
+  useLayoutEffect(() => {
+    newTaskReuseDraftRef.current = newTaskReuseDraft;
+    return () => { newTaskReuseDraftRef.current = null; };
+  });
   const bottomDraft = useComposerDraft(draftScopeKey(activeProject && activeSession?.kind === "canvas"
     ? ["followup", activeProject.id, activeSession.id] : null));
   const nodeDraft = useComposerDraft(draftScopeKey(activeProject && activeSession?.kind === "canvas" && selectedNode && composerAction
@@ -1777,6 +1790,24 @@ export default function App() {
       activeProjectId: resolvedProjectId,
       activeSessionId: null,
     }));
+  }
+
+  function reuseRecentTaskGoal(goal: string) {
+    const { projectId, mode, snapshot } = newTaskReuseDraft;
+    if (newTaskReuseDraftRef.current !== newTaskReuseDraft || !projectId) return;
+    const current = workspaceRef.current;
+    if (!current.projects.some((project) => project.id === projectId) ||
+      !current.sessions.some((session) => session.kind === "canvas" && session.projectId === projectId && session.goal === goal) ||
+      hasPendingNewSessionSubmission(newSessionSubmissionsRef.current, projectId, mode)) return;
+    const key = draftScopeKey(["new", projectId, mode]);
+    if (!composerDraftStore.reuseSessionGoal(key, snapshot, goal)) return;
+    const normalizedGoal = goal.trim();
+    for (const [scope, attempt] of newSessionSubmissionsRef.current) {
+      if (!attempt.busy && attempt.session.projectId === projectId && attempt.session.mode === mode && attempt.session.goal.trim() === normalizedGoal) {
+        newSessionSubmissionsRef.current.delete(scope);
+      }
+    }
+    refreshNewSessionState();
   }
 
   async function addSessionFromComposer(target: SessionTarget) {
@@ -2774,6 +2805,10 @@ export default function App() {
               onModeChange={setNewTaskMode}
               onProjectChange={setNewTaskProjectId}
               submissionStates={newSessionSubmissionsRef.current}
+              recentTaskReuse={{ sessions: workspace.sessions, projectId: resolvedNewTaskProjectId, mode: newTaskMode,
+                draft: newTaskGoal, draftVersion: newTaskReuseDraft.snapshot.version,
+                busy: hasPendingNewSessionSubmission(newSessionSubmissionsRef.current, resolvedNewTaskProjectId, newTaskMode),
+                onUseGoal: reuseRecentTaskGoal }}
               onCreate={addSessionFromComposer}
             />
           )}
@@ -3062,6 +3097,7 @@ function ProjectStartPage({
   onModeChange,
   onProjectChange,
   submissionStates,
+  recentTaskReuse,
   onCreate,
 }: {
   goal: string;
@@ -3072,6 +3108,7 @@ function ProjectStartPage({
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
   submissionStates: Map<string, NewSessionSubmissionState>;
+  recentTaskReuse: RecentTaskReuseProps;
   onCreate: (target: SessionTarget) => Promise<void>;
 }) {
   return (
@@ -3089,6 +3126,7 @@ function ProjectStartPage({
           onModeChange={onModeChange}
           onProjectChange={onProjectChange}
           submissionStates={submissionStates}
+          recentTaskReuse={recentTaskReuse}
           onCreate={onCreate}
         />
       </div>
@@ -3237,6 +3275,7 @@ function SessionComposer({
   onModeChange,
   onProjectChange,
   submissionStates,
+  recentTaskReuse,
   onClose,
   onCreate,
 }: {
@@ -3250,6 +3289,7 @@ function SessionComposer({
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
   submissionStates: Map<string, NewSessionSubmissionState>;
+  recentTaskReuse: RecentTaskReuseProps;
   onClose?: () => void;
   onCreate: (target: SessionTarget) => Promise<void>;
 }) {
@@ -3373,6 +3413,7 @@ function SessionComposer({
           aria-label="New task goal"
           rows={5}
         />
+        <RecentTaskReuse {...recentTaskReuse} />
       </div>
       <div className="control-strip">
         <div className="control-strip-row">

@@ -104,6 +104,12 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
   function clearCaptured(snapshot: ComposerDraftSnapshot) {
     return !!snapshot.key && drafts.get(snapshot.key) === snapshot && drafts.delete(snapshot.key);
   }
+  function writeDraft(key: string, text: string) {
+    // Object identity is the final clear gate, even if a persisted counter reaches its bound.
+    version = version < Number.MAX_SAFE_INTEGER ? version + 1 : 1;
+    drafts.set(key, Object.freeze({ key, text, version }));
+    save();
+  }
   function attempt<T extends Retry>(snapshot: ComposerDraftSnapshot, entry: T) {
     if (!retries.has(entry.key)) retries.set(entry.key, entry);
     save();
@@ -120,10 +126,18 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
     edit(key: string | null, text: string) {
       load();
       if (!key || !scopeFromKey(key)) return;
-      // Object identity is the final clear gate, even if a persisted counter reaches its bound.
-      version = version < Number.MAX_SAFE_INTEGER ? version + 1 : 1;
-      drafts.set(key, Object.freeze({ key, text, version }));
-      save();
+      writeDraft(key, text);
+    },
+    reuseSessionGoal(key: string | null, snapshot: ComposerDraftSnapshot, text: string) {
+      load();
+      const goal = text.trim();
+      if (!key || scopeFromKey(key)?.[0] !== "new" || !goal || (drafts.get(key) ?? EMPTY) !== snapshot) return false;
+      for (const retryKey of retries.keys()) {
+        const [kind, scope, retryGoal] = JSON.parse(retryKey);
+        if (kind === "session" && scope === key && retryGoal === goal) retries.delete(retryKey);
+      }
+      writeDraft(key, text);
+      return true;
     },
     clear(snapshot: ComposerDraftSnapshot) { load(); if (clearCaptured(snapshot)) save(); },
     inputAttempt(snapshot: ComposerDraftSnapshot, createInputId: () => string) {
