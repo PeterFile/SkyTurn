@@ -359,6 +359,36 @@
       "height": 200,
       "color": "5",
       "text": "Task: Project file snapshot contract\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: Registered artifact viewing\nEvidence: none\nRisk: Strict descriptor reads and immutable retry/reopen; no new composer UI in this slice"
+    },
+    {
+      "id": "73b53ccdf59486dd",
+      "type": "text",
+      "x": 680,
+      "y": 1460,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Filter Changes preview by file path\nState: Verify\nOwner: Codex\nDepends: none\nEvidence: Changes path filter focused regressions\nRisk: Changes filter final acceptance pending"
+    },
+    {
+      "id": "38d91c2187ddd0fa",
+      "type": "text",
+      "x": 40,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Changes path filter focused regressions\ncommit: none\ntest: Focused UI tests: 328 passed; final direct filter regressions: 27 passed; ui-canvas typecheck and git diff --check passed. Real Electron and exact-head CI pending.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261018/changes-filter-focused.log"
+    },
+    {
+      "id": "5543d65d0382da2c",
+      "type": "text",
+      "x": 900,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Changes filter final acceptance pending\nImpact: Focused tests do not establish production Electron rendering and Git-backed review.\nMitigation: Run production Electron with explicit synthetic terminal fixtures and real Git diffs; verify exact-head CI.\nStatus: Open"
     }
   ],
   "edges": [
@@ -559,6 +589,22 @@
       "toEnd": "arrow",
       "label": "depends",
       "color": "6"
+    },
+    {
+      "id": "27f12c1f1e254133",
+      "fromNode": "73b53ccdf59486dd",
+      "toNode": "38d91c2187ddd0fa",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "6a27a42987bf3dd8",
+      "fromNode": "5543d65d0382da2c",
+      "toNode": "73b53ccdf59486dd",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
     }
   ]
 }

@@ -1146,6 +1146,36 @@ h2 {
   color: var(--sk-diff-removed-text);
 }
 
+.changes-file-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.changes-file-filter label {
+  display: flex;
+  flex: 1 1 220px;
+  align-items: center;
+  gap: 8px;
+}
+
+.changes-file-filter input {
+  min-width: 0;
+  width: 100%;
+  min-height: 30px;
+  border: 1px solid var(--sk-border);
+  border-radius: var(--sk-radius-sm);
+  background: var(--sk-white);
+  color: inherit;
+  padding: 4px 8px;
+}
+
+.changes-file-filter small {
+  flex-basis: 100%;
+}
+
 .changes-toolbar {
   position: relative;
   display: flex;
