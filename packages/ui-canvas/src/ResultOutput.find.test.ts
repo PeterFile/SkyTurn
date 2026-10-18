@@ -216,7 +216,9 @@ describe("ResultOutput Find", () => {
 
   it("memoizes search across navigation, copy and status renders, and renders only the active match at the cap", () => {
     const search = vi.spyOn(outputFind, "findOutputMatches");
-    node = { ...node, output: ["x".repeat(2_000_000)] }; render(); click("Find"); query("x");
+    // Keep the large search fixture in Raw to avoid unrelated Markdown parsing.
+    click("Find");
+    node = { ...node, output: ["x".repeat(2_000_000)] }; render(); query("x");
     const calls = search.mock.calls.length;
     expect(render()).toContain("1 of 1000 matches (capped; first 1000 only)");
     expect(mark()).toHaveLength(1); expect(rawText()).toBe(node.output[0]);
