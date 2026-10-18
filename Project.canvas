@@ -359,6 +359,36 @@
       "height": 200,
       "color": "5",
       "text": "Task: Project file snapshot contract\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: Registered artifact viewing\nEvidence: none\nRisk: Strict descriptor reads and immutable retry/reopen; no new composer UI in this slice"
+    },
+    {
+      "id": "951cf72093aa88bc",
+      "type": "text",
+      "x": 680,
+      "y": 1460,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Draft Repair from registered artifact feedback\nState: Verify\nOwner: Codex\nDepends: none\nEvidence: Artifact Repair focused regression gate\nRisk: Artifact Repair final acceptance pending"
+    },
+    {
+      "id": "3136ea44b111ceaf",
+      "type": "text",
+      "x": 40,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Artifact Repair focused regression gate\ncommit: none\ntest: Focused UI regressions: 369 tests passed; ui-canvas typecheck passed; git diff --check passed. Real Electron and exact-head CI still pending.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261018/artifact-repair-focused.log"
+    },
+    {
+      "id": "24d48f59ef89c6f3",
+      "type": "text",
+      "x": 900,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Artifact Repair final acceptance pending\nImpact: Focused tests do not establish real Electron interaction or exact-head CI.\nMitigation: Run production Electron with clearly labeled synthetic terminal fixtures, inspect screenshots, and complete exact-head CI before delivery.\nStatus: Open"
     }
   ],
   "edges": [
@@ -559,6 +589,22 @@
       "toEnd": "arrow",
       "label": "depends",
       "color": "6"
+    },
+    {
+      "id": "c891ac5d1e661639",
+      "fromNode": "951cf72093aa88bc",
+      "toNode": "3136ea44b111ceaf",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "26b98886f8496c45",
+      "fromNode": "24d48f59ef89c6f3",
+      "toNode": "951cf72093aa88bc",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
     }
   ]
 }

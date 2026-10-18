@@ -118,3 +118,31 @@
   text-align: center;
   border: 1px dashed var(--border-error, #d32f2f);
 }
+
+.artifact-feedback {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.artifact-feedback textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+}
+
+.artifact-feedback-append {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.artifact-feedback button {
+  justify-self: start;
+}
+
+.artifact-feedback [role="alert"] {
+  margin: 0;
+  color: var(--text-error, #d32f2f);
+}
