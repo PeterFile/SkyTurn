@@ -112,6 +112,7 @@ export type ArtifactViewState = {
   result: ArtifactViewResult | null;
   loading: boolean;
   imageError: boolean;
+  imageLoaded: boolean;
   feedback: string;
   append: boolean;
   drafting: boolean;
@@ -123,54 +124,85 @@ const viewScope = (props: ArtifactViewProps) => JSON.stringify([
 ]);
 
 export function createArtifactViewController(read: () => ArtifactViewProps, changed: () => void) {
-  let state: ArtifactViewState = { result: null, loading: true, imageError: false, feedback: "", append: false, drafting: false, draftError: null };
+  let state: ArtifactViewState = { result: null, loading: true, imageError: false, imageLoaded: false, feedback: "", append: false, drafting: false, draftError: null };
   let mountToken = 0;
   let mountedScope: string | null = null;
-  let feedbackRevision = 0;
-  const current = (token: number, scope: string) => token === mountToken && mountedScope === scope &&
+  let requestRevision = 0;
+  const scopeCurrent = (token: number, scope: string) => token === mountToken && mountedScope === scope &&
     viewScope(read()) === scope && read().isCurrent?.() !== false;
+  const previewReady = () => state.result?.ok === true && !state.imageError &&
+    (state.result.content.mimeType === "text/plain" || state.imageLoaded);
+  const invalidatedMessage = () => state.imageError
+    ? "Image decode failed. Feedback retained; reopen the preview before retrying Draft Repair."
+    : "Feedback or append consent changed. Review the current feedback and retry Draft Repair.";
+  function setImageError(value: boolean) {
+    if (state.imageError !== value) {
+      requestRevision++;
+      state = { ...state, imageError: value, imageLoaded: false };
+      changed();
+    }
+  }
 
   return {
     get state() { return state; },
-    setFeedback(feedback: string) { feedbackRevision++; state = { ...state, feedback }; changed(); },
-    setAppend(append: boolean) { state = { ...state, append }; changed(); },
+    get canDraftRepair() { return previewReady() && !state.drafting && !!state.feedback.trim(); },
+    setFeedback(feedback: string) { requestRevision++; state = { ...state, feedback }; changed(); },
+    setAppend(append: boolean) { requestRevision++; state = { ...state, append }; changed(); },
     async draftRepair() {
       const props = read();
       const token = mountToken;
       const scope = viewScope(props);
       const result = state.result;
-      if (!current(token, scope) || state.drafting) return;
-      if (!result?.ok || result.artifact.runId !== props.runId || result.artifact.artifactPath !== props.artifactPath || state.imageError) {
+      if (!scopeCurrent(token, scope) || state.drafting) return;
+      if (!result?.ok || result.artifact.runId !== props.runId || result.artifact.artifactPath !== props.artifactPath) {
         state = { ...state, draftError: "Read and verify this registered artifact before drafting Repair." }; changed(); return;
+      }
+      if (state.imageError) {
+        state = { ...state, draftError: invalidatedMessage() }; changed(); return;
       }
       if (!props.onDraftRepair || !state.feedback.trim()) {
         state = { ...state, draftError: props.onDraftRepair ? "Enter artifact feedback first." : "Repair draft preparation is unavailable." }; changed(); return;
       }
-      const revision = feedbackRevision;
+      if (!previewReady()) {
+        state = { ...state, draftError: "Wait for the image preview to load successfully before drafting Repair." }; changed(); return;
+      }
+      const revision = requestRevision;
       const feedback = state.feedback;
-      const isCurrent = () => current(token, scope);
+      const isScopeCurrent = () => scopeCurrent(token, scope);
+      const isCurrent = () => isScopeCurrent() && revision === requestRevision && previewReady();
       state = { ...state, drafting: true, draftError: null }; changed();
       try {
         await props.onDraftRepair({ artifactPath: props.artifactPath, feedback, append: state.append, isCurrent });
-        if (!isCurrent()) return;
-        state = { ...state, feedback: revision === feedbackRevision ? "" : state.feedback };
+        if (!isScopeCurrent()) return;
+        state = isCurrent() ? { ...state, feedback: "" } : { ...state, draftError: invalidatedMessage() };
       } catch (error) {
-        if (isCurrent()) state = { ...state, draftError: error instanceof Error ? error.message : "Repair draft preparation failed." };
+        if (isScopeCurrent()) state = { ...state, draftError: !isCurrent() ? invalidatedMessage()
+          : error instanceof Error ? error.message : "Repair draft preparation failed." };
       } finally {
-        if (isCurrent()) { state = { ...state, drafting: false }; changed(); }
+        if (isScopeCurrent()) { state = { ...state, drafting: false }; changed(); }
       }
     },
-    setImageError(value: boolean) {
-      if (state.imageError !== value) {
-        state = { ...state, imageError: value };
-        changed();
-      }
+    setImageError,
+    imageEvents() {
+      const token = mountToken;
+      const scope = viewScope(read());
+      const result = state.result;
+      const isCurrent = () => scopeCurrent(token, scope) && result === state.result &&
+        result?.ok === true && result.content.mimeType !== "text/plain";
+      return {
+        onLoad() {
+          if (!isCurrent() || state.imageError || state.imageLoaded) return;
+          requestRevision++;
+          state = { ...state, imageLoaded: true }; changed();
+        },
+        onError() { if (isCurrent()) setImageError(true); },
+      };
     },
     mount() {
       const currentToken = ++mountToken;
       const scope = viewScope(read());
       mountedScope = scope;
-      state = { ...state, result: null, loading: true, imageError: false, drafting: false, draftError: null };
+      state = { ...state, result: null, loading: true, imageError: false, imageLoaded: false, drafting: false, draftError: null };
       changed();
 
       if (!window.devflow?.artifacts?.read) {
@@ -197,11 +229,11 @@ export function createArtifactViewController(read: () => ArtifactViewProps, chan
         runId: props.runId,
         artifactPath: props.artifactPath
       }).then(res => {
-        if (!current(currentToken, scope)) return;
+        if (!scopeCurrent(currentToken, scope)) return;
         state = { ...state, result: res, loading: false };
         changed();
       }).catch(err => {
-        if (!current(currentToken, scope)) return;
+        if (!scopeCurrent(currentToken, scope)) return;
         state = {
           ...state,
           result: {
@@ -267,26 +299,25 @@ export function ArtifactView(props: ArtifactViewProps) {
               <img
                 src={`data:${content.mimeType};base64,${content.base64}`}
                 alt={artifact.name}
-                onError={() => controller.setImageError(true)}
+                {...controller.imageEvents()}
               />
             )}
           </div>
         )}
       </div>
-      {!imageError && (
-        <div className="artifact-feedback">
-          <label>
-            Artifact feedback
-            <textarea rows={2} value={controller.state.feedback} onChange={event => controller.setFeedback(event.target.value)} />
-          </label>
-          <label className="artifact-feedback-append">
-            <input type="checkbox" checked={controller.state.append} onChange={event => controller.setAppend(event.target.checked)} />
-            Append to existing Repair draft
-          </label>
-          <button type="button" disabled={controller.state.drafting || !controller.state.feedback.trim()} onClick={() => void controller.draftRepair()}>Draft Repair</button>
-          {controller.state.draftError && <p role="alert">{controller.state.draftError}</p>}
-        </div>
-      )}
+      <div className="artifact-feedback">
+        <label>
+          Artifact feedback
+          <textarea rows={2} value={controller.state.feedback} onChange={event => controller.setFeedback(event.target.value)} />
+        </label>
+        <label className="artifact-feedback-append">
+          <input type="checkbox" checked={controller.state.append} onChange={event => controller.setAppend(event.target.checked)} />
+          Append to existing Repair draft
+        </label>
+        <button type="button" disabled={!controller.canDraftRepair} onClick={() => void controller.draftRepair()}>Draft Repair</button>
+        {content.mimeType !== "text/plain" && !imageError && !controller.state.imageLoaded && <p role="status">Image preview is still loading.</p>}
+        {controller.state.draftError && <p role="alert">{controller.state.draftError}</p>}
+      </div>
     </div>
   );
 }

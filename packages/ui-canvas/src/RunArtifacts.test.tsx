@@ -84,6 +84,7 @@ describe("RunArtifacts", () => {
     await controller.draftRepair();
     expect(prepare).not.toHaveBeenCalled();
     await Promise.resolve();
+    controller.imageEvents().onLoad();
     await controller.draftRepair();
     expect(controller.state.feedback).toBe("Make the title readable");
     expect(controller.state.draftError).toMatch(/after checkpoint/);
@@ -91,6 +92,47 @@ describe("RunArtifacts", () => {
     expect(prepare).toHaveBeenLastCalledWith(expect.objectContaining({ artifactPath: "test.png", feedback: "Make the title readable", append: false, isCurrent: expect.any(Function) }));
     expect(Object.keys(prepare.mock.calls[1][0]).sort()).toEqual(["append", "artifactPath", "feedback", "isCurrent"]);
     expect(controller.state.feedback).toBe("");
+  });
+
+  it("rejects image drafting before onLoad and permits it only after successful load", async () => {
+    const prepare = vi.fn().mockResolvedValue(undefined);
+    const { controller } = setup({ onDraftRepair: prepare });
+    await Promise.resolve();
+    controller.setFeedback("Image feedback");
+    await controller.draftRepair();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(controller.state.feedback).toBe("Image feedback");
+    expect(controller.canDraftRepair).toBe(false);
+    controller.imageEvents().onLoad();
+    expect(controller.canDraftRepair).toBe(true);
+    await controller.draftRepair();
+    expect(prepare).toHaveBeenCalledOnce();
+  });
+
+  it("keeps failed image decode unavailable even if a late load arrives", async () => {
+    const prepare = vi.fn();
+    const { controller } = setup({ onDraftRepair: prepare });
+    await Promise.resolve(); controller.setFeedback("retained");
+    const image = controller.imageEvents();
+    image.onError(); image.onLoad();
+    await controller.draftRepair();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(controller.canDraftRepair).toBe(false);
+    expect(controller.state.imageError).toBe(true);
+    expect(controller.state.feedback).toBe("retained");
+    expect(controller.state.draftError).toMatch(/image/i);
+  });
+
+  it("ignores old image callbacks across StrictMode remount and requires the current load", async () => {
+    const { controller, unmount } = setup({ onDraftRepair: vi.fn() });
+    await Promise.resolve(); controller.setFeedback("retained");
+    const oldImage = controller.imageEvents();
+    unmount(); controller.mount(); await Promise.resolve();
+    oldImage.onLoad(); oldImage.onError();
+    expect(controller.canDraftRepair).toBe(false);
+    expect(controller.state.imageError).toBe(false);
+    controller.imageEvents().onLoad();
+    expect(controller.canDraftRepair).toBe(true);
   });
 
   it.each(["unmount", "scope", "run"])("rejects a late verified read after %s", async (change) => {
@@ -111,11 +153,13 @@ describe("RunArtifacts", () => {
     let finish!: () => void;
     const prepare = vi.fn((_request: ArtifactRepairDraftRequest) => new Promise<void>(yes => { finish = yes; }));
     const { controller, unmount } = setup({ onDraftRepair: prepare });
-    await Promise.resolve(); controller.setFeedback("first");
+    await Promise.resolve(); controller.imageEvents().onLoad(); controller.setFeedback("first");
     const pending = controller.draftRepair();
     controller.setFeedback("new feedback");
     finish(); await pending;
     expect(controller.state.feedback).toBe("new feedback");
+    expect(controller.state.drafting).toBe(false);
+    expect(controller.state.draftError).toMatch(/changed|retry/i);
     const second = controller.draftRepair();
     const guard = prepare.mock.calls[1][0].isCurrent;
     unmount(); controller.mount();
@@ -139,7 +183,7 @@ describe("RunArtifacts", () => {
     await controller.draftRepair();
     expect(prepare).not.toHaveBeenCalled();
     expect(controller.state.feedback).toBe("kept");
-    expect(controller.state.draftError).toMatch(/verify/);
+    expect(controller.state.draftError).toMatch(failure === "decode-failed" ? /decode/i : /verify/);
   });
 
   it("ArtifactViewController handles mount/unmount cleanly without updating state if unmounted early", async () => {

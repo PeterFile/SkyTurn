@@ -7,6 +7,7 @@ import type { CanvasNode, CanvasSession, RunEvidence } from "@skyturn/project-co
 import * as AppModule from "./App.js";
 import { buildSelectedNodeActionState } from "./nodeActionState.js";
 import { createComposerDraftStore, draftScopeKey } from "./composerDrafts.js";
+import { createArtifactViewController } from "./RunArtifacts.js";
 
 // Reuse the existing App.test.ts controller harness style to execute production handlers.
 async function handlers(context: Record<string, unknown>) {
@@ -37,7 +38,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-async function fixture(status: RunEvidence["status"] = "succeeded") {
+async function fixture(status: RunEvidence["status"] = "succeeded", artifactPath = path) {
   const bytes = new Map<string, string>();
   const disk = { getItem: (key: string) => bytes.get(key) ?? null, setItem: (key: string, value: string) => { bytes.set(key, value); } };
   const store = createComposerDraftStore(() => disk);
@@ -46,12 +47,12 @@ async function fixture(status: RunEvidence["status"] = "succeeded") {
   const session: CanvasSession = { id: "s", projectId: "p", title: "fixture", goal: "fixture", kind: "canvas", mode: "fast",
     target: { executionTarget: "current_branch", selectedBranch: "main" }, nodes: [node], edges: [], createdAt: timestamp, updatedAt: timestamp };
   const event = (kind: FlowEvent["kind"], payload: Record<string, unknown>, seq: number): FlowEvent => ({ id: `e-${seq}`, sessionId: "s", seq, kind, payload, source: "workflow-kernel", createdAt: timestamp });
-  const evidence = { runId: "run", status, checks: [], artifacts: [path], review: null, exitCode: status === "succeeded" ? 0 : 1 };
+  const evidence = { runId: "run", status, checks: [], artifacts: [artifactPath], review: null, exitCode: status === "succeeded" ? 0 : 1 };
   const projection = reduceWorkflowEvents([
     event("workflow.user_input", { text: "fixture" }, 1),
     event("workflow.lane.declared", { lane: { id: "n", semanticKey: "n", kind: "implementation", laneKind: "implementation", title: "fixture", agentKind: "codex", executable: true } }, 2),
     event("workflow.segment.started", { segment: { id: "segment", laneId: "n", runId: "run", status: "running", exitCode: null } }, 3),
-    event("workflow.evidence.recorded", { laneId: "n", segmentId: "segment", evidence: { id: "ev", laneId: "n", segmentId: "segment", kind: "run", status: status === "succeeded" ? "passed" : "failed", checks: [], artifacts: [path], runEvidence: evidence } }, 4),
+    event("workflow.evidence.recorded", { laneId: "n", segmentId: "segment", evidence: { id: "ev", laneId: "n", segmentId: "segment", kind: "run", status: status === "succeeded" ? "passed" : "failed", checks: [], artifacts: [artifactPath], runEvidence: evidence } }, 4),
     event("workflow.segment.finished", { laneId: "n", segmentId: "segment", status, exitCode: evidence.exitCode }, 5),
     event("workflow.node.checkpoint_recorded", { checkpoint: { id: "after", sessionId: "s", nodeId: "n", laneId: "n", phase: "after", runId: "run", segmentId: "segment", executionTarget: "current_branch", source: "backend", createdAt: timestamp, evidenceRefs: [{ kind: "run", id: "run" }] } }, 6),
   ]);
@@ -72,12 +73,104 @@ async function fixture(status: RunEvidence["status"] = "succeeded") {
     setSelectedNodeId: vi.fn(), setComposerActions: vi.fn(), setInspectedNodeId: vi.fn(),
     setNodeActionFeedbackScope: vi.fn(), setNodeActionError: vi.fn(), setNodeActionStatus: vi.fn(), refreshNodeActionBusy: vi.fn(),
   };
-  return { store, disk, context, workflow, envelope, projection, session, node, api: await handlers(context) };
+  return { store, disk, context, workflow, envelope, projection, session, node, artifactPath, api: await handlers(context) };
+}
+async function preview(f: Awaited<ReturnType<typeof fixture>>, image = false) {
+  const read = vi.fn().mockResolvedValue({ protocolVersion: 1, ok: true,
+    artifact: { artifactPath: f.artifactPath, name: image ? "report.png" : "report.txt", type: image ? "png" : "txt", runId: "run", status: "succeeded", byteLength: 10 },
+    contentIdentity: "current-file-unhashed", content: image
+      ? { encoding: "base64", mimeType: "image/png", base64: "fixture", width: 1, height: 1 }
+      : { encoding: "utf8", mimeType: "text/plain", text: "Registered report" } });
+  vi.stubGlobal("window", { devflow: { ...window.devflow, artifacts: { read } } });
+  const prepare = vi.fn(f.api.prepareArtifactRepairDraft);
+  const controller = createArtifactViewController(() => ({ projectRoot: "/project", sessionId: "s", nodeId: "n", runId: "run",
+    artifactPath: f.artifactPath, onDraftRepair: prepare }), vi.fn());
+  const unmount = controller.mount(); await Promise.resolve();
+  return { controller, prepare, read, unmount };
 }
 const request = (patch = {}) => ({ artifactPath: path, feedback: "Improve contrast", append: false, isCurrent: () => true, ...patch });
 afterEach(() => vi.unstubAllGlobals());
 
 describe("artifact Repair App callbacks", () => {
+  it.each(["feedback", "append", "feedback-away-back", "append-away-back"])("invalidates a pending %s revision before the parent stores or closes, then recovers", async change => {
+    const f = await fixture(); f.store.edit(key, "existing draft");
+    const saved = f.store.read(key);
+    const { controller, prepare, read } = await preview(f);
+    controller.setFeedback("original feedback"); controller.setAppend(true);
+    const load = deferred<typeof f.envelope>(); f.workflow.getProjection.mockReturnValueOnce(load.promise);
+    const pending = controller.draftRepair();
+    expect(f.workflow.getProjection).toHaveBeenCalledOnce();
+    if (change.startsWith("feedback")) {
+      controller.setFeedback("newer feedback");
+      if (change.endsWith("back")) controller.setFeedback("original feedback");
+    } else {
+      controller.setAppend(false);
+      if (change.endsWith("back")) controller.setAppend(true);
+    }
+    expect(prepare.mock.calls[0][0].isCurrent()).toBe(false);
+    const feedback = controller.state.feedback;
+    load.resolve(f.envelope); await pending;
+    expect(f.store.read(key)).toBe(saved);
+    expect(f.context.setInspectedNodeId).not.toHaveBeenCalled();
+    expect(f.context.setSelectedNodeId).not.toHaveBeenCalled();
+    expect(controller.state.feedback).toBe(feedback);
+    expect(controller.state.drafting).toBe(false);
+    expect(controller.state.draftError).toMatch(/changed|retry/i);
+    controller.setAppend(true);
+    await controller.draftRepair();
+    expect(f.store.read(key).text).toMatch(/^existing draft\n\n/);
+    expect(f.store.read(key).text).toContain(feedback);
+    expect(f.context.setInspectedNodeId).toHaveBeenCalledExactlyOnceWith(null);
+    expect(controller.state.draftError).toBeNull();
+    expect(controller.state.drafting).toBe(false);
+    expect(read).toHaveBeenCalledOnce();
+    expect(f.workflow.requestRepair).not.toHaveBeenCalled();
+    expect(window.devflow.appendWorkflowUserInput).not.toHaveBeenCalled();
+    expect(window.devflow.startAgentRun).not.toHaveBeenCalled();
+  });
+
+  it("blocks pending and failed images at the parent boundary and invalidates an in-flight decode error", async () => {
+    const f = await fixture("succeeded", ".devflow/acceptance/report.png");
+    f.store.edit(key, "existing draft"); const saved = f.store.read(key);
+    const { controller, prepare, read } = await preview(f, true);
+    controller.setFeedback("image feedback"); controller.setAppend(true);
+    await controller.draftRepair();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(f.workflow.getProjection).not.toHaveBeenCalled();
+    const image = controller.imageEvents(); image.onLoad();
+    const load = deferred<typeof f.envelope>(); f.workflow.getProjection.mockReturnValueOnce(load.promise);
+    const pending = controller.draftRepair();
+    expect(f.workflow.getProjection).toHaveBeenCalledOnce();
+    image.onError();
+    expect(prepare.mock.calls[0][0].isCurrent()).toBe(false);
+    load.resolve(f.envelope); await pending;
+    expect(f.store.read(key)).toBe(saved);
+    expect(f.context.setInspectedNodeId).not.toHaveBeenCalled();
+    expect(f.context.setSelectedNodeId).not.toHaveBeenCalled();
+    expect(controller.state.feedback).toBe("image feedback");
+    expect(controller.state.drafting).toBe(false);
+    expect(controller.state.draftError).toMatch(/image|decode/i);
+    expect(controller.canDraftRepair).toBe(false);
+    await controller.draftRepair();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledOnce();
+    expect(f.workflow.requestRepair).not.toHaveBeenCalled();
+    expect(window.devflow.startAgentRun).not.toHaveBeenCalled();
+  });
+
+  it("transfers successfully loaded image feedback through the unchanged parent handler", async () => {
+    const f = await fixture("succeeded", ".devflow/acceptance/report.png");
+    const { controller, read } = await preview(f, true);
+    controller.setFeedback("image feedback"); controller.imageEvents().onLoad();
+    await controller.draftRepair();
+    expect(f.store.read(key).source?.artifactPath).toBe(f.artifactPath);
+    expect(f.store.read(key).text).toContain("image feedback");
+    expect(f.context.setInspectedNodeId).toHaveBeenCalledExactlyOnceWith(null);
+    expect(controller.state.feedback).toBe("");
+    expect(read).toHaveBeenCalledOnce();
+    expect(f.workflow.requestRepair).not.toHaveBeenCalled();
+  });
+
   it.each(["succeeded", "failed", "cancelled", "timed-out"] as const)("prepares an editable bound draft without scheduling for %s evidence, then sends only explicitly", async status => {
     const f = await fixture(status);
     const original = JSON.stringify(f.session);
