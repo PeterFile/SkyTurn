@@ -48,6 +48,10 @@ Adapter contracts expose discovery, health, start, send, cancel, and event sink 
 
 Hermes creates or confirms task graphs. Individual agents may write task-local outputs, but Hermes/orchestrator owns consolidation into shared memory files under `.devflow`.
 
+Hermes CLI and Hermes PTY output redact native session announcements before publishing output or progress. The internal streaming redactor recognizes the case-sensitive plain-text field `session_id` at the start of a CR/LF-delimited line, with optional spaces or tabs before the field and between the field and `:`. After the colon, it preserves whitespace and replaces the first non-whitespace token with one `[redacted]` marker, including quotes or punctuation within that token. It preserves the remaining safe text, whitespace, line endings, stream identity, and order. Empty values stay empty; truncated or arbitrarily long tokens never release value bytes. Tokens are suppressed immediately without buffering a line or growing a discovered-secret list, within the existing bounded carry and linear-work limits.
+
+This Hermes-only rule also applies to fresh runs without an input resume handle. JSON object keys and inline prose do not trigger it; other agents retain their existing behavior. Known input-handle redaction remains active. The rule protects future emitted output through the existing public boundary, including authoritative events, task output, and the observability mirror. It does not discover native sessions, establish resume mappings, rewrite historical output, change stdout workflow parsing, or alter completion evidence.
+
 ## Rollback Boundary
 
 Adapters may expose native recovery capabilities, but SkyTurn owns product rollback semantics.

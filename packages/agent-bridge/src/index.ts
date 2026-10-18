@@ -1350,7 +1350,9 @@ class PtyTerminalSessionManagerImpl implements PtyTerminalSessionManager {
       exitDisposable: null,
       scrollback: [],
       scrollbackBytes: 0,
-      outputRedactor: new StreamingSensitiveOutputRedactor(input.sensitiveValues),
+      outputRedactor: new StreamingSensitiveOutputRedactor(
+        input.sensitiveValues, undefined, input.agentKind === "hermes" ? "hermes" : undefined,
+      ),
       eventQueue: Promise.resolve(),
       timeoutTimer: null,
       stallTimer: null,
@@ -3779,7 +3781,7 @@ function createStreamingAdapterOutput(input: {
   onActivity: () => void;
   onStderr: (text: string) => void;
 }): StreamingAdapterOutput {
-  const redactor = new StreamingSensitiveOutputRedactor(input.sensitiveValues);
+  const redactor = new StreamingSensitiveOutputRedactor(input.sensitiveValues, undefined, "hermes");
   const decoders: Record<TerminalOutputStream, StringDecoder> = {
     stdout: new StringDecoder("utf8"),
     stderr: new StringDecoder("utf8"),
