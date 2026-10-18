@@ -368,7 +368,7 @@
       "width": 280,
       "height": 200,
       "color": "3",
-      "text": "Task: Draft Repair from registered artifact feedback\nState: Verify\nOwner: Codex\nDepends: none\nEvidence: Artifact Repair focused regression gate\nRisk: Artifact Repair final acceptance pending"
+      "text": "Task: Draft Repair from registered artifact feedback\nState: Verify\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: Artifact Repair desktop acceptance\nRisk: PR delivery only; not integrated into main"
     },
     {
       "id": "3136ea44b111ceaf",
@@ -378,7 +378,7 @@
       "width": 360,
       "height": 180,
       "color": "4",
-      "text": "Evidence: Artifact Repair focused regression gate\ncommit: none\ntest: Focused UI regressions: 369 tests passed; ui-canvas typecheck passed; git diff --check passed. Real Electron and exact-head CI still pending.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261018/artifact-repair-focused.log"
+      "text": "Evidence: Artifact Repair desktop acceptance\ncommit: PR #212 candidate\ntest: Full local gate: 3485 passed, 13 platform skips. After CSS-only correction: fresh build/lint/typecheck and 753 UI tests passed. Production Electron synthetic-fixture checks: 6/6, including source-bound draft restart, zero agent launches and zero owned-process leftovers.\nbuild: pnpm run build passed\nmanual: Three final screenshots inspected; feedback and preview contrast exceed 4.5:1. Not real-agent or demo:mvp evidence.\nartifact: https://github.com/PeterFile/SkyTurn/pull/212 ; /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261018/artifact-repair-ui-result-1792340294428.json"
     },
     {
       "id": "24d48f59ef89c6f3",
@@ -388,7 +388,7 @@
       "width": 360,
       "height": 180,
       "color": "1",
-      "text": "Risk: Artifact Repair final acceptance pending\nImpact: Focused tests do not establish real Electron interaction or exact-head CI.\nMitigation: Run production Electron with clearly labeled synthetic terminal fixtures, inspect screenshots, and complete exact-head CI before delivery.\nStatus: Open"
+      "text": "Risk: Artifact Repair delivery boundary\nImpact: The independent PR is not integrated into main. Desktop evidence uses explicit synthetic terminal authority, not a live Agent run; Windows artifact viewing remains unavailable.\nMitigation: Require exact-head CI on PR #212; merge only with separate authorization. Preserve current-file-unhashed and explicit-send boundaries.\nStatus: Documented limitation"
     }
   ],
   "edges": [

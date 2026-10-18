@@ -17,6 +17,8 @@ Draft bindings survive app reopen. Before sending a bound draft, SkyTurn checks 
 
 Closing the preview/modal, changing scope, navigating away and back, or replacing the run invalidates pending interactions. A late read or preparation callback cannot select, overwrite, or clear another draft. Storage failures retain the existing in-memory draft warning; reopening may lose edits that could not be saved.
 
+Changing feedback or Append consent while preparation is waiting invalidates that request, retains the current input, and permits an explicit retry. Image feedback requires successful browser decoding; a pending or failed image cannot prepare a draft. The viewer and feedback controls use the application's theme tokens to keep their labels and preview text readable.
+
 此切片提供 Electron 后端与 preload API，现已接入 UI。UI 在现有节点弹窗的 `Context` 中使用此接口（而非原计划的 Output）；不新增标签页、编辑器或通用文件预览入口。
 
 ## 调用接口
