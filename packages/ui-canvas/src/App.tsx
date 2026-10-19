@@ -187,7 +187,8 @@ import {
 } from "./editorLaunchOptions.js";
 import {
   DEFAULT_CHANGES_DIFF_OPTIONS,
-  renderChangesetDiffHtml,
+  renderChangesetDiffHtmlPreview,
+  type ChangesDiffPreview,
   type ChangesDiffViewOptions,
 } from "./diffViewer.js";
 import {
@@ -5264,7 +5265,7 @@ export function NodeModal({
         )}
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
-          {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
+          {tab === "Changes" && <ChangesTab key={JSON.stringify([projectRoot, session.projectId, session.id, node.id, node.runId])} node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
           {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} onDraftRepair={onDraftRepair} isCurrent={isPickerCurrent} />}
         </div>
       </section>
@@ -5418,12 +5419,25 @@ export function UserDecisionPanel({
 function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNode; projectRoot: string; session: CanvasSession; runEvents: RunEvent[] }) {
   const [reconciliation, setReconciliation] = useState<FinalChangesetReconciliation | null>(null);
   const [changeset, setChangeset] = useState<Changeset | null>(null);
-  const [diffHtml, setDiffHtml] = useState<string>("");
-  const [diffLoading, setDiffLoading] = useState(false);
-  const [diffError, setDiffError] = useState<string | null>(null);
+  const [fileQuery, setFileQuery] = useState("");
+  const [diffRender, setDiffRender] = useState<{
+    changeset: Changeset;
+    options: ChangesDiffViewOptions;
+    query: string;
+    preview?: ChangesDiffPreview;
+    error?: string;
+  } | null>(null);
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [diffCollapsed, setDiffCollapsed] = useState(false);
   const [options, setOptions] = useState<ChangesDiffViewOptions>(DEFAULT_CHANGES_DIFF_OPTIONS);
+  // Match inputs during render as well as effect cleanup to prevent a stale preview frame.
+  const currentDiffRender = diffRender?.changeset === changeset
+    && diffRender?.options === options
+    && diffRender?.query === fileQuery ? diffRender : null;
+  const diffPreview = currentDiffRender?.preview;
+  const diffHtml = diffPreview?.html ?? "";
+  const diffError = currentDiffRender?.error;
+  const diffLoading = !!changeset && hasAvailableChangeEvidence(changeset) && !currentDiffRender;
   const [deliveryStatus, setDeliveryStatus] = useState<"idle" | "committing" | string>("idle");
   const [deliveryError, setDeliveryError] = useState<string | null>(null);
   const [commitSubject, setCommitSubject] = useState("feat(workflow): commit verified changes");
@@ -5532,8 +5546,6 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     let active = true;
     setReconciliation(null);
     setChangeset(null);
-    setDiffHtml("");
-    setDiffError(null);
 
     const devflow = window.devflow;
     if (devflow && typeof devflow.reconcileFinalChangeset === "function") {
@@ -5573,34 +5585,20 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
     if (!changeset || !hasAvailableChangeEvidence(changeset)) return;
 
     let active = true;
-    setDiffLoading(true);
-    setDiffError(null);
-    void renderChangesetDiffHtml(changeset.patchPreview, changeset.files, options)
-      .then((html) => {
+    void renderChangesetDiffHtmlPreview(changeset.patchPreview, changeset.files, options, fileQuery)
+      .then((preview) => {
         if (!active) return;
-        setDiffHtml(html);
+        setDiffRender({ changeset, options, query: fileQuery, preview });
       })
       .catch((error: unknown) => {
         if (!active) return;
-        setDiffHtml("");
-        setDiffError(error instanceof Error ? error.message : "Unable to render diff preview.");
-      })
-      .finally(() => {
-        if (active) setDiffLoading(false);
+        setDiffRender({ changeset, options, query: fileQuery, error: error instanceof Error ? error.message : "Unable to render diff preview." });
       });
 
     return () => {
       active = false;
     };
-  }, [
-    changeset,
-    options.hideWhitespace,
-    options.loadFullFiles,
-    options.outputFormat,
-    options.richPreview,
-    options.wordDiffs,
-    options.wordWrap,
-  ]);
+  }, [changeset, options, fileQuery]);
 
   function setDiffOption<K extends keyof ChangesDiffViewOptions>(key: K, value: ChangesDiffViewOptions[K]) {
     setOptions((current) => ({ ...current, [key]: value }));
@@ -6092,6 +6090,24 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         )}
       </header>
 
+      <div className="changes-file-filter">
+        <label>
+          File path
+          <input
+            aria-label="Filter diff by file path"
+            type="search"
+            placeholder="Literal path substring"
+            value={fileQuery}
+            onChange={(event) => setFileQuery(event.target.value)}
+          />
+        </label>
+        <button className="changes-tool-button" type="button" disabled={!fileQuery} onClick={() => setFileQuery("")}>Clear filter</button>
+        <span role="status" aria-live="polite">
+          {diffPreview ? `${diffPreview.visibleFiles} / ${diffPreview.totalFiles} preview file blocks` : diffLoading ? "Counting preview file blocks..." : "Preview count unavailable."}
+        </span>
+        <small>Delivery uses the entire changeset, regardless of this filter. Counts cover parsed preview blocks; binary or bounded previews may omit content.</small>
+      </div>
+
       <ChangesDiffToolbar
         collapsed={diffCollapsed}
         options={options}
@@ -6170,6 +6186,8 @@ function ChangesTab({ node, projectRoot, session, runEvents }: { node: CanvasNod
         <div className="changes-empty" role="alert">{diffError}</div>
       ) : diffLoading ? (
         <div className="changes-empty">Rendering diff preview...</div>
+      ) : diffPreview && diffPreview.totalFiles > 0 && diffPreview.visibleFiles === 0 ? (
+        <div className="changes-empty" role="status">No preview file paths match this filter.</div>
       ) : diffHtml ? (
         <div className={diffShellClassName} dangerouslySetInnerHTML={{ __html: diffHtml }} />
       ) : (!hasGitEvidence && !reconciliation?.liveChanges) ? (

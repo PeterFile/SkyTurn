@@ -361,6 +361,36 @@
       "text": "Task: Project file snapshot contract\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: Registered artifact viewing\nEvidence: none\nRisk: Strict descriptor reads and immutable retry/reopen; no new composer UI in this slice"
     },
     {
+      "id": "73b53ccdf59486dd",
+      "type": "text",
+      "x": 680,
+      "y": 1460,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Filter Changes preview by file path\nState: Verify\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: Changes path filter desktop acceptance\nRisk: PR delivery only; not integrated into main"
+    },
+    {
+      "id": "38d91c2187ddd0fa",
+      "type": "text",
+      "x": 40,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Changes path filter desktop acceptance\ncommit: PR #213 candidate\ntest: Full local gate: 3457 passed, 13 skipped. Production Electron: 7/7 checks, real Git reconciliation, zero Agent launches or delivery actions, zero owned-process leftovers.\nbuild: build/lint/typecheck passed\nmanual: Four screenshots inspected. Synthetic terminal fixture; not live-agent evidence.\nartifact: https://github.com/PeterFile/SkyTurn/pull/213 ; /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261018/changes-filter-ui-result-1792340526361.json"
+    },
+    {
+      "id": "5543d65d0382da2c",
+      "type": "text",
+      "x": 900,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Changes filter delivery boundary\nImpact: PR is not integrated into main. Preview counts cover parsed blocks, not complete binary or bounded contents.\nMitigation: Require exact-head CI on PR #213. Filtering never changes the entire delivery changeset; merge requires separate authorization.\nStatus: Documented limitation"
+    },
+    {
       "id": "951cf72093aa88bc",
       "type": "text",
       "x": 680,
@@ -829,6 +859,22 @@
       "toEnd": "arrow",
       "label": "depends",
       "color": "6"
+    },
+    {
+      "id": "27f12c1f1e254133",
+      "fromNode": "73b53ccdf59486dd",
+      "toNode": "38d91c2187ddd0fa",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "6a27a42987bf3dd8",
+      "fromNode": "5543d65d0382da2c",
+      "toNode": "73b53ccdf59486dd",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
     },
     {
       "id": "c891ac5d1e661639",
