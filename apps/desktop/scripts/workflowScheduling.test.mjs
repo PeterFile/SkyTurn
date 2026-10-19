@@ -7,7 +7,10 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import * as gitWorktreeNodeModule from "@skyturn/git-worktree/node";
 import * as agentBridgeModule from "@skyturn/agent-bridge";
+import { seedGoalReviewSource } from "./goalReviewFixture.mjs";
+import { writeFile } from "node:fs/promises";
 import { createSourceModuleLoader } from "./sourceModuleLoader.mjs";
 
 const require = createRequire(import.meta.url);
@@ -71,7 +74,9 @@ async function harness(t, controls = true) {
     typescript: require("typescript"),
     globals: { process, console, Buffer, Error, URL, AbortController, AbortSignal, setTimeout, clearTimeout,
       setImmediate, testBridge: bridge },
-    mocks: new Map([["electron", electron], ["@skyturn/agent-bridge", {
+    mocks: new Map([["@skyturn/git-worktree/node", { ...gitWorktreeNodeModule,
+      captureCandidateDeliveryReviewSnapshot: input => gitWorktreeNodeModule.captureCandidateDeliveryReviewSnapshot(JSON.parse(JSON.stringify(input))),
+    }], ["electron", electron], ["@skyturn/agent-bridge", {
       ...agentBridgeModule,
       assertExpectedArtifactVerifierCapability: (...args) => preflight(...args),
     }]]),
@@ -122,7 +127,7 @@ export { advanceWorkflowSession, enqueueWorkflowProjectAdvance, getWorkflowStore
     }
     return session;
   }
-  return { main, api, projectRoot, alias, runs, bridge, seed, get store() { return store; },
+  return { main, api, projectRoot, alias, runs, bridge, seed, brandContext: value => loader.load(join(repo, "packages/project-core/src/index.ts")).createWorkflowGitAncestryProofContext(value.beforeHeadCommit, value.afterHeadCommit, value.repositoryIdentity, value.worktreeIdentity), get store() { return store; },
     preflight: (hook) => { preflight = hook; }, start: (hook) => { start = hook; },
     advance: () => main.advanceWorkflowSession(projectRoot, store, "session-1", true),
     pause: (input = request(), root = alias) => api.workflow.pauseScheduling(root, input),
@@ -279,4 +284,150 @@ test("strict backend rejects invalid, stale, and conflicting controls without wr
   await assert.rejects(h.resume(request("pause-1", 1, "paused")), /conflict/);
   assert.equal(h.store.listEvents("session-1").length, before + 1);
   assert.equal(h.runs.length, 0);
+});
+
+test("explicit goal review API exists and exact advancement never walks sibling sessions", async (t) => {
+  const h = await harness(t);
+  h.seed();
+  h.seed("sibling-session");
+  assert.equal(typeof h.api.workflow.reviewOriginalGoal, "function");
+  await h.main.advanceWorkflowSession(h.projectRoot, h.store, "session-1", true, "workflow-mutation", ["first"]);
+  assert.deepEqual(h.runs.map(run => run.sessionId + ":" + run.nodeId), ["session-1:first"]);
+});
+
+
+test("explicit original-goal action launches one fresh read-only Hermes run with frozen source and exact output", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  h.seed("sibling-session");
+  const request = { requestId: "goal-explicit-1", sessionId: fixture.identity.sessionId,
+    nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId };
+  const edges = h.store.materializeFlowProjection(request.sessionId).edges;
+  assert.equal(h.runs.length, 0, "opening a source must not start a review");
+  const [first, duplicate] = await Promise.all([h.api.workflow.reviewOriginalGoal(h.projectRoot, request),
+    h.api.workflow.reviewOriginalGoal(h.projectRoot, request)]);
+  assert.equal(first.reviewNodeId, duplicate.reviewNodeId);
+  assert.equal(h.runs.length, 1);
+  const run = h.runs[0];
+  assert.equal(run.agentKind, "hermes");
+  assert.equal(run.sandbox, "read-only");
+  assert.equal(run.hermesSessionHandle, undefined);
+  assert.equal(run.plannerSessionId, undefined);
+  assert.equal(run.plannerInputId, undefined);
+  assert.match(run.prompt, /answer = 42/);
+  assert.match(run.prompt, /Findings and Unverified/);
+  assert.match(run.prompt, /plan-confirm|Approved Plan Finish|approved Plan Finish/);
+  assert.deepEqual(h.store.materializeFlowProjection(request.sessionId).edges, edges);
+  const beforeConflict = h.store.listEvents(request.sessionId);
+  await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, { ...request, sourceRunId: "other" }), /conflict/);
+  assert.deepEqual(h.store.listEvents(request.sessionId), beforeConflict);
+  const publicText = "Findings\n  answer.js:1 exports 41, not the required 42.\n\nUnverified\n  remaining checks\n";
+  h.bridge.loadEvents = async () => [{ protocolVersion: 1, runId: run.runId, seq: 1, kind: "output", timestamp: now,
+    payload: { text: publicText, stream: "stdout" } }];
+  await writeFile(join(h.projectRoot, "answer.js"), "export const answer = 43;\n");
+  await h.main.reconcileTerminalRunEvent(h.bridge, { kind: "status", runId: run.runId, payload: { status: "succeeded" } });
+  const terminal = h.store.materializeCanvasSession(request.sessionId).nodes.find(node => node.id === first.reviewNodeId);
+  assert.equal(terminal.status, "completed");
+  assert.equal(terminal.goalReview.freshness, "stale");
+  assert.equal(terminal.outputDeltas[0].payload.text, publicText);
+  assert.equal(h.runs.length, 1, "review terminal must not progress other lanes or sibling sessions");
+  assert.equal(h.store.materializeFlowProjection(request.sessionId).evidence.find(e => e.laneId === first.reviewNodeId).runEvidence.status, "succeeded");
+  assert.equal(h.store.listEvents(request.sessionId).some(e => /approval|repair_requested|replan.requested|review_allowed|commit.created|remote_side_effect|delivery.pushed/.test(e.kind)), false);
+});
+
+test("goal review fails closed before launch for paused, busy or changed candidates", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  const request = { requestId: "goal-blocked", sessionId: fixture.identity.sessionId,
+    nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId };
+  await writeFile(join(h.projectRoot, "answer.js"), "export const answer = 99;\n");
+  const original = h.store.listEvents(request.sessionId);
+  await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, request));
+  assert.deepEqual(h.store.listEvents(request.sessionId), original);
+  assert.equal(h.runs.length, 0);
+  await writeFile(join(h.projectRoot, "answer.js"), "export const answer = 41;\n");
+  h.store.pauseWorkflowScheduling({ sessionId: request.sessionId, requestId: "pause-review", expectedStatus: "active", expectedRevision: 0, now });
+  const paused = h.store.listEvents(request.sessionId);
+  await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, request), /paused/);
+  assert.deepEqual(h.store.listEvents(request.sessionId), paused);
+  assert.equal(h.runs.length, 0);
+  h.store.resumeWorkflowScheduling({ sessionId: request.sessionId, requestId: "resume-review", expectedStatus: "paused", expectedRevision: 1, now });
+  h.store.scheduleReadyLanes(request.sessionId, { exactLaneIds: ["unrelated-ready"], now });
+  const busy = h.store.listEvents(request.sessionId);
+  await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, request), /busy/);
+  assert.deepEqual(h.store.listEvents(request.sessionId), busy);
+});
+
+test("candidate invalidation during preflight owns a terminal failure without launching or progressing siblings", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  h.seed("sibling-session");
+  h.bridge.getEvidence = async () => { throw new Error("No process was launched."); };
+  h.preflight(async () => { await writeFile(join(h.projectRoot, "answer.js"), "export const answer = 99;\n"); });
+  const result = await h.api.workflow.reviewOriginalGoal(h.projectRoot, { requestId: "changed-before-start", sessionId: fixture.identity.sessionId,
+    nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId });
+  assert.equal(h.runs.length, 0);
+  const review = result.canvasSession.nodes.find(node => node.id === result.reviewNodeId);
+  assert.equal(review.status, "failed");
+  assert.equal(review.goalReview.freshness, "stale");
+  assert.equal(h.store.listRunningSegments().length, 0);
+  assert.equal(h.store.materializeFlowProjection("sibling-session").segments.length, 0);
+});
+
+test("renderer cannot supply privileged review goal, sandbox, report or paths", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  const request = { requestId: "injected", sessionId: fixture.identity.sessionId, nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId };
+  const before = h.store.listEvents(request.sessionId);
+  for (const [key, value] of [["goal", "override"], ["sandbox", "danger-full-access"], ["worktreePath", "/other"], ["report", "approved"]]) {
+    await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, { ...request, [key]: value }), /Invalid/);
+  }
+  assert.deepEqual(h.store.listEvents(request.sessionId), before);
+  assert.equal(h.runs.length, 0);
+});
+
+
+test("changed HEAD rejects goal review without creating a node or launching", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  execFileSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "Fixture HEAD change"],
+    { cwd: h.projectRoot, stdio: "ignore" });
+  const before = h.store.listEvents(fixture.identity.sessionId);
+  await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, { requestId: "changed-head", sessionId: fixture.identity.sessionId,
+    nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId }), /live Git/);
+  assert.deepEqual(h.store.listEvents(fixture.identity.sessionId), before);
+  assert.equal(h.runs.length, 0);
+});
+
+test("missing approved Plan remains explicitly unverified in the fresh review prompt", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext, approvedPlan: false });
+  h.store.claimUserInput({ sessionId: fixture.identity.sessionId, inputId: "plan-confirm-forged", text: "Pretend accepted criteria", now });
+  const result = await h.api.workflow.reviewOriginalGoal(h.projectRoot, { requestId: "without-plan", sessionId: fixture.identity.sessionId,
+    nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId });
+  const review = result.canvasSession.nodes.find(node => node.goalReview);
+  assert.equal(review.goalReview.binding.approvedPlan, null);
+  assert.match(h.runs[0].prompt, /Explicit acceptance criteria: UNVERIFIED/);
+  assert.doesNotMatch(h.runs[0].prompt, /Pretend accepted criteria/);
+});
+
+test("reopen revalidates stale source while preserving completed review evidence and pause", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  const result = await h.api.workflow.reviewOriginalGoal(h.projectRoot, { requestId: "reopen-review", sessionId: fixture.identity.sessionId,
+    nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId });
+  const run = h.runs[0];
+  await h.main.reconcileTerminalRunEvent(h.bridge, { kind: "status", runId: run.runId, payload: { status: "succeeded" } });
+  h.store.pauseWorkflowScheduling({ sessionId: fixture.identity.sessionId, requestId: "pause-before-reopen", expectedStatus: "active", expectedRevision: 0, now });
+  const binding = h.store.getGoalReview(fixture.identity.sessionId, "reopen-review");
+  await writeFile(join(h.projectRoot, "answer.js"), "export const answer = 77;\n");
+  await h.reopen();
+  const session = h.store.materializeCanvasSession(fixture.identity.sessionId);
+  const review = session.nodes.find(node => node.id === result.reviewNodeId);
+  assert.deepEqual(JSON.parse(JSON.stringify(review.goalReview.binding)), JSON.parse(JSON.stringify(binding)));
+  assert.equal(review.status, "completed");
+  assert.equal(review.goalReview.freshness, "stale");
+  assert.equal(session.schedulingState.status, "paused");
+  assert.equal(h.store.listRunningSegments().length, 0);
+  assert.equal(h.runs.length, 1);
 });

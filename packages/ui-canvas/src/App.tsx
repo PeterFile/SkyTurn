@@ -1,3 +1,5 @@
+import { goalReviewUnavailableReason } from "@skyturn/project-core";
+import { createGoalReviewSubmitter } from "./goalReview.js";
 import { WorkflowSchedulingControl, type SchedulingAttempt } from "./WorkflowSchedulingControl.js";
 import { resolveEditorSelection } from "./editorLaunchOptions.js";
 import type { SettingsSnapshot } from "@skyturn/persistence";
@@ -926,6 +928,7 @@ function isTerminalRunEvidenceStatus(status: RunEvidence["status"]): boolean {
 }
 
 export function reassignmentUnavailableReason(session: CanvasSession, node: CanvasNode): string | null {
+  if (node.goalReview) return "Advisory reviews use a fresh read-only Hermes run and cannot be reassigned.";
   if (node.id === session.plannerNodeId) return "Planner root cannot be reassigned.";
   if (node.rollbackStatus === "rolled_back" || node.rollbackStatus === "inactive") return "Rolled-back or inactive lanes cannot be reassigned.";
   if (node.nodeKind !== "agent_task" || node.executable !== true || node.runtimePolicy?.executable === false) return "Only executable agent tasks can be reassigned.";
@@ -982,6 +985,7 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
+  const goalReviewSubmitterRef = useRef(createGoalReviewSubmitter());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const settingsBtnRef = useRef<HTMLButtonElement>(null);
   const [terminalOpen, setTerminalOpen] = useState(false);
@@ -2291,6 +2295,21 @@ export default function App() {
     applyGuardedWorkflowSessionResponse(result, responseGuard);
   }
 
+  async function reviewOriginalGoal(node: CanvasNode, isCurrent: () => boolean) {
+    if (!activeProject || activeSession?.kind !== "canvas" || !window.devflow?.workflow?.reviewOriginalGoal) return;
+    const workflow = window.devflow.workflow;
+    const guard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
+    if (!guard) return;
+    await goalReviewSubmitterRef.current({
+      scope: JSON.stringify([activeProject.id, activeSession.id, node.id, node.runId]),
+      input: { sessionId: activeSession.id, nodeId: node.id, sourceRunId: node.runId },
+      createRequestId: () => `goal-review-${globalThis.crypto.randomUUID()}`,
+      submit: request => workflow.reviewOriginalGoal(guard.queryRoot, request),
+      isCurrent,
+      apply: result => { applyGuardedWorkflowSessionResponse(result, guard); },
+    });
+  }
+
   function retryNode(nodeId: string) {
     if (!activeSession || activeSession.kind !== "canvas") return;
     if (window.devflow) return;
@@ -2752,6 +2771,8 @@ export default function App() {
           onRetry={() => retryNode(inspectedNode.id)}
           retryUnavailableReason={window.devflow ? DESKTOP_RETRY_UNAVAILABLE_REASON : null}
           onReassign={(selected, isCurrent) => reassignNode(inspectedNode.id, selected, isCurrent)}
+          onReviewOriginalGoal={(isCurrent) => reviewOriginalGoal(inspectedNode, isCurrent)}
+          goalReviewUnavailableReason={window.devflow?.workflow?.reviewOriginalGoal ? goalReviewUnavailableReason(activeSession, inspectedNode) : "Workflow backend unavailable."}
           onInsertBefore={() => insertBefore(inspectedNode.id)}
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
           editorLaunchBusy={editorLaunchBusy === `${activeProject.id}:${activeSession.id}:${inspectedNode.id}:${editorLaunchGenerationRef.current}`}
@@ -4886,8 +4907,12 @@ export function NodeModal({
   onOpenEditor,
   editorLaunchBusy,
   onDecisionAnswer,
+  onReviewOriginalGoal,
+  goalReviewUnavailableReason,
 }: {
   node: CanvasNode;
+  onReviewOriginalGoal?: (isCurrent: () => boolean) => Promise<void>;
+  goalReviewUnavailableReason?: string | null;
   isCurrentScope: () => boolean;
   reassignBlockedReason: string | null;
   projectRoot: string;
@@ -4909,6 +4934,10 @@ export function NodeModal({
   const backdropRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
   const closingRef = useRef(false);
+  const [reviewBusy, setReviewBusy] = useState(false);
+  const reviewBusyRef = useRef(false);
+  const [reviewMessage, setReviewMessage] = useState<string | null>(null);
+  useEffect(() => () => { closingRef.current = true; }, []);
   const [pickerOpen, setPickerOpen] = useState(false);
   const reassignButtonRef = useRef<HTMLButtonElement>(null);
   const pickerWasOpen = useRef(false);
@@ -4963,6 +4992,21 @@ export function NodeModal({
       .to(panel, { autoAlpha: 0, x: 28, duration: 0.18, ease: "power2.in" }, 0)
       .to(backdrop, { autoAlpha: 0, duration: 0.12, ease: "power2.out" }, 0);
   });
+  async function submitGoalReview() {
+    if (!onReviewOriginalGoal || goalReviewUnavailableReason !== null || reviewBusyRef.current || !isPickerCurrent()) return;
+    reviewBusyRef.current = true;
+    setReviewBusy(true);
+    setReviewMessage(null);
+    try {
+      await onReviewOriginalGoal(isPickerCurrent);
+      if (isPickerCurrent()) setReviewMessage("Advisory review requested. Goal acceptance remains unverified.");
+    } catch (error) {
+      if (isPickerCurrent()) setReviewMessage(error instanceof Error ? error.message : "Review unavailable.");
+    } finally {
+      reviewBusyRef.current = false;
+      if (isPickerCurrent()) setReviewBusy(false);
+    }
+  }
   const canExecute = canUseAgentNodeActions(node);
 
   return (
@@ -4978,6 +5022,11 @@ export function NodeModal({
           </button>
         </header>
         <div className="modal-actions">
+          <button onClick={() => { void submitGoalReview(); }}
+            disabled={!onReviewOriginalGoal || goalReviewUnavailableReason !== null || reviewBusy}
+            title={goalReviewUnavailableReason ?? undefined} aria-label="Review original goal">
+            {reviewBusy ? "Requesting review…" : "Review original goal"}
+          </button>
           <button onClick={onStop} disabled={!canExecute}>
             <Square size={15} />
             Stop
@@ -5001,12 +5050,14 @@ export function NodeModal({
             <Users size={15} />
             Reassign
           </button>
-          <button onClick={onInsertBefore} disabled={!canExecute}>
+          <button onClick={onInsertBefore} disabled={!canExecute || !!node.goalReview}>
             <Plus size={15} />
             Insert Before
           </button>
           <EditorLaunchMenu onOpenEditor={onOpenEditor} disabled={!canExecute} busy={editorLaunchBusy} />
         </div>
+        {goalReviewUnavailableReason && <p role="status">{goalReviewUnavailableReason}</p>}
+        {reviewMessage && <p role="status">{reviewMessage}</p>}
         {reassignBlockedReason && <p role="status">{reassignBlockedReason}</p>}
         {pickerOpen && <ReassignAgentPicker
           scopeId={JSON.stringify([session.projectId, session.id, node.id])}
@@ -5052,6 +5103,11 @@ export function NodeModal({
           </section>
         )}
         <div className="modal-body">
+          {node.goalReview && <p role="status" aria-label="Advisory review status">
+            Advisory only. {node.goalReview.freshness === "stale" ? "Source changed; stale and unverified." :
+              node.status === "completed" ? "Review process succeeded; goal acceptance remains unverified." :
+              node.status === "failed" ? "Review did not succeed; goal acceptance is unverified." : "Review pending; goal acceptance is unverified."}
+          </p>}
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
           {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} />}
@@ -6870,6 +6926,18 @@ function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasN
 
   return (
     <div className="context-tab">
+      {node.goalReview && <section aria-label="Original-goal review provenance">
+        <p>Original goal: {node.goalReview.binding.originalGoal}</p>
+        <p>Source run: {node.goalReview.binding.manifest.runId}</p>
+        <p>Source checkpoint: {node.goalReview.binding.manifest.afterCheckpointId}</p>
+        <p>Source HEAD: {node.goalReview.binding.manifest.afterHeadCommit}</p>
+        <p>Candidate digest: {node.goalReview.binding.manifestSha256}</p>
+        <p>Acceptance criteria remain unverified; only explicitly recorded criteria may be assessed.</p>
+        {node.goalReview.binding.approvedPlan ? <>
+          <p>Approved Plan Finish: {node.goalReview.binding.approvedPlan.eventId} (seq {node.goalReview.binding.approvedPlan.seq})</p>
+          <pre>{node.goalReview.binding.approvedPlan.text}</pre>
+        </> : <p>Explicit acceptance criteria: Unverified. No approved Plan Finish was recorded for this source.</p>}
+      </section>}
       <dl className="context-grid">
         <dt>Brief</dt>
         <dd>{node.context.brief}</dd>

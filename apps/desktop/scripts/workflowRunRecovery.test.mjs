@@ -2997,6 +2997,7 @@ async function loadMainWorkflowStoreHarness(options = {}) {
         now,
       };
     }`,
+    extractFunction(main, "goalReviewForLane"),
     extractSourceRange(main, "async function reconcileTerminalWorkflowRun", "async function enrichTerminalWorkflowRun"),
     extractSourceRange(main, "function assertTerminalRunEvidence", "async function verifyRunGitIdentityAtCheckpoint"),
     getWorkflowStoreSource,

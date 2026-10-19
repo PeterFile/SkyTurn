@@ -359,6 +359,36 @@
       "height": 200,
       "color": "5",
       "text": "Task: Project file snapshot contract\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: Registered artifact viewing\nEvidence: none\nRisk: Strict descriptor reads and immutable retry/reopen; no new composer UI in this slice"
+    },
+    {
+      "id": "317100ba8ef874af",
+      "type": "text",
+      "x": 680,
+      "y": 1460,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Review an exact run against original goals\nState: Verify\nOwner: Codex\nDepends: none\nEvidence: Goal review deterministic candidate checks\nRisk: Goal review authority and runtime acceptance"
+    },
+    {
+      "id": "3b47da9eb65341b2",
+      "type": "text",
+      "x": 900,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Goal review authority and runtime acceptance\nImpact: Fresh read-only review must not become approval or advance unrelated work; source changes can invalidate findings.\nMitigation: Freeze authoritative goal/run/candidate binding, target only the advisory lane, and verify real Hermes execution plus restart before delivery.\nStatus: Open"
+    },
+    {
+      "id": "6c02903108e0e530",
+      "type": "text",
+      "x": 40,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Goal review deterministic candidate checks\ncommit: none\ntest: Writer log inspected: project-core 305, kernel 289, persistence 434, UI 705, desktop 826 tests passed; build and affected typechecks passed. Independent review and real Hermes/Electron gate pending.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-goal-review-20261019/focused-tests.log"
     }
   ],
   "edges": [
@@ -559,6 +589,22 @@
       "toEnd": "arrow",
       "label": "depends",
       "color": "6"
+    },
+    {
+      "id": "397b30d40ff10af8",
+      "fromNode": "3b47da9eb65341b2",
+      "toNode": "317100ba8ef874af",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "0a3d5e287d3715ba",
+      "fromNode": "317100ba8ef874af",
+      "toNode": "6c02903108e0e530",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
     }
   ]
 }

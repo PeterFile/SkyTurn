@@ -78,6 +78,8 @@ export interface HydrateSelectedNodeActionStateInput extends Omit<BuildSelectedN
 }
 
 const knownFlowEventKinds = new Set<string>([
+  "workflow.goal_review.created",
+  "workflow.goal_review.checked",
   "workflow.user_input",
   "workflow.profile",
   "workflow.intent.accepted",
@@ -139,6 +141,7 @@ export function buildSelectedNodeActionState(input: BuildSelectedNodeActionState
   const laneId = resolveSelectedLaneId(projection, nodeId);
   if (!laneId) return failClosed("Selected node is stale or malformed.");
 
+  if (projection.lanes.find(lane => lane.id === laneId)?.goalReview) return failClosed("Advisory reviews cannot drive Repair, Variant, or Rollback.");
   const beforeCheckpoint = latestCheckpointForLane(projection, sessionId, laneId, nodeId, "before");
   const afterCheckpoint = latestCheckpointForLane(projection, sessionId, laneId, nodeId, "after");
   const checkpoints = checkpointDisplay(beforeCheckpoint, afterCheckpoint);

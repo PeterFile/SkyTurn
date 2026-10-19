@@ -47,6 +47,7 @@ Current architecture and operating contracts:
 - [`docs/natural-workflow-design.md`](docs/natural-workflow-design.md): durable workflow design and acceptance targets; use this README and live code/Git evidence for current capability claims.
 - [`docs/agent-adapters.md`](docs/agent-adapters.md), [`docs/agent-bridge.md`](docs/agent-bridge.md), and [`docs/codex-watchdog-design.md`](docs/codex-watchdog-design.md): adapter support levels, authoritative run evidence, and process supervision boundaries.
 - [`docs/git-worktree-design.md`](docs/git-worktree-design.md): Git, worktree, delivery, checkpoint, and rollback safety boundaries.
+- [`docs/goal-review.md`](docs/goal-review.md): explicit original-goal review, frozen source provenance, advisory findings, and the real verifier acceptance gate.
 
 Current verification entrypoints and scoped acceptance records:
 
@@ -92,6 +93,7 @@ Implemented in the current code:
 - Plan mode has gated Requirements, Design, and Tasks pages. Each page must be approved before the next one is accessible, and an approved plan can convert to a canvas.
 - The node modal has exactly three content tabs: **Output**, **Changes**, and **Context**. Selecting a node targets the bottom composer; details open from the node card **More** button.
 - **Context** displays node/session/worktree facts and `RunEvidence` facts, including status, exit code, checks, artifacts, and error/cancel/timeout reasons.
+- **More → Review original goal** requests a fresh read-only Hermes review of a succeeded Current branch implementation/fix with exact source evidence. Findings are advisory; process success is not goal acceptance or delivery approval. Original goal and source provenance remain available in **Context**.
 - **Changes** can show structured live run changes, git-backed final reconciliation, mismatch state, sanitized `diff2html` preview, and explicit delivery actions.
 - Selected-node composer actions exist for repair, variant, and rollback. Repair starts from the after checkpoint, variant starts from the before checkpoint, and rollback targets the selected node plus downstream nodes.
 - Electron main owns workflow IPC, git/worktree side effects, delivery gates, rollback safety checks, and run evidence lookup. Renderer code does not execute git, shell, filesystem, or SQLite side effects.

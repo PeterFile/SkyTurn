@@ -11346,6 +11346,7 @@ function prepareCandidateManifestRun(
   store: TestWorkflowStore,
   projectRoot: string,
   options: {
+    approvedPlan?: string;
     status?: "succeeded" | "failed";
     digestless?: boolean;
     includeProof?: boolean;
@@ -11354,7 +11355,8 @@ function prepareCandidateManifestRun(
     terminalEvidence?: Partial<RunEvidence>;
   } = {},
 ) {
-  seedStore(store);
+  seedStore(store, undefined, "session-1", options.approvedPlan ? "frozen" : undefined);
+  if (options.approvedPlan) store.claimUserInput({ sessionId: "session-1", inputId: "plan-confirm-frozen", text: options.approvedPlan, now: "2026-08-11T00:00:01.000Z" });
   declareCodeChangeWorkflow(store);
   advanceCodeChangeWorkflowToLane(store, "lane-implementation");
   const identity = {
@@ -12020,19 +12022,21 @@ function seedStore(
   store: ReturnType<typeof createWorkflowStore>,
   target?: { executionTarget: "new_worktree"; selectedBranch: string; baseRef: string },
   sessionId = "session-1",
+  planSessionId?: string,
 ): void {
-  const session = store.createWorkflowSession({
+  const sessionInput = {
     id: sessionId,
     projectId: "project-1",
     title: "Persisted workflow",
     goal: "Implement event sourced workflow",
-    mode: "fast",
+    mode: "fast" as const,
     plannerProfile: "default",
-    transport: "hermes_replay_recovery",
+    transport: "hermes_replay_recovery" as const,
     recoveryReason: "Hermes live chat handle was not available during test setup.",
     ...(target ? { target } : {}),
     now: "2026-06-14T00:00:00.000Z",
-  });
+  };
+  const session = planSessionId ? store.createPlanFinishWorkflowSession({ ...sessionInput, planSessionId }) : store.createWorkflowSession(sessionInput);
   completeInitialPlannerTurn(store, session);
   store.applyWorkflowCardToolCall(
     sessionId,
@@ -12661,3 +12665,148 @@ function workflowContext(sourceRunId: string) {
     causationId: "event-hermes-output",
   };
 }
+
+
+describe("explicit original-goal advisory review", () => {
+  it("freezes backend goal and source once, keeps delivery edges, and reopens exact binding", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const identity = prepareCandidateManifestRun(store, projectRoot);
+    const edges = store.materializeFlowProjection(identity.sessionId).edges;
+    const request = { requestId: "review-original-1", sessionId: identity.sessionId,
+      nodeId: identity.nodeId, sourceRunId: identity.runId };
+    expect(typeof store.createGoalReview).toBe("function");
+    const review = store.createGoalReview(request, "2026-08-11T00:00:06.000Z");
+    expect(review.created).toBe(true);
+    expect(review.binding.originalGoal).toBe(store.materializeCanvasSession(identity.sessionId)!.goal);
+    expect(review.binding.approvedPlan).toBeNull();
+    expect(review.binding.manifest.runId).toBe(identity.runId);
+    expect(store.materializeFlowProjection(identity.sessionId).edges).toEqual(edges);
+    const events = store.listEvents(identity.sessionId);
+    expect(store.createGoalReview(request, "2026-08-11T00:00:07.000Z")).toMatchObject({ created: false, binding: review.binding });
+    expect(() => store.createGoalReview({ ...request, sourceRunId: "another-run" }, "2026-08-11T00:00:07.000Z")).toThrow(/conflict/i);
+    expect(store.listEvents(identity.sessionId)).toEqual(events);
+    expect(store.previewReadyLanes(identity.sessionId, { allowedParallelism: 20 }).readyLanes.some(lane => lane.id === review.binding.reviewNodeId)).toBe(false);
+    const selected = store.scheduleReadyLanes(identity.sessionId, { exactLaneIds: [review.binding.reviewNodeId],
+      allowedParallelism: 2, now: "2026-08-11T00:00:08.000Z" });
+    expect(selected.readyLanes.map(lane => lane.id)).toEqual([review.binding.reviewNodeId]);
+    expect(selected.readyLanes[0]!.runtimePolicy.sandbox).toBe("read-only");
+    store.close();
+    const reopened = createWorkflowStore({ projectRoot });
+    expect(reopened.getGoalReview(identity.sessionId, request.requestId)).toEqual(review.binding);
+    expect(reopened.materializeCanvasSession(identity.sessionId)!.nodes.find(n => n.id === review.binding.reviewNodeId)?.goalReview?.binding).toEqual(review.binding);
+    reopened.close();
+  });
+
+  it("restricts exact scheduling without changing danger authorization or scheduling sibling lanes", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    seedStore(store);
+    for (const id of ["other-ready", "only-requested"]) store.appendWorkflowEvent({ sessionId: "session-1",
+      kind: "workflow.lane.declared", source: "test", payload: { lane: { id, kind: "validation", title: id } },
+      now: "2026-08-11T00:00:01.000Z" });
+    expect(store.scheduleReadyLanes("session-1", { exactLaneIds: ["only-requested"], allowedParallelism: 2,
+      now: "2026-08-11T00:00:02.000Z" }).readyLanes.map(lane => lane.id)).toEqual(["only-requested"]);
+    store.close();
+  });
+});
+
+
+describe("original-goal review evidence boundaries", () => {
+  it("freezes the applicable approved Plan event and ignores later user input", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const plan = "  Requirements\n\naccept value 42\nDesign\nTasks  ";
+    const source = prepareCandidateManifestRun(store, projectRoot, { approvedPlan: plan });
+    store.claimUserInput({ sessionId: source.sessionId, inputId: "plan-confirm-later", text: "Different later Plan", now: "2026-08-11T00:00:06.000Z" });
+    const request = { requestId: "frozen-plan", sessionId: source.sessionId, nodeId: source.nodeId, sourceRunId: source.runId };
+    const { binding } = store.createGoalReview(request, "2026-08-11T00:00:07.000Z");
+    const accepted = store.listEvents(source.sessionId).find(e => e.payload.inputId === "plan-confirm-frozen")!;
+    expect(binding.approvedPlan).toEqual({ eventId: accepted.id, seq: accepted.seq, text: accepted.payload.text });
+    store.claimUserInput({ sessionId: source.sessionId, inputId: "new-user-input", text: "Goal now changed", now: "2026-08-11T00:00:08.000Z" });
+    expect(store.createGoalReview(request, "2026-08-11T00:00:09.000Z").binding).toEqual(binding);
+    expect(store.createGoalReview({ ...request, requestId: "deliberate-second" }, "2026-08-11T00:00:10.000Z").binding.reviewNodeId).not.toBe(binding.reviewNodeId);
+    store.close();
+  });
+
+  it.each(["failed", "digestless", "inactive", "rolled_back", "source-mismatch"])("rejects %s sources without mutation", async (mode) => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const source = prepareCandidateManifestRun(store, projectRoot, { status: mode === "failed" ? "failed" : "succeeded", digestless: mode === "digestless" });
+    if (mode === "inactive" || mode === "rolled_back") store.appendWorkflowEvent({ sessionId: source.sessionId, kind: "workflow.lane.declared", source: "fixture",
+      payload: { lane: { id: source.laneId, kind: "implementation", status: "completed", rollbackStatus: mode } }, now: "2026-08-11T00:00:06.000Z" });
+    const events = store.listEvents(source.sessionId);
+    expect(() => store.createGoalReview({ requestId: "unavailable", sessionId: source.sessionId, nodeId: source.nodeId,
+      sourceRunId: mode === "source-mismatch" ? "old-run" : source.runId }, "2026-08-11T00:00:07.000Z")).toThrow();
+    expect(store.listEvents(source.sessionId)).toEqual(events);
+    store.close();
+  });
+
+  it("rejects forged binding, dependency edges, retries, reassign and Repair sources", async () => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const source = prepareCandidateManifestRun(store, projectRoot);
+    const { binding } = store.createGoalReview({ requestId: "advisory-only", sessionId: source.sessionId, nodeId: source.nodeId, sourceRunId: source.runId }, "2026-08-11T00:00:06.000Z");
+    const events = store.listEvents(source.sessionId);
+    for (const kind of ["workflow.goal_review.created", "workflow.goal_review.checked"] as const) expect(() => store.appendWorkflowEvent({ sessionId: source.sessionId,
+      kind, source: "workflow_store", payload: { binding }, now: "2026-08-11T00:00:07.000Z" })).toThrow(/transactional/);
+    for (const [from, to] of [[source.laneId, binding.reviewNodeId], [binding.reviewNodeId, "lane-validation"]]) expect(() => store.appendWorkflowEvent({ sessionId: source.sessionId,
+      kind: "workflow.edge.declared", source: "test", payload: { edge: { id: "forged-edge", sourceLaneId: from, targetLaneId: to } }, now: "2026-08-11T00:00:07.000Z" })).toThrow(/Advisory/);
+    expect(() => store.requestNodeRepair({ sessionId: source.sessionId, nodeId: binding.reviewNodeId, laneId: binding.reviewNodeId,
+      checkpointId: binding.manifest.afterCheckpointId, now: "2026-08-11T00:00:07.000Z" })).toThrow(/Advisory/);
+    expect(() => store.reassignWorkflowLane({ requestId: "reassign", sessionId: source.sessionId, laneId: binding.reviewNodeId, agentKind: "codex", now: "2026-08-11T00:00:07.000Z" })).toThrow(/Advisory/);
+    expect(store.listEvents(source.sessionId)).toEqual(events);
+    store.close();
+  });
+
+  it.each(["failed", "cancelled", "timed-out", "succeeded"] as const)("reopens exact %s evidence/output without approval or automatic repair", async status => {
+    const projectRoot = await makeTempRoot();
+    const store = createWorkflowStore({ projectRoot });
+    const source = prepareCandidateManifestRun(store, projectRoot);
+    const { binding } = store.createGoalReview({ requestId: "terminal-review", sessionId: source.sessionId, nodeId: source.nodeId, sourceRunId: source.runId }, "2026-08-11T00:00:06.000Z");
+    const lane = store.scheduleReadyLanes(source.sessionId, { exactLaneIds: [binding.reviewNodeId], now: "2026-08-11T00:00:07.000Z" }).readyLanes[0]!;
+    const output = "  Findings\nvalue=41\n\nUnverified\n  goal acceptance\n";
+    const terminal: import("./workflowStore.js").RecordRunResultInput = { sessionId: source.sessionId, laneId: lane.id, segmentId: lane.segmentId, runId: lane.runId, agentKind: "hermes",
+      outputSummary: "Metadata only", runEvents: [{ protocolVersion: 1, runId: lane.runId, seq: 1, timestamp: "2026-08-11T00:00:08.000Z", kind: "output", payload: { text: output } }],
+      evidence: { runId: lane.runId, status, exitCode: status === "succeeded" ? 0 : null, changesetId: null, checks: [], artifacts: [], review: null,
+        errorReason: status === "failed" || status === "timed-out" ? "Unverified" : null, cancelReason: status === "cancelled" ? "Stopped" : null, completedAt: "2026-08-11T00:00:08.000Z" },
+      now: "2026-08-11T00:00:08.000Z" };
+    store.recordRunResult(terminal);
+    store.recordGoalReviewFreshness(binding, "stale", terminal.now);
+    const before = store.listEvents(source.sessionId);
+    store.close();
+    const reopened = createWorkflowStore({ projectRoot });
+    const node = reopened.materializeCanvasSession(source.sessionId)!.nodes.find(n => n.id === lane.id)!;
+    expect(node.status).toBe(status === "succeeded" ? "completed" : "failed");
+    expect(node.goalReview?.freshness).toBe("stale");
+    expect(node.outputDeltas?.[0]?.payload.text).toBe(output);
+    reopened.recordRunResult(terminal);
+    expect(reopened.listEvents(source.sessionId)).toEqual(before);
+    expect(() => reopened.recordRunResult({ ...terminal, evidence: { ...terminal.evidence, status: status === "succeeded" ? "failed" : "succeeded", exitCode: status === "succeeded" ? 1 : 0 } })).toThrow();
+    expect(reopened.listEvents(source.sessionId)).toEqual(before);
+    expect(reopened.getLoopEngineeringState(source.sessionId).nextAction.laneId).not.toBe(lane.id);
+    expect(reopened.materializeFlowProjection(source.sessionId).evidence.find(e => e.laneId === lane.id)?.runEvidence).toEqual(terminal.evidence);
+    reopened.close();
+  });
+});
+
+
+it("untrusted intents cannot spoof advisory identity or use advisory provenance as a dependency", async () => {
+  const projectRoot = await makeTempRoot();
+  const store = createWorkflowStore({ projectRoot });
+  const source = prepareCandidateManifestRun(store, projectRoot);
+  const { binding } = store.createGoalReview({ requestId: "untrusted-review", sessionId: source.sessionId, nodeId: source.nodeId, sourceRunId: source.runId }, "2026-08-11T00:00:06.000Z");
+  const edges = store.materializeFlowProjection(source.sessionId).edges;
+  const lanes = store.materializeFlowProjection(source.sessionId).lanes;
+  for (const [index, operations] of [
+    [{ type: "ProposeLanes", lanes: [{ id: "forged", kind: "goal_review", title: "Forged", goalReview: { binding } }] }],
+    [{ type: "DeclareEdge", sourceLaneId: binding.reviewNodeId, targetLaneId: "lane-commit" }],
+    [{ type: "ProposeLanes", lanes: [{ id: "uses-review", kind: "implementation", title: "Uses advisory", dependsOn: [binding.reviewNodeId] }] }],
+    [{ type: "ReplanFromEvidence", laneId: binding.reviewNodeId, evidenceId: "report-prose" }],
+  ].entries()) {
+    expect(store.applyWorkflowIntent({ intentId: `spoof-${index}`, sessionId: source.sessionId, operations }, "2026-08-11T00:00:07.000Z").ok).toBe(false);
+    expect(store.materializeFlowProjection(source.sessionId).edges).toEqual(edges);
+    expect(store.materializeFlowProjection(source.sessionId).lanes).toEqual(lanes);
+  }
+  store.close();
+});

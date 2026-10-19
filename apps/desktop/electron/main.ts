@@ -29,6 +29,8 @@ import type {
   WorkflowSchedulingControlRequest,
 } from "@skyturn/persistence" with { "resolution-mode": "import" };
 import type {
+  GoalReviewRequest,
+  GoalReviewBinding,
   AgentDescriptor,
   CanvasSession,
   PlanBootstrapRequest,
@@ -339,6 +341,7 @@ interface FlowProjectionLike {
     laneKind?: string;
     agentKind?: string;
     executable?: boolean;
+    goalReview?: unknown;
   }>;
   segments: Array<{
     id: string;
@@ -775,6 +778,11 @@ interface WorkflowSegmentRendererFacts {
 }
 
 interface WorkflowStoreHost {
+  getGoalReview(sessionId: string, requestId: string): GoalReviewBinding | null;
+  prepareGoalReviewSource(input: GoalReviewRequest, now: string): WorkflowCandidateManifest;
+  createGoalReview(input: GoalReviewRequest, now: string): { created: boolean; binding: GoalReviewBinding };
+  assertGoalReviewSource(binding: GoalReviewBinding): void;
+  recordGoalReviewFreshness(binding: GoalReviewBinding, freshness: "current" | "stale" | "unverified", now: string): void;
   pauseWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult;
   resumeWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult;
   listWorkflowSessionIds(): string[];
@@ -1036,6 +1044,11 @@ function workflowRunStartDependencies(): Omit<
       await assertTrustedScheduledRunStartIdentity(input, store);
     },
     prepareBeforeCheckpoint: async (input, store) => {
+      const review = input.sessionId && input.nodeId ? goalReviewForLane(store, input.sessionId, input.nodeId) : undefined;
+      if (review) {
+        await requireCurrentGoalReview(input.projectRoot, store, review.binding);
+        return false;
+      }
       if (!isExecutableCheckpointLane(store, input.sessionId, input.nodeId)) return false;
       const identity = await resolveExecutableRunIdentity(input, "before", store);
       const changeset = await reconcileRunChangeset(input.projectRoot, identity, []);
@@ -1812,6 +1825,66 @@ ipcMain.handle("workflow:rollback:apply", workflowHandler(async (projectRoot: st
     });
   });
 }));
+
+// Creation and launch share the normal project admission queue; no sibling progression is owned here.
+ipcMain.handle("workflow:goalReview:create", workflowHandler(async (projectRoot: string, input: unknown) => {
+  assertKnownProjectRoot(projectRoot);
+  const { parseGoalReviewRequest } = await import("@skyturn/project-core");
+  const request = parseGoalReviewRequest(input);
+  const store = await getWorkflowStore(projectRoot, false);
+  const canonicalRoot = await workflowStoreIdentity(projectRoot);
+  return withWorkflowSessionMutationLock(canonicalRoot, request.sessionId, () => enqueueWorkflowProjectAdvance(canonicalRoot, async () => {
+    assertWorkflowAdvanceAdmissionOpen();
+    const previous = store.getGoalReview(request.sessionId, request.requestId);
+    if (!previous) {
+      const session = requireWorkflowCanvasSession(store, request.sessionId);
+      if (session.schedulingState?.status === "paused") throw new Error("Scheduling is paused. Resume explicitly before review.");
+      if (store.listRunningSegments().length > 0) throw new Error("Project is busy. Request review after active runs finish.");
+      const now = new Date().toISOString();
+      const source = store.prepareGoalReviewSource(request, now);
+      await assertGoalReviewLiveCandidate(projectRoot, source);
+    }
+    const result = store.createGoalReview(request, new Date().toISOString());
+    if (result.created) await advanceOneWorkflowSession(projectRoot, store, request.sessionId, "workflow-mutation", [result.binding.reviewNodeId]);
+    broadcastWorkflowProjection(projectRoot, request.sessionId, store, "workflow-mutation");
+    return { protocolVersion: RUN_PROTOCOL_VERSION, sessionId: request.sessionId, created: result.created,
+      reviewNodeId: result.binding.reviewNodeId, projection: store.materializeFlowProjection(request.sessionId),
+      canvasSession: materializeRendererCanvasSession(store, request.sessionId) };
+  }));
+}));
+
+async function assertGoalReviewLiveCandidate(projectRoot: string, manifest: WorkflowCandidateManifest): Promise<void> {
+  if (manifest.executionTarget !== "current_branch") throw new Error("Original-goal review requires Current branch.");
+  const root = await fs.realpath(projectRoot);
+  const { captureCandidateDeliveryReviewSnapshot } = await import("@skyturn/git-worktree/node");
+  try {
+    await captureCandidateDeliveryReviewSnapshot({ projectRoot: root, worktreePath: root,
+      expected: candidateCommitExpectationFromManifest(manifest) });
+  } catch { throw new Error("Original-goal review source changed or cannot be verified against live Git."); }
+}
+
+function goalReviewForLane(store: WorkflowStoreHost, sessionId: string, laneId: string) {
+  return requireWorkflowCanvasSession(store, sessionId).nodes.find(node => node.id === laneId)?.goalReview;
+}
+
+async function requireCurrentGoalReview(projectRoot: string, store: WorkflowStoreHost, binding: GoalReviewBinding): Promise<void> {
+  try {
+    store.assertGoalReviewSource(binding);
+    await assertGoalReviewLiveCandidate(projectRoot, binding.manifest);
+  } catch {
+    store.recordGoalReviewFreshness(binding, "stale", new Date().toISOString());
+    throw new Error("Original-goal review source changed; review did not launch.");
+  }
+}
+
+async function checkGoalReviewFreshness(projectRoot: string, store: WorkflowStoreHost, binding: GoalReviewBinding): Promise<void> {
+  let freshness: "current" | "stale" = "current";
+  try {
+    store.assertGoalReviewSource(binding);
+    await assertGoalReviewLiveCandidate(projectRoot, binding.manifest);
+  } catch { freshness = "stale"; }
+  store.recordGoalReviewFreshness(binding, freshness, new Date().toISOString());
+}
 
 ipcMain.handle("workflow:repair:create", workflowHandler(async (projectRoot: string, input: WorkflowCheckpointSuccessorInput) => {
   assertKnownProjectRoot(projectRoot);
@@ -3127,7 +3200,7 @@ async function compensateTerminalPersistenceFailure(failure: TerminalPersistence
     const cause = terminalWorkflowBroadcastCause(store, segment);
     // Start may be awaiting this durable compensation while holding the launch queue.
     void observeWorkflowTerminalReconciliation(async () => {
-      await advanceWorkflowSession(projectRoot, store, segment.sessionId, false, cause);
+      if (!goalReviewForLane(store, segment.sessionId, segment.laneId)) await advanceWorkflowSession(projectRoot, store, segment.sessionId, false, cause);
       broadcastWorkflowProjection(projectRoot, segment.sessionId, store, cause);
     });
   } catch {
@@ -3193,14 +3266,14 @@ async function reconcileTerminalRunEvent(bridge: AgentBridgeHost, event: unknown
   if (reconciled) {
     if (!workflowAdvanceAdmissionOpen) return;
     const cause = terminalWorkflowBroadcastCause(readyStore, initialSegment);
-    if (!advancedDuringReconciliation) {
+    if (!advancedDuringReconciliation && !goalReviewForLane(readyStore, initialSegment.sessionId, initialSegment.laneId)) {
       await advanceWorkflowSession(projectRoot, readyStore, initialSegment.sessionId, false, cause);
     }
     broadcastWorkflowProjection(projectRoot, initialSegment.sessionId, readyStore, cause);
   }
 }
 
-async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost> {
+async function getWorkflowStore(projectRoot: string, advance = true): Promise<WorkflowStoreHost> {
   const admissionEpoch = assertWorkflowAdvanceAdmissionOpen();
   const storeIdentity = await workflowStoreIdentity(projectRoot);
   assertWorkflowAdvanceAdmissionOpen(admissionEpoch);
@@ -3236,9 +3309,15 @@ async function getWorkflowStore(projectRoot: string): Promise<WorkflowStoreHost>
           },
         );
       }
+      for (const sessionId of store.listWorkflowSessionIds()) {
+        let session: CanvasSession;
+        try { session = requireWorkflowCanvasSession(store, sessionId); }
+        catch { continue; } // Keep corrupt sessions isolated from their valid siblings.
+        for (const node of session.nodes) if (node.goalReview) await checkGoalReviewFreshness(storeIdentity, store, node.goalReview.binding);
+      }
       assertWorkflowAdvanceAdmissionOpen(admissionEpoch);
       workflowStores.set(storeIdentity, store);
-      for (const sessionId of store.listWorkflowSessionIds()) {
+      for (const sessionId of advance ? store.listWorkflowSessionIds() : []) {
         await advanceWorkflowSession(projectRoot, store, sessionId);
       }
       return store;
@@ -3326,6 +3405,11 @@ async function reconcileTerminalWorkflowRun(
       });
     },
   });
+  const review = goalReviewForLane(store, segment.sessionId, segment.laneId);
+  if (review) {
+    await checkGoalReviewFreshness(projectRoot, store, review.binding);
+    return false;
+  }
   return reconcilePendingPlannerWorkflowIntent(projectRoot, store, segment);
 }
 
@@ -3501,6 +3585,7 @@ async function advanceWorkflowSession(
   sessionId: string,
   strictTarget = false,
   cause: WorkflowBroadcastCause = "workflow-advance",
+  exactLaneIds?: string[],
 ): Promise<void> {
   const admissionEpoch = assertWorkflowAdvanceAdmissionOpen();
   const publishedProjectIdentity = [...workflowStores.entries()].find(([, candidate]) => candidate === store)?.[0];
@@ -3511,11 +3596,11 @@ async function advanceWorkflowSession(
   const current = previous.catch(() => undefined).then(() => enqueueWorkflowProjectAdvance(projectIdentity, async () => {
     const sessionIds = [
       sessionId,
-      ...store.listWorkflowSessionIds().filter((candidate) => candidate !== sessionId),
+      ...(exactLaneIds ? [] : store.listWorkflowSessionIds().filter((candidate) => candidate !== sessionId)),
     ];
     for (const candidate of sessionIds) {
       try {
-        await advanceOneWorkflowSession(projectRoot, store, candidate, cause);
+        await advanceOneWorkflowSession(projectRoot, store, candidate, cause, exactLaneIds);
       } catch (error) {
         if (strictTarget && candidate === sessionId) throw error;
         // A corrupt durable session must not block recovery and launch for its siblings.
@@ -3559,6 +3644,7 @@ async function advanceOneWorkflowSession(
   store: WorkflowStoreHost,
   sessionId: string,
   cause: WorkflowBroadcastCause,
+  exactLaneIds?: string[],
 ): Promise<void> {
   while (true) {
     const canvasSession = store.materializeCanvasSession(sessionId);
@@ -3574,6 +3660,7 @@ async function advanceOneWorkflowSession(
     const allowedParallelism = Math.min(policy.allowedParallelism, remainingProjectCapacity);
     if (allowedParallelism === 0) return;
     const preview = store.previewReadyLanes(sessionId, {
+      exactLaneIds,
       allowedParallelism,
     });
     if (preview.readyLanes.length === 0) return;
@@ -3612,6 +3699,7 @@ async function advanceOneWorkflowSession(
       broadcastWorkflowProjection(projectRoot, sessionId, store, cause);
     }
     const scheduled = store.scheduleReadyLanes(sessionId, {
+      exactLaneIds,
       allowedParallelism,
       authorizedLaneIds,
       now: new Date().toISOString(),
@@ -3842,7 +3930,10 @@ async function buildScheduledWorkflowRunStartInput(
   if (artifactContract.required && artifactContract.declarations.length === 0) {
     throw new Error("Scheduled workflow lane requires a concrete expected artifact declaration.");
   }
-  const ledger = node.agent === "hermes" ? store.buildLedgerSummary(session.id) : undefined;
+  if (node.goalReview) {
+    await requireCurrentGoalReview(projectRoot, store, node.goalReview.binding);
+  }
+  const ledger = node.agent === "hermes" && !node.goalReview ? store.buildLedgerSummary(session.id) : undefined;
   const sandbox = runtime.sandboxForNodeRun(node);
   const prompt = process.platform === "darwin"
     ? runtime.buildPromptForNodeRun(session, node, ledger, "darwin-host-browser-capture")
@@ -3852,7 +3943,7 @@ async function buildScheduledWorkflowRunStartInput(
     runId: segment.runId,
     nodeId: node.id,
     sessionId: session.id,
-    ...(node.agent === "hermes"
+    ...(node.agent === "hermes" && !node.goalReview
       ? {
           plannerSessionId: session.hermesPlannerSessionId,
           plannerInputId: segment.runId,
@@ -6563,6 +6654,12 @@ async function assertTrustedScheduledRunStartIdentity(
   input: StartAgentRunInput,
   store: WorkflowStoreHost,
 ): Promise<void> {
+  const review = input.sessionId && input.nodeId ? goalReviewForLane(store, input.sessionId, input.nodeId) : undefined;
+  if (review) {
+    if (input.agentKind !== "hermes" || input.sandbox !== "read-only" || input.hermesSessionHandle !== undefined || input.plannerSessionId !== undefined || input.plannerInputId !== undefined) throw new Error("Advisory review requires fresh read-only Hermes execution.");
+    await requireCurrentGoalReview(input.projectRoot, store, review.binding);
+    return;
+  }
   if (isExecutableCheckpointLane(store, input.sessionId, input.nodeId)) {
     await resolveExecutableRunIdentity(input, "before", store);
     return;
@@ -6704,7 +6801,7 @@ function isExecutableCheckpointLane(
   if (typeof sessionId !== "string" || !sessionId.trim() || typeof nodeId !== "string" || !nodeId.trim()) return false;
   const projection = store.materializeFlowProjection(sessionId) as FlowProjectionLike;
   const lane = projection.lanes.find((item) => item.id === nodeId);
-  return Boolean(lane && lane.laneKind !== "planner" && lane.executable !== false);
+  return Boolean(lane && !lane.goalReview && lane.laneKind !== "planner" && lane.executable !== false);
 }
 
 function assertTerminalRunEvidence(evidence: unknown, runId: string): void {
