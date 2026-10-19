@@ -1845,7 +1845,10 @@ ipcMain.handle("workflow:goalReview:create", workflowHandler(async (projectRoot:
       await assertGoalReviewLiveCandidate(projectRoot, source);
     }
     const result = store.createGoalReview(request, new Date().toISOString());
-    await advanceOneWorkflowSession(projectRoot, store, request.sessionId, "workflow-mutation", [result.binding.reviewNodeId]);
+    // Validate replay identity first; pending reviews require an idle project, including New worktree sessions.
+    if (store.listRunningSegments().length === 0) {
+      await advanceOneWorkflowSession(projectRoot, store, request.sessionId, "workflow-mutation", [result.binding.reviewNodeId]);
+    }
     broadcastWorkflowProjection(projectRoot, request.sessionId, store, "workflow-mutation");
     return { protocolVersion: RUN_PROTOCOL_VERSION, sessionId: request.sessionId, created: result.created,
       reviewNodeId: result.binding.reviewNodeId, projection: store.materializeFlowProjection(request.sessionId),

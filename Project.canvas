@@ -368,7 +368,7 @@
       "width": 280,
       "height": 200,
       "color": "3",
-      "text": "Task: Review an exact run against original goals\nState: Verify\nOwner: Codex\nDepends: none\nEvidence: Goal review deterministic candidate checks\nRisk: Goal review authority and runtime acceptance"
+      "text": "Task: Review an exact run against original goals\nState: Verify\nOwner: Codex\nDepends: none\nEvidence: Goal review residual regression gates\nRisk: Goal review authority and runtime acceptance"
     },
     {
       "id": "3b47da9eb65341b2",
@@ -389,6 +389,26 @@
       "height": 180,
       "color": "4",
       "text": "Evidence: Goal review deterministic candidate checks\ncommit: none\ntest: Writer log inspected: project-core 305, kernel 289, persistence 434, UI 705, desktop 826 tests passed; build and affected typechecks passed. Independent review and real Hermes/Electron gate pending.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-goal-review-20261019/focused-tests.log"
+    },
+    {
+      "id": "ba16615bc7390683",
+      "type": "text",
+      "x": 440,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Goal review corrected gates and remaining blockers\ncommit: none\ntest: 75cd8b6: root build/lint/typecheck/test --concurrency=1 passed; Flow Kernel acceptance and Electron native rebuild passed. Focused review BLOCK; parent reproduced New worktree sibling busy-gate bypass and stale cleanupConfirmed failure result. Real Agent gate not run.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-goal-review-20261019/parent-blocker-validation.json"
+    },
+    {
+      "id": "a010710e9e7a04c7",
+      "type": "text",
+      "x": 40,
+      "y": 1860,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Goal review residual regression gates\ncommit: none\ntest: Node ABI115: affected scheduling and acceptance-helper files 32/32 passed, zero skips; New worktree busy replay red-to-green; inventory error/nonzero/zero receipt checks passed; desktop typecheck uncached passed. Real Hermes/Electron and exact-head CI remain pending.\nbuild: none\nmanual: none\nartifact: apps/desktop/scripts/workflowScheduling.test.mjs; apps/desktop/scripts/goalReviewUiAcceptance.test.mjs"
     }
   ],
   "edges": [
@@ -602,6 +622,22 @@
       "id": "0a3d5e287d3715ba",
       "fromNode": "317100ba8ef874af",
       "toNode": "6c02903108e0e530",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "972c2817101e3907",
+      "fromNode": "317100ba8ef874af",
+      "toNode": "ba16615bc7390683",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "ff1073fdbff4a954",
+      "fromNode": "317100ba8ef874af",
+      "toNode": "a010710e9e7a04c7",
       "toEnd": "arrow",
       "label": "evidence",
       "color": "4"

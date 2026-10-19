@@ -94,7 +94,7 @@ agentBridge = testBridge;
 export { buildScheduledWorkflowRunStartInput, advanceWorkflowSession, enqueueWorkflowProjectAdvance, getWorkflowStore, openedProjectRoots,
   planProjectIdentities, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, workflowStores,
   compensateTerminalPersistenceFailure, workflowTerminalReconciliationTasks,
-  workflowProjectAdvanceTails, workflowSessionMutationLocks, workflowStoreOperationTasks };` });
+  workflowProjectAdvanceTails, workflowSessionMutationLocks, workflowStoreOperationTasks, MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT };` });
   loader.load(join(repo, "apps/desktop/electron/preload.ts"));
   const { createWorkflowStore } = loader.load(join(repo, "packages/persistence/src/workflowStore.ts"));
   let store = createWorkflowStore({ projectRoot });
@@ -516,4 +516,78 @@ test("pending goal-review replay honors pause and busy gates without source rebi
   await h.api.workflow.reviewOriginalGoal(h.projectRoot, input);
   assert.equal(h.runs.length, 0);
   assert.deepEqual(JSON.parse(JSON.stringify(h.store.getGoalReview(input.sessionId, input.requestId))), JSON.parse(JSON.stringify(binding)));
+});
+
+test("pending goal-review replay waits for a New worktree sibling despite spare capacity", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  h.seed("idle-sibling");
+  const input = { requestId: "worktree-busy-replay", sessionId: fixture.identity.sessionId, nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId };
+  const { binding } = h.store.createGoalReview(input, now);
+  const edges = h.store.materializeFlowProjection(input.sessionId).edges;
+  const sibling = h.store.createWorkflowSession({ id: "worktree-sibling", projectId: "project-1", title: "Worktree sibling",
+    goal: "Independent work", mode: "fast", target: { executionTarget: "new_worktree", selectedBranch: "main" },
+    plannerProfile: "default", transport: "hermes_replay_recovery", recoveryReason: "Test fixture.", now });
+  const claimSibling = runId => h.store.claimPlannerRunStart({ sessionId: sibling.id, laneId: sibling.plannerLaneId,
+    runId, agentKind: "hermes", worktreePath: h.projectRoot, now }).segment;
+  const busy = claimSibling("busy-worktree-planner");
+  assert.equal(h.store.listRunningSegments().length, 1);
+  assert.ok(h.store.listRunningSegments().length < h.main.MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT);
+  const snapshot = () => [input.sessionId, sibling.id, "idle-sibling"].map(id => h.store.listEvents(id));
+  const beforeBusy = snapshot();
+  await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, { ...input, sourceRunId: "conflicting-source" }), /conflict/);
+  assert.deepEqual(snapshot(), beforeBusy, "Busy admission must not hide identity conflicts or write events.");
+  const waiting = await h.api.workflow.reviewOriginalGoal(h.projectRoot, input);
+  assert.equal(waiting.created, false);
+  assert.equal(waiting.reviewNodeId, binding.reviewNodeId);
+  assert.equal(h.runs.length, 0, "A running New worktree sibling must keep the pending review gated.");
+  assert.equal(waiting.canvasSession.nodes.find(node => node.id === binding.reviewNodeId).status, "pending");
+  assert.deepEqual(snapshot(), beforeBusy);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.store.getGoalReview(input.sessionId, input.requestId))), JSON.parse(JSON.stringify(binding)));
+
+  h.store.recordRunResult({ ...busy, evidence: evidence(busy.runId), outputSummary: "", now });
+  h.store.recordPlannerIntentReconciled(busy, now);
+  const siblingAfterTerminal = h.store.listEvents(sibling.id);
+  const claims = agentBridgeModule.createDurableRunClaimStore({ root: join(dirname(h.projectRoot), "replay-claims") });
+  let claimAttempts = 0;
+  h.start(async start => {
+    claimAttempts++;
+    assert.equal(await claims.publish(h.projectRoot, { sessionId: start.sessionId, nodeId: start.nodeId, runId: start.runId,
+      agentKind: "hermes", startedAt: now, startFingerprint: agentBridgeModule.createAgentRunStartFingerprint(start) }), "published");
+  });
+  const started = await Promise.all([h.api.workflow.reviewOriginalGoal(h.projectRoot, input), h.api.workflow.reviewOriginalGoal(h.projectRoot, input)]);
+  assert.ok(started.every(result => !result.created && result.reviewNodeId === binding.reviewNodeId));
+  assert.equal(h.runs.length, 1);
+  assert.equal(claimAttempts, 1);
+  const run = h.runs[0];
+  assert.equal(run.nodeId, binding.reviewNodeId);
+  assert.equal(run.sandbox, "read-only");
+  assert.equal(run.hermesSessionHandle, undefined);
+  assert.equal(run.plannerSessionId, undefined);
+  assert.equal((await claims.read(h.projectRoot, run.runId)).kind, "valid");
+  assert.deepEqual(h.store.listEvents(sibling.id), siblingAfterTerminal);
+
+  const anotherBusy = claimSibling("another-worktree-planner");
+  assert.equal(h.store.listRunningSegments().length, 2);
+  assert.ok(h.store.listRunningSegments().length < h.main.MAX_MAIN_WORKFLOW_RUNS_PER_PROJECT);
+  const beforeRunningReplay = snapshot();
+  await h.api.workflow.reviewOriginalGoal(h.projectRoot, input);
+  assert.deepEqual(snapshot(), beforeRunningReplay, "A matching running replay stays idempotent while the project is busy.");
+  await h.main.reconcileTerminalRunEvent(h.bridge, { kind: "status", runId: run.runId, payload: { status: "succeeded" } });
+  const beforeTerminalReplay = snapshot();
+  const terminal = await h.api.workflow.reviewOriginalGoal(h.projectRoot, input);
+  assert.equal(terminal.canvasSession.nodes.find(node => node.id === binding.reviewNodeId).status, "completed");
+  await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, { ...input, sourceRunId: "late-conflict" }), /conflict/);
+  assert.deepEqual(snapshot(), beforeTerminalReplay, "Terminal duplicates and conflicts must not write or progress siblings.");
+  assert.equal(h.runs.length, 1);
+  assert.equal(claimAttempts, 1);
+  assert.equal(h.store.listRunningSegments()[0].runId, anotherBusy.runId);
+  const projection = h.store.materializeFlowProjection(input.sessionId);
+  assert.equal(projection.segments.filter(segment => segment.laneId === binding.reviewNodeId).length, 1);
+  assert.equal(projection.lanes.filter(lane => lane.goalReview).length, 1);
+  assert.deepEqual(projection.edges, edges);
+  assert.equal(h.store.materializeFlowProjection("idle-sibling").segments.length, 0);
+  assert.equal(projection.segments.some(segment => segment.laneId === "unrelated-ready"), false);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.store.getGoalReview(input.sessionId, input.requestId))), JSON.parse(JSON.stringify(binding)));
+  assert.equal(snapshot().flat().some(event => /approval|repair_requested|replan.requested|review_allowed|commit.created|remote_side_effect|delivery\./.test(event.kind)), false);
 });

@@ -132,6 +132,23 @@ export function goalReviewFailureResult(stage, error, evidenceDir, cleanup) {
     evidenceDir, cleanupConfirmed: cleanup?.cleanupConfirmed === true, syntheticSource: true, realVerifierUnverified: true };
 }
 
+export async function confirmGoalReviewProcessCleanup(disposableRoot, cleanup, receipt, inventory = async () =>
+  (await command("ps", ["-axo", "pid=,args="], { maxBuffer: 4 * 1024 * 1024, timeout: 10000 })).stdout) {
+  const closed = cleanup.cleanupConfirmed === true;
+  // A successful close is provisional until the owned-process inventory also confirms it.
+  cleanup.cleanupConfirmed = false;
+  receipt.cleanupConfirmed = false;
+  receipt.checks.ownedProcessCleanup = false;
+  receipt.ownedProcessLeftovers = null;
+  const processes = await inventory();
+  receipt.ownedProcessLeftovers = processes.split("\n").filter(line => line.includes(disposableRoot) && Number(line.trim().split(/\s+/)[0]) !== process.pid).length;
+  assert.equal(receipt.ownedProcessLeftovers, 0, "Owned processes remain after close.");
+  assert.ok(closed, "Owned process shutdown was not confirmed.");
+  cleanup.cleanupConfirmed = true;
+  receipt.cleanupConfirmed = true;
+  receipt.checks.ownedProcessCleanup = true;
+}
+
 // Every expression here reads the visible renderer. No protected projection read can materialize this oracle.
 export async function readGoalReviewDom(cdp, { reviewId, terminal = false, waitMs = 15000 } = {}) {
   assert.ok(Number.isInteger(waitMs) && waitMs > 0 && waitMs <= timeoutMs);
@@ -408,10 +425,7 @@ export async function runGoalReviewUiAcceptance() {
     await saveGoalReviewReceipt(evidenceDir, root, receipt);
     const finalClose = await closeOwned(true);
     assert.ok(finalClose.ok && finalClose.cleanupConfirmed, "Owned process shutdown failed.");
-    const inventory = (await command("ps", ["-axo", "pid=,args="], { maxBuffer: 4 * 1024 * 1024, timeout: 10000 })).stdout;
-    receipt.ownedProcessLeftovers = inventory.split("\n").filter(line => line.includes(root) && Number(line.trim().split(/\s+/)[0]) !== process.pid).length;
-    assert.equal(receipt.ownedProcessLeftovers, 0);
-    receipt.checks.ownedProcessCleanup = true;
+    await confirmGoalReviewProcessCleanup(root, cleanup, receipt);
     assert.ok(Object.values(receipt.checks).every(value => value === true));
     stage = "receipt";
     receipt.ok = true;

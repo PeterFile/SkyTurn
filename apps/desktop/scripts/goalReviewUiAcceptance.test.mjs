@@ -147,6 +147,47 @@ test("failure diagnostics preserve cleanup truth and expose only stage/code/evid
   assert.doesNotMatch(JSON.stringify(result), /private-capability|private\/path|provider stream/);
 });
 
+for (const inventoryCase of ["error", "leftover", "empty"]) test(`owned-process inventory ${inventoryCase} controls cleanup truth and retained receipt`, async (t) => {
+  const module = await import("./goalReviewUiAcceptance.mjs");
+  assert.equal(typeof module.confirmGoalReviewProcessCleanup, "function");
+  const { mkdtemp, mkdir, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const root = await mkdtemp(join(tmpdir(), "residual-goal-review-cleanup-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const disposable = join(root, "disposable"), evidenceDir = join(root, "evidence");
+  await mkdir(disposable); await mkdir(evidenceDir);
+  const cleanup = { ok: true, cleanupConfirmed: true };
+  const screenshot = { name: "report-before.png", bytes: 64, sha256: "a".repeat(64) };
+  const receipt = { version: 1, ok: false, stage: "owned-process-cleanup", code: null, cleanupConfirmed: true,
+    evidenceDir, screenshots: [screenshot], candidate: null, checks: { ownedProcessCleanup: null } };
+  const inventory = async () => {
+    assert.equal(cleanup.cleanupConfirmed, false, "Close success is provisional until inventory is known.");
+    assert.equal(receipt.cleanupConfirmed, false);
+    if (inventoryCase === "error") throw new Error("Private process inventory unavailable.");
+    return `${process.pid} acceptance ${disposable}\n22 unrelated\n` + (inventoryCase === "leftover" ? `99999 owned ${disposable}\n` : "");
+  };
+  let failure;
+  try { await module.confirmGoalReviewProcessCleanup(disposable, cleanup, receipt, inventory); }
+  catch (error) { failure = error; }
+  const confirmed = inventoryCase === "empty";
+  assert.equal(Boolean(failure), !confirmed);
+  assert.equal(cleanup.cleanupConfirmed, confirmed);
+  assert.equal(receipt.cleanupConfirmed, confirmed);
+  assert.equal(receipt.checks.ownedProcessCleanup, confirmed);
+  assert.equal(receipt.ownedProcessLeftovers, inventoryCase === "error" ? null : inventoryCase === "leftover" ? 1 : 0);
+  // An independent earlier predicate can fail even when cleanup was fully confirmed.
+  const result = module.goalReviewFailureResult(receipt.stage, failure ?? Object.assign(new Error("Earlier predicate failed."), { code: "ERR_ASSERTION" }), evidenceDir, cleanup);
+  assert.equal(result.ok, false);
+  assert.equal(result.cleanupConfirmed, confirmed);
+  Object.assign(receipt, { ok: result.ok, code: result.code, cleanupConfirmed: result.cleanupConfirmed });
+  const file = await module.saveGoalReviewReceipt(evidenceDir, disposable, receipt);
+  const saved = JSON.parse(await readFile(file, "utf8"));
+  assert.deepEqual(saved, receipt);
+  assert.deepEqual(saved.screenshots, [screenshot]);
+  assert.doesNotMatch(JSON.stringify(saved), /Private process inventory/);
+});
+
 
 test("restart DOM is asserted before protected projection corroboration", async () => {
   const { verifyGoalReviewRestart } = await import("./goalReviewUiAcceptance.mjs");
