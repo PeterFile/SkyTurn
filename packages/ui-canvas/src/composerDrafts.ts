@@ -158,6 +158,17 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
       if (current?.text && !append) throw new Error("Append to the existing Repair draft explicitly, or clear its text first.");
       write(key, current?.text ? `${current.text}\n\n${text}` : text, source);
     },
+    reuseSessionGoal(key: string | null, snapshot: ComposerDraftSnapshot, text: string) {
+      load();
+      const goal = text.trim();
+      if (!key || scopeFromKey(key)?.[0] !== "new" || !goal || (drafts.get(key) ?? EMPTY) !== snapshot) return false;
+      for (const retryKey of retries.keys()) {
+        const [kind, scope, retryGoal] = JSON.parse(retryKey);
+        if (kind === "session" && scope === key && retryGoal === goal) retries.delete(retryKey);
+      }
+      write(key, text);
+      return true;
+    },
     clear(snapshot: ComposerDraftSnapshot) { load(); if (clearCaptured(snapshot)) save(); },
     inputAttempt(snapshot: ComposerDraftSnapshot, createInputId: () => string) {
       load();

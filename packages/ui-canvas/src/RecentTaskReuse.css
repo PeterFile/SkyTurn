@@ -1,0 +1,136 @@
+.recent-task-reuse {
+  min-width: 0;
+  margin-block: 10px;
+  padding: 10px;
+  border: 1px solid var(--sk-border, #3a3a3a);
+  border-radius: 8px;
+  background: var(--sk-surface-muted, #1e1e1e);
+  color: var(--sk-text, #e5e5e5);
+  font-size: 12px;
+}
+
+.recent-task-reuse h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.recent-task-reuse-choices {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.recent-task-reuse-choices legend,
+.recent-task-reuse-status {
+  margin: 0 0 6px;
+  padding: 0;
+  color: var(--sk-text-subtle, #a3a3a3);
+  font-size: 11px;
+}
+
+.recent-task-reuse-list {
+  max-height: 180px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.recent-task-reuse-choice {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 5px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.recent-task-reuse-choice:has(input:checked) {
+  background: var(--sk-surface, #2b2b2c);
+}
+
+.recent-task-reuse-choice input {
+  margin: 0;
+  accent-color: var(--sk-text, #e5e5e5);
+}
+
+.recent-task-reuse-choice span {
+  min-width: 0;
+}
+
+.recent-task-reuse-choice strong,
+.recent-task-reuse-choice small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-task-reuse-choice strong {
+  font-weight: 500;
+}
+
+.recent-task-reuse-choice small {
+  margin-top: 2px;
+  color: var(--sk-text-subtle, #a3a3a3);
+  font-family: var(--sk-font-mono, monospace);
+  font-size: 10px;
+}
+
+.recent-task-reuse-preview {
+  display: -webkit-box;
+  max-height: 4.5em;
+  margin: 8px 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.recent-task-reuse-confirmation {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--sk-border, #3a3a3a);
+}
+
+.recent-task-reuse-confirmation p {
+  margin: 0 0 8px;
+}
+
+.recent-task-reuse-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.recent-task-reuse-actions button {
+  min-height: 30px;
+  padding: 4px 10px;
+  border: 1px solid var(--sk-border, #3a3a3a);
+  border-radius: 5px;
+  background: var(--sk-surface, #2b2b2c);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.recent-task-reuse button:focus-visible,
+.recent-task-reuse input:focus-visible {
+  outline: 2px solid var(--sk-text, #e5e5e5);
+  outline-offset: 2px;
+}
+
+.recent-task-reuse button:disabled,
+.recent-task-reuse-choice:has(input:disabled) {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.recent-task-reuse > .recent-task-reuse-status:last-child {
+  margin-top: 6px;
+  margin-bottom: 0;
+}

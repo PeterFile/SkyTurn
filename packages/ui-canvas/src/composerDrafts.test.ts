@@ -45,6 +45,35 @@ describe("composer drafts", () => {
     expect(reopened.read(repair).source?.runId).toBe("new");
   });
 
+  it("keeps artifact Repair binding isolated from fresh goal reuse and ordinary retries across reopen", () => {
+    const disk = storage();
+    const store = createComposerDraftStore(() => disk);
+    store.appendArtifactRepair(source, "artifact feedback", false);
+    store.edit(intake, "goal");
+    const original = store.sessionAttempt(store.read(intake), target, seed);
+
+    const reopened = createComposerDraftStore(() => disk);
+    const unused = vi.fn(seed);
+    expect(reopened.sessionAttempt(reopened.read(intake), target, unused).uuid).toBe(original.uuid);
+    expect(unused).not.toHaveBeenCalled();
+    reopened.edit(repair, "edited artifact feedback");
+    const bound = reopened.read(repair);
+    expect(bound.source).toEqual(source);
+    expect(reopened.reuseSessionGoal(intake, reopened.read(intake), "goal")).toBe(true);
+    expect(reopened.read(repair)).toBe(bound);
+    expect(reopened.read(intake).source).toBeUndefined();
+
+    const restored = createComposerDraftStore(() => disk);
+    const fresh = restored.sessionAttempt(restored.read(intake), target, () => ({ ...seed(), uuid: "fresh" }));
+    expect(fresh.uuid).not.toBe(original.uuid);
+    expect(restored.sessionAttempt(restored.read(intake), target, unused).uuid).toBe(fresh.uuid);
+    expect(unused).not.toHaveBeenCalled();
+    expect(restored.read(repair)).toEqual(bound);
+    expect(() => restored.appendArtifactRepair({ ...source, runId: "replaced" }, "stale", true)).toThrow(/source/);
+    expect(restored.read(repair)).toEqual(bound);
+    expect(restored.warning()).toBeNull();
+  });
+
   it("reads legacy v2 text without inventing provenance and upgrades only on edit", () => {
     const disk = storage();
     const raw = JSON.stringify({ version: 2, drafts: [{ key: repair, text: "legacy", version: 3 }], retries: [] });
@@ -147,6 +176,60 @@ describe("composer drafts", () => {
     reopened.edit(intake, "another goal");
     expect(reopened.sessionAttempt(reopened.read(intake), target, () => ({ ...seed(), uuid: "other" })).uuid).toBe("other");
     expect(disk.bytes.get(COMPOSER_DRAFTS_KEY)).not.toMatch(/busy|workspace|nodes|error/);
+  });
+
+  it("reuses a goal with fresh seed identities across targets while preserving unrelated retries and late-clear safety", () => {
+    const disk = storage();
+    const store = createComposerDraftStore(() => disk);
+    const goal = " \tgoal\r\n ";
+    const otherMode = draftScopeKey(["new", "p", "plan"]);
+    const otherProject = draftScopeKey(["new", "p2", "fast"]);
+    const worktree = { executionTarget: "new_worktree" as const, selectedBranch: "dev", baseRef: "dev" };
+    store.edit(intake, goal);
+    const captured = store.read(intake);
+    const old = store.sessionAttempt(captured, target, seed);
+    store.sessionAttempt(captured, worktree, seed);
+    for (const key of [otherMode, otherProject]) {
+      store.edit(key, goal); store.sessionAttempt(store.read(key), target, seed);
+    }
+    store.edit(intake, "other goal");
+    store.sessionAttempt(store.read(intake), target, seed);
+    store.edit(intake, goal);
+    store.edit(followup, goal);
+    store.inputAttempt(store.read(followup), () => "keep-input");
+    expect(store.reuseSessionGoal(intake, store.read(intake), goal)).toBe(true);
+    expect(store.read(intake).text).toBe(goal);
+    expect(store.read(intake)).not.toBe(captured);
+    const reopened = createComposerDraftStore(() => disk);
+    for (const selected of [target, worktree]) {
+      expect(reopened.sessionAttempt(reopened.read(intake), selected, () => ({ ...seed(), uuid: "fresh" })).uuid).toBe("fresh");
+    }
+    for (const key of [otherMode, otherProject]) {
+      expect(reopened.sessionAttempt(reopened.read(key), target, () => ({ ...seed(), uuid: "wrong" })).uuid).toBe(seed().uuid);
+    }
+    expect(reopened.inputAttempt(reopened.read(followup), () => "wrong").inputId).toBe("keep-input");
+    reopened.edit(intake, "other goal");
+    expect(reopened.sessionAttempt(reopened.read(intake), target, () => ({ ...seed(), uuid: "wrong" })).uuid).toBe(seed().uuid);
+    expect(store.sessionAttempt(store.read(intake), target, () => ({ ...seed(), uuid: "new-live" })).uuid).toBe("new-live");
+    old.complete();
+    expect(store.read(intake).text).toBe(goal);
+    expect(store.sessionAttempt(store.read(intake), target, () => ({ ...seed(), uuid: "wrong" })).uuid).toBe("new-live");
+  });
+
+  it("rejects stale or non-New-Session goal replacement without writes or retry retirement", () => {
+    const disk = storage();
+    const store = createComposerDraftStore(() => disk);
+    store.edit(intake, "goal");
+    const captured = store.read(intake);
+    store.sessionAttempt(captured, target, seed);
+    store.edit(intake, "away"); store.edit(intake, "goal");
+    const raw = disk.bytes.get(COMPOSER_DRAFTS_KEY);
+    for (const [key, snapshot, goal] of [[intake, captured, "goal"], [intake, store.read(intake), "  "],
+      [followup, store.read(followup), "goal"], [null, store.read(null), "goal"]] as const) {
+      expect(store.reuseSessionGoal(key, snapshot, goal)).toBe(false);
+    }
+    expect(disk.bytes.get(COMPOSER_DRAFTS_KEY)).toBe(raw);
+    expect(store.sessionAttempt(store.read(intake), target, () => ({ ...seed(), uuid: "wrong" })).uuid).toBe(seed().uuid);
   });
 
   it.each(["{", "null", '{"version":999}', '{"version":1,"drafts":[],"retries":[]}',

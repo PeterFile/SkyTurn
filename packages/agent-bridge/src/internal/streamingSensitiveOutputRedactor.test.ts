@@ -5,6 +5,129 @@ import {
   type StreamingRedactorDiagnostics,
 } from "./streamingSensitiveOutputRedactor.js";
 
+describe("Hermes session announcements", () => {
+  it("redacts every field, colon, and value split while retaining stream identity and whitespace", () => {
+    const input = "safe\r\n \tsession_id \t: \tfresh-native-probe 	 suffix\r\nnext\n";
+    const expected = input.replace("fresh-native-probe", "[redacted]");
+    const markerStart = input.indexOf("fresh-native-probe");
+    const sanitized = Array.from(input, (char, index) =>
+      index === markerStart ? "[redacted]" :
+        index > markerStart && index < markerStart + "fresh-native-probe".length ? "" : char
+    );
+    for (let split = 0; split <= input.length; split += 1) {
+      for (const stream of ["stdout", "stderr"] as const) {
+        const redactor = new StreamingSensitiveOutputRedactor([], undefined, "hermes");
+        const chunks = [
+          ...redactor.push("stdout", input.slice(0, split)),
+          ...redactor.push(stream, input.slice(split)),
+          ...redactor.flush(),
+        ];
+        expect(chunks).toEqual([
+          ...(split ? [{ stream: "stdout", text: sanitized.slice(0, split).join("") }] : []),
+          ...(split < input.length ? [{ stream, text: sanitized.slice(split).join("") }] : []),
+        ]);
+        expect(chunks.map((chunk) => chunk.text).join(""), `split ${split}`).toBe(expected);
+      }
+    }
+  });
+
+  it("handles repeated announcements in alternating one-character streams", () => {
+    const input = "session_id: fresh-one\nsession_id:\tfresh-two\r\n\tsession_id : fresh-three";
+    const redactor = new StreamingSensitiveOutputRedactor([], undefined, "hermes");
+    const chunks = Array.from(input).flatMap((char, index) =>
+      redactor.push(index % 2 ? "stderr" : "stdout", char)
+    );
+    chunks.push(...redactor.flush());
+    expect(chunks.map((chunk) => chunk.text).join("")).toBe(input.replace(/fresh-\w+/g, "[redacted]"));
+    expect(chunks.map((chunk) => chunk.stream)).toEqual(Array.from(input, (_, index) => index % 2 ? "stderr" : "stdout"));
+  });
+
+  it.each(["a", "fresh-雪-💥", "'quoted-token'", '"quoted-token"', String.raw`fresh\u1234`, "fresh,;}]/path:=token"])(
+    "treats the complete first non-whitespace token %s as one value",
+    (value) => {
+      const redactor = new StreamingSensitiveOutputRedactor([], undefined, "hermes");
+      const input = `session_id:\t${value}\u2003safe suffix\r\n`;
+      const chunks = Array.from(input).flatMap((char) => redactor.push("stderr", char));
+      chunks.push(...redactor.flush());
+      expect(chunks.map((chunk) => chunk.text).join("")).toBe("session_id:\t[redacted]\u2003safe suffix\r\n");
+    },
+  );
+
+  it("flushes every truncated prefix and empty value without releasing any value bytes", () => {
+    const prefix = " \tsession_id \t: \t";
+    const input = `${prefix}fresh-truncated-probe`;
+    for (let length = 0; length <= input.length; length += 1) {
+      const redactor = new StreamingSensitiveOutputRedactor([], undefined, "hermes");
+      const chunks = [...redactor.push("stderr", input.slice(0, length)), ...redactor.flush()];
+      expect(chunks.map((chunk) => chunk.text).join(""), `length ${length}`)
+        .toBe(length <= prefix.length ? input.slice(0, length) : `${prefix}[redacted]`);
+      expect(redactor.flush()).toEqual([]);
+    }
+    const redactor = new StreamingSensitiveOutputRedactor([], undefined, "hermes");
+    const empty = "session_id: \t\r\nnext\nsession_id:\n";
+    expect([...redactor.push("stdout", empty), ...redactor.flush()].map((chunk) => chunk.text).join(""))
+      .toBe(empty);
+  });
+
+  it("leaves JSON keys, inline prose, other field spellings, and generic mode unchanged", () => {
+    const negative = '{"session_id":"public-value"}\n  "session_id": "public-value"\nprose session_id: public-value\nxsession_id: public-value\nSession_id: public-value\nsession_id = public-value\nsession_id_extra: public-value\nsess\nion_id: public-value\n';
+    for (const mode of [undefined, "hermes"] as const) {
+      const redactor = new StreamingSensitiveOutputRedactor([], undefined, mode);
+      const input = mode ? negative : `${negative}session_id: public-value\n`;
+      const chunks = Array.from(input).flatMap((char) => redactor.push("stdout", char));
+      chunks.push(...redactor.flush());
+      expect(chunks.map((chunk) => chunk.text).join("")).toBe(input);
+    }
+  });
+
+  it("coexists with every existing encoded known-handle representation", () => {
+    for (const representation of encodedRepresentations("opaque-雪-token")) {
+      const redactor = new StreamingSensitiveOutputRedactor(["opaque-雪-token"], undefined, "hermes");
+      const input = `known ${representation} after\nsession_id: fresh-probe\n`;
+      const chunks = Array.from(input).flatMap((char) => redactor.push("stdout", char));
+      chunks.push(...redactor.flush());
+      expect(chunks.map((chunk) => chunk.text).join("")).toBe("known [redacted] after\nsession_id: [redacted]\n");
+    }
+  });
+
+  it("preserves known-handle matching that overlaps an announcement field and its suffix", () => {
+    for (const handle of ["session_id:known-native-probe", "known-prefix\nsession_id:known-native-probe\nknown-tail"]) {
+      for (let split = 0; split <= handle.length; split += 1) {
+        const redactor = new StreamingSensitiveOutputRedactor([handle], undefined, "hermes");
+        const chunks = [
+          ...redactor.push("stdout", handle.slice(0, split)),
+          ...redactor.push("stderr", handle.slice(split)),
+          ...redactor.flush(),
+        ];
+        expect(chunks.map((chunk) => chunk.text).join(""), `split ${split}`).toBe("[redacted]");
+      }
+    }
+  });
+
+  it("keeps long tokens and prefix whitespace bounded with deterministic linear counters", () => {
+    const input = `${" \t".repeat(4096)}session_id${" \t".repeat(4096)}:${" \t".repeat(4096)}${"fresh-overflow-probe".repeat(8192)}\r\nnext\n`;
+    const results = [false, true].map((tinyChunks) => {
+      const diagnostics = makeDiagnostics();
+      const redactor = new StreamingSensitiveOutputRedactor([], diagnostics, "hermes");
+      const output = (tinyChunks ? Array.from(input) : [input]).flatMap((chunk, index) =>
+        redactor.push(index % 2 ? "stderr" : "stdout", chunk)
+      );
+      output.push(...redactor.flush());
+      expect(Buffer.from(output.map((chunk) => chunk.text).join("")).equals(
+        Buffer.from(input.replace("fresh-overflow-probe".repeat(8192), "[redacted]")),
+      )).toBe(true);
+      expectLinearBound(diagnostics);
+      expect(diagnostics.maxRetainedQueueChars).toBeLessThanOrEqual(128);
+      expect(diagnostics.maxBlockedCarryChars).toBeLessThanOrEqual(128);
+      expect(diagnostics.retainedQueueChars).toBe(0);
+      expect(diagnostics.maxFrontierStates).toBeLessThanOrEqual(512);
+      expect(diagnostics.boundedFrontierWork).toBeLessThanOrEqual(input.length * 8 + 2048);
+      return diagnostics;
+    });
+    expect(results[1]!.operations).toBeGreaterThan(results[0]!.operations);
+  });
+});
+
 describe("StreamingSensitiveOutputRedactor diagnostics", () => {
   it("redacts encoded sensitive values across every same-stream and alternating-stream split", () => {
     const sensitiveValues = ["opaque-token", "opaque-雪-token", "opaque-ÿ-token", "/Users/alice/private/repo"];

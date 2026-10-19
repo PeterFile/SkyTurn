@@ -23,6 +23,140 @@ describe("workflow runtime event merging", () => {
     expect(WorkflowRuntime).not.toHaveProperty("applyCompletedBridgeRunPersistenceResult");
   });
 
+  it.each(["local projection", "desktop observability"] as const)(
+    "preserves exact captured fragments through %s and replay",
+    (mode) => {
+      vi.stubGlobal("window", mode === "desktop observability" ? { devflow: {} } : undefined);
+      try {
+        // Synthetic public deltas exercise renderer reconciliation, not a real CLI run.
+        const runId = "run-session-1-node-code";
+        const deltas = [
+          event(runId, 1, "progress", { text: "  Warning: session store unavailable\r" }),
+          event(runId, 2, "progress", { text: "\n" }),
+          event(runId, 3, "output", { text: "" }),
+          event(runId, 4, "output", { text: "```j" }),
+          event(runId, 5, "changes", { text: "s\nconst x = " }),
+          event(runId, 6, "output", { text: "1;\n```" }),
+          event(runId, 7, "changes", { text: "\t \r\n" }),
+          event(runId, 8, "output", { text: "same" }),
+          event(runId, 9, "progress", { text: "same" }),
+        ];
+        const fragments = deltas.map((delta) => delta.payload.text as string);
+        const node = {
+          ...makeNode({ id: "node-code", agent: "codex", status: "failed", runId }),
+          outputDeltas: deltas,
+        };
+        const workspace = makeWorkspace([node]);
+        workspace.runEvidence[runId] = runEvidenceFor(runId, "cancelled");
+        const unrelated = {
+          ...makeSession([]),
+          id: "session-2",
+          projectId: "project-2",
+          nodes: [makeNode({ id: "other", agent: "codex", status: "running", runId: "run-other" })],
+        };
+        workspace.sessions.push(unrelated);
+
+        const partial = mergeRunEventsIntoWorkspace(workspace, runId, deltas.slice(0, 5).reverse());
+        expect(partial.sessions[0]?.nodes.find((candidate) => candidate.id === node.id)?.output).toEqual(
+          fragments.slice(0, 5),
+        );
+        const next = mergeRunEventsIntoWorkspace(partial, runId, [...deltas].reverse());
+        const replayed = mergeRunEventsIntoWorkspace(next, runId, deltas);
+        const reopened = mergeRunEventsIntoWorkspace(
+          JSON.parse(JSON.stringify(replayed)) as WorkspaceState,
+          runId,
+          deltas,
+        );
+
+        for (const state of [next, replayed, reopened]) {
+          const captured = state.sessions[0]?.nodes.find((candidate) => candidate.id === node.id);
+          expect(captured?.output).toEqual(fragments);
+          expect(captured?.output.join("")).toBe(fragments.join(""));
+          expect(captured?.outputDeltas).toEqual(deltas);
+          expect(captured?.status).toBe("failed");
+          expect(state.runEvidence[runId]).toEqual(workspace.runEvidence[runId]);
+          expect(state.runEvents[runId]).toEqual(deltas);
+          expect(state.sessions[1]).toEqual(unrelated);
+        }
+        expect(next.sessions[0]?.nodes.find((candidate) => candidate.id === node.id)?.outputDeltas).toBe(deltas);
+        expect(next.sessions[1]).toBe(unrelated);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it.each(["local projection", "desktop observability"] as const)(
+    "excludes metadata and non-string delta text from captured output in %s",
+    (mode) => {
+      vi.stubGlobal("window", mode === "desktop observability" ? { devflow: {} } : undefined);
+      try {
+        const runId = "run-session-1-node-code";
+        const workspace = makeWorkspace([
+          makeNode({ id: "node-code", agent: "codex", status: "running", runId }),
+        ]);
+        const next = mergeRunEventsIntoWorkspace(workspace, runId, [
+          event(runId, 1, "status", { status: "running", text: "status metadata" }),
+          event(runId, 2, "error", { message: "error metadata", text: "error text" }),
+          event(runId, 3, "evidence", { text: "evidence metadata" }),
+          event(runId, 4, "approval", { text: "approval metadata" }),
+          event(runId, 5, "progress", { text: 42, summary: "compact summary" }),
+          event(runId, 6, "changes", { text: null, patch: "patch metadata", nested: { text: "nested text" } }),
+          event(runId, 7, "progress", { command: "compact command" }),
+          event(runId, 8, "changes", { files: ["file.ts"] }),
+          event(runId, 9, "output", { text: "  captured\r\n" }),
+        ]);
+
+        expect(next.sessions[0]?.nodes.find((node) => node.id === "node-code")?.output).toEqual([
+          "  captured\r\n",
+        ]);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it.each(["progress", "changes"] as const)(
+    "displays %s diagnostic JSON without applying planner intents or tools",
+    (kind) => {
+      const workspace = makeWorkspace();
+      const runId = "run-session-1-node-1";
+      const intentText = JSON.stringify({
+        intentId: "diagnostic-intent",
+        sessionId: "session-1",
+        operations: [{
+          type: "ProposeLanes",
+          lanes: [{
+            id: "diagnostic-lane",
+            kind: "implementation",
+            title: "Diagnostic only",
+            agentKind: "codex",
+          }],
+        }],
+      });
+      const toolText = JSON.stringify({
+        toolCalls: [{
+          tool: "createWorkflowCard",
+          input: { id: "diagnostic-card", title: "Diagnostic only", agent: "codex", brief: "Do not execute" },
+        }],
+      });
+
+      for (const text of [intentText, toolText]) {
+        const deltas = [event(runId, 1, kind, { text }), event(runId, 2, "output", { text: "stdout text" })];
+        const next = mergeRunEventsIntoWorkspace(workspace, runId, deltas);
+        const replayed = mergeRunEventsIntoWorkspace(next, runId, deltas);
+        for (const state of [next, replayed]) {
+          const session = state.sessions[0] as CanvasSession;
+          expect(session.nodes.map((node) => node.id)).toEqual(["node-1"]);
+          expect(session.edges).toEqual([]);
+          expect(session.nodes[0]?.context.dependencies).toEqual([]);
+          expect(session.nodes[0]?.runtimePolicy).toEqual(workspace.sessions[0]?.nodes[0]?.runtimePolicy);
+          expect(session.nodes[0]?.output).toEqual([text, "stdout text"]);
+        }
+      }
+    },
+  );
+
   it.each([
     ["running", null],
     ["succeeded", "2026-06-10T00:00:01.000Z"],
