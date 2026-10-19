@@ -16,6 +16,85 @@ function storage() {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("composer drafts", () => {
+  const source = { projectId: "p", sessionId: "s", nodeId: "n", runId: "run", afterCheckpointId: "after",
+    artifactPath: ".devflow/acceptance/report.txt" };
+  const repair = draftScopeKey(["node", "p", "s", "n", "repair"]);
+  it("appends artifact feedback explicitly, persists its binding, and preserves other scopes and newer edits", () => {
+    const disk = storage();
+    const store = createComposerDraftStore(() => disk);
+    store.edit(repair, "existing\n"); store.edit(followup, "unrelated");
+    expect(() => store.appendArtifactRepair(source, "feedback", false)).toThrow(/Append/);
+    expect(store.read(repair).text).toBe("existing\n");
+    store.appendArtifactRepair(source, "feedback", true);
+    const captured = store.read(repair);
+    expect(captured.text).toBe("existing\n\n\nfeedback");
+    expect(captured.source).toEqual(source);
+    const reopened = createComposerDraftStore(() => disk);
+    expect(reopened.read(repair)).toEqual(captured);
+    reopened.edit(repair, "edited");
+    expect(reopened.read(repair).source).toEqual(source);
+    reopened.clear(captured);
+    expect(reopened.read(repair).text).toBe("edited");
+    expect(reopened.read(followup).text).toBe("unrelated");
+    for (const change of [{ runId: "new" }, { afterCheckpointId: "new" }, { artifactPath: ".devflow/acceptance/other.txt" }]) {
+      expect(() => reopened.appendArtifactRepair({ ...source, ...change }, "wrong", true)).toThrow(/source/);
+    }
+    expect(reopened.read(repair).text).toBe("edited");
+    reopened.edit(repair, "");
+    reopened.appendArtifactRepair({ ...source, runId: "new" }, "fresh", false);
+    expect(reopened.read(repair).source?.runId).toBe("new");
+  });
+
+  it("keeps artifact Repair binding isolated from fresh goal reuse and ordinary retries across reopen", () => {
+    const disk = storage();
+    const store = createComposerDraftStore(() => disk);
+    store.appendArtifactRepair(source, "artifact feedback", false);
+    store.edit(intake, "goal");
+    const original = store.sessionAttempt(store.read(intake), target, seed);
+
+    const reopened = createComposerDraftStore(() => disk);
+    const unused = vi.fn(seed);
+    expect(reopened.sessionAttempt(reopened.read(intake), target, unused).uuid).toBe(original.uuid);
+    expect(unused).not.toHaveBeenCalled();
+    reopened.edit(repair, "edited artifact feedback");
+    const bound = reopened.read(repair);
+    expect(bound.source).toEqual(source);
+    expect(reopened.reuseSessionGoal(intake, reopened.read(intake), "goal")).toBe(true);
+    expect(reopened.read(repair)).toBe(bound);
+    expect(reopened.read(intake).source).toBeUndefined();
+
+    const restored = createComposerDraftStore(() => disk);
+    const fresh = restored.sessionAttempt(restored.read(intake), target, () => ({ ...seed(), uuid: "fresh" }));
+    expect(fresh.uuid).not.toBe(original.uuid);
+    expect(restored.sessionAttempt(restored.read(intake), target, unused).uuid).toBe(fresh.uuid);
+    expect(unused).not.toHaveBeenCalled();
+    expect(restored.read(repair)).toEqual(bound);
+    expect(() => restored.appendArtifactRepair({ ...source, runId: "replaced" }, "stale", true)).toThrow(/source/);
+    expect(restored.read(repair)).toEqual(bound);
+    expect(restored.warning()).toBeNull();
+  });
+
+  it("reads legacy v2 text without inventing provenance and upgrades only on edit", () => {
+    const disk = storage();
+    const raw = JSON.stringify({ version: 2, drafts: [{ key: repair, text: "legacy", version: 3 }], retries: [] });
+    disk.bytes.set(COMPOSER_DRAFTS_KEY, raw);
+    const store = createComposerDraftStore(() => disk);
+    expect(store.read(repair).source).toBeUndefined();
+    expect(disk.bytes.get(COMPOSER_DRAFTS_KEY)).toBe(raw);
+    store.appendArtifactRepair(source, "feedback", true);
+    expect(createComposerDraftStore(() => disk).read(repair).source).toEqual(source);
+    expect(store.warning()).toBeNull();
+  });
+
+  it.each([null, { extra: "bytes" }, { artifactPath: "/host/report.txt" }, { artifactPath: null }, { nodeId: "other" }, { runId: "/raw/handle" }])("rejects unsafe persisted source metadata atomically (%j)", change => {
+    const disk = storage();
+    const raw = JSON.stringify({ version: 3, drafts: [{ key: repair, text: "kept", version: 1, source: change === null ? null : { ...source, ...change } }], retries: [] });
+    disk.bytes.set(COMPOSER_DRAFTS_KEY, raw);
+    const store = createComposerDraftStore(() => disk);
+    expect(store.warning()).toBeTruthy();
+    store.edit(followup, "memory");
+    expect(disk.bytes.get(COMPOSER_DRAFTS_KEY)).toBe(raw);
+  });
   it("frames every scope and restores exact multiline text synchronously on reopen", () => {
     const disk = storage();
     const store = createComposerDraftStore(() => disk);

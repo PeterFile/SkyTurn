@@ -19,7 +19,7 @@ import {
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
-import { composerDraftStore, draftScopeKey, useComposerDraft } from "./composerDrafts.js";
+import { composerDraftStore, draftScopeKey, useComposerDraft, type ComposerDraftSnapshot } from "./composerDrafts.js";
 import { RecentTaskReuse, type RecentTaskReuseProps } from "./RecentTaskReuse.js";
 import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
@@ -211,7 +211,7 @@ import {
   resolveRunWorktreePath,
   retryCanvasNode,
 } from "./workflowRuntime.js";
-import { RunArtifacts } from "./RunArtifacts.js";
+import { RunArtifacts, type ArtifactRepairDraftRequest } from "./RunArtifacts.js";
 import { addRequirementPlanningNode } from "./composer.js";
 import {
   buildSelectedNodeActionState,
@@ -1028,6 +1028,7 @@ export default function App() {
   const workspaceRef = useRef(workspace);
   const selectedNodeActionScopeRef = useRef<{ sessionId: string; nodeId: string } | null>(null);
   const selectedNodeActionGenerationRef = useRef(0);
+  const artifactRepairInteractionRef = useRef({ key: "" });
   const bottomComposerSubmissionsRef = useRef(new Map<string, BottomComposerSubmissionState>());
   const newSessionSubmissionsRef = useRef(new Map<string, NewSessionSubmissionState>());
   const schedulingAttemptsRef = useRef(new Map<string, SchedulingAttempt>());
@@ -1133,6 +1134,12 @@ export default function App() {
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === inspectedNodeId) ?? null
       : null;
+  const artifactRepairScope = JSON.stringify([activeProject?.id, activeProject?.rootPath, activeProject?.canonicalRootPath,
+    activeSession?.id, inspectedNode?.id, inspectedNode?.runId, selectedNodeId, modalTab, settingsOpen]);
+  if (artifactRepairInteractionRef.current.key !== artifactRepairScope) {
+    artifactRepairInteractionRef.current = { key: artifactRepairScope };
+  }
+  const artifactRepairInteraction = artifactRepairInteractionRef.current;
   const resolvedNewTaskProjectId = resolveSessionProjectId(
     workspace.projects,
     newTaskProjectId,
@@ -1153,6 +1160,7 @@ export default function App() {
   const { text: newTaskGoal, setText: setNewTaskGoal } = newTaskDraft;
   const { text: bottomGoal, setText: setBottomGoal } = bottomDraft;
   const { text: nodeActionText, setText: setNodeActionText } = nodeDraft;
+  const artifactRepairSource = nodeDraft.capture().source;
   const activeNewSessionFailure = activeSession?.kind === "canvas"
     ? [...newSessionSubmissionsRef.current.values()].find((attempt) => (
         attempt.session.id === activeSession.id && attempt.error !== null
@@ -2225,6 +2233,8 @@ export default function App() {
     if (!availability.enabled) { setNodeActionError(availability.reason); return; }
     const submitted = nodeDraft.capture();
     if (submitted.text !== requestText) return;
+    const sourceError = artifactRepairDraftMismatch(submitted, activeProject.id, activeSession, selectedNode, actionState);
+    if (sourceError) { setNodeActionError(sourceError); return; }
     pendingNodeActionsRef.current.set(pendingScope, action);
     const actionScope = { sessionId: activeSession.id, nodeId: selectedNode.id };
     const actionGeneration = selectedNodeActionGenerationRef.current + 1;
@@ -2238,7 +2248,7 @@ export default function App() {
 
     try {
       if (action === "repair") {
-        const repairPayload = actionState?.repairPayload;
+        let repairPayload = actionState?.repairPayload;
         if (!repairPayload) {
           setNodeActionError("Repair requires an after checkpoint.");
           return;
@@ -2249,6 +2259,23 @@ export default function App() {
         }
         const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
         if (!responseGuard) return;
+        if (submitted.source) {
+          const latest = await workflow.getProjection(responseGuard.queryRoot, activeSession.id);
+          const currentSession = canvasSessionForWorkflowAuthority(latest, responseGuard);
+          const currentNode = currentSession?.nodes.find(node => node.id === selectedNode.id);
+          if (!actionStillCurrent() || !currentSession || !currentNode ||
+            !workspaceMatchesWorkflowAuthority(workspaceRef.current, responseGuard) ||
+            workspaceRef.current.activeProjectId !== activeProject.id || workspaceRef.current.activeSessionId !== activeSession.id) {
+            throw new Error("Artifact Repair source changed. Draft retained; reopen its source artifact.");
+          }
+          const currentState = artifactRepairActionState(currentSession, currentNode, latest.projection);
+          const mismatch = artifactRepairDraftMismatch(submitted, activeProject.id, currentSession, currentNode, currentState);
+          const liveSession = workspaceRef.current.sessions.find(session => session.id === activeSession.id);
+          if (mismatch || liveSession?.kind !== "canvas" || liveSession.nodes.find(node => node.id === selectedNode.id)?.runId !== submitted.source.runId) {
+            throw new Error(mismatch ?? "Artifact Repair source run changed. Draft retained.");
+          }
+          repairPayload = currentState.repairPayload!;
+        }
         const result = await workflow.requestRepair(responseGuard.queryRoot, {
           ...repairPayload,
           instruction: requestText,
@@ -2324,6 +2351,41 @@ export default function App() {
       pendingNodeActionsRef.current.delete(pendingScope);
       refreshNodeActionBusy();
     }
+  }
+
+  async function prepareArtifactRepairDraft(request: ArtifactRepairDraftRequest) {
+    if (!activeProject || activeSession?.kind !== "canvas" || !inspectedNode) throw new Error("Artifact Repair source unavailable.");
+    const project = activeProject;
+    const session = activeSession;
+    const node = inspectedNode;
+    const runId = node.runId;
+    const isCurrent = () => request.isCurrent() && artifactRepairInteractionRef.current === artifactRepairInteraction &&
+      workspaceRef.current.activeProjectId === project.id && workspaceRef.current.activeSessionId === session.id &&
+      workspaceRef.current.sessions.some(current => current.kind === "canvas" && current.id === session.id &&
+        current.projectId === project.id && current.nodes.some(currentNode => currentNode.id === node.id && currentNode.runId === runId));
+    if (!isCurrent()) throw new Error("Artifact Repair interaction expired. Reopen its source artifact.");
+    if (!request.feedback.trim()) throw new Error("Enter artifact feedback first.");
+    const workflow = window.devflow?.workflow;
+    if (!workflow?.getProjection || !workflow.requestRepair) throw new Error("Workflow backend unavailable.");
+    const guard = captureWorkflowSessionResponseGuard(project, session.id, session);
+    if (!guard) throw new Error("Workflow project authority unavailable.");
+    const result = await workflow.getProjection(guard.queryRoot, session.id);
+    if (!isCurrent()) throw new Error("Artifact Repair interaction expired. Feedback retained.");
+    const authoritative = canvasSessionForWorkflowAuthority(result, guard);
+    const sourceNode = authoritative?.nodes.find(current => current.id === node.id);
+    if (!authoritative || !sourceNode || sourceNode.runId !== runId || !workspaceMatchesWorkflowAuthority(workspaceRef.current, guard)) {
+      throw new Error("Artifact Repair source changed. Feedback retained.");
+    }
+    const state = artifactRepairActionState(authoritative, sourceNode, result.projection);
+    const availability = selectedNodeActionAvailability(state, true).repair;
+    if (!availability.enabled || !state.repairPayload) throw new Error(availability.reason ?? "Repair requires an after checkpoint.");
+    const source = { projectId: project.id, sessionId: session.id, nodeId: node.id, runId,
+      afterCheckpointId: state.repairPayload.checkpointId, artifactPath: request.artifactPath };
+    const text = `Artifact feedback (current-file-unhashed; current file, not immutable historical bytes)\nArtifact: ${source.artifactPath}\nRun: ${source.runId}\nAfter checkpoint: ${source.afterCheckpointId}\n\n${request.feedback}`;
+    composerDraftStore.appendArtifactRepair(source, text, request.append);
+    setComposerActions(current => new Map(current).set(JSON.stringify([project.id, session.id, node.id]), "repair"));
+    setSelectedNodeId(node.id);
+    setInspectedNodeId(null);
   }
 
   function applyWorkflowActionResult(
@@ -2760,8 +2822,10 @@ export default function App() {
               selectedNodeActionScopeKey={selectedNodeActionScopeKey}
               selectedNodeActionState={selectedNodeActionState}
               nodeActionBusy={selectedNodeActionScopeKey ? pendingNodeActionsRef.current.get(selectedNodeActionScopeKey) ?? null : null}
-              nodeActionError={nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionError : null}
-              nodeActionStatus={nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionStatus : null}
+              nodeActionError={artifactRepairDraftMismatch(nodeDraft.capture(), activeProject.id, activeSession, selectedNode, selectedNodeActionState) ??
+                (nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionError : null)}
+              nodeActionStatus={(nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionStatus : null) ??
+                (artifactRepairSource ? `Artifact Repair draft: ${artifactRepairSource.artifactPath} · run ${artifactRepairSource.runId} · after ${artifactRepairSource.afterCheckpointId}` : null)}
               action={composerAction}
               onActionChange={(action) => {
                 if (selectedNodeActionScopeKey) setComposerActions((current) => new Map(current).set(selectedNodeActionScopeKey, action));
@@ -2847,6 +2911,7 @@ export default function App() {
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
           editorLaunchBusy={editorLaunchBusy === `${activeProject.id}:${activeSession.id}:${inspectedNode.id}:${editorLaunchGenerationRef.current}`}
           onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
+          onDraftRepair={prepareArtifactRepairDraft}
         />
       )}
 
@@ -3229,6 +3294,35 @@ export function selectedNodeActionAvailability(
       : unavailable("Variant requires a before checkpoint."),
     rollback: rollbackActionAvailability(state),
   };
+}
+
+export function artifactRepairDraftMismatch(
+  draft: ComposerDraftSnapshot,
+  projectId: string,
+  session: CanvasSession,
+  node: CanvasNode | null,
+  state: SelectedNodeActionState | null,
+): string | null {
+  const source = draft.source;
+  if (!source) return null;
+  const payload = state?.repairPayload;
+  return source.projectId === projectId && source.sessionId === session.id && session.projectId === projectId &&
+    source.nodeId === node?.id && source.runId === node?.runId &&
+    draft.key === draftScopeKey(["node", projectId, session.id, source.nodeId, "repair"]) &&
+    state?.canCreateRepair && payload?.sessionId === source.sessionId && payload.nodeId === source.nodeId &&
+    payload.checkpointId === source.afterCheckpointId
+    ? null : "Artifact Repair source run or after checkpoint changed/unavailable. Draft retained; reopen the source artifact or clear this draft explicitly.";
+}
+
+export function artifactRepairActionState(session: CanvasSession, node: CanvasNode, projection: unknown): SelectedNodeActionState {
+  const state = buildSelectedNodeActionState({ sessionId: session.id, selectedNode: node, projection });
+  const checkpointId = state.repairPayload?.checkpointId;
+  const checkpoints = isRecord(projection) && Array.isArray(projection.checkpoints) ? projection.checkpoints : [];
+  const matching = checkpoints.filter(checkpoint => isRecord(checkpoint) && checkpoint.id === checkpointId &&
+    checkpoint.sessionId === session.id && checkpoint.nodeId === node.id && checkpoint.laneId === state.repairPayload?.laneId &&
+    checkpoint.phase === "after" && checkpoint.runId === node.runId);
+  if (!checkpointId || matching.length !== 1) throw new Error("Repair requires an after checkpoint for this exact artifact source run. Feedback/draft retained.");
+  return state;
 }
 
 function rollbackActionAvailability(state: SelectedNodeActionState): NodeActionAvailability {
@@ -5001,6 +5095,7 @@ export function NodeModal({
   onOpenEditor,
   editorLaunchBusy,
   onDecisionAnswer,
+  onDraftRepair,
 }: {
   node: CanvasNode;
   isCurrentScope: () => boolean;
@@ -5020,6 +5115,7 @@ export function NodeModal({
   onOpenEditor: (editor?: EditorKind) => void;
   editorLaunchBusy?: boolean;
   onDecisionAnswer: (option: string) => void;
+  onDraftRepair?: (request: ArtifactRepairDraftRequest) => Promise<void>;
 }) {
   const backdropRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
@@ -5169,7 +5265,7 @@ export function NodeModal({
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
-          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} />}
+          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} onDraftRepair={onDraftRepair} isCurrent={isPickerCurrent} />}
         </div>
       </section>
     </div>
@@ -6980,7 +7076,8 @@ function RunEvidenceFacts({ runEvidence }: { runEvidence: RunEvidence }) {
   );
 }
 
-function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasNode; session: CanvasSession; projectRoot: string; runEvidence?: RunEvidence | null }) {
+function ContextTab({ node, session, projectRoot, runEvidence, onDraftRepair, isCurrent }: { node: CanvasNode; session: CanvasSession; projectRoot: string; runEvidence?: RunEvidence | null;
+  onDraftRepair?: (request: ArtifactRepairDraftRequest) => Promise<void>; isCurrent?: () => boolean }) {
   const isNewWorktree = node.worktree.executionTarget === "new_worktree" || !!node.worktree.worktreeId;
 
   return (
@@ -7023,7 +7120,7 @@ function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasN
         {runEvidence ? (
           <Fragment>
             <RunEvidenceFacts runEvidence={runEvidence} />
-            <RunArtifacts projectRoot={projectRoot} session={session} node={node} runEvidence={runEvidence} />
+            <RunArtifacts projectRoot={projectRoot} session={session} node={node} runEvidence={runEvidence} onDraftRepair={onDraftRepair} isCurrent={isCurrent} />
           </Fragment>
         ) : (
           <Fragment>

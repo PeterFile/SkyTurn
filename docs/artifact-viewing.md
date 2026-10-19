@@ -1,5 +1,24 @@
 # 查看已登记的运行产物
 
+## Prepare a Repair draft from artifact feedback
+
+1. Open a node through **More**, choose **Context**, and choose **View** on a registered artifact.
+2. After the preview is read and verified, enter **Artifact feedback** and choose **Draft Repair**. If the source node already has Repair text, explicitly select **Append to existing Repair draft**. Existing text is never silently replaced.
+3. Successful preparation closes the modal and binds the bottom composer to that source node and **Repair**. Edit the draft before sending. Drafting does not request Repair, change the graph, schedule work, or launch an agent.
+4. Only an explicit composer send uses the existing `workflow.requestRepair` path. The backend retains final live authorization.
+
+The local draft stores only its text and a narrow source binding: project, session, node, run, after-checkpoint ID, and exact registered artifact relative path. It does not copy preview bytes, base64, agent output, resume handles, or absolute project/worktree paths into evidence. This provenance is a local submission guard, not trusted completion evidence.
+
+The **current-file-unhashed** warning still applies: a successful preview shows the current file at the registered path, not immutable bytes from run completion. Feedback is plain text; there are no image annotations, executable HTML, arbitrary host-file reads, or additional modal tabs.
+
+Repair requires a valid after checkpoint for the exact source run. Succeeded, failed, cancelled, and timed-out runs are eligible under the same checkpoint rule. Missing checkpoints, failed reads, or unavailable services show a reason and retain entered feedback. Windows viewer support remains unchanged: unavailable reads do not offer a fallback.
+
+Draft bindings survive app reopen. Before sending a bound draft, SkyTurn checks the current selection, run, and after checkpoint again, including a fresh authoritative projection. A mismatch visibly rejects submission and keeps the text. Drafts from different artifact sources cannot be combined, even with Append selected. To intentionally discard an old binding, clear all of that Repair draft's text before preparing a new one. Unrelated node/action, session, and new-task drafts stay separate. Older saved drafts remain readable without an invented source binding.
+
+Closing the preview/modal, changing scope, navigating away and back, or replacing the run invalidates pending interactions. A late read or preparation callback cannot select, overwrite, or clear another draft. Storage failures retain the existing in-memory draft warning; reopening may lose edits that could not be saved.
+
+Changing feedback or Append consent while preparation is waiting invalidates that request, retains the current input, and permits an explicit retry. Image feedback requires successful browser decoding; a pending or failed image cannot prepare a draft. The viewer and feedback controls use the application's theme tokens to keep their labels and preview text readable.
+
 此切片提供 Electron 后端与 preload API，现已接入 UI。UI 在现有节点弹窗的 `Context` 中使用此接口（而非原计划的 Output）；不新增标签页、编辑器或通用文件预览入口。
 
 ## 调用接口

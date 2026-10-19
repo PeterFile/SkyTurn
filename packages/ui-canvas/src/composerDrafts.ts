@@ -1,4 +1,10 @@
 import { useSyncExternalStore } from "react";
+import { parseExpectedArtifactDeclaration } from "@skyturn/project-core";
+
+export type ArtifactRepairSource = Readonly<{
+  projectId: string; sessionId: string; nodeId: string; runId: string;
+  afterCheckpointId: string; artifactPath: string;
+}>;
 
 export type ComposerDraftScope =
   | readonly ["new", string, "fast" | "plan"]
@@ -7,7 +13,7 @@ export type ComposerDraftScope =
 type StorageAccess = Pick<Storage, "getItem" | "setItem">;
 type Target = { executionTarget: "current_branch" | "new_worktree"; selectedBranch: string; baseRef?: string };
 type Seed = Readonly<{ uuid: string; createdAt: string }>;
-export type ComposerDraftSnapshot = Readonly<{ key: string | null; text: string; version: number }>;
+export type ComposerDraftSnapshot = Readonly<{ key: string | null; text: string; version: number; source?: ArtifactRepairSource }>;
 type Retry = Readonly<{ key: string; inputId: string } | { key: string; uuid: string; createdAt: string }>;
 export const COMPOSER_DRAFTS_KEY = "skyturn_composer_drafts";
 const LIMIT = 1_048_576;
@@ -34,6 +40,19 @@ function scopeFromKey(key: unknown): ComposerDraftScope | null {
     const value: unknown = JSON.parse(key);
     return validScope(value) && JSON.stringify(value) === key ? value : null;
   } catch { return null; }
+}
+function validSource(value: unknown, key: string): value is ArtifactRepairSource {
+  if (!record(value) || !fields(value, ["projectId", "sessionId", "nodeId", "runId", "afterCheckpointId", "artifactPath"])) return false;
+  if (![value.projectId, value.sessionId, value.nodeId, value.runId, value.afterCheckpointId].every(
+    item => nonempty(item) && item.length <= 256 && item === item.trim() && !/[\x00-\x1f\x7f/\\]/.test(item),
+  )) return false;
+  return typeof value.artifactPath === "string" && value.artifactPath.length <= 4096 &&
+    parseExpectedArtifactDeclaration(value.artifactPath) === value.artifactPath &&
+    key === draftScopeKey(["node", value.projectId as string, value.sessionId as string, value.nodeId as string, "repair"]);
+}
+function sameSource(a: ArtifactRepairSource, b: ArtifactRepairSource): boolean {
+  return a.projectId === b.projectId && a.sessionId === b.sessionId && a.nodeId === b.nodeId &&
+    a.runId === b.runId && a.afterCheckpointId === b.afterCheckpointId && a.artifactPath === b.artifactPath;
 }
 function validRetry(value: unknown): value is Retry {
   if (!record(value) || !nonempty(value.key)) return false;
@@ -69,14 +88,16 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
       if (raw !== null) {
         if (raw.length > LIMIT) throw new Error("Draft storage limit.");
         const parsed: unknown = JSON.parse(raw);
-        if (!record(parsed) || parsed.version !== 2 || !fields(parsed, ["version", "drafts", "retries"]) ||
+        if (!record(parsed) || ![2, 3].includes(parsed.version as number) || !fields(parsed, ["version", "drafts", "retries"]) ||
           !Array.isArray(parsed.drafts) || !Array.isArray(parsed.retries) ||
           parsed.drafts.length + parsed.retries.length > MAX_RECORDS) throw new Error("Invalid drafts.");
         for (const row of parsed.drafts) {
-          if (!record(row) || !fields(row, ["key", "text", "version"]) || !nonempty(row.key) ||
+          if (!record(row) || !fields(row, ["key", "text", "version", ...(parsed.version === 3 && "source" in row ? ["source"] : [])]) || !nonempty(row.key) ||
             !scopeFromKey(row.key) || typeof row.text !== "string" || typeof row.version !== "number" ||
-            !Number.isSafeInteger(row.version) || row.version < 1 || drafts.has(row.key)) throw new Error("Invalid draft.");
-          drafts.set(row.key, Object.freeze({ key: row.key, text: row.text, version: row.version }));
+            !Number.isSafeInteger(row.version) || row.version < 1 || drafts.has(row.key) ||
+            ("source" in row && !validSource(row.source, row.key))) throw new Error("Invalid draft.");
+          drafts.set(row.key, Object.freeze({ key: row.key, text: row.text, version: row.version,
+            ...("source" in row ? { source: Object.freeze(row.source as ArtifactRepairSource) } : {}) }));
           version = Math.max(version, row.version);
         }
         for (const row of parsed.retries) {
@@ -93,7 +114,7 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
     if (writable && disk) {
       try {
         if (drafts.size + retries.size > MAX_RECORDS) throw new Error("Draft count limit.");
-        const raw = JSON.stringify({ version: 2, drafts: [...drafts.values()], retries: [...retries.values()] });
+        const raw = JSON.stringify({ version: 3, drafts: [...drafts.values()], retries: [...retries.values()] });
         if (raw.length > LIMIT) throw new Error("Draft storage limit.");
         disk.setItem(COMPOSER_DRAFTS_KEY, raw);
         error = null;
@@ -104,12 +125,6 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
   function clearCaptured(snapshot: ComposerDraftSnapshot) {
     return !!snapshot.key && drafts.get(snapshot.key) === snapshot && drafts.delete(snapshot.key);
   }
-  function writeDraft(key: string, text: string) {
-    // Object identity is the final clear gate, even if a persisted counter reaches its bound.
-    version = version < Number.MAX_SAFE_INTEGER ? version + 1 : 1;
-    drafts.set(key, Object.freeze({ key, text, version }));
-    save();
-  }
   function attempt<T extends Retry>(snapshot: ComposerDraftSnapshot, entry: T) {
     if (!retries.has(entry.key)) retries.set(entry.key, entry);
     save();
@@ -119,6 +134,12 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
       if (retired || cleared) save();
     } };
   }
+  function write(key: string, text: string, source?: ArtifactRepairSource) {
+    // Object identity is the final clear gate, even if a persisted counter reaches its bound.
+    version = version < Number.MAX_SAFE_INTEGER ? version + 1 : 1;
+    drafts.set(key, Object.freeze({ key, text, version, ...(source ? { source: Object.freeze({ ...source }) } : {}) }));
+    save();
+  }
   return {
     subscribe(listener: () => void) { listeners.add(listener); return () => { listeners.delete(listener); }; },
     warning() { load(); return error; },
@@ -126,7 +147,16 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
     edit(key: string | null, text: string) {
       load();
       if (!key || !scopeFromKey(key)) return;
-      writeDraft(key, text);
+      write(key, text, text ? drafts.get(key)?.source : undefined);
+    },
+    appendArtifactRepair(source: ArtifactRepairSource, text: string, append: boolean) {
+      load();
+      const key = draftScopeKey(["node", source.projectId, source.sessionId, source.nodeId, "repair"]);
+      if (!key || !validSource(source, key)) throw new Error("Invalid artifact Repair source.");
+      const current = drafts.get(key);
+      if (current?.source && !sameSource(current.source, source)) throw new Error("Repair draft has a different artifact source. Clear its text before drafting again.");
+      if (current?.text && !append) throw new Error("Append to the existing Repair draft explicitly, or clear its text first.");
+      write(key, current?.text ? `${current.text}\n\n${text}` : text, source);
     },
     reuseSessionGoal(key: string | null, snapshot: ComposerDraftSnapshot, text: string) {
       load();
@@ -136,7 +166,7 @@ export function createComposerDraftStore(getStorage: () => StorageAccess | undef
         const [kind, scope, retryGoal] = JSON.parse(retryKey);
         if (kind === "session" && scope === key && retryGoal === goal) retries.delete(retryKey);
       }
-      writeDraft(key, text);
+      write(key, text);
       return true;
     },
     clear(snapshot: ComposerDraftSnapshot) { load(); if (clearCaptured(snapshot)) save(); },

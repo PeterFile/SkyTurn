@@ -361,6 +361,36 @@
       "text": "Task: Project file snapshot contract\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: Registered artifact viewing\nEvidence: none\nRisk: Strict descriptor reads and immutable retry/reopen; no new composer UI in this slice"
     },
     {
+      "id": "951cf72093aa88bc",
+      "type": "text",
+      "x": 680,
+      "y": 1460,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Draft Repair from registered artifact feedback\nState: Verify\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: Artifact Repair desktop acceptance\nRisk: PR delivery only; not integrated into main"
+    },
+    {
+      "id": "3136ea44b111ceaf",
+      "type": "text",
+      "x": 40,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Artifact Repair desktop acceptance\ncommit: PR #212 candidate\ntest: Full local gate: 3485 passed, 13 platform skips. After CSS-only correction: fresh build/lint/typecheck and 753 UI tests passed. Production Electron synthetic-fixture checks: 6/6, including source-bound draft restart, zero agent launches and zero owned-process leftovers.\nbuild: pnpm run build passed\nmanual: Three final screenshots inspected; feedback and preview contrast exceed 4.5:1. Not real-agent or demo:mvp evidence.\nartifact: https://github.com/PeterFile/SkyTurn/pull/212 ; /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261018/artifact-repair-ui-result-1792340294428.json"
+    },
+    {
+      "id": "24d48f59ef89c6f3",
+      "type": "text",
+      "x": 900,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Artifact Repair delivery boundary\nImpact: The independent PR is not integrated into main. Desktop evidence uses explicit synthetic terminal authority, not a live Agent run; Windows artifact viewing remains unavailable.\nMitigation: Require exact-head CI on PR #212; merge only with separate authorization. Preserve current-file-unhashed and explicit-send boundaries.\nStatus: Documented limitation"
+    },
+    {
       "id": "588f56229ef6c88f",
       "type": "text",
       "x": 1320,
@@ -799,6 +829,22 @@
       "toEnd": "arrow",
       "label": "depends",
       "color": "6"
+    },
+    {
+      "id": "c891ac5d1e661639",
+      "fromNode": "951cf72093aa88bc",
+      "toNode": "3136ea44b111ceaf",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "26b98886f8496c45",
+      "fromNode": "24d48f59ef89c6f3",
+      "toNode": "951cf72093aa88bc",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
     },
     {
       "id": "18ba1f839e156b31",
