@@ -20,6 +20,7 @@ import {
   type NodeTypes,
 } from "@xyflow/react";
 import { composerDraftStore, draftScopeKey, useComposerDraft } from "./composerDrafts.js";
+import { RecentTaskReuse, type RecentTaskReuseProps } from "./RecentTaskReuse.js";
 import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
 import {
@@ -218,9 +219,11 @@ import {
 } from "./nodeActionState.js";
 import {
   buildNextSafeActionHint,
+  resolveNextActionNavigation,
   type NextActionNavigation,
   type NextSafeActionHint,
 } from "./nextSafeAction.js";
+import { deriveSessionAttention, SessionAttention, type SessionAttentionHint } from "./sessionAttention.js";
 
 export const INSERT_BEFORE_UNAVAILABLE_ERROR = "Insert before is unavailable because the desktop workflow backend is not connected.";
 export const DESKTOP_RETRY_UNAVAILABLE_REASON =
@@ -399,6 +402,12 @@ export function newSessionSubmissionScope(
   ]);
 }
 
+function hasPendingNewSessionSubmission(
+  states: ReadonlyMap<string, NewSessionSubmissionState>, projectId: string | null, mode: WorkflowMode,
+): boolean {
+  return [...states.values()].some((attempt) => attempt.busy && attempt.session.projectId === projectId && attempt.session.mode === mode);
+}
+
 export function upsertCanvasSession(
   sessions: CanvasSessionTab[],
   authoritative: CanvasSession,
@@ -542,6 +551,7 @@ interface WorkflowSessionEnvelopeValue {
   sessionId: string;
   canvasSession: CanvasSession;
   nextAction?: WorkflowLoopNextAction;
+  projection?: unknown;
 }
 
 export function workflowNextActionScopeKey(projectId: string, sessionId: string): string {
@@ -552,12 +562,14 @@ export function upsertWorkflowNextAction(
   current: ReadonlyMap<string, WorkflowLoopNextAction>,
   projectId: string,
   sessionId: string,
-  action: WorkflowLoopNextAction,
+  action: WorkflowLoopNextAction | null,
 ): ReadonlyMap<string, WorkflowLoopNextAction> {
   const key = workflowNextActionScopeKey(projectId, sessionId);
+  if (!action && !current.has(key)) return current;
   if (current.get(key) === action) return current;
   const next = new Map(current);
-  next.set(key, action);
+  if (action) next.set(key, action);
+  else next.delete(key);
   return next;
 }
 
@@ -586,6 +598,7 @@ function workflowSessionEnvelope(value: unknown): WorkflowSessionEnvelopeValue |
     sessionId: value.sessionId,
     canvasSession: value.canvasSession,
     nextAction: value.nextAction as WorkflowLoopNextAction | undefined,
+    projection: value.projection,
   };
 }
 
@@ -980,6 +993,8 @@ export default function App() {
   const pendingNodeActionsRef = useRef(new Map<string, Exclude<ComposerAction, null>>());
   const [nodeActionFeedbackScope, setNodeActionFeedbackScope] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  // Only explicit ordinary navigation leaves selection-only intent; scope changes cannot authorize scheduling.
+  const [attentionNavigation, setAttentionNavigation] = useState(false);
   const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1001,6 +1016,12 @@ export default function App() {
   const [nextActionsBySession, setNextActionsBySession] = useState<ReadonlyMap<string, WorkflowLoopNextAction>>(
     () => new Map(),
   );
+  const nextActionsBySessionRef = useRef(nextActionsBySession);
+  const attentionProjectionsRef = useRef(new Map<string, {
+    session: CanvasSession;
+    scope: AuthoritativeRunEvidenceHydrationScope;
+    projection: unknown;
+  }>());
   const [planFinishError, setPlanFinishError] = useState<{ sessionId: string; message: string } | null>(null);
   const [workspaceSaveError, setWorkspaceSaveError] = useState<string | null>(null);
   const insertBeforeIntentRequests = useRef(createInsertBeforeIntentRequestTracker(() => globalThis.crypto.randomUUID()));
@@ -1119,6 +1140,12 @@ export default function App() {
   );
   const composerAction = selectedNodeActionScopeKey ? composerActions.get(selectedNodeActionScopeKey) ?? null : null;
   const newTaskDraft = useComposerDraft(draftScopeKey(resolvedNewTaskProjectId ? ["new", resolvedNewTaskProjectId, newTaskMode] : null));
+  const newTaskReuseDraft = { projectId: resolvedNewTaskProjectId, mode: newTaskMode, snapshot: newTaskDraft.capture() };
+  const newTaskReuseDraftRef = useRef<typeof newTaskReuseDraft | null>(null);
+  useLayoutEffect(() => {
+    newTaskReuseDraftRef.current = newTaskReuseDraft;
+    return () => { newTaskReuseDraftRef.current = null; };
+  });
   const bottomDraft = useComposerDraft(draftScopeKey(activeProject && activeSession?.kind === "canvas"
     ? ["followup", activeProject.id, activeSession.id] : null));
   const nodeDraft = useComposerDraft(draftScopeKey(activeProject && activeSession?.kind === "canvas" && selectedNode && composerAction
@@ -1176,6 +1203,19 @@ export default function App() {
       workspaceMatchesWorkflowAuthority(workspaceRef.current, guard);
   }
 
+  function recordWorkflowSessionFacts(envelope: WorkflowSessionEnvelopeValue, scope: AuthoritativeRunEvidenceHydrationScope) {
+    const session = envelope.canvasSession;
+    // Metadata-only responses may omit nextAction; only an explicit update replaces it.
+    if (envelope.nextAction !== undefined) {
+      const next = upsertWorkflowNextAction(nextActionsBySessionRef.current, session.projectId, session.id, envelope.nextAction);
+      nextActionsBySessionRef.current = next;
+      setNextActionsBySession(next);
+    }
+    attentionProjectionsRef.current.set(workflowNextActionScopeKey(session.projectId, session.id), {
+      session, scope, projection: envelope.projection,
+    });
+  }
+
   function applyGuardedWorkflowSessionResponse(
     response: unknown,
     guard: WorkflowSessionResponseGuard,
@@ -1192,14 +1232,7 @@ export default function App() {
     const authoritative = canvasSessionForWorkflowAuthority(response, guard);
     if (!authoritative) return false;
     const envelope = workflowSessionEnvelope(response);
-    if (envelope?.nextAction) {
-      setNextActionsBySession((actions) => upsertWorkflowNextAction(
-        actions,
-        authoritative.projectId,
-        authoritative.id,
-        envelope.nextAction!,
-      ));
-    }
+    if (envelope) recordWorkflowSessionFacts(envelope, guard);
     installAuthoritativeCanvasSession(
       current,
       decorate ? decorate(guarded, authoritative) : guarded,
@@ -1401,19 +1434,12 @@ export default function App() {
       ));
       const authority = project ? workflowRequestAuthority(project, envelope.sessionId) : null;
       if (!authority) return;
-      if (envelope.nextAction) {
-        setNextActionsBySession((actions) => upsertWorkflowNextAction(
-          actions,
-          envelope.canvasSession.projectId,
-          envelope.sessionId,
-          envelope.nextAction!,
-        ));
-      }
       const generation = advanceWorkflowGeneration(workflowProjectionGenerationRef.current, {
         projectId: envelope.canvasSession.projectId,
         canonicalRoot: envelope.projectRoot,
         sessionId: envelope.sessionId,
       });
+      recordWorkflowSessionFacts(envelope, { ...authority, generation });
       installAuthoritativeCanvasSession(current, next, envelope.canvasSession, {
         ...authority,
         generation,
@@ -1501,6 +1527,8 @@ export default function App() {
 
   useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
+    // Projection queries advance scheduling; attention navigation must only select.
+    if (attentionNavigation) return;
     let active = true;
     const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
     if (!responseGuard) return;
@@ -1516,6 +1544,7 @@ export default function App() {
     activeProject?.rootPath,
     activeProject?.canonicalRootPath,
     activeSession?.id,
+    attentionNavigation,
   ]);
 
   useEffect(() => {
@@ -1564,6 +1593,20 @@ export default function App() {
     const sessionId = activeSession.id;
     const authority = workflowRequestAuthority(activeProject, sessionId);
     if (!authority) return;
+    if (attentionNavigation) {
+      // Output hydration clones nodes; authority, generation and run identity bind this snapshot.
+      const cached = attentionProjectionsRef.current.get(workflowNextActionScopeKey(authority.projectId, sessionId));
+      const cachedNode = cached?.session.nodes.find((node) => node.id === selectedNode.id);
+      if (cached && cachedNode && cached.scope.queryRoot === authority.queryRoot &&
+          workflowAuthorityGenerationKey(cached.scope) === workflowAuthorityGenerationKey(authority) &&
+          cached.scope.generation === currentWorkflowGeneration(workflowProjectionGenerationRef.current, authority) &&
+          isConcreteRunId(selectedNode.runId) && cachedNode.runId === selectedNode.runId &&
+          cachedNode.status === selectedNode.status && cachedNode.rollbackStatus === selectedNode.rollbackStatus &&
+          resolveNextActionNavigation({ kind: "blocked", laneId: selectedNode.id, reason: "" }, [selectedNode])) {
+        setSelectedNodeActionState(buildSelectedNodeActionState({ sessionId, selectedNode, projection: cached.projection }));
+      }
+      return;
+    }
     void workflow.getProjection(authority.queryRoot, sessionId).then(async (projectionResult) => {
       if (
         !active ||
@@ -1612,6 +1655,7 @@ export default function App() {
     activeSession?.kind,
     activeSession?.updatedAt,
     selectedNode,
+    attentionNavigation,
   ]);
 
   const activeCanvasSessionId = activeSession?.kind === "canvas" ? activeSession.id : null;
@@ -1746,6 +1790,24 @@ export default function App() {
       activeProjectId: resolvedProjectId,
       activeSessionId: null,
     }));
+  }
+
+  function reuseRecentTaskGoal(goal: string) {
+    const { projectId, mode, snapshot } = newTaskReuseDraft;
+    if (newTaskReuseDraftRef.current !== newTaskReuseDraft || !projectId) return;
+    const current = workspaceRef.current;
+    if (!current.projects.some((project) => project.id === projectId) ||
+      !current.sessions.some((session) => session.kind === "canvas" && session.projectId === projectId && session.goal === goal) ||
+      hasPendingNewSessionSubmission(newSessionSubmissionsRef.current, projectId, mode)) return;
+    const key = draftScopeKey(["new", projectId, mode]);
+    if (!composerDraftStore.reuseSessionGoal(key, snapshot, goal)) return;
+    const normalizedGoal = goal.trim();
+    for (const [scope, attempt] of newSessionSubmissionsRef.current) {
+      if (!attempt.busy && attempt.session.projectId === projectId && attempt.session.mode === mode && attempt.session.goal.trim() === normalizedGoal) {
+        newSessionSubmissionsRef.current.delete(scope);
+      }
+    }
+    refreshNewSessionState();
   }
 
   async function addSessionFromComposer(target: SessionTarget) {
@@ -2556,11 +2618,13 @@ export default function App() {
             sessions={workspace.sessions}
             activeProjectId={activeProject.id}
             activeSessionId={workspace.activeSessionId}
+            nextActionsBySession={nextActionsBySession}
             collapsedProjectIds={workspace.collapsedProjectIds}
             onNewSession={() => openProjectStartPage()}
             onOpenProject={() => void importProject()}
             onOpenSettings={() => setSettingsOpen(true)}
-            onSelectProject={(projectId) =>
+            onSelectProject={(projectId) => {
+              setAttentionNavigation(false);
               setWorkspace((current) => {
                 const activeSessionId = chooseActiveSessionIdForProject(
                   current.sessions,
@@ -2568,11 +2632,31 @@ export default function App() {
                   projectId,
                 );
                 return { ...current, activeProjectId: projectId, activeSessionId };
-              })
-            }
-            onSelectSession={(sessionId, projectId) =>
-              setWorkspace((current) => ({ ...current, activeProjectId: projectId, activeSessionId: sessionId }))
-            }
+              });
+            }}
+            onSelectSession={(sessionId, projectId) => {
+              setAttentionNavigation(false);
+              setWorkspace((current) => ({ ...current, activeProjectId: projectId, activeSessionId: sessionId }));
+            }}
+            onNavigateAttention={(project, session, attention) => {
+              const current = workspaceRef.current;
+              if (current.activeProjectId !== workspace.activeProjectId || current.activeSessionId !== workspace.activeSessionId) return;
+              const currentProject = current.projects.find((candidate) => candidate.id === project.id);
+              if (!currentProject || currentProject.rootPath !== project.rootPath ||
+                  currentProject.canonicalRootPath !== project.canonicalRootPath ||
+                  !workflowRequestAuthority(currentProject, session.id)) return;
+              const target = current.sessions.find((candidate) => candidate.id === session.id && candidate.projectId === project.id);
+              if (!target) return;
+              const latest = deriveSessionAttention(target, workflowNextActionForScope(nextActionsBySessionRef.current, project.id, target.id));
+              if (!latest || latest.kind !== attention.kind || latest.targetNodeId !== attention.targetNodeId) return;
+              const next = { ...current, activeProjectId: project.id, activeSessionId: target.id };
+              setAttentionNavigation(true);
+              workspaceRef.current = next;
+              setWorkspace(next);
+              setSelectedNodeId(latest.targetNodeId);
+              setInspectedNodeId(null);
+              setTerminalOpen(false);
+            }}
             onToggleProjectSessions={(projectId) =>
               setWorkspace((current) => ({
                 ...current,
@@ -2686,6 +2770,7 @@ export default function App() {
               workflowBackendAvailable={!!window.devflow?.workflow}
               nextActionHint={nextAction ? buildNextSafeActionHint(nextAction, activeSession.nodes) : null}
               onNavigateNextAction={(navigation) => {
+                setAttentionNavigation(false);
                 setSelectedNodeId(navigation.targetNodeId);
                 if (navigation.modalTab) {
                   setInspectedNodeId(navigation.targetNodeId);
@@ -2698,10 +2783,12 @@ export default function App() {
               onNodePositionCommit={commitActiveNodePosition}
               onOpenPlannerInspector={() => setTerminalOpen(true)}
               onSelectNode={(nodeId) => {
+                setAttentionNavigation(false);
                 setSelectedNodeId(nodeId);
                 setInspectedNodeId((current) => (current === nodeId ? current : null));
               }}
               onInspectNode={(nodeId) => {
+                setAttentionNavigation(false);
                 setSelectedNodeId(nodeId);
                 setInspectedNodeId(nodeId);
                 setModalTab("Output");
@@ -2718,6 +2805,10 @@ export default function App() {
               onModeChange={setNewTaskMode}
               onProjectChange={setNewTaskProjectId}
               submissionStates={newSessionSubmissionsRef.current}
+              recentTaskReuse={{ sessions: workspace.sessions, projectId: resolvedNewTaskProjectId, mode: newTaskMode,
+                draft: newTaskGoal, draftVersion: newTaskReuseDraft.snapshot.version,
+                busy: hasPendingNewSessionSubmission(newSessionSubmissionsRef.current, resolvedNewTaskProjectId, newTaskMode),
+                onUseGoal: reuseRecentTaskGoal }}
               onCreate={addSessionFromComposer}
             />
           )}
@@ -2880,12 +2971,14 @@ function Sidebar({
   sessions,
   activeProjectId,
   activeSessionId,
+  nextActionsBySession,
   collapsedProjectIds,
   onNewSession,
   onOpenProject,
   onOpenSettings,
   onSelectProject,
   onSelectSession,
+  onNavigateAttention,
   onToggleProjectSessions,
   settingsButtonRef,
 }: {
@@ -2893,12 +2986,14 @@ function Sidebar({
   sessions: CanvasSessionTab[];
   activeProjectId: string;
   activeSessionId: string | null;
+  nextActionsBySession: ReadonlyMap<string, WorkflowLoopNextAction>;
   collapsedProjectIds: string[];
   onNewSession: () => void;
   onOpenProject: () => void;
   onOpenSettings: () => void;
   onSelectProject: (projectId: string) => void;
   onSelectSession: (sessionId: string, projectId: string) => void;
+  onNavigateAttention: (project: ImportedProject, session: CanvasSessionTab, attention: SessionAttentionHint) => void;
   onToggleProjectSessions: (projectId: string) => void;
   settingsButtonRef?: React.RefObject<HTMLButtonElement | null>;
 }) {
@@ -2954,16 +3049,30 @@ function Sidebar({
               </div>
               {!collapsed && (
                 <div className="sidebar-session-list">
-                  {projectSessions.map((session) => (
-                    <button
-                      key={session.id}
-                      className={session.id === activeSessionId ? "sidebar-session-row active" : "sidebar-session-row"}
-                      onClick={() => onSelectSession(session.id, project.id)}
-                    >
-                      <span className="sidebar-session-title">{session.title}</span>
-                      <small>{formatRelativeTime(session.updatedAt)}</small>
-                    </button>
-                  ))}
+                  {projectSessions.map((session) => {
+                    const attention = workflowRequestAuthority(project, session.id)
+                      ? deriveSessionAttention(session, workflowNextActionForScope(nextActionsBySession, project.id, session.id)) : null;
+                    return (
+                      <div className="sidebar-session-entry" key={session.id}>
+                        <button
+                          className={project.id === activeProjectId && session.id === activeSessionId ? "sidebar-session-row active" : "sidebar-session-row"}
+                          onClick={() => onSelectSession(session.id, project.id)}
+                        >
+                          <span className="sidebar-session-title">{session.title}</span>
+                          <small>{formatRelativeTime(session.updatedAt)}</small>
+                        </button>
+                        {attention && (
+                          <SessionAttention
+                            attention={attention}
+                            sessionTitle={session.title}
+                            projectId={project.id}
+                            sessionId={session.id}
+                            onNavigate={() => onNavigateAttention(project, session, attention)}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
                   {projectSessions.length === 0 && <div className="sidebar-empty">No sessions</div>}
                 </div>
               )}
@@ -2988,6 +3097,7 @@ function ProjectStartPage({
   onModeChange,
   onProjectChange,
   submissionStates,
+  recentTaskReuse,
   onCreate,
 }: {
   goal: string;
@@ -2998,6 +3108,7 @@ function ProjectStartPage({
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
   submissionStates: Map<string, NewSessionSubmissionState>;
+  recentTaskReuse: RecentTaskReuseProps;
   onCreate: (target: SessionTarget) => Promise<void>;
 }) {
   return (
@@ -3015,6 +3126,7 @@ function ProjectStartPage({
           onModeChange={onModeChange}
           onProjectChange={onProjectChange}
           submissionStates={submissionStates}
+          recentTaskReuse={recentTaskReuse}
           onCreate={onCreate}
         />
       </div>
@@ -3163,6 +3275,7 @@ function SessionComposer({
   onModeChange,
   onProjectChange,
   submissionStates,
+  recentTaskReuse,
   onClose,
   onCreate,
 }: {
@@ -3176,6 +3289,7 @@ function SessionComposer({
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
   submissionStates: Map<string, NewSessionSubmissionState>;
+  recentTaskReuse: RecentTaskReuseProps;
   onClose?: () => void;
   onCreate: (target: SessionTarget) => Promise<void>;
 }) {
@@ -3299,6 +3413,7 @@ function SessionComposer({
           aria-label="New task goal"
           rows={5}
         />
+        <RecentTaskReuse {...recentTaskReuse} />
       </div>
       <div className="control-strip">
         <div className="control-strip-row">
