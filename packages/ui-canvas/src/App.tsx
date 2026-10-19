@@ -19,7 +19,8 @@ import {
   type NodeProps,
   type NodeTypes,
 } from "@xyflow/react";
-import { composerDraftStore, draftScopeKey, useComposerDraft } from "./composerDrafts.js";
+import { composerDraftStore, draftScopeKey, useComposerDraft, type ComposerDraftSnapshot } from "./composerDrafts.js";
+import { RecentTaskReuse, type RecentTaskReuseProps } from "./RecentTaskReuse.js";
 import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
 import {
@@ -211,7 +212,7 @@ import {
   resolveRunWorktreePath,
   retryCanvasNode,
 } from "./workflowRuntime.js";
-import { RunArtifacts } from "./RunArtifacts.js";
+import { RunArtifacts, type ArtifactRepairDraftRequest } from "./RunArtifacts.js";
 import { addRequirementPlanningNode } from "./composer.js";
 import {
   buildSelectedNodeActionState,
@@ -219,9 +220,11 @@ import {
 } from "./nodeActionState.js";
 import {
   buildNextSafeActionHint,
+  resolveNextActionNavigation,
   type NextActionNavigation,
   type NextSafeActionHint,
 } from "./nextSafeAction.js";
+import { deriveSessionAttention, SessionAttention, type SessionAttentionHint } from "./sessionAttention.js";
 
 export const INSERT_BEFORE_UNAVAILABLE_ERROR = "Insert before is unavailable because the desktop workflow backend is not connected.";
 export const DESKTOP_RETRY_UNAVAILABLE_REASON =
@@ -400,6 +403,12 @@ export function newSessionSubmissionScope(
   ]);
 }
 
+function hasPendingNewSessionSubmission(
+  states: ReadonlyMap<string, NewSessionSubmissionState>, projectId: string | null, mode: WorkflowMode,
+): boolean {
+  return [...states.values()].some((attempt) => attempt.busy && attempt.session.projectId === projectId && attempt.session.mode === mode);
+}
+
 export function upsertCanvasSession(
   sessions: CanvasSessionTab[],
   authoritative: CanvasSession,
@@ -543,6 +552,7 @@ interface WorkflowSessionEnvelopeValue {
   sessionId: string;
   canvasSession: CanvasSession;
   nextAction?: WorkflowLoopNextAction;
+  projection?: unknown;
 }
 
 export function workflowNextActionScopeKey(projectId: string, sessionId: string): string {
@@ -553,12 +563,14 @@ export function upsertWorkflowNextAction(
   current: ReadonlyMap<string, WorkflowLoopNextAction>,
   projectId: string,
   sessionId: string,
-  action: WorkflowLoopNextAction,
+  action: WorkflowLoopNextAction | null,
 ): ReadonlyMap<string, WorkflowLoopNextAction> {
   const key = workflowNextActionScopeKey(projectId, sessionId);
+  if (!action && !current.has(key)) return current;
   if (current.get(key) === action) return current;
   const next = new Map(current);
-  next.set(key, action);
+  if (action) next.set(key, action);
+  else next.delete(key);
   return next;
 }
 
@@ -587,6 +599,7 @@ function workflowSessionEnvelope(value: unknown): WorkflowSessionEnvelopeValue |
     sessionId: value.sessionId,
     canvasSession: value.canvasSession,
     nextAction: value.nextAction as WorkflowLoopNextAction | undefined,
+    projection: value.projection,
   };
 }
 
@@ -981,6 +994,8 @@ export default function App() {
   const pendingNodeActionsRef = useRef(new Map<string, Exclude<ComposerAction, null>>());
   const [nodeActionFeedbackScope, setNodeActionFeedbackScope] = useState<string | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  // Only explicit ordinary navigation leaves selection-only intent; scope changes cannot authorize scheduling.
+  const [attentionNavigation, setAttentionNavigation] = useState(false);
   const [inspectedNodeId, setInspectedNodeId] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<NodeModalTab>("Output");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1002,12 +1017,19 @@ export default function App() {
   const [nextActionsBySession, setNextActionsBySession] = useState<ReadonlyMap<string, WorkflowLoopNextAction>>(
     () => new Map(),
   );
+  const nextActionsBySessionRef = useRef(nextActionsBySession);
+  const attentionProjectionsRef = useRef(new Map<string, {
+    session: CanvasSession;
+    scope: AuthoritativeRunEvidenceHydrationScope;
+    projection: unknown;
+  }>());
   const [planFinishError, setPlanFinishError] = useState<{ sessionId: string; message: string } | null>(null);
   const [workspaceSaveError, setWorkspaceSaveError] = useState<string | null>(null);
   const insertBeforeIntentRequests = useRef(createInsertBeforeIntentRequestTracker(() => globalThis.crypto.randomUUID()));
   const workspaceRef = useRef(workspace);
   const selectedNodeActionScopeRef = useRef<{ sessionId: string; nodeId: string } | null>(null);
   const selectedNodeActionGenerationRef = useRef(0);
+  const artifactRepairInteractionRef = useRef({ key: "" });
   const bottomComposerSubmissionsRef = useRef(new Map<string, BottomComposerSubmissionState>());
   const newSessionSubmissionsRef = useRef(new Map<string, NewSessionSubmissionState>());
   const schedulingAttemptsRef = useRef(new Map<string, SchedulingAttempt>());
@@ -1113,6 +1135,12 @@ export default function App() {
     activeSession?.kind === "canvas"
       ? activeSession.nodes.find((node: CanvasNode) => node.id === inspectedNodeId) ?? null
       : null;
+  const artifactRepairScope = JSON.stringify([activeProject?.id, activeProject?.rootPath, activeProject?.canonicalRootPath,
+    activeSession?.id, inspectedNode?.id, inspectedNode?.runId, selectedNodeId, modalTab, settingsOpen]);
+  if (artifactRepairInteractionRef.current.key !== artifactRepairScope) {
+    artifactRepairInteractionRef.current = { key: artifactRepairScope };
+  }
+  const artifactRepairInteraction = artifactRepairInteractionRef.current;
   const resolvedNewTaskProjectId = resolveSessionProjectId(
     workspace.projects,
     newTaskProjectId,
@@ -1120,6 +1148,12 @@ export default function App() {
   );
   const composerAction = selectedNodeActionScopeKey ? composerActions.get(selectedNodeActionScopeKey) ?? null : null;
   const newTaskDraft = useComposerDraft(draftScopeKey(resolvedNewTaskProjectId ? ["new", resolvedNewTaskProjectId, newTaskMode] : null));
+  const newTaskReuseDraft = { projectId: resolvedNewTaskProjectId, mode: newTaskMode, snapshot: newTaskDraft.capture() };
+  const newTaskReuseDraftRef = useRef<typeof newTaskReuseDraft | null>(null);
+  useLayoutEffect(() => {
+    newTaskReuseDraftRef.current = newTaskReuseDraft;
+    return () => { newTaskReuseDraftRef.current = null; };
+  });
   const bottomDraft = useComposerDraft(draftScopeKey(activeProject && activeSession?.kind === "canvas"
     ? ["followup", activeProject.id, activeSession.id] : null));
   const nodeDraft = useComposerDraft(draftScopeKey(activeProject && activeSession?.kind === "canvas" && selectedNode && composerAction
@@ -1127,6 +1161,7 @@ export default function App() {
   const { text: newTaskGoal, setText: setNewTaskGoal } = newTaskDraft;
   const { text: bottomGoal, setText: setBottomGoal } = bottomDraft;
   const { text: nodeActionText, setText: setNodeActionText } = nodeDraft;
+  const artifactRepairSource = nodeDraft.capture().source;
   const activeNewSessionFailure = activeSession?.kind === "canvas"
     ? [...newSessionSubmissionsRef.current.values()].find((attempt) => (
         attempt.session.id === activeSession.id && attempt.error !== null
@@ -1177,6 +1212,19 @@ export default function App() {
       workspaceMatchesWorkflowAuthority(workspaceRef.current, guard);
   }
 
+  function recordWorkflowSessionFacts(envelope: WorkflowSessionEnvelopeValue, scope: AuthoritativeRunEvidenceHydrationScope) {
+    const session = envelope.canvasSession;
+    // Metadata-only responses may omit nextAction; only an explicit update replaces it.
+    if (envelope.nextAction !== undefined) {
+      const next = upsertWorkflowNextAction(nextActionsBySessionRef.current, session.projectId, session.id, envelope.nextAction);
+      nextActionsBySessionRef.current = next;
+      setNextActionsBySession(next);
+    }
+    attentionProjectionsRef.current.set(workflowNextActionScopeKey(session.projectId, session.id), {
+      session, scope, projection: envelope.projection,
+    });
+  }
+
   function applyGuardedWorkflowSessionResponse(
     response: unknown,
     guard: WorkflowSessionResponseGuard,
@@ -1193,14 +1241,7 @@ export default function App() {
     const authoritative = canvasSessionForWorkflowAuthority(response, guard);
     if (!authoritative) return false;
     const envelope = workflowSessionEnvelope(response);
-    if (envelope?.nextAction) {
-      setNextActionsBySession((actions) => upsertWorkflowNextAction(
-        actions,
-        authoritative.projectId,
-        authoritative.id,
-        envelope.nextAction!,
-      ));
-    }
+    if (envelope) recordWorkflowSessionFacts(envelope, guard);
     installAuthoritativeCanvasSession(
       current,
       decorate ? decorate(guarded, authoritative) : guarded,
@@ -1402,19 +1443,12 @@ export default function App() {
       ));
       const authority = project ? workflowRequestAuthority(project, envelope.sessionId) : null;
       if (!authority) return;
-      if (envelope.nextAction) {
-        setNextActionsBySession((actions) => upsertWorkflowNextAction(
-          actions,
-          envelope.canvasSession.projectId,
-          envelope.sessionId,
-          envelope.nextAction!,
-        ));
-      }
       const generation = advanceWorkflowGeneration(workflowProjectionGenerationRef.current, {
         projectId: envelope.canvasSession.projectId,
         canonicalRoot: envelope.projectRoot,
         sessionId: envelope.sessionId,
       });
+      recordWorkflowSessionFacts(envelope, { ...authority, generation });
       installAuthoritativeCanvasSession(current, next, envelope.canvasSession, {
         ...authority,
         generation,
@@ -1502,6 +1536,8 @@ export default function App() {
 
   useEffect(() => {
     if (!window.devflow || !activeProject || activeSession?.kind !== "canvas") return;
+    // Projection queries advance scheduling; attention navigation must only select.
+    if (attentionNavigation) return;
     let active = true;
     const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
     if (!responseGuard) return;
@@ -1517,6 +1553,7 @@ export default function App() {
     activeProject?.rootPath,
     activeProject?.canonicalRootPath,
     activeSession?.id,
+    attentionNavigation,
   ]);
 
   useEffect(() => {
@@ -1565,6 +1602,20 @@ export default function App() {
     const sessionId = activeSession.id;
     const authority = workflowRequestAuthority(activeProject, sessionId);
     if (!authority) return;
+    if (attentionNavigation) {
+      // Output hydration clones nodes; authority, generation and run identity bind this snapshot.
+      const cached = attentionProjectionsRef.current.get(workflowNextActionScopeKey(authority.projectId, sessionId));
+      const cachedNode = cached?.session.nodes.find((node) => node.id === selectedNode.id);
+      if (cached && cachedNode && cached.scope.queryRoot === authority.queryRoot &&
+          workflowAuthorityGenerationKey(cached.scope) === workflowAuthorityGenerationKey(authority) &&
+          cached.scope.generation === currentWorkflowGeneration(workflowProjectionGenerationRef.current, authority) &&
+          isConcreteRunId(selectedNode.runId) && cachedNode.runId === selectedNode.runId &&
+          cachedNode.status === selectedNode.status && cachedNode.rollbackStatus === selectedNode.rollbackStatus &&
+          resolveNextActionNavigation({ kind: "blocked", laneId: selectedNode.id, reason: "" }, [selectedNode])) {
+        setSelectedNodeActionState(buildSelectedNodeActionState({ sessionId, selectedNode, projection: cached.projection }));
+      }
+      return;
+    }
     void workflow.getProjection(authority.queryRoot, sessionId).then(async (projectionResult) => {
       if (
         !active ||
@@ -1613,6 +1664,7 @@ export default function App() {
     activeSession?.kind,
     activeSession?.updatedAt,
     selectedNode,
+    attentionNavigation,
   ]);
 
   const activeCanvasSessionId = activeSession?.kind === "canvas" ? activeSession.id : null;
@@ -1747,6 +1799,24 @@ export default function App() {
       activeProjectId: resolvedProjectId,
       activeSessionId: null,
     }));
+  }
+
+  function reuseRecentTaskGoal(goal: string) {
+    const { projectId, mode, snapshot } = newTaskReuseDraft;
+    if (newTaskReuseDraftRef.current !== newTaskReuseDraft || !projectId) return;
+    const current = workspaceRef.current;
+    if (!current.projects.some((project) => project.id === projectId) ||
+      !current.sessions.some((session) => session.kind === "canvas" && session.projectId === projectId && session.goal === goal) ||
+      hasPendingNewSessionSubmission(newSessionSubmissionsRef.current, projectId, mode)) return;
+    const key = draftScopeKey(["new", projectId, mode]);
+    if (!composerDraftStore.reuseSessionGoal(key, snapshot, goal)) return;
+    const normalizedGoal = goal.trim();
+    for (const [scope, attempt] of newSessionSubmissionsRef.current) {
+      if (!attempt.busy && attempt.session.projectId === projectId && attempt.session.mode === mode && attempt.session.goal.trim() === normalizedGoal) {
+        newSessionSubmissionsRef.current.delete(scope);
+      }
+    }
+    refreshNewSessionState();
   }
 
   async function addSessionFromComposer(target: SessionTarget) {
@@ -2164,6 +2234,8 @@ export default function App() {
     if (!availability.enabled) { setNodeActionError(availability.reason); return; }
     const submitted = nodeDraft.capture();
     if (submitted.text !== requestText) return;
+    const sourceError = artifactRepairDraftMismatch(submitted, activeProject.id, activeSession, selectedNode, actionState);
+    if (sourceError) { setNodeActionError(sourceError); return; }
     pendingNodeActionsRef.current.set(pendingScope, action);
     const actionScope = { sessionId: activeSession.id, nodeId: selectedNode.id };
     const actionGeneration = selectedNodeActionGenerationRef.current + 1;
@@ -2177,7 +2249,7 @@ export default function App() {
 
     try {
       if (action === "repair") {
-        const repairPayload = actionState?.repairPayload;
+        let repairPayload = actionState?.repairPayload;
         if (!repairPayload) {
           setNodeActionError("Repair requires an after checkpoint.");
           return;
@@ -2188,6 +2260,23 @@ export default function App() {
         }
         const responseGuard = captureWorkflowSessionResponseGuard(activeProject, activeSession.id, activeSession);
         if (!responseGuard) return;
+        if (submitted.source) {
+          const latest = await workflow.getProjection(responseGuard.queryRoot, activeSession.id);
+          const currentSession = canvasSessionForWorkflowAuthority(latest, responseGuard);
+          const currentNode = currentSession?.nodes.find(node => node.id === selectedNode.id);
+          if (!actionStillCurrent() || !currentSession || !currentNode ||
+            !workspaceMatchesWorkflowAuthority(workspaceRef.current, responseGuard) ||
+            workspaceRef.current.activeProjectId !== activeProject.id || workspaceRef.current.activeSessionId !== activeSession.id) {
+            throw new Error("Artifact Repair source changed. Draft retained; reopen its source artifact.");
+          }
+          const currentState = artifactRepairActionState(currentSession, currentNode, latest.projection);
+          const mismatch = artifactRepairDraftMismatch(submitted, activeProject.id, currentSession, currentNode, currentState);
+          const liveSession = workspaceRef.current.sessions.find(session => session.id === activeSession.id);
+          if (mismatch || liveSession?.kind !== "canvas" || liveSession.nodes.find(node => node.id === selectedNode.id)?.runId !== submitted.source.runId) {
+            throw new Error(mismatch ?? "Artifact Repair source run changed. Draft retained.");
+          }
+          repairPayload = currentState.repairPayload!;
+        }
         const result = await workflow.requestRepair(responseGuard.queryRoot, {
           ...repairPayload,
           instruction: requestText,
@@ -2263,6 +2352,41 @@ export default function App() {
       pendingNodeActionsRef.current.delete(pendingScope);
       refreshNodeActionBusy();
     }
+  }
+
+  async function prepareArtifactRepairDraft(request: ArtifactRepairDraftRequest) {
+    if (!activeProject || activeSession?.kind !== "canvas" || !inspectedNode) throw new Error("Artifact Repair source unavailable.");
+    const project = activeProject;
+    const session = activeSession;
+    const node = inspectedNode;
+    const runId = node.runId;
+    const isCurrent = () => request.isCurrent() && artifactRepairInteractionRef.current === artifactRepairInteraction &&
+      workspaceRef.current.activeProjectId === project.id && workspaceRef.current.activeSessionId === session.id &&
+      workspaceRef.current.sessions.some(current => current.kind === "canvas" && current.id === session.id &&
+        current.projectId === project.id && current.nodes.some(currentNode => currentNode.id === node.id && currentNode.runId === runId));
+    if (!isCurrent()) throw new Error("Artifact Repair interaction expired. Reopen its source artifact.");
+    if (!request.feedback.trim()) throw new Error("Enter artifact feedback first.");
+    const workflow = window.devflow?.workflow;
+    if (!workflow?.getProjection || !workflow.requestRepair) throw new Error("Workflow backend unavailable.");
+    const guard = captureWorkflowSessionResponseGuard(project, session.id, session);
+    if (!guard) throw new Error("Workflow project authority unavailable.");
+    const result = await workflow.getProjection(guard.queryRoot, session.id);
+    if (!isCurrent()) throw new Error("Artifact Repair interaction expired. Feedback retained.");
+    const authoritative = canvasSessionForWorkflowAuthority(result, guard);
+    const sourceNode = authoritative?.nodes.find(current => current.id === node.id);
+    if (!authoritative || !sourceNode || sourceNode.runId !== runId || !workspaceMatchesWorkflowAuthority(workspaceRef.current, guard)) {
+      throw new Error("Artifact Repair source changed. Feedback retained.");
+    }
+    const state = artifactRepairActionState(authoritative, sourceNode, result.projection);
+    const availability = selectedNodeActionAvailability(state, true).repair;
+    if (!availability.enabled || !state.repairPayload) throw new Error(availability.reason ?? "Repair requires an after checkpoint.");
+    const source = { projectId: project.id, sessionId: session.id, nodeId: node.id, runId,
+      afterCheckpointId: state.repairPayload.checkpointId, artifactPath: request.artifactPath };
+    const text = `Artifact feedback (current-file-unhashed; current file, not immutable historical bytes)\nArtifact: ${source.artifactPath}\nRun: ${source.runId}\nAfter checkpoint: ${source.afterCheckpointId}\n\n${request.feedback}`;
+    composerDraftStore.appendArtifactRepair(source, text, request.append);
+    setComposerActions(current => new Map(current).set(JSON.stringify([project.id, session.id, node.id]), "repair"));
+    setSelectedNodeId(node.id);
+    setInspectedNodeId(null);
   }
 
   function applyWorkflowActionResult(
@@ -2557,11 +2681,13 @@ export default function App() {
             sessions={workspace.sessions}
             activeProjectId={activeProject.id}
             activeSessionId={workspace.activeSessionId}
+            nextActionsBySession={nextActionsBySession}
             collapsedProjectIds={workspace.collapsedProjectIds}
             onNewSession={() => openProjectStartPage()}
             onOpenProject={() => void importProject()}
             onOpenSettings={() => setSettingsOpen(true)}
-            onSelectProject={(projectId) =>
+            onSelectProject={(projectId) => {
+              setAttentionNavigation(false);
               setWorkspace((current) => {
                 const activeSessionId = chooseActiveSessionIdForProject(
                   current.sessions,
@@ -2569,11 +2695,31 @@ export default function App() {
                   projectId,
                 );
                 return { ...current, activeProjectId: projectId, activeSessionId };
-              })
-            }
-            onSelectSession={(sessionId, projectId) =>
-              setWorkspace((current) => ({ ...current, activeProjectId: projectId, activeSessionId: sessionId }))
-            }
+              });
+            }}
+            onSelectSession={(sessionId, projectId) => {
+              setAttentionNavigation(false);
+              setWorkspace((current) => ({ ...current, activeProjectId: projectId, activeSessionId: sessionId }));
+            }}
+            onNavigateAttention={(project, session, attention) => {
+              const current = workspaceRef.current;
+              if (current.activeProjectId !== workspace.activeProjectId || current.activeSessionId !== workspace.activeSessionId) return;
+              const currentProject = current.projects.find((candidate) => candidate.id === project.id);
+              if (!currentProject || currentProject.rootPath !== project.rootPath ||
+                  currentProject.canonicalRootPath !== project.canonicalRootPath ||
+                  !workflowRequestAuthority(currentProject, session.id)) return;
+              const target = current.sessions.find((candidate) => candidate.id === session.id && candidate.projectId === project.id);
+              if (!target) return;
+              const latest = deriveSessionAttention(target, workflowNextActionForScope(nextActionsBySessionRef.current, project.id, target.id));
+              if (!latest || latest.kind !== attention.kind || latest.targetNodeId !== attention.targetNodeId) return;
+              const next = { ...current, activeProjectId: project.id, activeSessionId: target.id };
+              setAttentionNavigation(true);
+              workspaceRef.current = next;
+              setWorkspace(next);
+              setSelectedNodeId(latest.targetNodeId);
+              setInspectedNodeId(null);
+              setTerminalOpen(false);
+            }}
             onToggleProjectSessions={(projectId) =>
               setWorkspace((current) => ({
                 ...current,
@@ -2677,8 +2823,10 @@ export default function App() {
               selectedNodeActionScopeKey={selectedNodeActionScopeKey}
               selectedNodeActionState={selectedNodeActionState}
               nodeActionBusy={selectedNodeActionScopeKey ? pendingNodeActionsRef.current.get(selectedNodeActionScopeKey) ?? null : null}
-              nodeActionError={nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionError : null}
-              nodeActionStatus={nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionStatus : null}
+              nodeActionError={artifactRepairDraftMismatch(nodeDraft.capture(), activeProject.id, activeSession, selectedNode, selectedNodeActionState) ??
+                (nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionError : null)}
+              nodeActionStatus={(nodeActionFeedbackScope === selectedNodeActionScopeKey ? nodeActionStatus : null) ??
+                (artifactRepairSource ? `Artifact Repair draft: ${artifactRepairSource.artifactPath} · run ${artifactRepairSource.runId} · after ${artifactRepairSource.afterCheckpointId}` : null)}
               action={composerAction}
               onActionChange={(action) => {
                 if (selectedNodeActionScopeKey) setComposerActions((current) => new Map(current).set(selectedNodeActionScopeKey, action));
@@ -2687,6 +2835,7 @@ export default function App() {
               workflowBackendAvailable={!!window.devflow?.workflow}
               nextActionHint={nextAction ? buildNextSafeActionHint(nextAction, activeSession.nodes) : null}
               onNavigateNextAction={(navigation) => {
+                setAttentionNavigation(false);
                 setSelectedNodeId(navigation.targetNodeId);
                 if (navigation.modalTab) {
                   setInspectedNodeId(navigation.targetNodeId);
@@ -2699,10 +2848,12 @@ export default function App() {
               onNodePositionCommit={commitActiveNodePosition}
               onOpenPlannerInspector={() => setTerminalOpen(true)}
               onSelectNode={(nodeId) => {
+                setAttentionNavigation(false);
                 setSelectedNodeId(nodeId);
                 setInspectedNodeId((current) => (current === nodeId ? current : null));
               }}
               onInspectNode={(nodeId) => {
+                setAttentionNavigation(false);
                 setSelectedNodeId(nodeId);
                 setInspectedNodeId(nodeId);
                 setModalTab("Output");
@@ -2719,6 +2870,10 @@ export default function App() {
               onModeChange={setNewTaskMode}
               onProjectChange={setNewTaskProjectId}
               submissionStates={newSessionSubmissionsRef.current}
+              recentTaskReuse={{ sessions: workspace.sessions, projectId: resolvedNewTaskProjectId, mode: newTaskMode,
+                draft: newTaskGoal, draftVersion: newTaskReuseDraft.snapshot.version,
+                busy: hasPendingNewSessionSubmission(newSessionSubmissionsRef.current, resolvedNewTaskProjectId, newTaskMode),
+                onUseGoal: reuseRecentTaskGoal }}
               onCreate={addSessionFromComposer}
             />
           )}
@@ -2757,6 +2912,7 @@ export default function App() {
           onOpenEditor={(editor) => openEditor(editor, inspectedNode)}
           editorLaunchBusy={editorLaunchBusy === `${activeProject.id}:${activeSession.id}:${inspectedNode.id}:${editorLaunchGenerationRef.current}`}
           onDecisionAnswer={(option) => answerUserDecision(inspectedNode.id, option)}
+          onDraftRepair={prepareArtifactRepairDraft}
         />
       )}
 
@@ -2881,12 +3037,14 @@ function Sidebar({
   sessions,
   activeProjectId,
   activeSessionId,
+  nextActionsBySession,
   collapsedProjectIds,
   onNewSession,
   onOpenProject,
   onOpenSettings,
   onSelectProject,
   onSelectSession,
+  onNavigateAttention,
   onToggleProjectSessions,
   settingsButtonRef,
 }: {
@@ -2894,12 +3052,14 @@ function Sidebar({
   sessions: CanvasSessionTab[];
   activeProjectId: string;
   activeSessionId: string | null;
+  nextActionsBySession: ReadonlyMap<string, WorkflowLoopNextAction>;
   collapsedProjectIds: string[];
   onNewSession: () => void;
   onOpenProject: () => void;
   onOpenSettings: () => void;
   onSelectProject: (projectId: string) => void;
   onSelectSession: (sessionId: string, projectId: string) => void;
+  onNavigateAttention: (project: ImportedProject, session: CanvasSessionTab, attention: SessionAttentionHint) => void;
   onToggleProjectSessions: (projectId: string) => void;
   settingsButtonRef?: React.RefObject<HTMLButtonElement | null>;
 }) {
@@ -2955,16 +3115,30 @@ function Sidebar({
               </div>
               {!collapsed && (
                 <div className="sidebar-session-list">
-                  {projectSessions.map((session) => (
-                    <button
-                      key={session.id}
-                      className={session.id === activeSessionId ? "sidebar-session-row active" : "sidebar-session-row"}
-                      onClick={() => onSelectSession(session.id, project.id)}
-                    >
-                      <span className="sidebar-session-title">{session.title}</span>
-                      <small>{formatRelativeTime(session.updatedAt)}</small>
-                    </button>
-                  ))}
+                  {projectSessions.map((session) => {
+                    const attention = workflowRequestAuthority(project, session.id)
+                      ? deriveSessionAttention(session, workflowNextActionForScope(nextActionsBySession, project.id, session.id)) : null;
+                    return (
+                      <div className="sidebar-session-entry" key={session.id}>
+                        <button
+                          className={project.id === activeProjectId && session.id === activeSessionId ? "sidebar-session-row active" : "sidebar-session-row"}
+                          onClick={() => onSelectSession(session.id, project.id)}
+                        >
+                          <span className="sidebar-session-title">{session.title}</span>
+                          <small>{formatRelativeTime(session.updatedAt)}</small>
+                        </button>
+                        {attention && (
+                          <SessionAttention
+                            attention={attention}
+                            sessionTitle={session.title}
+                            projectId={project.id}
+                            sessionId={session.id}
+                            onNavigate={() => onNavigateAttention(project, session, attention)}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
                   {projectSessions.length === 0 && <div className="sidebar-empty">No sessions</div>}
                 </div>
               )}
@@ -2989,6 +3163,7 @@ function ProjectStartPage({
   onModeChange,
   onProjectChange,
   submissionStates,
+  recentTaskReuse,
   onCreate,
 }: {
   goal: string;
@@ -2999,6 +3174,7 @@ function ProjectStartPage({
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
   submissionStates: Map<string, NewSessionSubmissionState>;
+  recentTaskReuse: RecentTaskReuseProps;
   onCreate: (target: SessionTarget) => Promise<void>;
 }) {
   return (
@@ -3016,6 +3192,7 @@ function ProjectStartPage({
           onModeChange={onModeChange}
           onProjectChange={onProjectChange}
           submissionStates={submissionStates}
+          recentTaskReuse={recentTaskReuse}
           onCreate={onCreate}
         />
       </div>
@@ -3120,6 +3297,35 @@ export function selectedNodeActionAvailability(
   };
 }
 
+export function artifactRepairDraftMismatch(
+  draft: ComposerDraftSnapshot,
+  projectId: string,
+  session: CanvasSession,
+  node: CanvasNode | null,
+  state: SelectedNodeActionState | null,
+): string | null {
+  const source = draft.source;
+  if (!source) return null;
+  const payload = state?.repairPayload;
+  return source.projectId === projectId && source.sessionId === session.id && session.projectId === projectId &&
+    source.nodeId === node?.id && source.runId === node?.runId &&
+    draft.key === draftScopeKey(["node", projectId, session.id, source.nodeId, "repair"]) &&
+    state?.canCreateRepair && payload?.sessionId === source.sessionId && payload.nodeId === source.nodeId &&
+    payload.checkpointId === source.afterCheckpointId
+    ? null : "Artifact Repair source run or after checkpoint changed/unavailable. Draft retained; reopen the source artifact or clear this draft explicitly.";
+}
+
+export function artifactRepairActionState(session: CanvasSession, node: CanvasNode, projection: unknown): SelectedNodeActionState {
+  const state = buildSelectedNodeActionState({ sessionId: session.id, selectedNode: node, projection });
+  const checkpointId = state.repairPayload?.checkpointId;
+  const checkpoints = isRecord(projection) && Array.isArray(projection.checkpoints) ? projection.checkpoints : [];
+  const matching = checkpoints.filter(checkpoint => isRecord(checkpoint) && checkpoint.id === checkpointId &&
+    checkpoint.sessionId === session.id && checkpoint.nodeId === node.id && checkpoint.laneId === state.repairPayload?.laneId &&
+    checkpoint.phase === "after" && checkpoint.runId === node.runId);
+  if (!checkpointId || matching.length !== 1) throw new Error("Repair requires an after checkpoint for this exact artifact source run. Feedback/draft retained.");
+  return state;
+}
+
 function rollbackActionAvailability(state: SelectedNodeActionState): NodeActionAvailability {
   if (state.blockedByRemoteSideEffect) {
     return { enabled: false, reason: REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE };
@@ -3164,6 +3370,7 @@ function SessionComposer({
   onModeChange,
   onProjectChange,
   submissionStates,
+  recentTaskReuse,
   onClose,
   onCreate,
 }: {
@@ -3177,6 +3384,7 @@ function SessionComposer({
   onModeChange: (mode: WorkflowMode) => void;
   onProjectChange: (projectId: string) => void;
   submissionStates: Map<string, NewSessionSubmissionState>;
+  recentTaskReuse: RecentTaskReuseProps;
   onClose?: () => void;
   onCreate: (target: SessionTarget) => Promise<void>;
 }) {
@@ -3300,6 +3508,7 @@ function SessionComposer({
           aria-label="New task goal"
           rows={5}
         />
+        <RecentTaskReuse {...recentTaskReuse} />
       </div>
       <div className="control-strip">
         <div className="control-strip-row">
@@ -4887,6 +5096,7 @@ export function NodeModal({
   onOpenEditor,
   editorLaunchBusy,
   onDecisionAnswer,
+  onDraftRepair,
 }: {
   node: CanvasNode;
   isCurrentScope: () => boolean;
@@ -4906,6 +5116,7 @@ export function NodeModal({
   onOpenEditor: (editor?: EditorKind) => void;
   editorLaunchBusy?: boolean;
   onDecisionAnswer: (option: string) => void;
+  onDraftRepair?: (request: ArtifactRepairDraftRequest) => Promise<void>;
 }) {
   const backdropRef = useRef<HTMLDivElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
@@ -5055,7 +5266,7 @@ export function NodeModal({
         <div className="modal-body">
           {tab === "Output" && <OutputTab node={node} onDecisionAnswer={onDecisionAnswer} />}
           {tab === "Changes" && <ChangesTab key={JSON.stringify([projectRoot, session.projectId, session.id, node.id, node.runId])} node={node} projectRoot={projectRoot} session={session} runEvents={runEvents} />}
-          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} />}
+          {tab === "Context" && <ContextTab node={node} session={session} projectRoot={projectRoot} runEvidence={runEvidence} onDraftRepair={onDraftRepair} isCurrent={isPickerCurrent} />}
         </div>
       </section>
     </div>
@@ -6883,7 +7094,8 @@ function RunEvidenceFacts({ runEvidence }: { runEvidence: RunEvidence }) {
   );
 }
 
-function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasNode; session: CanvasSession; projectRoot: string; runEvidence?: RunEvidence | null }) {
+function ContextTab({ node, session, projectRoot, runEvidence, onDraftRepair, isCurrent }: { node: CanvasNode; session: CanvasSession; projectRoot: string; runEvidence?: RunEvidence | null;
+  onDraftRepair?: (request: ArtifactRepairDraftRequest) => Promise<void>; isCurrent?: () => boolean }) {
   const isNewWorktree = node.worktree.executionTarget === "new_worktree" || !!node.worktree.worktreeId;
 
   return (
@@ -6926,7 +7138,7 @@ function ContextTab({ node, session, projectRoot, runEvidence }: { node: CanvasN
         {runEvidence ? (
           <Fragment>
             <RunEvidenceFacts runEvidence={runEvidence} />
-            <RunArtifacts projectRoot={projectRoot} session={session} node={node} runEvidence={runEvidence} />
+            <RunArtifacts projectRoot={projectRoot} session={session} node={node} runEvidence={runEvidence} onDraftRepair={onDraftRepair} isCurrent={isCurrent} />
           </Fragment>
         ) : (
           <Fragment>

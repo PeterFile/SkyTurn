@@ -38,6 +38,17 @@ function luminance(value: string, tokens: Map<string, string>): number {
 }
 
 describe("ResultOutput product styles", () => {
+  it("keeps the active Find match readable with final product tokens", async () => {
+    const product = await readSource("./styles.css");
+    const styles = product.replace('@import "./ResultOutput.css";', await readSource("./ResultOutput.css"));
+    const tokens = declarations(styles, ":root");
+    const match = declarations(styles, ".result-output .result-output-active-match");
+    const foreground = luminance(match.get("color") ?? "", tokens);
+    const background = luminance(match.get("background") ?? "", tokens);
+    const contrast = (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
+    expect(contrast).toBeGreaterThanOrEqual(4.5);
+  });
+
   it("keeps selected Preview and Raw text contrast at least 4.5 with final dark tokens", async () => {
     const product = await readSource("./styles.css");
     expect(product).toContain('@import "./ResultOutput.css";');
