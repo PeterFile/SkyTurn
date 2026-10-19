@@ -7,11 +7,12 @@ import { createGitChangesetService, createWorkflowGitAncestryProof, createLiveWo
 
 export const goalReviewFixture = Object.freeze({
   sessionId: "goal-review-session", sourceNodeId: "source-implementation", unrelatedNodeId: "unrelated-ready",
-  originalGoal: "Implement answer.js exporting answer = 42. The current answer = 41 is a genuinely unmet goal. Review must identify this discrepancy.",
-  approvedPlan: "Approved Plan Finish\nAcceptance criterion: answer.js must export answer = 42.\nInspect the actual file and cite the observed value; never infer acceptance from process success.",
+  originalGoal: "Implement answer.js as an ES module exporting the named constant answer = 42.",
+  approvedPlan: "Approved Plan Finish\nAcceptance criterion: answer.js must export answer = 42.\nUse an ES module with a named constant export.",
 });
 
-export async function seedGoalReviewSource({ projectRoot, store, approvedPlan = true, brandContext }) {
+export async function seedGoalReviewSource({ projectRoot, store, approvedPlan = true, brandContext, observedValue = 41 }) {
+  if (!Number.isSafeInteger(observedValue) || observedValue === 42) throw new Error("Fixture requires an incorrect safe integer observation.");
   const root = await realpath(projectRoot);
   const withinTemp = relative(await realpath(tmpdir()), root);
   if (!withinTemp || withinTemp.startsWith("..") || isAbsolute(withinTemp)) throw new Error("Fixture requires an isolated disposable TMPDIR project.");
@@ -39,7 +40,7 @@ export async function seedGoalReviewSource({ projectRoot, store, approvedPlan = 
   const checkpoint = { ...identity, executionTarget: "current_branch", worktreePath: root, branchName, headCommit,
     evidenceRefs: [{ kind: "run", id: identity.runId }, { kind: "segment", id: identity.segmentId }] };
   store.recordRunCheckpoint({ ...checkpoint, phase: "before", worktreeState: "clean", now });
-  await writeFile(join(root, "answer.js"), "export const answer = 41;\n");
+  await writeFile(join(root, "answer.js"), `export const answer = ${observedValue};\n`);
   const node = store.materializeCanvasSession(session.id).nodes.find(node => node.id === identity.nodeId);
   const reconciled = await createGitChangesetService({ repoRoot: root }).reconcileFinalChangeset({ node,
     target: { executionTarget: "current_branch", selectedBranch: branchName }, baselineRef: headCommit });

@@ -91,7 +91,7 @@ async function harness(t, controls = true) {
   });
   const main = loader.load(join(repo, "apps/desktop/electron/main.ts"), { sourceSuffix: `
 agentBridge = testBridge;
-export { advanceWorkflowSession, enqueueWorkflowProjectAdvance, getWorkflowStore, openedProjectRoots,
+export { buildScheduledWorkflowRunStartInput, advanceWorkflowSession, enqueueWorkflowProjectAdvance, getWorkflowStore, openedProjectRoots,
   planProjectIdentities, reconcileTerminalRunEvent, reconcileTerminalWorkflowRun, workflowStores,
   compensateTerminalPersistenceFailure, workflowTerminalReconciliationTasks,
   workflowProjectAdvanceTails, workflowSessionMutationLocks, workflowStoreOperationTasks };` });
@@ -132,10 +132,10 @@ export { advanceWorkflowSession, enqueueWorkflowProjectAdvance, getWorkflowStore
     advance: () => main.advanceWorkflowSession(projectRoot, store, "session-1", true),
     pause: (input = request(), root = alias) => api.workflow.pauseScheduling(root, input),
     resume: (input = request("resume-1", 1, "paused")) => api.workflow.resumeScheduling(projectRoot, input),
-    async reopen() {
+    async reopen(advance = true) {
       store.close();
       main.workflowStores.clear();
-      store = await main.getWorkflowStore(alias);
+      store = await main.getWorkflowStore(alias, advance);
     },
   };
 }
@@ -430,4 +430,90 @@ test("reopen revalidates stale source while preserving completed review evidence
   assert.equal(session.schedulingState.status, "paused");
   assert.equal(h.store.listRunningSegments().length, 0);
   assert.equal(h.runs.length, 1);
+});
+
+
+test("goal-review replay recovers creation-before-schedule after reopen with one exact launch", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  h.seed("replay-sibling");
+  const input = { requestId: "creation-crash", sessionId: fixture.identity.sessionId, nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId };
+  const created = h.store.createGoalReview(input, now);
+  const claims = agentBridgeModule.createDurableRunClaimStore({ root: join(dirname(h.projectRoot), "creation-claims") });
+  h.start(async start => {
+    assert.equal(await claims.publish(h.projectRoot, { sessionId: start.sessionId, nodeId: start.nodeId, runId: start.runId,
+      agentKind: "hermes", startedAt: now, startFingerprint: agentBridgeModule.createAgentRunStartFingerprint(start) }), "published");
+  });
+  await h.reopen(false);
+  assert.equal(h.runs.length, 0);
+  const beforeConflict = h.store.listEvents(input.sessionId);
+  await assert.rejects(h.api.workflow.reviewOriginalGoal(h.projectRoot, { ...input, sourceRunId: "wrong-source" }), /conflict/);
+  assert.deepEqual(h.store.listEvents(input.sessionId), beforeConflict);
+  const [first, duplicate] = await Promise.all([h.api.workflow.reviewOriginalGoal(h.projectRoot, input), h.api.workflow.reviewOriginalGoal(h.projectRoot, input)]);
+  assert.equal(first.created, false);
+  assert.equal(first.reviewNodeId, created.binding.reviewNodeId);
+  assert.equal(duplicate.reviewNodeId, first.reviewNodeId);
+  assert.equal(h.runs.length, 1);
+  assert.equal(h.runs[0].nodeId, created.binding.reviewNodeId);
+  assert.equal(h.runs[0].sandbox, "read-only");
+  assert.equal(h.runs[0].hermesSessionHandle, undefined);
+  assert.equal(h.runs[0].plannerSessionId, undefined);
+  assert.equal((await claims.read(h.projectRoot, h.runs[0].runId)).kind, "valid");
+  assert.deepEqual(JSON.parse(JSON.stringify(h.store.getGoalReview(input.sessionId, input.requestId))), JSON.parse(JSON.stringify(created.binding)));
+  assert.equal(h.store.materializeFlowProjection(input.sessionId).segments.filter(segment => segment.laneId === first.reviewNodeId).length, 1);
+  assert.equal(h.store.materializeFlowProjection("replay-sibling").segments.length, 0);
+  assert.equal(h.store.listEvents(input.sessionId).some(event => /approval|repair_requested|replan.requested|review_allowed|commit.created|remote_side_effect|delivery.pushed/.test(event.kind)), false);
+});
+
+
+for (const claimed of [false, true]) test(`goal-review restart after schedule ${claimed ? "and durable claim" : "before claim"} converges without relaunch`, async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  h.seed("crash-sibling");
+  const input = { requestId: claimed ? "claim-crash" : "schedule-crash", sessionId: fixture.identity.sessionId, nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId };
+  const { binding } = h.store.createGoalReview(input, now);
+  const lane = h.store.scheduleReadyLanes(input.sessionId, { exactLaneIds: [binding.reviewNodeId], now }).readyLanes[0];
+  const claims = agentBridgeModule.createDurableRunClaimStore({ root: join(dirname(h.projectRoot), "claims") });
+  const actualBridge = new agentBridgeModule.AgentBridge({ adapters: [], durableRunClaimStore: claims });
+  t.after(() => actualBridge.close());
+  if (claimed) {
+    const start = await h.main.buildScheduledWorkflowRunStartInput(h.projectRoot, h.store, { sessionId: input.sessionId, laneId: lane.id, segmentId: lane.segmentId, runId: lane.runId, agentKind: "hermes" });
+    await claims.publish(h.projectRoot, { sessionId: input.sessionId, nodeId: lane.id, runId: lane.runId, agentKind: "hermes",
+      startedAt: now, startFingerprint: agentBridgeModule.createAgentRunStartFingerprint(start) });
+  }
+  h.bridge.getEvidence = (...args) => actualBridge.getEvidence(...args);
+  h.bridge.loadEvents = (...args) => actualBridge.loadEvents(...args);
+  h.bridge.listRuns = () => actualBridge.listRuns();
+  await h.reopen(false);
+  const recovered = h.store.materializeCanvasSession(input.sessionId).nodes.find(node => node.id === lane.id);
+  assert.equal(recovered.status, "failed");
+  const before = h.store.listEvents(input.sessionId);
+  const replayed = await h.api.workflow.reviewOriginalGoal(h.projectRoot, input);
+  assert.equal(replayed.reviewNodeId, binding.reviewNodeId);
+  assert.equal(replayed.created, false);
+  assert.equal(h.runs.length, 0);
+  assert.deepEqual(h.store.listEvents(input.sessionId), before);
+  assert.equal(h.store.materializeFlowProjection(input.sessionId).segments.filter(segment => segment.laneId === lane.id).length, 1);
+  assert.equal(h.store.materializeFlowProjection("crash-sibling").segments.length, 0);
+  assert.equal((await claims.read(h.projectRoot, lane.runId)).kind, claimed ? "valid" : "missing");
+  assert.equal(before.some(event => /approval|repair_requested|replan.requested|review_allowed|commit.created|remote_side_effect|delivery.pushed/.test(event.kind)), false);
+  assert.throws(() => h.store.recordRunResult({ sessionId: input.sessionId, laneId: lane.id, segmentId: lane.segmentId, runId: lane.runId, agentKind: "hermes",
+    outputSummary: "Late contradictory success", runEvents: [], evidence: evidence(lane.runId), now }));
+  assert.deepEqual(h.store.listEvents(input.sessionId), before);
+});
+
+test("pending goal-review replay honors pause and busy gates without source rebinding", async (t) => {
+  const h = await harness(t);
+  const fixture = await seedGoalReviewSource({ projectRoot: h.projectRoot, store: h.store, brandContext: h.brandContext });
+  const input = { requestId: "gated-replay", sessionId: fixture.identity.sessionId, nodeId: fixture.identity.nodeId, sourceRunId: fixture.identity.runId };
+  const { binding } = h.store.createGoalReview(input, now);
+  h.store.pauseWorkflowScheduling({ sessionId: input.sessionId, requestId: "pause-pending", expectedStatus: "active", expectedRevision: 0, now });
+  await h.api.workflow.reviewOriginalGoal(h.projectRoot, input);
+  assert.equal(h.runs.length, 0);
+  assert.equal(h.store.materializeFlowProjection(input.sessionId).schedulingState.status, "paused");
+  h.store.resumeWorkflowScheduling({ sessionId: input.sessionId, requestId: "resume-pending", expectedStatus: "paused", expectedRevision: 1, now });
+  h.store.scheduleReadyLanes(input.sessionId, { exactLaneIds: ["unrelated-ready"], now });
+  await h.api.workflow.reviewOriginalGoal(h.projectRoot, input);
+  assert.equal(h.runs.length, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(h.store.getGoalReview(input.sessionId, input.requestId))), JSON.parse(JSON.stringify(binding)));
 });
