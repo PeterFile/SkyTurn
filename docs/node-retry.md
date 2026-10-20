@@ -4,7 +4,7 @@ Open a task card through **More**, then select **Retry**. Retry is available for
 
 Review the confirmation, then choose **Start new attempt**. The new attempt uses the **current workspace**, including existing file changes. Retry does not reset Git, roll back changes, or restore a checkpoint. **Cancel Retry** closes the confirmation without submitting a Retry request.
 
-The backend assigns a new run and segment. The original attempt, output, and evidence remain in the workflow history. **Output** keeps the original output and includes subsequent output as it arrives. **Context** shows the current run identity and status, plus retained attempt identities and terminal facts. The node details still have exactly **Output**, **Changes**, and **Context** tabs.
+The backend assigns a new run and segment. The original attempt, output, and evidence remain in the workflow history. **Output** keeps the original output and includes subsequent output as it arrives, including after reopening the session or refreshing node details. Replaying an attempt does not duplicate its output or remove output from earlier attempts. **Context** shows the current run identity and status, plus retained attempt identities and terminal facts. The node details still have exactly **Output**, **Changes**, and **Context** tabs.
 
 Paused scheduling stays paused. A Retry can be reserved while paused and will wait for scheduling to resume. **Stop** controls a running agent; **Pause** controls workflow scheduling. Neither is a Retry or a rollback.
 

@@ -6,6 +6,7 @@ import type { AgentRun, CanvasNode, CanvasSession, ImportedProject, RunEvent, Ru
 import * as WorkflowRuntime from "./workflowRuntime.js";
 import {
   applyBridgeRunResult,
+  applyRunEventToWorkspace,
   buildPromptForNodeRun,
   loadExactRunEvidence,
   loadExactTerminalRunEvidence,
@@ -17,6 +18,84 @@ import {
 } from "./workflowRuntime.js";
 
 describe("workflow runtime event merging", () => {
+  it.each(["local projection", "desktop observability"] as const)(
+    "retains exact previous-attempt output during current-run hydration in %s",
+    (mode) => {
+      vi.stubGlobal("window", mode === "desktop observability" ? { devflow: {} } : undefined);
+      try {
+        const runId = "run-retry-current";
+        const historical = [
+          event("run-original", 1, "output", { text: "  SYNTHETIC original failed Codex output\r\n\n" }),
+          event("run-original", 2, "changes", { text: "\t \r\n" }),
+          event("run-retry-previous", 1, "progress", { text: "same" }),
+          event("run-retry-previous", 2, "output", { text: "" }),
+        ];
+        const current = [
+          event(runId, 1, "progress", { text: "same" }),
+          event(runId, 2, "output", { text: "```ts\nconst " }),
+          event(runId, 3, "status", { status: "running" }),
+          event(runId, 4, "output", { text: "value = 1;\n```\n" }),
+        ];
+        const outputDeltas = [...historical, current[0]!, current[1]!, current[3]!];
+        const node = {
+          ...makeNode({ id: "node-code", agent: "codex", status: "failed", runId }),
+          output: outputDeltas.map((delta) => delta.payload.text as string),
+          outputDeltas,
+        };
+        const workspace = makeWorkspace([node]);
+        workspace.runEvidence[runId] = runEvidenceFor(runId, "cancelled");
+        const hydrated = mergeRunEventsIntoWorkspace(workspace, runId, [...current].reverse());
+        const replayed = mergeRunEventsIntoWorkspace(hydrated, runId, [...current, ...current]);
+        const reopened = mergeRunEventsIntoWorkspace(
+          JSON.parse(JSON.stringify(replayed)) as WorkspaceState, runId, current,
+        );
+        const liveDelta = event(runId, 5, "changes", { text: "\r\n  live tail\t" });
+        const liveFromSnapshot = applyRunEventToWorkspace(workspace, liveDelta);
+        const live = applyRunEventToWorkspace(reopened, liveDelta);
+        const snapshot = {
+          ...live,
+          sessions: live.sessions.map((session) => ({
+            ...session,
+            nodes: session.nodes.map((candidate) => candidate.id === node.id ? node : candidate),
+          })),
+        };
+        const afterSnapshot = mergeRunEventsIntoWorkspace(snapshot, runId, current);
+        const repeatedLive = applyRunEventToWorkspace(afterSnapshot, liveDelta);
+
+        const snapshotNode = liveFromSnapshot.sessions[0]?.nodes.find((candidate) => candidate.id === node.id);
+        expect(snapshotNode?.output).toEqual([...node.output, liveDelta.payload.text]);
+        expect(snapshotNode?.outputDeltas).toEqual(outputDeltas);
+        expect(liveFromSnapshot.runEvents[runId]).toEqual([liveDelta]);
+        const statusOnly = applyRunEventToWorkspace(workspace, current[2]!);
+        expect(statusOnly.sessions[0]?.nodes.find((candidate) => candidate.id === node.id)?.output).toEqual(node.output);
+        const staleRun = applyRunEventToWorkspace(liveFromSnapshot, event("run-original", 3, "output", { text: "stale" }));
+        expect(staleRun.sessions).toEqual(liveFromSnapshot.sessions);
+        const replacement = event(runId, 2, "output", { text: "```ts\nlet " });
+        const replaced = mergeRunEventsIntoWorkspace(workspace, runId, [replacement]);
+        expect(replaced.sessions[0]?.nodes.find((candidate) => candidate.id === node.id)?.output).toEqual(
+          outputDeltas.map((delta) => delta.runId === runId && delta.seq === 2 ? replacement.payload.text : delta.payload.text),
+        );
+
+        for (const state of [hydrated, replayed, reopened, live, afterSnapshot, repeatedLive]) {
+          const expected = [live, afterSnapshot, repeatedLive].includes(state)
+            ? [...node.output, liveDelta.payload.text as string]
+            : node.output;
+          const captured = state.sessions[0]?.nodes.find((candidate) => candidate.id === node.id);
+          expect(captured?.output).toEqual(expected);
+          expect(captured?.output.join("")).toBe(expected.join(""));
+          expect(captured?.outputDeltas).toEqual(outputDeltas);
+          expect(captured?.status).toBe("failed");
+          expect(state.runEvidence[runId]).toEqual(workspace.runEvidence[runId]);
+          expect(state.runEvents[runId]).toEqual(
+            [live, afterSnapshot, repeatedLive].includes(state) ? [...current, liveDelta] : current,
+          );
+        }
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    },
+  );
+
   it("does not expose renderer terminal persistence APIs", () => {
     expect(WorkflowRuntime).not.toHaveProperty("claimCompletedBridgeRunPersistence");
     expect(WorkflowRuntime).not.toHaveProperty("persistCompletedBridgeRunResult");
@@ -58,7 +137,7 @@ describe("workflow runtime event merging", () => {
 
         const partial = mergeRunEventsIntoWorkspace(workspace, runId, deltas.slice(0, 5).reverse());
         expect(partial.sessions[0]?.nodes.find((candidate) => candidate.id === node.id)?.output).toEqual(
-          fragments.slice(0, 5),
+          fragments,
         );
         const next = mergeRunEventsIntoWorkspace(partial, runId, [...deltas].reverse());
         const replayed = mergeRunEventsIntoWorkspace(next, runId, deltas);
