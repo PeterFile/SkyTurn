@@ -25,11 +25,11 @@ vi.mock("react", async (original) => {
     // Explicit renders read the latest real store snapshot without scheduling subscriptions.
     useSyncExternalStore: <T>(_subscribe: unknown, getSnapshot: () => T) => getSnapshot(),
     useEffect: () => undefined,
-    useLayoutEffect: (effect: any, dependencies: any[]) => {
+    useLayoutEffect: (effect: any, dependencies?: any[]) => {
       const host = runtime.host;
       const index = host.index++;
       const old = host.slots[index];
-      if (!old || dependencies.some((value, i) => !Object.is(value, old.dependencies[i]))) {
+      if (!dependencies || !old || dependencies.some((value, i) => !Object.is(value, old.dependencies[i]))) {
         host.effects.push(() => { old?.cleanup?.(); host.slots[index] = { dependencies, cleanup: effect() }; });
       }
     } };

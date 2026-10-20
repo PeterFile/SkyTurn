@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { WorktreeComparisonRequest } from "@skyturn/git-worktree" with { "resolution-mode": "import" };
 import type {
+  ArtifactViewApi,
   PlanApi,
   SettingsApi,
   WorkflowApi,
@@ -36,6 +37,10 @@ import {
   parseWorkflowProjectionResponseEnvelope,
   parseWorkflowResponseEnvelope,
 } from "./workflowIpcContracts";
+
+const artifacts = {
+  read: (input) => ipcRenderer.invoke("artifact:read", input),
+} satisfies ArtifactViewApi;
 
 const terminal = {
   start: (input: TerminalStartInput): Promise<TerminalStartResult> => ipcRenderer.invoke("terminal:start", input),
@@ -220,6 +225,7 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 }
 
 contextBridge.exposeInMainWorld("devflow", {
+  artifacts,
   openProject: () => ipcRenderer.invoke("project:open"),
   initializeProjectMemory: (rootPath: string) => ipcRenderer.invoke("project:initDevflow", rootPath),
   getProjectBranchFacts: (projectRoot: string) => ipcRenderer.invoke("project:branchFacts", projectRoot),

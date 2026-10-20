@@ -1,0 +1,210 @@
+.run-artifacts {
+  margin-top: 1rem;
+  min-width: 0;
+  color: var(--sk-text);
+}
+
+.run-artifacts.empty {
+  color: var(--sk-text-subtle);
+  font-style: italic;
+}
+
+.artifacts-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.artifact-item {
+  border: 1px solid var(--sk-border);
+  border-radius: 4px;
+  background: var(--sk-surface);
+  color: var(--sk-text);
+  overflow: hidden;
+}
+
+.artifact-item-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: var(--sk-bg);
+  border-bottom: 1px solid var(--sk-border);
+}
+
+.artifact-item-header .icon-button {
+  flex: 0 0 auto;
+  width: auto;
+  white-space: nowrap;
+}
+
+.artifact-item-header .icon-button svg {
+  flex-shrink: 0;
+}
+
+.artifact-name-row {
+  display: flex;
+  flex: 1 1 12rem;
+  flex-direction: column;
+  min-width: 0;
+  gap: 0.2rem;
+}
+
+.artifact-name {
+  font-family: monospace;
+  font-size: 0.9em;
+  word-break: break-all;
+}
+
+.artifact-meta-preview {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.artifact-view {
+  padding: 0.5rem;
+  font-size: 0.9em;
+}
+
+.artifact-view.loading {
+  color: var(--sk-text-subtle);
+  font-style: italic;
+}
+
+.artifact-view.error {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  color: var(--sk-status-failed-text);
+  background: var(--sk-bg);
+  padding: 0.5rem;
+  border-radius: 4px;
+}
+
+.artifact-meta-post {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.meta-badge {
+  background: var(--sk-bg);
+  padding: 0.1rem 0.4rem;
+  border-radius: 2px;
+  font-size: 0.8em;
+  color: var(--sk-text);
+  display: inline-block;
+  width: fit-content;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow-wrap: anywhere;
+}
+
+.meta-badge.warning {
+  background: color-mix(in srgb, var(--sk-status-retrying) 12%, var(--sk-surface));
+  color: var(--sk-text);
+  border: 1px solid var(--sk-warning-border);
+}
+
+.artifact-content {
+  max-height: 400px;
+  overflow: auto;
+  border: 1px solid var(--sk-border);
+  background: var(--sk-bg);
+  color: var(--sk-text);
+  padding: 0.5rem;
+}
+
+.artifact-text {
+  margin: 0;
+  color: var(--sk-text);
+  white-space: pre-wrap;
+  font-family: monospace;
+  word-break: break-word;
+}
+
+.artifact-image-container img {
+  max-width: 100%;
+  display: block;
+}
+
+.artifact-image-error {
+  color: var(--sk-status-failed-text);
+  padding: 1rem;
+  text-align: center;
+  border: 1px dashed var(--sk-danger-border);
+}
+
+.artifact-feedback {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.artifact-feedback textarea {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  border: 1px solid var(--sk-border);
+  border-radius: 4px;
+  padding: 0.5rem;
+  background: var(--sk-bg);
+  color: var(--sk-text);
+  caret-color: var(--sk-accent);
+}
+
+.artifact-feedback label {
+  color: var(--sk-text);
+}
+
+.artifact-feedback-append {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.artifact-feedback button {
+  justify-self: start;
+}
+
+.artifact-feedback input[type="checkbox"] {
+  flex: 0 0 auto;
+  accent-color: var(--sk-accent);
+}
+
+.artifact-item-header .icon-button,
+.artifact-feedback button {
+  min-height: 32px;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--sk-border);
+  border-radius: 4px;
+  background: var(--sk-surface);
+  color: var(--sk-text);
+}
+
+.artifact-item-header .icon-button:hover:not(:disabled),
+.artifact-feedback button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sk-text) 8%, var(--sk-surface));
+  color: var(--sk-text);
+}
+
+.artifact-feedback textarea:focus-visible,
+.artifact-feedback input:focus-visible,
+.artifact-feedback button:focus-visible,
+.artifact-item-header .icon-button:focus-visible {
+  outline: 2px solid var(--sk-accent);
+  outline-offset: 2px;
+}
+
+.artifact-feedback [role="alert"] {
+  margin: 0;
+  color: var(--sk-status-failed-text);
+}

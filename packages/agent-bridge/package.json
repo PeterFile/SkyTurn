@@ -16,6 +16,11 @@
       "types": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./bounded-file-reader": {
+      "types": "./src/boundedFileReader.ts",
+      "import": "./dist/boundedFileReader.js",
+      "default": "./dist/boundedFileReader.js"
     }
   },
   "scripts": {
@@ -24,7 +29,7 @@
     "native:copy": "node scripts/buildArtifactGate.mjs --copy-dist",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "pnpm run native:build && vitest run src",
+    "test": "pnpm run native:build && vitest run src && node --test scripts/boundedFileReader.test.mjs",
     "test:windows": "node scripts/windowsProcessTreeIntegration.mjs"
   },
   "dependencies": {

@@ -281,7 +281,7 @@ export function mergeRunEventsIntoWorkspace(
 }
 
 function applyRunObservabilityToNode(node: CanvasNode, events: RunEvent[]): CanvasNode {
-  const output = outputFromEvents(events);
+  const output = capturedOutputFromEvents(events);
   const progress = progressPhraseFromEvents(events);
   return {
     ...node,
@@ -296,7 +296,7 @@ function applyRunEventsToNode(
   events: RunEvent[],
   evidence: RunEvidence | null,
 ): CanvasNode {
-  const output = outputFromEvents(events);
+  const output = capturedOutputFromEvents(events);
   const run = runFromEvents(node, session, evidence);
   const derivedStatus = run ? deriveNodeStatusFromEvidence(run, evidence) : node.status;
   const status = derivedStatus === "completed" && !isSuccessfulRunEvidence(evidence, {
@@ -1198,6 +1198,14 @@ function latestEvidenceCheckName(value: unknown): string | null {
     if (phrase) return phrase;
   }
   return null;
+}
+
+function capturedOutputFromEvents(events: RunEvent[]): string[] {
+  // Display diagnostics without admitting them to Hermes protocol parsing.
+  return events.flatMap((event) => {
+    if (event.kind !== "output" && event.kind !== "progress" && event.kind !== "changes") return [];
+    return typeof event.payload.text === "string" ? [event.payload.text] : [];
+  });
 }
 
 function outputFromEvents(events: RunEvent[]): string[] {

@@ -54,6 +54,7 @@ import {
   workflowNextActionForScope,
 } from "./App.js";
 import { createReassignmentController } from "./ReassignAgentPicker.js";
+import { RecentTaskReuse } from "./RecentTaskReuse.js";
 import * as AppModule from "./App.js";
 import { parsePlanBootstrapSession } from "@skyturn/project-core";
 import type { AgentDescriptor, CanvasNode, CanvasSession, Changeset, FinalChangesetReconciliation, PlanSession, RunEvidence, WorkflowLoopNextAction } from "@skyturn/project-core";
@@ -4552,6 +4553,169 @@ async function composerAppFunctions(names: string[], context: Record<string, unk
 const composerAuthorityFunctions = ["workflowRequestAcknowledged", "canvasSessionForWorkflowAuthority",
   "workspaceMatchesWorkflowAuthority", "workflowSessionEnvelope", "isCanvasSession", "isCanonicalWorkflowProjectRoot",
   "isRecord", "rollbackBlockedMessage", "optionalText", "hasCanonicalWorkflowPathSegments"];
+
+describe("App recent task goal reuse", () => {
+  async function setup(mode: "fast" | "plan" = "fast") {
+    const store = createComposerDraftStore(() => undefined);
+    const project = workflowProjectForTest("project-1", "/opened/project-1-alias", "/canonical/project-1");
+    const goal = " \tBuild exactly this\r\n ";
+    const source = AppModule.createSession(project.id, goal, "fast", {
+      executionTarget: "new_worktree", selectedBranch: "source-branch", baseRef: "source-branch",
+    }) as CanvasSession;
+    const workspaceRef = { current: { ...workflowWorkspaceForTest([project], [source]), activeSessionId: null } };
+    const key = draftScopeKey(["new", project.id, mode]);
+    store.edit(key, goal);
+    const newTaskReuseDraft = { projectId: project.id, mode, snapshot: store.read(key) };
+    const context = { ...AppModule, draftScopeKey, composerDraftStore: store, workspaceRef, newTaskReuseDraft,
+      newTaskReuseDraftRef: { current: newTaskReuseDraft }, resolvedNewTaskProjectId: project.id, newTaskMode: mode,
+      newTaskDraft: { capture: () => store.read(key) }, newSessionSubmissionsRef: { current: new Map() },
+      refreshNewSessionState: vi.fn(), changesetsForSession: () => ({}),
+      setWorkspace: update => { workspaceRef.current = update(workspaceRef.current); },
+      captureWorkflowSessionResponseGuard: (_project, sessionId, session) => workflowGuardForTest(session, { sessionId }),
+      applyGuardedWorkflowSessionResponse: vi.fn(() => false),
+      persistCanvasWorkflowSession: vi.fn(async () => { throw new Error("Unavailable"); }),
+    };
+    const handlers = await composerAppFunctions([...composerAuthorityFunctions, "hasPendingNewSessionSubmission",
+      "reuseRecentTaskGoal", "addSessionFromComposer"], context);
+    return { store, project, goal, source, workspaceRef, key, context, handlers,
+      target: { executionTarget: "current_branch" as const, selectedBranch: "main" } };
+  }
+
+  it("preserves failed Retry identity but explicitly reuses identical text as a fresh create/planner/run", async () => {
+    const app = await setup();
+    const { context, handlers, target, source, goal, workspaceRef } = app;
+    const before = structuredClone(workspaceRef.current);
+    const getProjection = vi.fn();
+    vi.stubGlobal("window", { devflow: { workflow: { getProjection } } });
+    try {
+      await handlers.addSessionFromComposer(target); await handlers.addSessionFromComposer(target);
+      const [first, retry] = context.persistCanvasWorkflowSession.mock.calls.map(call => call[1] as CanvasSession);
+      expect(retry).toBe(first);
+      expect(context.newSessionSubmissionsRef.current.size).toBe(1);
+      const untouched = { session: { ...source, goal: "Other goal" }, inputId: "keep", busy: false, error: "Failed" };
+      context.newSessionSubmissionsRef.current.set("other-goal", untouched);
+      const otherProject = { ...untouched, session: { ...source, projectId: "other-project" }, busy: true };
+      context.newSessionSubmissionsRef.current.set("other-project", otherProject);
+      const otherMode = { ...untouched, session: { ...source, mode: "plan" }, busy: true };
+      context.newSessionSubmissionsRef.current.set("other-mode", otherMode);
+      context.newSessionSubmissionsRef.current.set("other-target", { ...untouched, session: source });
+      handlers.reuseRecentTaskGoal(goal);
+      expect(workspaceRef.current).toEqual(before);
+      expect(app.store.read(app.key).text).toBe(goal);
+      expect(context.persistCanvasWorkflowSession).toHaveBeenCalledTimes(2);
+      expect(getProjection).not.toHaveBeenCalled();
+      expect(context.newSessionSubmissionsRef.current.size).toBe(3);
+      expect(context.newSessionSubmissionsRef.current.get("other-goal")).toBe(untouched);
+      expect(context.newSessionSubmissionsRef.current.get("other-project")).toBe(otherProject);
+      expect(context.newSessionSubmissionsRef.current.get("other-mode")).toBe(otherMode);
+      await handlers.addSessionFromComposer(target);
+      const fresh = context.persistCanvasWorkflowSession.mock.calls[2][1] as CanvasSession;
+      expect(fresh.id).not.toBe(first.id);
+      expect(fresh.hermesPlannerSessionId).not.toBe(first.hermesPlannerSessionId);
+      expect(fresh.nodes[0].runId).not.toBe(first.nodes[0].runId);
+      expect(fresh.target).toEqual(target);
+      expect(fresh.id).not.toBe(source.id);
+      expect(workspaceRef.current.sessions[0]).toEqual(source);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each(["busy", "busy-other-goal", "draft", "scope", "project", "source", "goal"] as const)(
+    "rechecks %s in the parent callback without clearing a failed Retry", async (conflict) => {
+      const { store, key, goal, source, context, handlers, target, workspaceRef } = await setup();
+      store.sessionAttempt(store.read(key), target, () => ({ uuid: "keep-seed", createdAt: "2026-10-17T00:00:00.000Z" }));
+      if (conflict.startsWith("busy")) context.newSessionSubmissionsRef.current.set("pending", {
+        session: { ...source, goal: conflict === "busy" ? goal : "Another goal" }, inputId: "pending", busy: true, error: null,
+      });
+      if (conflict === "draft") { store.edit(key, "away"); store.edit(key, goal); }
+      if (conflict === "scope") context.newTaskReuseDraftRef.current = { ...context.newTaskReuseDraft };
+      if (conflict === "project") workspaceRef.current = { ...workspaceRef.current, projects: [] };
+      if (conflict === "source") workspaceRef.current = { ...workspaceRef.current, sessions: [] };
+      if (conflict === "goal") workspaceRef.current.sessions = [{ ...source, goal: "Changed source" }];
+      const snapshot = store.read(key);
+      const workspace = workspaceRef.current;
+      handlers.reuseRecentTaskGoal(goal);
+      expect(store.read(key)).toBe(snapshot);
+      expect(workspaceRef.current).toBe(workspace);
+      expect(store.sessionAttempt(snapshot, target, () => ({ uuid: "wrong", createdAt: "2026-10-17T00:00:00.000Z" })).uuid).toBe("keep-seed");
+      expect(context.persistCanvasWorkflowSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps a replacement draft when an earlier settled create acknowledgement clears its old capture", async () => {
+    const { store, key, goal, context, handlers, target } = await setup();
+    const captured = store.read(key);
+    context.persistCanvasWorkflowSession.mockImplementation(async (_root, seed) => workflowEnvelopeForTest(seed));
+    context.applyGuardedWorkflowSessionResponse.mockImplementation(() => { handlers.reuseRecentTaskGoal(goal); return false; });
+    vi.stubGlobal("window", { devflow: {} });
+    try { await handlers.addSessionFromComposer(target); } finally { vi.unstubAllGlobals(); }
+    expect(store.read(key).text).toBe(goal);
+    expect(store.read(key)).not.toBe(captured);
+    expect(store.sessionAttempt(store.read(key), target, () => ({ uuid: "fresh", createdAt: "2026-10-17T00:00:00.000Z" })).uuid).toBe("fresh");
+  });
+
+  it("keeps Plan drafts separate and creates fresh stage state only on explicit Create", async () => {
+    const { store, key, goal, source, context, handlers, target, workspaceRef } = await setup("plan");
+    const fastKey = draftScopeKey(["new", source.projectId, "fast"]);
+    store.edit(fastKey, "Keep fast draft");
+    const before = workspaceRef.current;
+    handlers.reuseRecentTaskGoal(goal);
+    expect(store.read(key).text).toBe(goal);
+    expect(store.read(fastKey).text).toBe("Keep fast draft");
+    expect(workspaceRef.current).toBe(before);
+    await handlers.addSessionFromComposer(target);
+    const plan = workspaceRef.current.sessions.at(-1)!;
+    expect(plan.kind).toBe("plan");
+    expect(plan.id).not.toBe(source.id);
+    expect(plan.target).toEqual(target);
+    expect(plan.nodes).toEqual([]);
+    expect(context.persistCanvasWorkflowSession).not.toHaveBeenCalled();
+  });
+
+  it("wires the chooser into New Session and preserves default and user-selected targets through reuse", async () => {
+    function reactElements(tree: ReactNode): ReactElement<Record<string, unknown>>[] {
+      if (Array.isArray(tree)) return tree.flatMap(reactElements);
+      if (!isValidElement<Record<string, unknown>>(tree)) return [];
+      return [tree, ...reactElements(tree.props.children as ReactNode)];
+    }
+    const app = await setup();
+    const chooser = { sessions: [app.source], projectId: app.project.id, mode: "fast", draft: app.goal,
+      draftVersion: app.store.read(app.key).version, busy: false, onUseGoal: app.handlers.reuseRecentTaskGoal };
+    const states: unknown[] = []; let cursor = 0;
+    const CustomSelect = () => null;
+    const { SessionComposer, ProjectStartPage } = await composerAppFunctions(["SessionComposer", "ProjectStartPage"], {
+      ...AppModule, React: { createElement }, RecentTaskReuse, CustomSelect, ProjectDropdown: () => null, ModeSwitch: () => null,
+      ArrowUp: () => null, useRef: () => ({ current: null }), useEffect: () => {},
+      useGSAP: () => ({ contextSafe: callback => callback }), userPrefersReducedMotion: () => true,
+      useState: initial => { const index = cursor++; if (!(index in states)) states[index] = initial;
+        return [states[index], value => { states[index] = value; }]; },
+    });
+    const onCreate = vi.fn(async () => {});
+    const props = { goal: app.goal, mode: "fast", projects: [app.project], selectedProjectId: app.project.id,
+      onGoalChange: vi.fn(), onModeChange: vi.fn(), onProjectChange: vi.fn(),
+      submissionStates: app.context.newSessionSubmissionsRef.current, recentTaskReuse: chooser, onCreate };
+    const start = ProjectStartPage(props);
+    const composer = reactElements(start).find(element => element.type === SessionComposer)!;
+    expect(composer.props.recentTaskReuse).toBe(chooser);
+    const render = () => { cursor = 0; return SessionComposer(composer.props); };
+    let tree = render();
+    const selects = () => reactElements(tree).filter(element => element.type === CustomSelect);
+    expect(selects()[0].props.value).toBe("current_branch");
+    (selects()[0].props.onChange as (value: string) => void)("new_worktree");
+    (selects()[1].props.onChange as (value: string) => void)("chosen-branch");
+    tree = render();
+    const reuse = reactElements(tree).find(element => element.type === RecentTaskReuse)!;
+    expect(reuse.props).toEqual(chooser);
+    (reuse.props.onUseGoal as (goal: string) => void)(app.goal);
+    tree = render();
+    expect(selects().map(select => select.props.value)).toEqual(["new_worktree", "chosen-branch"]);
+    expect(onCreate).not.toHaveBeenCalled();
+    (tree.props.onSubmit as (event: { preventDefault: () => void }) => void)({ preventDefault: () => {} });
+    expect(onCreate).toHaveBeenCalledExactlyOnceWith({ executionTarget: "new_worktree", selectedBranch: "chosen-branch", baseRef: "chosen-branch" });
+    const source = await readSource("./App.tsx");
+    expect(source).toContain("onUseGoal: reuseRecentTaskGoal");
+  });
+});
+
 describe("App composer draft acknowledgement", () => {
   it.each([false, true])("retires acknowledged create/append identity without replacing broadcast or newer edits (%s)", async (editAgain) => {
     const bytes = new Map();

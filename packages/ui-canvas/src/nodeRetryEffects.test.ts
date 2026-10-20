@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { emptyWorkspace, type WorkflowBroadcastEnvelope } from "@skyturn/persistence";
 import { reduceWorkflowEvents } from "@skyturn/workflow-kernel";
 import App, { NodeModal } from "./App.js";
+import { WorkflowSchedulingControl } from "./WorkflowSchedulingControl.js";
 
 vi.mock("@gsap/react", () => ({ useGSAP: () => ({ contextSafe: (callback: unknown) => callback }) }));
 
@@ -86,6 +87,7 @@ async function harness() {
   });
   const getProjection = vi.fn(async () => projection);
   const getWorkflowProjection = vi.fn(() => refresh.promise);
+  const resumeScheduling = vi.fn();
   const document = { nodeType: 9, addEventListener() {}, removeEventListener() {}, activeElement: null,
     defaultView: { HTMLIFrameElement: class {} } };
   const container = { nodeType: 1, tagName: "DIV", namespaceURI: "http://www.w3.org/1999/xhtml",
@@ -97,7 +99,7 @@ async function harness() {
     onRunEvent: vi.fn(() => () => undefined), onWorkflowEvent,
     getRunEvents: vi.fn(async () => ({ events: [] })),
     getRunEvidence: vi.fn(async () => null), getWorkflowProjection,
-    workflow: { getProjection, retryLane },
+    workflow: { getProjection, retryLane, resumeScheduling, pauseScheduling: vi.fn() },
   }, matchMedia: () => ({ matches: true }) });
   let tree: ReactElement;
   let modalTree: ReactElement;
@@ -138,11 +140,62 @@ async function harness() {
     expect(modalProps().node.status).toBe("failed");
   };
   expect(button(modalTree, "Retry").disabled).toBe(false);
-  return { ...f, refresh, retryLane, getProjection, modalProps, click, installRefresh, broadcastRefresh,
+  return { ...f, refresh, retryLane, resumeScheduling, getProjection, modalProps, click, installRefresh, broadcastRefresh,
+    async broadcast(event: WorkflowBroadcastEnvelope) {
+      projection = event;
+      await act(async () => { for (const listener of workflowListeners) listener(event); });
+    },
     modal: () => modalTree, tree: () => tree };
 }
 
 describe("Retry with real asynchronous React effects", () => {
+  it("acknowledges Resume after the reserved Retry run broadcasts first without replacing its output or history", async () => {
+    const h = await harness();
+    await h.installRefresh();
+    await h.click("Retry");
+    await h.click("Start new attempt");
+    const reserved = await h.retryLane.mock.results[0].value;
+    expect(h.modalProps().node.runId).toBe("new-run");
+    expect(h.modalProps().session.schedulingState).toEqual({ status: "paused", revision: 1 });
+    const scheduling = () => WorkflowSchedulingControl(find(h.tree(), (node) => node.type === WorkflowSchedulingControl).props);
+    const pending = deferred<any>();
+    h.resumeScheduling.mockReturnValueOnce(pending.promise);
+    const resumeButton = button(scheduling(), "Resume");
+    expect(resumeButton.disabled).toBe(false);
+    let resume!: Promise<void>;
+    await act(async () => { resume = resumeButton.onClick(); });
+    expect(h.resumeScheduling).toHaveBeenCalledExactlyOnceWith("/alias", {
+      sessionId: "session", requestId: expect.any(String), expectedStatus: "paused", expectedRevision: 1,
+    });
+    const reply = structuredClone(reserved);
+    const schedulingState = { status: "active", revision: 2, requestId: h.resumeScheduling.mock.calls[0][1].requestId };
+    reply.canvasSession.schedulingState = schedulingState;
+    reply.projection.schedulingState = schedulingState;
+    const started = structuredClone(reply);
+    const output = [...h.response.canvasSession.nodes[0].output, "  Retry progress\r\n\n"];
+    Object.assign(started.canvasSession.nodes[0], { status: "running", output });
+    Object.assign(started.projection.lanes[0], { status: "running", output });
+    started.projection.segments.push({ id: "new-segment", laneId: "lane", runId: "new-run", status: "running", exitCode: null });
+    await h.broadcast({ ...started, cause: "workflow-mutation", nextAction: { kind: "blocked", reason: "Run is active." } });
+    const latest = h.modalProps().session;
+    const history = structuredClone(h.modalProps().retryState.history);
+    const reads = h.getProjection.mock.calls.length;
+    expect(button(scheduling(), "Pause").disabled).toBe(true);
+    expect(h.modalProps().node).toMatchObject({ runId: "new-run", status: "running", output });
+    expect(history.map((attempt) => attempt.runId)).toEqual(["old-run", "new-run"]);
+    expect(history[0].evidence).toEqual(h.response.projection.evidence[0].runEvidence);
+    await act(async () => { pending.resolve(reply); await resume; });
+    expect(button(scheduling(), "Pause").disabled).toBe(false);
+    expect(text(scheduling())).not.toMatch(/Reload scheduling|no longer current/);
+    expect(h.modalProps().session).toBe(latest);
+    expect(h.modalProps().node.output).toEqual(output);
+    expect(h.modalProps().retryState.history).toEqual(history);
+    expect(button(h.modal(), "Retry").disabled).toBe(true);
+    expect(h.getProjection).toHaveBeenCalledTimes(reads);
+    expect(h.retryLane).toHaveBeenCalledOnce();
+    expect(h.resumeScheduling).toHaveBeenCalledOnce();
+  });
+
   it("opens confirmation after More activates Retry and the pending session projection replaces its object", async () => {
     const h = await harness();
     await h.installRefresh();
