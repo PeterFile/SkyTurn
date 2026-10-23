@@ -8,6 +8,15 @@ export interface RunArtifactsProps {
   session: CanvasSession;
   node: CanvasNode;
   runEvidence?: RunEvidence | null;
+  onDraftRepair?: (request: ArtifactRepairDraftRequest) => Promise<void>;
+  isCurrent?: () => boolean;
+}
+
+export interface ArtifactRepairDraftRequest {
+  artifactPath: string;
+  feedback: string;
+  append: boolean;
+  isCurrent: () => boolean;
 }
 
 function getArtifactType(path: string) {
@@ -25,6 +34,8 @@ export const RunArtifacts = memo(function RunArtifacts({
   session,
   node,
   runEvidence,
+  onDraftRepair,
+  isCurrent,
 }: RunArtifactsProps) {
   const artifacts = runEvidence?.artifacts ?? [];
   const runId = runEvidence?.runId === node.runId ? runEvidence?.runId : undefined;
@@ -75,6 +86,8 @@ export const RunArtifacts = memo(function RunArtifacts({
                   nodeId={node.id}
                   runId={runId}
                   artifactPath={path}
+                  onDraftRepair={onDraftRepair}
+                  isCurrent={isCurrent}
                 />
               )}
             </li>
@@ -91,33 +104,110 @@ export interface ArtifactViewProps {
   nodeId: string;
   runId: string;
   artifactPath: string;
+  onDraftRepair?: (request: ArtifactRepairDraftRequest) => Promise<void>;
+  isCurrent?: () => boolean;
 }
 
 export type ArtifactViewState = {
   result: ArtifactViewResult | null;
   loading: boolean;
   imageError: boolean;
+  imageLoaded: boolean;
+  feedback: string;
+  append: boolean;
+  drafting: boolean;
+  draftError: string | null;
 };
 
+const viewScope = (props: ArtifactViewProps) => JSON.stringify([
+  props.projectRoot, props.sessionId, props.nodeId, props.runId, props.artifactPath,
+]);
+
 export function createArtifactViewController(read: () => ArtifactViewProps, changed: () => void) {
-  let state: ArtifactViewState = { result: null, loading: true, imageError: false };
+  let state: ArtifactViewState = { result: null, loading: true, imageError: false, imageLoaded: false, feedback: "", append: false, drafting: false, draftError: null };
   let mountToken = 0;
+  let mountedScope: string | null = null;
+  let requestRevision = 0;
+  const scopeCurrent = (token: number, scope: string) => token === mountToken && mountedScope === scope &&
+    viewScope(read()) === scope && read().isCurrent?.() !== false;
+  const previewReady = () => state.result?.ok === true && !state.imageError &&
+    (state.result.content.mimeType === "text/plain" || state.imageLoaded);
+  const invalidatedMessage = () => state.imageError
+    ? "Image decode failed. Feedback retained; reopen the preview before retrying Draft Repair."
+    : "Feedback or append consent changed. Review the current feedback and retry Draft Repair.";
+  function setImageError(value: boolean) {
+    if (state.imageError !== value) {
+      requestRevision++;
+      state = { ...state, imageError: value, imageLoaded: false };
+      changed();
+    }
+  }
 
   return {
     get state() { return state; },
-    setImageError(value: boolean) {
-      if (state.imageError !== value) {
-        state = { ...state, imageError: value };
-        changed();
+    get canDraftRepair() { return previewReady() && !state.drafting && !!state.feedback.trim(); },
+    setFeedback(feedback: string) { requestRevision++; state = { ...state, feedback }; changed(); },
+    setAppend(append: boolean) { requestRevision++; state = { ...state, append }; changed(); },
+    async draftRepair() {
+      const props = read();
+      const token = mountToken;
+      const scope = viewScope(props);
+      const result = state.result;
+      if (!scopeCurrent(token, scope) || state.drafting) return;
+      if (!result?.ok || result.artifact.runId !== props.runId || result.artifact.artifactPath !== props.artifactPath) {
+        state = { ...state, draftError: "Read and verify this registered artifact before drafting Repair." }; changed(); return;
       }
+      if (state.imageError) {
+        state = { ...state, draftError: invalidatedMessage() }; changed(); return;
+      }
+      if (!props.onDraftRepair || !state.feedback.trim()) {
+        state = { ...state, draftError: props.onDraftRepair ? "Enter artifact feedback first." : "Repair draft preparation is unavailable." }; changed(); return;
+      }
+      if (!previewReady()) {
+        state = { ...state, draftError: "Wait for the image preview to load successfully before drafting Repair." }; changed(); return;
+      }
+      const revision = requestRevision;
+      const feedback = state.feedback;
+      const isScopeCurrent = () => scopeCurrent(token, scope);
+      const isCurrent = () => isScopeCurrent() && revision === requestRevision && previewReady();
+      state = { ...state, drafting: true, draftError: null }; changed();
+      try {
+        await props.onDraftRepair({ artifactPath: props.artifactPath, feedback, append: state.append, isCurrent });
+        if (!isScopeCurrent()) return;
+        state = isCurrent() ? { ...state, feedback: "" } : { ...state, draftError: invalidatedMessage() };
+      } catch (error) {
+        if (isScopeCurrent()) state = { ...state, draftError: !isCurrent() ? invalidatedMessage()
+          : error instanceof Error ? error.message : "Repair draft preparation failed." };
+      } finally {
+        if (isScopeCurrent()) { state = { ...state, drafting: false }; changed(); }
+      }
+    },
+    setImageError,
+    imageEvents() {
+      const token = mountToken;
+      const scope = viewScope(read());
+      const result = state.result;
+      const isCurrent = () => scopeCurrent(token, scope) && result === state.result &&
+        result?.ok === true && result.content.mimeType !== "text/plain";
+      return {
+        onLoad() {
+          if (!isCurrent() || state.imageError || state.imageLoaded) return;
+          requestRevision++;
+          state = { ...state, imageLoaded: true }; changed();
+        },
+        onError() { if (isCurrent()) setImageError(true); },
+      };
     },
     mount() {
       const currentToken = ++mountToken;
-      state = { result: null, loading: true, imageError: false };
+      const scope = viewScope(read());
+      mountedScope = scope;
+      state = { ...state, result: null, loading: true, imageError: false, imageLoaded: false, drafting: false, draftError: null };
       changed();
 
       if (!window.devflow?.artifacts?.read) {
         state = {
+          ...state,
           result: {
             protocolVersion: 1,
             ok: false,
@@ -128,7 +218,7 @@ export function createArtifactViewController(read: () => ArtifactViewProps, chan
           imageError: false,
         };
         changed();
-        return () => { if (mountToken === currentToken) mountToken++; };
+        return () => { if (mountToken === currentToken) { mountToken++; mountedScope = null; } };
       }
 
       const props = read();
@@ -139,11 +229,11 @@ export function createArtifactViewController(read: () => ArtifactViewProps, chan
         runId: props.runId,
         artifactPath: props.artifactPath
       }).then(res => {
-        if (mountToken !== currentToken) return;
+        if (!scopeCurrent(currentToken, scope)) return;
         state = { ...state, result: res, loading: false };
         changed();
       }).catch(err => {
-        if (mountToken !== currentToken) return;
+        if (!scopeCurrent(currentToken, scope)) return;
         state = {
           ...state,
           result: {
@@ -157,7 +247,7 @@ export function createArtifactViewController(read: () => ArtifactViewProps, chan
         changed();
       });
 
-      return () => { if (mountToken === currentToken) mountToken++; };
+      return () => { if (mountToken === currentToken) { mountToken++; mountedScope = null; } };
     }
   };
 }
@@ -167,7 +257,7 @@ export function ArtifactView(props: ArtifactViewProps) {
   const [, redraw] = useReducer((value: number) => value + 1, 0);
   const [controller] = useState(() => createArtifactViewController(() => latest.current, redraw));
   useLayoutEffect(() => { latest.current = props; });
-  useLayoutEffect(() => controller.mount(), [controller]);
+  useLayoutEffect(() => controller.mount(), [controller, props.projectRoot, props.sessionId, props.nodeId, props.runId, props.artifactPath]);
 
   const { result, loading, imageError } = controller.state;
 
@@ -209,11 +299,24 @@ export function ArtifactView(props: ArtifactViewProps) {
               <img
                 src={`data:${content.mimeType};base64,${content.base64}`}
                 alt={artifact.name}
-                onError={() => controller.setImageError(true)}
+                {...controller.imageEvents()}
               />
             )}
           </div>
         )}
+      </div>
+      <div className="artifact-feedback">
+        <label>
+          Artifact feedback
+          <textarea rows={2} value={controller.state.feedback} onChange={event => controller.setFeedback(event.target.value)} />
+        </label>
+        <label className="artifact-feedback-append">
+          <input type="checkbox" checked={controller.state.append} onChange={event => controller.setAppend(event.target.checked)} />
+          Append to existing Repair draft
+        </label>
+        <button type="button" disabled={!controller.canDraftRepair} onClick={() => void controller.draftRepair()}>Draft Repair</button>
+        {content.mimeType !== "text/plain" && !imageError && !controller.state.imageLoaded && <p role="status">Image preview is still loading.</p>}
+        {controller.state.draftError && <p role="alert">{controller.state.draftError}</p>}
       </div>
     </div>
   );

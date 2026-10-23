@@ -57,6 +57,7 @@ import {
 } from "./internal/adapterTestFactories.js";
 import { createDurableRunClaimStore, defaultDurableRunClaimRoot } from "./durableRunClaim.js";
 import { assertWindowsExpectedArtifactVerifierCapability } from "./internal/windowsExpectedArtifactVerifier.js";
+import * as fdAnchoredCliLaunch from "./internal/fdAnchoredCliLaunch.js";
 
 type SpawnWindowsJobObjectProcess = typeof import(
   "./internal/windowsJobObjectProcess.js"
@@ -7568,6 +7569,7 @@ describe("agent bridge", () => {
 
   it.runIf(macOsSandboxExecAvailable)("denies all Hermes filesystem writes in macOS read-only mode", async () => {
     const projectRoot = await makeTempRoot();
+    const hermesHome = await makeTempRoot();
     const outsideRoot = await makeTempRoot();
     const outsidePath = join(outsideRoot, "outside.txt");
     const binRoot = await makeTempRoot();
@@ -7586,15 +7588,11 @@ describe("agent bridge", () => {
     const bridge = new AgentBridge({
       adapters: [createHermesCliAdapter({
         executablePath: hermesPath,
-        env: { SKYTURN_OUTSIDE_PATH: outsidePath },
+        env: { HERMES_HOME: hermesHome, SKYTURN_OUTSIDE_PATH: outsidePath },
       })],
     });
-    const completed = waitForEvent(
-      bridge,
-      (event) => event.kind === "status" && event.payload.status === "succeeded",
-    );
 
-    await bridge.startRun({
+    const run = await bridge.startRun({
       protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
       nodeId: "node-hermes-read-only-sandbox",
       sessionId: "session-1",
@@ -7604,8 +7602,14 @@ describe("agent bridge", () => {
       sandbox: "read-only",
       prompt: "Attempt writes",
     });
-    await completed;
+    const terminal = await waitForPersistedEvent(
+      projectRoot,
+      run.id,
+      (event) => event.kind === "status" &&
+        ["succeeded", "failed", "cancelled", "timed-out"].includes(String(event.payload.status)),
+    );
 
+    expect(terminal.payload.status).toBe("succeeded");
     await expect(stat(join(projectRoot, "inside.txt"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(stat(outsidePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -8688,6 +8692,87 @@ describe("agent bridge", () => {
     });
   });
 
+  it.each(["exit", "failure", "cancel", "timeout", "error"] as const)(
+    "keeps fresh Hermes announcements private through the public CLI chain on %s",
+    async (terminalPath) => {
+      const projectRoot = await makeTempRoot();
+      const boundary = pendingManagedProcessBoundary();
+      // This pipe fixture never launches a CLI or exercises the host sandbox.
+      const capability = vi.spyOn(fdAnchoredCliLaunch, "hasFdAnchoredCliLaunchCapability").mockResolvedValue(true);
+      if (terminalPath !== "error") boundary.ready.resolve();
+      boundary.terminateAndReap.mockImplementation(async () => boundary.completeReap());
+      managedProcessMock.spawn = boundary.spawn;
+      const bridge = new AgentBridge({ adapters: [createHermesCliAdapter({
+        executablePath: "/bin/sh",
+        timeoutMs: terminalPath === "timeout" ? 100 : 0,
+      })] });
+      const liveEvents: RunEvent[] = [];
+      bridge.onRunEvent((event) => liveEvents.push(event));
+      const terminal = waitForEvent(bridge, (event) => event.kind === "status" &&
+        ["succeeded", "failed", "cancelled", "timed-out"].includes(String(event.payload.status)));
+      const starting = bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: "node-fresh-announcement",
+        sessionId: "session-1",
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "hermes",
+        sandbox: "read-only",
+        prompt: "Plan",
+      });
+      try {
+        await boundary.spawned.promise;
+        await flushMicrotasks();
+        const workflow = '{"toolCalls":[{"tool":"createWorkflowCard","input":{"id":"node-code","title":"Code","agent":"codex","brief":"Implement"}}]}\n';
+        boundary.stdout.write(workflow);
+        boundary.stderr.write(" \tsess");
+        boundary.stderr.write("ion_id \t: fresh-native-cli-probe \t\r\n");
+        boundary.stdout.write("session_id: fresh-native-stdout-probe\n");
+        boundary.stderr.write("planning warning\r\nsession_id: fresh-native-eof-probe");
+        if (terminalPath === "error") boundary.ready.reject(new Error("synthetic readiness failure"));
+        const run = await starting;
+        expect(boundary.spawn).toHaveBeenCalledWith(expect.objectContaining({ sandbox: "read-only" }));
+        if (terminalPath === "exit" || terminalPath === "failure") {
+          boundary.closed.resolve({ exitCode: terminalPath === "exit" ? 0 : 1, signalCode: null });
+        } else if (terminalPath === "cancel") await bridge.cancelRun(run.id, "cancelled");
+        await terminal;
+
+        const events = await bridge.loadEvents(projectRoot, run.id);
+        const reopened = new AgentBridge({ adapters: [] });
+        const reopenedEvents = await reopened.loadEvents(projectRoot, run.id);
+        const evidence = await reopened.getEvidence(projectRoot, run.id);
+        const taskOutput = await readTaskOutput(projectRoot, run.nodeId);
+        const mirror = await readFile(join(projectRoot, ".devflow", "runs", run.id, "events.ndjson"), "utf8");
+        const flowEvents = flowEventsFromAgentRun({
+          sessionId: "session-1", laneId: "lane-implementation", segmentId: "segment-announcement",
+          run, events, evidence, now: "2026-10-18T00:00:00.000Z",
+        });
+        expect(reopenedEvents).toEqual(events);
+        expect(events).toEqual(liveEvents);
+        for (const surface of [JSON.stringify({ liveEvents, events, reopenedEvents, evidence, flowEvents }), taskOutput, mirror]) {
+          expect(surface).not.toContain("fresh-native-");
+        }
+        const stdout = events.filter((event) => event.kind === "output").map((event) => event.payload.text).join("");
+        const stderr = events.filter((event) => event.kind === "progress" && event.payload.stream === "stderr")
+          .map((event) => event.payload.text).join("");
+        expect(stdout).toBe(`${workflow}session_id: [redacted]\n`);
+        expect(JSON.parse(stdout.split("\n")[0]!)).toEqual(JSON.parse(workflow));
+        expect(stderr).toBe(" \tsession_id \t: [redacted] \t\r\nplanning warning\r\nsession_id: [redacted]");
+        expect(taskOutput).toContain(stdout);
+        expect(flowEvents.some((event) => event.kind === "workflow.segment.output_delta")).toBe(true);
+        expect(evidence.status).toBe(terminalPath === "exit" ? "succeeded" :
+          terminalPath === "cancel" ? "cancelled" : terminalPath === "timeout" ? "timed-out" : "failed");
+        if (terminalPath === "failure") {
+          expect(events).toContainEqual(expect.objectContaining({
+            kind: "error", payload: expect.objectContaining({ source: "hermes", category: "non-zero-exit" }),
+          }));
+        }
+      } finally {
+        capability.mockRestore();
+      }
+    },
+  );
+
   it("runs Hermes chat planning without oneshot -z and marks replay recovery honestly", async () => {
     const projectRoot = await makeTempRoot();
     const binRoot = await makeTempRoot();
@@ -9747,6 +9832,26 @@ describe("agent bridge", () => {
     expect(launch.metadata.recoveryReason).toBeUndefined();
   });
 
+  it("keeps fresh Hermes announcements private through the planner PTY route", async () => {
+    const projectRoot = await makeTempRoot();
+    const { events, factory, pty } = makePtyManager();
+    const transport = createHermesPlannerPtyTransport({
+      ptyFactory: factory, executablePath: "hermes", featureFlags: { ptyInteractiveSessions: true },
+      emitEvent: async (event) => { events.push(event); },
+    });
+    const started = await transport.startSession({
+      runId: "run-fresh-hermes-pty", canvasSessionId: "session-fresh-hermes-pty",
+      projectRoot, worktreePath: projectRoot,
+    });
+    pty.emitStderr("session_id: fresh-native-route-probe\r\n");
+    pty.emitExit({ exitCode: 0, signal: null });
+    await waitForTerminalEvent(events, (event) => event.kind === "lifecycle" && event.status === "exited");
+    expect(factory.spawn).toHaveBeenCalledWith(expect.objectContaining({ args: ["chat", "--cli", "--source", "skyturn"] }));
+    expect(events.filter((event) => event.kind === "output").map((event) => event.text).join(""))
+      .toBe("session_id: [redacted]\r\n");
+    expect(JSON.stringify({ started, events })).not.toContain("fresh-native-");
+  });
+
   it("passes a raw Hermes handle only to PTY spawn argv and redacts arbitrary output chunk splits", async () => {
     const projectRoot = await makeTempRoot();
     const rawHandle = "opaque-hermes-resume-capability-7e4f9b2c";
@@ -10005,6 +10110,44 @@ describe("agent bridge", () => {
 });
 
 describe("PTY terminal session manager", () => {
+  it.each(["exit", "cancel", "timeout", "error"] as const)(
+    "keeps fresh Hermes announcements private in PTY listeners and scrollback on %s",
+    async (terminalPath) => {
+      vi.useFakeTimers();
+      const { events, manager, pty } = makePtyManager({ timeoutMs: 25 });
+      const session = await manager.startSession({ ...ptySessionInput(), agentKind: "hermes" });
+      pty.emitStdout("safe\r\n \tsess");
+      pty.emitStderr("ion_id \t: fresh-native-pty-probe \t\r\n");
+      pty.emitStdout("session_id: fresh-native-eof-probe");
+      if (terminalPath === "exit") pty.emitExit({ exitCode: 0, signal: null });
+      else if (terminalPath === "cancel") await manager.cancelSession(session.id, "cancelled");
+      else if (terminalPath === "timeout") await vi.advanceTimersByTimeAsync(25);
+      else await manager.terminateSession(session.id, "pty error");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events.some((event) => event.kind === "lifecycle" &&
+        ["exited", "cancelled", "timed-out", "failed"].includes(String(event.status)))).toBe(true);
+      const output = events.filter((event) => event.kind === "output")
+        .map((event) => ({ stream: event.stream, text: event.text }));
+      expect(output).toEqual([
+        { stream: "stdout", text: "safe\r\n \tsess" },
+        { stream: "stderr", text: "ion_id \t: [redacted] \t\r\n" },
+        { stream: "stdout", text: "session_id: [redacted]" },
+      ]);
+      expect(manager.getScrollback(session.id).map(({ stream, text }) => ({ stream, text }))).toEqual(output);
+      expect(JSON.stringify({ events, scrollback: manager.getScrollback(session.id), evidence: manager.getExitEvidence(session.id) }))
+        .not.toContain("fresh-native-");
+    },
+  );
+
+  it("leaves non-Hermes PTY session_id progress unchanged", async () => {
+    const { events, manager, pty } = makePtyManager();
+    const session = await manager.startSession(ptySessionInput());
+    pty.emitStdout("session_id: public-field\n");
+    pty.emitExit({ exitCode: 0, signal: null });
+    await waitForTerminalEvent(events, (event) => event.kind === "lifecycle" && event.status === "exited");
+    expect(manager.getScrollback(session.id).map((chunk) => chunk.text).join("")).toBe("session_id: public-field\n");
+  });
+
   it("starts a session and emits terminal lifecycle events", async () => {
     const { events, manager } = makePtyManager();
 
@@ -11444,6 +11587,11 @@ function pendingManagedProcessBoundary() {
   });
 
   return {
+    child,
+    stdout,
+    stderr,
+    ready,
+    closed,
     completeReap() {
       Object.assign(child, { exitCode: null, signalCode: "SIGTERM" });
       ready.reject(new Error("synthetic readiness failure after termination"));

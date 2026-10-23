@@ -79,6 +79,8 @@ For the current project branch path, the diff baseline is the branch state at se
 
 The real Node changeset implementation now collects changed files, diff stat, bounded diff preview, and reconciliation metadata from the selected execution target. Deterministic mocked diff data remains only for browser/mock paths and contract tests.
 
+In the node modal **Changes** tab, the file path filter narrows only the parsed diff preview. It matches a literal, case-insensitive substring against both old and new file names, including renamed and deleted files. The visible/total count covers parsed preview file blocks, which may contain bounded or binary metadata rather than full source content. **Clear filter** restores all preview blocks; switching project, session, node, or run, or reopening **Changes** resets the filter. Full changed-file evidence, diff statistics, mismatch warnings, and delivery gates remain visible and unchanged. Delivery always uses the entire changeset, regardless of the filter.
+
 Codex reference points inspected in `openai/codex`:
 
 - `codex-rs/protocol/src/protocol.rs`: `PatchApplyBeginEvent`, `PatchApplyUpdatedEvent`, `PatchApplyEndEvent`, `TurnDiffEvent`.

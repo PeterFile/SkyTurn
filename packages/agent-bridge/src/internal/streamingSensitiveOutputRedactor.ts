@@ -4,6 +4,7 @@ const carryLimit = 128;
 const pathModeCarryLimit = carryLimit;
 const patternUnitLimit = 65_536;
 const outputBatchLength = 1_024;
+const hermesSessionField = "session_id";
 
 export interface StreamingRedactorDiagnostics {
   operations: number;
@@ -64,6 +65,7 @@ interface MatcherNode {
 
 type RedactionMode =
   | { kind: "secret"; quote: "\"" | "'" | null; started: boolean }
+  | { kind: "hermes-session"; started: boolean }
   | {
       kind: "path";
       quote: "\"" | "'" | null;
@@ -479,10 +481,12 @@ export class StreamingSensitiveOutputRedactor {
   private currentMatched = false;
   private lastRaw: string | null = null;
   private sameRawRunLength = 0;
+  private hermesFieldPosition = 0;
 
   constructor(
     sensitiveValues: string[] | undefined,
     private readonly diagnostics?: StreamingRedactorDiagnostics,
+    private readonly announcementMode?: "hermes",
   ) {
     const values = [...new Set((sensitiveValues ?? []).filter(Boolean))];
     const patterns = sensitivePatterns(values);
@@ -555,7 +559,10 @@ export class StreamingSensitiveOutputRedactor {
       chunk.chars.push(char);
       this.retainedQueueChars += 1;
       this.updateDiagnostics();
+      const announcement = this.trackHermesAnnouncement(raw);
       this.processChar(char);
+      // Preserve known-handle frontiers that can overlap the field and value.
+      if (announcement && !this.mode) this.mode = { kind: "hermes-session", started: false };
       this.releaseResolved(char.sequence);
       this.drainReady(output);
     }
@@ -589,6 +596,7 @@ export class StreamingSensitiveOutputRedactor {
     }
     this.resetExplicitChannels();
     this.mode = null;
+    this.hermesFieldPosition = 0;
     this.resetGenericState();
     this.releaseBefore(this.sequence);
     const output: RedactedTerminalChunk[] = [];
@@ -599,8 +607,9 @@ export class StreamingSensitiveOutputRedactor {
   private processChar(char: PendingChar): void {
     this.currentMatched = false;
     if (this.mode) {
+      const hermesSession = this.mode.kind === "hermes-session";
       this.processModeChar(char);
-      return;
+      if (!hermesSession) return;
     }
 
     this.applyMatches(this.rawMatcher.feed(char.raw, char.sequence, char.sequence));
@@ -608,12 +617,22 @@ export class StreamingSensitiveOutputRedactor {
     this.escapeDecoder.feed(char);
     this.shellByteDecoder.feed(char);
     this.percentDecoder.feed(char);
-    if (this.overflowRedaction) return;
+    if (this.overflowRedaction || this.mode?.kind === "hermes-session") return;
     this.processGenericTrigger(char);
   }
 
   private processModeChar(char: PendingChar): void {
     const mode = this.mode!;
+    if (mode.kind === "hermes-session") {
+      if (char.raw === "\r" || char.raw === "\n" || (mode.started && /^\s$/u.test(char.raw))) {
+        this.mode = null;
+        this.resetGenericState();
+      } else if (!/^\s$/u.test(char.raw)) {
+        this.markRange(char.sequence, char.sequence, !mode.started);
+        mode.started = true;
+      }
+      return;
+    }
     if (mode.kind === "path") {
       if (isPathTerminator(char.raw, mode.quote)) {
         this.finishModeAndReplay(char);
@@ -662,6 +681,27 @@ export class StreamingSensitiveOutputRedactor {
     this.mode = null;
     this.resetGenericState();
     this.processChar(char);
+  }
+
+  private trackHermesAnnouncement(raw: string): boolean {
+    if (this.announcementMode !== "hermes") return false;
+    this.recordOperations();
+    // Track raw line position once, including characters consumed by another mode.
+    // Only SP/HT may precede the literal field or separate it from its colon.
+    if (raw === "\r" || raw === "\n") {
+      this.hermesFieldPosition = 0;
+      return false;
+    }
+    if (this.hermesFieldPosition < 0) return false;
+    if ((this.hermesFieldPosition === 0 || this.hermesFieldPosition === hermesSessionField.length) &&
+      (raw === " " || raw === "\t")) return false;
+    if (this.hermesFieldPosition < hermesSessionField.length) {
+      this.hermesFieldPosition = raw === hermesSessionField[this.hermesFieldPosition]
+        ? this.hermesFieldPosition + 1 : -1;
+      return false;
+    }
+    this.hermesFieldPosition = -1;
+    return raw === ":";
   }
 
   private processGenericTrigger(char: PendingChar): void {
