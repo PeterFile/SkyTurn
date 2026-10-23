@@ -282,7 +282,7 @@ export function mergeRunEventsIntoWorkspace(
 }
 
 function applyRunObservabilityToNode(node: CanvasNode, events: RunEvent[]): CanvasNode {
-  const output = outputFromEvents(events);
+  const output = capturedOutputForNode(node, events);
   const progress = progressPhraseFromEvents(events);
   return {
     ...node,
@@ -297,7 +297,7 @@ function applyRunEventsToNode(
   events: RunEvent[],
   evidence: RunEvidence | null,
 ): CanvasNode {
-  const output = outputFromEvents(events);
+  const output = capturedOutputForNode(node, events);
   const run = runFromEvents(node, session, evidence);
   const derivedStatus = run ? deriveNodeStatusFromEvidence(run, evidence) : node.status;
   const status = derivedStatus === "completed" && !isSuccessfulRunEvidence(evidence, {
@@ -1224,6 +1224,29 @@ function latestEvidenceCheckName(value: unknown): string | null {
     if (phrase) return phrase;
   }
   return null;
+}
+
+function capturedOutputForNode(node: CanvasNode, events: RunEvent[]): string[] {
+  const snapshot = (node.outputDeltas ?? []).map((candidate) => {
+    const event = parseRunEvent(candidate);
+    if (!event) throw new Error("Invalid RunEvidence event stream.");
+    return event;
+  });
+  // Sequence numbers are run-local; keep prior attempts in authoritative order.
+  const previousAttempts = snapshot.filter((event) => event.runId !== node.runId);
+  const currentAttempt = dedupeRunEvents([
+    ...snapshot.filter((event) => event.runId === node.runId),
+    ...events,
+  ]);
+  return capturedOutputFromEvents([...previousAttempts, ...currentAttempt]);
+}
+
+function capturedOutputFromEvents(events: RunEvent[]): string[] {
+  // Display diagnostics without admitting them to Hermes protocol parsing.
+  return events.flatMap((event) => {
+    if (event.kind !== "output" && event.kind !== "progress" && event.kind !== "changes") return [];
+    return typeof event.payload.text === "string" ? [event.payload.text] : [];
+  });
 }
 
 function outputFromEvents(events: RunEvent[]): string[] {

@@ -130,6 +130,7 @@ test("Electron main tracks every top-level workflow store operation, not only wo
     "workflow:variant:create",
     "workflow:userDecision:answer",
     "workflow:lane:reassign",
+    "workflow:lane:retry",
     "workflow:worktree:create",
     "workflow:worktree:compare",
     "workflow:worktree:adopt",
@@ -151,7 +152,7 @@ test("Electron main tracks every top-level workflow store operation, not only wo
   const registeredWorkflowHandlers = [
     ...main.matchAll(/ipcMain\.handle\("workflow:[^"]+",\s*workflowHandler\(/g),
   ];
-  assert.equal(workflowChannels.length, 29);
+  assert.equal(workflowChannels.length, 30);
   assert.equal(registeredWorkflowHandlers.length, workflowChannels.length);
   assert.match(main, /const workflowStoreOperationTasks = new Set<Promise<unknown>>\(\)/);
   assert.match(

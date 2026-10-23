@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { ArtifactView, RunArtifacts, createArtifactViewController, type ArtifactViewProps } from "./RunArtifacts.js";
+import { ArtifactView, RunArtifacts, createArtifactViewController, type ArtifactViewProps, type ArtifactRepairDraftRequest } from "./RunArtifacts.js";
 
 function setup(patch: Partial<ArtifactViewProps> = {}) {
   let props: ArtifactViewProps = { projectRoot: "/tmp/project", sessionId: "session-1", nodeId: "node-1", runId: "run-1", artifactPath: "test.png", ...patch };
@@ -75,6 +75,115 @@ describe("RunArtifacts", () => {
     if (controller.state.result?.ok) {
       expect(controller.state.result.contentIdentity).toBe("current-file-unhashed");
     }
+  });
+
+  it("transfers only verified feedback through the real controller callback and retains feedback on failure", async () => {
+    const prepare = vi.fn().mockRejectedValueOnce(new Error("Repair requires an after checkpoint.")).mockResolvedValue(undefined);
+    const { controller } = setup({ onDraftRepair: prepare });
+    controller.setFeedback("Make the title readable");
+    await controller.draftRepair();
+    expect(prepare).not.toHaveBeenCalled();
+    await Promise.resolve();
+    controller.imageEvents().onLoad();
+    await controller.draftRepair();
+    expect(controller.state.feedback).toBe("Make the title readable");
+    expect(controller.state.draftError).toMatch(/after checkpoint/);
+    await controller.draftRepair();
+    expect(prepare).toHaveBeenLastCalledWith(expect.objectContaining({ artifactPath: "test.png", feedback: "Make the title readable", append: false, isCurrent: expect.any(Function) }));
+    expect(Object.keys(prepare.mock.calls[1][0]).sort()).toEqual(["append", "artifactPath", "feedback", "isCurrent"]);
+    expect(controller.state.feedback).toBe("");
+  });
+
+  it("rejects image drafting before onLoad and permits it only after successful load", async () => {
+    const prepare = vi.fn().mockResolvedValue(undefined);
+    const { controller } = setup({ onDraftRepair: prepare });
+    await Promise.resolve();
+    controller.setFeedback("Image feedback");
+    await controller.draftRepair();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(controller.state.feedback).toBe("Image feedback");
+    expect(controller.canDraftRepair).toBe(false);
+    controller.imageEvents().onLoad();
+    expect(controller.canDraftRepair).toBe(true);
+    await controller.draftRepair();
+    expect(prepare).toHaveBeenCalledOnce();
+  });
+
+  it("keeps failed image decode unavailable even if a late load arrives", async () => {
+    const prepare = vi.fn();
+    const { controller } = setup({ onDraftRepair: prepare });
+    await Promise.resolve(); controller.setFeedback("retained");
+    const image = controller.imageEvents();
+    image.onError(); image.onLoad();
+    await controller.draftRepair();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(controller.canDraftRepair).toBe(false);
+    expect(controller.state.imageError).toBe(true);
+    expect(controller.state.feedback).toBe("retained");
+    expect(controller.state.draftError).toMatch(/image/i);
+  });
+
+  it("ignores old image callbacks across StrictMode remount and requires the current load", async () => {
+    const { controller, unmount } = setup({ onDraftRepair: vi.fn() });
+    await Promise.resolve(); controller.setFeedback("retained");
+    const oldImage = controller.imageEvents();
+    unmount(); controller.mount(); await Promise.resolve();
+    oldImage.onLoad(); oldImage.onError();
+    expect(controller.canDraftRepair).toBe(false);
+    expect(controller.state.imageError).toBe(false);
+    controller.imageEvents().onLoad();
+    expect(controller.canDraftRepair).toBe(true);
+  });
+
+  it.each(["unmount", "scope", "run"])("rejects a late verified read after %s", async (change) => {
+    let resolve!: (value: unknown) => void;
+    const result = await (globalThis as any).window.devflow.artifacts.read();
+    (globalThis as any).window.devflow.artifacts.read = vi.fn(() => new Promise(yes => { resolve = yes; }));
+    const prepare = vi.fn();
+    const { controller, update, unmount } = setup({ onDraftRepair: prepare });
+    controller.setFeedback("retained");
+    if (change === "unmount") unmount();
+    else update(change === "run" ? { runId: "next" } : { sessionId: "next" });
+    resolve(result); await Promise.resolve(); await controller.draftRepair();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(controller.state.feedback).toBe("retained");
+  });
+
+  it("never clears newer feedback or a remounted interaction when preparation finishes late", async () => {
+    let finish!: () => void;
+    const prepare = vi.fn((_request: ArtifactRepairDraftRequest) => new Promise<void>(yes => { finish = yes; }));
+    const { controller, unmount } = setup({ onDraftRepair: prepare });
+    await Promise.resolve(); controller.imageEvents().onLoad(); controller.setFeedback("first");
+    const pending = controller.draftRepair();
+    controller.setFeedback("new feedback");
+    finish(); await pending;
+    expect(controller.state.feedback).toBe("new feedback");
+    expect(controller.state.drafting).toBe(false);
+    expect(controller.state.draftError).toMatch(/changed|retry/i);
+    const second = controller.draftRepair();
+    const guard = prepare.mock.calls[1][0].isCurrent;
+    unmount(); controller.mount();
+    expect(guard()).toBe(false);
+    finish(); await second;
+    expect(controller.state.feedback).toBe("new feedback");
+  });
+
+  it.each(["read-failed", "unavailable", "wrong-run", "wrong-path", "decode-failed"])("rejects %s without sending feedback or clearing it", async failure => {
+    const read = (globalThis as any).window.devflow.artifacts.read;
+    const result = await read();
+    if (failure === "read-failed") read.mockResolvedValue({ protocolVersion: 1, ok: false, code: "MISSING", message: "Registered artifact is missing." });
+    if (failure === "unavailable") (globalThis as any).window.devflow.artifacts = undefined;
+    if (failure === "wrong-run") read.mockResolvedValue({ ...result, artifact: { ...result.artifact, runId: "other" } });
+    if (failure === "wrong-path") read.mockResolvedValue({ ...result, artifact: { ...result.artifact, artifactPath: "other.png" } });
+    const prepare = vi.fn();
+    const { controller } = setup({ onDraftRepair: prepare });
+    await Promise.resolve();
+    controller.setFeedback("kept");
+    if (failure === "decode-failed") controller.setImageError(true);
+    await controller.draftRepair();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(controller.state.feedback).toBe("kept");
+    expect(controller.state.draftError).toMatch(failure === "decode-failed" ? /decode/i : /verify/);
   });
 
   it("ArtifactViewController handles mount/unmount cleanly without updating state if unmounted early", async () => {

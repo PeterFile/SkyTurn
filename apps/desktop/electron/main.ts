@@ -19,6 +19,7 @@ import type {
   PlannerIntentDisposition,
   PlannerIntentOperationSummary,
   WorkflowMaterializedView,
+  WorkflowRetryResult,
   WorkflowSchedulingControlInput,
   WorkflowSchedulingControlResult,
 } from "@skyturn/persistence/workflow-store" with { "resolution-mode": "import" };
@@ -50,6 +51,7 @@ import type {
 import type {
   WorkflowIntentOperation,
   WorkflowIntentOperationType,
+  WorkflowRetryRequest,
 } from "@skyturn/workflow-kernel" with { "resolution-mode": "import" };
 import type { ExpectedArtifactPublisher } from "@skyturn/agent-bridge" with { "resolution-mode": "import" };
 import {
@@ -783,6 +785,7 @@ interface WorkflowStoreHost {
   createGoalReview(input: GoalReviewRequest, now: string): { created: boolean; binding: GoalReviewBinding };
   assertGoalReviewSource(binding: GoalReviewBinding): void;
   recordGoalReviewFreshness(binding: GoalReviewBinding, freshness: "current" | "stale" | "unverified", now: string): void;
+  retryWorkflowLane(input: WorkflowRetryRequest, now: string): WorkflowRetryResult;
   pauseWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult;
   resumeWorkflowScheduling(input: WorkflowSchedulingControlInput): WorkflowSchedulingControlResult;
   listWorkflowSessionIds(): string[];
@@ -1570,6 +1573,34 @@ ipcMain.handle("workflow:lane:reassign", workflowHandler(async (projectRoot: str
     projection: result.projection,
     canvasSession: materializeRendererCanvasSession(store, sessionId),
   };
+}));
+
+ipcMain.handle("workflow:lane:retry", workflowHandler(async (projectRoot: string, input: unknown) => {
+  assertKnownProjectRoot(projectRoot);
+  const { parseWorkflowRetryRequest } = await import("@skyturn/workflow-kernel");
+  const request = parseWorkflowRetryRequest(input);
+  const projectIdentity = await planProjectIdentities.canonicalize(projectRoot);
+  // Initialization may advance or reconcile sessions before either mutation lock is held.
+  const store = await getWorkflowStore(projectIdentity);
+  return withWorkflowSessionMutationLock(projectIdentity, request.sessionId, () =>
+    enqueueWorkflowProjectAdvance(projectIdentity, async () => {
+      const result = store.retryWorkflowLane(request, new Date().toISOString());
+      if (result.created) {
+        // Already inside the launch queue; the scheduler retains pause and start ownership.
+        await advanceOneWorkflowSession(projectIdentity, store, request.sessionId, "workflow-mutation");
+      }
+      const view = store.materializeWorkflowView(request.sessionId);
+      broadcastWorkflowProjection(projectIdentity, request.sessionId, store);
+      return {
+        protocolVersion: RUN_PROTOCOL_VERSION,
+        event: result.event,
+        created: result.created,
+        projection: view.projection,
+        canvasSession: materializeRendererCanvasSession(store, request.sessionId, view.canvasSession),
+        nextAction: view.loopState.nextAction,
+      };
+    }),
+  );
 }));
 
 ipcMain.handle("workflow:checkpoints", workflowHandler(async (projectRoot: string, input: WorkflowCheckpointInput) => {

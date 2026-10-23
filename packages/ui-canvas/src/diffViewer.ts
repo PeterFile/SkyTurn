@@ -13,6 +13,12 @@ export interface ChangesDiffViewOptions {
 
 export type DiffHtmlSanitizer = (unsafeHtml: string) => Promise<string> | string;
 
+export interface ChangesDiffPreview {
+  html: string;
+  visibleFiles: number;
+  totalFiles: number;
+}
+
 export const DEFAULT_CHANGES_DIFF_OPTIONS: ChangesDiffViewOptions = {
   hideWhitespace: false,
   loadFullFiles: false,
@@ -46,13 +52,32 @@ export async function renderChangesetDiffHtml(
   options: ChangesDiffViewOptions,
   sanitizeHtml: DiffHtmlSanitizer = sanitizeDiffHtml,
 ): Promise<string> {
+  return (await renderChangesetDiffHtmlPreview(patchPreview, files, options, "", sanitizeHtml)).html;
+}
+
+export async function renderChangesetDiffHtmlPreview(
+  patchPreview: string,
+  files: string[],
+  options: ChangesDiffViewOptions,
+  query = "",
+  sanitizeHtml: DiffHtmlSanitizer = sanitizeDiffHtml,
+): Promise<ChangesDiffPreview> {
   const normalizedPatch = normalizePatchPreviewForDiff2Html(patchPreview, files);
   const diffInput = options.hideWhitespace ? filterWhitespaceOnlyChanges(normalizedPatch) : normalizedPatch;
-  if (!diffInput.trim()) return "";
+  if (!diffInput.trim()) return { html: "", visibleFiles: 0, totalFiles: 0 };
 
-  const { html } = await import("diff2html");
-  const unsafeHtml = html(diffInput, buildDiff2HtmlConfig(options));
-  return sanitizeHtml(unsafeHtml);
+  const { parse, html } = await import("diff2html");
+  const config = buildDiff2HtmlConfig(options);
+  const parsedFiles = parse(diffInput, config);
+  const needle = query.toLowerCase();
+  const visibleFiles = needle ? parsedFiles.filter(file =>
+    file.oldName.toLowerCase().includes(needle) || file.newName.toLowerCase().includes(needle),
+  ) : parsedFiles;
+  return {
+    html: visibleFiles.length ? await sanitizeHtml(html(visibleFiles, config)) : "",
+    visibleFiles: visibleFiles.length,
+    totalFiles: parsedFiles.length,
+  };
 }
 
 export function normalizePatchPreviewForDiff2Html(patchPreview: string, fallbackFiles: string[] = []): string {
@@ -101,7 +126,8 @@ async function sanitizeDiffHtml(unsafeHtml: string): Promise<string> {
 }
 
 function looksLikeUnifiedDiff(patchPreview: string): boolean {
-  return /(^|\n)(diff --git |--- |\+\+\+ |@@ )/.test(patchPreview) && /(^|\n)@@ /.test(patchPreview);
+  return /(^|\n)diff --git /.test(patchPreview)
+    || (/(^|\n)(--- |\+\+\+ |@@ )/.test(patchPreview) && /(^|\n)@@ /.test(patchPreview));
 }
 
 function normalizeLoosePatchLine(line: string): string {

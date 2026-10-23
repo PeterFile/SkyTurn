@@ -361,20 +361,320 @@
       "text": "Task: Project file snapshot contract\nState: Active\nOwner: Codex / Hermes acceptance\nDepends: Registered artifact viewing\nEvidence: none\nRisk: Strict descriptor reads and immutable retry/reopen; no new composer UI in this slice"
     },
     {
-      "id": "317100ba8ef874af",
+      "id": "73b53ccdf59486dd",
       "type": "text",
       "x": 680,
       "y": 1460,
       "width": 280,
       "height": 200,
       "color": "3",
-      "text": "Task: Review an exact run against original goals\nState: Verify\nOwner: Codex\nDepends: none\nEvidence: Goal review residual regression gates\nRisk: Goal review authority and runtime acceptance"
+      "text": "Task: Filter Changes preview by file path\nState: Verify\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: Changes path filter desktop acceptance\nRisk: PR delivery only; not integrated into main"
+    },
+    {
+      "id": "38d91c2187ddd0fa",
+      "type": "text",
+      "x": 40,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Changes path filter desktop acceptance\ncommit: PR #213 candidate\ntest: Full local gate: 3457 passed, 13 skipped. Production Electron: 7/7 checks, real Git reconciliation, zero Agent launches or delivery actions, zero owned-process leftovers.\nbuild: build/lint/typecheck passed\nmanual: Four screenshots inspected. Synthetic terminal fixture; not live-agent evidence.\nartifact: https://github.com/PeterFile/SkyTurn/pull/213 ; /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261018/changes-filter-ui-result-1792340526361.json"
+    },
+    {
+      "id": "5543d65d0382da2c",
+      "type": "text",
+      "x": 900,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Changes filter delivery boundary\nImpact: PR is not integrated into main. Preview counts cover parsed blocks, not complete binary or bounded contents.\nMitigation: Require exact-head CI on PR #213. Filtering never changes the entire delivery changeset; merge requires separate authorization.\nStatus: Documented limitation"
+    },
+    {
+      "id": "951cf72093aa88bc",
+      "type": "text",
+      "x": 680,
+      "y": 1460,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Draft Repair from registered artifact feedback\nState: Verify\nOwner: Codex / Hermes acceptance\nDepends: none\nEvidence: Artifact Repair desktop acceptance\nRisk: PR delivery only; not integrated into main"
+    },
+    {
+      "id": "3136ea44b111ceaf",
+      "type": "text",
+      "x": 40,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Artifact Repair desktop acceptance\ncommit: PR #212 candidate\ntest: Full local gate: 3485 passed, 13 platform skips. After CSS-only correction: fresh build/lint/typecheck and 753 UI tests passed. Production Electron synthetic-fixture checks: 6/6, including source-bound draft restart, zero agent launches and zero owned-process leftovers.\nbuild: pnpm run build passed\nmanual: Three final screenshots inspected; feedback and preview contrast exceed 4.5:1. Not real-agent or demo:mvp evidence.\nartifact: https://github.com/PeterFile/SkyTurn/pull/212 ; /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261018/artifact-repair-ui-result-1792340294428.json"
+    },
+    {
+      "id": "24d48f59ef89c6f3",
+      "type": "text",
+      "x": 900,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Artifact Repair delivery boundary\nImpact: The independent PR is not integrated into main. Desktop evidence uses explicit synthetic terminal authority, not a live Agent run; Windows artifact viewing remains unavailable.\nMitigation: Require exact-head CI on PR #212; merge only with separate authorization. Preserve current-file-unhashed and explicit-send boundaries.\nStatus: Documented limitation"
+    },
+    {
+      "id": "588f56229ef6c88f",
+      "type": "text",
+      "x": 1320,
+      "y": 1220,
+      "width": 280,
+      "height": 200,
+      "color": "4",
+      "text": "Task: Cross-session attention navigation\nState: Done\nOwner: Codex\nDepends: none\nEvidence: Three product increments pass real desktop and Hermes acceptance\nRisk: Prior navigation blocker resolved by lifecycle regressions and real desktop evidence; full MVP remains separate.\nGate: Local feature gate: productUiAcceptance.mjs real attention navigation, More-only modal, answer clearing and restart passed; deterministic zero-query scope guards passed. Not full demo:mvp or remote delivery."
+    },
+    {
+      "id": "e9fb087c418d67d6",
+      "type": "text",
+      "x": 1320,
+      "y": 980,
+      "width": 280,
+      "height": 200,
+      "color": "4",
+      "text": "Task: Find exact captured Agent output\nState: Done\nOwner: Codex\nDepends: none\nEvidence: Hermes public-output privacy and all three product increments pass real acceptance\nRisk: Captured-progress omission and future native session announcement exposure resolved. Historical output is not rewritten.\nGate: Local feature gate: productUiPrivacyAcceptance.mjs 14/14 passed, exact raw/find/native clipboard and scoped privacy checks passed; frozen source unchanged. Not full demo:mvp, native resume acceptance, or remote delivery."
+    },
+    {
+      "id": "8bad69fba7455055",
+      "type": "text",
+      "x": 1320,
+      "y": 1460,
+      "width": 280,
+      "height": 200,
+      "color": "4",
+      "text": "Task: Reuse a project task as a fresh session draft\nState: Done\nOwner: Codex\nDepends: none\nEvidence: Three product increments pass real desktop and Hermes acceptance\nRisk: Preceding output-parity blocker resolved; fresh real Create verified. Native Hermes resume and full MVP remain separate.\nGate: Local feature gate: productUiAcceptance.mjs explicit reuse/cancel/edit/branch/restart and fresh Create passed with a new successful private Hermes run; original sessions unchanged. Not full demo:mvp or remote delivery."
+    },
+    {
+      "id": "88bb01cfad6882b6",
+      "type": "text",
+      "x": 900,
+      "y": 1420,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Real Agent acceptance is blocked by the scratch state-root overlap\nImpact: demo:mvp build and native rebuild passed, then Hermes launch failed: POSIX managed process owner is unavailable. The prescribed scratch fixture is inside HERMES_HOME; pathsOverlap rejects it before CLI execution. Local tests and synthetic Electron fixtures do not prove real Agent completion.\nMitigation: Keep the sandbox boundary. Resume live acceptance only after an explicitly authorized isolated Hermes validation environment is established; no main-profile or credential changes are authorized.\nStatus: Open"
+    },
+    {
+      "id": "459bd26bad2d3d46",
+      "type": "text",
+      "x": 40,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Output find and task reuse local regression evidence\ncommit: none\ntest: Integrated main worktree: 9 focused Vitest files, 375/375 passed. Includes raw-output Find/Copy and explicit-reuse fresh identity versus ordinary Retry.\nbuild: ui-canvas typecheck and git diff --check passed. Electron interaction not yet run; real Agent acceptance blocked separately.\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/real-mvp.log"
+    },
+    {
+      "id": "ca3ca7e1dc658a33",
+      "type": "text",
+      "x": 900,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Attention navigation invalidation can reenter scheduling queries\nImpact: Focused post-repair review still blocks: replacing the project/root makes attentionNavigation false, allowing getWorkflowProjection/getProjection to advance scheduling. Candidate removed from main; preserved in feat/session-attention-20261017 worktree.\nMitigation: Re-plan the navigation-intent lifetime contract and assert zero scheduling queries on root/project invalidation before reopening this lane. No additional repair/review loop in this wave.\nStatus: Open"
+    },
+    {
+      "id": "6a58859b68d564da",
+      "type": "text",
+      "x": 440,
+      "y": 1640,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Output find final local and Electron UI evidence\ncommit: none\ntest: Final candidate: pnpm run test --concurrency=1 exit 0; 3488 passed and 13 platform skips in logs, 22 Turbo tasks successful (19 cached). UI package 756 tests passed. productUiFixtureAcceptance.mjs exit 0 proves literal/case-sensitive search, keyboard wrap, no-match, Escape, exact CRLF DOM text and native clipboard in real Electron with explicitly synthetic SQLite output.\nbuild: pnpm run build, lint and typecheck passed. UI candidate SHA256 5ecccb467544deeeb6cc11024d8d5aeead9d73baa4c0de74633f574c08ee4c58 unchanged through acceptance. Native Node ABI restored; persistence 420/420 passed.\nmanual: Screenshots inspected: three content tabs retained, query/count/highlight readable. No real Agent execution claimed; no commit/push/PR/merge.\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/productUiFixtureAcceptance-result-1792248580852.json"
+    },
+    {
+      "id": "65e28683f1051170",
+      "type": "text",
+      "x": 40,
+      "y": 1860,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Task reuse Electron draft and restart evidence\ncommit: none\ntest: Final full tests exit 0. Real Electron synthetic fixture passed radio-selection-without-change, Use/Cancel/Replace, exact editable goal, retained target/branch, unchanged source graph/evidence, zero Agent runs and pending-draft persistence after process restart. Fresh Create/session/planner/run identity has deterministic tests only; real Create/Agent gate remains blocked.\nbuild: Final build/lint/typecheck passed. UI candidate SHA256 5ecccb467544deeeb6cc11024d8d5aeead9d73baa4c0de74633f574c08ee4c58. Electron ABI rebuilt for acceptance; Node ABI restored with persistence 420/420 passed.\nmanual: Confirmation and restart screenshots inspected. Attention candidate is absent. No Create clicked; no real Agent execution, commit/push/PR/merge claimed.\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/productUiFixtureAcceptance-result-1792248580852.json"
+    },
+    {
+      "id": "d05696fefa8fd02e",
+      "type": "text",
+      "x": 440,
+      "y": 1860,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Attention navigation lifetime and integrated desktop UI evidence\ncommit: none\ntest: Current UI candidate d2a76bd9099a3cdd548b9cd0e225ed55aa78d6c30f7e3c7aa8c572fbf2bd73d3: build/lint/typecheck passed; 3537 tests passed, 13 skipped; 20/22 Turbo tasks cached. Passive root/project invalidation query-zero regressions passed. Real Electron synthetic fixture passed badge exact-node navigation, no modal, no Agent starts, unchanged workflow events and badge clearing. Does not prove real Agent execution.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/productUiAttentionFixtureAcceptance-result-1792256428040.json"
+    },
+    {
+      "id": "355e74eb42461f8e",
+      "type": "text",
+      "x": 680,
+      "y": 1940,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Hermes read-only startup compatibility\nState: Verify\nOwner: Codex\nDepends: none\nEvidence: Isolated developer runtime passes unchanged sandbox and real model smoke\nRisk: Full MVP commit-lane host trust was not authorized"
+    },
+    {
+      "id": "3d5de3db6d8e0d9f",
+      "type": "text",
+      "x": 40,
+      "y": 2080,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Isolated runtime crossed overlap gate but fails install-state write\ncommit: none\ntest: demo:mvp exit 1 in isolated sibling state/fixture roots. Hermes process produced failed terminal RunEvidence, exitCode 1, install state is not writable by this user. No model success, workflow intent or Codex lane. User reported isolated OAuth complete; auth validity not yet proven. Main profile and sandbox unchanged.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/continuation-real-mvp.log"
+    },
+    {
+      "id": "56216e4dcd90b1bd",
+      "type": "text",
+      "x": 900,
+      "y": 1860,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Hermes managed dependency startup needs writes outside read-only allowlist\nImpact: Real MVP and reused-task Create success gates remain unverified despite all three synthetic desktop UI checks passing.\nMitigation: Authorized isolated compatibility slice; prefer independent supported runtime. Do not modify main profile, authorize project writes, or enable danger-full-access.\nStatus: Open"
+    },
+    {
+      "id": "ae8ca7cec490300e",
+      "type": "text",
+      "x": 440,
+      "y": 2080,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Isolated developer runtime passes unchanged sandbox and real model smoke\ncommit: none\ntest: Host parent-validate.sh exit 0: true bootstrap/help, denied project/install/tool/source/venv/dummy-config/dummy-auth writes and fork, allowed prepared state write, all native children reaped. readonlyAgentSmoke.mjs exit 0: authoritative reopened PrivateRunEventStore reports succeeded/exitCode 0, Hermes CLI exit passed, one exact output marker, evidence before one terminal status, cleanup complete. Production sandbox helpers unchanged. Main managed CLI is not claimed fixed.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/skyturn-readonly-smoke-apxWRr/receipt.json"
+    },
+    {
+      "id": "3890db11e61254fc",
+      "type": "text",
+      "x": 900,
+      "y": 2080,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Full MVP commit-lane host trust was not authorized\nImpact: Unmodified demo:mvp requires Codex danger-full-access for its commit lane; full MVP acceptance remains unpassed even if real read-only model and desktop feature checks succeed.\nMitigation: User explicitly declined this mode. Do not rerun it, relax sandbox policy or report a reduced suite as full MVP. Complete remaining real UI checks under existing permissions.\nStatus: Open"
+    },
+    {
+      "id": "ea7da8237d58216d",
+      "type": "text",
+      "x": 40,
+      "y": 2300,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Real Hermes-backed attention navigation and decision resolution\ncommit: none\ntest: Corrected productUiAcceptance.mjs: two real Hermes turns passed authoritative private terminal and reconciled-intent checks; attentionNavigation, decisionModal and decisionResolution all ok=true. Exact-session/node navigation opens neither modal nor terminal, starts no run and does not answer/resume; More has exactly Output/Changes/Context, Continue clears the inactive badge. Full script exited 1 later at RAW_DIFFERS_FROM_AUTHORITATIVE_OUTPUT; not a complete UI-suite claim.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/productUiAcceptance-result-1792260858124-e9789b69.json"
+    },
+    {
+      "id": "1215779b304f352b",
+      "type": "text",
+      "x": 900,
+      "y": 2300,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Renderer replay omits captured progress text\nImpact: Real UI Raw text has 533 chars versus authoritative 975 chars; a no-Agent reopen reproduces the mismatch. Earlier synthetic find/copy evidence does not establish production stream parity.\nMitigation: Narrow renderer display/protocol-text split with regression tests; keep model intent parsing stdout-only, preserve exact typed text, and rerun the unchanged real harness. No sandbox or Hermes profile changes.\nStatus: Open"
+    },
+    {
+      "id": "f6481e940c8c8a0a",
+      "type": "text",
+      "x": 900,
+      "y": 2520,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Real reuse Create is blocked by the preceding output-parity gate\nImpact: Real Hermes startup and attention passed, but the suite stopped before recent reuse/restart/Create. Synthetic draft evidence and unit identities remain valid but do not prove the real reused-goal run.\nMitigation: Repair captured-output reconciliation, keep the failing gate, then run the existing real UI sequence. Full demo:mvp remains excluded because danger-full-access was declined.\nStatus: Open"
+    },
+    {
+      "id": "efaf12ad6a3d647d",
+      "type": "text",
+      "x": 440,
+      "y": 2300,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Three product increments pass real desktop and Hermes acceptance\ncommit: none\ntest: Unchanged productUiAcceptance.mjs exit 0 with all 13 required checks true on frozen candidate: 3 distinct real Hermes runs independently reread from SQLite as succeeded/exit 0 with CLI checks; attention only navigates, More tabs and answer clearing pass; exact raw/find/native-copy pass; same-project editable reuse, explicit overwrite, branch controls, restart without relaunch, fresh Create, source immutability and cleanup pass. Narrow display/protocol split reviewed NON-BLOCK at diff SHA256 00fa09459b94e72bba7e3183f150f8a6f2ec4678d02b937ce9215686a55f8200. Full tests 3543 passed/13 skipped, 22 Turbo tasks/20 cached. Node ABI restored; persistence 420/420. Decision-only UI acceptance, not full Hermes-to-Codex demo:mvp or native Hermes resume acceptance.\nbuild: pnpm run build, pnpm run lint, pnpm run typecheck and git diff --check passed; source manifest unchanged throughout real run.\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/productUiAcceptance-result-1792261875754-ae1d8e2e.json"
+    },
+    {
+      "id": "0dc66cad054a1433",
+      "type": "text",
+      "x": 1320,
+      "y": 1700,
+      "width": 280,
+      "height": 200,
+      "color": "4",
+      "text": "Task: Redact newly announced native Hermes session identifiers\nState: Done\nOwner: Codex\nDepends: none\nEvidence: Hermes public-output privacy and all three product increments pass real acceptance\nRisk: Future documented announcement exposure resolved. Historical output and broader native resume behavior remain outside this slice.\nGate: Local scoped gate: productUiPrivacyAcceptance.mjs 14/14 plus full checks and exact-candidate NON-BLOCK review. 3 real CLI runs and 2 restored Raw views verified. PTY wiring/terminal paths tested synthetically. Future documented plain-text session_id announcements only; no historical rewrite, native resume proof, full demo:mvp or remote delivery."
+    },
+    {
+      "id": "7c2d6cf9183a6286",
+      "type": "text",
+      "x": 900,
+      "y": 2740,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Native session identifiers reach public progress output\nImpact: Final screenshot inspection and authoritative SQLite readback found a newly generated native session_id announcement in each of 3 public progress deltas. Values are deliberately omitted from the diagnostic. Native resume usability was not tested, and the CLI reported its own session store unavailable; this is a public identifier/redaction gap, not a proven credential exploit. Functional 13-check acceptance does not cover it.\nMitigation: Separate bounded adapter-output investigation and redaction repair with chunked/replay/public-surface tests, independent review and targeted real verification; never hide progress again or relax sandbox/main-profile permissions.\nStatus: Open"
+    },
+    {
+      "id": "08445a03a1e7d358",
+      "type": "text",
+      "x": 40,
+      "y": 2520,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Public native session identifier finding without identifier values\ncommit: none\ntest: Read-only SQLite query matched native session_id announcements in 3 authoritative typed progress deltas; final Raw screenshot also shows the announcement. Report contains only application workflow session identity, event sequence, kind and boolean marker, not the native identifier value. No resume attempted.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/native-session-identifier-finding.json"
+    },
+    {
+      "id": "355de28a3c53fafc",
+      "type": "text",
+      "x": 440,
+      "y": 2520,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Scoped Hermes announcement redaction candidate passes static and full checks\ncommit: none\ntest: Synthetic baseline regression reproduced in internal and CLI tests; author 36 redactor and49 entry/PTY focused tests passed. Parent full test3567 passed/13 skipped,22 Turbo tasks/20 cached; independent exact-candidate review NON-BLOCK. Covers fresh no-handle announcements, splits/stream order/EOF and terminal routes, known-handle overlap, private replay/task output/mirror and non-Hermes compatibility. Actual real-model privacy gate remains pending; synthetic pipe/Fake PTY is not real model evidence.\nbuild: Root build/lint/typecheck and diff check passed. Five-path binary diff SHA256115dd8c2da08af9a349305c1bf4ef2f4f95a10f75edffecfc7f4740a0999c792 frozen. No sandbox/persistence/UI changes in this slice.\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/native-id-review-final.txt"
+    },
+    {
+      "id": "e5ddb0c18e6d0387",
+      "type": "text",
+      "x": 40,
+      "y": 2740,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Real native announcement redaction observed; extended UI suite remains incomplete\ncommit: none\ntest: First extended privacy suite exit1 UI_TARGET_NOT_UNIQUE at create-once-from-reused-goal because new privacy helper selects reused/source equal titles. Independent read-only SQLite check: 3 distinct real Hermes segments succeeded/exit0/CLI passed; each has one sanitized session_id announcement and zero native identifier shapes. Attention, find/native-copy, reuse draft and restart passed before the selector failure. Do not mark the 14-check suite complete; C/restored Raw and final assertions remain pending.\nbuild: Source and harness unchanged during failed run; production five-path review fingerprint remains frozen. Node ABI restored and persistence420/420 after this run.\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/native-id-first-real-partial-verification.json"
+    },
+    {
+      "id": "b3cecd4f84f6f056",
+      "type": "text",
+      "x": 440,
+      "y": 2740,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Hermes public-output privacy and all three product increments pass real acceptance\ncommit: none\ntest: productUiPrivacyAcceptance.mjs exit0:14/14 required checks, retaining all13 functional gates and adding privacy.3 distinct real non-PTY Hermes runs succeeded/exit0/CLI passed;3 live and2 restarted sessions have positive redacted announcements across authoritative typed output/canonical output/Raw. Error/evidence metadata checked; independent SQLite readback each run has1 redacted announcement and0 native identifier shapes. Exact native clipboard, fresh reuse identity/source preservation and cleanup pass. Screenshot file hashes verified; no fixture processes remain. PTY coverage remains synthetic tests, not a real interactive-model claim.\nbuild: Frozen source/harness unchanged. Independent review NON-BLOCK. Root build/lint/typecheck/test passed:3567 passed/13 skipped;22 Turbo tasks/20 cached. Harness88/88 deterministic checks. Final Node ABI restored; persistence420/420. Earlier failed suite remains preserved; only identity-based harness selection changed for rerun.\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/native-id-final-parent-verification.json"
+    },
+    {
+      "id": "317100ba8ef874af",
+      "type": "text",
+      "x": 1760,
+      "y": 980,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Review an exact run against original goals\nState: Blocked\nOwner: Codex\nDepends: none\nEvidence: Goal review residual regression gates\nRisk: Goal review authority and runtime acceptance\nGate: Real Hermes/Electron acceptance and exact-head CI remain pending; integration is not runtime acceptance."
     },
     {
       "id": "3b47da9eb65341b2",
       "type": "text",
-      "x": 900,
-      "y": 1420,
+      "x": 2080,
+      "y": 980,
       "width": 360,
       "height": 180,
       "color": "1",
@@ -383,8 +683,8 @@
     {
       "id": "6c02903108e0e530",
       "type": "text",
-      "x": 40,
-      "y": 1640,
+      "x": 1760,
+      "y": 1220,
       "width": 360,
       "height": 180,
       "color": "4",
@@ -393,8 +693,8 @@
     {
       "id": "ba16615bc7390683",
       "type": "text",
-      "x": 440,
-      "y": 1640,
+      "x": 2160,
+      "y": 1220,
       "width": 360,
       "height": 180,
       "color": "4",
@@ -403,8 +703,8 @@
     {
       "id": "a010710e9e7a04c7",
       "type": "text",
-      "x": 40,
-      "y": 1860,
+      "x": 1760,
+      "y": 1440,
       "width": 360,
       "height": 180,
       "color": "4",
@@ -609,6 +909,284 @@
       "toEnd": "arrow",
       "label": "depends",
       "color": "6"
+    },
+    {
+      "id": "27f12c1f1e254133",
+      "fromNode": "73b53ccdf59486dd",
+      "toNode": "38d91c2187ddd0fa",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "6a27a42987bf3dd8",
+      "fromNode": "5543d65d0382da2c",
+      "toNode": "73b53ccdf59486dd",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "c891ac5d1e661639",
+      "fromNode": "951cf72093aa88bc",
+      "toNode": "3136ea44b111ceaf",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "26b98886f8496c45",
+      "fromNode": "24d48f59ef89c6f3",
+      "toNode": "951cf72093aa88bc",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "18ba1f839e156b31",
+      "fromNode": "88bb01cfad6882b6",
+      "toNode": "8bad69fba7455055",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "39e62943d6ecad88",
+      "fromNode": "e9fb087c418d67d6",
+      "toNode": "459bd26bad2d3d46",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "deb2190f48452bec",
+      "fromNode": "8bad69fba7455055",
+      "toNode": "459bd26bad2d3d46",
+      "toEnd": "arrow",
+      "label": "local verification only"
+    },
+    {
+      "id": "5ca99f7ece905f0b",
+      "fromNode": "8bad69fba7455055",
+      "toNode": "459bd26bad2d3d46",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "2a999ef8a1add7f7",
+      "fromNode": "ca3ca7e1dc658a33",
+      "toNode": "588f56229ef6c88f",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "74e7a99b47a269da",
+      "fromNode": "e9fb087c418d67d6",
+      "toNode": "6a58859b68d564da",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "0905170ac711be4c",
+      "fromNode": "8bad69fba7455055",
+      "toNode": "65e28683f1051170",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "a617a7f152140e90",
+      "fromNode": "588f56229ef6c88f",
+      "toNode": "d05696fefa8fd02e",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "7b4d1a197fe1af58",
+      "fromNode": "ca3ca7e1dc658a33",
+      "toNode": "d05696fefa8fd02e",
+      "toEnd": "arrow",
+      "label": "resolved by local contract and UI evidence"
+    },
+    {
+      "id": "e68bcdd644c80057",
+      "fromNode": "355e74eb42461f8e",
+      "toNode": "3d5de3db6d8e0d9f",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "e2e9eb287ad931ed",
+      "fromNode": "88bb01cfad6882b6",
+      "toNode": "3d5de3db6d8e0d9f",
+      "toEnd": "arrow",
+      "label": "superseded by isolated runtime evidence"
+    },
+    {
+      "id": "8a0c5b30d506903f",
+      "fromNode": "56216e4dcd90b1bd",
+      "toNode": "355e74eb42461f8e",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "d6d167a616f9a6f1",
+      "fromNode": "355e74eb42461f8e",
+      "toNode": "ae8ca7cec490300e",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "387370fb1a6c9d35",
+      "fromNode": "3890db11e61254fc",
+      "toNode": "355e74eb42461f8e",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "24d6a779734dc85a",
+      "fromNode": "588f56229ef6c88f",
+      "toNode": "ea7da8237d58216d",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "09b42daabb5ade8a",
+      "fromNode": "1215779b304f352b",
+      "toNode": "e9fb087c418d67d6",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "1057a82f315b4a57",
+      "fromNode": "f6481e940c8c8a0a",
+      "toNode": "8bad69fba7455055",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "76c87891f4a8723b",
+      "fromNode": "e9fb087c418d67d6",
+      "toNode": "efaf12ad6a3d647d",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "1d88a010e0de8e26",
+      "fromNode": "588f56229ef6c88f",
+      "toNode": "efaf12ad6a3d647d",
+      "toEnd": "arrow",
+      "label": "validated by"
+    },
+    {
+      "id": "f6dd1c35693620fd",
+      "fromNode": "8bad69fba7455055",
+      "toNode": "efaf12ad6a3d647d",
+      "toEnd": "arrow",
+      "label": "validated by"
+    },
+    {
+      "id": "f0918f6f1f930fa0",
+      "fromNode": "1215779b304f352b",
+      "toNode": "efaf12ad6a3d647d",
+      "toEnd": "arrow",
+      "label": "resolved for this candidate by"
+    },
+    {
+      "id": "61c280f55da223ec",
+      "fromNode": "f6481e940c8c8a0a",
+      "toNode": "efaf12ad6a3d647d",
+      "toEnd": "arrow",
+      "label": "resolved by"
+    },
+    {
+      "id": "086fb6dbcef9dec6",
+      "fromNode": "588f56229ef6c88f",
+      "toNode": "efaf12ad6a3d647d",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "6d74c1b79018c4e1",
+      "fromNode": "8bad69fba7455055",
+      "toNode": "efaf12ad6a3d647d",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "d3645c5603b6bfd7",
+      "fromNode": "7c2d6cf9183a6286",
+      "toNode": "0dc66cad054a1433",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "85c1ebecc90c3bbd",
+      "fromNode": "0dc66cad054a1433",
+      "toNode": "08445a03a1e7d358",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "38ac30856035e59d",
+      "fromNode": "e9fb087c418d67d6",
+      "toNode": "7c2d6cf9183a6286",
+      "toEnd": "arrow",
+      "label": "separate open output-safety boundary"
+    },
+    {
+      "id": "8c2cd9f997df9a5c",
+      "fromNode": "0dc66cad054a1433",
+      "toNode": "355de28a3c53fafc",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "917d826f9b08918d",
+      "fromNode": "0dc66cad054a1433",
+      "toNode": "e5ddb0c18e6d0387",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "310d1783bd6c42b4",
+      "fromNode": "0dc66cad054a1433",
+      "toNode": "b3cecd4f84f6f056",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "745e83c46546b0cb",
+      "fromNode": "7c2d6cf9183a6286",
+      "toNode": "b3cecd4f84f6f056",
+      "toEnd": "arrow",
+      "label": "future plain-text announcements addressed by"
+    },
+    {
+      "id": "4706730699e1c989",
+      "fromNode": "e9fb087c418d67d6",
+      "toNode": "b3cecd4f84f6f056",
+      "toEnd": "arrow",
+      "label": "privacy plus exact captured text verified by"
     },
     {
       "id": "397b30d40ff10af8",
