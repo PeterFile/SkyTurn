@@ -1,3 +1,5 @@
+import { parseGoalReviewRequest, parseGoalReviewBinding, publicGoalReviewBinding,
+  type GoalReviewRequest, type GoalReviewBinding } from "@skyturn/project-core";
 import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
@@ -467,6 +469,7 @@ export interface ScheduledWorkflowLane extends FlowLane {
 export interface ScheduleReadyWorkflowLanesInput {
   allowedParallelism?: number;
   authorizedLaneIds?: string[];
+  exactLaneIds?: string[];
   now: string;
 }
 
@@ -1112,6 +1115,7 @@ export class WorkflowStore {
   }
 
   appendWorkflowEvent(input: AppendWorkflowEventInput): WorkflowEventRecord {
+    if (input.kind === "workflow.goal_review.created" || input.kind === "workflow.goal_review.checked") throw new Error("Goal review requires its transactional API.");
     if (input.kind === "workflow.lane.retry_requested") throw new Error("Retry must use its transactional API.");
     if (input.kind === "workflow.scheduling.paused" || input.kind === "workflow.scheduling.resumed") {
       throw new Error("Workflow scheduling control must use its transactional API.");
@@ -1129,6 +1133,11 @@ export class WorkflowStore {
     assertGenericCheckpointEventHasNoRestrictedFields(input);
     const laneId = laneIdFromPayload(input.payload);
     const projection = this.materializeFlowProjection(input.sessionId);
+    if (input.kind === "workflow.edge.declared" && isRecord(input.payload.edge) && projection.lanes.some(lane =>
+      lane.goalReview && [input.payload.edge && (input.payload.edge as Record<string, unknown>).sourceLaneId, (input.payload.edge as Record<string, unknown>).targetLaneId].includes(lane.id))) throw new Error("Advisory review cannot have execution edges.");
+    if (input.kind === "workflow.lane.declared" && isRecord(input.payload.lane) &&
+      (input.payload.lane.kind === "goal_review" || input.payload.lane.semanticSubtype === "goal_review" || input.payload.lane.goalReview !== undefined ||
+       projection.lanes.some(lane => lane.goalReview && lane.id === (input.payload.lane as Record<string, unknown>).id))) throw new Error("Goal review cannot be forged or redeclared.");
     const retryReplay = this.genericRetryLifecycleReplay(input, projection);
     if (retryReplay) return retryReplay;
     const lane = laneId ? projection.lanes.find((item) => item.id === laneId) : undefined;
@@ -1560,6 +1569,7 @@ export class WorkflowStore {
     sessionId: string,
     input: ScheduleReadyWorkflowLanesInput,
   ): ScheduleReadyWorkflowLanesResult {
+    const exactLaneIds = input.exactLaneIds?.map(id => requireIdentifier(id, "exactLaneId"));
     const authorizedLaneIds = input.authorizedLaneIds === undefined
       ? null
       : new Set(input.authorizedLaneIds.map((laneId) => requireIdentifier(laneId, "authorizedLaneId")));
@@ -1580,6 +1590,7 @@ export class WorkflowStore {
           authorizedLaneIds,
           sharedWriterUnavailable,
           barrier.runningScopes,
+          exactLaneIds,
         );
       } else {
         const preview = this.previewReadyLanes(sessionId, input);
@@ -1661,7 +1672,7 @@ export class WorkflowStore {
 
   previewReadyLanes(
     sessionId: string,
-    input: Pick<ScheduleReadyWorkflowLanesInput, "allowedParallelism">,
+    input: Pick<ScheduleReadyWorkflowLanesInput, "allowedParallelism" | "exactLaneIds">,
   ): ScheduleReadyWorkflowLanesResult {
     const projection = this.materializeFlowProjection(sessionId);
     const runningScopes = projection.lanes
@@ -1670,6 +1681,7 @@ export class WorkflowStore {
     const ready = scheduleFlowReadyLanes(projection, {
       allowedParallelism: input.allowedParallelism ?? 1,
       runningScopes,
+      exactLaneIds: input.exactLaneIds,
     });
     const scheduled = ready.map((lane) => ({
       ...lane,
@@ -1686,6 +1698,7 @@ export class WorkflowStore {
     authorizedLaneIds: Set<string> | null,
     sharedWriterUnavailable: boolean,
     sharedRunningScopes: RunningWorkflowScopes[],
+    exactLaneIds?: string[],
   ): ScheduledWorkflowLane[] {
     const selected: FlowLane[] = [];
     const excludedLaneIds = new Set<string>();
@@ -1705,6 +1718,7 @@ export class WorkflowStore {
       const lane = scheduleFlowReadyLanes(schedulingProjection, {
         allowedParallelism: 1,
         runningScopes: occupied,
+        exactLaneIds,
       })[0];
       if (!lane) break;
       excludedLaneIds.add(lane.id);
@@ -1712,6 +1726,7 @@ export class WorkflowStore {
       const authorized = lane.runtimePolicy.sandbox !== "danger-full-access" ||
         authorizedLaneIds?.has(lane.id) === true;
       if (!authorized) continue;
+      if (lane.goalReview && (sharedWriterUnavailable || sharedRunningScopes.length > 0 || selected.length > 0)) continue;
       const isWriter = this.isTrustedCurrentBranchWriter(lane);
       if (isWriter && writerSelected) continue;
 
@@ -1801,6 +1816,7 @@ export class WorkflowStore {
     const lanes = projection.lanes.filter((lane) => lane.id === laneId);
     if (lanes.length !== 1) return true;
     const lane = lanes[0]!;
+    if (lane.goalReview) return true;
     const policy = lane.runtimePolicy;
     if (
       policy.source !== "workflow_projection" ||
@@ -1895,6 +1911,7 @@ export class WorkflowStore {
     const sessionId = requireWorkflowIdentifier(input.sessionId, "sessionId");
     const laneId = requireWorkflowIdentifier(input.laneId, "laneId");
     const session = this.requireKnownSession(sessionId);
+    if (this.materializeFlowProjection(sessionId).lanes.some(lane => lane.id === laneId && lane.goalReview)) throw new Error("Advisory reviewer cannot be reassigned.");
     const agentKind = requireWorkflowReassignmentAgent(input.agentKind);
     const idempotencyKey = `lane-reassign:${requestId}`;
     const existing = this.getEventByIdempotencyKey(sessionId, idempotencyKey);
@@ -2681,6 +2698,84 @@ export class WorkflowStore {
     return tx.immediate();
   }
 
+  getGoalReview(sessionId: string, requestId: string): GoalReviewBinding | null {
+    const event = this.getEventByIdempotencyKey(sessionId, `goal-review:${requestId}`);
+    if (!event) return null;
+    if (event.kind !== "workflow.goal_review.created" || event.source !== "workflow_store") throw new Error("Goal review requestId conflict.");
+    return parseGoalReviewBinding(event.payload.binding);
+  }
+
+  prepareGoalReviewSource(input: GoalReviewRequest, now: string): WorkflowCandidateManifest {
+    const request = parseGoalReviewRequest(input);
+    const session = this.requireKnownSession(request.sessionId);
+    const projection = this.materializeFlowProjection(request.sessionId);
+    const lane = projection.lanes.find(lane => lane.id === request.nodeId);
+    const segments = projection.segments.filter(segment => segment.laneId === request.nodeId);
+    const segment = segments.at(-1);
+    if (session.target.executionTarget !== "current_branch" || !lane || lane.goalReview || lane.rollbackStatus ||
+      lane.status !== "completed" || !["implementation", "fix"].includes(lane.laneKind) || !segment ||
+      segment.runId !== request.sourceRunId || segment.status !== "succeeded") throw new Error("Original-goal review source is unavailable or stale.");
+    const identity = { sessionId: request.sessionId, nodeId: request.nodeId, laneId: lane.id, segmentId: segment.id, runId: segment.runId };
+    return this.getCandidateManifest(identity) ?? this.deriveCandidateManifest(identity, now);
+  }
+
+  createGoalReview(input: GoalReviewRequest, now: string): { created: boolean; binding: GoalReviewBinding } {
+    const request = parseGoalReviewRequest(input);
+    const tx = this.db.transaction(() => {
+      const collisions = this.db.prepare("SELECT session_id FROM workflow_events WHERE idempotency_key = ?").all(`goal-review:${request.requestId}`) as Array<{ session_id: string }>;
+      if (collisions.some(row => row.session_id !== request.sessionId)) throw new Error("Goal review requestId identity conflict.");
+      const existing = this.getGoalReview(request.sessionId, request.requestId);
+      if (existing) {
+        if (stableJson(existing.request) !== stableJson(request)) throw new Error("Goal review requestId identity conflict.");
+        return { created: false, binding: existing };
+      }
+      const session = this.requireKnownSession(request.sessionId);
+      const projection = this.materializeFlowProjection(request.sessionId);
+      if (projection.schedulingState.status === "paused") throw new Error("Workflow scheduling is paused.");
+      const preview = this.prepareGoalReviewSource(request, now);
+      const sourceStart = projection.events.find(event => event.kind === "workflow.segment.started" &&
+        isRecord(event.payload.segment) && event.payload.segment.id === preview.segmentId);
+      const planBinding = this.getEventByIdempotencyKey(request.sessionId, "plan-finish:binding");
+      const approvedInputId = planBinding?.kind === "workflow.plan_finish.bound" && planBinding.source === "workflow_store" &&
+        typeof planBinding.payload.planSessionId === "string" ? `plan-confirm-${planBinding.payload.planSessionId}` : null;
+      const approved = approvedInputId ? this.listEvents(request.sessionId).find(event => event.kind === "workflow.user_input" &&
+        event.payload.inputId === approvedInputId && event.seq > planBinding!.seq && event.seq < (sourceStart?.seq ?? 0)) : undefined;
+      // Size validation precedes all writes. Never truncate original goal or approved Plan text.
+      const manifest = preview;
+      const binding = parseGoalReviewBinding({ version: 1, request,
+        reviewNodeId: `goal-review-${createHash("sha256").update(request.sessionId + "\0" + request.requestId).digest("hex")}`,
+        originalGoal: session.goal,
+        approvedPlan: approved ? { eventId: approved.id, seq: approved.seq, text: approved.payload.text } : null,
+        manifest, manifestSha256: createHash("sha256").update(canonicalWorkflowCandidateManifestJson(manifest)).digest("hex"),
+        executionTarget: { executionTarget: "current_branch", selectedBranch: manifest.branchName } });
+      const publicBinding = parseGoalReviewBinding(publicGoalReviewBinding(binding));
+      this.freezeCandidateManifest({ sessionId: manifest.sessionId, nodeId: manifest.nodeId, laneId: manifest.laneId, segmentId: manifest.segmentId, runId: manifest.runId, now });
+      this.insertEventInTransaction({ sessionId: request.sessionId, kind: "workflow.goal_review.created", source: "workflow_store",
+        laneId: binding.reviewNodeId, idempotencyKey: `goal-review:${request.requestId}`, payload: { binding: publicBinding }, now });
+      this.materializeFlowProjection(request.sessionId);
+      return { created: true, binding: publicBinding };
+    });
+    return tx.immediate();
+  }
+
+  assertGoalReviewSource(binding: GoalReviewBinding): void {
+    const parsed = parseGoalReviewBinding(binding);
+    const frozen = this.getGoalReview(parsed.request.sessionId, parsed.request.requestId);
+    if (!frozen || stableJson(frozen) !== stableJson(parsed)) throw new Error("Goal review binding conflict.");
+    const current = this.prepareGoalReviewSource(parsed.request, parsed.manifest.createdAt);
+    if (canonicalWorkflowCandidateManifestJson(current) !== canonicalWorkflowCandidateManifestJson(parsed.manifest)) throw new Error("Goal review source is stale.");
+  }
+
+  recordGoalReviewFreshness(binding: GoalReviewBinding, freshness: "current" | "stale" | "unverified", now: string): void {
+    const parsed = parseGoalReviewBinding(binding);
+    const projection = this.materializeFlowProjection(parsed.request.sessionId);
+    const lane = projection.lanes.find(lane => lane.id === parsed.reviewNodeId);
+    if (!lane?.goalReview || stableJson(lane.goalReview.binding) !== stableJson(parsed)) throw new Error("Goal review binding conflict.");
+    if (lane.goalReview.freshness === "stale" || lane.goalReview.freshness === freshness) return;
+    this.insertEventInTransaction({ sessionId: parsed.request.sessionId, kind: "workflow.goal_review.checked", source: "workflow_store",
+      laneId: lane.id, payload: { laneId: lane.id, freshness }, now });
+  }
+
   getCandidateManifest(identity: WorkflowCandidateManifestIdentity): WorkflowCandidateManifest | null {
     const normalized = normalizeCandidateManifestIdentity(identity);
     const event = this.getEventByIdempotencyKey(
@@ -3236,6 +3331,14 @@ export class WorkflowStore {
       row,
       event: mapEvent(row),
     }));
+    for (const { event } of events) {
+      if (event.kind === "workflow.goal_review.created") {
+        if (event.source !== "workflow_store" || Object.keys(event.payload).length !== 1) throw new Error("Invalid goal review event.");
+        const binding = parseGoalReviewBinding(event.payload.binding);
+        if (binding.request.sessionId !== event.sessionId || event.idempotencyKey !== `goal-review:${binding.request.requestId}` ||
+          createHash("sha256").update(canonicalWorkflowCandidateManifestJson(binding.manifest)).digest("hex") !== binding.manifestSha256) throw new Error("Invalid goal review event identity.");
+      }
+    }
     validatePersistedCheckpointAncestryProofs(events);
     validatePersistedVariantComparisonRecords(events);
     return events;
@@ -3886,6 +3989,13 @@ export class WorkflowStore {
     const decisionNodes = projection.userDecisions.map((decision, index) =>
       flowDecisionToCanvasNode(session, decision, projection.lanes.length + index + 1),
     );
+    for (const node of flowNodes) {
+      if (node.status !== "completed" || node.rollbackStatus || !["implementation", "fix"].includes(node.laneKind ?? "")) continue;
+      const manifestEvent = events.find(event => event.kind === "workflow.candidate.manifest_recorded" && isRecord(event.payload.manifest) && event.payload.manifest.runId === node.runId);
+      const manifest = manifestEvent ? parseWorkflowCandidateManifest(manifestEvent.payload.manifest) : null;
+      if (manifest) node.goalReviewSource = { sourceRunId: manifest.runId, afterCheckpointId: manifest.afterCheckpointId,
+        headCommit: manifest.afterHeadCommit, manifestSha256: createHash("sha256").update(canonicalWorkflowCandidateManifestJson(manifest)).digest("hex") };
+    }
     const nodes = [plannerNode, ...flowNodes, ...decisionNodes];
     return {
       id: session.id,
@@ -3917,6 +4027,7 @@ export class WorkflowStore {
     const tx = this.db.transaction(() => {
       const session = this.requireKnownSession(input.sessionId);
       const currentProjection = this.materializeFlowProjection(input.sessionId);
+      if (currentProjection.lanes.some(lane => lane.goalReview && [input.nodeId, input.laneId].includes(lane.id))) throw new Error("Advisory review cannot drive Repair or Variant.");
       const currentPrepared = prepareCheckpointSuccessorRequest(kind, input, currentProjection);
       const existing = this.checkpointSuccessorIdempotentResult(
         kind,
@@ -5894,6 +6005,7 @@ function flowLaneToCanvasNode(
     executable: lane.executable,
     laneKind: lane.laneKind,
     semanticSubtype: lane.semanticSubtype,
+    ...(lane.goalReview ? { goalReview: lane.goalReview } : {}),
     requiredEvidence: lane.requiredEvidence,
     runtimePolicy: lane.runtimePolicy,
     runtime: runtimeForNodeStatus(status, lane.kind),
@@ -5918,8 +6030,8 @@ function flowLaneToCanvasNode(
     worktree: worktreeForSessionTarget(session, lane.id, undefined, createdWorktree, candidateBinding),
     context: {
       brief: lane.brief ?? lane.title,
-      sessionGoal: session.goal,
-      relatedRequirements: "Compiled from Hermes WorkflowIntent.",
+      sessionGoal: lane.goalReview?.binding.originalGoal ?? session.goal,
+      relatedRequirements: lane.goalReview ? "Acceptance criteria unverified; inspect the frozen approved Plan if present." : "Compiled from Hermes WorkflowIntent.",
       relatedDesign: "Flow Kernel policy/gate/compiler creates the DAG projection.",
       relatedTasks: lane.semanticKey,
       dependencies,

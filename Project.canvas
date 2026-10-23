@@ -659,6 +659,56 @@
       "height": 180,
       "color": "4",
       "text": "Evidence: Hermes public-output privacy and all three product increments pass real acceptance\ncommit: none\ntest: productUiPrivacyAcceptance.mjs exit0:14/14 required checks, retaining all13 functional gates and adding privacy.3 distinct real non-PTY Hermes runs succeeded/exit0/CLI passed;3 live and2 restarted sessions have positive redacted announcements across authoritative typed output/canonical output/Raw. Error/evidence metadata checked; independent SQLite readback each run has1 redacted announcement and0 native identifier shapes. Exact native clipboard, fresh reuse identity/source preservation and cleanup pass. Screenshot file hashes verified; no fixture processes remain. PTY coverage remains synthetic tests, not a real interactive-model claim.\nbuild: Frozen source/harness unchanged. Independent review NON-BLOCK. Root build/lint/typecheck/test passed:3567 passed/13 skipped;22 Turbo tasks/20 cached. Harness88/88 deterministic checks. Final Node ABI restored; persistence420/420. Earlier failed suite remains preserved; only identity-based harness selection changed for rerun.\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-wave-20261017/native-id-final-parent-verification.json"
+    },
+    {
+      "id": "317100ba8ef874af",
+      "type": "text",
+      "x": 1760,
+      "y": 980,
+      "width": 280,
+      "height": 200,
+      "color": "3",
+      "text": "Task: Review an exact run against original goals\nState: Blocked\nOwner: Codex\nDepends: none\nEvidence: Goal review residual regression gates\nRisk: Goal review authority and runtime acceptance\nGate: Real Hermes/Electron acceptance and exact-head CI remain pending; integration is not runtime acceptance."
+    },
+    {
+      "id": "3b47da9eb65341b2",
+      "type": "text",
+      "x": 2080,
+      "y": 980,
+      "width": 360,
+      "height": 180,
+      "color": "1",
+      "text": "Risk: Goal review authority and runtime acceptance\nImpact: Fresh read-only review must not become approval or advance unrelated work; source changes can invalidate findings.\nMitigation: Freeze authoritative goal/run/candidate binding, target only the advisory lane, and verify real Hermes execution plus restart before delivery.\nStatus: Open"
+    },
+    {
+      "id": "6c02903108e0e530",
+      "type": "text",
+      "x": 1760,
+      "y": 1220,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Goal review deterministic candidate checks\ncommit: none\ntest: Writer log inspected: project-core 305, kernel 289, persistence 434, UI 705, desktop 826 tests passed; build and affected typechecks passed. Independent review and real Hermes/Electron gate pending.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-goal-review-20261019/focused-tests.log"
+    },
+    {
+      "id": "ba16615bc7390683",
+      "type": "text",
+      "x": 2160,
+      "y": 1220,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Goal review corrected gates and remaining blockers\ncommit: none\ntest: 75cd8b6: root build/lint/typecheck/test --concurrency=1 passed; Flow Kernel acceptance and Electron native rebuild passed. Focused review BLOCK; parent reproduced New worktree sibling busy-gate bypass and stale cleanupConfirmed failure result. Real Agent gate not run.\nbuild: none\nmanual: none\nartifact: /Users/cwp/.hermes/cache/scratch/skyturn-goal-review-20261019/parent-blocker-validation.json"
+    },
+    {
+      "id": "a010710e9e7a04c7",
+      "type": "text",
+      "x": 1760,
+      "y": 1440,
+      "width": 360,
+      "height": 180,
+      "color": "4",
+      "text": "Evidence: Goal review residual regression gates\ncommit: none\ntest: Node ABI115: affected scheduling and acceptance-helper files 32/32 passed, zero skips; New worktree busy replay red-to-green; inventory error/nonzero/zero receipt checks passed; desktop typecheck uncached passed. Real Hermes/Electron and exact-head CI remain pending.\nbuild: none\nmanual: none\nartifact: apps/desktop/scripts/workflowScheduling.test.mjs; apps/desktop/scripts/goalReviewUiAcceptance.test.mjs"
     }
   ],
   "edges": [
@@ -1137,6 +1187,38 @@
       "toNode": "b3cecd4f84f6f056",
       "toEnd": "arrow",
       "label": "privacy plus exact captured text verified by"
+    },
+    {
+      "id": "397b30d40ff10af8",
+      "fromNode": "3b47da9eb65341b2",
+      "toNode": "317100ba8ef874af",
+      "toEnd": "arrow",
+      "label": "may block",
+      "color": "1"
+    },
+    {
+      "id": "0a3d5e287d3715ba",
+      "fromNode": "317100ba8ef874af",
+      "toNode": "6c02903108e0e530",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "972c2817101e3907",
+      "fromNode": "317100ba8ef874af",
+      "toNode": "ba16615bc7390683",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
+    },
+    {
+      "id": "ff1073fdbff4a954",
+      "fromNode": "317100ba8ef874af",
+      "toNode": "a010710e9e7a04c7",
+      "toEnd": "arrow",
+      "label": "evidence",
+      "color": "4"
     }
   ]
 }

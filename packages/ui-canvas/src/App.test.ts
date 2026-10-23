@@ -5029,3 +5029,19 @@ describe("App draft scope and restart", () => {
     }
   });
 });
+
+
+it("More exposes the explicit original-goal action and honest unavailable text without auto-submitting", () => {
+  const request = vi.fn();
+  const node = mockNode();
+  const html = renderToStaticMarkup(createElement(NodeModal, {
+    node, session: canvasSessionForTest("goal-session"), projectRoot: "/project", runEvents: [], runEvidence: null,
+    tab: "Output", isCurrentScope: () => true, reassignBlockedReason: null, onTab: vi.fn(), onClose: vi.fn(), onStop: vi.fn(),
+    onRetry: vi.fn(), retryUnavailableReason: null, onReassign: vi.fn(), onInsertBefore: vi.fn(), onOpenEditor: vi.fn(),
+    onDecisionAnswer: vi.fn(), onReviewOriginalGoal: request, goalReviewUnavailableReason: "Exact candidate evidence is unavailable.",
+  }));
+  expect(html).toContain('aria-label="Review original goal"');
+  expect(html).toContain("Exact candidate evidence is unavailable.");
+  expect(html).toMatch(/<button[^>]*disabled=""[^>]*aria-label="Review original goal"/);
+  expect(request).not.toHaveBeenCalled();
+});

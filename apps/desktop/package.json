@@ -18,6 +18,7 @@
     "package:mac": "node scripts/packageDesktop.mjs",
     "smoke:package": "node scripts/packageDesktopSmoke.mjs",
     "demo:mvp": "node scripts/mvpWorkflowDemo.mjs",
+    "acceptance:goal-review-ui": "node scripts/goalReviewUiAcceptance.mjs",
     "acceptance:new-session": "pnpm run acceptance:new-session-ui",
     "acceptance:new-session-ui": "node scripts/newSessionUiAcceptance.mjs",
     "acceptance:failure-repair-regression": "node scripts/failureRepairRegressionAcceptance.mjs",

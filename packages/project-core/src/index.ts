@@ -3224,6 +3224,8 @@ export interface CanvasNode {
   changesetId: string;
   output: string[];
   outputDeltas?: RunEvent[];
+  goalReview?: import("./goalReview.js").GoalReviewState;
+  goalReviewSource?: { sourceRunId: string; afterCheckpointId: string; headCommit: string; manifestSha256: string };
   candidateBinding?: WorkflowLaneCandidateBinding;
   worktree: WorktreeMetadata;
   context: CanvasNodeContext;
@@ -3673,3 +3675,5 @@ function cleanSessionRef(value: unknown): string {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
+
+export * from "./goalReview.js";

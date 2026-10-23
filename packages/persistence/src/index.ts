@@ -322,6 +322,9 @@ export interface PlanApi {
 }
 
 export interface WorkflowApi {
+  reviewOriginalGoal: (projectRoot: string, input: import("@skyturn/project-core").GoalReviewRequest) => Promise<WorkflowSessionResult<{
+    created: boolean; reviewNodeId: string; projection: unknown;
+  }>>;
   pauseScheduling: (projectRoot: string, input: WorkflowSchedulingControlRequest) => Promise<WorkflowSchedulingResult>;
   resumeScheduling: (projectRoot: string, input: WorkflowSchedulingControlRequest) => Promise<WorkflowSchedulingResult>;
   createSession: (projectRoot: string, input: unknown) => Promise<WorkflowSessionResult<{ session: unknown; projection: unknown }>>;

@@ -54,6 +54,7 @@ export const WORKFLOW_IPC_CHANNELS = {
   insertBefore: "workflow:insertBefore",
   rollbackEligibility: "workflow:rollback:eligibility",
   rollbackApply: "workflow:rollback:apply",
+  goalReviewCreate: "workflow:goalReview:create",
   repairCreate: "workflow:repair:create",
   variantCreate: "workflow:variant:create",
   answerUserDecision: "workflow:userDecision:answer",

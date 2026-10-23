@@ -13,7 +13,7 @@ import type {
   WorkflowLaneRetryResult,
   WorkflowNodePositionUpdateRequest,
 } from "@skyturn/persistence" with { "resolution-mode": "import" };
-import type { PlanEvent } from "@skyturn/project-core" with { "resolution-mode": "import" };
+import type { PlanEvent, GoalReviewRequest } from "@skyturn/project-core" with { "resolution-mode": "import" };
 import type {
   TerminalActionResult,
   TerminalCancelInput,
@@ -156,6 +156,8 @@ const workflow = {
     invokeWorkflow("workflow:rollback:eligibility", projectRoot, [input]),
   applyRollback: (projectRoot: string, input: unknown) =>
     invokeWorkflow("workflow:rollback:apply", projectRoot, [input], "required"),
+  reviewOriginalGoal: (projectRoot: string, input: GoalReviewRequest) =>
+    invokeWorkflow("workflow:goalReview:create", projectRoot, [input], "required"),
   requestRepair: (projectRoot: string, input: unknown) =>
     invokeWorkflow("workflow:repair:create", projectRoot, [input], "required"),
   requestVariant: (projectRoot: string, input: unknown) =>
