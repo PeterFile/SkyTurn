@@ -47,6 +47,7 @@ Current architecture and operating contracts:
 - [`docs/natural-workflow-design.md`](docs/natural-workflow-design.md): durable workflow design and acceptance targets; use this README and live code/Git evidence for current capability claims.
 - [`docs/agent-adapters.md`](docs/agent-adapters.md), [`docs/agent-bridge.md`](docs/agent-bridge.md), and [`docs/codex-watchdog-design.md`](docs/codex-watchdog-design.md): adapter support levels, authoritative run evidence, and process supervision boundaries.
 - [`docs/git-worktree-design.md`](docs/git-worktree-design.md): Git, worktree, delivery, checkpoint, and rollback safety boundaries.
+- [`docs/goal-review.md`](docs/goal-review.md): explicit original-goal review, frozen source provenance, advisory findings, and the real verifier acceptance gate.
 
 Current verification entrypoints and scoped acceptance records:
 
@@ -92,6 +93,7 @@ Implemented in the current code:
 - Plan mode has gated Requirements, Design, and Tasks pages. Each page must be approved before the next one is accessible, and an approved plan can convert to a canvas.
 - The node modal has exactly three content tabs: **Output**, **Changes**, and **Context**. Selecting a node targets the bottom composer; details open from the node card **More** button.
 - **Context** displays node/session/worktree facts and `RunEvidence` facts, including status, exit code, checks, artifacts, and error/cancel/timeout reasons.
+- **More → Review original goal** requests a fresh read-only Hermes review of a succeeded Current branch implementation/fix with exact source evidence. Findings are advisory; process success is not goal acceptance or delivery approval. Original goal and source provenance remain available in **Context**. Real Hermes/Electron acceptance remains **Blocked** pending the [real verifier gate](docs/goal-review.md#run-the-real-acceptance-gate).
 - In **Context**, feedback on a successfully viewed [registered artifact](docs/artifact-viewing.md) can prepare an editable **Repair** draft. Explicit append preserves existing text; the draft retains its source run and after checkpoint across reopening and rejects stale-source submission. Drafting does not launch an agent, and the preview remains the current file rather than an immutable historical snapshot.
 - **Changes** can show structured live run changes, git-backed final reconciliation, mismatch state, sanitized `diff2html` preview, and explicit delivery actions.
 - In **Changes**, a literal, case-insensitive file path filter matches old and new names and shows visible/total preview blocks. Clearing restores the full preview. Filtering does not narrow evidence or delivery scope; delivery still uses the entire changeset. See [Git and worktree design](docs/git-worktree-design.md).

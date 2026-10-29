@@ -1,3 +1,4 @@
+import { parseGoalReviewBinding, type GoalReviewBinding } from "@skyturn/project-core";
 import type {
   AgentKind,
   AgentRunSandbox,
@@ -165,6 +166,7 @@ export interface LaneSuggestion {
 }
 
 export interface FlowLane {
+  goalReview?: { binding: GoalReviewBinding; freshness: "unverified" | "current" | "stale" };
   id: string;
   semanticKey: string;
   kind: string;
@@ -266,6 +268,8 @@ export interface FlowProjectionNode {
 }
 
 export type FlowEventKind =
+  | "workflow.goal_review.created"
+  | "workflow.goal_review.checked"
   | "workflow.user_input"
   | "workflow.profile"
   | "workflow.intent.accepted"
@@ -369,7 +373,7 @@ export function compileWorkflowRetry(
   const segment = latestSegmentForLane(projection, request.laneId);
   const evidence = projection.evidence.filter((item) => item.laneId === request.laneId && item.segmentId === request.terminalSegmentId);
   const terminal = evidence.length === 1 ? parseRunEvidence(evidence[0]?.runEvidence) : null;
-  if (!lane?.executable || lane.nodeKind !== "agent_task" || isPlannerOrIntakeLane(lane) ||
+  if (lane?.goalReview || !lane?.executable || lane.nodeKind !== "agent_task" || isPlannerOrIntakeLane(lane) ||
     !lane.runtimePolicy.trusted || !lane.runtimePolicy.executable || lane.runtimePolicy.source !== "workflow_projection" ||
     lane.status !== "failed" || lane.rollbackStatus || projection.laneRollbackStatuses[lane.id] ||
     segment?.id !== request.terminalSegmentId || segment.runId !== request.terminalRunId ||
@@ -447,6 +451,7 @@ export interface GateResult {
 }
 
 export interface ScheduleReadyLanesInput {
+  exactLaneIds?: readonly string[];
   allowedParallelism: number;
   runningScopes?: Array<{ fileScopes: string[]; packageScopes: string[] }>;
 }
@@ -663,6 +668,7 @@ function parseExternalLaneSuggestions(value: unknown, field: string): LaneSugges
 }
 
 function parseExternalLaneSuggestion(raw: Record<string, unknown>): LaneSuggestion | string {
+  if (raw.kind === "goal_review" || raw.semanticSubtype === "goal_review" || raw.goalReview !== undefined) return "Goal review requires an explicit backend action.";
   if (!isNonEmptyString(raw.id) || !isNonEmptyString(raw.kind) || !isNonEmptyString(raw.title)) {
     return "Lane suggestions require id, kind, and title.";
   }
@@ -800,6 +806,18 @@ export function compileWorkflowIntent(
 }
 
 export function evaluateGate(projection: FlowProjection, operation: WorkflowIntentOperation): GateResult {
+  const advisoryIds = new Set(projection.lanes.filter(lane => lane.goalReview).map(lane => lane.id));
+  const suggested = "lanes" in operation ? operation.lanes ?? [] : [];
+  if (suggested.some(lane => advisoryIds.has(lane.id) || advisoryIds.has(lane.semanticKey ?? "") ||
+    lane.dependsOn?.some(id => advisoryIds.has(id)))) return blocked("Advisory original-goal reviews cannot be execution dependencies.");
+  const operationIds = ["laneId", "sourceLaneId", "targetLaneId", "upstreamLaneIds"].flatMap(key => {
+    const value = (operation as unknown as Record<string, unknown>)[key];
+    return Array.isArray(value) ? value : [value];
+  });
+  const evidenceId = "evidenceId" in operation ? operation.evidenceId : undefined;
+  if (operationIds.some(id => advisoryIds.has(id as string)) || projection.evidence.some(e =>
+    e.id === evidenceId && advisoryIds.has(e.laneId))) return blocked("Advisory original-goal reviews cannot drive workflow actions.");
+
   if ("agentKind" in operation && operation.agentKind === "hermes" && "status" in operation && operation.status === "completed") {
     return blocked("Hermes cannot set completed; completion requires evidence.");
   }
@@ -885,7 +903,7 @@ export function compileInsertClarificationBefore(
   if (!isValidInsertRequestId(request.requestId)) throw new Error("Insert-before requestId is invalid.");
   assertCompleteGraphHygiene(projection, "Insert-before existing graph");
   const target = projection.lanes.find((lane) => lane.id === request.targetLaneId);
-  if (!isEligibleInsertBeforeTarget(target)) {
+  if (target?.goalReview || !isEligibleInsertBeforeTarget(target)) {
     throw new Error("Insert-before target must be an eligible pending lane.");
   }
 
@@ -1029,6 +1047,8 @@ export function scheduleReadyLanes(projection: FlowProjection, input: ScheduleRe
 
   for (const lane of projection.lanes) {
     if (selected.length >= input.allowedParallelism) break;
+    if (input.exactLaneIds && !input.exactLaneIds.includes(lane.id)) continue;
+    if (lane.goalReview && !input.exactLaneIds?.includes(lane.id)) continue;
     if (!lane.executable) continue;
     if (isTerminalRollbackLane(lane)) continue;
     if (lane.status !== "pending" && lane.status !== "ready") continue;
@@ -1312,6 +1332,7 @@ function projectNextLoopAction(
   }
 
   const failedLane = [...projection.lanes].reverse().find((lane) =>
+    !lane.goalReview &&
     lane.status === "failed" && !isTerminalRollbackLane(lane) && lane.semanticSubtype !== "repair"
   );
   if (failedLane) {
@@ -1768,6 +1789,27 @@ export function reduceWorkflowEvents(events: FlowEvent[]): FlowProjection {
     if (event.kind === "workflow.intent.rejected" && typeof event.payload.intentId === "string" && typeof event.payload.reason === "string") {
       projection.rejectedIntents.push({ intentId: event.payload.intentId, reason: event.payload.reason });
     }
+    if (event.kind === "workflow.goal_review.created") {
+      const binding = parseGoalReviewBinding(event.payload.binding);
+      if (event.source !== "workflow_store" || event.sessionId !== binding.request.sessionId ||
+        event.idempotencyKey !== `goal-review:${binding.request.requestId}` || projection.lanes.some(lane => lane.id === binding.reviewNodeId)) {
+        throw new Error("Invalid original-goal review authority.");
+      }
+      const lane: FlowLane = { id: binding.reviewNodeId, semanticKey: binding.reviewNodeId, kind: "goal_review",
+        laneKind: "review", semanticSubtype: "goal_review", title: "Review original goal", agentKind: "hermes",
+        nodeKind: "agent_task", executable: true, status: "pending", fileScopes: ["**"], packageScopes: [],
+        requiredEvidence: [], output: [], goalReview: { binding, freshness: "unverified" },
+        runtimePolicy: { source: "workflow_projection", trusted: true, executable: true, sandbox: "read-only",
+          sideEffects: [], reason: "Explicit advisory review of one frozen source run." } };
+      declaredLaneStatuses.set(lane.id, "pending");
+      upsertLane(projection, lane);
+    }
+    if (event.kind === "workflow.goal_review.checked") {
+      const lane = projection.lanes.find(lane => lane.id === event.payload.laneId);
+      if (event.source !== "workflow_store" || !lane?.goalReview ||
+        !["unverified", "current", "stale"].includes(event.payload.freshness as string)) throw new Error("Invalid original-goal review check.");
+      if (lane.goalReview.freshness !== "stale") lane.goalReview.freshness = event.payload.freshness as "current" | "stale" | "unverified";
+    }
     if (event.kind === "workflow.lane.declared" && isRecord(event.payload.lane)) {
       const normalizedLane = normalizeLane(event.payload.lane);
       declaredLaneStatuses.set(normalizedLane.id, normalizedLane.status);
@@ -2190,6 +2232,7 @@ function assertCompleteGraphHygiene(projection: FlowProjection, context: string)
     if (!lanesById.has(edge.sourceLaneId)) throw new Error(`${context} references missing source lane ${edge.sourceLaneId}.`);
     const target = lanesById.get(edge.targetLaneId);
     if (!target) throw new Error(`${context} references missing target lane ${edge.targetLaneId}.`);
+    if (target.goalReview || lanesById.get(edge.sourceLaneId)?.goalReview) throw new Error(`${context} cannot connect advisory review lanes.`);
     if (edge.sourceLaneId === edge.targetLaneId) throw new Error(`${context} contains a self-edge ${edge.id}.`);
     if (isPlannerOrIntakeLane(target)) {
       throw new Error(`${context} cannot target planner/intake lane ${edge.targetLaneId}.`);
@@ -2853,6 +2896,7 @@ function normalizeLane(value: Record<string, unknown> | LaneSuggestion | FlowLan
   const record = value as Record<string, unknown>;
   const id = requireString(record.id, "lane.id");
   const kind = requireString(record.kind, "lane.kind");
+  if (kind === "goal_review" || record.semanticSubtype === "goal_review" || record.goalReview !== undefined) throw new Error("Advisory review requires its internal creation event.");
   const laneKind = isWorkflowLaneKind(record.laneKind) ? record.laneKind : laneKindForLegacyKind(kind);
   const semanticSubtype =
     typeof record.semanticSubtype === "string" ? record.semanticSubtype : semanticSubtypeForLegacyKind(kind, laneKind);
@@ -4427,6 +4471,7 @@ function upsertLane(projection: FlowProjection, lane: FlowLane): void {
     return;
   }
   const existing = projection.lanes[index];
+  if (existing.goalReview) throw new Error("Advisory review cannot be redeclared.");
   if (isTerminalRollbackLane(existing)) {
     projection.lanes[index] = {
       ...existing,
@@ -4446,6 +4491,7 @@ function upsertLane(projection: FlowProjection, lane: FlowLane): void {
 }
 
 function upsertEdge(projection: FlowProjection, edge: FlowEdge): void {
+  if (projection.lanes.some(lane => lane.goalReview && [edge.sourceLaneId, edge.targetLaneId].includes(lane.id))) throw new Error("Advisory review cannot have execution edges.");
   if (projection.edges.some((item) => item.sourceLaneId === edge.sourceLaneId && item.targetLaneId === edge.targetLaneId)) return;
   projection.edges.push(edge);
 }
