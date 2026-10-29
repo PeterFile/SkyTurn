@@ -29,8 +29,10 @@
     "native:copy": "node scripts/buildArtifactGate.mjs --copy-dist",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
-    "test": "pnpm run native:build && vitest run src && node --test scripts/boundedFileReader.test.mjs scripts/prepareHermesRuntimeImage.test.mjs",
+    "test": "pnpm run native:build && vitest run src && node --test scripts/boundedFileReader.test.mjs scripts/prepareHermesRuntimeImage.test.mjs scripts/hermesContainerLifecycle.test.mjs",
     "hermes:image:prepare": "node scripts/prepareHermesRuntimeImage.mjs",
+    "hermes:container:acceptance": "node scripts/acceptHermesContainerLifecycle.mjs",
+    "test:hermes:lifecycle": "node --test scripts/hermesContainerLifecycle.test.mjs",
     "test:windows": "node scripts/windowsProcessTreeIntegration.mjs"
   },
   "dependencies": {
