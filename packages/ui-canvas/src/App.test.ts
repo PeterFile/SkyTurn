@@ -4531,28 +4531,81 @@ describe("App scheduling response freshness", () => {
   });
 });
 
+let composerAppCompilationCache: {
+  source: string;
+  declarations: Map<string, string>;
+  outputs: Map<string, ts.TranspileOutput>;
+} | undefined;
+
+function compileComposerAppFunctions(source: string, names: string[]): ts.TranspileOutput {
+  if (composerAppCompilationCache?.source !== source) {
+    const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    const declarations = new Map<string, string>();
+    function visit(node: ts.Node) {
+      if (ts.isFunctionDeclaration(node) && node.name) declarations.set(node.name.text, node.getText(ast).replace(/^export /, ""));
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) declarations.set(node.name.text, `const ${node.getText(ast)};`);
+      ts.forEachChild(node, visit);
+    }
+    visit(ast);
+    composerAppCompilationCache = { source, declarations, outputs: new Map() };
+  }
+  const compilation = composerAppCompilationCache;
+  const cacheKey = JSON.stringify(names);
+  const cached = compilation.outputs.get(cacheKey);
+  if (cached) return cached;
+  const selected = names.map(name => {
+    expect(compilation.declarations.has(name), `App must implement ${name}`).toBe(true);
+    return compilation.declarations.get(name);
+  }).join("\n");
+  const compiled = ts.transpileModule(selected, { fileName: "App.tsx", compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None, jsx: ts.JsxEmit.React } });
+  compilation.outputs.set(cacheKey, compiled);
+  return compiled;
+}
+
 // Execute current App handlers with controlled IPC, retaining real authority and draft logic.
 async function composerAppFunctions(names: string[], context: Record<string, unknown>) {
   const source = await readSource("./App.tsx");
-  const ast = ts.createSourceFile("App.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-  const declarations = new Map<string, string>();
-  function visit(node: ts.Node) {
-    if (ts.isFunctionDeclaration(node) && node.name) declarations.set(node.name.text, node.getText(ast).replace(/^export /, ""));
-    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) declarations.set(node.name.text, `const ${node.getText(ast)};`);
-    ts.forEachChild(node, visit);
-  }
-  visit(ast);
-  const selected = names.map(name => {
-    expect(declarations.has(name), `App must implement ${name}`).toBe(true);
-    return declarations.get(name);
-  }).join("\n");
-  const javascript = ts.transpileModule(selected, { fileName: "App.tsx", compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None, jsx: ts.JsxEmit.React } }).outputText;
+  const javascript = compileComposerAppFunctions(source, names).outputText;
   const entries = Object.entries(context).filter(([key]) => key !== "default");
+  // Cache only compilation; each call gets fresh closures and declaration-local state.
   return new Function(...entries.map(([key]) => key), `${javascript}; return { ${names.join(",")} };`)(...entries.map(([, value]) => value));
 }
 const composerAuthorityFunctions = ["workflowRequestAcknowledged", "canvasSessionForWorkflowAuthority",
   "workspaceMatchesWorkflowAuthority", "workflowSessionEnvelope", "isCanvasSession", "isCanonicalWorkflowProjectRoot",
   "isRecord", "rollbackBlockedMessage", "optionalText", "hasCanonicalWorkflowPathSegments"];
+
+describe("App composer handler compilation", () => {
+  it("reuses compilation while binding fresh current App handlers and context keys", async () => {
+    const source = await readSource("./App.tsx");
+    const names = ["isRecord", "optionalText", "rollbackBlockedMessage", "NODE_ACTION_IMPACT_COPY"];
+    const compiled = compileComposerAppFunctions(source, names);
+    expect(compileComposerAppFunctions(source, [...names])).toBe(compiled);
+    const first = await composerAppFunctions(names, { REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE: "first", default: null });
+    const second = await composerAppFunctions(names, { unused: true, REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE: "second" });
+    const third = await composerAppFunctions(names, { REMOTE_SIDE_EFFECT_ROLLBACK_BLOCK_MESSAGE: "third", default: null });
+    const blocked = { status: "blocked", blockedReason: { remoteSideEffects: ["push"] } };
+    expect(second.rollbackBlockedMessage(blocked)).toBe("second");
+    expect(third.rollbackBlockedMessage(blocked)).toBe("third");
+    expect(first.rollbackBlockedMessage(blocked)).toBe("first");
+    expect(first.rollbackBlockedMessage).not.toBe(second.rollbackBlockedMessage);
+    first.NODE_ACTION_IMPACT_COPY.repair = "changed";
+    expect(second.NODE_ACTION_IMPACT_COPY.repair).toBe("Repair uses the after checkpoint.");
+    expect(third.NODE_ACTION_IMPACT_COPY.repair).toBe("Repair uses the after checkpoint.");
+  });
+
+  it("keys compilation by exact source and ordered declaration names", () => {
+    const source = 'const left = "left"; const right = left;';
+    const compile = (text: string, names: string[]) => compileComposerAppFunctions(text, names).outputText;
+    const left = compile(source, ["left"]);
+    const both = compile(source, ["left", "right"]);
+    expect(new Function(`${left}; return left;`)()).toBe("left");
+    expect(new Function(`${both}; return right;`)()).toBe("left");
+    expect(() => new Function(`${compile(source, ["right", "left"])}; return right;`)()).toThrow(ReferenceError);
+    expect(new Function(`${compile(source.replace('"left"', '"next"'), ["left"])}; return left;`)()).toBe("next");
+    expect(() => compile('const left = "left";', ["right"])).toThrow("App must implement right");
+    expect(compile(source, ["left"])).toBe(left);
+  });
+});
 
 describe("App recent task goal reuse", () => {
   async function setup(mode: "fast" | "plan" = "fast") {

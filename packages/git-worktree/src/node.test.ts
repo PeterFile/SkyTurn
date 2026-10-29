@@ -2379,7 +2379,30 @@ describe("candidate delivery commits", () => {
     expect(git(repo.repoRoot, ["rev-parse", "refs/heads/other"])).toBe(headCommit);
   });
 
-  it("rejects malformed expectations and all bound fact mismatches without mutating refs, index, or worktree", async () => {
+  const candidateRejectionCases: [string, (expected: CandidateCommitExpectation, ancestorCommit: string) => unknown][] = [
+    ["a missing patch digest", (expected) => {
+      const { fullPatchSha256: _removedDigest, ...missingDigest } = expected;
+      return missingDigest;
+    }],
+    ["an unexpected expectation field", (expected) => ({ ...expected, unexpected: true })],
+    ["an uppercase before commit", (expected) => ({ ...expected, beforeHeadCommit: "A".repeat(40) })],
+    ["an uppercase patch digest", (expected) => ({ ...expected, fullPatchSha256: "A".repeat(64) })],
+    ["a zero patch length", (expected) => ({ ...expected, fullPatchByteLength: 0 })],
+    ["an oversized patch length", (expected) => ({ ...expected, fullPatchByteLength: Number.MAX_SAFE_INTEGER })],
+    ["an unsafe branch name", (expected) => ({ ...expected, branchName: "-unsafe" })],
+    ["an oversized branch name", (expected) => ({ ...expected, branchName: "x".repeat(1_025) })],
+    ["a repository identity mismatch", (expected) => ({ ...expected, repositoryIdentity: "0".repeat(64) })],
+    ["a worktree identity mismatch", (expected) => ({ ...expected, worktreeIdentity: "1".repeat(64) })],
+    ["an ancestry proof mismatch", (expected) => ({ ...expected, ancestryProofSha256: "2".repeat(64) })],
+    ["a patch digest mismatch", (expected) => ({ ...expected, fullPatchSha256: "3".repeat(64) })],
+    ["a patch length mismatch", (expected) => ({ ...expected, fullPatchByteLength: expected.fullPatchByteLength + 1 })],
+    ["a file manifest mismatch", (expected) => ({ ...expected, fileManifestSha256: "4".repeat(64) })],
+    ["a before commit mismatch", (expected, ancestorCommit) => ({ ...expected, beforeHeadCommit: ancestorCommit })],
+    ["an after commit mismatch", (expected, ancestorCommit) => ({ ...expected, afterHeadCommit: ancestorCommit })],
+    ["a branch name mismatch", (expected) => ({ ...expected, branchName: "alternate" })],
+  ];
+
+  it.each(candidateRejectionCases)("rejects %s without mutating refs, index, or worktree", async (_name, variantFor) => {
     const repo = await createTestRepo("skyturn-candidate-rejections-");
     tempRoots.push(repo.tempRoot);
     await writeFile(join(repo.repoRoot, "anchor.txt"), "second commit\n");
@@ -2390,42 +2413,21 @@ describe("candidate delivery commits", () => {
     const ancestorCommit = git(repo.repoRoot, ["rev-parse", "HEAD^"]);
     git(repo.repoRoot, ["branch", "alternate", headCommit]);
     const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
-    const { fullPatchSha256: _removedDigest, ...missingDigest } = expected;
-    const variants: unknown[] = [
-      missingDigest,
-      { ...expected, unexpected: true },
-      { ...expected, beforeHeadCommit: "A".repeat(40) },
-      { ...expected, fullPatchSha256: "A".repeat(64) },
-      { ...expected, fullPatchByteLength: 0 },
-      { ...expected, fullPatchByteLength: Number.MAX_SAFE_INTEGER },
-      { ...expected, branchName: "-unsafe" },
-      { ...expected, branchName: "x".repeat(1_025) },
-      { ...expected, repositoryIdentity: "0".repeat(64) },
-      { ...expected, worktreeIdentity: "1".repeat(64) },
-      { ...expected, ancestryProofSha256: "2".repeat(64) },
-      { ...expected, fullPatchSha256: "3".repeat(64) },
-      { ...expected, fullPatchByteLength: expected.fullPatchByteLength + 1 },
-      { ...expected, fileManifestSha256: "4".repeat(64) },
-      { ...expected, beforeHeadCommit: ancestorCommit },
-      { ...expected, afterHeadCommit: ancestorCommit },
-      { ...expected, branchName: "alternate" },
-    ];
+    const variant = variantFor(expected, ancestorCommit);
     const indexPath = git(repo.repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
     const indexBefore = readFileSync(indexPath);
     const statusBefore = git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
 
-    for (const variant of variants) {
-      await expect(createCandidateDeliveryCommit({
-        projectRoot: repo.repoRoot,
-        worktreePath: repo.repoRoot,
-        expected: variant as CandidateCommitExpectation,
-        subject: "feat(delivery): reject mismatched candidate",
-      })).rejects.toThrow(/Candidate delivery commit (?:input is invalid|was rejected)\./);
-      expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
-      expect(git(repo.repoRoot, ["rev-parse", "refs/heads/alternate"])).toBe(headCommit);
-      expect(readFileSync(indexPath)).toEqual(indexBefore);
-      expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe(statusBefore);
-    }
+    await expect(createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected: variant as CandidateCommitExpectation,
+      subject: "feat(delivery): reject mismatched candidate",
+    })).rejects.toThrow(/Candidate delivery commit (?:input is invalid|was rejected)\./);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/alternate"])).toBe(headCommit);
+    expect(readFileSync(indexPath)).toEqual(indexBefore);
+    expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe(statusBefore);
   });
 
   it("returns bounded evidence and errors without paths, filenames, or reviewed bytes", async () => {
