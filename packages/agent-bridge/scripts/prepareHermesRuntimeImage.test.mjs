@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const source = new URL("./prepareHermesRuntimeImage.mjs", import.meta.url);
 const posixTest = (name, run) => test(name, {
@@ -15,8 +15,10 @@ const posixTest = (name, run) => test(name, {
 }, run);
 const image = "docker.io/nousresearch/hermes-agent@sha256:a11574b7fe8e1631d7d88d556677dac693bc058abf558cdeb899155688c1bf05";
 const imageId = "sha256:02e7aa0e84123fa0e9b22686e7a2bfb7d85fd59821d4d28812a3e07f3061cf41";
+const manifestDescriptor = { mediaType: "application/vnd.docker.distribution.manifest.v2+json", digest: image.split("@")[1], size: 8054 };
 const inspection = () => [{ Id: imageId, RepoDigests: [image.replace("docker.io/", "")], Os: "linux", Architecture: "amd64",
   Config: { Volumes: { "/opt/data": {} }, Entrypoint: ["/opt/hermes/docker/entrypoint-dispatch.sh"], Labels: null, User: "root", WorkingDir: "/opt/hermes" } }];
+const manifestInspection = () => [{ ...inspection()[0], Id: manifestDescriptor.digest, Descriptor: { ...manifestDescriptor }, Manifests: null }];
 async function prepare(...args) {
   assert.ok(existsSync(source), "preparation script must exist");
   return (await import(source.href)).prepareHermesRuntimeImage(...args);
@@ -61,6 +63,9 @@ async function failure(f, dependencies, code) {
   const evidence = JSON.parse(await readFile(join(f.state, directories[0], "preparation.json"), "utf8"));
   assert.equal(evidence.status, "failed"); assert.equal(evidence.code, code);
   assert.equal(evidence.runtimeReady, false); assert.equal(evidence.plannerReady, false);
+  if (code === "IMAGE_MISMATCH") {
+    assert.equal(evidence.inspectedImageId, undefined); assert.equal(evidence.imageIdentityKind, undefined);
+  }
   return evidence;
 }
 
@@ -80,6 +85,7 @@ posixTest("prepares only the immutable pin using explicit endpoint and empty iso
   };
   const result = await prepare(f.args, io);
   assert.equal(result.status, "prepared"); assert.equal(result.image, image); assert.equal(result.imageId, imageId);
+  assert.equal(result.inspectedImageId, imageId); assert.equal(result.imageIdentityKind, "config");
   assert.equal(result.daemonId, "test-daemon");
   assert.equal(result.runtimeReady, false); assert.equal(result.plannerReady, false);
   assert.equal((await lstat(result.evidenceDirectory)).mode & 0o777, 0o700);
@@ -92,8 +98,75 @@ posixTest("prepares only the immutable pin using explicit endpoint and empty iso
   ]);
   const pin = JSON.parse(await readFile(new URL("../runtime/hermes-image.json", import.meta.url), "utf8"));
   assert.equal(pin.image, image); assert.equal(pin.imageId, imageId);
+  assert.deepEqual(pin.manifestDescriptor, manifestDescriptor);
   assert.deepEqual(pin.labels, {}); assert.deepEqual(pin.volumes, ["/opt/data"]);
   assert.deepEqual(deadlines, [60_000, 1_200_000, 60_000, 60_000]);
+});
+
+posixTest("accepts the observed containerd manifest ID with its exact pinned descriptor", async (t) => {
+  const f = await fixture(t);
+  const io = boundary(f, ["\"test-daemon\"", "pulled", "\"test-daemon\"", JSON.stringify(manifestInspection())]);
+  const result = await prepare(f.args, io);
+  assert.equal(result.status, "prepared"); assert.equal(result.image, image); assert.equal(result.imageId, imageId);
+  assert.equal(result.inspectedImageId, manifestDescriptor.digest); assert.equal(result.imageIdentityKind, "manifest");
+  assert.equal(result.runtimeReady, false); assert.equal(result.plannerReady, false);
+  const evidence = JSON.parse(await readFile(join(result.evidenceDirectory, "preparation.json"), "utf8"));
+  assert.equal(evidence.inspectedImageId, manifestDescriptor.digest); assert.equal(evidence.imageIdentityKind, "manifest");
+  assert.deepEqual(evidence.commands.map(({ command, closed, exitCode }) => [command, closed, exitCode]), [
+    ["daemon-before", true, 0], ["pull", true, 0], ["daemon-after", true, 0], ["image-inspect", true, 0],
+  ]);
+});
+
+posixTest("accepts a legacy config ID with a consistent descriptor and explicit Docker Hub prefix", async (t) => {
+  const f = await fixture(t); const data = inspection();
+  data[0].Descriptor = { ...manifestDescriptor }; data[0].RepoDigests = [image]; data[0].Config.Labels = {};
+  const result = await prepare(f.args, boundary(f, ["\"test-daemon\"", "pulled", "\"test-daemon\"", JSON.stringify(data)]));
+  assert.equal(result.status, "prepared"); assert.equal(result.imageId, imageId);
+  assert.equal(result.inspectedImageId, imageId); assert.equal(result.imageIdentityKind, "config");
+  const evidence = JSON.parse(await readFile(join(result.evidenceDirectory, "preparation.json"), "utf8"));
+  assert.equal(evidence.inspectedImageId, imageId); assert.equal(evidence.imageIdentityKind, "config");
+});
+
+posixTest("rejects invalid manifest pins before private state or commands", async (t) => {
+  for (const descriptor of [undefined, null, [], {},
+    { ...manifestDescriptor, digest: imageId }, { ...manifestDescriptor, digest: "sha256:bad" },
+    { ...manifestDescriptor, mediaType: "application/vnd.oci.image.index.v1+json" },
+    { ...manifestDescriptor, size: undefined }, { ...manifestDescriptor, size: "8054" },
+    { ...manifestDescriptor, size: 0 }, { ...manifestDescriptor, size: -1 },
+    { ...manifestDescriptor, size: 1.5 }, { ...manifestDescriptor, size: Number.MAX_SAFE_INTEGER + 1 },
+  ]) {
+    const f = await fixture(t); const io = boundary(f);
+    await mkdir(join(f.root, "scripts")); await mkdir(join(f.root, "runtime"));
+    const script = join(f.root, "scripts", "prepare.mjs");
+    await writeFile(script, await readFile(source));
+    const pin = JSON.parse(await readFile(new URL("../runtime/hermes-image.json", import.meta.url), "utf8"));
+    await writeFile(join(f.root, "runtime", "hermes-image.json"), JSON.stringify({ ...pin, manifestDescriptor: descriptor }));
+    const module = await import(pathToFileURL(script).href);
+    await assert.rejects(module.prepareHermesRuntimeImage(f.args, io), { code: "INVALID_PIN" });
+    assert.equal(io.calls.length, 0); assert.deepEqual(readdirSync(f.state), []);
+  }
+});
+
+posixTest("requires an exact descriptor for manifest IDs and rejects conflicting legacy descriptors", async (t) => {
+  for (const inspect of [inspection, manifestInspection]) {
+    for (const descriptor of [null, false, "PRIVATE_RAW_ERROR", [], {},
+      { ...manifestDescriptor, digest: imageId }, { ...manifestDescriptor, digest: "sha256:bad" },
+      { ...manifestDescriptor, mediaType: undefined }, { ...manifestDescriptor, digest: undefined },
+      { ...manifestDescriptor, mediaType: "application/vnd.oci.image.index.v1+json" },
+      { ...manifestDescriptor, size: undefined }, { ...manifestDescriptor, size: "8054" },
+      { ...manifestDescriptor, size: 0 }, { ...manifestDescriptor, size: -1 },
+      { ...manifestDescriptor, size: 8053 }, { ...manifestDescriptor, size: 8054.5 },
+      { ...manifestDescriptor, unexpected: true },
+    ]) {
+      const f = await fixture(t); const data = inspect(); data[0].Descriptor = descriptor;
+      const io = boundary(f, ["\"test-daemon\"", "pulled", "\"test-daemon\"", JSON.stringify(data)]);
+      const evidence = await failure(f, io, "IMAGE_MISMATCH");
+      assert.equal(io.calls.length, 4); assert.ok(evidence.commands.every((x) => x.closed && x.exitCode === 0));
+      assert.equal(evidence.stage, "image-inspect"); assert.ok(!JSON.stringify(evidence).includes("PRIVATE_RAW_ERROR"));
+    }
+  }
+  const f = await fixture(t); const data = manifestInspection(); delete data[0].Descriptor;
+  await failure(f, boundary(f, ["\"test-daemon\"", "pulled", "\"test-daemon\"", JSON.stringify(data)]), "IMAGE_MISMATCH");
 });
 
 posixTest("rejects malformed arguments and unsafe paths before any directory creation or process", async (t) => {
@@ -151,18 +224,28 @@ posixTest("fails closed on daemon mismatch both before and after pull", async (t
 });
 
 posixTest("rejects wrong digest, image ID, platform, volume, entrypoint, and invented labels", async (t) => {
-  for (const change of [
-    (x) => { x.RepoDigests = [image.replace(/.$/, "0")]; }, (x) => { x.Id = imageId.replace(/.$/, "0"); },
-    (x) => { x.Os = "darwin"; }, (x) => { x.Architecture = "arm64"; },
-    (x) => { x.Config.Volumes = {}; }, (x) => { x.Config.Volumes["/extra"] = {}; },
-    (x) => { x.Config.Volumes["/opt/data"] = null; }, (x) => { x.Config.Entrypoint = ["/bin/sh"]; },
-    (x) => { x.Config.Labels = { "org.opencontainers.image.revision": "invented" }; },
-    (x) => { x.Config.User = "other"; }, (x) => { x.Config.WorkingDir = "/"; },
-  ]) {
-    const f = await fixture(t); const data = inspection(); change(data[0]);
-    await failure(f, boundary(f, ["\"test-daemon\"", "pulled", "\"test-daemon\"", JSON.stringify(data)]), "IMAGE_MISMATCH");
+  for (const inspect of [inspection, manifestInspection]) {
+    for (const change of [
+      (x) => { x.RepoDigests = [image.replace(/.$/, "0")]; }, (x) => { x.Id = imageId.replace(/.$/, "0"); },
+      (x) => { delete x.Id; }, (x) => { x.Id = null; }, (x) => { x.Id = ""; }, (x) => { x.Id = 8054; },
+      (x) => { delete x.RepoDigests; }, (x) => { x.RepoDigests = []; }, (x) => { x.RepoDigests = [imageId]; },
+      (x) => { x.RepoDigests = null; }, (x) => { x.RepoDigests = image; },
+      (x) => { x.Os = "darwin"; }, (x) => { x.Architecture = "arm64"; },
+      (x) => { delete x.Os; }, (x) => { delete x.Architecture; },
+      (x) => { delete x.Config; }, (x) => { delete x.Config.Volumes; },
+      (x) => { x.Config.Volumes = {}; }, (x) => { x.Config.Volumes["/extra"] = {}; },
+      (x) => { x.Config.Volumes["/opt/data"] = null; }, (x) => { x.Config.Entrypoint = ["/bin/sh"]; },
+      (x) => { delete x.Config.Entrypoint; },
+      (x) => { x.Config.Labels = { "org.opencontainers.image.revision": "invented" }; },
+      (x) => { x.Config.User = "other"; }, (x) => { x.Config.WorkingDir = "/"; },
+      (x) => { delete x.Config.User; }, (x) => { delete x.Config.WorkingDir; },
+    ]) {
+      const f = await fixture(t); const data = inspect(); change(data[0]);
+      const evidence = await failure(f, boundary(f, ["\"test-daemon\"", "pulled", "\"test-daemon\"", JSON.stringify(data)]), "IMAGE_MISMATCH");
+      assert.equal(evidence.stage, "image-inspect"); assert.ok(evidence.commands.every((x) => x.closed && x.exitCode === 0));
+    }
   }
-  for (const output of ["PRIVATE_RAW_ERROR", "{}", "[]", JSON.stringify([...inspection(), ...inspection()])]) {
+  for (const output of ["PRIVATE_RAW_ERROR", "{}", "[]", "[null]", "[true]", "[{}]", JSON.stringify([...inspection(), ...inspection()])]) {
     const f = await fixture(t);
     await failure(f, boundary(f, ["\"test-daemon\"", "pulled", "\"test-daemon\"", output]), "IMAGE_MISMATCH");
   }

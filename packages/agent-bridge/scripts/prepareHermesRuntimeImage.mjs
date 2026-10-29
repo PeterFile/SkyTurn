@@ -59,6 +59,10 @@ async function readPin() {
     && /^sha256:[a-f0-9]{64}$/.test(pin.imageId) && equal(pin.platform, { os: "linux", architecture: "amd64" })
     && equal(pin.volumes, ["/opt/data"]) && equal(pin.entrypoint, ["/opt/hermes/docker/entrypoint-dispatch.sh"])
     && equal(pin.labels, {}) && pin.user === "root" && pin.workingDirectory === "/opt/hermes", "INVALID_PIN");
+  const descriptor = pin.manifestDescriptor;
+  requireValue(equal(descriptor, { mediaType: "application/vnd.docker.distribution.manifest.v2+json",
+    digest: pin.image.split("@")[1], size: descriptor?.size })
+    && Number.isSafeInteger(descriptor?.size) && descriptor.size > 0, "INVALID_PIN");
   return pin;
 }
 function verifyImage(text, pin) {
@@ -66,11 +70,17 @@ function verifyImage(text, pin) {
   try { entries = JSON.parse(text); } catch { throw new PreparationError("IMAGE_MISMATCH"); }
   requireValue(Array.isArray(entries) && entries.length === 1, "IMAGE_MISMATCH");
   const entry = entries[0]; const config = entry?.Config;
-  requireValue(entry?.Id === pin.imageId && entry.Os === pin.platform.os && entry.Architecture === pin.platform.architecture
+  const descriptorMatches = equal(entry?.Descriptor, pin.manifestDescriptor);
+  // Classic stores report the config digest; containerd stores report the manifest target digest.
+  const imageIdentityKind = entry?.Id === pin.imageId ? "config"
+    : entry?.Id === pin.manifestDescriptor.digest && descriptorMatches ? "manifest" : undefined;
+  requireValue(imageIdentityKind !== undefined && (entry.Descriptor === undefined || descriptorMatches)
+    && entry.Os === pin.platform.os && entry.Architecture === pin.platform.architecture
     && Array.isArray(entry.RepoDigests) && entry.RepoDigests.some((digest) => typeof digest === "string"
       && digest.replace(/^docker\.io\//, "") === pin.image.replace(/^docker\.io\//, ""))
     && equal(config?.Volumes, { "/opt/data": {} }) && equal(config?.Entrypoint, pin.entrypoint)
     && equal(config?.Labels ?? {}, pin.labels) && config?.User === pin.user && config?.WorkingDir === pin.workingDirectory, "IMAGE_MISMATCH");
+  return { inspectedImageId: entry.Id, imageIdentityKind };
 }
 
 function dockerCommand(executable, args, options, evidence, { spawnProcess, scheduleTimeout, signal }, timeoutMs) {
@@ -112,10 +122,11 @@ function dockerCommand(executable, args, options, evidence, { spawnProcess, sche
 
 // Only the imported offline test API accepts boundary injection; the CLI has no bypass flags.
 export async function prepareHermesRuntimeImage(args, { spawnProcess = spawn, lstatPath = lstat, scheduleTimeout = setTimeout, signal } = {}) {
-  let evidenceDirectory; let stage = "arguments"; let pin; let daemonId;
+  let evidenceDirectory; let stage = "arguments"; let pin; let daemonId; let imageIdentity;
   const commands = [];
   const summary = (status, code) => ({ status, preparationOnly: true, runtimeReady: false, plannerReady: false,
     ...(pin ? { image: pin.image, imageId: pin.imageId, platform: "linux/amd64" } : {}),
+    ...imageIdentity,
     ...(daemonId ? { daemonId } : {}),
     ...(evidenceDirectory ? { evidenceDirectory } : {}), ...(code ? { code, stage } : {}) });
   const persist = (value) => writeFile(join(evidenceDirectory, "preparation.json"), `${JSON.stringify({ ...value, commands })}\n`, { mode: 0o600 });
@@ -151,7 +162,7 @@ export async function prepareHermesRuntimeImage(args, { spawnProcess = spawn, ls
     await verifyDaemon("daemon-before");
     await command("pull", ["pull", "--quiet", "--platform", "linux/amd64", pin.image], 1_200_000);
     await verifyDaemon("daemon-after");
-    verifyImage(await command("image-inspect", ["image", "inspect", pin.image]), pin);
+    imageIdentity = verifyImage(await command("image-inspect", ["image", "inspect", pin.image]), pin);
     requireValue(!signal?.aborted, "COMMAND_ABORTED");
     const result = summary("prepared"); await persist(result);
     requireValue(!signal?.aborted, "COMMAND_ABORTED");
