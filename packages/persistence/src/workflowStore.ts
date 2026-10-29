@@ -56,7 +56,8 @@ import type {
   WorkflowRollbackEligibility,
   WorkflowWorktreeIdentity,
 } from "@skyturn/project-core";
-import type { WorkflowNodePositionUpdateRequest } from "./index.js";
+import { parseProjectFileReferences, parseResolvedProjectFileReferences, type ProjectFileReference,
+  type ResolvedProjectFileReference, type WorkflowNodePositionUpdateRequest } from "./index.js";
 import {
   canonicalRequiredEvidenceForLane,
   compilePauseWorkflowScheduling,
@@ -435,6 +436,8 @@ export interface AppendUserInput {
   inputId: string;
   text: string;
   now: string;
+  references?: readonly ProjectFileReference[];
+  resolvedReferences?: readonly ResolvedProjectFileReference[];
 }
 
 export interface ClaimUserInputResult {
@@ -1206,12 +1209,15 @@ export class WorkflowStore {
   }
 
   claimUserInput(input: AppendUserInput): ClaimUserInputResult {
+    const references = parseProjectFileReferences(input.references);
+    const resolvedReferences = parseResolvedProjectFileReferences(input.resolvedReferences, references);
     const safeInput: AppendWorkflowEventInput = {
       sessionId: input.sessionId,
       kind: "workflow.user_input",
       source: "user",
       idempotencyKey: `user-input:${input.inputId}`,
-      payload: { inputId: input.inputId, text: input.text },
+      payload: { inputId: input.inputId, text: input.text,
+        ...(references.length ? { references, resolvedReferences } : {}) },
       now: input.now,
     };
     const tx = this.db.transaction(() => {
@@ -1243,6 +1249,20 @@ export class WorkflowStore {
       return { event, created, ownsDelivery: !delivered };
     });
     return tx();
+  }
+
+  /** Read the original snapshot before any retry can touch the filesystem. */
+  getUserInput(input: Omit<AppendUserInput, "now" | "resolvedReferences">): WorkflowEventRecord | null {
+    const references = parseProjectFileReferences(input.references);
+    const event = this.getEventByIdempotencyKey(input.sessionId, `user-input:${input.inputId}`);
+    if (!event) return null;
+    const storedReferences = parseProjectFileReferences(event.payload.references);
+    if (event.kind !== "workflow.user_input" || event.source !== "user" || event.payload.inputId !== input.inputId ||
+      event.payload.text !== input.text || stableJson(storedReferences) !== stableJson(references)) {
+      throw new Error(`Workflow user input id was already used with different input: ${input.inputId}.`);
+    }
+    parseResolvedProjectFileReferences(event.payload.resolvedReferences, storedReferences);
+    return event;
   }
 
   recordUserInputDelivered(input: RecordUserInputDeliveredInput): WorkflowEventRecord {

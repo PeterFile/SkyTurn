@@ -3956,6 +3956,9 @@ async function loadMainWorkflowTransportRuntime({
     },
     parseWorkflowBroadcastEnvelope: contracts.parseWorkflowBroadcastEnvelope,
     parseWorkflowResponseEnvelope: contracts.parseWorkflowResponseEnvelope,
+    projectReferenceResponseForRenderer: createSourceModuleLoader({ typescript: ts }).load(
+      join(root, "electron", "projectReferenceRuntime.ts"),
+    ).projectReferenceResponseForRenderer,
     planProjectIdentities: { canonicalize },
     registerWorkflowStoreOperation,
     workflowStores,

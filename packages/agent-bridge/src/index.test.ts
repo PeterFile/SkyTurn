@@ -18,7 +18,7 @@ import {
 import { spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { appendFileSync, existsSync, fstatSync } from "node:fs";
+import { appendFileSync, existsSync, fstatSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
@@ -29,6 +29,9 @@ import { summarizeRunEvidence } from "@skyturn/project-core";
 import type { AgentRun, RunEvent, RunEvidence, StartAgentRunInput } from "@skyturn/project-core";
 import type { TerminalSessionEventDraft } from "@skyturn/project-core";
 import { reduceWorkflowEvents, scheduleReadyLanes, type FlowEvent } from "@skyturn/workflow-kernel";
+// Load real published namespaces during collection, outside the assertion deadline.
+import * as publicApi from "@skyturn/agent-bridge";
+import * as boundedFileReader from "@skyturn/agent-bridge/bounded-file-reader";
 
 import {
   AgentBridge as ProductionAgentBridge,
@@ -58,6 +61,7 @@ import {
 import { createDurableRunClaimStore, defaultDurableRunClaimRoot } from "./durableRunClaim.js";
 import { assertWindowsExpectedArtifactVerifierCapability } from "./internal/windowsExpectedArtifactVerifier.js";
 import * as fdAnchoredCliLaunch from "./internal/fdAnchoredCliLaunch.js";
+import { StreamingSensitiveOutputRedactor } from "./internal/streamingSensitiveOutputRedactor.js";
 
 type SpawnWindowsJobObjectProcess = typeof import(
   "./internal/windowsJobObjectProcess.js"
@@ -6372,8 +6376,6 @@ describe("agent bridge", () => {
       },
     });
 
-    const publicApi = await import("@skyturn/agent-bridge");
-    const boundedFileReader = await import("@skyturn/agent-bridge/bounded-file-reader");
     expect(Object.keys(boundedFileReader)).toEqual(["readBoundedFile"]);
     for (const name of [
       "createTestCodexCliAdapter",
@@ -9338,6 +9340,10 @@ describe("agent bridge", () => {
         ...mixedUnicodeSensitiveValueRepresentationsForTest(rawHandle),
       ]),
     ];
+    const crossStream = Array.from(representations[2]);
+    const split = Math.floor(crossStream.length / 2);
+    const crossPrefix = `before-X ${crossStream.slice(0, split).join("")}`;
+    const crossSuffix = `${crossStream.slice(split).join("")} after-X\r\n`;
     await writeFile(
       hermesPath,
       [
@@ -9346,6 +9352,12 @@ describe("agent bridge", () => {
         "const handle = args[args.indexOf('--resume') + 1];",
         "if (handle !== process.env.SKYTURN_EXPECTED_HANDLE) process.exit(9);",
         "const values = JSON.parse(process.env.SKYTURN_EMITTED_VALUES);",
+        "const { existsSync } = require('node:fs');",
+        "const { join } = require('node:path');",
+        "const acknowledged = async (name) => {",
+        "  const path = join(process.env.SKYTURN_ACK_ROOT, name);",
+        "  while (!existsSync(path)) await new Promise(setImmediate);",
+        "};",
         "const wait = () => new Promise((resolve) => setTimeout(resolve, 2));",
         "(async () => {",
         "  for (const [valueIndex, value] of values.entries()) {",
@@ -9355,9 +9367,9 @@ describe("agent bridge", () => {
         "  const crossStream = Array.from(values[2]);",
         "  const split = Math.floor(crossStream.length / 2);",
         "  process.stdout.write(`before-X ${crossStream.slice(0, split).join('')}`);",
-        "  await new Promise((resolve) => setTimeout(resolve, 50));",
+        "  await acknowledged('prefix');",
         "  process.stderr.write(`${crossStream.slice(split).join('')} after-X\\r\\n`);",
-        "  await new Promise((resolve) => setTimeout(resolve, 50));",
+        "  await acknowledged('suffix');",
         "  process.stdout.write('  indented\\toutput  \\r\\n\\r\\n');",
         "})();",
       ].join("\n"),
@@ -9370,23 +9382,49 @@ describe("agent bridge", () => {
         env: {
           SKYTURN_EXPECTED_HANDLE: rawHandle,
           SKYTURN_EMITTED_VALUES: JSON.stringify(representations),
+          SKYTURN_ACK_ROOT: binRoot,
         },
       })],
     });
     bridge.onRunEvent((event) => liveEvents.push(event));
     const completed = waitForEvent(bridge, (event) => event.kind === "status" && event.payload.status === "succeeded");
-
-    const run = await bridge.startRun({
-      protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
-      nodeId: "node-hermes-stream-redaction",
-      sessionId: "session-1",
-      hermesSessionHandle: rawHandle,
-      projectRoot,
-      worktreePath: projectRoot,
-      agentKind: "hermes",
-      prompt: "Continue",
+    const received = { stdout: "", stderr: "" };
+    const observedOrder: string[] = [];
+    const originalPush = StreamingSensitiveOutputRedactor.prototype.push;
+    // Acknowledge actual adapter input processing, never elapsed time or public redaction output.
+    const observer = vi.spyOn(StreamingSensitiveOutputRedactor.prototype, "push").mockImplementation(function (this: StreamingSensitiveOutputRedactor, stream, value) {
+      const chunks = originalPush.call(this, stream, value);
+      received[stream] += value;
+      for (const [name, seen] of [
+        ["prefix", received.stdout.includes(crossPrefix)],
+        ["suffix", received.stderr.includes(crossSuffix)],
+        ["plain", received.stdout.includes("  indented\toutput  \r\n\r\n")],
+      ] as const) {
+        if (seen && !observedOrder.includes(name)) {
+          observedOrder.push(name);
+          writeFileSync(join(binRoot, name), "observed");
+        }
+      }
+      return chunks;
     });
-    await completed;
+    let run: AgentRun;
+    try {
+      run = await bridge.startRun({
+        protocolVersion: RUN_EVENT_PROTOCOL_VERSION,
+        nodeId: "node-hermes-stream-redaction",
+        sessionId: "session-1",
+        hermesSessionHandle: rawHandle,
+        projectRoot,
+        worktreePath: projectRoot,
+        agentKind: "hermes",
+        prompt: "Continue",
+      });
+      await completed;
+    } finally {
+      observer.mockRestore();
+      await bridge.close();
+    }
+    expect(observedOrder).toEqual(["prefix", "suffix", "plain"]);
 
     const events = await loadRunEvents(projectRoot, run.id);
     const evidence = await bridge.getEvidence(projectRoot, run.id);

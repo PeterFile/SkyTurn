@@ -647,12 +647,12 @@ export function parseExpectedArtifactDeclaration(value: unknown): string | null 
   return normalized;
 }
 
-function isSensitiveArtifactComponent(value: string): boolean {
+export function isSensitiveArtifactComponent(value: string): boolean {
   const key = sensitiveArtifactFoldKey(value);
   if (narrowServiceAccountReportPattern.test(key)) return false;
   const tokens = key.split(".").filter(Boolean);
   const compact = tokens.join("");
-  if (key === ".env" || key.startsWith(".env.") || key === ".npmrc" || key.startsWith(".npmrc.")) return true;
+  if ([".env", ".npmrc", ".netrc", ".pypirc"].some((name) => key === name || key.startsWith(`${name}.`))) return true;
   if (isSensitiveCompactArtifactFamily(compact)) return true;
   if (tokens[0] === "cookies" && tokens[1] === "sqlite") return true;
   if (tokens[0] === "id" && privateKeyIds.has(tokens[1] ?? "")) return true;
