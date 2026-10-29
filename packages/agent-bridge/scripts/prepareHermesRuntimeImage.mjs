@@ -120,6 +120,9 @@ function dockerCommand(executable, args, options, evidence, { spawnProcess, sche
   });
 }
 
+// Internal developer-script reuse; these are not package-root adapter APIs.
+export { parseArguments, checkPaths, readPin, verifyImage, dockerCommand };
+
 // Only the imported offline test API accepts boundary injection; the CLI has no bypass flags.
 export async function prepareHermesRuntimeImage(args, { spawnProcess = spawn, lstatPath = lstat, scheduleTimeout = setTimeout, signal } = {}) {
   let evidenceDirectory; let stage = "arguments"; let pin; let daemonId; let imageIdentity;

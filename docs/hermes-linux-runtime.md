@@ -1,6 +1,6 @@
 # Prepare the optional Hermes Linux image
 
-Image preparation is an explicit developer operation. It leaves the existing native Hermes path unchanged. This slice does not launch containers, integrate a Docker adapter, configure Hermes, log in to a provider, or establish runtime/planner readiness.
+Image preparation is an explicit developer operation. It leaves the existing native Hermes path unchanged. The preparation command does not launch containers, integrate a Docker adapter, configure Hermes, log in to a provider, or establish runtime/planner readiness. The separate [experimental lifecycle acceptance](#run-the-experimental-lifecycle-acceptance) below launches only fixed no-credential fixtures.
 
 ## Review the pinned image
 
@@ -108,3 +108,87 @@ git diff --check
 ```
 
 The package's existing test command also includes these tests. They use Node stdlib only, injected child processes, real private filesystem fixtures, and a socket-type fixture without creating or connecting to sockets. Coverage includes the observed containerd inspect shape, legacy config IDs, strict descriptor and metadata rejection, and the unchanged command, timeout, and close/reap boundaries. Offline success does not prove that real preparation has completed. Tests requiring POSIX ownership, permissions, or Unix socket paths explicitly skip on Windows; the platform-independent CLI invalid-argument test still runs there. This is proactive generic package-test portability work, not evidence of a current Windows CI failure; Windows CI uses the separate `test:windows` command. The CLI exposes no test bypass flags.
+
+## Run the experimental lifecycle acceptance
+
+This independently reviewable developer experiment belongs to AgentBridge. It is a next slice toward #206/#214, not completion of those changes. It does not change production adapters, Electron, native launch permissions, product claims/events, or planner readiness. The product's existing DurableRunClaim remains the future launch authority. The scripts export no package-root API and publish no RunEvidence.
+
+Run only after the parent reviews the executable, socket, expected daemon, private state root, and security protocol. The four explicit preparation arguments and the committed pin use the **same strict validators**, including classic/containerd image identity support. The lifecycle never pulls or authenticates. Every Docker client gets a new empty HOME/config, explicit host/config flags, and the preparation allowlist; host credentials, global Docker configuration, and parent environment variables are unavailable to it.
+
+The parent owns all real Docker operations and independent security review. Replace every placeholder below with reviewed values, including existing private canonical state-parent and scratch directories that satisfy the path rules above. Obtain the expected daemon ID through a trusted operator check. From the repository root, create a **new** acceptance root; the subshell exits before any Docker request if exclusive mkdir fails:
+
+```sh
+(
+  set -eu
+  umask 077
+  docker_executable='/absolute/canonical/docker'
+  docker_host='unix:///absolute/canonical/docker.sock'
+  expected_daemon_id='EXPECTED_DAEMON_ID'
+  state_parent='/absolute/private/hermes-container-lifecycle'
+  scratch_root='/absolute/private/canonical/scratch'
+  state_root="$state_parent/acceptance-state"
+  mkdir -m 700 "$state_root"
+  TMPDIR="$scratch_root" \
+  pnpm --filter @skyturn/agent-bridge run hermes:container:acceptance \
+    --docker-executable "$docker_executable" \
+    --docker-host "$docker_host" \
+    --expected-daemon-id "$expected_daemon_id" \
+    --state-root "$state_root"
+)
+```
+
+The equivalent dependency-free command replaces the pnpm prefix with `node packages/agent-bridge/scripts/acceptHermesContainerLifecycle.mjs`. If the root already exists, inspect it before choosing a new dedicated root; do not overwrite earlier evidence. The placeholders are not usable endpoint evidence. The command validates the supplied executable, socket, private state root, daemon identity, and image before execution; it never relaxes those checks to accommodate an example.
+
+The command runs these real Engine cases serially. Each creates new bounded random names and retains its containers and labelled state volumes. It never touches prior bootstrap resources, removes objects, or prunes.
+
+| Case | Required assertion |
+| --- | --- |
+| Bootstrap | Official entrypoint, stage2 configuration/PM initialization, privilege drop, normal `hermes --help`, UID/GID 10000, zero permitted/effective/ambient capabilities, and NNP 1. |
+| Natural root exit | The fixture forks a real 600-second child, verifies it exists, then exits naturally. Exact daemon readback must show the container exited with PID 0. |
+| Cancel and timeout | Wait for a real long-running fixture child; cancellation or a 30-second task deadline must produce confirmed exact-CID cleanup, with a failed task outcome. |
+| Controller SIGKILL | Kill a separate real controller after its child fixture is live. Independently inspect the stopped container before recovery; the original owner must have cleaned up despite lost consumers. Only then use cleanup-only reconcile for a fresh durable acknowledgement, asserting no extra start or stop. |
+| Create/start response loss | A private Unix HTTP proxy forwards to the reviewed real daemon, drains one successful create/start response, then drops it. The client must actually fail; cleanup must reconcile the real object. No fake runtime facts are substituted. |
+| Daemon unavailable | The private proxy closes connections after a real child is live. Cleanup must remain unknown and repeated start must fail closed. Explicitly reconcile the same CID through the parent's reviewed direct socket to the same daemon, without another start. The real daemon is never stopped. |
+| Name/ownership conflict | Exclusively create a differently labelled decoy after the owner's absence check. The owner's real create must fail. It must neither start nor stop the decoy; inspect must still show `created`. |
+
+Any fixture, transport-fault, task-outcome, isolation, terminal-readback, or CLI-close assertion failure exits nonzero and records failed acceptance. A healthy real daemon and its immutable image are required; offline substitutes cannot satisfy this command. Successful output means this fixed no-credential experiment passed, not authenticated Hermes chat or planner acceptance. The proxy tests daemon *unreachability* without changing shared daemon settings; simultaneous owner/daemon loss has no immediate-stop guarantee.
+
+### Keep lifecycle and task facts separate
+
+`managedHermesContainer.mjs` starts a detached host owner with a private control pipe and a separate status pipe. The owner validates state and sends `ready`; only controller acknowledgement permits preflight. After persisted identity and absence checks, `armed` requires a second acknowledgement before any create. Docker children receive only ignored stdin and their own stdout/stderr pipes, never the control/status descriptors. EOF, cancel, startup abort, task timeout, and status EPIPE converge on one owner cleanup path. A command already in flight must reach actual `close` before reconciliation; the fixed command deadline may kill the client once, but no kill return value, exit event, or extra cleanup timeout substitutes for close.
+
+Every container uses the immutable pin, normal entrypoint, `--pull never`, `--restart no`, `--init`, network none, a read-only root, no-new-privileges, cap-drop ALL with only CHOWN/DAC_OVERRIDE/SETUID/SETGID/KILL added for bootstrap, private tmpfs `/run` and `/tmp`, and one new labelled `/opt/data` volume. There are no host bind mounts, Docker socket mounts, credentials, alternate entrypoints, guessed venv executables, or fallback runtimes. The inspected dispatcher supports the non-PID1 `--init` path by running stage2 and main-wrapper; no full s6 service tree is claimed. Docker's [create](https://docs.docker.com/reference/cli/docker/container/create/) and [start](https://docs.docker.com/reference/cli/docker/container/start/) are separate operations; client completion alone is not container completion.
+
+Only an exclusive create's full 64-hex CID receipt permits start. The ownership label is independently random and cannot be derived from the visible random resource name. Before a receipt is persisted, cleanup/reconcile can discover an object by the saved name, but must exact-match its CID if known, independent label, image pin, entrypoint, and fixed fixture command. Discovery never authorizes start. A name collision with conflicting ownership is quarantined without stopping it. Missing create receipts, unresolved start acceptance, malformed state, and daemon identity conflicts fail closed.
+
+The supplied state root is **one operation only**: another start is always refused, even after success. PID owner tickets serialize writers and fail conservatively on PID reuse, unreadable/partial tickets, or a still-live owner. These are experimental diagnostic admission records, not product run claims. Reconciliation can use a later exclusive owner ticket only after prior owners are confirmed absent; it can stop the exact owned orphan but never create/start one. It retains previous per-attempt terminal snapshots.
+
+To reconcile a retained operation directory from `acceptance.json`, use the original executable/daemon and a reviewed socket to that same daemon. Replace `--state-root` with that **case's** directory:
+
+```sh
+node packages/agent-bridge/scripts/managedHermesContainer.mjs --reconcile hold \
+  --docker-executable '/absolute/reviewed/docker' \
+  --docker-host 'unix:///reviewed/socket/to-the-same-daemon' \
+  --expected-daemon-id 'ORIGINAL_DAEMON_ID' \
+  --state-root '/absolute/private/retained-case-directory'
+```
+
+The original full launch fingerprint is retained. Cleanup-only recovery can explicitly select another socket that passes the unchanged strict path/socket validators, while the executable, expected daemon ID, and immutable pin must match the original authority fingerprint. The daemon identity is checked before cleanup. For a retained fault-proxy case, use the parent's reviewed direct socket; no proxy needs to be restored and no daemon restart is performed. Endpoint changes never authorize another launch. A partial identity journal requires operator review rather than guessing or relaunching.
+
+`operation.json`, `owner-N.json`, and immutable-per-attempt `terminal-N.json` retain names, identity, CID, intents, sanitized errors, per-command actual close/exit facts, task exit, and cleanup outcome. Journal writes use exclusive private files, file fsync, atomic replacement for updates, and parent directory fsync; failed durability blocks success. `inspect.json` retains the owner's exact matched daemon readback; `parent-inspect.json` independently checks it. `fixture-output.json` holds only bounded known no-credential fixture stdout; arbitrary task commands/output are unavailable. Task stdout cannot forge status. Future production output must pass the existing streaming redactor/private-event path.
+
+Ordinary preflight/create/start writes remain strict launch gates. During cleanup only, diagnostic write/fsync/rename failures are latched but cannot prevent the same strict private-path, daemon, and exact-ownership checks, stop attempt, actual CLI close, or terminal readback. This applies to command pre/post writes, inspect records, discovered CID receipts, and final records. A command's original failure is retained if its post-command receipt also fails to persist.
+
+`containerCleanup: confirmed` records **observed** exact-owned daemon terminal facts. `cliClosed` records observed client close/stdio completion, without inventing a missing close when only its write failed. `cleanup: confirmed` and task success require those facts and an acknowledgement with `evidencePersisted: true` and `cliEvidencePersisted: true`, issued only after all final writes complete. On-disk snapshots retain both acknowledgement flags as false: readable draft bytes, including after a failed fsync, never prove durability. Any persistence failure latches `persistenceFailed: true`, keeps cleanup unknown and outcome failed, and rejects with fixed `STATE_PERSISTENCE_FAILED` after attempting validated physical cleanup; no terminal success is published. A later successful diagnostic write cannot clear the latch. Permanently failing final writes may leave an earlier unacknowledged draft; its proposed cleanup/outcome is not durable completion evidence.
+
+A lost historical close record remains `cliClosed: false`, `cleanup: unknown`, even if later reconciliation stops the container. `outcome: succeeded` further requires natural task completion with exit zero. Cancel, timeout, startup failure, and reconciliation retain failed task outcomes; confirmed cleanup never turns them into task success. Local journals are mutable by the same UID/administrator and do not provide host isolation. This slice makes no guarantee after independent owner loss while the daemon is unavailable; retained state permits exact later stop/reconciliation without relaunch.
+
+### Verify offline without dependencies
+
+```sh
+TMPDIR='/absolute/private/canonical/scratch' \
+node --test packages/agent-bridge/scripts/hermesContainerLifecycle.test.mjs \
+  packages/agent-bridge/scripts/prepareHermesRuntimeImage.test.mjs
+```
+
+`pnpm --filter @skyturn/agent-bridge run test:hermes:lifecycle` runs the focused suite; the existing package test includes it as well. It uses real private filesystem state, real detached controller/owner processes for SIGKILL/EPIPE, and an injected offline Docker boundary. The preparation regressions still validate the unchanged command semantics and strict pin/path/socket/identity checks. Syntax checks and these suites need Node only. The full package build/lint/Vitest gates still require workspace dependencies and are separate from real Docker acceptance.
