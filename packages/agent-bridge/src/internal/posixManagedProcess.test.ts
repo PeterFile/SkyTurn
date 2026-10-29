@@ -1,11 +1,12 @@
 import { spawn, spawnSync } from "node:child_process";
+import { EventEmitter, once } from "node:events";
 import { constants as fsConstants } from "node:fs";
 import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { spawnPosixManagedProcess } from "./posixManagedProcess.js";
 
@@ -32,27 +33,85 @@ describe("POSIX managed process ownership", () => {
     expect(packageJson.files).not.toContain("dist/native/posix-process-owner");
   });
 
-  posixIt("copies the executable owner helper into the published dist package", async () => {
+  posixIt("keeps the built owner helper bytes and executable mode in dist", async () => {
     const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
-    const buildScript = fileURLToPath(new URL("../../scripts/buildArtifactGate.mjs", import.meta.url));
-    const built = spawnSync(process.execPath, [buildScript, "--copy-dist"], {
-      cwd: packageRoot,
-      encoding: "utf8",
-    });
-    expect(built.status, built.stderr).toBe(0);
-
+    // The package build dependency publishes real native helpers before this suite.
     const helper = await stat(join(packageRoot, "dist/native/posix-process-owner"));
     expect(helper.isFile()).toBe(true);
     expect(helper.size).toBeGreaterThan(0);
     expect(helper.mode & 0o111).not.toBe(0);
+    expect(await readFile(join(packageRoot, "dist/native/posix-process-owner"))).toHaveLength(helper.size);
+  });
 
-    const packed = spawnSync("pnpm", ["pack", "--dry-run", "--json"], {
+  posixIt("includes the executable owner helper in the actual published package file list", async ({ signal, onTestFinished }) => {
+    const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+    const packed = spawn("pnpm", ["pack", "--dry-run", "--json"], {
       cwd: packageRoot,
-      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    expect(packed.status, packed.stderr).toBe(0);
-    const packedFiles = JSON.parse(packed.stdout).files.map(({ path }: { path: string }) => path);
+    const closed = waitForPackClose(packed, signal, onTestFinished);
+    let stdout = "";
+    let stderr = "";
+    packed.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+    packed.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    const result = await closed;
+    expect(result.code, stderr).toBe(0);
+    const packedFiles = JSON.parse(stdout).files.map(({ path }: { path: string }) => path);
     expect(packedFiles).toContain("dist/native/posix-process-owner");
+  });
+
+  it.each([
+    ["timeout", "false"],
+    ["timeout", "throws"],
+    ["failure", "false"],
+    ["failure", "throws"],
+    ["spawn-error", "false"],
+  ] as const)("reaps pack cleanup only at close after %s when kill %s", async (reason, killResult) => {
+    const controller = new AbortController();
+    const child = Object.assign(new EventEmitter(), {
+      exitCode: 0,
+      signalCode: "SIGKILL",
+      kill: vi.fn(() => {
+        if (killResult === "throws") throw new Error("synthetic kill failure");
+        return false;
+      }),
+    }) as unknown as ReturnType<typeof spawn>;
+    let cleanup: (() => Promise<void>) | undefined;
+    const closed = waitForPackClose(child, controller.signal, (handler) => { cleanup = handler; });
+    expect(cleanup).toBeTypeOf("function");
+    if (reason === "timeout") controller.abort();
+    if (reason === "spawn-error") child.emit("error", new Error("synthetic spawn failure"));
+    const reaped = cleanup!();
+    expect(cleanup!()).toBe(reaped);
+    let settled = false;
+    void reaped.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(child.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+    child.emit("exit", 0, null);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    child.emit("close", null, "SIGKILL");
+    await expect(closed).resolves.toEqual({ code: null, signal: "SIGKILL" });
+    await reaped;
+    expect(settled).toBe(true);
+    expect(child.kill).toHaveBeenCalledOnce();
+  });
+
+  posixIt("reaps a real pack-test child and its stdio after cancellation", async ({ onTestFinished }) => {
+    const controller = new AbortController();
+    const child = spawn(process.execPath, ["-e", "process.on('message', () => {}); process.send('ready');"], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+    });
+    const closed = waitForPackClose(child, controller.signal, onTestFinished);
+    const kill = vi.spyOn(child, "kill");
+    child.stdout?.resume();
+    child.stderr?.resume();
+    expect(await once(child, "message")).toEqual(["ready", undefined]);
+    controller.abort();
+    await expect(closed).resolves.toEqual({ code: null, signal: "SIGKILL" });
+    expect(kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+    expect(child.stdout?.destroyed).toBe(true);
+    expect(child.stderr?.destroyed).toBe(true);
   });
 
   posixIt("keeps published helpers executable until a complete rebuild is atomically published", async () => {
@@ -675,6 +734,37 @@ async function expectOnlyFixtureNativeFiles(nativeRoot: string): Promise<void> {
     "posix-process-owner",
     "posix-process-owner.c",
   ]);
+}
+
+function waitForPackClose(
+  child: ReturnType<typeof spawn>,
+  signal: AbortSignal,
+  onTestFinished: (cleanup: () => Promise<void>) => void,
+) {
+  let didClose = false;
+  let termination: Promise<void> | undefined;
+  const onAbort = () => { void terminateAndReap(); };
+  const closed = new Promise<Awaited<ReturnType<typeof waitForChildClose>>>((resolve) => {
+    child.once("close", (code, signalCode) => {
+      didClose = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve({ code, signal: signalCode });
+    });
+  });
+  function terminateAndReap(): Promise<void> {
+    return termination ??= Promise.resolve().then(async () => {
+      if (!didClose) {
+        try { child.kill("SIGKILL"); } catch { /* Close remains the reap boundary. */ }
+      }
+      await closed;
+    });
+  }
+  // Vitest aborts this signal at the existing test deadline; cleanup also runs on ordinary failure.
+  onTestFinished(terminateAndReap);
+  child.once("error", onAbort);
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+  return closed;
 }
 
 function waitForChildClose(child: ReturnType<typeof spawn>): Promise<{
