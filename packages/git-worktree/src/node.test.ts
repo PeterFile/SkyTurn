@@ -2308,6 +2308,7 @@ describe("candidate delivery commits", () => {
     expect(candidateWorktreeState(repo.repoRoot)).toEqual(worktreeBefore);
   });
 
+  // Let both Git pipelines settle and close after the 5s publication protocol watchdog.
   it.skipIf(process.platform === "win32")("allows at most one concurrent secure publication", async () => {
     const repo = await createTestRepo("skyturn-candidate-concurrent-");
     tempRoots.push(repo.tempRoot);
@@ -2315,6 +2316,10 @@ describe("candidate delivery commits", () => {
     const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
     const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
     const wrapper = await installCandidateConcurrentCasWrapper(repo.repoRoot);
+    const indexPath = git(repo.repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const indexBefore = readFileSync(indexPath);
+    const featureBefore = readFileSync(join(repo.repoRoot, "feature.txt"));
+    const processes: ObservedGitProcess[] = [];
     const publish = () => createCandidateDeliveryCommit({
       projectRoot: repo.repoRoot,
       worktreePath: repo.repoRoot,
@@ -2322,7 +2327,9 @@ describe("candidate delivery commits", () => {
       subject: "feat(delivery): publish one concurrent candidate",
     });
 
-    const results = await withFakeGit(wrapper.binDir, () => Promise.allSettled([publish(), publish()]));
+    const results = await withObservedGitProcesses(processes, () => (
+      withFakeGit(wrapper.binDir, () => Promise.allSettled([publish(), publish()]))
+    ));
 
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
@@ -2330,7 +2337,15 @@ describe("candidate delivery commits", () => {
       result.status === "fulfilled"
     ));
     expect(winner?.value.commitSha).toBe(git(repo.repoRoot, ["rev-parse", "refs/heads/main"]));
-  });
+    expect(processes.filter(({ args }) => args[0] === "update-ref")).toHaveLength(2);
+    expect(processes.every(({ closed }) => closed)).toBe(true);
+    expect(readFileSync(indexPath)).toEqual(indexBefore);
+    expect(readFileSync(join(repo.repoRoot, "feature.txt"))).toEqual(featureBefore);
+    const stateAfter = candidateWorktreeState(repo.repoRoot);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(winner?.value.commitSha);
+    expect(candidateWorktreeState(repo.repoRoot)).toEqual(stateAfter);
+  }, 10_000);
 
   it.skipIf(process.platform === "win32")("publishes only to R when HEAD switches to another branch at H before CAS", async () => {
     const repo = await createTestRepo("skyturn-candidate-head-switch-");
