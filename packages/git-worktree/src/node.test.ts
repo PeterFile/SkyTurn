@@ -47,9 +47,10 @@ interface TestRepo {
   baseCommit: string;
 }
 
-function git(cwd: string, args: string[]): string {
+function git(cwd: string, args: string[], env = process.env): string {
   return execFileSync("git", args, {
     cwd,
+    env,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
@@ -2008,6 +2009,7 @@ describe("candidate delivery commits", () => {
     git(repo.repoRoot, ["branch", "victim", headCommit]);
     const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
     const wrapper = await installCandidateSymbolicBranchWrapper(repo.repoRoot, "refs/heads/main", "refs/heads/victim");
+    const worktreeBefore = candidateWorktreeState(repo.repoRoot);
 
     await expect(withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
       projectRoot: repo.repoRoot,
@@ -2025,24 +2027,13 @@ describe("candidate delivery commits", () => {
       "prepare",
       "abort",
     ]);
-    const unreachableCommits = git(repo.repoRoot, [
-      "fsck",
-      "--unreachable",
-      "--no-reflogs",
-      "--no-progress",
-    ]).split("\n").flatMap((line) => {
-      const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
-      return match ? [match[1]] : [];
-    });
-    expect(unreachableCommits).toHaveLength(1);
-    const candidateCommit = unreachableCommits[0];
-    expect(git(repo.repoRoot, ["show", `${candidateCommit}:feature.txt`])).toBe("reviewed symbolic candidate");
-    const branchCommits = git(repo.repoRoot, [
-      "for-each-ref",
-      "--format=%(objectname)",
-      "refs/heads",
-    ]).split("\n");
-    expect(branchCommits).not.toContain(candidateCommit);
+    expectUnpublishedCandidate(
+      repo.repoRoot,
+      candidateCommitFromProtocol(wrapper.protocolPath),
+      headCommit,
+      "reviewed symbolic candidate\n",
+    );
+    expect(candidateWorktreeState(repo.repoRoot)).toEqual(worktreeBefore);
   });
 
   it.skipIf(process.platform === "win32")("aborts a malformed prepared-transaction protocol without changing the branch", async () => {
@@ -2081,16 +2072,18 @@ describe("candidate delivery commits", () => {
     const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
     const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
     const wrapper = await installCandidateSilentPrepareWrapper(repo.repoRoot);
+    const worktreeBefore = candidateWorktreeState(repo.repoRoot);
+    const processes: ObservedGitProcess[] = [];
 
     const startedAt = Date.now();
     let exposed = "";
     try {
-      await withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+      await withObservedGitProcesses(processes, () => withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
         projectRoot: repo.repoRoot,
         worktreePath: repo.repoRoot,
         expected,
         subject: "feat(delivery): reject silent prepared publication",
-      }));
+      })));
     } catch (error) {
       exposed = String(error);
     }
@@ -2106,23 +2099,16 @@ describe("candidate delivery commits", () => {
     ]);
     expect(existsSync(wrapper.terminationPath)).toBe(true);
     expect(existsSync(wrapper.lockMarkerPath)).toBe(false);
+    expect(processes.filter(({ args }) => args[0] === "update-ref")).toHaveLength(1);
+    expect(processes.every(({ closed }) => closed)).toBe(true);
     expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
-    const unreachableCommits = git(repo.repoRoot, [
-      "fsck",
-      "--unreachable",
-      "--no-reflogs",
-      "--no-progress",
-    ]).split("\n").flatMap((line) => {
-      const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
-      return match ? [match[1]] : [];
-    });
-    expect(unreachableCommits).toHaveLength(1);
-    const branchCommits = git(repo.repoRoot, [
-      "for-each-ref",
-      "--format=%(objectname)",
-      "refs/heads",
-    ]).split("\n");
-    expect(branchCommits).not.toContain(unreachableCommits[0]);
+    expectUnpublishedCandidate(
+      repo.repoRoot,
+      candidateCommitFromProtocol(wrapper.protocolPath),
+      headCommit,
+      "reviewed silent candidate\n",
+    );
+    expect(candidateWorktreeState(repo.repoRoot)).toEqual(worktreeBefore);
   }, 25_000);
 
   it.skipIf(process.platform === "win32")("terminates and reaps silent prepared-ref validation before aborting publication", async () => {
@@ -2132,14 +2118,16 @@ describe("candidate delivery commits", () => {
     const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
     const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
     const wrapper = await installCandidateSilentValidationWrapper(repo.repoRoot);
+    const worktreeBefore = candidateWorktreeState(repo.repoRoot);
+    const processes: ObservedGitProcess[] = [];
 
     const startedAt = Date.now();
-    await expect(withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
+    await expect(withObservedGitProcesses(processes, () => withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
       projectRoot: repo.repoRoot,
       worktreePath: repo.repoRoot,
       expected,
       subject: "feat(delivery): reject silent prepared-ref validation",
-    }))).rejects.toThrow("Candidate delivery commit was rejected.");
+    })))).rejects.toThrow("Candidate delivery commit was rejected.");
     const elapsedMs = Date.now() - startedAt;
 
     expect(elapsedMs).toBeLessThan(10_000);
@@ -2156,23 +2144,17 @@ describe("candidate delivery commits", () => {
     expect(existsSync(wrapper.abortAfterValidationClosePath)).toBe(true);
     expect(existsSync(wrapper.updateRefClosedPath)).toBe(true);
     expect(existsSync(wrapper.lockMarkerPath)).toBe(false);
+    expect(processes.filter(({ args }) => args[0] === "update-ref")).toHaveLength(1);
+    expect(processes.some(({ args }) => args[0] === "for-each-ref")).toBe(true);
+    expect(processes.every(({ closed }) => closed)).toBe(true);
     expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
-    const unreachableCommits = git(repo.repoRoot, [
-      "fsck",
-      "--unreachable",
-      "--no-reflogs",
-      "--no-progress",
-    ]).split("\n").flatMap((line) => {
-      const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
-      return match ? [match[1]] : [];
-    });
-    expect(unreachableCommits).toHaveLength(1);
-    const branchCommits = git(repo.repoRoot, [
-      "for-each-ref",
-      "--format=%(objectname)",
-      "refs/heads",
-    ]).split("\n");
-    expect(branchCommits).not.toContain(unreachableCommits[0]);
+    expectUnpublishedCandidate(
+      repo.repoRoot,
+      candidateCommitFromProtocol(wrapper.protocolPath),
+      headCommit,
+      "reviewed silent validation\n",
+    );
+    expect(candidateWorktreeState(repo.repoRoot)).toEqual(worktreeBefore);
   }, 20_000);
 
   it.skipIf(process.platform === "win32")("bounds prepared-transaction output and leaves the branch unchanged", async () => {
@@ -2310,6 +2292,7 @@ describe("candidate delivery commits", () => {
     const parentTree = git(repo.repoRoot, ["rev-parse", `${headCommit}^{tree}`]);
     const competingCommit = git(repo.repoRoot, ["commit-tree", parentTree, "-p", headCommit, "-m", "competing update"]);
     const wrapper = await installCandidateCasWrapper(repo.repoRoot, "refs/heads/main", headCommit, competingCommit);
+    const worktreeBefore = candidateWorktreeState(repo.repoRoot);
 
     await expect(withFakeGit(wrapper.binDir, () => createCandidateDeliveryCommit({
       projectRoot: repo.repoRoot,
@@ -2318,21 +2301,14 @@ describe("candidate delivery commits", () => {
       subject: "feat(delivery): lose stale candidate race",
     }))).rejects.toThrow("Candidate delivery commit was rejected.");
 
-    const candidateCommit = git(repo.repoRoot, [
-      "fsck",
-      "--unreachable",
-      "--no-reflogs",
-      "--no-progress",
-    ]).split("\n").flatMap((line) => {
-      const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
-      return match ? [match[1]] : [];
-    })[0];
-    expect(candidateCommit).toMatch(/^[0-9a-f]{40}$/);
+    const candidateCommit = readFileSync(wrapper.commitReceiptPath, "utf8").trim();
     expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(competingCommit);
     expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).not.toBe(candidateCommit);
-    expect(git(repo.repoRoot, ["cat-file", "-t", candidateCommit])).toBe("commit");
+    expectUnpublishedCandidate(repo.repoRoot, candidateCommit, headCommit, "reviewed candidate\n");
+    expect(candidateWorktreeState(repo.repoRoot)).toEqual(worktreeBefore);
   });
 
+  // Let both Git pipelines settle and close after the 5s publication protocol watchdog.
   it.skipIf(process.platform === "win32")("allows at most one concurrent secure publication", async () => {
     const repo = await createTestRepo("skyturn-candidate-concurrent-");
     tempRoots.push(repo.tempRoot);
@@ -2340,6 +2316,10 @@ describe("candidate delivery commits", () => {
     const headCommit = git(repo.repoRoot, ["rev-parse", "HEAD"]);
     const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
     const wrapper = await installCandidateConcurrentCasWrapper(repo.repoRoot);
+    const indexPath = git(repo.repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    const indexBefore = readFileSync(indexPath);
+    const featureBefore = readFileSync(join(repo.repoRoot, "feature.txt"));
+    const processes: ObservedGitProcess[] = [];
     const publish = () => createCandidateDeliveryCommit({
       projectRoot: repo.repoRoot,
       worktreePath: repo.repoRoot,
@@ -2347,7 +2327,9 @@ describe("candidate delivery commits", () => {
       subject: "feat(delivery): publish one concurrent candidate",
     });
 
-    const results = await withFakeGit(wrapper.binDir, () => Promise.allSettled([publish(), publish()]));
+    const results = await withObservedGitProcesses(processes, () => (
+      withFakeGit(wrapper.binDir, () => Promise.allSettled([publish(), publish()]))
+    ));
 
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
@@ -2355,7 +2337,15 @@ describe("candidate delivery commits", () => {
       result.status === "fulfilled"
     ));
     expect(winner?.value.commitSha).toBe(git(repo.repoRoot, ["rev-parse", "refs/heads/main"]));
-  });
+    expect(processes.filter(({ args }) => args[0] === "update-ref")).toHaveLength(2);
+    expect(processes.every(({ closed }) => closed)).toBe(true);
+    expect(readFileSync(indexPath)).toEqual(indexBefore);
+    expect(readFileSync(join(repo.repoRoot, "feature.txt"))).toEqual(featureBefore);
+    const stateAfter = candidateWorktreeState(repo.repoRoot);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(winner?.value.commitSha);
+    expect(candidateWorktreeState(repo.repoRoot)).toEqual(stateAfter);
+  }, 10_000);
 
   it.skipIf(process.platform === "win32")("publishes only to R when HEAD switches to another branch at H before CAS", async () => {
     const repo = await createTestRepo("skyturn-candidate-head-switch-");
@@ -2379,7 +2369,25 @@ describe("candidate delivery commits", () => {
     expect(git(repo.repoRoot, ["rev-parse", "refs/heads/other"])).toBe(headCommit);
   });
 
-  it("rejects malformed expectations and all bound fact mismatches without mutating refs, index, or worktree", async () => {
+  it.each([
+    "missing patch digest",
+    "unexpected expectation field",
+    "uppercase before commit",
+    "uppercase patch digest",
+    "zero patch length",
+    "unsafe patch length",
+    "unsafe branch name",
+    "oversized branch name",
+    "repository identity mismatch",
+    "worktree identity mismatch",
+    "ancestry proof mismatch",
+    "patch digest mismatch",
+    "patch length mismatch",
+    "file manifest mismatch",
+    "before commit mismatch",
+    "after commit mismatch",
+    "branch mismatch",
+  ] as const)("rejects %s without mutating refs, index, or worktree", async (variantName) => {
     const repo = await createTestRepo("skyturn-candidate-rejections-");
     tempRoots.push(repo.tempRoot);
     await writeFile(join(repo.repoRoot, "anchor.txt"), "second commit\n");
@@ -2391,41 +2399,40 @@ describe("candidate delivery commits", () => {
     git(repo.repoRoot, ["branch", "alternate", headCommit]);
     const expected = await candidateExpectationFor(repo.repoRoot, headCommit, headCommit);
     const { fullPatchSha256: _removedDigest, ...missingDigest } = expected;
-    const variants: unknown[] = [
-      missingDigest,
-      { ...expected, unexpected: true },
-      { ...expected, beforeHeadCommit: "A".repeat(40) },
-      { ...expected, fullPatchSha256: "A".repeat(64) },
-      { ...expected, fullPatchByteLength: 0 },
-      { ...expected, fullPatchByteLength: Number.MAX_SAFE_INTEGER },
-      { ...expected, branchName: "-unsafe" },
-      { ...expected, branchName: "x".repeat(1_025) },
-      { ...expected, repositoryIdentity: "0".repeat(64) },
-      { ...expected, worktreeIdentity: "1".repeat(64) },
-      { ...expected, ancestryProofSha256: "2".repeat(64) },
-      { ...expected, fullPatchSha256: "3".repeat(64) },
-      { ...expected, fullPatchByteLength: expected.fullPatchByteLength + 1 },
-      { ...expected, fileManifestSha256: "4".repeat(64) },
-      { ...expected, beforeHeadCommit: ancestorCommit },
-      { ...expected, afterHeadCommit: ancestorCommit },
-      { ...expected, branchName: "alternate" },
-    ];
+    const variants: Record<typeof variantName, unknown> = {
+      "missing patch digest": missingDigest,
+      "unexpected expectation field": { ...expected, unexpected: true },
+      "uppercase before commit": { ...expected, beforeHeadCommit: "A".repeat(40) },
+      "uppercase patch digest": { ...expected, fullPatchSha256: "A".repeat(64) },
+      "zero patch length": { ...expected, fullPatchByteLength: 0 },
+      "unsafe patch length": { ...expected, fullPatchByteLength: Number.MAX_SAFE_INTEGER },
+      "unsafe branch name": { ...expected, branchName: "-unsafe" },
+      "oversized branch name": { ...expected, branchName: "x".repeat(1_025) },
+      "repository identity mismatch": { ...expected, repositoryIdentity: "0".repeat(64) },
+      "worktree identity mismatch": { ...expected, worktreeIdentity: "1".repeat(64) },
+      "ancestry proof mismatch": { ...expected, ancestryProofSha256: "2".repeat(64) },
+      "patch digest mismatch": { ...expected, fullPatchSha256: "3".repeat(64) },
+      "patch length mismatch": { ...expected, fullPatchByteLength: expected.fullPatchByteLength + 1 },
+      "file manifest mismatch": { ...expected, fileManifestSha256: "4".repeat(64) },
+      "before commit mismatch": { ...expected, beforeHeadCommit: ancestorCommit },
+      "after commit mismatch": { ...expected, afterHeadCommit: ancestorCommit },
+      "branch mismatch": { ...expected, branchName: "alternate" },
+    };
     const indexPath = git(repo.repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
     const indexBefore = readFileSync(indexPath);
     const statusBefore = git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
 
-    for (const variant of variants) {
-      await expect(createCandidateDeliveryCommit({
-        projectRoot: repo.repoRoot,
-        worktreePath: repo.repoRoot,
-        expected: variant as CandidateCommitExpectation,
-        subject: "feat(delivery): reject mismatched candidate",
-      })).rejects.toThrow(/Candidate delivery commit (?:input is invalid|was rejected)\./);
-      expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
-      expect(git(repo.repoRoot, ["rev-parse", "refs/heads/alternate"])).toBe(headCommit);
-      expect(readFileSync(indexPath)).toEqual(indexBefore);
-      expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe(statusBefore);
-    }
+    await expect(createCandidateDeliveryCommit({
+      projectRoot: repo.repoRoot,
+      worktreePath: repo.repoRoot,
+      expected: variants[variantName] as CandidateCommitExpectation,
+      subject: "feat(delivery): reject mismatched candidate",
+    })).rejects.toThrow(/Candidate delivery commit (?:input is invalid|was rejected)\./);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/main"])).toBe(headCommit);
+    expect(git(repo.repoRoot, ["rev-parse", "refs/heads/alternate"])).toBe(headCommit);
+    expect(readFileSync(indexPath)).toEqual(indexBefore);
+    expect(git(repo.repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe(statusBefore);
+    expect(readFileSync(join(repo.repoRoot, "feature.txt"), "utf8")).toBe("reviewed rejection fixture\n");
   });
 
   it("returns bounded evidence and errors without paths, filenames, or reviewed bytes", async () => {
@@ -4013,13 +4020,21 @@ async function installCandidateCasWrapper(
   branchRef: string,
   expectedOldCommit: string,
   competingCommit: string,
-): Promise<{ binDir: string }> {
+): Promise<{ binDir: string; commitReceiptPath: string }> {
   const binDir = join(repoRoot, ".git", "candidate-cas-git");
   const markerPath = join(binDir, "competed");
+  const commitReceiptPath = join(binDir, "commit.txt");
   await mkdir(binDir, { recursive: true });
   const realGit = resolveExecutable("git");
   const script = [
     "#!/bin/sh",
+    "if [ \"$1\" = \"commit-tree\" ]; then",
+    `  candidate_commit=$(${shellSingleQuote(realGit)} "$@")`,
+    "  result=$?",
+    `  printf '%.128s\\n' "$candidate_commit" > ${shellSingleQuote(commitReceiptPath)}`,
+    "  printf '%s\\n' \"$candidate_commit\"",
+    "  exit \"$result\"",
+    "fi",
     "if [ \"$1\" = \"update-ref\" ] && [ \"$2\" = \"--stdin\" ] && [ ! -e " + shellSingleQuote(markerPath) + " ]; then",
     `  : > ${shellSingleQuote(markerPath)}`,
     `  ${shellSingleQuote(realGit)} -C ${shellSingleQuote(repoRoot)} update-ref ${shellSingleQuote(branchRef)} ${shellSingleQuote(competingCommit)} ${shellSingleQuote(expectedOldCommit)}`,
@@ -4030,7 +4045,7 @@ async function installCandidateCasWrapper(
   const gitPath = join(binDir, "git");
   await writeFile(gitPath, script, "utf8");
   await chmod(gitPath, 0o755);
-  return { binDir };
+  return { binDir, commitReceiptPath };
 }
 
 async function installCandidateSymbolicBranchWrapper(
@@ -4293,6 +4308,85 @@ async function withFakeGit<T>(binDir: string, callback: () => Promise<T>): Promi
     if (previousPath === undefined) delete process.env.PATH;
     else process.env.PATH = previousPath;
   }
+}
+
+interface ObservedGitProcess {
+  args: string[];
+  closed: boolean;
+}
+
+async function withObservedGitProcesses<T>(
+  processes: ObservedGitProcess[],
+  callback: () => Promise<T>,
+): Promise<T> {
+  const originalEmit = ChildProcess.prototype.emit;
+  ChildProcess.prototype.emit = function (event: string | symbol, ...args: unknown[]): boolean {
+    if (event === "spawn" && basename(this.spawnfile) === "git") {
+      const observed = { args: this.spawnargs.slice(1), closed: false };
+      processes.push(observed);
+      this.once("close", () => { observed.closed = true; });
+    }
+    return Reflect.apply(originalEmit, this, [event, ...args]);
+  };
+  try {
+    return await callback();
+  } finally {
+    ChildProcess.prototype.emit = originalEmit;
+  }
+}
+
+function candidateWorktreeState(repoRoot: string): { status: string; index: Buffer; feature: Buffer } {
+  const status = git(repoRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
+  const indexPath = git(repoRoot, ["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+  return {
+    status,
+    index: readFileSync(indexPath),
+    feature: readFileSync(join(repoRoot, "feature.txt")),
+  };
+}
+
+function candidateCommitFromProtocol(protocolPath: string): string {
+  const updates = readFileSync(protocolPath, "utf8").split("\n").flatMap((line) => {
+    const match = /^update refs\/heads\/main ([0-9a-f]{40}) [0-9a-f]{40}$/.exec(line);
+    return match ? [match[1]] : [];
+  });
+  expect(updates).toHaveLength(1);
+  return updates[0];
+}
+
+function expectUnpublishedCandidate(
+  repoRoot: string,
+  candidateCommit: string,
+  parentCommit: string,
+  reviewedBytes: string,
+): void {
+  // Publication protocol or commit-tree receipts identify creation; fsck only checks reachability.
+  expect(candidateCommit).toMatch(/^[0-9a-f]{40}$/);
+  expect(git(repoRoot, ["cat-file", "-t", candidateCommit])).toBe("commit");
+  expect(git(repoRoot, ["rev-list", "--parents", "-n", "1", candidateCommit]))
+    .toBe(`${candidateCommit} ${parentCommit}`);
+  const tree = git(repoRoot, ["rev-parse", `${candidateCommit}^{tree}`]);
+  expect(tree).toMatch(/^[0-9a-f]{40}$/);
+  expect(git(repoRoot, ["cat-file", "-t", tree])).toBe("tree");
+  const blob = execFileSync("git", ["hash-object", "--stdin"], {
+    cwd: repoRoot,
+    input: reviewedBytes,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+  }).trim();
+  expect(git(repoRoot, ["ls-tree", "-r", tree])).toBe(`100644 blob ${blob}\tfeature.txt`);
+  expect(gitBuffer(repoRoot, ["show", `${candidateCommit}:feature.txt`])).toEqual(Buffer.from(reviewedBytes));
+  expect(git(repoRoot, ["for-each-ref", `--contains=${candidateCommit}`, "--format=%(refname)"])).toBe("");
+  expect(git(repoRoot, ["rev-list", "--all", "--reflog", "HEAD"]).split("\n")).not.toContain(candidateCommit);
+
+  // Git localizes fsck prose, so pin only this human-readable query to the C locale.
+  const unreachableCommits = git(repoRoot, [
+    "fsck", "--unreachable", "--no-reflogs", "--no-progress",
+  ], { ...process.env, LC_ALL: "C" }).split("\n").flatMap((line) => {
+    const match = /^unreachable commit ([0-9a-f]{40})$/.exec(line);
+    return match ? [match[1]] : [];
+  });
+  expect(unreachableCommits).toEqual([candidateCommit]);
 }
 
 function resolveExecutable(command: string): string {
